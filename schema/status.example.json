@@ -1,0 +1,96 @@
+{
+  "schema_version": "0.1.0",
+  "generated_at": "2026-08-09T03:00:00Z",
+  "providers": [
+    {
+      "provider": "codex",
+      "display_name": "Codex",
+      "collection_mode": "automatic",
+      "source": "official_app_server",
+      "source_type": "official",
+      "confidence": "official",
+      "last_updated": "2026-08-09T02:09:43Z",
+      "status": "ok",
+      "windows": [
+        {
+          "name": "primary",
+          "duration_minutes": 10080,
+          "used_percent": 99,
+          "remaining_percent": 1,
+          "resets_at": "2026-08-10T08:29:43Z"
+        }
+      ],
+      "metadata": {
+        "method": "account/rateLimits/read",
+        "planType": "plus",
+        "credits": { "hasCredits": false, "unlimited": false },
+        "spendControlReached": false,
+        "secondary_window_present": false,
+        "poc_note": "This account returned exactly one 7-day window; secondary was null. Do not assume five_hour + weekly for every account/plan."
+      }
+    },
+    {
+      "provider": "claude_code",
+      "display_name": "Claude Code",
+      "collection_mode": "hybrid",
+      "source": "claude_code_jsonl",
+      "source_type": "local_estimate",
+      "confidence": "local_estimate",
+      "last_updated": "2026-08-08T18:07:37Z",
+      "status": "ok",
+      "windows": [
+        {
+          "name": "five_hour",
+          "duration_minutes": 300,
+          "used_percent": 31.3,
+          "remaining_percent": 68.7,
+          "resets_at": "2026-08-08T20:00:00Z"
+        },
+        {
+          "name": "seven_day",
+          "duration_minutes": null,
+          "used_percent": null,
+          "remaining_percent": null,
+          "resets_at": null
+        }
+      ],
+      "metadata": {
+        "tool": "claude-monitor v4.0.0",
+        "official_statusline_available": false,
+        "poc_note": "seven_day fields were null in this PoC because no statusLine hook was configured and no claude CLI binary was reachable from the test shell. official_statusline source_type is the intended primary once a collector can run inside a live interactive session."
+      }
+    },
+    {
+      "provider": "antigravity",
+      "display_name": "Antigravity",
+      "collection_mode": "manual",
+      "source": "manual_report",
+      "source_type": "manual",
+      "confidence": "manual",
+      "last_updated": "2026-08-09T03:30:00Z",
+      "status": "unknown",
+      "windows": [],
+      "metadata": {
+        "cdp_poc_result": "inconclusive - DevToolsActivePort port did not accept connections (curl exit 7 / connection refused)",
+        "allowed_status_values": ["abundant", "normal", "low", "exhausted", "unknown"]
+      }
+    },
+    {
+      "provider": "gemini_app",
+      "display_name": "Gemini App / Google AI Pro",
+      "collection_mode": "manual",
+      "source": "manual_report",
+      "source_type": "manual",
+      "confidence": "manual",
+      "last_updated": "2026-08-09T04:10:00Z",
+      "status": "unknown",
+      "windows": [],
+      "metadata": {
+        "official_ui_available": true,
+        "automatic_acquisition_verified": false,
+        "allowed_status_values": ["abundant", "normal", "low", "exhausted", "unknown"],
+        "poc_note": "No gemini/gcloud CLI or OAuth credential store found on the test machine. Not to be confused with Gemini API developer quota."
+      }
+    }
+  ]
+}

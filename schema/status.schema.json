@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/REPLACE_WITH_OWNER/ai-development-manager/schema/status.schema.json",
+  "title": "AI Development Manager - Provider Status v0.1",
+  "description": "Provider-neutral schema for AI quota/usage status. Derived from real PoC evidence (Codex app-server, Claude statusline/JSONL, Antigravity manual, Gemini manual) - does not assume any provider has a fixed set of windows (e.g. five_hour + weekly). Windows are an open list; any window may be absent or null.",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "providers"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "0.1.0"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this status document was assembled (not per-provider last_updated, which lives inside each provider entry)."
+    },
+    "providers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/provider" }
+    }
+  },
+  "$defs": {
+    "provider": {
+      "type": "object",
+      "required": [
+        "provider",
+        "display_name",
+        "collection_mode",
+        "source",
+        "source_type",
+        "confidence",
+        "last_updated",
+        "status",
+        "windows"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "description": "Stable machine-readable id, e.g. \"codex\", \"claude_code\", \"antigravity\", \"gemini_app\"."
+        },
+        "display_name": {
+          "type": "string",
+          "description": "Human-readable label for UI/report use, e.g. \"Codex\", \"Claude Code\", \"Antigravity\", \"Gemini App / Google AI Pro\"."
+        },
+        "collection_mode": {
+          "type": "string",
+          "enum": ["automatic", "manual", "hybrid"],
+          "description": "How this provider's data currently gets into this document. Not a promise that automatic collection is implemented yet - see source_type/confidence for that."
+        },
+        "source": {
+          "type": "string",
+          "description": "Concrete mechanism, e.g. \"official_app_server\" (Codex account/rateLimits/read), \"official_statusline\", \"claude_code_jsonl\", \"manual_report\". Free text, provider-specific vocabulary lives in docs/QUOTA-SOURCES.md."
+        },
+        "source_type": {
+          "type": "string",
+          "enum": ["official", "local_estimate", "manual"],
+          "description": "official = came from the provider's own authoritative API/protocol (e.g. Codex app-server, Claude official statusline rate_limits). local_estimate = derived locally from token/session logs, not authoritative (e.g. claude-monitor JSONL fallback). manual = a human (or an AI acting on a human's report) entered it."
+        },
+        "confidence": {
+          "type": "string",
+          "description": "Free-text confidence label carried from the source tool when available (e.g. claude-monitor's \"local_estimate\"/\"official\"), or \"manual\" / \"unknown\" otherwise. Not constrained to a fixed enum because different upstream tools use different vocabularies."
+        },
+        "last_updated": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When this provider's data was actually captured/reported - NOT when this document was generated. Stale last_updated must not be treated as a live value by any consumer (e.g. ChatGPT dispatch logic)."
+        },
+        "status": {
+          "type": "string",
+          "description": "Coarse human status. For manual providers (Antigravity, Gemini v0.1) this is the primary signal: abundant | normal | low | exhausted | unknown. For automatic providers this may be derived from windows[] instead of set directly.",
+          "examples": ["abundant", "normal", "low", "exhausted", "unknown", "ok"]
+        },
+        "windows": {
+          "type": "array",
+          "description": "Zero or more quota windows. Deliberately an open list, not fixed fields - e.g. Codex (this account) has exactly one 7-day window with no secondary; Claude Code may have five_hour and/or seven_day, either of which may be missing independently. Consumers must not assume any specific window name is present.",
+          "items": { "$ref": "#/$defs/window" }
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Source-specific extra fields that don't fit the generic shape, e.g. Codex's planType/credits/spendControlReached, or Antigravity's raw manual note text. Freeform, not validated by this schema.",
+          "additionalProperties": true
+        }
+      }
+    },
+    "window": {
+      "type": "object",
+      "description": "A single quota window. All fields except name are individually nullable/optional because different providers/accounts return different subsets (e.g. Codex's real response had primary.usedPercent/windowDurationMins/resetsAt but secondary: null entirely).",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Source-provided or source-derived label, e.g. \"primary\", \"secondary\", \"five_hour\", \"seven_day\". Not a controlled vocabulary - do not hardcode expectations around specific names."
+        },
+        "duration_minutes": {
+          "type": ["integer", "null"],
+          "description": "Window length in minutes if known, e.g. 10080 for a 7-day window (real Codex value). Null if unknown."
+        },
+        "used_percent": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "remaining_percent": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "resets_at": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "ISO 8601 timestamp, or null if unknown/not applicable."
+        }
+      }
+    }
+  }
+}
