@@ -6,7 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from manager.sessions import _repository_identity, candidate_title, classify_project, discover_codex_sessions, import_codex_sessions, load_preview_projects, parse_identity_header, preview_codex_sessions, project_preview_snapshot
+from manager.sessions import _repository_identity, candidate_title, classify_project, discover_codex_sessions, extract_repository_urls, import_codex_sessions, load_preview_projects, parse_identity_header, preview_codex_sessions, project_preview_snapshot
 from manager.tasks import validate
 
 
@@ -180,6 +180,25 @@ class SessionTests(unittest.TestCase):
         record = classify_project({"working_directory": None, "conversation_label": None, "_identity_header": {"ai": "Codex", "project": "adm", "task": "phase-2c", "conversation": "Preview"}}, [PROJECT], lambda _cwd: {"git_root": None, "remote": None})
         self.assertEqual("phase-2c", record["task_id"])
         self.assertEqual("Preview", record["conversation_label"])
+
+    def test_exact_session_repository_url_maps_and_normalizes(self):
+        record = classify_project({"working_directory": None, "_repository_urls": ["git@github.com:ne9221/ai-development-manager.git"]}, [PROJECT], lambda _cwd: {"git_root": None, "remote": None})
+        self.assertEqual("ai-development-manager", record["project_id"])
+        self.assertEqual("session_repository_url", record["classification_method"])
+        self.assertEqual([], extract_repository_urls("Please look at the ai-development-manager project"))
+        unresolved = classify_project({"working_directory": None, "classification_status": "needs_review", "_repository_urls": ["https://github.com/example/unrelated"]}, [PROJECT], lambda _cwd: {"git_root": None, "remote": None})
+        self.assertEqual("needs_review", unresolved["classification_status"])
+
+    def test_multi_message_repository_url_is_read_only_signal(self):
+        extra = {"timestamp": "2026-08-10T01:00:04Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Repository: https://github.com/ne9221/ai-development-manager"}]}}
+        temp, root, path = self.session_file(fixture("C:/elsewhere") + json.dumps(extra) + "\n")
+        with temp:
+            before = path.read_bytes()
+            parsed = discover_codex_sessions(root)[0]
+            self.assertEqual(["https://github.com/ne9221/ai-development-manager"], parsed["_repository_urls"])
+            classified = classify_project(parsed, [PROJECT], lambda _cwd: {"git_root": None, "remote": None})
+            self.assertEqual("session_repository_url", classified["classification_method"])
+            self.assertEqual(before, path.read_bytes())
 
 
 if __name__ == "__main__": unittest.main()

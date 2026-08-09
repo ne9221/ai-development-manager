@@ -17,7 +17,7 @@
     "working_directory": {"type": ["string", "null"]},
     "repository": {"type": ["string", "null"]},
     "source_identifier": {"type": "string", "minLength": 1},
-    "classification_method": {"enum": ["git_repository", "working_directory", "project_alias", "explicit_project_header", "conflicting_deterministic_signals", "unclassified"]},
+    "classification_method": {"enum": ["git_repository", "git_root", "git_repository_name", "working_directory", "project_alias", "session_repository_url", "explicit_project_header", "conflicting_deterministic_signals", "unclassified"]},
     "classification_confidence": {"enum": ["high", null]},
     "classification_status": {"enum": ["classified", "needs_review"]},
     "status": {"enum": ["active", "completed", "research", "obsolete", "unknown"]},

@@ -62,11 +62,18 @@ def parse_identity_header(text):
     return values if all(values.get(key) for key in ("ai", "project", "task")) else None
 
 
+def extract_repository_urls(text):
+    if not isinstance(text, str):
+        return []
+    values = re.findall(r"(?:https?://[^\s<>\]\[)]+|git@github\.com:[^\s<>\]\[)]+)", text, re.I)
+    return list(dict.fromkeys(value.rstrip(".,;:") for value in values))
+
+
 def parse_codex_session(path, source_root, titles=None):
     """Return reliable metadata from one Codex JSONL file without changing it."""
     path = Path(path)
     metadata = None
-    timestamps, messages, model, first_prompt, identity_header = [], 0, None, None, None
+    timestamps, messages, model, first_prompt, identity_header, repository_urls = [], 0, None, None, None, []
     for item in _json_lines(path):
         timestamp = _safe_timestamp(item.get("timestamp"))
         if timestamp:
@@ -82,6 +89,8 @@ def parse_codex_session(path, source_root, titles=None):
                 first_prompt = _text_content(payload.get("content"))
             if payload.get("role") == "user" and identity_header is None:
                 identity_header = parse_identity_header(_text_content(payload.get("content")))
+            if payload.get("role") == "user":
+                repository_urls.extend(extract_repository_urls(_text_content(payload.get("content"))))
     if not metadata:
         return None
     session_id = metadata.get("session_id") or metadata.get("id")
@@ -104,6 +113,7 @@ def parse_codex_session(path, source_root, titles=None):
         "message_count": messages, "model": model,
         "first_user_prompt": first_prompt[:SHORT_PROMPT_LIMIT] if first_prompt else None,
         "_identity_header": identity_header,
+        "_repository_urls": list(dict.fromkeys(repository_urls)),
     }
 
 
@@ -165,10 +175,21 @@ def _header_matches(project_ref, projects):
     return [project for project in projects if needle and any(isinstance(value, str) and value.strip().casefold() == needle for value in [project.get("project_id"), project.get("name"), *project.get("aliases", [])])]
 
 
+def _working_directory_matches(value, projects):
+    current = _normal_path(value)
+    return [project for project in projects if current and _normal_path(project.get("working_directory")) and (current == _normal_path(project["working_directory"]) or current.startswith(_normal_path(project["working_directory"]) + os.sep))]
+
+
+def _repo_name(value):
+    normalized = _normal_repo(value)
+    return normalized.rsplit("/", 1)[-1] if normalized else None
+
+
 def classify_project(record, projects, repository_lookup=_repository_identity):
     """Classify only with deterministic repository, cwd, or alias signals."""
     result = dict(record)
     header = result.pop("_identity_header", None)
+    repository_urls = result.pop("_repository_urls", [])
     if header:
         result["task_id"] = header["task"]
         if header.get("conversation"):
@@ -178,12 +199,20 @@ def classify_project(record, projects, repository_lookup=_repository_identity):
     result["repository"] = identity.get("remote") or identity.get("git_root")
     remote = _normal_repo(identity.get("remote"))
     repo_matches = [p for p in projects if remote and _normal_repo(p.get("repo")) == remote]
+    cwd_matches = _working_directory_matches(cwd, projects)
+    root_matches = _working_directory_matches(identity.get("git_root"), projects)
+    root_name = _repo_name(identity.get("git_root"))
+    root_name_matches = [p for p in projects if root_name and _repo_name(p.get("repo")) == root_name]
+    message_repo_matches = []
+    for url in repository_urls:
+        matches = [p for p in projects if _normal_repo(p.get("repo")) == _normal_repo(url)]
+        if len(matches) == 1:
+            message_repo_matches.append(matches[0])
     current = _normal_path(cwd)
-    cwd_matches = [p for p in projects if current and _normal_path(p.get("working_directory")) and (current == _normal_path(p["working_directory"]) or current.startswith(_normal_path(p["working_directory"]) + os.sep))]
     basename = os.path.basename(current) if current else ""
     alias_matches = [p for p in projects if basename and any(_normal_path(alias) == basename for alias in [p.get("project_id"), p.get("name"), *p.get("aliases", [])])]
     header_matches = _header_matches(header.get("project"), projects) if header else []
-    signals = [("git_repository", repo_matches), ("working_directory", cwd_matches), ("project_alias", alias_matches), ("explicit_project_header", header_matches)]
+    signals = [("git_repository", repo_matches), ("git_root", root_matches), ("git_repository_name", root_name_matches), ("working_directory", cwd_matches), ("project_alias", alias_matches), ("session_repository_url", message_repo_matches), ("explicit_project_header", header_matches)]
     resolved = [(method, matches[0]) for method, matches in signals if len(matches) == 1]
     project_ids = {project["project_id"] for _, project in resolved}
     if len(project_ids) > 1:
