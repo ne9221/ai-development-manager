@@ -1,0 +1,77 @@
+import unittest
+from datetime import datetime, timedelta, timezone
+
+from manager.assignment import decide, quota_score
+from manager.quota_reader import summarize
+
+
+NOW = datetime(2026, 8, 9, 4, 0, tzinfo=timezone.utc)
+
+
+def provider(name, remaining=None, updated=NOW, resets=None, windows=1):
+    values = [] if remaining is None else [{
+        "name": f"window_{index}", "remaining_percent": remaining,
+        "used_percent": 100 - remaining, "resets_at": resets,
+    } for index in range(windows)]
+    return {
+        "provider": name, "display_name": name, "collection_mode": "automatic",
+        "source": "official", "source_type": "official", "confidence": "official" if values else "unknown",
+        "last_updated": updated.isoformat(), "status": "ok" if values else "unknown", "windows": values,
+    }
+
+
+def quota(*providers, max_age=60):
+    return summarize({"generated_at": NOW.isoformat(), "providers": list(providers)}, max_age, NOW)
+
+
+class ManagerTest(unittest.TestCase):
+    def task(self, **changes):
+        value = {"task_type": "implementation", "complexity": "medium", "expected_minutes": 20, "needs_repo_edit": True}
+        value.update(changes)
+        return value
+
+    def test_codex_fresh_claude_unknown(self):
+        result = decide(self.task(), quota(provider("codex", 90), provider("claude")), NOW)
+        self.assertEqual(result["recommended_provider"], "codex")
+
+    def test_codex_low_claude_available(self):
+        result = decide(self.task(task_type="architecture", needs_repo_edit=False), quota(provider("codex", 5), provider("claude", 80)), NOW)
+        self.assertEqual(result["recommended_provider"], "claude")
+
+    def test_both_unknown_still_recommends_by_capability(self):
+        result = decide(self.task(), quota(provider("codex"), provider("claude")), NOW)
+        self.assertEqual(result["recommended_provider"], "codex")
+        self.assertIn("unknown", result["warning"])
+
+    def test_stale_quota_is_not_reliable(self):
+        summary = quota(provider("codex", 90, NOW - timedelta(hours=2)))
+        codex = next(item for item in summary["providers"] if item["provider"] == "codex")
+        self.assertTrue(codex["stale"])
+        self.assertFalse(codex["has_reliable_quota"])
+
+    def test_one_and_multiple_windows(self):
+        summary = quota(provider("codex", 50, windows=1), provider("claude", 50, windows=3))
+        self.assertEqual(len(summary["providers"][0]["windows"]), 1)
+        self.assertEqual(len(summary["providers"][1]["windows"]), 3)
+
+    def test_empty_windows(self):
+        summary = quota(provider("codex"))
+        self.assertFalse(summary["providers"][0]["has_reliable_quota"])
+
+    def test_near_reset_is_evidence(self):
+        reset = (NOW + timedelta(minutes=2)).isoformat()
+        near, _ = quota_score(quota(provider("codex", 10, resets=reset))["providers"][0], 20, NOW)
+        far, _ = quota_score(quota(provider("codex", 10, resets=(NOW + timedelta(hours=2)).isoformat()))["providers"][0], 20, NOW)
+        self.assertGreater(near, far)
+
+    def test_twenty_minutes_assigns(self):
+        self.assertIsNotNone(decide(self.task(expected_minutes=20), quota(provider("codex", 50)), NOW)["recommended_provider"])
+
+    def test_over_twenty_minutes_splits(self):
+        result = decide(self.task(expected_minutes=45), quota(provider("codex", 90)), NOW)
+        self.assertIsNone(result["recommended_provider"])
+        self.assertEqual(result["recommended_mode"], "split_task")
+
+
+if __name__ == "__main__":
+    unittest.main()

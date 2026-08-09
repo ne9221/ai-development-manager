@@ -30,3 +30,13 @@ for the exact folder layout to create.
 
 v0.1 - skeleton only. No collectors, no scheduler, no Drive/Sheets sync, no
 task/handoff workflow yet.
+
+## Unified quota reader and assignment
+
+From the repository root, read the Google Drive runtime SSOT or produce a
+task recommendation with:
+
+```powershell
+python -m manager.quota_reader --max-age-minutes 60
+python -m manager.assignment --task-type implementation --expected-minutes 20 --needs-repo-edit
+```
