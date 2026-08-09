@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+from datetime import date
 from pathlib import Path
 
 from collectors.publish_drive import build_service
@@ -332,6 +333,67 @@ def assign_review(store, session, project_id, projects, timestamp):
     return store.put("session_reviews", REVIEW_PROJECT_ID, record["session_id"], record)
 
 
+def _search_text(value):
+    return re.sub(r"\s+", " ", value or "").casefold().strip()
+
+
+def apply_manual_reviews(records, review_records=()):
+    reviews = {record["session_id"]: record for record in review_records}
+    result = []
+    for record in records:
+        item = dict(record)
+        review = reviews.get(item["session_id"])
+        if review:
+            item.update(project_id=review["project_id"], classification_method=review["classification_method"], classification_status=review["classification_status"])
+        result.append(item)
+    return result
+
+
+def search_sessions(records, query=None, project=None, task=None, status=None, since=None, review_records=()):
+    """Deterministic, in-memory metadata and text search; no index is persisted."""
+    since_date = None
+    if since:
+        try:
+            since_date = date.fromisoformat(since)
+        except ValueError as exc:
+            raise TaskError("--since must use YYYY-MM-DD") from exc
+    query = _search_text(query)
+    project = _search_text(project)
+    task = _search_text(task)
+    status = _search_text(status)
+    results = []
+    for record in apply_manual_reviews(records, review_records):
+        if project and _search_text(record.get("project_id")) != project:
+            continue
+        if task and task not in _search_text(record.get("task_id")):
+            continue
+        if status and _search_text(record.get("classification_status")) != status:
+            continue
+        record_date = (record.get("updated_at") or record.get("started_at") or "")[:10]
+        if since_date and (not record_date or date.fromisoformat(record_date) < since_date):
+            continue
+        fields = ("session_id", "title", "first_user_prompt", "project_id", "task_id", "conversation_label", "provider", "working_directory", "repository", "classification_status", "started_at", "updated_at")
+        if query and query not in _search_text(" ".join(str(record.get(field) or "") for field in fields)):
+            continue
+        results.append({
+            "session_id": record["session_id"], "date": record.get("updated_at") or record.get("started_at"),
+            "project_id": record.get("project_id"), "task_id": record.get("task_id"),
+            "title": record.get("title"), "prompt_snippet": prompt_snippet(record),
+            "classification_status": record.get("classification_status"),
+            "source_identifier": record.get("source_identifier"),
+        })
+    return results
+
+
+def load_review_records_file(path):
+    records = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(records, list):
+        raise TaskError("review records file must be a JSON array")
+    for record in records:
+        validate("session_review", record)
+    return records
+
+
 def project_preview_snapshot(projects):
     """Create the smallest non-secret project input needed by session preview."""
     document = {"snapshot_type": "project_preview", "version": PROJECT_SNAPSHOT_VERSION, "projects": [{
@@ -382,10 +444,21 @@ def main():
     review_assign.add_argument("session_id"); review_assign.add_argument("project_id")
     review_assign.add_argument("--sessions-root", type=Path, default=None)
     review_assign.add_argument("--projects-file", type=Path, default=None)
+    search = sub.add_parser("search", help="Read-only deterministic Codex session search")
+    search.add_argument("--query"); search.add_argument("--project"); search.add_argument("--task")
+    search.add_argument("--status"); search.add_argument("--since")
+    search.add_argument("--sessions-root", type=Path, default=None)
+    search.add_argument("--projects-file", type=Path, default=None)
+    search.add_argument("--reviews-file", type=Path, default=None, help="Temporary exported manual review records")
     args = parser.parse_args()
     try:
         if args.command == "export-project-preview":
             print(json.dumps(project_preview_snapshot(read_projects(DriveRecords(build_service()))), indent=2))
+        elif args.command == "search":
+            projects = load_preview_projects(args.projects_file) if args.projects_file else []
+            records = [classify_project(record, projects) for record in discover_codex_sessions(args.sessions_root)]
+            reviews = load_review_records_file(args.reviews_file) if args.reviews_file else []
+            print(json.dumps(search_sessions(records, args.query, args.project, args.task, args.status, args.since, reviews), indent=2))
         elif args.command in ("review-list", "review-assign"):
             store = DriveRecords(build_service())
             projects = load_preview_projects(args.projects_file) if args.projects_file else read_projects(store)

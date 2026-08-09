@@ -6,7 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from manager.sessions import REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_codex_sessions, extract_repository_urls, import_codex_sessions, load_preview_projects, parse_identity_header, preview_codex_sessions, project_preview_snapshot, review_queue
+from manager.sessions import REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_codex_sessions, extract_repository_urls, import_codex_sessions, load_preview_projects, parse_identity_header, preview_codex_sessions, project_preview_snapshot, review_queue, search_sessions
 from manager.tasks import validate
 
 
@@ -31,6 +31,12 @@ def fixture(cwd="C:/work/ai-development-manager"):
         {"timestamp": "2026-08-10T01:00:03Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Working"}]}},
     ]
     return "\n".join(json.dumps(line) for line in lines) + "\n"
+
+
+def search_record(session_id="search-1", **changes):
+    record = {"session_id": session_id, "provider": "codex", "project_id": "ai-development-manager", "task_id": "codex-session-organizer", "conversation_label": "Search", "title": "Quota session", "first_user_prompt": "Find quota data for 中文專案", "working_directory": "C:/work/ai-development-manager", "repository": "https://github.com/ne9221/ai-development-manager", "classification_status": "needs_review", "classification_method": "unclassified", "started_at": "2026-08-01T00:00:00Z", "updated_at": "2026-08-10T00:00:00Z", "source_identifier": "sessions/search-1.jsonl"}
+    record.update(changes)
+    return record
 
 
 class SessionTests(unittest.TestCase):
@@ -228,6 +234,26 @@ class SessionTests(unittest.TestCase):
         changed = assign_review(store, session, "other-project", [PROJECT, other], "2026-08-10T03:00:00Z")
         self.assertEqual("other-project", changed["project_id"])
         self.assertEqual({"previous_project_id": "ai-development-manager", "new_project_id": "other-project", "assigned_at": "2026-08-10T03:00:00Z"}, changed["assignment_history"][-1])
+
+    def test_search_filters_text_metadata_dates_and_manual_mapping(self):
+        first = search_record()
+        second = search_record("search-2", project_id=None, task_id="other-task", title="Other", first_user_prompt="Different", updated_at="2026-07-01T00:00:00Z")
+        records = [first, second]
+        self.assertEqual(["search-1"], [item["session_id"] for item in search_sessions(records, query="quota")])
+        self.assertEqual(["search-1"], [item["session_id"] for item in search_sessions(records, query="中文")])
+        self.assertEqual(["search-1"], [item["session_id"] for item in search_sessions(records, project="AI-DEVELOPMENT-MANAGER", task="session-organizer", status="needs_review", since="2026-08-01")])
+        self.assertEqual([], search_sessions(records, query="no-result"))
+        review = {"session_id": "search-2", "provider": "codex", "project_id": "ai-development-manager", "classification_method": "manual_review", "classification_status": "classified", "source_identifier": "sessions/search-2.jsonl", "assigned_at": "2026-08-10T00:00:00Z", "assignment_history": [{"previous_project_id": None, "new_project_id": "ai-development-manager", "assigned_at": "2026-08-10T00:00:00Z"}]}
+        mapped = search_sessions(records, project="ai-development-manager", review_records=[review])
+        self.assertEqual({"search-1", "search-2"}, {item["session_id"] for item in mapped})
+
+    def test_search_is_read_only_for_source_fixture(self):
+        temp, root, path = self.session_file()
+        with temp:
+            before = path.read_bytes()
+            record = classify_project(discover_codex_sessions(root)[0], [PROJECT], lambda _cwd: {"git_root": None, "remote": None})
+            search_sessions([record], query="registry")
+            self.assertEqual(before, path.read_bytes())
 
 
 if __name__ == "__main__": unittest.main()
