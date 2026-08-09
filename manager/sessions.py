@@ -173,10 +173,13 @@ def all_projects(store):
     return projects
 
 
-def import_codex_sessions(store, sessions_root=None, projects=None, repository_lookup=_repository_identity):
+def import_codex_sessions(store, sessions_root=None, projects=None, repository_lookup=_repository_identity, session_ids=None):
     projects = all_projects(store) if projects is None else projects
+    requested = set(session_ids or [])
     records = []
     for record in discover_codex_sessions(sessions_root):
+        if requested and record["session_id"] not in requested:
+            continue
         record = classify_project(record, projects, repository_lookup)
         validate("session", record)
         store.put("sessions", record["project_id"] or UNCLASSIFIED_PROJECT_ID, record["session_id"], record)
@@ -189,9 +192,10 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     importer = sub.add_parser("import-codex", help="Read Codex JSONL sessions and write metadata to Drive")
     importer.add_argument("--sessions-root", type=Path, default=None)
+    importer.add_argument("--session-id", action="append", default=[], help="Import only this Codex session ID (repeatable)")
     args = parser.parse_args()
     try:
-        records = import_codex_sessions(DriveRecords(build_service()), args.sessions_root)
+        records = import_codex_sessions(DriveRecords(build_service()), args.sessions_root, session_ids=args.session_id)
         print(json.dumps({"imported": len(records), "provider": "codex"}, indent=2))
         return 0
     except (TaskError, OSError) as exc:

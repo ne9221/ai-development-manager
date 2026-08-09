@@ -82,5 +82,13 @@ class SessionTests(unittest.TestCase):
             self.assertEqual("codex", record["provider"])
             self.assertEqual("git_repository", record["classification_method"])
 
+    def test_import_can_limit_to_requested_session(self):
+        temp, root, _ = self.session_file()
+        with temp:
+            store = MemoryStore()
+            records = import_codex_sessions(store, root, session_ids=["different-session"])
+            self.assertEqual([], records)
+            self.assertEqual({}, store.records)
+
 
 if __name__ == "__main__": unittest.main()
