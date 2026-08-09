@@ -32,6 +32,24 @@ python collectors/publish_drive.py
 python -m unittest collectors/test_codex.py collectors/test_publish_drive.py
 ```
 
+## Claude Code
+
+`claude.py` is a statusline receiver: Claude Code pipes its official JSON to
+stdin after a session response. The receiver normalizes whichever of
+`rate_limits.five_hour` and `rate_limits.seven_day` are actually present,
+validates the combined runtime document, and preserves the existing Codex
+provider. Missing official limits are recorded as unknown; JSONL estimates are
+never substituted.
+
+Example `statusLine` command (use absolute paths in `~/.claude/settings.json`):
+
+```json
+{"type":"command","command":"python C:/path/to/repo/collectors/claude.py"}
+```
+
+The current machine has no reachable Claude Code CLI, so no global statusline
+setting is installed by this repository.
+
 ## Planned providers
 
 | Provider | Planned primary source | Automatic? | PoC evidence |

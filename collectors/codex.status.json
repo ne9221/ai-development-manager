@@ -1,6 +1,6 @@
 {
   "schema_version": "0.1.0",
-  "generated_at": "2026-08-09T03:25:28Z",
+  "generated_at": "2026-08-09T03:56:18Z",
   "providers": [
     {
       "provider": "codex",
@@ -32,6 +32,24 @@
         "raw_resets_at": {
           "primary": 1786846646
         }
+      }
+    },
+    {
+      "provider": "claude",
+      "display_name": "Claude Code",
+      "collection_mode": "automatic",
+      "source": "claude_code_statusline_rate_limits",
+      "source_type": "official",
+      "confidence": "unknown",
+      "last_updated": "2026-08-09T03:56:18Z",
+      "status": "unknown",
+      "windows": [],
+      "metadata": {
+        "official_rate_limits_available": false,
+        "missing_windows": [
+          "five_hour",
+          "seven_day"
+        ]
       }
     }
   ]
