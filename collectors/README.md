@@ -1,8 +1,23 @@
-# Collectors (planned, not implemented in v0.1)
+# Collectors
 
-No collector code exists yet. This just records, per provider, what the
-Phase-0 PoCs found so the next implementation round doesn't have to
-re-derive it.
+## Codex
+
+`codex.py` starts the official `codex app-server` over stdio, performs the
+required initialize handshake, reads `account/rateLimits/read`, normalizes all
+non-null quota windows, and validates the result against
+`../schema/status.schema.json`.
+
+```powershell
+python -m pip install -r collectors/requirements.txt
+python collectors/codex.py --show-raw
+python -m unittest collectors/test_codex.py
+```
+
+The default output is `collectors/codex.status.json`. Failures exit non-zero
+without writing fabricated quota values. Set `CODEX_BIN` only when `codex` is
+not available on `PATH`.
+
+## Planned providers
 
 | Provider | Planned primary source | Automatic? | PoC evidence |
 |---|---|---|---|

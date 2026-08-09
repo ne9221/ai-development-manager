@@ -1,0 +1,38 @@
+{
+  "schema_version": "0.1.0",
+  "generated_at": "2026-08-09T03:03:10Z",
+  "providers": [
+    {
+      "provider": "codex",
+      "display_name": "Codex",
+      "collection_mode": "automatic",
+      "source": "codex_app_server",
+      "source_type": "official",
+      "confidence": "official",
+      "last_updated": "2026-08-09T03:03:10Z",
+      "status": "ok",
+      "windows": [
+        {
+          "name": "primary",
+          "duration_minutes": 10080,
+          "used_percent": 5,
+          "remaining_percent": 95,
+          "resets_at": "2026-08-16T02:17:26Z"
+        }
+      ],
+      "metadata": {
+        "method": "account/rateLimits/read",
+        "limit_id": "codex",
+        "plan_type": "plus",
+        "credits": {
+          "hasCredits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "raw_resets_at": {
+          "primary": 1786846646
+        }
+      }
+    }
+  ]
+}
