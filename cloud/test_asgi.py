@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from cloud.app import create_app
-from cloud.asgi import MCPBearerAuth, create_asgi
+from cloud.asgi import MCPBearerAuth, create_asgi, server
 
 
 async def request(app, authorization=None, path="/mcp/", method="POST", body=b""):
@@ -24,6 +24,8 @@ async def request(app, authorization=None, path="/mcp/", method="POST", body=b""
 
 class ASGIAuthTests(unittest.TestCase):
     def test_mcp_authentication_boundary(self):
+        self.assertTrue(server.session_manager.security_settings.enable_dns_rebinding_protection)
+        self.assertEqual(["localhost"], server.session_manager.security_settings.allowed_hosts)
         async def downstream(scope, receive, send):
             await send({"type": "http.response.start", "status": 204, "headers": []})
             await send({"type": "http.response.body", "body": b""})

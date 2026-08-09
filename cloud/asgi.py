@@ -8,6 +8,7 @@ from starlette.applications import Starlette
 from starlette.middleware.wsgi import WSGIMiddleware
 from starlette.responses import JSONResponse
 from starlette.routing import Mount
+from mcp.server.transport_security import TransportSecuritySettings
 
 from cloud.app import app as rest_app
 from manager.mcp_adapter import server
@@ -29,7 +30,15 @@ class MCPBearerAuth:
         await self.app(scope, receive, send)
 
 
-mcp_app = server.streamable_http_app(streamable_http_path="/", json_response=True, stateless_http=True)
+mcp_host = os.environ.get("MCP_ALLOWED_HOST", "localhost")
+mcp_app = server.streamable_http_app(
+    streamable_http_path="/", json_response=True, stateless_http=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[mcp_host],
+        allowed_origins=[f"https://{mcp_host}"],
+    ),
+)
 
 
 @asynccontextmanager
