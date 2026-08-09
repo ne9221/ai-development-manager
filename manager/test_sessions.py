@@ -1,10 +1,12 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
-from manager.sessions import candidate_title, classify_project, discover_codex_sessions, import_codex_sessions, preview_codex_sessions
+from manager.sessions import _repository_identity, candidate_title, classify_project, discover_codex_sessions, import_codex_sessions, load_preview_projects, preview_codex_sessions, project_preview_snapshot
 from manager.tasks import validate
 
 
@@ -122,6 +124,34 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(0, preview["classified_sessions"])
             self.assertEqual(1, preview["needs_review_sessions"])
             self.assertEqual(1, len(preview["sessions"]))
+
+    def test_project_snapshot_contract_allows_missing_optional_signals(self):
+        no_repo = deepcopy(PROJECT); no_repo.pop("repo")
+        no_cwd = deepcopy(PROJECT); no_cwd.pop("working_directory")
+        snapshot = project_preview_snapshot([no_repo, no_cwd])
+        self.assertEqual("project_preview", snapshot["snapshot_type"])
+        self.assertIsNone(snapshot["projects"][0]["repo"])
+        self.assertIsNone(snapshot["projects"][1]["working_directory"])
+
+    def test_malformed_project_snapshot_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "projects.json"; path.write_text('{"projects": []}', encoding="utf-8")
+            with self.assertRaises(Exception): load_preview_projects(path)
+
+    def test_alias_and_ambiguous_project_signals_are_conservative(self):
+        record = {"working_directory": "C:/work/adm"}
+        alias_project = deepcopy(PROJECT); alias_project["working_directory"] = None
+        classified = classify_project(record, [alias_project], lambda _cwd: {"git_root": None, "remote": None})
+        self.assertEqual("project_alias", classified["classification_method"])
+        duplicate = deepcopy(alias_project); duplicate["project_id"] = "other-project"; duplicate["aliases"] = ["adm"]
+        ambiguous = classify_project(record, [alias_project, duplicate], lambda _cwd: {"git_root": None, "remote": None})
+        self.assertIsNone(ambiguous.get("project_id"))
+
+    @patch("manager.sessions.Path.is_dir", return_value=True)
+    @patch("manager.sessions.subprocess.run")
+    def test_repository_probe_tolerates_missing_decoded_stdout(self, run, _is_dir):
+        run.side_effect = [subprocess.CompletedProcess([], 0, stdout=None), subprocess.CompletedProcess([], 0, stdout=None)]
+        self.assertEqual({"git_root": None, "remote": None}, _repository_identity("C:/work/project"))
 
 
 if __name__ == "__main__": unittest.main()

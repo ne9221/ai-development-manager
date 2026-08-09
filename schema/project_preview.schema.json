@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Project Preview Snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["snapshot_type", "version", "projects"],
+  "properties": {
+    "snapshot_type": {"const": "project_preview"},
+    "version": {"const": 1},
+    "projects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["project_id", "name", "aliases", "repo", "working_directory"],
+        "properties": {
+          "project_id": {"type": "string", "minLength": 1},
+          "name": {"type": "string", "minLength": 1},
+          "aliases": {"type": "array", "items": {"type": "string"}},
+          "repo": {"type": ["string", "null"]},
+          "working_directory": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}

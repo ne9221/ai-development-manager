@@ -72,6 +72,23 @@ python -m manager.tasks task-complete example-project example-task --summary "Ac
 Task creation records the current assignment recommendation and quota evidence,
 but never starts an AI provider.
 
+## Codex session preview
+
+Session preview is read-only. It does not alter Codex session files, create a
+local registry, or write `SESSIONS` in Drive. When Drive credentials are
+available, export the minimal project classification input to stdout and keep
+any redirected file temporary:
+
+```powershell
+python -m manager.sessions export-project-preview > project-preview.json
+python -m manager.sessions preview-codex --projects-file project-preview.json
+python -m manager.sessions preview-codex --projects-file project-preview.json --needs-review
+```
+
+The snapshot contains only `project_id`, `name`, `aliases`, `repo`, and
+`working_directory`; it never contains credentials, task data, handoffs, or
+session transcripts.
+
 ## Execution metrics and estimates
 
 Execution records capture elapsed time and quota snapshots before and after a

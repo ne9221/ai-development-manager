@@ -9,12 +9,14 @@ import subprocess
 from pathlib import Path
 
 from collectors.publish_drive import build_service
+from manager.runtime_bridge import all_projects as read_projects
 from manager.tasks import DriveRecords, ROOT_FOLDER_ID, ROOT_FOLDERS, TaskError, validate
 
 
 SHORT_PROMPT_LIMIT = 1000
 TITLE_LIMIT = 72
 UNCLASSIFIED_PROJECT_ID = "_unclassified"
+PROJECT_SNAPSHOT_VERSION = 1
 
 
 def _json_lines(path):
@@ -123,8 +125,10 @@ def _repository_identity(cwd):
     if not cwd or not Path(cwd).is_dir():
         return {"git_root": None, "remote": None}
     try:
-        root = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], text=True, capture_output=True, check=True).stdout.strip()
-        remote = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], text=True, capture_output=True).stdout.strip() or None
+        root_result = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], text=True, encoding="utf-8", errors="replace", capture_output=True, check=True)
+        remote_result = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], text=True, encoding="utf-8", errors="replace", capture_output=True)
+        root = (root_result.stdout or "").strip()
+        remote = (remote_result.stdout or "").strip() or None
         return {"git_root": root or None, "remote": remote}
     except (OSError, subprocess.SubprocessError):
         return {"git_root": None, "remote": None}
@@ -210,28 +214,25 @@ def preview_codex_sessions(sessions_root=None, projects=None, needs_review=False
     }
 
 
-def load_preview_projects(path):
-    document = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(document, list) or not all(isinstance(item, dict) for item in document):
-        raise TaskError("preview projects file must be a JSON array of project records")
+def project_preview_snapshot(projects):
+    """Create the smallest non-secret project input needed by session preview."""
+    document = {"snapshot_type": "project_preview", "version": PROJECT_SNAPSHOT_VERSION, "projects": [{
+        "project_id": project.get("project_id"), "name": project.get("name"),
+        "aliases": project.get("aliases", []), "repo": project.get("repo"),
+        "working_directory": project.get("working_directory"),
+    } for project in projects]}
+    validate("project_preview", document)
     return document
 
 
-def all_projects(store):
-    if hasattr(store, "list_projects"):
-        return store.list_projects()
-    root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"], create=False)
-    projects = []
-    for item in store.children(root):
-        if item.get("mimeType") == "application/vnd.google-apps.folder":
-            project = store.get("projects", item["name"], item["name"])
-            validate("project", project)
-            projects.append(project)
-    return projects
+def load_preview_projects(path):
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
+    validate("project_preview", document)
+    return document["projects"]
 
 
 def import_codex_sessions(store, sessions_root=None, projects=None, repository_lookup=_repository_identity, session_ids=None):
-    projects = all_projects(store) if projects is None else projects
+    projects = read_projects(store) if projects is None else projects
     requested = set(session_ids or [])
     records = []
     for record in discover_codex_sessions(sessions_root):
@@ -254,9 +255,12 @@ def main():
     preview.add_argument("--sessions-root", type=Path, default=None)
     preview.add_argument("--projects-file", type=Path, default=None, help="Temporary JSON project input; never persisted")
     preview.add_argument("--needs-review", action="store_true", help="Show only sessions requiring review")
+    sub.add_parser("export-project-preview", help="Read Drive projects and emit a temporary preview snapshot to stdout")
     args = parser.parse_args()
     try:
-        if args.command == "preview-codex":
+        if args.command == "export-project-preview":
+            print(json.dumps(project_preview_snapshot(read_projects(DriveRecords(build_service()))), indent=2))
+        elif args.command == "preview-codex":
             projects = load_preview_projects(args.projects_file) if args.projects_file else []
             print(json.dumps(preview_codex_sessions(args.sessions_root, projects, args.needs_review), indent=2))
         else:
