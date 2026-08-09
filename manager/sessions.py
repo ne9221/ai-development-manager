@@ -45,11 +45,28 @@ def _safe_timestamp(value):
     return value if isinstance(value, str) and value else None
 
 
+def parse_identity_header(text):
+    """Parse the explicit AI work identity block, never ordinary prose."""
+    if not isinstance(text, str):
+        return None
+    values = {}
+    names = {"ai": "ai", "project": "project", "task": "task", "conversation": "conversation", "run/session": "run_session"}
+    for line in text.splitlines():
+        match = re.fullmatch(r"(AI|Project|Task|Conversation|Run/Session):[ \t]*(.+?)[ \t]*", line, re.I)
+        if not match:
+            continue
+        key, value = names[match.group(1).lower()], match.group(2)
+        if key in values and values[key] != value:
+            return None
+        values[key] = value
+    return values if all(values.get(key) for key in ("ai", "project", "task")) else None
+
+
 def parse_codex_session(path, source_root, titles=None):
     """Return reliable metadata from one Codex JSONL file without changing it."""
     path = Path(path)
     metadata = None
-    timestamps, messages, model, first_prompt = [], 0, None, None
+    timestamps, messages, model, first_prompt, identity_header = [], 0, None, None, None
     for item in _json_lines(path):
         timestamp = _safe_timestamp(item.get("timestamp"))
         if timestamp:
@@ -63,6 +80,8 @@ def parse_codex_session(path, source_root, titles=None):
             messages += 1
             if payload.get("role") == "user" and first_prompt is None:
                 first_prompt = _text_content(payload.get("content"))
+            if payload.get("role") == "user" and identity_header is None:
+                identity_header = parse_identity_header(_text_content(payload.get("content")))
     if not metadata:
         return None
     session_id = metadata.get("session_id") or metadata.get("id")
@@ -84,6 +103,7 @@ def parse_codex_session(path, source_root, titles=None):
         "classification_status": "needs_review", "status": "unknown",
         "message_count": messages, "model": model,
         "first_user_prompt": first_prompt[:SHORT_PROMPT_LIMIT] if first_prompt else None,
+        "_identity_header": identity_header,
     }
 
 
@@ -140,29 +160,37 @@ def _normal_repo(value):
     return value.strip().lower().removesuffix(".git").replace("git@github.com:", "https://github.com/").rstrip("/")
 
 
+def _header_matches(project_ref, projects):
+    needle = project_ref.strip().casefold() if isinstance(project_ref, str) else ""
+    return [project for project in projects if needle and any(isinstance(value, str) and value.strip().casefold() == needle for value in [project.get("project_id"), project.get("name"), *project.get("aliases", [])])]
+
+
 def classify_project(record, projects, repository_lookup=_repository_identity):
     """Classify only with deterministic repository, cwd, or alias signals."""
     result = dict(record)
+    header = result.pop("_identity_header", None)
+    if header:
+        result["task_id"] = header["task"]
+        if header.get("conversation"):
+            result["conversation_label"] = header["conversation"][:500]
     cwd = result.get("working_directory")
     identity = repository_lookup(cwd)
     result["repository"] = identity.get("remote") or identity.get("git_root")
     remote = _normal_repo(identity.get("remote"))
     repo_matches = [p for p in projects if remote and _normal_repo(p.get("repo")) == remote]
-    if len(repo_matches) == 1:
-        project = repo_matches[0]
-        result.update(project_id=project["project_id"], classification_method="git_repository", classification_confidence="high", classification_status="classified")
-        return result
     current = _normal_path(cwd)
-    cwd_matches = [p for p in projects if _normal_path(p.get("working_directory")) and (current == _normal_path(p["working_directory"]) or current.startswith(_normal_path(p["working_directory"]) + os.sep))]
-    if len(cwd_matches) == 1:
-        project = cwd_matches[0]
-        result.update(project_id=project["project_id"], classification_method="working_directory", classification_confidence="high", classification_status="classified")
-        return result
+    cwd_matches = [p for p in projects if current and _normal_path(p.get("working_directory")) and (current == _normal_path(p["working_directory"]) or current.startswith(_normal_path(p["working_directory"]) + os.sep))]
     basename = os.path.basename(current) if current else ""
     alias_matches = [p for p in projects if basename and any(_normal_path(alias) == basename for alias in [p.get("project_id"), p.get("name"), *p.get("aliases", [])])]
-    if len(alias_matches) == 1:
-        project = alias_matches[0]
-        result.update(project_id=project["project_id"], classification_method="project_alias", classification_confidence="high", classification_status="classified")
+    header_matches = _header_matches(header.get("project"), projects) if header else []
+    signals = [("git_repository", repo_matches), ("working_directory", cwd_matches), ("project_alias", alias_matches), ("explicit_project_header", header_matches)]
+    resolved = [(method, matches[0]) for method, matches in signals if len(matches) == 1]
+    project_ids = {project["project_id"] for _, project in resolved}
+    if len(project_ids) > 1:
+        result.update(project_id=None, classification_method="conflicting_deterministic_signals", classification_confidence=None, classification_status="needs_review")
+    elif resolved:
+        method, project = next(((method, project) for method, project in resolved if method == "explicit_project_header"), resolved[0])
+        result.update(project_id=project["project_id"], classification_method=method, classification_confidence="high", classification_status="classified")
     return result
 
 

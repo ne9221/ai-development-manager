@@ -6,7 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from manager.sessions import _repository_identity, candidate_title, classify_project, discover_codex_sessions, import_codex_sessions, load_preview_projects, preview_codex_sessions, project_preview_snapshot
+from manager.sessions import _repository_identity, candidate_title, classify_project, discover_codex_sessions, import_codex_sessions, load_preview_projects, parse_identity_header, preview_codex_sessions, project_preview_snapshot
 from manager.tasks import validate
 
 
@@ -152,6 +152,34 @@ class SessionTests(unittest.TestCase):
     def test_repository_probe_tolerates_missing_decoded_stdout(self, run, _is_dir):
         run.side_effect = [subprocess.CompletedProcess([], 0, stdout=None), subprocess.CompletedProcess([], 0, stdout=None)]
         self.assertEqual({"git_root": None, "remote": None}, _repository_identity("C:/work/project"))
+
+    def test_strict_identity_header_matches_id_name_and_alias_only(self):
+        header = parse_identity_header("AI: Codex\nProject: ai-development-manager\nTask: phase-2c\nConversation: Preview\nRun/Session: run-1")
+        self.assertEqual("ai-development-manager", header["project"])
+        self.assertEqual("phase-2c", header["task"])
+        self.assertEqual("Preview", header["conversation"])
+        self.assertIsNone(parse_identity_header("Please look at the ai-development-manager project"))
+        self.assertIsNone(parse_identity_header("Project: ai-development-manager\nTask: phase-2c"))
+        for reference in ("AI Development Manager", "adm"):
+            record = classify_project({"working_directory": None, "_identity_header": {"ai": "Codex", "project": reference, "task": "t"}}, [PROJECT], lambda _cwd: {"git_root": None, "remote": None})
+            self.assertEqual("ai-development-manager", record["project_id"])
+            self.assertEqual("explicit_project_header", record["classification_method"])
+
+    def test_identity_header_agrees_or_conflicts_with_repo_and_cwd(self):
+        header = {"ai": "Codex", "project": "ai-development-manager", "task": "phase-2c"}
+        same = classify_project({"working_directory": "C:/work/a", "_identity_header": header}, [PROJECT], lambda _cwd: {"git_root": "C:/work/a", "remote": "https://github.com/ne9221/ai-development-manager.git"})
+        self.assertEqual("ai-development-manager", same["project_id"])
+        self.assertEqual("explicit_project_header", same["classification_method"])
+        other = deepcopy(PROJECT); other.update(project_id="other", name="Other", aliases=[], repo="https://github.com/example/other", working_directory="C:/work/other")
+        repo_conflict = classify_project({"working_directory": "C:/work/other", "_identity_header": header}, [PROJECT, other], lambda _cwd: {"git_root": "C:/work/other", "remote": "https://github.com/example/other.git"})
+        self.assertEqual("conflicting_deterministic_signals", repo_conflict["classification_method"])
+        cwd_conflict = classify_project({"working_directory": "C:/work/other", "_identity_header": header}, [PROJECT, other], lambda _cwd: {"git_root": None, "remote": None})
+        self.assertEqual("needs_review", cwd_conflict["classification_status"])
+
+    def test_identity_header_maps_task_and_conversation(self):
+        record = classify_project({"working_directory": None, "conversation_label": None, "_identity_header": {"ai": "Codex", "project": "adm", "task": "phase-2c", "conversation": "Preview"}}, [PROJECT], lambda _cwd: {"git_root": None, "remote": None})
+        self.assertEqual("phase-2c", record["task_id"])
+        self.assertEqual("Preview", record["conversation_label"])
 
 
 if __name__ == "__main__": unittest.main()
