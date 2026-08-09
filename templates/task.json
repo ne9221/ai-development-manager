@@ -1,0 +1,18 @@
+{
+  "task_id": "example-task",
+  "project_id": "example-project",
+  "title": "Example task",
+  "task_type": "implementation",
+  "complexity": "medium",
+  "expected_minutes": 20,
+  "needs_repo_edit": true,
+  "needs_research": false,
+  "needs_browser": false,
+  "parallelizable": false,
+  "scope": [],
+  "constraints": [],
+  "acceptance_criteria": [],
+  "source_context": {},
+  "current_progress": "Not started",
+  "next_action": "Confirm assignment and begin"
+}

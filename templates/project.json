@@ -1,0 +1,11 @@
+{
+  "project_id": "example-project",
+  "name": "Example Project",
+  "repo": "https://github.com/example/example-project",
+  "default_branch": "main",
+  "runtime_ssot": "Google Drive/AI Development Manager",
+  "project_rules": [],
+  "active_tasks": [],
+  "current_phase": "",
+  "important_constraints": []
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Handoff",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["handoff_id", "task_id", "project_id", "created_at", "from_provider", "to_provider", "from_session", "reason", "completed_work", "current_state", "files_changed", "commits", "tests", "known_issues", "do_not_touch", "next_action", "acceptance_criteria", "minimal_context"],
+  "properties": {
+    "handoff_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "project_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "from_provider": {"type": ["string", "null"]},
+    "to_provider": {"type": ["string", "null"]},
+    "from_session": {"type": ["string", "null"]},
+    "reason": {"type": "string", "minLength": 1},
+    "completed_work": {"type": "array", "items": {"type": "string"}},
+    "current_state": {"type": "string"},
+    "files_changed": {"type": "array", "items": {"type": "string"}},
+    "commits": {"type": "array", "items": {"type": "string"}},
+    "tests": {"type": "array", "items": {"type": "string"}},
+    "known_issues": {"type": "array", "items": {"type": "string"}},
+    "do_not_touch": {"type": "array", "items": {"type": "string"}},
+    "next_action": {"type": "string"},
+    "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+    "minimal_context": {"type": "string", "maxLength": 4000}
+  }
+}

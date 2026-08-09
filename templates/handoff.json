@@ -1,0 +1,19 @@
+{
+  "handoff_id": "example-task-session-b",
+  "task_id": "example-task",
+  "project_id": "example-project",
+  "from_provider": "codex",
+  "to_provider": "claude",
+  "from_session": "session-a",
+  "reason": "provider switch",
+  "completed_work": [],
+  "current_state": "",
+  "files_changed": [],
+  "commits": [],
+  "tests": [],
+  "known_issues": [],
+  "do_not_touch": [],
+  "next_action": "",
+  "acceptance_criteria": [],
+  "minimal_context": "Only the incremental context needed by the next session."
+}

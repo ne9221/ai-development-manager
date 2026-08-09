@@ -53,3 +53,21 @@ under the repo-external `AI_MANAGER_HOME` directory.
 Windows logon and every 15 minutes; overlapping executions are ignored by Task
 Scheduler and rejected by the runtime file lock. The task does not require an
 open terminal or an active Codex/Claude conversation window.
+
+## Tasks and handoffs
+
+Drive-backed runtime records use `schema/project.schema.json`,
+`schema/task.schema.json`, and `schema/handoff.schema.json`:
+
+```powershell
+python -m manager.tasks project-put templates/project.json
+python -m manager.tasks task-create templates/task.json
+python -m manager.tasks task-read example-project example-task
+python -m manager.tasks task-update example-project example-task --status in_progress --progress "Started"
+python -m manager.tasks handoff-create templates/handoff.json
+python -m manager.tasks handoff-latest example-project example-task
+python -m manager.tasks task-complete example-project example-task --summary "Acceptance criteria passed"
+```
+
+Task creation records the current assignment recommendation and quota evidence,
+but never starts an AI provider.

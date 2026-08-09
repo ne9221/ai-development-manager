@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Project",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["project_id", "name", "repo", "default_branch", "runtime_ssot", "project_rules", "active_tasks", "current_phase", "important_constraints"],
+  "properties": {
+    "project_id": {"type": "string", "minLength": 1},
+    "name": {"type": "string", "minLength": 1},
+    "repo": {"type": "string", "format": "uri"},
+    "default_branch": {"type": "string", "minLength": 1},
+    "runtime_ssot": {"type": "string", "minLength": 1},
+    "project_rules": {"type": "array", "items": {"type": "string"}},
+    "active_tasks": {"type": "array", "items": {"type": "string"}},
+    "current_phase": {"type": "string"},
+    "important_constraints": {"type": "array", "items": {"type": "string"}}
+  }
+}
