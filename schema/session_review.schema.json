@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Session Review Assignment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["session_id", "provider", "project_id", "classification_method", "classification_status", "source_identifier", "assigned_at", "assignment_history"],
+  "properties": {
+    "session_id": {"type": "string", "minLength": 1},
+    "provider": {"const": "codex"},
+    "project_id": {"type": "string", "minLength": 1},
+    "classification_method": {"const": "manual_review"},
+    "classification_status": {"const": "classified"},
+    "source_identifier": {"type": ["string", "null"]},
+    "assigned_at": {"type": "string", "format": "date-time"},
+    "assignment_history": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["previous_project_id", "new_project_id", "assigned_at"],
+        "properties": {
+          "previous_project_id": {"type": ["string", "null"]},
+          "new_project_id": {"type": "string", "minLength": 1},
+          "assigned_at": {"type": "string", "format": "date-time"}
+        }
+      }
+    }
+  }
+}

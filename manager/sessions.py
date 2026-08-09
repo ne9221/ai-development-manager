@@ -16,6 +16,7 @@ from manager.tasks import DriveRecords, TaskError, validate
 SHORT_PROMPT_LIMIT = 1000
 TITLE_LIMIT = 72
 UNCLASSIFIED_PROJECT_ID = "_unclassified"
+REVIEW_PROJECT_ID = "_review_queue"
 PROJECT_SNAPSHOT_VERSION = 1
 
 
@@ -213,6 +214,7 @@ def classify_project(record, projects, repository_lookup=_repository_identity):
     alias_matches = [p for p in projects if basename and any(_normal_path(alias) == basename for alias in [p.get("project_id"), p.get("name"), *p.get("aliases", [])])]
     header_matches = _header_matches(header.get("project"), projects) if header else []
     signals = [("git_repository", repo_matches), ("git_root", root_matches), ("git_repository_name", root_name_matches), ("working_directory", cwd_matches), ("project_alias", alias_matches), ("session_repository_url", message_repo_matches), ("explicit_project_header", header_matches)]
+    result["_candidate_signals"] = [{"method": method, "project_ids": [project["project_id"] for project in matches]} for method, matches in signals if matches]
     resolved = [(method, matches[0]) for method, matches in signals if len(matches) == 1]
     project_ids = {project["project_id"] for _, project in resolved}
     if len(project_ids) > 1:
@@ -271,6 +273,65 @@ def preview_codex_sessions(sessions_root=None, projects=None, needs_review=False
     }
 
 
+def prompt_snippet(record, limit=240):
+    value = re.sub(r"\s+", " ", record.get("first_user_prompt") or "").strip()
+    return value if len(value) <= limit else value[:limit - 1].rstrip() + "…"
+
+
+def review_queue(records, review_records=()):
+    """Build a non-persistent queue from unresolved records and manual mappings."""
+    reviews = {record["session_id"]: record for record in review_records}
+    items = []
+    for record in records:
+        review = reviews.get(record["session_id"])
+        if review or record.get("classification_status") != "needs_review":
+            continue
+        items.append({
+            "session_id": record["session_id"], "provider": record["provider"],
+            "started_at": record["started_at"], "updated_at": record["updated_at"],
+            "title": record["title"], "prompt_snippet": prompt_snippet(record),
+            "working_directory": display_working_directory(record["working_directory"]),
+            "repository": record["repository"],
+            "classification_reason": record["classification_method"],
+            "candidate_deterministic_signals": record.get("_candidate_signals", []),
+        })
+    return items
+
+
+def list_review_records(store):
+    try:
+        records = store.list_records("session_reviews", REVIEW_PROJECT_ID)
+    except (TaskError, KeyError):
+        return []
+    for record in records:
+        validate("session_review", record)
+    return records
+
+
+def assign_review(store, session, project_id, projects, timestamp):
+    matches = [project for project in projects if project.get("project_id") == project_id]
+    if len(matches) != 1:
+        raise TaskError(f"manual assignment requires one valid project_id: {project_id}")
+    try:
+        existing = store.get("session_reviews", REVIEW_PROJECT_ID, session["session_id"])
+        validate("session_review", existing)
+    except (TaskError, KeyError):
+        existing = None
+    if existing and existing["project_id"] == project_id:
+        return existing
+    history = list(existing["assignment_history"]) if existing else []
+    previous = existing["project_id"] if existing else session.get("project_id")
+    history.append({"previous_project_id": previous, "new_project_id": project_id, "assigned_at": timestamp})
+    record = {
+        "session_id": session["session_id"], "provider": session["provider"], "project_id": project_id,
+        "classification_method": "manual_review", "classification_status": "classified",
+        "source_identifier": session.get("source_identifier"), "assigned_at": timestamp,
+        "assignment_history": history,
+    }
+    validate("session_review", record)
+    return store.put("session_reviews", REVIEW_PROJECT_ID, record["session_id"], record)
+
+
 def project_preview_snapshot(projects):
     """Create the smallest non-secret project input needed by session preview."""
     document = {"snapshot_type": "project_preview", "version": PROJECT_SNAPSHOT_VERSION, "projects": [{
@@ -296,6 +357,7 @@ def import_codex_sessions(store, sessions_root=None, projects=None, repository_l
         if requested and record["session_id"] not in requested:
             continue
         record = classify_project(record, projects, repository_lookup)
+        record.pop("_candidate_signals", None)
         validate("session", record)
         store.put("sessions", record["project_id"] or UNCLASSIFIED_PROJECT_ID, record["session_id"], record)
         records.append(record)
@@ -313,10 +375,29 @@ def main():
     preview.add_argument("--projects-file", type=Path, default=None, help="Temporary JSON project input; never persisted")
     preview.add_argument("--needs-review", action="store_true", help="Show only sessions requiring review")
     sub.add_parser("export-project-preview", help="Read Drive projects and emit a temporary preview snapshot to stdout")
+    review_list = sub.add_parser("review-list", help="List unresolved Codex sessions; manual mappings are read from Drive")
+    review_list.add_argument("--sessions-root", type=Path, default=None)
+    review_list.add_argument("--projects-file", type=Path, default=None)
+    review_assign = sub.add_parser("review-assign", help="Assign one Codex session to a valid project in Drive")
+    review_assign.add_argument("session_id"); review_assign.add_argument("project_id")
+    review_assign.add_argument("--sessions-root", type=Path, default=None)
+    review_assign.add_argument("--projects-file", type=Path, default=None)
     args = parser.parse_args()
     try:
         if args.command == "export-project-preview":
             print(json.dumps(project_preview_snapshot(read_projects(DriveRecords(build_service()))), indent=2))
+        elif args.command in ("review-list", "review-assign"):
+            store = DriveRecords(build_service())
+            projects = load_preview_projects(args.projects_file) if args.projects_file else read_projects(store)
+            records = [classify_project(record, projects) for record in discover_codex_sessions(args.sessions_root)]
+            if args.command == "review-list":
+                print(json.dumps(review_queue(records, list_review_records(store)), indent=2))
+            else:
+                session = next((record for record in records if record["session_id"] == args.session_id), None)
+                if not session:
+                    raise TaskError(f"Codex session not found: {args.session_id}")
+                from manager.tasks import now_iso
+                print(json.dumps(assign_review(store, session, args.project_id, projects, now_iso()), indent=2))
         elif args.command == "preview-codex":
             projects = load_preview_projects(args.projects_file) if args.projects_file else []
             print(json.dumps(preview_codex_sessions(args.sessions_root, projects, args.needs_review), indent=2))

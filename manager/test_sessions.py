@@ -6,7 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from manager.sessions import _repository_identity, candidate_title, classify_project, discover_codex_sessions, extract_repository_urls, import_codex_sessions, load_preview_projects, parse_identity_header, preview_codex_sessions, project_preview_snapshot
+from manager.sessions import REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_codex_sessions, extract_repository_urls, import_codex_sessions, load_preview_projects, parse_identity_header, preview_codex_sessions, project_preview_snapshot, review_queue
 from manager.tasks import validate
 
 
@@ -19,6 +19,8 @@ class MemoryStore:
     def put(self, area, project_id, name, document):
         self.records[(area, project_id, name)] = deepcopy(document)
         return document
+    def get(self, area, project_id, name): return deepcopy(self.records[(area, project_id, name)])
+    def list_records(self, area, project_id): return [deepcopy(value) for (record_area, record_project, _), value in self.records.items() if record_area == area and record_project == project_id]
 
 
 def fixture(cwd="C:/work/ai-development-manager"):
@@ -199,6 +201,33 @@ class SessionTests(unittest.TestCase):
             classified = classify_project(parsed, [PROJECT], lambda _cwd: {"git_root": None, "remote": None})
             self.assertEqual("session_repository_url", classified["classification_method"])
             self.assertEqual(before, path.read_bytes())
+
+    def test_review_queue_excludes_classified_and_preserves_source(self):
+        temp, root, path = self.session_file(fixture("C:/elsewhere"))
+        with temp:
+            before = path.read_bytes()
+            unresolved = classify_project(discover_codex_sessions(root)[0], [PROJECT], lambda _cwd: {"git_root": None, "remote": None})
+            queue = review_queue([unresolved])
+            self.assertEqual(1, len(queue))
+            self.assertEqual("unclassified", queue[0]["classification_reason"])
+            self.assertIn("prompt_snippet", queue[0])
+            resolved = dict(unresolved, classification_status="classified")
+            self.assertEqual([], review_queue([resolved]))
+            self.assertEqual(before, path.read_bytes())
+
+    def test_manual_assignment_is_validated_idempotent_and_audited(self):
+        store = MemoryStore()
+        session = {"session_id": "review-1", "provider": "codex", "project_id": None, "source_identifier": "sessions/test.jsonl"}
+        first = assign_review(store, session, "ai-development-manager", [PROJECT], "2026-08-10T01:00:00Z")
+        validate("session_review", first)
+        self.assertEqual(REVIEW_PROJECT_ID, next(iter(store.records))[1])
+        same = assign_review(store, session, "ai-development-manager", [PROJECT], "2026-08-10T02:00:00Z")
+        self.assertEqual(1, len(same["assignment_history"]))
+        with self.assertRaises(Exception): assign_review(store, session, "missing", [PROJECT], "2026-08-10T02:00:00Z")
+        other = deepcopy(PROJECT); other["project_id"] = "other-project"
+        changed = assign_review(store, session, "other-project", [PROJECT, other], "2026-08-10T03:00:00Z")
+        self.assertEqual("other-project", changed["project_id"])
+        self.assertEqual({"previous_project_id": "ai-development-manager", "new_project_id": "other-project", "assigned_at": "2026-08-10T03:00:00Z"}, changed["assignment_history"][-1])
 
 
 if __name__ == "__main__": unittest.main()

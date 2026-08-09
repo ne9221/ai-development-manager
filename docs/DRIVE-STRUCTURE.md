@@ -22,3 +22,7 @@ adds a final handoff, and copies the completed task into `TASK-HISTORY`.
 provider metadata and short indexing text only, never a full provider
 conversation transcript. Sessions without a deterministic project match use
 `SESSIONS/_unclassified/` and `classification_status: needs_review`.
+
+`SESSION-REVIEWS/_review_queue/<session_id>.json` stores an explicit human
+project assignment and its minimal reassignment audit. The review queue itself
+is generated from read-only session discovery plus these records.

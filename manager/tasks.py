@@ -16,8 +16,8 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 
 ROOT_FOLDER_ID = "1pXvl8BglU05ZrXMHIVIDyK-lOWNShXSO"
-ROOT_FOLDERS = {"tasks": "TASKS", "handoffs": "HANDOFFS", "history": "TASK-HISTORY", "projects": "PROJECTS", "executions": "EXECUTIONS", "sessions": "SESSIONS"}
-SCHEMAS = {name: Path(__file__).parents[1] / "schema" / f"{name}.schema.json" for name in ("project", "project_preview", "task", "handoff", "execution", "session")}
+ROOT_FOLDERS = {"tasks": "TASKS", "handoffs": "HANDOFFS", "history": "TASK-HISTORY", "projects": "PROJECTS", "executions": "EXECUTIONS", "sessions": "SESSIONS", "session_reviews": "SESSION-REVIEWS"}
+SCHEMAS = {name: Path(__file__).parents[1] / "schema" / f"{name}.schema.json" for name in ("project", "project_preview", "task", "handoff", "execution", "session", "session_review")}
 MIME_JSON = "application/json"
 MIME_FOLDER = "application/vnd.google-apps.folder"
 
@@ -98,6 +98,11 @@ class DriveRecords:
             return json.loads(self.files.get_media(fileId=matches[0]["id"]).execute().decode("utf-8"))
         except Exception as exc:
             raise TaskError(f"could not read Drive record: {filename}") from exc
+
+    def list_records(self, area, project_id):
+        parent = self.project_folder(area, project_id, create=False)
+        names = [item["name"][:-5] for item in self.children(parent) if item.get("name", "").endswith(".json")]
+        return [self.get(area, project_id, name) for name in names]
 
     def latest(self, area, project_id, task_id):
         parent = self.project_folder(area, project_id, create=False)
