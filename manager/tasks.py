@@ -114,7 +114,7 @@ def create_project(store, document):
     return store.put("projects", document["project_id"], document["project_id"], document)
 
 
-def create_task(store, document, service=None, assign=True):
+def create_task(store, document, service=None, assign=True, persist=True):
     timestamp = now_iso()
     document = dict(document)
     document.setdefault("status", "ready")
@@ -138,7 +138,7 @@ def create_task(store, document, service=None, assign=True):
             "quota_evidence": decision["quota_evidence"],
         })
     validate("task", document)
-    return store.put("tasks", document["project_id"], document["task_id"], document)
+    return store.put("tasks", document["project_id"], document["task_id"], document) if persist else document
 
 
 def update_task(store, project_id, task_id, **changes):

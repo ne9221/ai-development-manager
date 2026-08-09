@@ -56,6 +56,12 @@ class RuntimeBridgeTests(unittest.TestCase):
         self.assertTrue(result["alternatives"]); self.assertEqual("fresh", result["quota_freshness"]); self.assertIn("80% remaining", result["quota_summary"])
         self.assertIsInstance(json.loads(json.dumps(result)), dict); self.assertIn("推荐：codex", human_summary(result))
 
+    def test_read_only_new_task_does_not_write_runtime_records(self):
+        before = deepcopy(self.store.records)
+        result = runtime_bridge(self.store, object(), {"project_id": "adm", "user_request": "Cloud read-only dispatch"}, quota(), [], read_only=True)
+        self.assertEqual("new_task", result["request_type"]); self.assertEqual(before, self.store.records)
+        self.assertEqual("cloud-read-only-dispatch", result["active_task"]["task_id"])
+
     def test_continuation_task_handoff_and_no_handoff(self):
         create_task(self.store, task(), assign=False); self.store.records[("projects", "adm", "adm")]["active_tasks"] = ["t1"]
         no_handoff = self.call({"project_id": "adm", "task_id": "t1", "user_request": "继续"})

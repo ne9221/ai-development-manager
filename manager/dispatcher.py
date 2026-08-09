@@ -156,8 +156,9 @@ def dispatch(store, service, request, quota_document=None, executions=None):
             pass
     if not task:
         task_input.update(recommended_provider=selected, mode=CAPABILITIES[selected]["mode"], effort=decision["recommended_effort"], quota_evidence=decision["quota_evidence"])
-        task = create_task(store, task_input, service, assign=False)
-        if task["task_id"] not in project["active_tasks"]:
+        persist_task = request.get("persist_task", True)
+        task = create_task(store, task_input, service, assign=False, persist=persist_task)
+        if persist_task and task["task_id"] not in project["active_tasks"]:
             project["active_tasks"].append(task["task_id"]); store.put("projects", project["project_id"], project["project_id"], project)
     summary = quota_line(selected_quota)
     generated = prompt_for(project, task, handoff, selected, selected_estimate, summary, warnings, request.get("shared_rules"), request.get("ponytail_available"))

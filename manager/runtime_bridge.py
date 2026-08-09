@@ -116,7 +116,7 @@ def request_type(user_request, task, multi_task):
     return "continuation" if task else "new_task"
 
 
-def runtime_bridge(store, service, request, quota_document=None, executions=None, dispatch_func=dispatch, schedule_func=schedule, rules_path=RULES_PATH):
+def runtime_bridge(store, service, request, quota_document=None, executions=None, dispatch_func=dispatch, schedule_func=schedule, rules_path=RULES_PATH, read_only=False):
     if not isinstance(request, dict) or not isinstance(request.get("user_request"), str) or not request["user_request"].strip():
         raise TaskError("user_request is required")
     project = resolve_project(store, request.get("project_id"), request["user_request"])
@@ -165,11 +165,16 @@ def runtime_bridge(store, service, request, quota_document=None, executions=None
             "needs_browser": task.get("needs_browser", False) if task else False,
             "preferred_provider": request.get("preferred_provider"), "excluded_provider": request.get("excluded_provider"),
             "shared_rules": shared_rules, "ponytail_available": request.get("ponytail_available"),
+            "persist_task": not read_only,
         }
         result = dispatch_func(store, service, dispatch_request, raw_quota, history)
         warnings = result["warnings"]
         if not task:
-            task = store.get("tasks", project_id, new_task_id)
+            task = ({
+                "task_id": new_task_id, "title": request["user_request"], "status": "ready",
+                "current_progress": "Not started", "next_action": "Confirm dispatch recommendation",
+                "assigned_provider": None, "recommended_provider": result.get("recommended_provider"),
+            } if read_only else store.get("tasks", project_id, new_task_id))
         next_action = task.get("next_action") or "Copy the generated prompt to the recommended provider"
 
     provider = result.get("recommended_provider")

@@ -1,0 +1,8 @@
+.git
+.test-deps
+__pycache__
+*.pyc
+*.token*
+*credential*.json
+*oauth*.json
+collectors/*.status.json
