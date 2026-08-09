@@ -103,3 +103,21 @@ python -m manager.dispatcher --project-id ai-development-manager --task-id phase
 Existing tasks prioritize `current_progress`, `next_action`, and the latest
 compact handoff. Requests estimated above 20 minutes emit a bounded phase plan
 and instruct the selected provider to execute Phase 1 only.
+
+## Multi-task scheduling
+
+The scheduler groups ready Drive tasks into parallel-safe batches. It respects
+dependencies, edit/read-only state, working tree and allowed-path conflicts,
+one provider slot per batch, quota freshness, and near resets. Every scheduled
+item contains the unchanged Dispatcher result and generated prompt; nothing is
+started or sent automatically.
+
+```powershell
+python -m manager.scheduler --project-id ai-development-manager `
+  --task-id implementation-task --task-id architecture-review `
+  --task-id docs-update --task-id dependent-tests
+```
+
+Low reliable quota with a reset within 30 minutes may return
+`defer_until_reset` for non-high-priority work. Unknown quota stays eligible
+with a warning rather than being treated as zero or abundant.

@@ -1,0 +1,4 @@
+{
+  "project_id": "example-project",
+  "task_ids": ["implementation-task", "architecture-review", "docs-update", "dependent-tests"]
+}
