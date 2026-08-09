@@ -40,3 +40,16 @@ task recommendation with:
 python -m manager.quota_reader --max-age-minutes 60
 python -m manager.assignment --task-type implementation --expected-minutes 20 --needs-repo-edit
 ```
+
+## Runtime quota refresh (Windows)
+
+`python -m manager.refresh_status` reads the current Drive SSOT, refreshes the
+available official providers, validates the merged document, and updates the
+same Drive `status.json`. Runtime output, the lock, OAuth token, and logs live
+under the repo-external `AI_MANAGER_HOME` directory.
+
+`manager/install_scheduler.ps1` installs the hidden
+`AI Development Manager - Quota Refresh` task for the current user. It runs at
+Windows logon and every 15 minutes; overlapping executions are ignored by Task
+Scheduler and rejected by the runtime file lock. The task does not require an
+open terminal or an active Codex/Claude conversation window.
