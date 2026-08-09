@@ -1,0 +1,10 @@
+{
+  "project_id": "example-project",
+  "user_request": "Continue the current implementation task",
+  "task_id": null,
+  "task_type": "implementation",
+  "complexity": "medium",
+  "preferred_provider": null,
+  "excluded_provider": null,
+  "multi_task": false
+}

@@ -55,10 +55,13 @@ def phase_goals(scope, count):
     return ["; ".join(group) if group else "Integrate and validate the preceding phase" for group in groups]
 
 
-def prompt_for(project, task, handoff, provider, estimate_result, quota_summary, warnings):
+def prompt_for(project, task, handoff, provider, estimate_result, quota_summary, warnings, shared_rules=None, ponytail_available=None):
     forbidden = list(project.get("important_constraints", [])) + list(task.get("constraints", []))
     if handoff:
         forbidden += handoff.get("do_not_touch", [])
+    policies = set(project.get("execution_policies", [])) | set(task.get("execution_policies", []))
+    coding = task.get("needs_repo_edit", True) and task.get("task_type") in ("implementation", "bugfix", "debugging", "regression", "testing")
+    ponytail = "ponytail" in policies and coding
     minutes = estimate_result["estimated_minutes"]
     count = estimate_result["suggested_phases"] if estimate_result["split_recommended"] else 1
     phases = phase_goals(task.get("scope", []), count)
@@ -74,6 +77,11 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
         f"Branch: {project['default_branch']}", f"Baseline commit: {baseline}",
         f"Task goal: {task['title']}", f"Current state: {task.get('current_progress', 'Not started')}",
         f"Next action: {task.get('next_action', '')}", f"Latest handoff: {handoff_text}",
+        "Rule priority (highest first):",
+        *[f"- Project business / acceptance: {item}" for item in project.get("project_rules", [])],
+        *[f"- Project business / acceptance: {item}" for item in task.get("acceptance_criteria", [])],
+        *[f"- AI Development Manager scope / protection: {item}" for item in (shared_rules or [])],
+        *[f"- AI Development Manager scope / protection: {item}" for item in task.get("constraints", [])],
         "Allowed scope:", *[f"- {item}" for item in task.get("scope", [])],
         "Forbidden scope / do not touch:", *[f"- {item}" for item in dict.fromkeys(forbidden)],
         "Acceptance criteria:", *[f"- {item}" for item in task.get("acceptance_criteria", [])],
@@ -81,6 +89,9 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
     ]
     if count > 1:
         lines += ["Phase plan:", *[f"- Phase {index + 1}: {goal}" for index, goal in enumerate(phases)], "Execute Phase 1 only, then report before continuing."]
+    if ponytail:
+        skill = "Enable the local Ponytail skill. " if ponytail_available is not False else "Ponytail skill is unavailable; use the equivalent text policy. "
+        lines += ["Ponytail minimal-change preference (lower priority than requirements above):", skill + "Use Ponytail/minimal-change principles: make the smallest safe change that satisfies the acceptance criteria; do not refactor unrelated code. Necessary tests, schema changes, compatibility fixes, correctness, and regression protection remain required."]
     lines += [
         f"Quota summary: {quota_summary}",
         f"Warnings: {'; '.join(warnings) if warnings else 'none'}",
@@ -149,7 +160,7 @@ def dispatch(store, service, request, quota_document=None, executions=None):
         if task["task_id"] not in project["active_tasks"]:
             project["active_tasks"].append(task["task_id"]); store.put("projects", project["project_id"], project["project_id"], project)
     summary = quota_line(selected_quota)
-    generated = prompt_for(project, task, handoff, selected, selected_estimate, summary, warnings)
+    generated = prompt_for(project, task, handoff, selected, selected_estimate, summary, warnings, request.get("shared_rules"), request.get("ponytail_available"))
     return {
         "recommended_provider": selected, "mode": CAPABILITIES[selected]["mode"], "effort": decision["recommended_effort"],
         "estimated_minutes": selected_estimate["estimated_minutes"], "split_recommended": selected_estimate["split_recommended"], "phase_count": selected_estimate["suggested_phases"],

@@ -16,6 +16,7 @@
   "read_only": false,
   "preferred_provider": null,
   "excluded_provider": null,
+  "execution_policies": [],
   "scope": [],
   "constraints": [],
   "acceptance_criteria": [],

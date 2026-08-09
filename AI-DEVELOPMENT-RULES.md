@@ -1,6 +1,6 @@
 # AI Development Rules
 
-version: 0.1.0
+version: 0.1.1
 last_updated: 2026-08-09
 
 Single source of truth for cross-project AI-development rules. This document
@@ -33,9 +33,16 @@ individual project's own `TASKS` or business rules - it sits above them.
 10. Never fabricate a fixed usage percentage for a provider just because it
     currently lacks an automatic quota API (e.g. Antigravity, Gemini App in
     v0.1) - use the manual `status` enum instead.
+11. For code changes, after project business rules, acceptance criteria,
+    required tests, stability, and regression protection are satisfied, prefer
+    Ponytail/minimal-change and YAGNI: reuse existing code, avoid unrelated
+    refactors or unnecessary abstractions/wrappers/dependencies, and modify only
+    the task's required scope. Minimality must never reduce correctness.
 
 ## Changelog
 
 - 0.1.0 (2026-08-09): Initial version. Rules 1-10 above, derived from the
   Phase-0 quota-source PoCs for Codex, Claude Code, Antigravity, and Gemini
   App / Google AI Pro.
+- 0.1.1 (2026-08-09): Added rule 11 for subordinate Ponytail/minimal-change
+  execution policy on code modifications.

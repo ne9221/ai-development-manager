@@ -121,3 +121,16 @@ python -m manager.scheduler --project-id ai-development-manager `
 Low reliable quota with a reset within 30 minutes may return
 `defer_until_reset` for non-high-priority work. Unknown quota stays eligible
 with a warning rather than being treated as zero or abundant.
+
+## ChatGPT runtime bridge
+
+The stable one-call bridge resolves project aliases, reads current Drive quota,
+active task/latest handoff and execution history, then reuses Dispatcher or
+Scheduler. JSON output is compact and transport-neutral.
+
+```powershell
+python -m manager.runtime_bridge --project-id ai-development-manager --request "Continue Phase 9" --json
+```
+
+See `docs/CHATGPT-INTEGRATION.md` for the upper-level client contract, explicit
+fallback behavior, shared-rule priority, and optional Ponytail policy.

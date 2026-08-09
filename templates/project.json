@@ -1,6 +1,7 @@
 {
   "project_id": "example-project",
   "name": "Example Project",
+  "aliases": ["example"],
   "repo": "https://github.com/example/example-project",
   "default_branch": "main",
   "working_directory": null,
@@ -9,5 +10,6 @@
   "project_rules": [],
   "active_tasks": [],
   "current_phase": "",
-  "important_constraints": []
+  "important_constraints": [],
+  "execution_policies": ["ponytail"]
 }

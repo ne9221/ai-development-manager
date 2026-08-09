@@ -27,6 +27,7 @@
     "read_only": {"type": "boolean"},
     "preferred_provider": {"type": ["string", "null"]},
     "excluded_provider": {"type": ["string", "null"]},
+    "execution_policies": {"type": "array", "items": {"type": "string"}},
     "scope": {"type": "array", "items": {"type": "string"}},
     "constraints": {"type": "array", "items": {"type": "string"}},
     "acceptance_criteria": {"type": "array", "items": {"type": "string"}},

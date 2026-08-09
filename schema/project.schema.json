@@ -7,6 +7,7 @@
   "properties": {
     "project_id": {"type": "string", "minLength": 1},
     "name": {"type": "string", "minLength": 1},
+    "aliases": {"type": "array", "items": {"type": "string"}},
     "repo": {"type": "string", "format": "uri"},
     "default_branch": {"type": "string", "minLength": 1},
     "working_directory": {"type": ["string", "null"]},
@@ -15,6 +16,7 @@
     "project_rules": {"type": "array", "items": {"type": "string"}},
     "active_tasks": {"type": "array", "items": {"type": "string"}},
     "current_phase": {"type": "string"},
-    "important_constraints": {"type": "array", "items": {"type": "string"}}
+    "important_constraints": {"type": "array", "items": {"type": "string"}},
+    "execution_policies": {"type": "array", "items": {"type": "string"}}
   }
 }
