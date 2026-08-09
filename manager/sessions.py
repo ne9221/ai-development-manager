@@ -10,7 +10,7 @@ from pathlib import Path
 
 from collectors.publish_drive import build_service
 from manager.runtime_bridge import all_projects as read_projects
-from manager.tasks import DriveRecords, ROOT_FOLDER_ID, ROOT_FOLDERS, TaskError, validate
+from manager.tasks import DriveRecords, TaskError, validate
 
 
 SHORT_PROMPT_LIMIT = 1000
