@@ -5,7 +5,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from cloud.app import create_app
+from cloud.app import create_app, logger
 from manager.tasks import TaskError
 
 
@@ -46,6 +46,7 @@ class CloudAppTests(unittest.TestCase):
     def tearDown(self): self.env.stop()
 
     def test_health_is_minimal_and_public(self):
+        self.assertEqual(logging.INFO, logger.getEffectiveLevel())
         status, body, _ = invoke(self.app, "GET", "/health", auth=None)
         self.assertEqual(200, status); self.assertEqual({"status", "contract_version", "timestamp"}, set(body)); self.assertEqual("1.0", body["contract_version"])
 
