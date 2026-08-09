@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Session Registry Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["session_id", "provider", "project_id", "task_id", "conversation_label", "title", "summary", "started_at", "updated_at", "working_directory", "repository", "source_identifier", "classification_method", "classification_confidence", "classification_status", "status", "message_count", "model", "first_user_prompt"],
+  "properties": {
+    "session_id": {"type": "string", "minLength": 1},
+    "provider": {"const": "codex"},
+    "project_id": {"type": ["string", "null"]},
+    "task_id": {"type": ["string", "null"]},
+    "conversation_label": {"type": ["string", "null"], "maxLength": 500},
+    "title": {"type": ["string", "null"], "maxLength": 500},
+    "summary": {"type": ["string", "null"], "maxLength": 4000},
+    "started_at": {"type": ["string", "null"], "format": "date-time"},
+    "updated_at": {"type": ["string", "null"], "format": "date-time"},
+    "working_directory": {"type": ["string", "null"]},
+    "repository": {"type": ["string", "null"]},
+    "source_identifier": {"type": "string", "minLength": 1},
+    "classification_method": {"enum": ["git_repository", "working_directory", "project_alias", "unclassified"]},
+    "classification_confidence": {"enum": ["high", null]},
+    "classification_status": {"enum": ["classified", "needs_review"]},
+    "status": {"enum": ["active", "completed", "research", "obsolete", "unknown"]},
+    "message_count": {"type": ["integer", "null"], "minimum": 0},
+    "model": {"type": ["string", "null"]},
+    "first_user_prompt": {"type": ["string", "null"], "maxLength": 1000}
+  }
+}

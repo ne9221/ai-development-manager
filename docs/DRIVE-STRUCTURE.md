@@ -17,3 +17,8 @@ The manager creates only missing per-project folders and updates the same
 record file by id/name. Duplicate records are rejected, and writes are read
 back byte-for-byte before success is reported. Completion keeps the live task,
 adds a final handoff, and copies the completed task into `TASK-HISTORY`.
+
+`SESSIONS/<project_id>/<session_id>.json` is the Session Registry. It contains
+provider metadata and short indexing text only, never a full provider
+conversation transcript. Sessions without a deterministic project match use
+`SESSIONS/_unclassified/` and `classification_status: needs_review`.

@@ -1,7 +1,7 @@
 # AI Development Rules
 
-version: 0.1.1
-last_updated: 2026-08-09
+version: 0.1.2
+last_updated: 2026-08-10
 
 Single source of truth for cross-project AI-development rules. This document
 governs how AI coding tools (ChatGPT, Claude Code, Codex, Antigravity,
@@ -38,6 +38,9 @@ individual project's own `TASKS` or business rules - it sits above them.
     Ponytail/minimal-change and YAGNI: reuse existing code, avoid unrelated
     refactors or unnecessary abstractions/wrappers/dependencies, and modify only
     the task's required scope. Minimality must never reduce correctness.
+12. Every AI work report must identify `AI: <Codex|Claude|Antigravity>`,
+    `Project: <project>`, and `Task: <task_id>`; include `Conversation:` and
+    `Run/Session:` whenever they apply.
 
 ## Changelog
 
@@ -46,3 +49,4 @@ individual project's own `TASKS` or business rules - it sits above them.
   App / Google AI Pro.
 - 0.1.1 (2026-08-09): Added rule 11 for subordinate Ponytail/minimal-change
   execution policy on code modifications.
+- 0.1.2 (2026-08-10): Added required cross-AI work-report identity fields.
