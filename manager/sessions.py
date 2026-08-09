@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from manager.tasks import DriveRecords, ROOT_FOLDER_ID, ROOT_FOLDERS, TaskError,
 
 
 SHORT_PROMPT_LIMIT = 1000
+TITLE_LIMIT = 72
 UNCLASSIFIED_PROJECT_ID = "_unclassified"
 
 
@@ -160,6 +162,61 @@ def classify_project(record, projects, repository_lookup=_repository_identity):
     return result
 
 
+def candidate_title(record):
+    """Return a short, deterministic label without summarizing or changing source data."""
+    if isinstance(record.get("title"), str) and record["title"].strip():
+        value = re.sub(r"\s+", " ", record["title"]).strip()
+        return value if len(value) <= TITLE_LIMIT else value[:TITLE_LIMIT - 1].rstrip() + "…"
+    prompt = record.get("first_user_prompt")
+    if not isinstance(prompt, str):
+        return None
+    lines = [line.strip() for line in prompt.splitlines()]
+    lines = [line for line in lines if line and not re.match(r"^(AI|Project|Task|Mode|Effort|Conversation|Run/Session):", line, re.I)]
+    value = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    if not value:
+        return None
+    return value if len(value) <= TITLE_LIMIT else value[:TITLE_LIMIT - 1].rstrip() + "…"
+
+
+def display_working_directory(value):
+    if not isinstance(value, str) or not value:
+        return None
+    parts = [part for part in re.split(r"[\\\\/]", value) if part]
+    return "/".join(parts[-2:]) if parts else value
+
+
+def preview_codex_sessions(sessions_root=None, projects=None, needs_review=False, repository_lookup=_repository_identity):
+    """Read sessions and return a non-persistent preview; no Drive API is called."""
+    projects = projects or []
+    records = [classify_project(record, projects, repository_lookup) for record in discover_codex_sessions(sessions_root)]
+    grouped = {}
+    for record in records:
+        project_id = record.get("project_id") or "_unclassified"
+        grouped[project_id] = grouped.get(project_id, 0) + 1
+    shown = [record for record in records if not needs_review or record["classification_status"] == "needs_review"]
+    return {
+        "total_sessions": len(records),
+        "classified_sessions": sum(record["classification_status"] == "classified" for record in records),
+        "needs_review_sessions": sum(record["classification_status"] == "needs_review" for record in records),
+        "projects": [{"project_id": key, "session_count": grouped[key]} for key in sorted(grouped)],
+        "sessions": [{
+            "session_id": record["session_id"], "project_id": record["project_id"],
+            "started_at": record["started_at"], "updated_at": record["updated_at"],
+            "existing_title": record["title"], "candidate_title": candidate_title(record),
+            "classification_method": record["classification_method"],
+            "classification_status": record["classification_status"],
+            "working_directory": display_working_directory(record["working_directory"]),
+        } for record in shown],
+    }
+
+
+def load_preview_projects(path):
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(document, list) or not all(isinstance(item, dict) for item in document):
+        raise TaskError("preview projects file must be a JSON array of project records")
+    return document
+
+
 def all_projects(store):
     if hasattr(store, "list_projects"):
         return store.list_projects()
@@ -193,10 +250,18 @@ def main():
     importer = sub.add_parser("import-codex", help="Read Codex JSONL sessions and write metadata to Drive")
     importer.add_argument("--sessions-root", type=Path, default=None)
     importer.add_argument("--session-id", action="append", default=[], help="Import only this Codex session ID (repeatable)")
+    preview = sub.add_parser("preview-codex", help="Read-only Codex session classification and title preview")
+    preview.add_argument("--sessions-root", type=Path, default=None)
+    preview.add_argument("--projects-file", type=Path, default=None, help="Temporary JSON project input; never persisted")
+    preview.add_argument("--needs-review", action="store_true", help="Show only sessions requiring review")
     args = parser.parse_args()
     try:
-        records = import_codex_sessions(DriveRecords(build_service()), args.sessions_root, session_ids=args.session_id)
-        print(json.dumps({"imported": len(records), "provider": "codex"}, indent=2))
+        if args.command == "preview-codex":
+            projects = load_preview_projects(args.projects_file) if args.projects_file else []
+            print(json.dumps(preview_codex_sessions(args.sessions_root, projects, args.needs_review), indent=2))
+        else:
+            records = import_codex_sessions(DriveRecords(build_service()), args.sessions_root, session_ids=args.session_id)
+            print(json.dumps({"imported": len(records), "provider": "codex"}, indent=2))
         return 0
     except (TaskError, OSError) as exc:
         print(f"ERROR: {exc}", file=__import__("sys").stderr)

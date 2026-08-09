@@ -4,7 +4,7 @@ import unittest
 from copy import deepcopy
 from pathlib import Path
 
-from manager.sessions import classify_project, discover_codex_sessions, import_codex_sessions
+from manager.sessions import candidate_title, classify_project, discover_codex_sessions, import_codex_sessions, preview_codex_sessions
 from manager.tasks import validate
 
 
@@ -89,6 +89,39 @@ class SessionTests(unittest.TestCase):
             records = import_codex_sessions(store, root, session_ids=["different-session"])
             self.assertEqual([], records)
             self.assertEqual({}, store.records)
+
+    def test_existing_title_wins_over_prompt_candidate(self):
+        temp, root, _ = self.session_file()
+        with temp:
+            record = discover_codex_sessions(root, titles={"session-123": "Existing title"})[0]
+            self.assertEqual("Existing title", candidate_title(record))
+            self.assertEqual("t" * 71 + "…", candidate_title({"title": "t" * 100, "first_user_prompt": "ignored"}))
+
+    def test_prompt_candidate_is_short_and_omits_metadata_lines(self):
+        prompt = "AI: Codex\nProject: ai-development-manager\nTask: test\nBuild a concise preview command for session records"
+        self.assertEqual("Build a concise preview command for session records", candidate_title({"title": None, "first_user_prompt": prompt}))
+        self.assertEqual("x" * 71 + "…", candidate_title({"title": None, "first_user_prompt": "x" * 100}))
+
+    def test_preview_groups_classification_without_persisting(self):
+        temp, root, path = self.session_file()
+        with temp:
+            before = path.read_bytes()
+            lookup = lambda _cwd: {"git_root": None, "remote": None}
+            preview = preview_codex_sessions(root, [PROJECT], repository_lookup=lookup)
+            self.assertEqual(1, preview["total_sessions"])
+            self.assertEqual(1, preview["classified_sessions"])
+            self.assertEqual(0, preview["needs_review_sessions"])
+            self.assertEqual([{"project_id": "ai-development-manager", "session_count": 1}], preview["projects"])
+            self.assertNotIn("first_user_prompt", preview["sessions"][0])
+            self.assertEqual(before, path.read_bytes())
+
+    def test_preview_needs_review_filter_and_counts(self):
+        temp, root, _ = self.session_file(fixture("C:/elsewhere"))
+        with temp:
+            preview = preview_codex_sessions(root, [PROJECT], needs_review=True, repository_lookup=lambda _cwd: {"git_root": None, "remote": None})
+            self.assertEqual(0, preview["classified_sessions"])
+            self.assertEqual(1, preview["needs_review_sessions"])
+            self.assertEqual(1, len(preview["sessions"]))
 
 
 if __name__ == "__main__": unittest.main()
