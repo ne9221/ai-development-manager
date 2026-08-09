@@ -17,6 +17,21 @@ The default output is `collectors/codex.status.json`. Failures exit non-zero
 without writing fabricated quota values. Set `CODEX_BIN` only when `codex` is
 not available on `PATH`.
 
+## Google Drive publisher
+
+`publish_drive.py` validates `codex.status.json`, then creates or updates the
+single raw `application/json` file named `status.json` in the configured Drive
+folder and verifies its metadata and bytes after upload.
+
+Authentication uses Google Application Default Credentials, an existing token
+at `GOOGLE_DRIVE_TOKEN`, or an official Desktop OAuth client JSON selected with
+`GOOGLE_OAUTH_CLIENT_SECRETS`. Credentials remain outside the repository.
+
+```powershell
+python collectors/publish_drive.py
+python -m unittest collectors/test_codex.py collectors/test_publish_drive.py
+```
+
 ## Planned providers
 
 | Provider | Planned primary source | Automatic? | PoC evidence |
