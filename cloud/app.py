@@ -20,6 +20,7 @@ ALLOWED_INPUTS = {"project_id", "user_request", "task_id", "task_type", "complex
 logger = logging.getLogger("runtime_bridge_cloud")
 logger.addHandler(logging.StreamHandler())
 logger.setLevel(logging.INFO)
+logger.propagate = False
 
 
 def iso_now():
