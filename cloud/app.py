@@ -18,6 +18,7 @@ from manager.tasks import DriveRecords, TaskError
 CONTRACT_VERSION = "1.0"
 ALLOWED_INPUTS = {"project_id", "user_request", "task_id", "task_type", "complexity", "preferred_provider", "excluded_provider", "multi_task"}
 logger = logging.getLogger("runtime_bridge_cloud")
+logger.addHandler(logging.StreamHandler())
 logger.setLevel(logging.INFO)
 
 

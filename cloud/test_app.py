@@ -47,6 +47,7 @@ class CloudAppTests(unittest.TestCase):
 
     def test_health_is_minimal_and_public(self):
         self.assertEqual(logging.INFO, logger.getEffectiveLevel())
+        self.assertTrue(logger.handlers)
         status, body, _ = invoke(self.app, "GET", "/health", auth=None)
         self.assertEqual(200, status); self.assertEqual({"status", "contract_version", "timestamp"}, set(body)); self.assertEqual("1.0", body["contract_version"])
 
