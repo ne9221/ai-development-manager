@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Execution",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["execution_id", "task_id", "project_id", "provider", "mode", "effort", "started_at", "completed_at", "elapsed_minutes", "status", "quota_before", "quota_after", "quota_delta", "source_confidence", "notes", "task_snapshot"],
+  "properties": {
+    "execution_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "project_id": {"type": "string", "minLength": 1},
+    "provider": {"type": "string", "minLength": 1},
+    "mode": {"type": ["string", "null"]},
+    "effort": {"type": ["string", "null"]},
+    "started_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": ["string", "null"], "format": "date-time"},
+    "elapsed_minutes": {"type": ["number", "null"], "minimum": 0},
+    "status": {"enum": ["running", "completed", "failed", "interrupted"]},
+    "quota_before": {"type": "object"},
+    "quota_after": {"type": ["object", "null"]},
+    "quota_delta": {"type": ["object", "null"]},
+    "source_confidence": {"type": "string"},
+    "notes": {"type": "array", "items": {"type": "string"}},
+    "task_snapshot": {"type": "object"}
+  }
+}

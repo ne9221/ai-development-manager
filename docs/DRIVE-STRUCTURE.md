@@ -9,6 +9,7 @@ AI Development Manager/
 ├─ PROJECTS/<project_id>/<project_id>.json
 ├─ TASKS/<project_id>/<task_id>.json
 ├─ HANDOFFS/<project_id>/<handoff_id>.json
+├─ EXECUTIONS/<project_id>/<execution_id>.json
 └─ TASK-HISTORY/<project_id>/<task_id>-<completion-date>.json
 ```
 

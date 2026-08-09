@@ -1,0 +1,18 @@
+{
+  "execution_id": "example-task-run-1",
+  "task_id": "example-task",
+  "project_id": "example-project",
+  "provider": "codex",
+  "mode": "code",
+  "effort": "medium",
+  "started_at": "2026-01-01T00:00:00Z",
+  "completed_at": null,
+  "elapsed_minutes": null,
+  "status": "running",
+  "quota_before": {"status": "unknown", "windows": []},
+  "quota_after": null,
+  "quota_delta": null,
+  "source_confidence": "unknown",
+  "notes": [],
+  "task_snapshot": {"task_type": "implementation", "complexity": "medium"}
+}

@@ -51,8 +51,9 @@ def quota_score(provider, expected_minutes, now):
     return score, evidence
 
 
-def decide(task, quota, now=None):
+def decide(task, quota, now=None, estimates=None):
     now = now or datetime.now(timezone.utc)
+    estimates = estimates or {}
     expected = task.get("expected_minutes", 20)
     ranked = []
     warnings = []
@@ -65,6 +66,7 @@ def decide(task, quota, now=None):
         if task.get("complexity") == "high" and provider["provider"] == "claude":
             score += 1
         q_score, evidence = quota_score(provider, expected, now)
+        evidence["historical_estimate"] = estimates.get(provider["provider"])
         score += q_score
         if not provider["has_reliable_quota"]:
             warnings.append(f"{provider['display_name']} quota is {provider['status']} or stale")
@@ -73,15 +75,19 @@ def decide(task, quota, now=None):
 
     split = expected > 20
     winner = ranked[0]
+    historical = estimates.get(winner["provider"])
+    reasons = ([f"Expected duration {expected} minutes exceeds the 20-minute task target; split before assignment"] if split else [
+        f"Best combined capability and quota evidence score for {task.get('task_type', 'implementation')}",
+        "Unknown quota remained eligible but carried uncertainty",
+    ])
+    if historical:
+        reasons.append(f"History: {historical['estimated_minutes']} minutes from {historical['sample_count']} matching executions ({historical['confidence']} confidence)")
     return {
         "recommended_provider": None if split else winner["provider"],
         "recommended_mode": "split_task" if split else winner["mode"],
         "recommended_effort": "high" if task.get("complexity") == "high" else "medium",
         "alternatives": [item["provider"] for item in ranked[:3] if split or item is not winner],
-        "reasons": ([f"Expected duration {expected} minutes exceeds the 20-minute task target; split before assignment"] if split else [
-            f"Best combined capability and quota evidence score for {task.get('task_type', 'implementation')}",
-            "Unknown quota remained eligible but carried uncertainty",
-        ]),
+        "reasons": reasons,
         "quota_evidence": {item["provider"]: item["evidence"] for item in ranked},
         "warning": "; ".join(dict.fromkeys(warnings)) or None,
     }
@@ -97,11 +103,22 @@ def main():
     parser.add_argument("--needs-browser", action="store_true")
     parser.add_argument("--parallelizable", action="store_true")
     parser.add_argument("--max-age-minutes", type=float, default=60)
+    parser.add_argument("--project-id")
     args = parser.parse_args()
     task = vars(args)
     max_age = task.pop("max_age_minutes")
+    project_id = task.pop("project_id")
     quota = summarize(read_drive_status(), max_age)
-    print(json.dumps(decide(task, quota), indent=2))
+    estimates = {}
+    if project_id:
+        from collectors.publish_drive import build_service
+        from manager.estimator import estimate
+        from manager.executions import list_executions
+        from manager.tasks import DriveRecords
+        service = build_service(); history = list_executions(DriveRecords(service), project_id)
+        for provider in CAPABILITIES:
+            estimates[provider] = estimate({**task, "provider": provider}, history)
+    print(json.dumps(decide(task, quota, estimates=estimates), indent=2))
     return 0
 
 

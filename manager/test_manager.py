@@ -72,6 +72,12 @@ class ManagerTest(unittest.TestCase):
         self.assertIsNone(result["recommended_provider"])
         self.assertEqual(result["recommended_mode"], "split_task")
 
+    def test_historical_estimate_is_explainable_evidence(self):
+        estimate = {"estimated_minutes": 18, "sample_count": 3, "confidence": "medium"}
+        result = decide(self.task(), quota(provider("codex", 90)), NOW, {"codex": estimate})
+        self.assertEqual(estimate, result["quota_evidence"]["codex"]["historical_estimate"])
+        self.assertIn("3 matching executions", result["reasons"][-1])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -71,3 +71,20 @@ python -m manager.tasks task-complete example-project example-task --summary "Ac
 
 Task creation records the current assignment recommendation and quota evidence,
 but never starts an AI provider.
+
+## Execution metrics and estimates
+
+Execution records capture elapsed time and quota snapshots before and after a
+run. Missing windows and quota resets produce unknown deltas instead of guessed
+usage. Records remain in Drive under `EXECUTIONS/<project_id>/`.
+
+```powershell
+python -m manager.executions start example-project example-task example-run --provider codex
+python -m manager.executions finish example-project example-run --note "Acceptance criteria passed"
+python -m manager.executions read example-project example-run
+python -m manager.estimator example-project --task-type implementation --provider codex --mode code --effort medium
+python -m manager.assignment --project-id example-project --task-type implementation --needs-repo-edit
+```
+
+The estimator uses medians from similar completed executions. Estimates over
+20 minutes recommend multiple phases; they do not split or execute tasks.
