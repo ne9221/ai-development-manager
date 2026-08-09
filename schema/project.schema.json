@@ -9,6 +9,8 @@
     "name": {"type": "string", "minLength": 1},
     "repo": {"type": "string", "format": "uri"},
     "default_branch": {"type": "string", "minLength": 1},
+    "working_directory": {"type": ["string", "null"]},
+    "baseline_commit": {"type": ["string", "null"]},
     "runtime_ssot": {"type": "string", "minLength": 1},
     "project_rules": {"type": "array", "items": {"type": "string"}},
     "active_tasks": {"type": "array", "items": {"type": "string"}},

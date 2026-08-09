@@ -3,6 +3,8 @@
   "name": "Example Project",
   "repo": "https://github.com/example/example-project",
   "default_branch": "main",
+  "working_directory": null,
+  "baseline_commit": null,
   "runtime_ssot": "Google Drive/AI Development Manager",
   "project_rules": [],
   "active_tasks": [],

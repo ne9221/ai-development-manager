@@ -1,0 +1,11 @@
+{
+  "project_id": "example-project",
+  "title": "Fix a regression",
+  "task_type": "implementation",
+  "complexity": "medium",
+  "expected_minutes": 20,
+  "scope": ["Fix the regression", "Add a regression test"],
+  "constraints": ["Do not modify unrelated modules"],
+  "acceptance_criteria": ["Relevant tests pass"],
+  "needs_repo_edit": true
+}

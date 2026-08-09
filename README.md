@@ -88,3 +88,18 @@ python -m manager.assignment --project-id example-project --task-type implementa
 
 The estimator uses medians from similar completed executions. Estimates over
 20 minutes recommend multiple phases; they do not split or execute tasks.
+
+## Dispatcher and AI-ready prompt
+
+The dispatcher reads the Drive project/task/latest handoff, current quota, and
+execution estimates, then creates a short recommendation and paste-ready prompt.
+It never starts or sends work to an AI provider.
+
+```powershell
+python -m manager.dispatcher --project-id ai-development-manager --title "Phase 7 dispatcher" --task-type implementation --complexity medium --scope "Implement dispatcher" --acceptance "Tests pass"
+python -m manager.dispatcher --project-id ai-development-manager --task-id phase-7-dispatcher --title "Phase 7 dispatcher" --task-type implementation --complexity medium --json
+```
+
+Existing tasks prioritize `current_progress`, `next_action`, and the latest
+compact handoff. Requests estimated above 20 minutes emit a bounded phase plan
+and instruct the selected provider to execute Phase 1 only.
