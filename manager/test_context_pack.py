@@ -18,10 +18,12 @@ class Store:
         self.direct = [session("direct", "ai-development-manager", "2026-08-09T00:00:00Z")]
         self.unclassified = [session("manual", None, "2026-08-10T00:00:00Z"), session("direct", None, "2026-08-09T00:00:00Z")]
         self.reviews = [{"session_id": "manual", "provider": "codex", "project_id": "ai-development-manager", "classification_method": "manual_review", "classification_status": "classified", "source_identifier": "sessions/manual.jsonl", "assigned_at": "2026-08-10T00:00:00Z", "assignment_history": [{"previous_project_id": None, "new_project_id": "ai-development-manager", "assigned_at": "2026-08-10T00:00:00Z"}]}]
+        self.overview = {"project_id": "ai-development-manager", "version": "1.0", "updated_at": "2026-08-10T00:00:00Z", "items": [{"item_id": f"P{index:02d}", "title": f"Item {index}", "status": "in_progress", "priority": "high", "current_progress": "Progress", "next_action": "Next", "task_ids": [], "merged_into": None, "notes": []} for index in range(6)]}
     def list_projects(self): return [PROJECT]
     def get(self, area, project_id, name):
         if area == "projects" and name == "ai-development-manager": return PROJECT
         if area == "tasks" and name == "task-1": return TASK
+        if area == "overviews" and name == "overview": return self.overview
         raise TaskError(name)
     def latest(self, area, project_id, task_id): return HANDOFF
     def list_records(self, area, project_id):
@@ -48,6 +50,21 @@ class ContextPackTests(unittest.TestCase):
         self.assertIn("manual", ids)
         self.assertEqual(1, ids.count("direct"))
         self.assertEqual("manual_review", next(item for item in pack["recent_sessions"] if item["session_id"] == "manual")["classification_method"])
+
+    def test_overview_focus_is_bounded(self):
+        pack = context_pack(Store(), "ai-development-manager")
+        self.assertEqual(5, len(pack["overview_focus"]))
+        self.assertEqual("P00", pack["overview_focus"][0]["item_id"])
+
+    def test_missing_overview_is_backward_compatible(self):
+        store = Store()
+        store.overview = None
+        original_get = store.get
+        def missing_overview(area, project_id, name):
+            if area == "overviews": raise TaskError(name)
+            return original_get(area, project_id, name)
+        store.get = missing_overview
+        self.assertEqual([], context_pack(store, "ai-development-manager")["overview_focus"])
 
 
 if __name__ == "__main__": unittest.main()

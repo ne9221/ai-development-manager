@@ -3,6 +3,10 @@
 Google Drive is the runtime SSOT. Project, task, handoff, and history records
 are real JSON files; Git contains only their schemas, templates, and manager.
 
+Development Overviews are stored as `OVERVIEWS/<project_id>/overview.json`.
+They are compact management summaries with stable item IDs, not replacements
+for detailed TASKS or HANDOFFS.
+
 ```
 AI Development Manager/
 ├─ AI-RESOURCE-STATUS/status.json

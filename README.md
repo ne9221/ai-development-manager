@@ -102,6 +102,19 @@ and at most five recent session metadata records. It deliberately excludes full
 provider transcripts and directs the next AI to resume current progress and
 the handoff before exploring completed work.
 
+## Development Overview
+
+The Drive-backed Development Overview is a compact project management view; it
+does not automatically synchronize with TASKS or HANDOFFS:
+
+```powershell
+python -m manager.overview init ai-development-manager
+python -m manager.overview read ai-development-manager
+python -m manager.overview summary ai-development-manager
+python -m manager.overview item-add ai-development-manager P06 --title "Example work"
+python -m manager.overview item-update ai-development-manager P06 --status awaiting_validation --progress "Implementation complete" --next-action "Run validation"
+```
+
 ## Execution metrics and estimates
 
 Execution records capture elapsed time and quota snapshots before and after a

@@ -9,6 +9,7 @@ from collectors.publish_drive import build_service
 from manager.runtime_bridge import active_task, resolve_project
 from manager.sessions import apply_manual_reviews, list_review_records, prompt_snippet
 from manager.tasks import DriveRecords, TaskError
+from manager.overview import read_overview
 
 
 RULES_PATH = __import__("pathlib").Path(__file__).parents[1] / "AI-DEVELOPMENT-RULES.md"
@@ -53,6 +54,19 @@ def recent_sessions(store, project_id, reviews=None, limit=5):
     } for record in selected[:limit]]
 
 
+def overview_focus(store, project_id, limit=5):
+    """Return only actionable overview items; missing overviews remain compatible."""
+    try:
+        overview = read_overview(store, project_id)
+    except (TaskError, KeyError):
+        return []
+    included = {"in_progress", "awaiting_validation"}
+    items = [item for item in overview["items"] if item["status"] in included or (item["status"] == "pending" and item["priority"] == "high")]
+    order = {"in_progress": 0, "awaiting_validation": 1, "pending": 2}
+    items.sort(key=lambda item: (order[item["status"]], item["item_id"]))
+    return [{key: item[key] for key in ("item_id", "title", "status", "priority", "current_progress", "next_action")} for item in items[:limit]]
+
+
 def context_pack(store, project_ref, task_id=None, user_request="", reviews=None, session_limit=5):
     project = resolve_project(store, project_ref, user_request)
     task = active_task(store, project, task_id, user_request)
@@ -68,6 +82,7 @@ def context_pack(store, project_ref, task_id=None, user_request="", reviews=None
         "active_task": ({key: task.get(key) for key in ("task_id", "title", "status", "current_progress", "next_action", "scope", "acceptance_criteria")} if task else None),
         "latest_handoff": ({key: handoff.get(key) for key in ("handoff_id", "from_provider", "from_session", "reason", "current_state", "next_action", "minimal_context", "tests", "known_issues")} if handoff else None),
         "recent_sessions": recent_sessions(store, project["project_id"], reviews, session_limit),
+        "overview_focus": overview_focus(store, project["project_id"]),
         "shared_rules": shared_rules(),
         "user_request": user_request or None,
         "continuation_instruction": "Resume from active_task.current_progress, active_task.next_action, and latest_handoff before exploring new work. Do not re-explore completed work or read full session transcripts.",

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Development Overview",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["project_id", "version", "updated_at", "items"],
+  "properties": {
+    "project_id": {"type": "string", "minLength": 1},
+    "version": {"type": "string", "minLength": 1},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item_id", "title", "status", "priority", "current_progress", "next_action", "task_ids", "merged_into", "notes"],
+        "properties": {
+          "item_id": {"type": "string", "pattern": "^P[0-9]+$"},
+          "title": {"type": "string", "minLength": 1, "maxLength": 500},
+          "status": {"enum": ["pending", "in_progress", "awaiting_validation", "completed", "deferred", "cancelled", "merged"]},
+          "priority": {"enum": ["high", "medium", "low"]},
+          "current_progress": {"type": "string", "maxLength": 2000},
+          "next_action": {"type": "string", "maxLength": 2000},
+          "task_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+          "merged_into": {"type": ["string", "null"]},
+          "notes": {"type": "array", "items": {"type": "string", "maxLength": 2000}}
+        }
+      }
+    }
+  }
+}
