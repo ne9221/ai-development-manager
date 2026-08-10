@@ -1,6 +1,6 @@
 # AI Development Rules
 
-version: 0.1.2
+version: 0.1.3
 last_updated: 2026-08-10
 
 Single source of truth for cross-project AI-development rules. This document
@@ -10,9 +10,15 @@ individual project's own `TASKS` or business rules - it sits above them.
 
 ## Rules
 
-1. Cloud-first. The local machine is only a necessary execution environment
-   (collectors, cache, login/session state, scratch/temp) - never the system
-   of record.
+1. Cloud-first. Except software explicitly intended for shared company
+   computers and required to run offline, project runtime state, reports,
+   overview, task/handoff, rules, research records, and management files use
+   Google Drive/Workspace, GitHub, or another approved cloud service as SSOT.
+   A company computer's encrypted local files must not become SSOT merely for
+   convenience. Scratch/temp/cache/login/session state may remain local. Before
+   creating other persistent local project data, report why cloud is unsuitable,
+   why local storage is required, its location/content, and its impact on
+   cross-AI/device handoff; obtain user confirmation first.
 2. Before dispatching a task to an AI, read the latest quota status for the
    candidate AIs first.
 3. Choose an AI based on task nature + current quota + reset time - not a
@@ -41,6 +47,28 @@ individual project's own `TASKS` or business rules - it sits above them.
 12. Every AI work report must identify `AI: <Codex|Claude|Antigravity>`,
     `Project: <project>`, and `Task: <task_id>`; include `Conversation:` and
     `Run/Session:` whenever they apply.
+13. Each AI development project maintains a user/ChatGPT-readable Development
+    Overview with stable item IDs (for example `P01`). It summarizes pending,
+    in-progress, validation, completed, deferred, and cancelled/merged work;
+    it does not replace detailed TASKS, README, HANDOFF, AGENTS, or project
+    rules.
+14. Use a GitHub Research Gate only for a new case, a new technical/architecture
+    problem, repeated failure/high cost, planned foundational tool, or likely
+    mature reusable solution. Do not re-research ordinary UI tweaks, located
+    bugs, small rule-consistent changes, or recently reviewed unchanged issues.
+    Record reviewed projects, decision, selection/rejection reasons, and the
+    recheck trigger.
+15. Run weekly GitHub Discovery every Monday at 09:00 Asia/Taipei. Search actual
+    needs such as AI coding/multi-agent, provider tooling, MCP/memory/
+    orchestration, audit/accounting, Office/PDF/document processing, personal
+    accounting, and productivity. Keep only a small set worth direct adoption,
+    integration/reference, or a new project; avoid popularity-only and
+    unchanged repeat findings.
+16. This file is the cross-project Global Rules SSOT. Every AI task applies it
+    before project-specific rules, and rule changes require version + changelog.
+    Project business/acceptance requirements win within their scope; Global
+    Rules govern coordination and execution. Claude, Codex, and Antigravity
+    must not maintain drifting copies of these common rules.
 
 ## Changelog
 
@@ -50,3 +78,6 @@ individual project's own `TASKS` or business rules - it sits above them.
 - 0.1.1 (2026-08-09): Added rule 11 for subordinate Ponytail/minimal-change
   execution policy on code modifications.
 - 0.1.2 (2026-08-10): Added required cross-AI work-report identity fields.
+- 0.1.3 (2026-08-10): Added Development Overview, GitHub Research Gate,
+  Weekly GitHub Discovery, cloud/local exception approval, and Global Rules
+  SSOT enforcement.
