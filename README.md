@@ -72,6 +72,17 @@ python -m manager.tasks task-complete example-project example-task --summary "Ac
 Task creation records the current assignment recommendation and quota evidence,
 but never starts an AI provider.
 
+## Drive authentication health
+
+Normal Drive reads do not start a browser authorization flow. Check
+non-sensitive authentication health first, then explicitly authorize only when
+required:
+
+```powershell
+python -m manager.drive_auth status
+python -m manager.drive_auth authorize
+```
+
 ## Codex session preview
 
 Session preview is read-only. It does not alter Codex session files, create a

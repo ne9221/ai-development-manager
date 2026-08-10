@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -31,39 +32,92 @@ def load_status(path, schema_path):
     return document
 
 
-def credentials():
+def token_path():
+    return Path(os.environ.get(
+        "GOOGLE_DRIVE_TOKEN",
+        Path.home() / ".config" / "ai-development-manager" / "google-drive-token.json",
+    ))
+
+
+def _oauth_imports():
     try:
         import google.auth
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
         from google_auth_oauthlib.flow import InstalledAppFlow
+        from google.auth.exceptions import DefaultCredentialsError, RefreshError
     except ImportError as exc:
         raise PublisherError("Google Drive dependencies unavailable; install collectors/requirements.txt") from exc
+    return {"google_auth": google.auth, "Request": Request, "Credentials": Credentials,
+            "InstalledAppFlow": InstalledAppFlow, "DefaultCredentialsError": DefaultCredentialsError,
+            "RefreshError": RefreshError}
 
-    token_path = Path(os.environ.get(
-        "GOOGLE_DRIVE_TOKEN",
-        Path.home() / ".config" / "ai-development-manager" / "google-drive-token.json",
-    ))
-    creds = Credentials.from_authorized_user_file(token_path, SCOPES) if token_path.is_file() else None
-    save_token = False
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        save_token = True
-    if not creds or not creds.valid:
+
+def _write_token(path, creds):
+    """Replace a token only after a successful refresh or interactive authorization."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = creds.to_json()
+    handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as output:
+            output.write(payload)
+        Path(temporary).replace(path)
+    finally:
+        if Path(temporary).exists():
+            Path(temporary).unlink()
+
+
+def credentials_with_source(allow_interactive=False, oauth=None):
+    oauth = oauth or _oauth_imports()
+    path = token_path()
+    creds = None
+    source = None
+    token_problem = None
+    if path.is_file():
         try:
-            creds, _ = google.auth.default(scopes=SCOPES)
-        except google.auth.exceptions.DefaultCredentialsError:
-            client_secrets = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRETS")
-            if not client_secrets:
-                raise PublisherError(
-                    "Google OAuth not authorized; set GOOGLE_OAUTH_CLIENT_SECRETS to an official Desktop OAuth client JSON"
-                )
-            creds = InstalledAppFlow.from_client_secrets_file(client_secrets, SCOPES).run_local_server(port=0)
-            save_token = True
-    if save_token:
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(creds.to_json(), encoding="utf-8")
-    return creds
+            creds = oauth["Credentials"].from_authorized_user_file(path, SCOPES)
+            source = "existing_token"
+        except Exception:
+            token_problem = "malformed_token"
+    if creds and creds.expired:
+        if not creds.refresh_token:
+            token_problem = "expired_without_refresh_token"; creds = None
+        else:
+            try:
+                creds.refresh(oauth["Request"]())
+                _write_token(path, creds)
+                source = "refreshed_token"
+            except oauth["RefreshError"]:
+                token_problem = "invalid_refresh_token"; creds = None
+            except Exception as exc:
+                raise PublisherError(f"Google OAuth token refresh failed: {exc}") from exc
+    if creds and creds.valid:
+        return creds, source
+
+    try:
+        creds, _ = oauth["google_auth"].default(scopes=SCOPES)
+        if creds and creds.valid:
+            return creds, "application_default"
+    except oauth["DefaultCredentialsError"]:
+        pass
+
+    client_secrets = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRETS")
+    if not allow_interactive or not client_secrets:
+        detail = f" ({token_problem})" if token_problem else ""
+        suffix = " Set GOOGLE_OAUTH_CLIENT_SECRETS, then run python -m manager.drive_auth authorize." if not client_secrets else " Run python -m manager.drive_auth authorize."
+        raise PublisherError(f"Google OAuth reauthorization required{detail}.{suffix}")
+    try:
+        creds = oauth["InstalledAppFlow"].from_client_secrets_file(client_secrets, SCOPES).run_local_server(port=0)
+    except Exception as exc:
+        raise PublisherError(f"Google Desktop OAuth authorization failed: {exc}") from exc
+    if not creds or not creds.valid:
+        raise PublisherError("Google Desktop OAuth did not return valid credentials")
+    _write_token(path, creds)
+    return creds, "desktop_oauth"
+
+
+def credentials(allow_interactive=False):
+    return credentials_with_source(allow_interactive=allow_interactive)[0]
 
 
 def build_service():
