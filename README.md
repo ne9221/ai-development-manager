@@ -89,6 +89,19 @@ The snapshot contains only `project_id`, `name`, `aliases`, `repo`, and
 `working_directory`; it never contains credentials, task data, handoffs, or
 session transcripts.
 
+## Continuation context pack
+
+Read bounded continuation context from Drive without writing session data:
+
+```powershell
+python -m manager.context_pack --project-id ai-development-manager --request "continue session organizer" --json
+```
+
+The pack includes the project, active task, latest handoff, all shared rules,
+and at most five recent session metadata records. It deliberately excludes full
+provider transcripts and directs the next AI to resume current progress and
+the handoff before exploring completed work.
+
 ## Execution metrics and estimates
 
 Execution records capture elapsed time and quota snapshots before and after a
