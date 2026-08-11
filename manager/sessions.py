@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 from collectors.publish_drive import build_service
 from manager.runtime_bridge import all_projects as read_projects
@@ -24,14 +25,47 @@ REVIEW_PROJECT_ID = "_review_queue"
 PROJECT_SNAPSHOT_VERSION = 1
 
 
+def manager_session_key(provider, provider_session_id):
+    """Return the reversible, provider-aware Manager identity/storage key."""
+    if not isinstance(provider, str) or not provider or not isinstance(provider_session_id, str) or not provider_session_id:
+        raise TaskError("provider and provider_session_id must be non-empty strings")
+    return f"{quote(provider, safe='')}:{quote(provider_session_id, safe='')}"
+
+
+def parse_manager_session_key(value):
+    """Reverse a Manager key; malformed values are not accepted as identities."""
+    if not isinstance(value, str) or value.count(":") != 1:
+        return None
+    provider, provider_session_id = (unquote(part) for part in value.split(":", 1))
+    return (provider, provider_session_id) if provider and provider_session_id else None
+
+
+def session_provider_identity(record):
+    """Get provider identity, including legacy records that predate the new field."""
+    provider = record.get("provider")
+    provider_session_id = record.get("provider_session_id") or record.get("session_id")
+    if not isinstance(provider, str) or not provider or not isinstance(provider_session_id, str) or not provider_session_id:
+        raise TaskError("session record is missing provider-aware identity")
+    return (provider, provider_session_id)
+
+
+def session_manager_key(record):
+    provider, provider_session_id = session_provider_identity(record)
+    return manager_session_key(provider, provider_session_id)
+
+
+def _session_matches_reference(record, value):
+    """Keep Codex CLI raw-ID selection compatible while accepting Manager keys."""
+    return value in {record.get("session_id"), record.get("provider_session_id"), session_manager_key(record)}
+
+
 @dataclass
 class CanonicalSession:
     """Provider-neutral session metadata; never contains a source transcript.
 
-    ``session_id`` remains the existing Manager registry key during this
-    compatibility phase.  Provider identity is always the pair exposed by
-    ``provider_identity`` so later providers do not rely on raw IDs being
-    globally unique.
+    ``session_id`` is the Manager key derived only from provider identity.
+    ``provider_session_id`` remains the provider-owned raw ID.  Legacy records
+    without the latter field are read through ``session_provider_identity``.
     """
 
     session_id: str
@@ -234,7 +268,7 @@ class CodexSessionAdapter(SessionAdapter):
 
     def normalize(self, parsed_session):
         return CanonicalSession(
-            session_id=parsed_session["session_id"],
+            session_id=manager_session_key(self.provider, parsed_session["session_id"]),
             provider=self.provider,
             provider_session_id=parsed_session["session_id"],
             project_id=parsed_session.get("project_id"),
@@ -407,10 +441,10 @@ def prompt_snippet(record, limit=240):
 
 def review_queue(records, review_records=()):
     """Build a non-persistent queue from unresolved records and manual mappings."""
-    reviews = {record["session_id"]: record for record in review_records}
+    reviews = {session_provider_identity(record): record for record in review_records}
     items = []
     for record in records:
-        review = reviews.get(record["session_id"])
+        review = reviews.get(session_provider_identity(record))
         if review or record.get("classification_status") != "needs_review":
             continue
         items.append({
@@ -439,25 +473,37 @@ def assign_review(store, session, project_id, projects, timestamp):
     matches = [project for project in projects if project.get("project_id") == project_id]
     if len(matches) != 1:
         raise TaskError(f"manual assignment requires one valid project_id: {project_id}")
+    key = session_manager_key(session)
+    storage_key = key
     try:
-        existing = store.get("session_reviews", REVIEW_PROJECT_ID, session["session_id"])
+        existing = store.get("session_reviews", REVIEW_PROJECT_ID, key)
         validate("session_review", existing)
     except (TaskError, KeyError):
-        existing = None
+        try:
+            # Existing Codex review files were named with the raw provider ID.
+            storage_key = session_provider_identity(session)[1]
+            existing = store.get("session_reviews", REVIEW_PROJECT_ID, storage_key)
+            validate("session_review", existing)
+            if session_provider_identity(existing) != session_provider_identity(session):
+                existing = None
+        except (TaskError, KeyError):
+            existing = None
+            storage_key = key
     if existing and existing["project_id"] == project_id:
         return existing
     history = list(existing["assignment_history"]) if existing else []
     previous = existing["project_id"] if existing else session.get("project_id")
     history.append({"previous_project_id": previous, "new_project_id": project_id, "assigned_at": timestamp})
     record = {
-        "session_id": session["session_id"], "provider": session["provider"], "project_id": project_id,
+        "session_id": existing["session_id"] if existing else key, "provider": session["provider"],
+        "provider_session_id": session_provider_identity(session)[1], "project_id": project_id,
         "classification_method": "manual_review", "classification_status": "classified",
         "mapping_source": "manual_review",
         "source_identifier": session.get("source_identifier"), "assigned_at": timestamp,
         "assignment_history": history,
     }
     validate("session_review", record)
-    return store.put("session_reviews", REVIEW_PROJECT_ID, record["session_id"], record)
+    return store.put("session_reviews", REVIEW_PROJECT_ID, storage_key, record)
 
 
 def _search_text(value):
@@ -465,11 +511,11 @@ def _search_text(value):
 
 
 def apply_manual_reviews(records, review_records=()):
-    reviews = {record["session_id"]: record for record in review_records}
+    reviews = {session_provider_identity(record): record for record in review_records}
     result = []
     for record in records:
         item = dict(record)
-        review = reviews.get(item["session_id"])
+        review = reviews.get(session_provider_identity(item))
         if review:
             item.update(project_id=review["project_id"], classification_method=review["classification_method"], mapping_source=review.get("mapping_source", review["classification_method"]), classification_status=review["classification_status"])
         result.append(item)
@@ -543,12 +589,12 @@ def import_codex_sessions(store, sessions_root=None, projects=None, repository_l
     requested = set(session_ids or [])
     records = []
     for record in discover_codex_sessions(sessions_root):
-        if requested and record["session_id"] not in requested:
+        if requested and not any(_session_matches_reference(record, value) for value in requested):
             continue
         record = classify_project(record, projects, repository_lookup)
         record.pop("_candidate_signals", None)
         validate("session", record)
-        store.put("sessions", record["project_id"] or UNCLASSIFIED_PROJECT_ID, record["session_id"], record)
+        store.put("sessions", record["project_id"] or UNCLASSIFIED_PROJECT_ID, session_manager_key(record), record)
         records.append(record)
     return records
 
@@ -593,7 +639,7 @@ def main():
             if args.command == "review-list":
                 print(json.dumps(review_queue(records, list_review_records(store)), indent=2))
             else:
-                session = next((record for record in records if record["session_id"] == args.session_id), None)
+                session = next((record for record in records if _session_matches_reference(record, args.session_id)), None)
                 if not session:
                     raise TaskError(f"Codex session not found: {args.session_id}")
                 from manager.tasks import now_iso

@@ -7,7 +7,7 @@ import re
 
 from collectors.publish_drive import build_service
 from manager.runtime_bridge import active_task, resolve_project
-from manager.sessions import apply_manual_reviews, list_review_records, prompt_snippet
+from manager.sessions import apply_manual_reviews, list_review_records, prompt_snippet, session_manager_key
 from manager.tasks import DriveRecords, TaskError
 from manager.overview import read_overview
 
@@ -36,9 +36,9 @@ def recent_sessions(store, project_id, reviews=None, limit=5):
         raise TaskError("session limit must be between 1 and 5")
     records = {}
     for record in _records(store, "sessions", project_id):
-        records[record["session_id"]] = record
+        records[session_manager_key(record)] = record
     for record in _records(store, "sessions", "_unclassified"):
-        records.setdefault(record["session_id"], record)
+        records.setdefault(session_manager_key(record), record)
     effective = apply_manual_reviews(records.values(), list_review_records(store) if reviews is None else reviews)
     selected = [record for record in effective if record.get("project_id") == project_id]
     selected.sort(key=lambda record: record.get("updated_at") or record.get("started_at") or "", reverse=True)

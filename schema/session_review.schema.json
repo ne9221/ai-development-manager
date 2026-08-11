@@ -5,8 +5,9 @@
   "additionalProperties": false,
   "required": ["session_id", "provider", "project_id", "classification_method", "classification_status", "source_identifier", "assigned_at", "assignment_history"],
   "properties": {
-    "session_id": {"type": "string", "minLength": 1},
+    "session_id": {"type": "string", "minLength": 1, "description": "Manager provider-aware key; legacy Codex records may retain the raw ID."},
     "provider": {"type": "string", "minLength": 1},
+    "provider_session_id": {"type": ["string", "null"], "minLength": 1},
     "project_id": {"type": "string", "minLength": 1},
     "classification_method": {"const": "manual_review"},
     "classification_status": {"const": "classified"},

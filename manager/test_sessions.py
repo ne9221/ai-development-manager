@@ -6,7 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from manager.sessions import CanonicalSession, CodexSessionAdapter, REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_codex_sessions, extract_repository_urls, import_codex_sessions, load_preview_projects, parse_identity_header, preview_codex_sessions, project_preview_snapshot, review_queue, search_sessions
+from manager.sessions import CanonicalSession, CodexSessionAdapter, REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_codex_sessions, extract_repository_urls, import_codex_sessions, load_preview_projects, manager_session_key, parse_identity_header, parse_manager_session_key, preview_codex_sessions, project_preview_snapshot, review_queue, search_sessions
 from manager.tasks import validate
 
 
@@ -51,7 +51,7 @@ class SessionTests(unittest.TestCase):
             before = path.read_bytes()
             record = discover_codex_sessions(root)[0]
             self.assertEqual("codex", record["provider"])
-            self.assertEqual("session-123", record["session_id"])
+            self.assertEqual("codex:session-123", record["session_id"])
             self.assertEqual(2, record["message_count"])
             self.assertEqual("gpt-5-codex", record["model"])
             self.assertEqual("Implement the registry", record["first_user_prompt"])
@@ -68,7 +68,7 @@ class SessionTests(unittest.TestCase):
             self.assertEqual("codex", canonical.provider)
             self.assertEqual("session-123", canonical.provider_session_id)
             self.assertEqual(("codex", "session-123"), canonical.provider_identity)
-            self.assertEqual("session-123", canonical.session_id)
+            self.assertEqual("codex:session-123", canonical.session_id)
             self.assertEqual("2026/08/10/rollout-2026-08-10-session-123.jsonl", canonical.source_identifier)
             self.assertTrue(canonical.content_hash)
             self.assertEqual(before, path.read_bytes())
@@ -81,6 +81,12 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(1, len(records))
             self.assertEqual("session-123", records[0]["provider_session_id"])
             self.assertEqual(before, path.read_bytes())
+
+    def test_manager_key_is_provider_aware_reversible_and_stable(self):
+        self.assertEqual("codex:abc123", manager_session_key("codex", "abc123"))
+        self.assertEqual(manager_session_key("codex", "abc123"), manager_session_key("codex", "abc123"))
+        self.assertNotEqual(manager_session_key("codex", "abc123"), manager_session_key("claude", "abc123"))
+        self.assertEqual(("codex", "a/b:c"), parse_manager_session_key(manager_session_key("codex", "a/b:c")))
 
     def test_missing_cwd_is_retained_as_null(self):
         temp, root, _ = self.session_file(fixture(cwd=None).replace(', "cwd": null', ''))
@@ -116,6 +122,7 @@ class SessionTests(unittest.TestCase):
             validate("session", record)
             self.assertEqual("codex", record["provider"])
             self.assertEqual("session-123", record["provider_session_id"])
+            self.assertIn(("sessions", "ai-development-manager", "codex:session-123"), store.records)
             self.assertEqual("git_repository", record["classification_method"])
 
     def test_import_can_limit_to_requested_session(self):
@@ -261,6 +268,23 @@ class SessionTests(unittest.TestCase):
         self.assertEqual("other-project", changed["project_id"])
         self.assertEqual("manual_review", changed["mapping_source"])
         self.assertEqual({"previous_project_id": "ai-development-manager", "new_project_id": "other-project", "assigned_at": "2026-08-10T03:00:00Z"}, changed["assignment_history"][-1])
+
+    def test_legacy_codex_review_is_readable_and_new_reviews_do_not_collide(self):
+        legacy = {"session_id": "abc123", "provider": "codex", "project_id": "ai-development-manager", "classification_method": "manual_review", "classification_status": "classified", "source_identifier": "sessions/abc123.jsonl", "assigned_at": "2026-08-10T00:00:00Z", "assignment_history": [{"previous_project_id": None, "new_project_id": "ai-development-manager", "assigned_at": "2026-08-10T00:00:00Z"}]}
+        codex = search_record("codex:abc123", provider_session_id="abc123", project_id=None)
+        claude = search_record("claude:abc123", provider="claude", provider_session_id="abc123", project_id=None)
+        self.assertEqual("ai-development-manager", search_sessions([codex], project="ai-development-manager", review_records=[legacy])[0]["project_id"])
+        store = MemoryStore()
+        first = assign_review(store, codex, "ai-development-manager", [PROJECT], "2026-08-10T01:00:00Z")
+        second = assign_review(store, claude, "ai-development-manager", [PROJECT], "2026-08-10T01:00:00Z")
+        validate("session_review", first); validate("session_review", second)
+        self.assertEqual({"codex:abc123", "claude:abc123"}, {key[2] for key in store.records})
+        self.assertEqual([], review_queue([codex, claude], [first, second]))
+        legacy_store = MemoryStore(); legacy_store.records[("session_reviews", REVIEW_PROJECT_ID, "abc123")] = deepcopy(legacy)
+        other = deepcopy(PROJECT); other["project_id"] = "other-project"
+        updated = assign_review(legacy_store, codex, "other-project", [PROJECT, other], "2026-08-10T02:00:00Z")
+        self.assertEqual("abc123", updated["session_id"])
+        self.assertEqual({"abc123"}, {key[2] for key in legacy_store.records})
 
     def test_search_filters_text_metadata_dates_and_manual_mapping(self):
         first = search_record()
