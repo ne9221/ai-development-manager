@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Read-only Codex session discovery and Drive-backed session registry."""
+"""Provider-neutral session discovery with a read-only Codex adapter."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 
@@ -19,6 +22,82 @@ TITLE_LIMIT = 72
 UNCLASSIFIED_PROJECT_ID = "_unclassified"
 REVIEW_PROJECT_ID = "_review_queue"
 PROJECT_SNAPSHOT_VERSION = 1
+
+
+@dataclass
+class CanonicalSession:
+    """Provider-neutral session metadata; never contains a source transcript.
+
+    ``session_id`` remains the existing Manager registry key during this
+    compatibility phase.  Provider identity is always the pair exposed by
+    ``provider_identity`` so later providers do not rely on raw IDs being
+    globally unique.
+    """
+
+    session_id: str
+    provider: str
+    provider_session_id: str
+    project_id: str | None = None
+    task_id: str | None = None
+    source_identifier: str | None = None
+    source_path: str | None = None
+    working_directory: str | None = None
+    started_at: str | None = None
+    updated_at: str | None = None
+    model: str | None = None
+    status: str | None = None
+    parent_session_id: str | None = None
+    title: str | None = None
+    summary: str | None = None
+    usage_ref: str | None = None
+    resume_ref: str | None = None
+    classification_method: str | None = None
+    mapping_source: str | None = None
+    classification_confidence: str | None = None
+    classification_status: str | None = None
+    content_hash: str | None = None
+    conversation_label: str | None = None
+    repository: str | None = None
+    message_count: int | None = None
+    first_user_prompt: str | None = None
+    identity_header: dict | None = None
+    repository_urls: list | None = None
+
+    @property
+    def provider_identity(self):
+        return (self.provider, self.provider_session_id)
+
+    def to_record(self):
+        record = asdict(self)
+        record["_identity_header"] = record.pop("identity_header")
+        record["_repository_urls"] = record.pop("repository_urls") or []
+        return record
+
+
+class SessionAdapter(ABC):
+    """Small provider boundary: discover raw data, parse it, then normalize it."""
+
+    provider: str
+
+    @abstractmethod
+    def discover_raw_sessions(self, source_root=None, **kwargs):
+        """Yield provider-owned raw session references without writing to them."""
+
+    @abstractmethod
+    def parse_raw_session(self, raw_session):
+        """Parse one provider raw session into provider-shaped metadata."""
+
+    @abstractmethod
+    def normalize(self, parsed_session):
+        """Convert provider-shaped metadata to ``CanonicalSession``."""
+
+    def discover(self, source_root=None, **kwargs):
+        sessions = []
+        for raw_session in self.discover_raw_sessions(source_root, **kwargs):
+            parsed = self.parse_raw_session(raw_session)
+            if parsed:
+                sessions.append(self.normalize(parsed).to_record())
+        return sessions
 
 
 def _json_lines(path):
@@ -71,7 +150,7 @@ def extract_repository_urls(text):
     return list(dict.fromkeys(value.rstrip(".,;:") for value in values))
 
 
-def parse_codex_session(path, source_root, titles=None):
+def _parse_codex_session_raw(path, source_root, titles=None):
     """Return reliable metadata from one Codex JSONL file without changing it."""
     path = Path(path)
     metadata = None
@@ -116,6 +195,8 @@ def parse_codex_session(path, source_root, titles=None):
         "first_user_prompt": first_prompt[:SHORT_PROMPT_LIMIT] if first_prompt else None,
         "_identity_header": identity_header,
         "_repository_urls": list(dict.fromkeys(repository_urls)),
+        "source_path": str(path),
+        "content_hash": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
 
 
@@ -135,18 +216,63 @@ def default_sessions_root():
     return Path.home() / ".codex" / "sessions"
 
 
+class CodexSessionAdapter(SessionAdapter):
+    """Read Codex JSONL sessions without altering Codex-owned files or indexes."""
+
+    provider = "codex"
+
+    def discover_raw_sessions(self, source_root=None, titles=None):
+        root = Path(source_root or default_sessions_root())
+        if not root.is_dir():
+            raise TaskError(f"Codex sessions directory not found: {root}")
+        if titles is None:
+            titles = load_codex_titles(root.parent / "session_index.jsonl")
+        return ({"path": path, "source_root": root, "titles": titles} for path in sorted(root.rglob("*.jsonl")))
+
+    def parse_raw_session(self, raw_session):
+        return _parse_codex_session_raw(raw_session["path"], raw_session["source_root"], raw_session["titles"])
+
+    def normalize(self, parsed_session):
+        return CanonicalSession(
+            session_id=parsed_session["session_id"],
+            provider=self.provider,
+            provider_session_id=parsed_session["session_id"],
+            project_id=parsed_session.get("project_id"),
+            task_id=parsed_session.get("task_id"),
+            source_identifier=parsed_session.get("source_identifier"),
+            source_path=parsed_session.get("source_path"),
+            working_directory=parsed_session.get("working_directory"),
+            started_at=parsed_session.get("started_at"),
+            updated_at=parsed_session.get("updated_at"),
+            model=parsed_session.get("model"),
+            status=parsed_session.get("status"),
+            parent_session_id=None,
+            title=parsed_session.get("title"),
+            summary=parsed_session.get("summary"),
+            usage_ref=None,
+            resume_ref=None,
+            classification_method=parsed_session.get("classification_method"),
+            mapping_source=None,
+            classification_confidence=parsed_session.get("classification_confidence"),
+            classification_status=parsed_session.get("classification_status"),
+            content_hash=parsed_session.get("content_hash"),
+            conversation_label=parsed_session.get("conversation_label"),
+            repository=parsed_session.get("repository"),
+            message_count=parsed_session.get("message_count"),
+            first_user_prompt=parsed_session.get("first_user_prompt"),
+            identity_header=parsed_session.get("_identity_header"),
+            repository_urls=parsed_session.get("_repository_urls"),
+        )
+
+
+def parse_codex_session(path, source_root, titles=None):
+    """Compatibility wrapper returning the historical metadata mapping."""
+    parsed = _parse_codex_session_raw(path, source_root, titles)
+    return CodexSessionAdapter().normalize(parsed).to_record() if parsed else None
+
+
 def discover_codex_sessions(sessions_root=None, titles=None):
-    root = Path(sessions_root or default_sessions_root())
-    if not root.is_dir():
-        raise TaskError(f"Codex sessions directory not found: {root}")
-    if titles is None:
-        titles = load_codex_titles(root.parent / "session_index.jsonl")
-    records = []
-    for path in sorted(root.rglob("*.jsonl")):
-        record = parse_codex_session(path, root, titles)
-        if record:
-            records.append(record)
-    return records
+    return CodexSessionAdapter().discover(sessions_root, titles=titles)
 
 
 def _normal_path(value):
@@ -219,10 +345,10 @@ def classify_project(record, projects, repository_lookup=_repository_identity):
     resolved = [(method, matches[0]) for method, matches in signals if len(matches) == 1]
     project_ids = {project["project_id"] for _, project in resolved}
     if len(project_ids) > 1:
-        result.update(project_id=None, classification_method="conflicting_deterministic_signals", classification_confidence=None, classification_status="needs_review")
+        result.update(project_id=None, classification_method="conflicting_deterministic_signals", mapping_source=None, classification_confidence=None, classification_status="needs_review")
     elif resolved:
         method, project = next(((method, project) for method, project in resolved if method == "explicit_project_header"), resolved[0])
-        result.update(project_id=project["project_id"], classification_method=method, classification_confidence="high", classification_status="classified")
+        result.update(project_id=project["project_id"], classification_method=method, mapping_source=method, classification_confidence="high", classification_status="classified")
     return result
 
 
@@ -326,6 +452,7 @@ def assign_review(store, session, project_id, projects, timestamp):
     record = {
         "session_id": session["session_id"], "provider": session["provider"], "project_id": project_id,
         "classification_method": "manual_review", "classification_status": "classified",
+        "mapping_source": "manual_review",
         "source_identifier": session.get("source_identifier"), "assigned_at": timestamp,
         "assignment_history": history,
     }
@@ -344,7 +471,7 @@ def apply_manual_reviews(records, review_records=()):
         item = dict(record)
         review = reviews.get(item["session_id"])
         if review:
-            item.update(project_id=review["project_id"], classification_method=review["classification_method"], classification_status=review["classification_status"])
+            item.update(project_id=review["project_id"], classification_method=review["classification_method"], mapping_source=review.get("mapping_source", review["classification_method"]), classification_status=review["classification_status"])
         result.append(item)
     return result
 

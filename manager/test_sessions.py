@@ -6,7 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from manager.sessions import REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_codex_sessions, extract_repository_urls, import_codex_sessions, load_preview_projects, parse_identity_header, preview_codex_sessions, project_preview_snapshot, review_queue, search_sessions
+from manager.sessions import CanonicalSession, CodexSessionAdapter, REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_codex_sessions, extract_repository_urls, import_codex_sessions, load_preview_projects, parse_identity_header, preview_codex_sessions, project_preview_snapshot, review_queue, search_sessions
 from manager.tasks import validate
 
 
@@ -57,6 +57,31 @@ class SessionTests(unittest.TestCase):
             self.assertEqual("Implement the registry", record["first_user_prompt"])
             self.assertEqual(before, path.read_bytes())
 
+    def test_codex_adapter_normalizes_raw_session_to_canonical_identity(self):
+        temp, root, path = self.session_file()
+        with temp:
+            before = path.read_bytes()
+            adapter = CodexSessionAdapter()
+            raw = next(adapter.discover_raw_sessions(root))
+            canonical = adapter.normalize(adapter.parse_raw_session(raw))
+            self.assertIsInstance(canonical, CanonicalSession)
+            self.assertEqual("codex", canonical.provider)
+            self.assertEqual("session-123", canonical.provider_session_id)
+            self.assertEqual(("codex", "session-123"), canonical.provider_identity)
+            self.assertEqual("session-123", canonical.session_id)
+            self.assertEqual("2026/08/10/rollout-2026-08-10-session-123.jsonl", canonical.source_identifier)
+            self.assertTrue(canonical.content_hash)
+            self.assertEqual(before, path.read_bytes())
+
+    def test_malformed_active_jsonl_tail_is_ignored_by_adapter(self):
+        temp, root, path = self.session_file(fixture() + '{"timestamp":"incomplete"')
+        with temp:
+            before = path.read_bytes()
+            records = CodexSessionAdapter().discover(root)
+            self.assertEqual(1, len(records))
+            self.assertEqual("session-123", records[0]["provider_session_id"])
+            self.assertEqual(before, path.read_bytes())
+
     def test_missing_cwd_is_retained_as_null(self):
         temp, root, _ = self.session_file(fixture(cwd=None).replace(', "cwd": null', ''))
         with temp:
@@ -90,6 +115,7 @@ class SessionTests(unittest.TestCase):
             record = next(iter(store.records.values()))
             validate("session", record)
             self.assertEqual("codex", record["provider"])
+            self.assertEqual("session-123", record["provider_session_id"])
             self.assertEqual("git_repository", record["classification_method"])
 
     def test_import_can_limit_to_requested_session(self):
@@ -233,6 +259,7 @@ class SessionTests(unittest.TestCase):
         other = deepcopy(PROJECT); other["project_id"] = "other-project"
         changed = assign_review(store, session, "other-project", [PROJECT, other], "2026-08-10T03:00:00Z")
         self.assertEqual("other-project", changed["project_id"])
+        self.assertEqual("manual_review", changed["mapping_source"])
         self.assertEqual({"previous_project_id": "ai-development-manager", "new_project_id": "other-project", "assigned_at": "2026-08-10T03:00:00Z"}, changed["assignment_history"][-1])
 
     def test_search_filters_text_metadata_dates_and_manual_mapping(self):

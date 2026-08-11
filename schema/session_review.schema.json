@@ -6,11 +6,12 @@
   "required": ["session_id", "provider", "project_id", "classification_method", "classification_status", "source_identifier", "assigned_at", "assignment_history"],
   "properties": {
     "session_id": {"type": "string", "minLength": 1},
-    "provider": {"const": "codex"},
+    "provider": {"type": "string", "minLength": 1},
     "project_id": {"type": "string", "minLength": 1},
     "classification_method": {"const": "manual_review"},
     "classification_status": {"const": "classified"},
     "source_identifier": {"type": ["string", "null"]},
+    "mapping_source": {"type": ["string", "null"]},
     "assigned_at": {"type": "string", "format": "date-time"},
     "assignment_history": {
       "type": "array",
