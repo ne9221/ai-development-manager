@@ -250,6 +250,10 @@ def default_sessions_root():
     return Path.home() / ".codex" / "sessions"
 
 
+def default_claude_sessions_root():
+    return Path.home() / ".claude" / "projects"
+
+
 class CodexSessionAdapter(SessionAdapter):
     """Read Codex JSONL sessions without altering Codex-owned files or indexes."""
 
@@ -307,6 +311,101 @@ def parse_codex_session(path, source_root, titles=None):
 
 def discover_codex_sessions(sessions_root=None, titles=None):
     return CodexSessionAdapter().discover(sessions_root, titles=titles)
+
+
+class ClaudeSessionAdapter(SessionAdapter):
+    """Read Claude Code project JSONL sessions without altering Claude files."""
+
+    provider = "claude"
+
+    def discover_raw_sessions(self, source_root=None):
+        root = Path(source_root or default_claude_sessions_root())
+        if not root.is_dir():
+            raise TaskError(f"Claude projects directory not found: {root}")
+        return ({"path": path, "source_root": root} for path in sorted(root.rglob("*.jsonl")))
+
+    def parse_raw_session(self, raw_session):
+        path, root = Path(raw_session["path"]), raw_session["source_root"]
+        session_id = cwd = model = title = summary = parent_session_id = first_prompt = identity_header = None
+        timestamps, messages, repository_urls = [], 0, []
+        for item in _json_lines(path):
+            timestamp = _safe_timestamp(item.get("timestamp"))
+            if timestamp:
+                timestamps.append(timestamp)
+            if session_id is None and isinstance(item.get("sessionId"), str) and item["sessionId"]:
+                session_id = item["sessionId"]
+            if cwd is None and isinstance(item.get("cwd"), str):
+                cwd = item["cwd"]
+            if parent_session_id is None and isinstance(item.get("parentSessionId"), str):
+                parent_session_id = item["parentSessionId"]
+            if item.get("type") == "custom-title" and isinstance(item.get("customTitle"), str) and item["customTitle"].strip():
+                title = item["customTitle"].strip()[:500]
+            elif title is None and item.get("type") == "ai-title" and isinstance(item.get("aiTitle"), str) and item["aiTitle"].strip():
+                title = item["aiTitle"].strip()[:500]
+            if summary is None and isinstance(item.get("summary"), str) and item["summary"].strip():
+                summary = item["summary"].strip()[:4000]
+            message = item.get("message") if isinstance(item.get("message"), dict) else {}
+            role = message.get("role")
+            if item.get("type") in ("user", "assistant") and role in ("user", "assistant"):
+                messages += 1
+                if role == "assistant" and model is None and isinstance(message.get("model"), str):
+                    model = message["model"]
+                if role == "user":
+                    text = _text_content(message.get("content"))
+                    if first_prompt is None:
+                        first_prompt = text
+                    if identity_header is None:
+                        identity_header = parse_identity_header(text)
+                    repository_urls.extend(extract_repository_urls(text))
+        if not session_id:
+            return None
+        try:
+            source_identifier = path.relative_to(root).as_posix()
+        except ValueError:
+            source_identifier = str(path)
+        return {
+            "provider_session_id": session_id, "source_identifier": source_identifier,
+            "source_path": str(path), "working_directory": cwd,
+            "started_at": min(timestamps) if timestamps else None,
+            "updated_at": max(timestamps) if timestamps else None,
+            "model": model, "status": "unknown", "parent_session_id": parent_session_id,
+            "title": title, "summary": summary, "message_count": messages,
+            "first_user_prompt": first_prompt[:SHORT_PROMPT_LIMIT] if first_prompt else None,
+            "_identity_header": identity_header,
+            "_repository_urls": list(dict.fromkeys(repository_urls)),
+            "content_hash": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    def normalize(self, parsed_session):
+        provider_session_id = parsed_session["provider_session_id"]
+        return CanonicalSession(
+            session_id=manager_session_key(self.provider, provider_session_id),
+            provider=self.provider, provider_session_id=provider_session_id,
+            project_id=None, task_id=None,
+            source_identifier=parsed_session.get("source_identifier"), source_path=parsed_session.get("source_path"),
+            working_directory=parsed_session.get("working_directory"),
+            started_at=parsed_session.get("started_at"), updated_at=parsed_session.get("updated_at"),
+            model=parsed_session.get("model"), status=parsed_session.get("status"),
+            parent_session_id=parsed_session.get("parent_session_id"), title=parsed_session.get("title"),
+            summary=parsed_session.get("summary"), usage_ref=None, resume_ref=None,
+            classification_method="unclassified", mapping_source=None, classification_confidence=None,
+            classification_status="needs_review", content_hash=parsed_session.get("content_hash"),
+            conversation_label=parsed_session.get("title"), repository=None,
+            message_count=parsed_session.get("message_count"), first_user_prompt=parsed_session.get("first_user_prompt"),
+            identity_header=parsed_session.get("_identity_header"), repository_urls=parsed_session.get("_repository_urls"),
+        )
+
+
+def discover_claude_sessions(sessions_root=None):
+    return ClaudeSessionAdapter().discover(sessions_root)
+
+
+def session_adapter(provider):
+    adapters = {"codex": CodexSessionAdapter, "claude": ClaudeSessionAdapter}
+    try:
+        return adapters[provider]()
+    except KeyError as exc:
+        raise TaskError(f"unsupported session provider: {provider}") from exc
 
 
 def _normal_path(value):
@@ -409,10 +508,10 @@ def display_working_directory(value):
     return "/".join(parts[-2:]) if parts else value
 
 
-def preview_codex_sessions(sessions_root=None, projects=None, needs_review=False, repository_lookup=_repository_identity):
-    """Read sessions and return a non-persistent preview; no Drive API is called."""
+def preview_sessions(adapter, sessions_root=None, projects=None, needs_review=False, repository_lookup=_repository_identity):
+    """Read one adapter and return a non-persistent preview; no Drive API is called."""
     projects = projects or []
-    records = [classify_project(record, projects, repository_lookup) for record in discover_codex_sessions(sessions_root)]
+    records = [classify_project(record, projects, repository_lookup) for record in adapter.discover(sessions_root)]
     grouped = {}
     for record in records:
         project_id = record.get("project_id") or "_unclassified"
@@ -432,6 +531,14 @@ def preview_codex_sessions(sessions_root=None, projects=None, needs_review=False
             "working_directory": display_working_directory(record["working_directory"]),
         } for record in shown],
     }
+
+
+def preview_codex_sessions(sessions_root=None, projects=None, needs_review=False, repository_lookup=_repository_identity):
+    return preview_sessions(CodexSessionAdapter(), sessions_root, projects, needs_review, repository_lookup)
+
+
+def preview_claude_sessions(sessions_root=None, projects=None, needs_review=False, repository_lookup=_repository_identity):
+    return preview_sessions(ClaudeSessionAdapter(), sessions_root, projects, needs_review, repository_lookup)
 
 
 def prompt_snippet(record, limit=240):
@@ -584,11 +691,11 @@ def load_preview_projects(path):
     return document["projects"]
 
 
-def import_codex_sessions(store, sessions_root=None, projects=None, repository_lookup=_repository_identity, session_ids=None):
+def import_sessions(store, adapter, sessions_root=None, projects=None, repository_lookup=_repository_identity, session_ids=None):
     projects = read_projects(store) if projects is None else projects
     requested = set(session_ids or [])
     records = []
-    for record in discover_codex_sessions(sessions_root):
+    for record in adapter.discover(sessions_root):
         if requested and not any(_session_matches_reference(record, value) for value in requested):
             continue
         record = classify_project(record, projects, repository_lookup)
@@ -599,24 +706,41 @@ def import_codex_sessions(store, sessions_root=None, projects=None, repository_l
     return records
 
 
+def import_codex_sessions(store, sessions_root=None, projects=None, repository_lookup=_repository_identity, session_ids=None):
+    return import_sessions(store, CodexSessionAdapter(), sessions_root, projects, repository_lookup, session_ids)
+
+
+def import_claude_sessions(store, sessions_root=None, projects=None, repository_lookup=_repository_identity, session_ids=None):
+    return import_sessions(store, ClaudeSessionAdapter(), sessions_root, projects, repository_lookup, session_ids)
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     importer = sub.add_parser("import-codex", help="Read Codex JSONL sessions and write metadata to Drive")
     importer.add_argument("--sessions-root", type=Path, default=None)
     importer.add_argument("--session-id", action="append", default=[], help="Import only this Codex session ID (repeatable)")
+    claude_importer = sub.add_parser("import-claude", help="Read Claude Code JSONL sessions and write metadata to Drive")
+    claude_importer.add_argument("--sessions-root", type=Path, default=None)
+    claude_importer.add_argument("--session-id", action="append", default=[], help="Import only this Claude session ID (repeatable)")
     preview = sub.add_parser("preview-codex", help="Read-only Codex session classification and title preview")
     preview.add_argument("--sessions-root", type=Path, default=None)
     preview.add_argument("--projects-file", type=Path, default=None, help="Temporary JSON project input; never persisted")
     preview.add_argument("--needs-review", action="store_true", help="Show only sessions requiring review")
+    claude_preview = sub.add_parser("preview-claude", help="Read-only Claude session classification and title preview")
+    claude_preview.add_argument("--sessions-root", type=Path, default=None)
+    claude_preview.add_argument("--projects-file", type=Path, default=None, help="Temporary JSON project input; never persisted")
+    claude_preview.add_argument("--needs-review", action="store_true", help="Show only sessions requiring review")
     sub.add_parser("export-project-preview", help="Read Drive projects and emit a temporary preview snapshot to stdout")
     review_list = sub.add_parser("review-list", help="List unresolved Codex sessions; manual mappings are read from Drive")
     review_list.add_argument("--sessions-root", type=Path, default=None)
     review_list.add_argument("--projects-file", type=Path, default=None)
+    review_list.add_argument("--provider", choices=("codex", "claude"), default="codex")
     review_assign = sub.add_parser("review-assign", help="Assign one Codex session to a valid project in Drive")
     review_assign.add_argument("session_id"); review_assign.add_argument("project_id")
     review_assign.add_argument("--sessions-root", type=Path, default=None)
     review_assign.add_argument("--projects-file", type=Path, default=None)
+    review_assign.add_argument("--provider", choices=("codex", "claude"), default="codex")
     search = sub.add_parser("search", help="Read-only deterministic Codex session search")
     search.add_argument("--query"); search.add_argument("--project"); search.add_argument("--task")
     search.add_argument("--status"); search.add_argument("--since")
@@ -635,7 +759,7 @@ def main():
         elif args.command in ("review-list", "review-assign"):
             store = DriveRecords(build_service())
             projects = load_preview_projects(args.projects_file) if args.projects_file else read_projects(store)
-            records = [classify_project(record, projects) for record in discover_codex_sessions(args.sessions_root)]
+            records = [classify_project(record, projects) for record in session_adapter(args.provider).discover(args.sessions_root)]
             if args.command == "review-list":
                 print(json.dumps(review_queue(records, list_review_records(store)), indent=2))
             else:
@@ -647,6 +771,12 @@ def main():
         elif args.command == "preview-codex":
             projects = load_preview_projects(args.projects_file) if args.projects_file else []
             print(json.dumps(preview_codex_sessions(args.sessions_root, projects, args.needs_review), indent=2))
+        elif args.command == "preview-claude":
+            projects = load_preview_projects(args.projects_file) if args.projects_file else []
+            print(json.dumps(preview_claude_sessions(args.sessions_root, projects, args.needs_review), indent=2))
+        elif args.command == "import-claude":
+            records = import_claude_sessions(DriveRecords(build_service()), args.sessions_root, session_ids=args.session_id)
+            print(json.dumps({"imported": len(records), "provider": "claude"}, indent=2))
         else:
             records = import_codex_sessions(DriveRecords(build_service()), args.sessions_root, session_ids=args.session_id)
             print(json.dumps({"imported": len(records), "provider": "codex"}, indent=2))

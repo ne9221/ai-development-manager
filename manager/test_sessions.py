@@ -6,7 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from manager.sessions import CanonicalSession, CodexSessionAdapter, REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_codex_sessions, extract_repository_urls, import_codex_sessions, load_preview_projects, manager_session_key, parse_identity_header, parse_manager_session_key, preview_codex_sessions, project_preview_snapshot, review_queue, search_sessions
+from manager.sessions import CanonicalSession, ClaudeSessionAdapter, CodexSessionAdapter, REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_claude_sessions, discover_codex_sessions, extract_repository_urls, import_claude_sessions, import_codex_sessions, load_preview_projects, manager_session_key, parse_identity_header, parse_manager_session_key, preview_claude_sessions, preview_codex_sessions, project_preview_snapshot, review_queue, search_sessions
 from manager.tasks import validate
 
 
@@ -33,6 +33,15 @@ def fixture(cwd="C:/work/ai-development-manager"):
     return "\n".join(json.dumps(line) for line in lines) + "\n"
 
 
+def claude_fixture(cwd="C:/work/ai-development-manager", prompt="Implement the registry"):
+    lines = [
+        {"type": "user", "uuid": "u-1", "parentUuid": None, "sessionId": "claude-123", "timestamp": "2026-08-10T01:00:00Z", "cwd": cwd, "message": {"role": "user", "content": prompt}},
+        {"type": "assistant", "uuid": "a-1", "parentUuid": "u-1", "sessionId": "claude-123", "timestamp": "2026-08-10T01:00:01Z", "cwd": cwd, "message": {"role": "assistant", "model": "claude-sonnet-4", "content": [{"type": "text", "text": "Working"}]}},
+        {"type": "custom-title", "sessionId": "claude-123", "customTitle": "Claude registry work"},
+    ]
+    return "\n".join(json.dumps(line) for line in lines) + "\n"
+
+
 def search_record(session_id="search-1", **changes):
     record = {"session_id": session_id, "provider": "codex", "project_id": "ai-development-manager", "task_id": "codex-session-organizer", "conversation_label": "Search", "title": "Quota session", "first_user_prompt": "Find quota data for 中文專案", "working_directory": "C:/work/ai-development-manager", "repository": "https://github.com/ne9221/ai-development-manager", "classification_status": "needs_review", "classification_method": "unclassified", "started_at": "2026-08-01T00:00:00Z", "updated_at": "2026-08-10T00:00:00Z", "source_identifier": "sessions/search-1.jsonl"}
     record.update(changes)
@@ -44,6 +53,11 @@ class SessionTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory(); root = Path(temp.name) / "sessions" / "2026" / "08" / "10"; root.mkdir(parents=True)
         path = root / "rollout-2026-08-10-session-123.jsonl"; path.write_text(content or fixture(), encoding="utf-8")
         return temp, Path(temp.name) / "sessions", path
+
+    def claude_session_file(self, content=None):
+        temp = tempfile.TemporaryDirectory(); root = Path(temp.name) / "projects" / "C--work--ai-development-manager"; root.mkdir(parents=True)
+        path = root / "claude-123.jsonl"; path.write_text(content or claude_fixture(), encoding="utf-8")
+        return temp, Path(temp.name) / "projects", path
 
     def test_parse_valid_fixture_and_preserves_source(self):
         temp, root, path = self.session_file()
@@ -81,6 +95,48 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(1, len(records))
             self.assertEqual("session-123", records[0]["provider_session_id"])
             self.assertEqual(before, path.read_bytes())
+
+    def test_claude_adapter_normalizes_verified_project_jsonl_read_only(self):
+        temp, root, path = self.claude_session_file()
+        with temp:
+            before = path.read_bytes()
+            record = discover_claude_sessions(root)[0]
+            self.assertEqual("claude", record["provider"])
+            self.assertEqual("claude-123", record["provider_session_id"])
+            self.assertEqual("claude:claude-123", record["session_id"])
+            self.assertNotEqual(manager_session_key("codex", "claude-123"), record["session_id"])
+            self.assertEqual("C--work--ai-development-manager/claude-123.jsonl", record["source_identifier"])
+            self.assertEqual("claude-sonnet-4", record["model"])
+            self.assertEqual("Claude registry work", record["title"])
+            self.assertEqual("working_directory", classify_project(record, [PROJECT], lambda _cwd: {"git_root": None, "remote": None})["classification_method"])
+            self.assertEqual(before, path.read_bytes())
+
+    def test_claude_malformed_tail_identity_header_and_common_classification(self):
+        prompt = "AI: Claude\nProject: adm\nTask: phase-2b\nConversation: Import\nImplement the Claude adapter"
+        temp, root, path = self.claude_session_file(claude_fixture("C:/elsewhere", prompt) + '{"type":"user"')
+        with temp:
+            before = path.read_bytes()
+            record = discover_claude_sessions(root)[0]
+            classified = classify_project(record, [PROJECT], lambda _cwd: {"git_root": None, "remote": None})
+            self.assertEqual("ai-development-manager", classified["project_id"])
+            self.assertEqual("explicit_project_header", classified["classification_method"])
+            self.assertEqual("phase-2b", classified["task_id"])
+            self.assertEqual(before, path.read_bytes())
+
+    def test_claude_cwd_classification_preview_review_and_import(self):
+        temp, root, _ = self.claude_session_file(claude_fixture("C:/elsewhere"))
+        with temp:
+            unresolved = classify_project(discover_claude_sessions(root)[0], [PROJECT], lambda _cwd: {"git_root": None, "remote": None})
+            self.assertEqual("needs_review", unresolved["classification_status"])
+            self.assertEqual("claude", review_queue([unresolved])[0]["provider"])
+            assigned = assign_review(MemoryStore(), unresolved, "ai-development-manager", [PROJECT], "2026-08-10T02:00:00Z")
+            self.assertEqual([], review_queue([unresolved], [assigned]))
+            preview = preview_claude_sessions(root, [PROJECT], repository_lookup=lambda _cwd: {"git_root": None, "remote": None})
+            self.assertEqual(1, preview["needs_review_sessions"])
+            store = MemoryStore()
+            imported = import_claude_sessions(store, root, repository_lookup=lambda _cwd: {"git_root": None, "remote": None})
+            self.assertEqual("claude:claude-123", imported[0]["session_id"])
+            validate("session", imported[0])
 
     def test_manager_key_is_provider_aware_reversible_and_stable(self):
         self.assertEqual("codex:abc123", manager_session_key("codex", "abc123"))
