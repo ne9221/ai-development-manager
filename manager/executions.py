@@ -12,6 +12,9 @@ from manager.session_identity import manager_session_key, parse_manager_session_
 from manager.tasks import DriveRecords, TaskError, complete_task, now_iso, update_task, validate
 
 
+MAX_SNAPSHOT_AGE_MINUTES = 60
+
+
 def parse_time(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
 
@@ -29,32 +32,64 @@ def quota_snapshot(document, provider_id):
     }
 
 
+def _snapshot_reason(snapshot, boundary, side):
+    if not snapshot:
+        return f"unknown_due_to_missing_{side}"
+    if snapshot.get("status") != "known":
+        return "unknown_due_to_unreliable_snapshot"
+    try:
+        age = abs((parse_time(boundary) - parse_time(snapshot.get("captured_at"))).total_seconds() / 60)
+    except (TypeError, ValueError):
+        return "unknown_due_to_snapshot_timestamp"
+    return "unknown_due_to_stale_snapshot" if age > MAX_SNAPSHOT_AGE_MINUTES else None
+
+
+def _window_identity(window):
+    value = window.get("window_id") or window.get("name")
+    return str(value) if value is not None else None
+
+
+def _unknown_window(name, reason):
+    return {"name": name, "window_id": name, "status": "unknown", "attribution_status": "unknown", "used_percent_delta": None, "reason": reason, "attribution_reason": reason}
+
+
 def quota_delta(before, after, started_at, completed_at):
-    before_windows = {item["name"]: item for item in before.get("windows", [])}
-    after_windows = {item["name"]: item for item in after.get("windows", [])}
+    """Return conservative execution attribution evidence, never inferred usage."""
+    before_reason = _snapshot_reason(before, started_at, "before")
+    after_reason = _snapshot_reason(after, completed_at, "after")
+    before_windows = {_window_identity(item): item for item in (before or {}).get("windows", []) if _window_identity(item)}
+    after_windows = {_window_identity(item): item for item in (after or {}).get("windows", []) if _window_identity(item)}
     results = []
-    for name in sorted(before_windows.keys() | after_windows.keys()):
-        old, new = before_windows.get(name), after_windows.get(name)
-        result = {"name": name, "status": "unknown", "used_percent_delta": None}
-        if not old or not new:
-            result["reason"] = "window_missing_before" if not old else "window_missing_after"
+    for window_id in sorted(before_windows.keys() | after_windows.keys()):
+        old, new = before_windows.get(window_id), after_windows.get(window_id)
+        name = (new or old).get("name")
+        if before_reason:
+            result = _unknown_window(name, before_reason)
+        elif after_reason:
+            result = _unknown_window(name, after_reason)
+        elif not old or not new:
+            result = _unknown_window(name, "unknown_due_to_window_missing_before" if not old else "unknown_due_to_window_missing_after")
         elif old.get("used_percent") is None or new.get("used_percent") is None:
-            result["reason"] = "usage_unknown"
+            result = _unknown_window(name, "unknown_due_to_usage_unavailable")
         else:
             old_reset = old.get("resets_at")
-            crossed = bool(old_reset and parse_time(started_at) < parse_time(old_reset) <= parse_time(completed_at))
+            try:
+                crossed = bool(old_reset and parse_time(started_at) < parse_time(old_reset) <= parse_time(completed_at))
+            except (TypeError, ValueError):
+                crossed = True
             changed_reset = old_reset and new.get("resets_at") and old_reset != new.get("resets_at")
             delta = new["used_percent"] - old["used_percent"]
-            if crossed or (delta < 0 and changed_reset):
-                result["reason"] = "quota_reset_crossed"
+            if crossed or changed_reset:
+                result = _unknown_window(name, "unknown_due_to_reset")
             elif delta < 0:
-                result["reason"] = "usage_decreased_unknown"
+                result = _unknown_window(name, "unknown_due_to_usage_decreased")
             else:
-                result.update(status="known", used_percent_delta=round(delta, 6), reason=None)
+                result = {"name": name, "window_id": window_id, "status": "known", "attribution_status": "known", "used_percent_delta": round(delta, 6), "reason": None, "attribution_reason": None}
         results.append(result)
     known = sum(item["status"] == "known" for item in results)
     status = "known" if results and known == len(results) else "partial" if known else "unknown"
-    return {"status": status, "windows": results}
+    reason = None if status == "known" else before_reason or after_reason or "unknown_due_to_incomparable_windows"
+    return {"status": status, "attribution_status": status, "attribution_reason": reason, "windows": results}
 
 
 def task_snapshot(task):

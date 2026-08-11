@@ -14,12 +14,16 @@ class MemoryStore:
     def get(self, area, project, name): return deepcopy(self.records[(area, project, name)])
 
 
-def quota(windows, generated="2026-08-09T00:00:00Z"):
-    return {"generated_at": generated, "providers": [{"provider": "codex", "source_type": "official", "confidence": "official", "last_updated": generated, "windows": windows}]}
+def quota(windows, generated="2026-08-09T00:00:00Z", provider="codex"):
+    return {"generated_at": generated, "providers": [{"provider": provider, "source_type": "official", "confidence": "official", "last_updated": generated, "windows": windows}]}
 
 
 def window(name="primary", used=10, reset="2026-08-10T00:00:00Z"):
     return {"name": name, "used_percent": used, "remaining_percent": 100-used, "resets_at": reset}
+
+
+def snapshot(windows, captured_at="2026-08-09T00:00:00Z"):
+    return {"status": "known", "captured_at": captured_at, "source_type": "official", "confidence": "official", "windows": windows}
 
 
 def task():
@@ -42,22 +46,44 @@ class ExecutionTests(unittest.TestCase):
         before = quota([window(), window("secondary", 30)])
         after = quota([window(used=13), window("secondary", 34)], "2026-08-09T00:10:00Z")
         with patch("manager.executions.read_drive_status", side_effect=[before, after]):
-            start_execution(self.store, object(), "p1", "t1", "e1", "codex", "code", "medium", "2026-08-09T00:00:00Z")
+            start_execution(self.store, object(), "p1", "t1", "e1", "codex", "code", "medium", "2026-08-09T00:00:00Z", session=session())
             run = finish_execution(self.store, object(), "p1", "e1", "completed", "2026-08-09T00:10:00Z", "done")
         self.assertEqual(10, run["elapsed_minutes"])
         self.assertEqual([3, 4], [item["used_percent_delta"] for item in run["quota_delta"]["windows"]])
+        self.assertEqual("known", run["quota_delta"]["attribution_status"])
+        self.assertEqual("codex:s1", run["session_id"])
         self.assertEqual(run, read_execution(self.store, "p1", "e1"))
         self.assertEqual("completed", self.store.get("tasks", "p1", "t1")["status"])
 
     def test_single_missing_unknown_and_reset(self):
         known = quota_delta(quota_snapshot(quota([window()]), "codex"), quota_snapshot(quota([window(used=12)]), "codex"), "2026-08-09T00:00:00Z", "2026-08-09T00:10:00Z")
         self.assertEqual("known", known["status"])
-        missing = quota_delta({"windows": [window()]}, {"windows": []}, "2026-08-09T00:00:00Z", "2026-08-09T00:10:00Z")
-        self.assertEqual("window_missing_after", missing["windows"][0]["reason"])
-        unknown = quota_delta({"windows": []}, {"windows": []}, "2026-08-09T00:00:00Z", "2026-08-09T00:10:00Z")
+        missing = quota_delta(snapshot([window()]), None, "2026-08-09T00:00:00Z", "2026-08-09T00:10:00Z")
+        self.assertEqual("unknown_due_to_missing_after", missing["windows"][0]["reason"])
+        self.assertIsNone(missing["windows"][0]["used_percent_delta"])
+        missing_before = quota_delta(None, snapshot([window(used=12)], "2026-08-09T00:10:00Z"), "2026-08-09T00:00:00Z", "2026-08-09T00:10:00Z")
+        self.assertEqual("unknown_due_to_missing_before", missing_before["windows"][0]["reason"])
+        unknown = quota_delta(None, None, "2026-08-09T00:00:00Z", "2026-08-09T00:10:00Z")
         self.assertEqual("unknown", unknown["status"])
-        reset = quota_delta({"windows": [window(used=90, reset="2026-08-09T00:05:00Z")]}, {"windows": [window(used=2, reset="2026-08-10T00:05:00Z")]}, "2026-08-09T00:00:00Z", "2026-08-09T00:10:00Z")
-        self.assertEqual("quota_reset_crossed", reset["windows"][0]["reason"])
+        reset = quota_delta(snapshot([window(used=90, reset="2026-08-09T00:05:00Z")]), snapshot([window(used=2, reset="2026-08-10T00:05:00Z")], "2026-08-09T00:10:00Z"), "2026-08-09T00:00:00Z", "2026-08-09T00:10:00Z")
+        self.assertEqual("unknown_due_to_reset", reset["windows"][0]["reason"])
+
+    def test_attribution_rejects_stale_and_changed_windows_without_zero(self):
+        stale = quota_delta(snapshot([window()]), snapshot([window(used=12)]), "2026-08-09T00:00:00Z", "2026-08-09T03:00:00Z")
+        self.assertEqual("unknown_due_to_stale_snapshot", stale["windows"][0]["reason"])
+        self.assertIsNone(stale["windows"][0]["used_percent_delta"])
+        changed = quota_delta(snapshot([window("5h")]), snapshot([window("7d", used=12)], "2026-08-09T00:10:00Z"), "2026-08-09T00:00:00Z", "2026-08-09T00:10:00Z")
+        self.assertEqual("unknown", changed["attribution_status"])
+        self.assertTrue(all(item["used_percent_delta"] is None for item in changed["windows"]))
+
+    def test_claude_execution_uses_same_conservative_attribution_contract(self):
+        before = quota([window("5h")], provider="claude")
+        after = quota([window("5h", used=14)], "2026-08-09T00:10:00Z", provider="claude")
+        with patch("manager.executions.read_drive_status", side_effect=[before, after]):
+            start_execution(self.store, object(), "p1", "t1", "claude-usage", "claude", started_at="2026-08-09T00:00:00Z", session=session("claude", "s1"))
+            result = finish_execution(self.store, object(), "p1", "claude-usage", completed_at="2026-08-09T00:10:00Z")
+        self.assertEqual("known", result["quota_delta"]["attribution_status"])
+        self.assertEqual(4, result["quota_delta"]["windows"][0]["used_percent_delta"])
 
     def test_failed_and_interrupted_are_preserved(self):
         for execution_id, terminal in (("failed", "failed"), ("interrupted", "interrupted")):
