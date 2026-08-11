@@ -3,7 +3,8 @@ from copy import deepcopy
 from unittest.mock import patch
 
 from manager.estimator import estimate
-from manager.executions import finish_execution, quota_delta, quota_snapshot, read_execution, start_execution
+from manager.executions import finish_execution, link_execution_session, quota_delta, quota_snapshot, read_execution, read_session_for_link, start_execution
+from manager.sessions import manager_session_key
 from manager.tasks import TaskError, create_task, validate
 
 
@@ -27,6 +28,10 @@ def task():
 
 def execution(minutes, delta=2, status="completed"):
     return {"provider": "codex", "mode": "code", "effort": "medium", "status": status, "elapsed_minutes": minutes, "task_snapshot": {"task_type": "implementation", "complexity": "medium", "needs_repo_edit": True}, "quota_delta": {"status": "known", "windows": [{"name": "primary", "status": "known", "used_percent_delta": delta}]}}
+
+
+def session(provider="codex", provider_session_id="s1", project_id="p1"):
+    return {"session_id": manager_session_key(provider, provider_session_id), "provider": provider, "provider_session_id": provider_session_id, "project_id": project_id}
 
 
 class ExecutionTests(unittest.TestCase):
@@ -61,6 +66,37 @@ class ExecutionTests(unittest.TestCase):
                 result = finish_execution(self.store, object(), "p1", execution_id, terminal, "2026-08-09T00:01:00Z")
             self.assertEqual(terminal, result["status"])
             self.assertEqual(1, result["elapsed_minutes"])
+
+    def test_start_links_codex_and_claude_canonical_sessions(self):
+        with patch("manager.executions.read_drive_status", side_effect=[quota([]), quota([])]):
+            codex = start_execution(self.store, object(), "p1", "t1", "codex-run", "codex", started_at="2026-08-09T00:00:00Z", session=session("codex", "abc123"))
+            claude = start_execution(self.store, object(), "p1", "t1", "claude-run", "claude", started_at="2026-08-09T00:00:00Z", session=session("claude", "abc123"))
+        self.assertEqual("codex:abc123", codex["session_id"])
+        self.assertEqual("claude:abc123", claude["session_id"])
+        self.assertNotEqual(codex["session_id"], claude["session_id"])
+        self.assertEqual("abc123", claude["provider_session_id"])
+
+    def test_link_rejects_provider_and_project_mismatch(self):
+        with patch("manager.executions.read_drive_status", return_value=quota([])):
+            start_execution(self.store, object(), "p1", "t1", "e-link", "codex", started_at="2026-08-09T00:00:00Z")
+        with self.assertRaises(TaskError): link_execution_session(self.store, "p1", "e-link", session("claude", "s1"))
+        with self.assertRaises(TaskError): link_execution_session(self.store, "p1", "e-link", session("codex", "s1", "other"))
+
+    def test_link_is_idempotent_allows_shared_session_and_legacy_reads(self):
+        with patch("manager.executions.read_drive_status", side_effect=[quota([]), quota([])]):
+            start_execution(self.store, object(), "p1", "t1", "e1", "codex", started_at="2026-08-09T00:00:00Z")
+            second = start_execution(self.store, object(), "p1", "t1", "e2", "codex", started_at="2026-08-09T00:01:00Z", session=session())
+        first = link_execution_session(self.store, "p1", "e1", session())
+        self.assertEqual(first, link_execution_session(self.store, "p1", "e1", session()))
+        self.assertEqual(first["session_id"], second["session_id"])
+        legacy = deepcopy(first); legacy.pop("session_id"); legacy.pop("provider_session_id"); legacy.pop("finished_at")
+        self.store.put("executions", "p1", "legacy", legacy)
+        self.assertEqual("e1", read_execution(self.store, "p1", "legacy")["execution_id"])
+
+    def test_link_lookup_reads_legacy_codex_registry_key(self):
+        legacy = {"session_id": "abc123", "provider": "codex", "project_id": "p1"}
+        self.store.put("sessions", "p1", "abc123", legacy)
+        self.assertEqual(legacy, read_session_for_link(self.store, "p1", "codex:abc123"))
 
     def test_malformed_execution_rejected(self):
         with self.assertRaises(TaskError): validate("execution", {"execution_id": "bad"})

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from collectors.publish_drive import build_service
 from manager.quota_reader import read_drive_status
+from manager.session_identity import manager_session_key, parse_manager_session_key, session_provider_identity
 from manager.tasks import DriveRecords, TaskError, complete_task, now_iso, update_task, validate
 
 
@@ -61,7 +62,62 @@ def task_snapshot(task):
     return {key: task.get(key) for key in keys if key in task}
 
 
-def start_execution(store, service, project_id, task_id, execution_id, provider, mode=None, effort=None, started_at=None, notes=None):
+def session_link_fields(execution, session):
+    """Validate and return the one primary provider conversation for a run."""
+    provider, provider_session_id = session_provider_identity(session)
+    if execution["provider"] != provider:
+        raise TaskError("execution provider does not match session provider")
+    if session.get("project_id") != execution["project_id"]:
+        raise TaskError("execution project does not match session project")
+    return {
+        "session_id": manager_session_key(provider, provider_session_id),
+        "provider_session_id": provider_session_id,
+    }
+
+
+def _linked_session_key(execution):
+    value = execution.get("session_id")
+    if not value:
+        return None
+    if parse_manager_session_key(value):
+        return value
+    return manager_session_key(execution["provider"], execution.get("provider_session_id") or value)
+
+
+def link_execution_session(store, project_id, execution_id, session):
+    """Attach one primary session after a run starts; repeat links are idempotent."""
+    execution = store.get("executions", project_id, execution_id)
+    fields = session_link_fields(execution, session)
+    existing = _linked_session_key(execution)
+    if existing:
+        if existing == fields["session_id"]:
+            return execution
+        raise TaskError("execution is already linked to another session")
+    execution.update(fields)
+    validate("execution", execution)
+    return store.put("executions", project_id, execution_id, execution)
+
+
+def read_session_for_link(store, project_id, session_ref, provider=None):
+    """Read canonical registry records and fall back to legacy Codex raw keys."""
+    parsed = parse_manager_session_key(session_ref)
+    if parsed:
+        provider, provider_session_id = parsed
+        key = session_ref
+    else:
+        provider_session_id = session_ref
+        key = manager_session_key(provider or "codex", provider_session_id)
+    for location, name in ((project_id, key), (project_id, provider_session_id), ("_unclassified", key), ("_unclassified", provider_session_id)):
+        try:
+            session = store.get("sessions", location, name)
+            if session_provider_identity(session) == (provider, provider_session_id):
+                return session
+        except (TaskError, KeyError):
+            pass
+    raise TaskError(f"session not found for link: {session_ref}")
+
+
+def start_execution(store, service, project_id, task_id, execution_id, provider, mode=None, effort=None, started_at=None, notes=None, session=None):
     task = store.get("tasks", project_id, task_id)
     started_at = started_at or now_iso()
     before = quota_snapshot(read_drive_status(service=service), provider)
@@ -69,10 +125,13 @@ def start_execution(store, service, project_id, task_id, execution_id, provider,
         "execution_id": execution_id, "task_id": task_id, "project_id": project_id,
         "provider": provider, "mode": mode or task.get("mode"), "effort": effort or task.get("effort"),
         "started_at": started_at, "completed_at": None, "elapsed_minutes": None, "status": "running",
+        "finished_at": None, "session_id": None, "provider_session_id": None,
         "quota_before": before, "quota_after": None, "quota_delta": None,
         "source_confidence": before.get("confidence", "unknown"), "notes": notes or [],
         "task_snapshot": task_snapshot(task),
     }
+    if session:
+        execution.update(session_link_fields(execution, session))
     validate("execution", execution)
     store.put("executions", project_id, execution_id, execution)
     update_task(store, project_id, task_id, status="in_progress", assigned_provider=provider, blocked_reason=None, current_progress=f"Execution {execution_id} running", next_action="Finish or interrupt execution")
@@ -90,6 +149,7 @@ def finish_execution(store, service, project_id, execution_id, status="completed
     after = quota_snapshot(read_drive_status(service=service), execution["provider"])
     execution.update(
         completed_at=completed_at, elapsed_minutes=round(elapsed, 6), status=status,
+        finished_at=completed_at,
         quota_after=after, quota_delta=quota_delta(execution["quota_before"], after, execution["started_at"], completed_at),
     )
     if note:
@@ -125,14 +185,19 @@ def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     start = sub.add_parser("start"); start.add_argument("project_id"); start.add_argument("task_id"); start.add_argument("execution_id"); start.add_argument("--provider", required=True); start.add_argument("--mode"); start.add_argument("--effort"); start.add_argument("--note", action="append")
+    start.add_argument("--session-id", help="Canonical session key or legacy raw Codex session ID")
     for command in ("finish", "fail", "interrupt"):
         item = sub.add_parser(command); item.add_argument("project_id"); item.add_argument("execution_id"); item.add_argument("--note")
     read = sub.add_parser("read"); read.add_argument("project_id"); read.add_argument("execution_id")
+    link = sub.add_parser("link-session"); link.add_argument("project_id"); link.add_argument("execution_id"); link.add_argument("session_id"); link.add_argument("--provider")
     args = parser.parse_args()
     try:
         service = build_service(); store = DriveRecords(service)
-        if args.command == "start": result = start_execution(store, service, args.project_id, args.task_id, args.execution_id, args.provider, args.mode, args.effort, notes=args.note)
+        if args.command == "start":
+            session = read_session_for_link(store, args.project_id, args.session_id, args.provider) if args.session_id else None
+            result = start_execution(store, service, args.project_id, args.task_id, args.execution_id, args.provider, args.mode, args.effort, notes=args.note, session=session)
         elif args.command == "read": result = read_execution(store, args.project_id, args.execution_id)
+        elif args.command == "link-session": result = link_execution_session(store, args.project_id, args.execution_id, read_session_for_link(store, args.project_id, args.session_id, args.provider))
         else:
             terminal = {"finish": "completed", "fail": "failed", "interrupt": "interrupted"}[args.command]
             result = finish_execution(store, service, args.project_id, args.execution_id, terminal, note=args.note)

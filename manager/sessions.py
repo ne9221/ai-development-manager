@@ -11,10 +11,10 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
-from urllib.parse import quote, unquote
 
 from collectors.publish_drive import build_service
 from manager.runtime_bridge import all_projects as read_projects
+from manager.session_identity import manager_session_key, parse_manager_session_key, session_manager_key, session_provider_identity
 from manager.tasks import DriveRecords, TaskError, validate
 
 
@@ -23,35 +23,6 @@ TITLE_LIMIT = 72
 UNCLASSIFIED_PROJECT_ID = "_unclassified"
 REVIEW_PROJECT_ID = "_review_queue"
 PROJECT_SNAPSHOT_VERSION = 1
-
-
-def manager_session_key(provider, provider_session_id):
-    """Return the reversible, provider-aware Manager identity/storage key."""
-    if not isinstance(provider, str) or not provider or not isinstance(provider_session_id, str) or not provider_session_id:
-        raise TaskError("provider and provider_session_id must be non-empty strings")
-    return f"{quote(provider, safe='')}:{quote(provider_session_id, safe='')}"
-
-
-def parse_manager_session_key(value):
-    """Reverse a Manager key; malformed values are not accepted as identities."""
-    if not isinstance(value, str) or value.count(":") != 1:
-        return None
-    provider, provider_session_id = (unquote(part) for part in value.split(":", 1))
-    return (provider, provider_session_id) if provider and provider_session_id else None
-
-
-def session_provider_identity(record):
-    """Get provider identity, including legacy records that predate the new field."""
-    provider = record.get("provider")
-    provider_session_id = record.get("provider_session_id") or record.get("session_id")
-    if not isinstance(provider, str) or not provider or not isinstance(provider_session_id, str) or not provider_session_id:
-        raise TaskError("session record is missing provider-aware identity")
-    return (provider, provider_session_id)
-
-
-def session_manager_key(record):
-    provider, provider_session_id = session_provider_identity(record)
-    return manager_session_key(provider, provider_session_id)
 
 
 def _session_matches_reference(record, value):
