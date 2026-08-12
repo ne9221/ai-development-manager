@@ -564,6 +564,7 @@ def assign_review(store, session, project_id, projects, timestamp):
             validate("session_review", existing)
             if session_provider_identity(existing) != session_provider_identity(session):
                 existing = None
+                storage_key = key
         except (TaskError, KeyError):
             existing = None
             storage_key = key
@@ -672,7 +673,23 @@ def import_sessions(store, adapter, sessions_root=None, projects=None, repositor
         record = classify_project(record, projects, repository_lookup)
         record.pop("_candidate_signals", None)
         validate("session", record)
-        store.put("sessions", record["project_id"] or UNCLASSIFIED_PROJECT_ID, session_manager_key(record), record)
+        target = record["project_id"] or UNCLASSIFIED_PROJECT_ID
+        key = session_manager_key(record)
+        identity = session_provider_identity(record)
+        stale = []
+        partitions = {UNCLASSIFIED_PROJECT_ID, *(project["project_id"] for project in projects)}
+        for project_id in partitions - {target}:
+            for storage_key in dict.fromkeys((key, identity[1])):
+                try:
+                    existing = store.get("sessions", project_id, storage_key)
+                    validate("session", existing)
+                except (TaskError, KeyError):
+                    continue
+                if session_provider_identity(existing) == identity:
+                    stale.append((project_id, storage_key))
+        store.put("sessions", target, key, record)
+        for project_id, storage_key in stale:
+            store.delete("sessions", project_id, storage_key)
         records.append(record)
     return records
 

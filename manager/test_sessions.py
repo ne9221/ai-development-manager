@@ -6,21 +6,24 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
+from manager.context_pack import recent_sessions
+from manager.session_identity import session_provider_identity
 from manager.sessions import CanonicalSession, ClaudeSessionAdapter, CodexSessionAdapter, REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_claude_sessions, discover_codex_sessions, extract_repository_urls, import_claude_sessions, import_codex_sessions, load_preview_projects, manager_session_key, parse_identity_header, parse_manager_session_key, preview_claude_sessions, preview_codex_sessions, project_preview_snapshot, review_queue, search_sessions
-from manager.tasks import validate
+from manager.tasks import TaskError, validate
 
 
 PROJECT = {"project_id": "ai-development-manager", "name": "AI Development Manager", "aliases": ["adm"], "repo": "https://github.com/ne9221/ai-development-manager", "default_branch": "main", "working_directory": "C:/work/ai-development-manager", "runtime_ssot": "Google Drive", "project_rules": [], "active_tasks": [], "current_phase": "1", "important_constraints": []}
 
 
 class MemoryStore:
-    def __init__(self): self.records = {}
+    def __init__(self): self.records = {}; self.deleted = []
     def list_projects(self): return [PROJECT]
     def put(self, area, project_id, name, document):
         self.records[(area, project_id, name)] = deepcopy(document)
         return document
     def get(self, area, project_id, name): return deepcopy(self.records[(area, project_id, name)])
     def list_records(self, area, project_id): return [deepcopy(value) for (record_area, record_project, _), value in self.records.items() if record_area == area and record_project == project_id]
+    def delete(self, area, project_id, name): self.deleted.append((area, project_id, name)); del self.records[(area, project_id, name)]
 
 
 def fixture(cwd="C:/work/ai-development-manager"):
@@ -143,6 +146,16 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(manager_session_key("codex", "abc123"), manager_session_key("codex", "abc123"))
         self.assertNotEqual(manager_session_key("codex", "abc123"), manager_session_key("claude", "abc123"))
         self.assertEqual(("codex", "a/b:c"), parse_manager_session_key(manager_session_key("codex", "a/b:c")))
+        values = ["abc:def", "abc%3Adef", "Unicode-é", "中文", "a/b", "a\\b", " spaced value "]
+        keys = [manager_session_key("claude", value) for value in values]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertEqual(values, [parse_manager_session_key(key)[1] for key in keys])
+
+    def test_legacy_identity_fallback_normalizes_canonical_session_id_once(self):
+        self.assertEqual(("codex", "abc123"), session_provider_identity({"provider": "codex", "session_id": "abc123", "provider_session_id": None}))
+        self.assertEqual(("claude", "abc123"), session_provider_identity({"provider": "claude", "session_id": "claude:abc123", "provider_session_id": None}))
+        self.assertEqual(("claude", "codex:abc123"), session_provider_identity({"provider": "claude", "session_id": "codex:abc123", "provider_session_id": None}))
+        self.assertEqual(("claude", "claude:%"), session_provider_identity({"provider": "claude", "session_id": "claude:%", "provider_session_id": None}))
 
     def test_missing_cwd_is_retained_as_null(self):
         temp, root, _ = self.session_file(fixture(cwd=None).replace(', "cwd": null', ''))
@@ -188,6 +201,58 @@ class SessionTests(unittest.TestCase):
             records = import_codex_sessions(store, root, session_ids=["different-session"])
             self.assertEqual([], records)
             self.assertEqual({}, store.records)
+
+    def test_reclassification_writes_new_location_then_removes_verified_stale_copies(self):
+        temp, root, _ = self.session_file(fixture("C:/elsewhere"))
+        project_a = deepcopy(PROJECT)
+        project_b = deepcopy(PROJECT); project_b.update(project_id="other-project", name="Other", aliases=[], repo="https://github.com/example/other", working_directory="C:/other")
+        with temp:
+            store = MemoryStore()
+            no_match = lambda _cwd: {"git_root": None, "remote": None}
+            origin = lambda _cwd: {"git_root": "C:/work/a", "remote": PROJECT["repo"]}
+            other = lambda _cwd: {"git_root": "C:/work/b", "remote": project_b["repo"]}
+            import_codex_sessions(store, root, [project_a, project_b], no_match)
+            key = "codex:session-123"
+            self.assertIn(("sessions", "_unclassified", key), store.records)
+
+            import_codex_sessions(store, root, [project_a, project_b], origin)
+            self.assertNotIn(("sessions", "_unclassified", key), store.records)
+            self.assertIn(("sessions", project_a["project_id"], key), store.records)
+
+            claude_key = "claude:session-123"
+            claude = deepcopy(store.records[("sessions", project_a["project_id"], key)])
+            claude.update(session_id=claude_key, provider="claude", provider_session_id="session-123")
+            store.records[("sessions", project_a["project_id"], claude_key)] = claude
+            import_codex_sessions(store, root, [project_a, project_b], other)
+            self.assertNotIn(("sessions", project_a["project_id"], key), store.records)
+            self.assertIn(("sessions", project_a["project_id"], claude_key), store.records)
+            self.assertIn(("sessions", project_b["project_id"], key), store.records)
+            self.assertEqual([claude_key], [item["session_id"] for item in recent_sessions(store, project_a["project_id"], reviews=[])])
+            self.assertEqual([key], [item["session_id"] for item in recent_sessions(store, project_b["project_id"], reviews=[])])
+
+            deleted = list(store.deleted)
+            import_codex_sessions(store, root, [project_a, project_b], other)
+            self.assertEqual(deleted, store.deleted)
+
+    def test_reclassification_keeps_old_location_when_new_write_fails(self):
+        temp, root, _ = self.session_file(fixture("C:/elsewhere"))
+        project_b = deepcopy(PROJECT); project_b.update(project_id="other-project", name="Other", aliases=[], repo="https://github.com/example/other", working_directory="C:/other")
+        with temp:
+            store = MemoryStore()
+            origin = lambda _cwd: {"git_root": "C:/work/a", "remote": PROJECT["repo"]}
+            other = lambda _cwd: {"git_root": "C:/work/b", "remote": project_b["repo"]}
+            import_codex_sessions(store, root, [PROJECT, project_b], origin)
+            key = ("sessions", PROJECT["project_id"], "codex:session-123")
+            original_put = store.put
+            def fail_new_location(area, project_id, name, document):
+                if area == "sessions" and project_id == project_b["project_id"]:
+                    raise TaskError("write failed")
+                return original_put(area, project_id, name, document)
+            store.put = fail_new_location
+            with self.assertRaisesRegex(TaskError, "write failed"):
+                import_codex_sessions(store, root, [PROJECT, project_b], other)
+            self.assertIn(key, store.records)
+            self.assertEqual([], store.deleted)
 
     def test_existing_title_wins_over_prompt_candidate(self):
         temp, root, _ = self.session_file()
@@ -341,6 +406,13 @@ class SessionTests(unittest.TestCase):
         updated = assign_review(legacy_store, codex, "other-project", [PROJECT, other], "2026-08-10T02:00:00Z")
         self.assertEqual("abc123", updated["session_id"])
         self.assertEqual({"abc123"}, {key[2] for key in legacy_store.records})
+        collision_store = MemoryStore(); collision_store.records[("session_reviews", REVIEW_PROJECT_ID, "abc123")] = deepcopy(legacy)
+        claude_review = assign_review(collision_store, claude, "other-project", [PROJECT, other], "2026-08-10T03:00:00Z")
+        self.assertEqual({"abc123", "claude:abc123"}, {key[2] for key in collision_store.records})
+        self.assertEqual("codex", collision_store.records[("session_reviews", REVIEW_PROJECT_ID, "abc123")]["provider"])
+        self.assertEqual("claude", claude_review["provider"])
+        self.assertEqual(1, len(claude_review["assignment_history"]))
+        self.assertNotEqual(legacy["assignment_history"], claude_review["assignment_history"])
 
     def test_search_filters_text_metadata_dates_and_manual_mapping(self):
         first = search_record()

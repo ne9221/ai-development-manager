@@ -99,6 +99,16 @@ class DriveRecords:
         except Exception as exc:
             raise TaskError(f"could not read Drive record: {filename}") from exc
 
+    def delete(self, area, project_id, name):
+        parent = self.project_folder(area, project_id, create=False)
+        filename = f"{safe_id(name)}.json"
+        matches = self.children(parent, filename)
+        if len(matches) != 1:
+            raise TaskError(f"expected one Drive record {filename}; found {len(matches)}")
+        self.files.delete(fileId=matches[0]["id"]).execute()
+        if self.children(parent, filename):
+            raise TaskError(f"Drive delete verification failed: {filename}")
+
     def list_records(self, area, project_id):
         parent = self.project_folder(area, project_id, create=False)
         names = [item["name"][:-5] for item in self.children(parent) if item.get("name", "").endswith(".json")]
