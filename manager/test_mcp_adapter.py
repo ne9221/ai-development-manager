@@ -9,6 +9,7 @@ from unittest.mock import patch
 from mcp import Client
 
 from manager.mcp_adapter import invoke_bridge, server
+from manager.runtime_quota_tool import read_runtime_status
 from manager.tasks import TaskError
 
 
@@ -56,6 +57,10 @@ class MCPAdapterTests(unittest.TestCase):
                 self.assertTrue(all(item.annotations.read_only_hint and item.annotations.destructive_hint is False for item in tools))
                 quota_tool = next(item for item in tools if item.name == "adm_runtime_quota_status")
                 self.assertEqual({"max_age_minutes"}, set(quota_tool.input_schema["properties"]))
+                self.assertEqual(
+                    {"default": 60, "minimum": 1, "maximum": 1440, "title": "Max Age Minutes", "type": "integer"},
+                    quota_tool.input_schema["properties"]["max_age_minutes"],
+                )
                 result = await client.call_tool("adm_health", {})
                 self.assertEqual({"status": "ok", "mcp_adapter_version": "1.0", "runtime_contract_version": "1.0"}, structured(result))
         asyncio.run(check())
@@ -84,10 +89,28 @@ class MCPAdapterTests(unittest.TestCase):
         self.assertTrue(all(item["status"] == "unavailable" and item["windows"] == [] for item in unavailable["providers"].values()))
         self.assertNotIn("backend-secret", json.dumps(unavailable))
 
-    def test_runtime_quota_invalid_arguments_fail_closed(self):
-        for arguments in ({"max_age_minutes": 0}, {"max_age_minutes": 1441}, {"max_age_minutes": True}, {"max_age_minutes": None}):
-            with self.subTest(arguments=arguments):
-                self.assertTrue(asyncio.run(tool("adm_runtime_quota_status", arguments)).is_error)
+    def test_runtime_quota_valid_boundaries_reach_loader(self):
+        with patch("manager.runtime_bridge.read_drive_status", return_value=quota_document()), \
+             patch("manager.runtime_quota_tool.read_runtime_status", wraps=read_runtime_status) as loader:
+            for value in (1, 1440):
+                with self.subTest(value=value):
+                    self.assertFalse(asyncio.run(tool("adm_runtime_quota_status", {"max_age_minutes": value})).is_error)
+        self.assertEqual([1, 1440], [call.kwargs["max_age_minutes"] for call in loader.call_args_list])
+
+    def test_runtime_quota_unexpected_property_is_not_forwarded(self):
+        with patch("manager.runtime_bridge.read_drive_status", return_value=quota_document()), \
+             patch("manager.runtime_quota_tool.read_runtime_status", wraps=read_runtime_status) as loader:
+            result = asyncio.run(tool("adm_runtime_quota_status", {"service": {"token": "caller-value"}}))
+        self.assertFalse(result.is_error)
+        loader.assert_called_once_with(max_age_minutes=60)
+
+    def test_runtime_quota_invalid_arguments_fail_closed_before_loader(self):
+        invalid = (-1, 0, 1441, 1.0, "60", True, None, 10**200, {"nested": "value"})
+        with patch("manager.runtime_quota_tool.read_runtime_status") as loader:
+            for value in invalid:
+                with self.subTest(value=value):
+                    self.assertTrue(asyncio.run(tool("adm_runtime_quota_status", {"max_age_minutes": value})).is_error)
+        loader.assert_not_called()
 
     def test_adapter_import_does_not_require_pywintypes(self):
         code = 'import sys; sys.modules["pywintypes"] = None; import manager.runtime_quota_tool'
