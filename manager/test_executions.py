@@ -3,7 +3,7 @@ from copy import deepcopy
 from unittest.mock import patch
 
 from manager.estimator import estimate
-from manager.executions import finish_execution, link_execution_session, list_executions, quota_delta, quota_snapshot, read_execution, read_session_for_link, start_execution
+from manager.executions import finish_execution, link_execution_session, list_executions, mark_execution_running, quota_delta, quota_snapshot, read_execution, read_session_for_link, reserve_execution, start_execution
 from manager.sessions import manager_session_key
 from manager.tasks import DriveRecords, TaskError, create_task, validate
 from manager.test_tasks import FakeDriveService
@@ -12,7 +12,9 @@ from manager.test_tasks import FakeDriveService
 class MemoryStore:
     def __init__(self): self.records = {}
     def put(self, area, project, name, document): self.records[(area, project, name)] = deepcopy(document); return document
-    def get(self, area, project, name): return deepcopy(self.records[(area, project, name)])
+    def get(self, area, project, name):
+        if (area, project, name) not in self.records: raise TaskError("not found")
+        return deepcopy(self.records[(area, project, name)])
 
 
 def quota(windows, generated="2026-08-09T00:00:00Z", provider="codex"):
@@ -55,6 +57,96 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual("codex:s1", run["session_id"])
         self.assertEqual(run, read_execution(self.store, "p1", "e1"))
         self.assertEqual("completed", self.store.get("tasks", "p1", "t1")["status"])
+
+    def test_reserve_preserves_evidence_without_starting_task(self):
+        before = quota([window()])
+        with patch("manager.executions.read_drive_status", return_value=before):
+            result = reserve_execution(self.store, object(), "p1", "t1", "reserved-1", "codex", "code", "medium", "2026-08-09T00:00:00Z", ["decision recorded"])
+        self.assertEqual("reserved", result["status"])
+        self.assertEqual("2026-08-09T00:00:00Z", result["reserved_at"])
+        self.assertIsNone(result["started_at"])
+        self.assertEqual(["decision recorded"], result["notes"])
+        self.assertEqual("known", result["quota_before"]["status"])
+        self.assertEqual("implementation", result["task_snapshot"]["task_type"])
+        self.assertIsNone(result["session_id"])
+        stored_task = self.store.get("tasks", "p1", "t1")
+        self.assertEqual("ready", stored_task["status"])
+        self.assertIsNone(stored_task["assigned_provider"])
+        validate("execution", result)
+
+    def test_reserve_requires_an_existing_task(self):
+        with self.assertRaises(TaskError):
+            reserve_execution(self.store, object(), "p1", "missing", "no-task", "codex")
+
+    def test_reservation_retry_is_idempotent_and_conflicts_fail_closed(self):
+        with patch("manager.executions.read_drive_status", return_value=quota([window()])) as reader:
+            first = reserve_execution(self.store, object(), "p1", "t1", "reserved-retry", "codex", "code", "medium", "2026-08-09T00:00:00Z")
+            second = reserve_execution(self.store, object(), "p1", "t1", "reserved-retry", "codex", "code", "medium", "2026-08-09T01:00:00Z", ["replacement"])
+        self.assertEqual(first, second)
+        self.assertEqual("2026-08-09T00:00:00Z", second["reserved_at"])
+        self.assertEqual(first["quota_before"], second["quota_before"])
+        self.assertEqual(first["task_snapshot"], second["task_snapshot"])
+        reader.assert_called_once()
+        with self.assertRaisesRegex(TaskError, "already reserved or used"):
+            reserve_execution(self.store, object(), "p1", "t1", "reserved-retry", "claude", "analysis", "medium")
+        with self.assertRaisesRegex(TaskError, "already reserved or used"):
+            reserve_execution(self.store, object(), "p1", "t1", "reserved-retry", "codex", "code", "medium", session=session())
+        self.assertEqual(first, self.store.get("executions", "p1", "reserved-retry"))
+
+    def test_mark_running_updates_execution_before_task_and_preserves_reservation(self):
+        with patch("manager.executions.read_drive_status", return_value=quota([])):
+            reserved = reserve_execution(self.store, object(), "p1", "t1", "run-reserved", "codex", reserved_at="2026-08-09T00:00:00Z")
+        result = mark_execution_running(self.store, "p1", "run-reserved", "2026-08-09T00:01:00Z")
+        self.assertEqual("running", result["status"])
+        self.assertEqual(reserved["reserved_at"], result["reserved_at"])
+        self.assertEqual("2026-08-09T00:01:00Z", result["started_at"])
+        stored_task = self.store.get("tasks", "p1", "t1")
+        self.assertEqual("in_progress", stored_task["status"])
+        self.assertEqual("codex", stored_task["assigned_provider"])
+
+    def test_mark_running_persistence_failure_leaves_task_ready(self):
+        with patch("manager.executions.read_drive_status", return_value=quota([])):
+            reserve_execution(self.store, object(), "p1", "t1", "put-fails", "codex")
+        with patch.object(self.store, "put", side_effect=TaskError("write failed")):
+            with self.assertRaisesRegex(TaskError, "write failed"):
+                mark_execution_running(self.store, "p1", "put-fails")
+        self.assertEqual("ready", self.store.get("tasks", "p1", "t1")["status"])
+        self.assertEqual("reserved", self.store.get("executions", "p1", "put-fails")["status"])
+
+    def test_reserved_schema_and_transition_rejections(self):
+        with patch("manager.executions.read_drive_status", return_value=quota([])):
+            reserved = reserve_execution(self.store, object(), "p1", "t1", "reserved-invalid", "codex", reserved_at="2026-08-09T00:00:00Z")
+        for changes in ({"started_at": "2026-08-09T00:01:00Z"}, {"completed_at": "2026-08-09T00:01:00Z"}, {"finished_at": "2026-08-09T00:01:00Z"}, {"elapsed_minutes": 0}):
+            with self.subTest(changes=changes), self.assertRaises(TaskError):
+                validate("execution", {**reserved, **changes})
+        missing_timestamp = dict(reserved); missing_timestamp.pop("reserved_at")
+        with self.assertRaises(TaskError): validate("execution", missing_timestamp)
+        with self.assertRaises(TaskError): validate("execution", {**reserved, "status": "running"})
+        with patch("manager.executions.read_drive_status", return_value=quota([])):
+            with self.assertRaisesRegex(TaskError, "not running"):
+                finish_execution(self.store, object(), "p1", "reserved-invalid")
+        self.assertEqual("ready", self.store.get("tasks", "p1", "t1")["status"])
+        running = mark_execution_running(self.store, "p1", "reserved-invalid", "2026-08-09T00:01:00Z")
+        with self.assertRaisesRegex(TaskError, "not reserved"):
+            mark_execution_running(self.store, "p1", running["execution_id"])
+
+    def test_reserve_rejects_running_and_terminal_execution_ids(self):
+        for status in ("running", "completed", "failed", "interrupted"):
+            execution_id = f"used-{status}"
+            with patch("manager.executions.read_drive_status", side_effect=[quota([]), quota([])]):
+                start_execution(self.store, object(), "p1", "t1", execution_id, "codex", started_at="2026-08-09T00:00:00Z")
+                if status != "running":
+                    finish_execution(self.store, object(), "p1", execution_id, status, "2026-08-09T00:01:00Z")
+            with self.assertRaisesRegex(TaskError, "already reserved or used"):
+                reserve_execution(self.store, object(), "p1", "t1", execution_id, "codex")
+            with self.assertRaisesRegex(TaskError, "not reserved"):
+                mark_execution_running(self.store, "p1", execution_id)
+
+    def test_legacy_running_record_without_reserved_at_still_validates(self):
+        with patch("manager.executions.read_drive_status", return_value=quota([])):
+            legacy = start_execution(self.store, object(), "p1", "t1", "legacy-running", "codex", started_at="2026-08-09T00:00:00Z")
+        legacy.pop("reserved_at")
+        validate("execution", legacy)
 
     def test_drive_execution_ids_round_trip_through_create_list_and_read(self):
         store = DriveRecords(FakeDriveService())

@@ -152,25 +152,54 @@ def read_session_for_link(store, project_id, session_ref, provider=None):
     raise TaskError(f"session not found for link: {session_ref}")
 
 
-def start_execution(store, service, project_id, task_id, execution_id, provider, mode=None, effort=None, started_at=None, notes=None, session=None):
+def reserve_execution(store, service, project_id, task_id, execution_id, provider, mode=None, effort=None, reserved_at=None, notes=None, session=None):
     task = store.get("tasks", project_id, task_id)
-    started_at = started_at or now_iso()
+    mode, effort = mode or task.get("mode"), effort or task.get("effort")
+    link = {"session_id": None, "provider_session_id": None}
+    if session:
+        link.update(session_link_fields({"provider": provider, "project_id": project_id}, session))
+    try:
+        existing = store.get("executions", project_id, execution_id)
+    except TaskError as exc:
+        if "found 0" not in str(exc) and "not found" not in str(exc):
+            raise
+    else:
+        validate("execution", existing)
+        identity = ("execution_id", "task_id", "project_id", "provider", "mode", "effort", "session_id", "provider_session_id")
+        expected = (execution_id, task_id, project_id, provider, mode, effort, link["session_id"], link["provider_session_id"])
+        if existing["status"] == "reserved" and tuple(existing.get(key) for key in identity) == expected:
+            return existing
+        raise TaskError(f"execution ID is already reserved or used: {execution_id}")
+    reserved_at = reserved_at or now_iso()
     before = quota_snapshot(read_drive_status(service=service), provider)
     execution = {
         "execution_id": execution_id, "task_id": task_id, "project_id": project_id,
-        "provider": provider, "mode": mode or task.get("mode"), "effort": effort or task.get("effort"),
-        "started_at": started_at, "completed_at": None, "elapsed_minutes": None, "status": "running",
-        "finished_at": None, "session_id": None, "provider_session_id": None,
+        "provider": provider, "mode": mode, "effort": effort,
+        "reserved_at": reserved_at, "started_at": None, "completed_at": None, "elapsed_minutes": None, "status": "reserved",
+        "finished_at": None, **link,
         "quota_before": before, "quota_after": None, "quota_delta": None,
         "source_confidence": before.get("confidence", "unknown"), "notes": notes or [],
         "task_snapshot": task_snapshot(task),
     }
-    if session:
-        execution.update(session_link_fields(execution, session))
+    validate("execution", execution)
+    return store.put("executions", project_id, execution_id, execution)
+
+
+def mark_execution_running(store, project_id, execution_id, started_at=None):
+    execution = store.get("executions", project_id, execution_id)
+    validate("execution", execution)
+    if execution["status"] != "reserved":
+        raise TaskError("execution is not reserved")
+    execution.update(status="running", started_at=started_at or now_iso())
     validate("execution", execution)
     store.put("executions", project_id, execution_id, execution)
-    update_task(store, project_id, task_id, status="in_progress", assigned_provider=provider, blocked_reason=None, current_progress=f"Execution {execution_id} running", next_action="Finish or interrupt execution")
+    update_task(store, project_id, execution["task_id"], status="in_progress", assigned_provider=execution["provider"], blocked_reason=None, current_progress=f"Execution {execution_id} running", next_action="Finish or interrupt execution")
     return execution
+
+
+def start_execution(store, service, project_id, task_id, execution_id, provider, mode=None, effort=None, started_at=None, notes=None, session=None):
+    reservation = reserve_execution(store, service, project_id, task_id, execution_id, provider, mode, effort, started_at, notes, session)
+    return mark_execution_running(store, project_id, reservation["execution_id"], started_at)
 
 
 def finish_execution(store, service, project_id, execution_id, status="completed", completed_at=None, note=None):

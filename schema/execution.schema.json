@@ -11,18 +11,34 @@
     "provider": {"type": "string", "minLength": 1},
     "mode": {"type": ["string", "null"]},
     "effort": {"type": ["string", "null"]},
-    "started_at": {"type": "string", "format": "date-time"},
+    "reserved_at": {"type": "string", "format": "date-time"},
+    "started_at": {"type": ["string", "null"], "format": "date-time"},
     "completed_at": {"type": ["string", "null"], "format": "date-time"},
     "finished_at": {"type": ["string", "null"], "format": "date-time", "description": "Explicit execution finish timestamp; legacy records may use completed_at only."},
     "session_id": {"type": ["string", "null"], "minLength": 1, "description": "Primary manager canonical session identity."},
     "provider_session_id": {"type": ["string", "null"], "minLength": 1, "description": "Raw provider session ID for the primary linked session."},
     "elapsed_minutes": {"type": ["number", "null"], "minimum": 0},
-    "status": {"enum": ["running", "completed", "failed", "interrupted"]},
+    "status": {"enum": ["reserved", "running", "completed", "failed", "interrupted"]},
     "quota_before": {"type": "object"},
     "quota_after": {"type": ["object", "null"]},
     "quota_delta": {"type": ["object", "null"]},
     "source_confidence": {"type": "string"},
     "notes": {"type": "array", "items": {"type": "string"}},
     "task_snapshot": {"type": "object"}
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "reserved"}}},
+      "then": {
+        "required": ["reserved_at", "finished_at"],
+        "properties": {
+          "started_at": {"type": "null"},
+          "completed_at": {"type": "null"},
+          "finished_at": {"type": "null"},
+          "elapsed_minutes": {"type": "null"}
+        }
+      },
+      "else": {"properties": {"started_at": {"type": "string", "format": "date-time"}}}
+    }
+  ]
 }
