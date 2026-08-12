@@ -305,6 +305,17 @@ a concise handoff with actual time and quota/token usage when available.
   if its public contract requires use-site support, and focused lifecycle tests.
 - Acceptance: production-write reservation passes local preflight and acquire
   before running; read-only bypass is recorded; every rejection prevents launch.
+- `manager.execution_lifecycle.enter_running_gate()` is the Slice 3 lifecycle
+  boundary. It stops after execution/task persistence and returns the active
+  lease privately; it does not launch a provider. The legacy direct `start`
+  API/CLI is retired.
+- Production lock input uses the canonical Project repository plus the
+  reservation snapshot's working directory, full branch, baseline, and
+  non-empty `allowed_paths`; missing or conflicting evidence fails closed.
+- An ordinary persistence exception after acquire rolls execution/task back and
+  releases the lease. A process crash before running persistence leaves the
+  reservation unchanged and relies on bounded lease expiry; crash reconciliation
+  remains deferred.
 - Forbidden scope: provider-specific launch logic, session linking, heartbeat,
   terminal policy, quota scoring changes, or advisory `check()` as authority.
 

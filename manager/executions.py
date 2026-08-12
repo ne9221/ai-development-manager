@@ -97,7 +97,7 @@ def task_snapshot(task):
         "title", "task_type", "complexity", "expected_minutes", "needs_repo_edit",
         "needs_research", "needs_browser", "parallelizable", "read_only", "scope",
         "constraints", "acceptance_criteria", "working_directory", "branch",
-        "allowed_paths", "execution_policies",
+        "baseline_head", "allowed_paths", "execution_policies",
     )
     return {key: task.get(key) for key in keys if key in task}
 
@@ -194,35 +194,62 @@ def reserve_execution(store, project_id, task_id, execution_id, provider, quota_
     return store.put("executions", project_id, execution_id, execution)
 
 
-def start_execution(store, service, project_id, task_id, execution_id, provider, mode=None, effort=None, started_at=None, notes=None, session=None):
-    task = store.get("tasks", project_id, task_id)
-    try:
-        existing = store.get("executions", project_id, execution_id)
-    except KeyError:
-        existing = None
-    except TaskError as exc:
-        if "found 0" not in str(exc) and "not found" not in str(exc):
-            raise
-        existing = None
-    if existing is not None:
-        raise TaskError(f"execution_id already exists; reserved executions require the authoritative running gate: {execution_id}")
-    started_at = started_at or now_iso()
-    before = quota_snapshot(read_drive_status(service=service), provider)
-    execution = {
-        "execution_id": execution_id, "task_id": task_id, "project_id": project_id,
-        "provider": provider, "mode": mode or task.get("mode"), "effort": effort or task.get("effort"),
-        "started_at": started_at, "completed_at": None, "elapsed_minutes": None, "status": "running",
-        "finished_at": None, "session_id": None, "provider_session_id": None,
-        "quota_before": before, "quota_after": None, "quota_delta": None,
-        "source_confidence": before.get("confidence", "unknown"), "notes": notes or [],
-        "task_snapshot": task_snapshot(task),
-    }
-    if session:
-        execution.update(session_link_fields(execution, session))
+def start_execution(*_args, **_kwargs):
+    raise TaskError("legacy start is retired; reserve first and use the authoritative running gate")
+
+
+def _mark_execution_running(store, project_id, task_id, execution_id, provider, access, lease_evidence, quota_before, source_confidence, started_at=None):
+    """Persist the running execution first, then its task transition."""
+    execution = store.get("executions", project_id, execution_id)
     validate("execution", execution)
-    store.put("executions", project_id, execution_id, execution)
-    update_task(store, project_id, task_id, status="in_progress", assigned_provider=provider, blocked_reason=None, current_progress=f"Execution {execution_id} running", next_action="Finish or interrupt execution")
-    return execution
+    requested_identity = {"project_id": project_id, "task_id": task_id, "execution_id": execution_id, "provider": provider}
+    if any(execution.get(key) != value for key, value in requested_identity.items()):
+        raise TaskError("running identity does not match the reservation")
+    if execution["status"] != "reserved":
+        raise TaskError("running transition requires a reserved execution")
+    task = store.get("tasks", project_id, task_id)
+    validate("task", task)
+    if task["status"] != "ready":
+        raise TaskError("running transition requires the task to remain ready")
+    if access == "production_write":
+        if not isinstance(lease_evidence, dict) or lease_evidence.get("authority") != "acquired":
+            raise TaskError("production running transition requires acquired lease evidence")
+    elif access == "read_only":
+        if lease_evidence is not None:
+            raise TaskError("read-only running transition cannot carry writer lease evidence")
+    else:
+        raise TaskError("access must be production_write or read_only")
+    if not isinstance(quota_before, dict) or not isinstance(source_confidence, str):
+        raise TaskError("running transition requires quota-before evidence")
+
+    execution_before, task_before = execution, task
+    execution_write_attempted = task_write_attempted = False
+    try:
+        running = {
+            **execution, "access": access, "lease_evidence": lease_evidence,
+            "started_at": started_at or now_iso(), "status": "running",
+            "quota_before": quota_before, "source_confidence": source_confidence,
+        }
+        validate("execution", running)
+        execution_write_attempted = True
+        store.put("executions", project_id, execution_id, running)
+        task_write_attempted = True
+        update_task(store, project_id, task_id, status="in_progress", assigned_provider=provider, blocked_reason=None, current_progress=f"Execution {execution_id} running", next_action="Launch provider after the running gate")
+    except Exception as exc:
+        cleanup_errors = []
+        for attempted, area, name, document in (
+            (execution_write_attempted, "executions", execution_id, execution_before),
+            (task_write_attempted, "tasks", task_id, task_before),
+        ):
+            if attempted:
+                try:
+                    store.put(area, project_id, name, document)
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f"{area} rollback failed: {cleanup_exc}")
+        if cleanup_errors:
+            raise TaskError(f"running transition failed and rollback was incomplete: {'; '.join(cleanup_errors)}") from exc
+        raise
+    return running
 
 
 def finish_execution(store, service, project_id, execution_id, status="completed", completed_at=None, note=None):
@@ -279,12 +306,11 @@ def main():
     link = sub.add_parser("link-session"); link.add_argument("project_id"); link.add_argument("execution_id"); link.add_argument("session_id"); link.add_argument("--provider")
     args = parser.parse_args()
     try:
+        if args.command == "start":
+            return start_execution()
         service = build_service(); store = DriveRecords(service)
         if args.command == "reserve":
             result = reserve_execution(store, args.project_id, args.task_id, args.execution_id, args.provider, json.loads(args.quota_evidence_json), args.mode, args.effort, notes=args.note)
-        elif args.command == "start":
-            session = read_session_for_link(store, args.project_id, args.session_id, args.provider) if args.session_id else None
-            result = start_execution(store, service, args.project_id, args.task_id, args.execution_id, args.provider, args.mode, args.effort, notes=args.note, session=session)
         elif args.command == "read": result = read_execution(store, args.project_id, args.execution_id)
         elif args.command == "link-session": result = link_execution_session(store, args.project_id, args.execution_id, read_session_for_link(store, args.project_id, args.session_id, args.provider))
         else:

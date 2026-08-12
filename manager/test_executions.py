@@ -3,10 +3,11 @@ import unittest
 from copy import deepcopy
 from unittest.mock import patch
 
+from manager import executions as executions_module
 from manager.estimator import estimate
 from manager.executions import finish_execution, link_execution_session, list_executions, main as executions_main, quota_delta, quota_snapshot, read_execution, read_session_for_link, reserve_execution, start_execution, task_snapshot
 from manager.sessions import manager_session_key
-from manager.tasks import DriveRecords, TaskError, create_task, validate
+from manager.tasks import DriveRecords, TaskError, create_task, update_task, validate
 from manager.test_tasks import FakeDriveService
 
 
@@ -50,6 +51,27 @@ def execution(minutes, delta=2, status="completed"):
 
 def session(provider="codex", provider_session_id="s1", project_id="p1"):
     return {"session_id": manager_session_key(provider, provider_session_id), "provider": provider, "provider_session_id": provider_session_id, "project_id": project_id}
+
+
+def put_legacy_running(store, service, project_id, task_id, execution_id, provider, mode=None, effort=None, started_at=None, notes=None, session=None):
+    """Create a legacy running fixture without exposing a production bypass."""
+    task_document = store.get("tasks", project_id, task_id)
+    before = quota_snapshot(executions_module.read_drive_status(service=service), provider)
+    record = {
+        "execution_id": execution_id, "task_id": task_id, "project_id": project_id,
+        "provider": provider, "mode": mode or task_document.get("mode"), "effort": effort or task_document.get("effort"),
+        "started_at": started_at, "completed_at": None, "elapsed_minutes": None, "status": "running",
+        "finished_at": None, "session_id": None, "provider_session_id": None,
+        "quota_before": before, "quota_after": None, "quota_delta": None,
+        "source_confidence": before.get("confidence", "unknown"), "notes": notes or [],
+        "task_snapshot": task_snapshot(task_document),
+    }
+    if session:
+        record.update(executions_module.session_link_fields(record, session))
+    validate("execution", record)
+    store.put("executions", project_id, execution_id, record)
+    update_task(store, project_id, task_id, status="in_progress", assigned_provider=provider)
+    return record
 
 
 class ExecutionTests(unittest.TestCase):
@@ -102,8 +124,8 @@ class ExecutionTests(unittest.TestCase):
 
     def test_reserve_rejects_running_terminal_and_malformed_existing_records(self):
         with patch("manager.executions.read_drive_status", side_effect=[quota([]), quota([]), quota([])]):
-            running = start_execution(self.store, object(), "p1", "t1", "already-running", "codex", started_at="2026-08-09T00:00:00Z")
-            start_execution(self.store, object(), "p1", "t1", "already-terminal", "codex", started_at="2026-08-09T00:00:00Z")
+            running = put_legacy_running(self.store, object(), "p1", "t1", "already-running", "codex", started_at="2026-08-09T00:00:00Z")
+            put_legacy_running(self.store, object(), "p1", "t1", "already-terminal", "codex", started_at="2026-08-09T00:00:00Z")
             terminal = finish_execution(self.store, object(), "p1", "already-terminal", completed_at="2026-08-09T00:01:00Z")
         for execution_id, existing in (("already-running", running), ("already-terminal", terminal)):
             with self.assertRaisesRegex(TaskError, "different reservation"):
@@ -133,14 +155,14 @@ class ExecutionTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(TaskError):
                 validate("execution", invalid)
         with patch("manager.executions.read_drive_status", side_effect=[quota([]), quota([])]):
-            legacy = start_execution(self.store, object(), "p1", "t1", "legacy-running", "codex", started_at="2026-08-09T00:00:00Z")
+            legacy = put_legacy_running(self.store, object(), "p1", "t1", "legacy-running", "codex", started_at="2026-08-09T00:00:00Z")
             validate("execution", legacy)
             validate("execution", finish_execution(self.store, object(), "p1", "legacy-running", completed_at="2026-08-09T00:01:00Z"))
 
     def test_legacy_start_cannot_promote_or_overwrite_reservation(self):
         with patch("manager.executions.read_drive_status") as reader:
             reserved = reserve_execution(self.store, "p1", "t1", "reserved-gate", "codex", decision(), reserved_at="2026-08-09T00:00:00Z")
-            with self.assertRaisesRegex(TaskError, "authoritative running gate"):
+            with self.assertRaisesRegex(TaskError, "legacy start is retired"):
                 start_execution(self.store, object(), "p1", "t1", "reserved-gate", "codex")
         reader.assert_not_called()
         self.assertEqual(reserved, self.store.get("executions", "p1", "reserved-gate"))
@@ -150,7 +172,7 @@ class ExecutionTests(unittest.TestCase):
         before = quota([window(), window("secondary", 30)])
         after = quota([window(used=13), window("secondary", 34)], "2026-08-09T00:10:00Z")
         with patch("manager.executions.read_drive_status", side_effect=[before, after]):
-            start_execution(self.store, object(), "p1", "t1", "e1", "codex", "code", "medium", "2026-08-09T00:00:00Z", session=session())
+            put_legacy_running(self.store, object(), "p1", "t1", "e1", "codex", "code", "medium", "2026-08-09T00:00:00Z", session=session())
             run = finish_execution(self.store, object(), "p1", "e1", "completed", "2026-08-09T00:10:00Z", "done")
         self.assertEqual(10, run["elapsed_minutes"])
         self.assertEqual([3, 4], [item["used_percent_delta"] for item in run["quota_delta"]["windows"]])
@@ -165,7 +187,7 @@ class ExecutionTests(unittest.TestCase):
         execution_ids = ["exec-123", "exec:123", "exec 123", "執行:123", "exec/123", "exec\\123"]
         with patch("manager.executions.read_drive_status", return_value=quota([])):
             for execution_id in execution_ids:
-                start_execution(store, object(), "p1", "t1", execution_id, "codex", started_at="2026-08-09T00:00:00Z")
+                put_legacy_running(store, object(), "p1", "t1", execution_id, "codex", started_at="2026-08-09T00:00:00Z")
         records = list_executions(store, "p1")
         self.assertEqual(execution_ids, [record["execution_id"] for record in records])
         for execution_id in execution_ids:
@@ -248,7 +270,7 @@ class ExecutionTests(unittest.TestCase):
         before = quota([window("5h")], provider="claude")
         after = quota([window("5h", used=14)], "2026-08-09T00:10:00Z", provider="claude")
         with patch("manager.executions.read_drive_status", side_effect=[before, after]):
-            start_execution(self.store, object(), "p1", "t1", "claude-usage", "claude", started_at="2026-08-09T00:00:00Z", session=session("claude", "s1"))
+            put_legacy_running(self.store, object(), "p1", "t1", "claude-usage", "claude", started_at="2026-08-09T00:00:00Z", session=session("claude", "s1"))
             result = finish_execution(self.store, object(), "p1", "claude-usage", completed_at="2026-08-09T00:10:00Z")
         self.assertEqual("known", result["quota_delta"]["attribution_status"])
         self.assertEqual(4, result["quota_delta"]["windows"][0]["used_percent_delta"])
@@ -256,15 +278,15 @@ class ExecutionTests(unittest.TestCase):
     def test_failed_and_interrupted_are_preserved(self):
         for execution_id, terminal in (("failed", "failed"), ("interrupted", "interrupted")):
             with patch("manager.executions.read_drive_status", side_effect=[quota([]), quota([])]):
-                start_execution(self.store, object(), "p1", "t1", execution_id, "codex", started_at="2026-08-09T00:00:00Z")
+                put_legacy_running(self.store, object(), "p1", "t1", execution_id, "codex", started_at="2026-08-09T00:00:00Z")
                 result = finish_execution(self.store, object(), "p1", execution_id, terminal, "2026-08-09T00:01:00Z")
             self.assertEqual(terminal, result["status"])
             self.assertEqual(1, result["elapsed_minutes"])
 
     def test_start_links_codex_and_claude_canonical_sessions(self):
         with patch("manager.executions.read_drive_status", side_effect=[quota([]), quota([])]):
-            codex = start_execution(self.store, object(), "p1", "t1", "codex-run", "codex", started_at="2026-08-09T00:00:00Z", session=session("codex", "abc123"))
-            claude = start_execution(self.store, object(), "p1", "t1", "claude-run", "claude", started_at="2026-08-09T00:00:00Z", session=session("claude", "abc123"))
+            codex = put_legacy_running(self.store, object(), "p1", "t1", "codex-run", "codex", started_at="2026-08-09T00:00:00Z", session=session("codex", "abc123"))
+            claude = put_legacy_running(self.store, object(), "p1", "t1", "claude-run", "claude", started_at="2026-08-09T00:00:00Z", session=session("claude", "abc123"))
         self.assertEqual("codex:abc123", codex["session_id"])
         self.assertEqual("claude:abc123", claude["session_id"])
         self.assertNotEqual(codex["session_id"], claude["session_id"])
@@ -272,14 +294,14 @@ class ExecutionTests(unittest.TestCase):
 
     def test_link_rejects_provider_and_project_mismatch(self):
         with patch("manager.executions.read_drive_status", return_value=quota([])):
-            start_execution(self.store, object(), "p1", "t1", "e-link", "codex", started_at="2026-08-09T00:00:00Z")
+            put_legacy_running(self.store, object(), "p1", "t1", "e-link", "codex", started_at="2026-08-09T00:00:00Z")
         with self.assertRaises(TaskError): link_execution_session(self.store, "p1", "e-link", session("claude", "s1"))
         with self.assertRaises(TaskError): link_execution_session(self.store, "p1", "e-link", session("codex", "s1", "other"))
 
     def test_link_is_idempotent_allows_shared_session_and_legacy_reads(self):
         with patch("manager.executions.read_drive_status", side_effect=[quota([]), quota([])]):
-            start_execution(self.store, object(), "p1", "t1", "e1", "codex", started_at="2026-08-09T00:00:00Z")
-            second = start_execution(self.store, object(), "p1", "t1", "e2", "codex", started_at="2026-08-09T00:01:00Z", session=session())
+            put_legacy_running(self.store, object(), "p1", "t1", "e1", "codex", started_at="2026-08-09T00:00:00Z")
+            second = put_legacy_running(self.store, object(), "p1", "t1", "e2", "codex", started_at="2026-08-09T00:01:00Z", session=session())
         first = link_execution_session(self.store, "p1", "e1", session())
         self.assertEqual(first, link_execution_session(self.store, "p1", "e1", session()))
         self.assertEqual(first["session_id"], second["session_id"])

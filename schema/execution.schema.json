@@ -20,7 +20,9 @@
           "quota_before": {"type": "null"},
           "quota_after": {"type": "null"},
           "quota_delta": {"type": "null"},
-          "source_confidence": {"type": "null"}
+          "source_confidence": {"type": "null"},
+          "access": {"type": "null"},
+          "lease_evidence": {"type": "null"}
         }
       },
       "else": {
@@ -30,6 +32,14 @@
           "source_confidence": {"type": "string"}
         }
       }
+    },
+    {
+      "if": {"properties": {"access": {"const": "production_write"}}, "required": ["access"]},
+      "then": {"required": ["lease_evidence"], "properties": {"lease_evidence": {"type": "object", "properties": {"authority": {"const": "acquired"}}}}}
+    },
+    {
+      "if": {"properties": {"access": {"const": "read_only"}}, "required": ["access"]},
+      "then": {"required": ["lease_evidence"], "properties": {"lease_evidence": {"type": "null"}}}
     }
   ],
   "required": ["execution_id", "task_id", "project_id", "provider", "mode", "effort", "started_at", "completed_at", "elapsed_minutes", "status", "quota_before", "quota_after", "quota_delta", "source_confidence", "notes", "task_snapshot"],
@@ -53,6 +63,25 @@
     "quota_after": {"type": ["object", "null"]},
     "quota_delta": {"type": ["object", "null"]},
     "source_confidence": {"type": ["string", "null"]},
+    "access": {"enum": ["production_write", "read_only", null]},
+    "lease_evidence": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["authority", "lock_id", "generation", "repository", "branch", "scope", "baseline_head"],
+          "properties": {
+            "authority": {"const": "acquired"},
+            "lock_id": {"type": "string", "pattern": "^repo-[0-9a-f]{64}$"},
+            "generation": {"type": "integer", "minimum": 1},
+            "repository": {"type": "string", "pattern": "^github:[a-z0-9_.-]+/[a-z0-9_.-]+$"},
+            "branch": {"type": "string", "pattern": "^refs/heads/.+$"},
+            "scope": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+            "baseline_head": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"}
+          }
+        }
+      ]
+    },
     "notes": {"type": "array", "items": {"type": "string"}},
     "task_snapshot": {"type": "object"}
   }

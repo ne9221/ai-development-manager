@@ -22,6 +22,7 @@
     "parallelizable": {"type": "boolean"},
     "working_directory": {"type": ["string", "null"]},
     "branch": {"type": ["string", "null"]},
+    "baseline_head": {"type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
     "worktree_id": {"type": ["string", "null"]},
     "allowed_paths": {"type": "array", "items": {"type": "string"}},
     "read_only": {"type": "boolean"},

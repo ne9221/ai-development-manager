@@ -135,12 +135,17 @@ run. Missing windows and quota resets produce unknown deltas instead of guessed
 usage. Records remain in Drive under `EXECUTIONS/<project_id>/`.
 
 ```powershell
-python -m manager.executions start example-project example-task example-run --provider codex
+python -m manager.executions reserve example-project example-task example-run --provider codex --quota-evidence-json $env:CURRENT_QUOTA_EVIDENCE_JSON
+# After manager.execution_lifecycle.enter_running_gate() and the later supervised provider lifecycle:
 python -m manager.executions finish example-project example-run --note "Acceptance criteria passed"
 python -m manager.executions read example-project example-run
 python -m manager.estimator example-project --task-type implementation --provider codex --mode code --effort medium
 python -m manager.assignment --project-id example-project --task-type implementation --needs-repo-edit
 ```
+
+The legacy direct `start` command is retired. Production running transitions use
+`manager.execution_lifecycle.enter_running_gate()` after reservation and
+authoritative writer acquire.
 
 The estimator uses medians from similar completed executions. Estimates over
 20 minutes recommend multiple phases; they do not split or execute tasks.
