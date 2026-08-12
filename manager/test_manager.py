@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from manager.assignment import decide, quota_score
-from manager.quota_reader import summarize
+from manager.quota_reader import QuotaReaderError, parse_time, summarize
 
 
 NOW = datetime(2026, 8, 9, 4, 0, tzinfo=timezone.utc)
@@ -48,6 +48,18 @@ class ManagerTest(unittest.TestCase):
         codex = next(item for item in summary["providers"] if item["provider"] == "codex")
         self.assertTrue(codex["stale"])
         self.assertFalse(codex["has_reliable_quota"])
+
+    def test_future_clock_skew_tolerance(self):
+        near = quota(provider("codex", 90, NOW + timedelta(minutes=1)))
+        self.assertFalse(near["providers"][0]["future_skewed"])
+        far = quota(provider("codex", 90, NOW + timedelta(minutes=6)))
+        self.assertTrue(far["providers"][0]["future_skewed"])
+        self.assertFalse(far["providers"][0]["has_reliable_quota"])
+
+    def test_naive_and_malformed_timestamps_are_rejected(self):
+        for value in ("2026-08-09T04:00:00", "not-a-time"):
+            with self.assertRaises(QuotaReaderError):
+                parse_time(value)
 
     def test_one_and_multiple_windows(self):
         summary = quota(provider("codex", 50, windows=1), provider("claude", 50, windows=3))

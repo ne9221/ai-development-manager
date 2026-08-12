@@ -2,12 +2,12 @@ import json
 import io
 import unittest
 from copy import deepcopy
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from manager.quota_reader import QuotaReaderError
-from manager.runtime_bridge import human_summary, main, resolve_project, runtime_bridge, runtime_status_contract
+from manager.runtime_bridge import human_summary, main, read_runtime_status, resolve_project, runtime_bridge, runtime_status_contract
 from manager.tasks import TaskError, create_handoff, create_project, create_task
 
 
@@ -40,7 +40,8 @@ def quota(codex=80, claude=None, updated=NOW):
     providers = []
     for name, remaining in (("codex", codex), ("claude", claude), ("antigravity", None), ("gemini_app", None)):
         windows = [] if remaining is None else [{"name": "primary", "remaining_percent": remaining, "used_percent": 100-remaining, "resets_at": None}]
-        providers.append({"provider": name, "display_name": name, "collection_mode": "automatic" if name in ("codex", "claude") else "manual", "source": "test", "source_type": "official" if name in ("codex", "claude") else "manual", "confidence": "official" if windows else "unknown", "last_updated": updated.isoformat(), "status": "ok" if windows else "unknown", "windows": windows})
+        source = {"codex": "codex_app_server", "claude": "claude_code_statusline_rate_limits"}.get(name, "manual_report")
+        providers.append({"provider": name, "display_name": name, "collection_mode": "automatic" if name in ("codex", "claude") else "manual", "source": source, "source_type": "official" if name in ("codex", "claude") else "manual", "confidence": "official" if windows else "unknown", "last_updated": updated.isoformat(), "status": "ok" if windows else "unknown", "windows": windows})
     return {"schema_version": "0.1.0", "generated_at": updated.isoformat(), "providers": providers}
 
 
@@ -138,6 +139,28 @@ class RuntimeStatusContractTests(unittest.TestCase):
         self.assertEqual("stale", stale["providers"]["codex"]["status"])
         self.assertEqual("stale", stale["providers"]["codex"]["freshness"])
 
+    def test_unofficial_sources_never_become_known(self):
+        for source_type, confidence, source in (
+            ("local_estimate", "local_estimate", "claude_code_jsonl"),
+            ("manual", "manual", "manual_report"),
+            ("official", "official", "synthetic_source"),
+        ):
+            result = self.contract(claude={"source_type": source_type, "confidence": confidence, "source": source})
+            self.assertEqual("unknown", result["providers"]["claude"]["status"])
+            self.assertEqual([], result["providers"]["claude"]["windows"])
+            self.assertEqual("unknown", result["providers"]["claude"]["source"])
+
+    def test_future_timestamp_tolerance_and_malformed_timestamp(self):
+        small_skew = runtime_status_contract(quota(codex=80, claude=60, updated=NOW + timedelta(minutes=1)), now=NOW)
+        self.assertEqual("known", small_skew["providers"]["codex"]["status"])
+        far_future = runtime_status_contract(quota(codex=80, claude=60, updated=NOW + timedelta(days=36500)), now=NOW)
+        self.assertEqual("unavailable", far_future["providers"]["codex"]["status"])
+        malformed = quota(codex=80, claude=60)
+        malformed["providers"][0]["last_updated"] = "not-a-time"
+        result = runtime_status_contract(malformed, now=NOW)
+        self.assertEqual("unavailable", result["providers"]["codex"]["status"])
+        self.assertEqual("known", result["providers"]["claude"]["status"])
+
     def test_missing_provider_is_unavailable(self):
         document = quota()
         document["providers"] = [item for item in document["providers"] if item["provider"] != "claude"]
@@ -153,6 +176,24 @@ class RuntimeStatusContractTests(unittest.TestCase):
             self.assertEqual({"status", "windows", "source", "last_updated", "freshness"}, set(provider))
         self.assertLessEqual(len(result["providers"]["codex"]["windows"]), 8)
 
+    def test_window_bounds_safe_names_and_duplicate_first_wins(self):
+        document = quota(codex=80, claude=60)
+        document["providers"][0]["windows"] = [
+            {"name": "primary", "used_percent": index, "remaining_percent": 100-index, "resets_at": None}
+            for index in range(2)
+        ] + [{"name": f"Bearer secret {index}", "used_percent": 20, "remaining_percent": 80} for index in range(10000)]
+        result = runtime_status_contract(document, now=NOW)["providers"]["codex"]
+        self.assertEqual(8, len(result["windows"]))
+        self.assertEqual(0, result["windows"][0]["used_percent"])
+        self.assertNotIn("Bearer", json.dumps(result))
+
+    def test_duplicate_provider_isolated(self):
+        document = quota(codex=80, claude=60)
+        document["providers"].append(deepcopy(document["providers"][0]))
+        result = runtime_status_contract(document, now=NOW)
+        self.assertEqual("unavailable", result["providers"]["codex"]["status"])
+        self.assertEqual("known", result["providers"]["claude"]["status"])
+
     def test_no_metadata_secrets_or_raw_payload_leak(self):
         document = quota(codex=80, claude=60)
         document["providers"][0]["metadata"] = {"raw_payload": {"access_token": "raw-secret"}}
@@ -161,6 +202,81 @@ class RuntimeStatusContractTests(unittest.TestCase):
         self.assertNotIn("metadata", serialized)
         self.assertNotIn("raw_payload", serialized)
         self.assertNotIn("raw-secret", serialized)
+
+    def test_free_text_source_and_window_names_are_whitelisted(self):
+        attacks = [
+            "Bearer sk-live-secret", "sk-proj-live-secret", "user@example.com",
+            "C:/Users/Alice/private", "/home/alice/private", "account customer-12345",
+            "x" * 10000,
+        ]
+        for attack in attacks:
+            document = quota(codex=80, claude=60)
+            document["providers"][0]["source"] = attack
+            document["providers"][0]["windows"][0]["name"] = attack
+            serialized = json.dumps(runtime_status_contract(document, now=NOW))
+            self.assertNotIn(attack, serialized)
+        document = quota(codex=80, claude=60)
+        document["providers"][0]["windows"][0]["name"] = "Bearer sk-live-secret"
+        codex = runtime_status_contract(document, now=NOW)["providers"]["codex"]
+        self.assertEqual("window_1", codex["windows"][0]["name"])
+
+    def test_malformed_python_provider_is_isolated(self):
+        invalid_windows = [
+            {"name": {"email": "leak@example.com"}, "remaining_percent": 80},
+            {"name": "primary", "remaining_percent": -1},
+            {"name": "primary", "remaining_percent": 101},
+            {"name": "primary", "remaining_percent": "80"},
+            None, [], "bad",
+        ]
+        for invalid in invalid_windows:
+            document = quota(codex=80, claude=60)
+            document["providers"][0]["windows"] = [invalid]
+            result = runtime_status_contract(document, now=NOW)
+            self.assertEqual("unavailable", result["providers"]["codex"]["status"])
+            self.assertEqual("known", result["providers"]["claude"]["status"])
+
+    def test_public_loader_sanitizes_drive_failures(self):
+        for reader in (
+            lambda **_: (_ for _ in ()).throw(RuntimeError("Bearer backend-secret")),
+            lambda **_: None,
+            lambda **_: {"schema_version": "0.1.0", "generated_at": "bad", "providers": []},
+        ):
+            result = read_runtime_status(reader=reader, now=NOW)
+            self.assertEqual("unavailable", result["providers"]["codex"]["status"])
+
+        class BadService:
+            def files(self): raise RuntimeError("token=raw-secret")
+        result = read_runtime_status(service=BadService(), now=NOW)
+        self.assertEqual("unavailable", result["providers"]["codex"]["status"])
+
+        class FailedRequest:
+            def execute(self): raise RuntimeError("Bearer execute-secret")
+        class FailedFiles:
+            def list(self, **_): return FailedRequest()
+        class FailedExecuteService:
+            def files(self): return FailedFiles()
+        result = read_runtime_status(service=FailedExecuteService(), now=NOW)
+        self.assertEqual("unavailable", result["providers"]["claude"]["status"])
+
+        class ResultRequest:
+            def __init__(self, value=None, error=None): self.value, self.error = value, error
+            def execute(self):
+                if self.error: raise self.error
+                return self.value
+        class FailedGetFiles:
+            def list(self, **_): return ResultRequest({"files": [{"id": "status"}]})
+            def get_media(self, **_): return ResultRequest(error=RuntimeError("sk-get-secret"))
+        class FailedGetService:
+            def files(self): return FailedGetFiles()
+        result = read_runtime_status(service=FailedGetService(), now=NOW)
+        self.assertEqual("unavailable", result["providers"]["codex"]["status"])
+
+        class MalformedFiles(FailedGetFiles):
+            def get_media(self, **_): return ResultRequest(b"not json")
+        class MalformedService:
+            def files(self): return MalformedFiles()
+        result = read_runtime_status(service=MalformedService(), now=NOW)
+        self.assertEqual("unavailable", result["providers"]["codex"]["status"])
 
     def test_missing_and_malformed_drive_status_emit_unavailable_json(self):
         for message in ("found 0", "malformed token=raw-secret payload"):
@@ -173,6 +289,15 @@ class RuntimeStatusContractTests(unittest.TestCase):
             self.assertEqual("unavailable", result["providers"]["codex"]["status"])
             self.assertEqual("unavailable", result["providers"]["claude"]["status"])
             self.assertNotIn("raw-secret", output.getvalue())
+
+    def test_cli_stdout_is_pure_json_and_stderr_has_no_backend_detail(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch("manager.runtime_bridge.read_drive_status", side_effect=RuntimeError("Bearer backend-secret")), \
+             redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(0, main(["status", "--json"]))
+        json.loads(output.getvalue())
+        self.assertEqual("", errors.getvalue())
+        self.assertNotIn("backend-secret", output.getvalue())
 
 
 if __name__ == "__main__": unittest.main()

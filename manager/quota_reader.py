@@ -16,6 +16,11 @@ EXPECTED_PROVIDERS = {
     "antigravity": "Antigravity",
     "gemini_app": "Gemini App / Google AI Pro",
 }
+FUTURE_SKEW_MINUTES = 5
+RELIABLE_SOURCES = {
+    "codex": {"codex_app_server", "official_app_server"},
+    "claude": {"claude_code_statusline_rate_limits", "official_statusline"},
+}
 
 
 class QuotaReaderError(RuntimeError):
@@ -26,7 +31,10 @@ def parse_time(value):
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("timezone is required")
+        return parsed.astimezone(timezone.utc)
     except (AttributeError, ValueError) as exc:
         raise QuotaReaderError(f"invalid timestamp: {value}") from exc
 
@@ -39,18 +47,19 @@ def validate_status(document, schema_path):
         raise QuotaReaderError(f"status schema validation failed: {exc}") from exc
 
 
-def read_drive_status(service=None, folder_id=FOLDER_ID, schema_path=None):
-    service = service or build_service()
+def read_drive_status(service=None, folder_id=FOLDER_ID, schema_path=None, validate_document=True):
     schema_path = schema_path or Path(__file__).parents[1] / "schema" / "status.schema.json"
-    files = service.files()
     query = f"name='{FILE_NAME}' and '{folder_id}' in parents and trashed=false"
     try:
+        service = service or build_service()
+        files = service.files()
         matches = files.list(q=query, spaces="drive", fields="files(id,name,mimeType,parents)", pageSize=10).execute().get("files", [])
         if len(matches) != 1:
             raise QuotaReaderError(f"Drive SSOT must contain exactly one {FILE_NAME}; found {len(matches)}")
         raw = files.get_media(fileId=matches[0]["id"]).execute()
         document = json.loads(raw.decode("utf-8"))
-        validate_status(document, schema_path)
+        if validate_document:
+            validate_status(document, schema_path)
         return document
     except QuotaReaderError:
         raise
@@ -65,16 +74,21 @@ def summarize(document, max_age_minutes=60, now=None):
     for provider_id, display_name in EXPECTED_PROVIDERS.items():
         item = providers.get(provider_id, {})
         updated = parse_time(item.get("last_updated"))
-        age_minutes = None if updated is None else max(0, (now - updated).total_seconds() / 60)
-        stale = age_minutes is None or age_minutes > max_age_minutes
+        age_minutes = None if updated is None else (now - updated).total_seconds() / 60
+        future_skewed = age_minutes is not None and age_minutes < -FUTURE_SKEW_MINUTES
+        stale = age_minutes is None or age_minutes > max_age_minutes or future_skewed
         windows = item.get("windows", [])
         resets = [(parse_time(window.get("resets_at")), window.get("resets_at")) for window in windows if window.get("resets_at")]
         future_resets = [pair for pair in resets if pair[0] and pair[0] >= now]
         nearest_reset = min(future_resets, default=(None, None), key=lambda pair: pair[0])[1]
+        source_reliable = (
+            item.get("source_type") == "official"
+            and item.get("confidence") == "official"
+        )
+        source_verified = source_reliable and item.get("source") in RELIABLE_SOURCES.get(provider_id, set())
         reliable = (
             not stale
-            and item.get("source_type") == "official"
-            and item.get("confidence") == "official"
+            and source_reliable
             and bool(windows)
             and any(window.get("remaining_percent") is not None for window in windows)
         )
@@ -89,8 +103,11 @@ def summarize(document, max_age_minutes=60, now=None):
             "last_updated": item.get("last_updated"),
             "freshness": "stale" if stale else "fresh",
             "stale": stale,
-            "age_minutes": None if age_minutes is None else round(age_minutes, 1),
+            "age_minutes": None if age_minutes is None else round(max(0, age_minutes), 1),
+            "future_skewed": future_skewed,
             "windows": windows,
+            "source_reliable": source_reliable,
+            "source_verified": source_verified,
             "has_reliable_quota": reliable,
             "nearest_reset_at": nearest_reset,
         })
