@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from manager.context_pack import recent_sessions
 from manager.session_identity import session_provider_identity
-from manager.sessions import CanonicalSession, ClaudeSessionAdapter, CodexSessionAdapter, REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_claude_sessions, discover_codex_sessions, extract_repository_urls, import_claude_sessions, import_codex_sessions, load_preview_projects, manager_session_key, parse_identity_header, parse_manager_session_key, preview_claude_sessions, preview_codex_sessions, project_preview_snapshot, review_queue, search_sessions
+from manager.sessions import CanonicalSession, ClaudeSessionAdapter, CodexSessionAdapter, REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_claude_sessions, discover_codex_sessions, extract_repository_urls, import_claude_sessions, import_codex_sessions, import_sessions, load_preview_projects, manager_session_key, parse_identity_header, parse_manager_session_key, preview_claude_sessions, preview_codex_sessions, project_preview_snapshot, review_queue, search_sessions
 from manager.tasks import TaskError, validate
 
 
@@ -16,14 +16,31 @@ PROJECT = {"project_id": "ai-development-manager", "name": "AI Development Manag
 
 
 class MemoryStore:
-    def __init__(self): self.records = {}; self.deleted = []
+    def __init__(self): self.records = {}; self.deleted = []; self.versions = {}
     def list_projects(self): return [PROJECT]
     def put(self, area, project_id, name, document):
-        self.records[(area, project_id, name)] = deepcopy(document)
+        key = (area, project_id, name)
+        self.records[key] = deepcopy(document)
+        self.versions[key] = self.versions.get(key, 0) + 1
         return document
     def get(self, area, project_id, name): return deepcopy(self.records[(area, project_id, name)])
+    def get_with_token(self, area, project_id, name):
+        key = (area, project_id, name)
+        return deepcopy(self.records[key]), {"version": self.versions.get(key, 0), "document": deepcopy(self.records[key])}
     def list_records(self, area, project_id): return [deepcopy(value) for (record_area, record_project, _), value in self.records.items() if record_area == area and record_project == project_id]
-    def delete(self, area, project_id, name): self.deleted.append((area, project_id, name)); del self.records[(area, project_id, name)]
+    def delete(self, area, project_id, name, expected=None):
+        key = (area, project_id, name)
+        if expected is not None and (self.versions.get(key, 0) != expected["version"] or self.records.get(key) != expected["document"]):
+            return False
+        self.deleted.append(key)
+        del self.records[key]
+        self.versions.pop(key, None)
+        return True
+
+
+class StaticAdapter:
+    def __init__(self, records): self.records = records
+    def discover(self, _root): return deepcopy(self.records)
 
 
 def fixture(cwd="C:/work/ai-development-manager"):
@@ -254,6 +271,87 @@ class SessionTests(unittest.TestCase):
             self.assertIn(key, store.records)
             self.assertEqual([], store.deleted)
 
+    def test_reclassification_cleanup_failure_or_concurrent_replacement_keeps_duplicate(self):
+        temp, root, _ = self.session_file(fixture("C:/elsewhere"))
+        project_b = deepcopy(PROJECT); project_b.update(project_id="other-project", name="Other", aliases=[], repo="https://github.com/example/other", working_directory="C:/other")
+        with temp:
+            origin = lambda _cwd: {"git_root": "C:/work/a", "remote": PROJECT["repo"]}
+            other = lambda _cwd: {"git_root": "C:/work/b", "remote": project_b["repo"]}
+            key = "codex:session-123"
+
+            failing = MemoryStore()
+            import_codex_sessions(failing, root, [PROJECT, project_b], origin)
+            stale_key = ("sessions", PROJECT["project_id"], key)
+            failing.put("sessions", "_unclassified", key, failing.records[stale_key])
+            original_delete = failing.delete
+            def fail_one(area, project_id, name, expected=None):
+                if (area, project_id, name) == stale_key:
+                    raise TaskError("delete failed")
+                return original_delete(area, project_id, name, expected)
+            failing.delete = fail_one
+            import_codex_sessions(failing, root, [PROJECT, project_b], other)
+            self.assertIn(stale_key, failing.records)
+            self.assertNotIn(("sessions", "_unclassified", key), failing.records)
+            self.assertIn(("sessions", project_b["project_id"], key), failing.records)
+
+            concurrent = MemoryStore()
+            import_codex_sessions(concurrent, root, [PROJECT, project_b], origin)
+            original_delete = concurrent.delete
+            replaced = []
+            def replace_before_delete(area, project_id, name, expected=None):
+                if (area, project_id, name) == stale_key and not replaced:
+                    replacement = deepcopy(concurrent.records[stale_key])
+                    replacement.update(updated_at="2026-08-10T09:00:00Z", source_identifier="concurrent.jsonl")
+                    concurrent.put(*stale_key, replacement)
+                    replaced.append(True)
+                return original_delete(area, project_id, name, expected)
+            concurrent.delete = replace_before_delete
+            import_codex_sessions(concurrent, root, [PROJECT, project_b], other)
+            self.assertEqual("concurrent.jsonl", concurrent.records[stale_key]["source_identifier"])
+            self.assertIn(("sessions", project_b["project_id"], key), concurrent.records)
+
+    def test_multiple_stale_copies_are_conditionally_removed(self):
+        temp, root, _ = self.session_file(fixture("C:/elsewhere"))
+        project_b = deepcopy(PROJECT); project_b.update(project_id="other-project", name="Other", aliases=[], repo="https://github.com/example/other", working_directory="C:/other")
+        with temp:
+            store = MemoryStore()
+            no_match = lambda _cwd: {"git_root": None, "remote": None}
+            other = lambda _cwd: {"git_root": "C:/work/b", "remote": project_b["repo"]}
+            import_codex_sessions(store, root, [PROJECT, project_b], no_match)
+            key = "codex:session-123"
+            duplicate = deepcopy(store.records[("sessions", "_unclassified", key)])
+            store.put("sessions", PROJECT["project_id"], key, duplicate)
+            import_codex_sessions(store, root, [PROJECT, project_b], other)
+            self.assertNotIn(("sessions", "_unclassified", key), store.records)
+            self.assertNotIn(("sessions", PROJECT["project_id"], key), store.records)
+            self.assertIn(("sessions", project_b["project_id"], key), store.records)
+
+    def test_duplicate_sources_and_registry_choose_deterministic_freshest_record(self):
+        temp, root, _ = self.session_file()
+        with temp:
+            base = discover_codex_sessions(root)[0]
+            older = deepcopy(base); older.update(updated_at="2026-08-10T02:00:00Z", source_identifier="z-older.jsonl")
+            newer = deepcopy(base); newer.update(updated_at="2026-08-10T03:00:00Z", source_identifier="a-newer.jsonl")
+            store = MemoryStore()
+            result = import_sessions(store, StaticAdapter([newer, older]), projects=[PROJECT], repository_lookup=lambda _cwd: {"git_root": None, "remote": None})
+            self.assertEqual("a-newer.jsonl", result[0]["source_identifier"])
+
+            first = deepcopy(base); first.update(updated_at="2026-08-10T04:00:00Z", source_identifier="a.jsonl", content_hash="a")
+            second = deepcopy(base); second.update(updated_at="2026-08-10T04:00:00Z", source_identifier="b.jsonl", content_hash="b")
+            result = import_sessions(MemoryStore(), StaticAdapter([second, first]), projects=[PROJECT], repository_lookup=lambda _cwd: {"git_root": None, "remote": None})
+            self.assertEqual("b.jsonl", result[0]["source_identifier"])
+
+            registry = MemoryStore()
+            existing = deepcopy(result[0])
+            existing.update(updated_at="2026-08-11T00:00:00Z", source_identifier="registry-newer.jsonl", project_id=None, classification_method="unclassified", mapping_source=None, classification_confidence=None, classification_status="needs_review")
+            registry.put("sessions", "_unclassified", existing["session_id"], existing)
+            stale_registry_copy = deepcopy(result[0]); stale_registry_copy.update(updated_at="2026-08-10T01:00:00Z", source_identifier="registry-older.jsonl")
+            registry.put("sessions", PROJECT["project_id"], existing["session_id"], stale_registry_copy)
+            result = import_sessions(registry, StaticAdapter([older]), projects=[PROJECT], repository_lookup=lambda _cwd: {"git_root": None, "remote": None})
+            self.assertEqual("registry-newer.jsonl", result[0]["source_identifier"])
+            self.assertIn(("sessions", "_unclassified", existing["session_id"]), registry.records)
+            self.assertNotIn(("sessions", PROJECT["project_id"], existing["session_id"]), registry.records)
+
     def test_existing_title_wins_over_prompt_candidate(self):
         temp, root, _ = self.session_file()
         with temp:
@@ -413,6 +511,23 @@ class SessionTests(unittest.TestCase):
         self.assertEqual("claude", claude_review["provider"])
         self.assertEqual(1, len(claude_review["assignment_history"]))
         self.assertNotEqual(legacy["assignment_history"], claude_review["assignment_history"])
+
+    def test_canonical_review_lookup_rejects_wrong_stored_identity(self):
+        store = MemoryStore()
+        claude = search_record("claude:abc123", provider="claude", provider_session_id="abc123", project_id=None)
+        wrong = {
+            "session_id": "codex:abc123", "provider": "codex", "provider_session_id": "abc123",
+            "project_id": "ai-development-manager", "classification_method": "manual_review",
+            "classification_status": "classified", "mapping_source": "manual_review",
+            "source_identifier": "sessions/codex.jsonl", "assigned_at": "2026-08-10T00:00:00Z",
+            "assignment_history": [{"previous_project_id": None, "new_project_id": "ai-development-manager", "assigned_at": "2026-08-10T00:00:00Z"}],
+        }
+        canonical_key = ("session_reviews", REVIEW_PROJECT_ID, "claude:abc123")
+        store.records[canonical_key] = deepcopy(wrong)
+        before = deepcopy(store.records)
+        with self.assertRaisesRegex(TaskError, "identity conflict"):
+            assign_review(store, claude, "ai-development-manager", [PROJECT], "2026-08-10T01:00:00Z")
+        self.assertEqual(before, store.records)
 
     def test_search_filters_text_metadata_dates_and_manual_mapping(self):
         first = search_record()
