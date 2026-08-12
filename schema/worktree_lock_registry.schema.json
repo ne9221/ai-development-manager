@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Writer Lease Registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "locks"],
+  "properties": {
+    "schema_version": {"const": "0.2.0"},
+    "locks": {
+      "type": "object",
+      "propertyNames": {"pattern": "^repo-[0-9a-f]{64}$"},
+      "additionalProperties": {"type": "object"}
+    }
+  }
+}

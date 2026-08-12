@@ -14,7 +14,7 @@ AI Development Manager/
 ├─ TASKS/<project_id>/<task_id>.json
 ├─ HANDOFFS/<project_id>/<handoff_id>.json
 ├─ EXECUTIONS/<project_id>/<execution_id>.json
-├─ WORKTREE-LOCKS/_global/<lock_id>.json
+├─ WORKTREE-LOCKS/_global/registry.json
 └─ TASK-HISTORY/<project_id>/<task_id>-<completion-date>.json
 ```
 
@@ -36,7 +36,10 @@ human project assignment and its minimal reassignment audit. Legacy Codex raw
 session-ID review records remain readable. The review queue itself
 is generated from read-only session discovery plus these records.
 
-`WORKTREE-LOCKS/_global/<lock_id>.json` stores expiring logical leases for
-repository writes. The global namespace detects collisions even if the same
-repository is referenced by different project IDs. Released and expired
-records remain auditable but do not block new work.
+`WORKTREE-LOCKS/_global/registry.json` is a separately provisioned CAS registry
+for coarse repository writer leases. Its Drive file ID is configuration; lock
+operations never discover authority by filename. Canonical repository hashes
+key the `locks` object, and every mutation sends the prior ETag in `If-Match`,
+so concurrent writers have one winner. Lease owner tokens are returned only by
+acquire; Drive stores their hashes. Released and expired generations remain
+auditable but do not block a new owner.

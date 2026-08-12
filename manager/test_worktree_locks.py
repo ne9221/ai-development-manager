@@ -1,118 +1,229 @@
-import re
-import sys
-import types
+import subprocess
+import tempfile
+import threading
 import unittest
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
 
-from manager.tasks import DriveRecords, MIME_FOLDER, ROOT_FOLDER_ID, TaskError
-from manager.worktree_locks import LOCK_NAMESPACE, acquire, check, inspect, release
+from manager.tasks import DriveConflict, TaskError
+from manager.worktree_locks import acquire, canonical_branch, canonical_repository, canonical_scope, check, inspect, list_locks, release, renew, repository_lock_id, semantic_lock, validate_local_preflight
 
 
 NOW = datetime(2026, 8, 12, tzinfo=timezone.utc)
+HEAD = "a" * 40
+REPO = "https://github.com/Example/Repo.git"
 
 
-class MemoryStore:
-    def __init__(self): self.records = {}
-    def put(self, area, project, name, document): self.records[(area, project, name)] = deepcopy(document); return deepcopy(document)
-    def get(self, area, project, name):
-        if (area, project, name) not in self.records: raise TaskError("not found")
-        return deepcopy(self.records[(area, project, name)])
-    def list_records(self, area, project): return [deepcopy(value) for (stored_area, stored_project, _), value in self.records.items() if (stored_area, stored_project) == (area, project)]
+class MemoryRegistry:
+    def __init__(self, document=None):
+        self.document = deepcopy(document or {"schema_version": "0.2.0", "locks": {}})
+        self.version = 1
+        self.now = NOW
+        self.mutex = threading.Lock()
+
+    def read(self):
+        with self.mutex:
+            return deepcopy(self.document), str(self.version), self.now
+
+    def cas(self, version, document):
+        with self.mutex:
+            if version != str(self.version):
+                raise DriveConflict("stale")
+            self.document = deepcopy(document)
+            self.version += 1
 
 
-def lock(store, lock_id, branch="feature/a", scope=None, access="production", at=NOW, repository="https://github.com/example/repo"):
-    return acquire(store, lock_id, "p1", f"task-{lock_id}", f"exec-{lock_id}", "codex", repository, branch, scope or [f"src/{lock_id}.py"], "abc123", access, at=at)
+class InterleavingRegistry(MemoryRegistry):
+    def __init__(self, preferred_execution):
+        super().__init__()
+        self.preferred_execution = preferred_execution
+        self.barrier = threading.Barrier(2)
+        self.preferred_done = threading.Event()
+        self.initial_reads = 0
+
+    def read(self):
+        snapshot = super().read()
+        with self.mutex:
+            first_round = self.initial_reads < 2
+            self.initial_reads += 1
+        if first_round:
+            self.barrier.wait(timeout=2)
+        return snapshot
+
+    def cas(self, version, document):
+        execution = next(iter(document["locks"].values()))["execution_id"]
+        if execution != self.preferred_execution:
+            self.preferred_done.wait(timeout=2)
+        try:
+            return super().cas(version, document)
+        finally:
+            if execution == self.preferred_execution:
+                self.preferred_done.set()
 
 
-class Request:
-    def __init__(self, value): self.value = value
-    def execute(self): return self.value
+def no_preflight(*_args):
+    return {}
 
 
-class FakeMedia:
-    def __init__(self, stream, mimetype, resumable=False): self.raw = stream.read()
+def acquire_args(execution_id="exec-a", **changes):
+    value = {
+        "project_id": "p1", "task_id": "task-a", "execution_id": execution_id,
+        "provider": "codex", "session_id": "codex:session-a", "repository": REPO,
+        "branch": "main", "scope": ["manager/a.py"], "baseline_head": HEAD,
+        "working_directory": "unused", "preflight_func": no_preflight,
+    }
+    value.update(changes)
+    return value
 
 
-class FakeFiles:
-    def __init__(self):
-        self.next_id = 1
-        self.items = {ROOT_FOLDER_ID: {"id": ROOT_FOLDER_ID, "name": "root", "mimeType": MIME_FOLDER, "parents": []}}
-        self.content = {}
-
-    def list(self, q, **kwargs):
-        parent = re.search(r"'([^']+)' in parents", q).group(1)
-        name_match = re.search(r"and name='([^']+)'", q)
-        values = [item for item in self.items.values() if parent in item.get("parents", []) and (not name_match or item["name"] == name_match.group(1))]
-        return Request({"files": deepcopy(values)})
-
-    def create(self, body, media_body=None, **kwargs):
-        file_id = f"id-{self.next_id}"; self.next_id += 1
-        self.items[file_id] = {"id": file_id, **deepcopy(body)}
-        if media_body: self.content[file_id] = media_body.raw
-        return Request({"id": file_id})
-
-    def update(self, fileId, body, media_body, **kwargs):
-        self.items[fileId].update(deepcopy(body)); self.content[fileId] = media_body.raw
-        return Request({"id": fileId})
-
-    def get_media(self, fileId): return Request(self.content[fileId])
+def owner_from(result, **changes):
+    value = {key: result[key] for key in ("project_id", "task_id", "execution_id", "provider", "session_id")}
+    value.update(changes)
+    return value
 
 
-class FakeDrive:
-    def __init__(self): self.api = FakeFiles()
-    def files(self): return self.api
+def fake_git(remote=REPO, branch="refs/heads/main", head=HEAD, detached=False):
+    def runner(command, **_kwargs):
+        args = command[3:]
+        if args[:3] == ["remote", "get-url", "--all"]:
+            return subprocess.CompletedProcess(command, 0, remote + "\n", "")
+        if args[:3] == ["symbolic-ref", "--quiet", "HEAD"]:
+            return subprocess.CompletedProcess(command, 1 if detached else 0, "" if detached else branch + "\n", "")
+        if args[:2] == ["rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(command, 0, head + "\n", "")
+        return subprocess.CompletedProcess(command, 1, "", "unexpected")
+    return runner
 
 
 class WorktreeLockTests(unittest.TestCase):
-    def setUp(self): self.store = MemoryStore()
+    def test_atomic_interleavings_have_exactly_one_winner(self):
+        for preferred in ("exec-a", "exec-b"):
+            registry = InterleavingRegistry(preferred)
+            results, errors = [], []
 
-    def test_same_repo_same_branch_conflicts_even_when_disjoint(self):
-        lock(self.store, "one", scope=["src/a.py"])
-        with self.assertRaisesRegex(TaskError, "same repository and branch"): lock(self.store, "two", scope=["src/b.py"])
+            def run(execution):
+                try:
+                    results.append(acquire(registry, **acquire_args(execution, task_id=f"task-{execution}", session_id=f"codex:{execution}")))
+                except TaskError as exc:
+                    errors.append(str(exc))
 
-    def test_same_repo_conflicts_across_project_ids(self):
-        lock(self.store, "one")
-        with self.assertRaisesRegex(TaskError, "same repository and branch"):
-            acquire(self.store, "two", "p2", "task-two", "exec-two", "claude", "https://github.com/example/repo.git", "feature/a", ["other.py"], "def456", at=NOW)
+            threads = [threading.Thread(target=run, args=(execution,)) for execution in ("exec-a", "exec-b")]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join(timeout=3)
+            self.assertEqual([preferred], [item["execution_id"] for item in results])
+            self.assertEqual(1, len(errors))
 
-    def test_overlapping_files_conflict_across_branches(self):
-        lock(self.store, "one", scope=["manager"])
-        with self.assertRaisesRegex(TaskError, "overlapping file scope"): lock(self.store, "two", branch="feature/b", scope=["manager/sessions.py"])
+    def test_coarse_repo_lock_blocks_branches_and_disjoint_scope(self):
+        registry = MemoryRegistry(); acquire(registry, **acquire_args())
+        with self.assertRaisesRegex(TaskError, "active production writer"):
+            acquire(registry, **acquire_args("exec-b", task_id="task-b", session_id="codex:b", branch="feature/b", scope=["docs/b.md"]))
 
-    def test_disjoint_files_on_separate_branches_are_allowed(self):
-        lock(self.store, "one", scope=["manager/a.py"])
-        self.assertEqual("two", lock(self.store, "two", branch="feature/b", scope=["manager/b.py"])["lock_id"])
+    def test_same_owner_retry_requires_and_accepts_token(self):
+        registry = MemoryRegistry(); first = acquire(registry, **acquire_args())
+        with self.assertRaisesRegex(TaskError, "active production writer"):
+            acquire(registry, **acquire_args())
+        second = acquire(registry, **acquire_args(lease_token=first["lease_token"]))
+        self.assertEqual(first["generation"], second["generation"])
+        self.assertEqual(first["lease_token"], second["lease_token"])
 
-    def test_read_only_is_allowed_and_unknown_production_is_blocked(self):
-        lock(self.store, "one")
-        readonly = acquire(self.store, "read", "p1", "task-read", "exec-read", "claude", access="read_only", at=NOW)
-        self.assertEqual("read_only", readonly["access"])
-        self.assertFalse(check(self.store, {**readonly, "lock_id": "bad", "access": "production"}, NOW)["safe"])
+    def test_wrong_owner_cannot_release_or_renew(self):
+        registry = MemoryRegistry(); result = acquire(registry, **acquire_args())
+        for change in ({"execution_id": "other"}, {"project_id": "other"}, {"provider": "claude"}, {"session_id": "claude:other"}):
+            with self.assertRaisesRegex(TaskError, "owner verification"):
+                release(registry, result["lock_id"], **owner_from(result, **change), lease_token=result["lease_token"])
+            with self.assertRaisesRegex(TaskError, "owner verification"):
+                renew(registry, result["lock_id"], **owner_from(result, **change), lease_token=result["lease_token"])
 
-    def test_stale_lock_does_not_conflict(self):
-        lock(self.store, "old", at=NOW - timedelta(hours=2))
-        self.assertEqual("expired", inspect(self.store, "p1", "old", NOW)["effective_status"])
-        self.assertEqual("new", lock(self.store, "new")["lock_id"])
+    def test_correct_release_and_double_release(self):
+        registry = MemoryRegistry(); result = acquire(registry, **acquire_args())
+        first = release(registry, result["lock_id"], **owner_from(result), lease_token=result["lease_token"])
+        second = release(registry, result["lock_id"], **owner_from(result), lease_token=result["lease_token"])
+        self.assertEqual("released", first["status"]); self.assertEqual(first, second)
+        self.assertNotIn("lease_token", first); self.assertNotIn("lease_token_hash", first)
 
-    def test_release_removes_conflict_and_is_idempotent(self):
-        lock(self.store, "one")
-        first = release(self.store, "p1", "one", NOW)
-        self.assertEqual(first, release(self.store, "p1", "one", NOW + timedelta(minutes=1)))
-        self.assertEqual("two", lock(self.store, "two")["lock_id"])
+    def test_renew_owner_expiry_and_new_generation(self):
+        registry = MemoryRegistry(); first = acquire(registry, **acquire_args(ttl_minutes=10))
+        registry.now += timedelta(minutes=5)
+        renewed = renew(registry, first["lock_id"], **owner_from(first), lease_token=first["lease_token"], ttl_minutes=20)
+        self.assertEqual("active", renewed["effective_status"])
+        registry.now += timedelta(minutes=21)
+        with self.assertRaisesRegex(TaskError, "expired lease cannot be renewed"):
+            renew(registry, first["lock_id"], **owner_from(first), lease_token=first["lease_token"])
+        second = acquire(registry, **acquire_args("exec-b", task_id="task-b", session_id="codex:b"))
+        self.assertEqual(first["generation"] + 1, second["generation"])
+        with self.assertRaisesRegex(TaskError, "owner verification"):
+            renew(registry, first["lock_id"], **owner_from(first), lease_token=first["lease_token"])
 
-    def test_duplicate_acquire_is_idempotent(self):
-        first = lock(self.store, "one")
-        self.assertEqual(first, lock(self.store, "one"))
+    def test_repository_normalization_credentials_clones_and_fork(self):
+        expected = "github:owner/repo"
+        for value in ("https://github.com/Owner/Repo", "https://github.com/owner/repo.git", "git@github.com:owner/repo.git", "ssh://git@github.com/owner/repo"):
+            self.assertEqual(expected, canonical_repository(value))
+        self.assertNotEqual(repository_lock_id(expected), repository_lock_id(canonical_repository("https://github.com/fork/repo")))
+        for value in ("C:/clone/repo", "https://user:token@github.com/owner/repo", "https://example.com/owner/repo"):
+            with self.assertRaises(TaskError): canonical_repository(value)
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for clone in (first, second):
+                self.assertEqual(expected, validate_local_preflight(clone, expected, "refs/heads/main", HEAD, fake_git(remote="https://github.com/owner/repo.git"))["repository"])
 
-    def test_drive_records_persist_and_read_back_lock(self):
-        drive = FakeDrive(); store = DriveRecords(drive)
-        google = types.ModuleType("googleapiclient"); http = types.ModuleType("googleapiclient.http"); http.MediaIoBaseUpload = FakeMedia
-        with patch.dict(sys.modules, {"googleapiclient": google, "googleapiclient.http": http}):
-            saved = lock(store, "drive")
-            self.assertEqual(saved, store.get("worktree_locks", LOCK_NAMESPACE, "drive"))
-            self.assertTrue(any(item["name"] == "WORKTREE-LOCKS" for item in drive.api.items.values()))
+    def test_branch_contract_preserves_case_and_rejects_detached(self):
+        self.assertEqual("refs/heads/main", canonical_branch("main"))
+        self.assertEqual("refs/heads/Feature/X", canonical_branch("refs/heads/Feature/X"))
+        self.assertNotEqual(canonical_branch("Feature/X"), canonical_branch("feature/x"))
+        for value in ("HEAD", HEAD, "refs/tags/v1", "main..bad"):
+            with self.assertRaises(TaskError): canonical_branch(value)
+        with tempfile.TemporaryDirectory() as clone:
+            with self.assertRaisesRegex(TaskError, "symbolic-ref"):
+                validate_local_preflight(clone, "github:example/repo", "refs/heads/main", HEAD, fake_git(detached=True))
+
+    def test_scope_contract_root_slashes_and_rejections(self):
+        self.assertEqual(["."], canonical_scope([".", "manager/a.py"]))
+        self.assertEqual(["manager/a.py"], canonical_scope(["manager\\a.py", "manager/a.py/"]))
+        for value in ([".."], ["src/../x"], ["src/./x"], ["*.py"], ["C:\\repo\\x"], ["/repo/x"], ["src//x"]):
+            with self.assertRaises(TaskError): canonical_scope(value)
+
+    def test_local_preflight_mismatch_and_valid(self):
+        with tempfile.TemporaryDirectory() as clone:
+            self.assertEqual(HEAD, validate_local_preflight(clone, "github:example/repo", "refs/heads/main", HEAD, fake_git())["baseline_head"])
+            with self.assertRaisesRegex(TaskError, "origin"):
+                validate_local_preflight(clone, "github:other/repo", "refs/heads/main", HEAD, fake_git())
+            with self.assertRaisesRegex(TaskError, "branch"):
+                validate_local_preflight(clone, "github:example/repo", "refs/heads/other", HEAD, fake_git())
+            with self.assertRaisesRegex(TaskError, "HEAD"):
+                validate_local_preflight(clone, "github:example/repo", "refs/heads/main", "b" * 40, fake_git())
+        with self.assertRaisesRegex(TaskError, "working directory"):
+            validate_local_preflight("missing", "github:example/repo", "refs/heads/main", HEAD, fake_git())
+
+    def test_check_is_advisory_validated_and_read_only_cannot_upgrade(self):
+        registry = MemoryRegistry()
+        request = acquire_args(); request.pop("working_directory"); request.pop("preflight_func"); request["access"] = "production"
+        preview = check(registry, request, "unused", no_preflight)
+        self.assertTrue(preview["safe"]); self.assertEqual("advisory_only", preview["authority"])
+        malformed = {**request, "access": "invalid", "repository": None}
+        with self.assertRaises(TaskError): check(registry, malformed, "unused", no_preflight)
+        readonly = {key: request[key] for key in ("project_id", "task_id", "execution_id", "provider", "session_id")}; readonly["access"] = "read_only"
+        self.assertTrue(check(registry, readonly)["safe"])
+        with self.assertRaisesRegex(TaskError, "cannot acquire or upgrade"):
+            acquire(registry, **acquire_args(access="read_only"))
+
+    def test_drive_unavailable_malformed_registry_and_redaction_fail_closed(self):
+        class Unavailable:
+            def read(self): raise OSError("Drive unavailable")
+        with self.assertRaises(OSError): acquire(Unavailable(), **acquire_args())
+        malformed = MemoryRegistry({"schema_version": "0.2.0", "locks": {"bad": {}}})
+        with self.assertRaises(TaskError): check(malformed, {**{k: v for k, v in acquire_args().items() if k not in ("working_directory", "preflight_func")}, "access": "production"}, "unused", no_preflight)
+        registry = MemoryRegistry(); result = acquire(registry, **acquire_args())
+        viewed = inspect(registry, result["lock_id"])
+        self.assertNotIn("lease_token", viewed); self.assertNotIn("lease_token_hash", viewed)
+        self.assertNotIn("lease_token_hash", list_locks(registry)[0])
+
+    def test_schema_semantic_timestamp_invariants(self):
+        registry = MemoryRegistry(); result = acquire(registry, **acquire_args())
+        raw = next(iter(registry.document["locks"].values()))
+        broken = {**raw, "expires_at": raw["created_at"]}
+        with self.assertRaisesRegex(TaskError, "timestamp ordering"):
+            semantic_lock(broken, raw["lock_id"])
+        broken = {**raw, "status": "released", "released_at": None}
+        with self.assertRaises(TaskError): semantic_lock(broken, raw["lock_id"])
 
 
 if __name__ == "__main__": unittest.main()
