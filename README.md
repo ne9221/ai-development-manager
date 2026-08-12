@@ -188,3 +188,18 @@ python -m manager.runtime_bridge --project-id ai-development-manager --request "
 
 See `docs/CHATGPT-INTEGRATION.md` for the upper-level client contract, explicit
 fallback behavior, shared-rule priority, and optional Ponytail policy.
+
+## Working-tree preflight locks
+
+Drive-backed logical leases prevent production writes from starting on the
+same repository/branch or overlapping file scope. Read-only work remains
+parallel-safe; expired and released leases do not block. This P0 is an explicit
+CLI and is not yet wired into Dispatcher or Scheduler.
+
+```powershell
+python -m manager.worktree_locks check example-project task-1 run-1 --provider codex --repository https://github.com/example/repo --branch feature/a --baseline-head abc123 --scope manager/tasks.py
+python -m manager.worktree_locks acquire lock-1 example-project task-1 run-1 --provider codex --repository https://github.com/example/repo --branch feature/a --baseline-head abc123 --scope manager/tasks.py
+python -m manager.worktree_locks inspect example-project lock-1
+python -m manager.worktree_locks list example-project
+python -m manager.worktree_locks release example-project lock-1
+```

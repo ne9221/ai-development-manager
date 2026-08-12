@@ -14,6 +14,7 @@ AI Development Manager/
 ├─ TASKS/<project_id>/<task_id>.json
 ├─ HANDOFFS/<project_id>/<handoff_id>.json
 ├─ EXECUTIONS/<project_id>/<execution_id>.json
+├─ WORKTREE-LOCKS/_global/<lock_id>.json
 └─ TASK-HISTORY/<project_id>/<task_id>-<completion-date>.json
 ```
 
@@ -34,3 +35,8 @@ never a full provider conversation transcript. Sessions without a deterministic 
 human project assignment and its minimal reassignment audit. Legacy Codex raw
 session-ID review records remain readable. The review queue itself
 is generated from read-only session discovery plus these records.
+
+`WORKTREE-LOCKS/_global/<lock_id>.json` stores expiring logical leases for
+repository writes. The global namespace detects collisions even if the same
+repository is referenced by different project IDs. Released and expired
+records remain auditable but do not block new work.

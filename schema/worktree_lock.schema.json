@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Working Tree Lock",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lock_id", "project_id", "task_id", "execution_id", "provider", "session_id", "repository", "branch", "scope", "baseline_head", "access", "status", "created_at", "expires_at", "released_at"],
+  "properties": {
+    "lock_id": {"type": "string", "minLength": 1},
+    "project_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "execution_id": {"type": "string", "minLength": 1},
+    "provider": {"type": "string", "minLength": 1},
+    "session_id": {"type": ["string", "null"], "minLength": 1},
+    "repository": {"type": ["string", "null"], "minLength": 1},
+    "branch": {"type": ["string", "null"], "minLength": 1},
+    "scope": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "baseline_head": {"type": ["string", "null"], "minLength": 1},
+    "access": {"enum": ["production", "read_only"]},
+    "status": {"enum": ["active", "released"]},
+    "created_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "released_at": {"type": ["string", "null"], "format": "date-time"}
+  }
+}
