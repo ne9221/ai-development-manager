@@ -22,6 +22,42 @@ For every development request, the upper-level client should:
 
 ## Stable JSON boundary
 
+For quota/status only, without project or task context:
+
+```powershell
+python -m manager.runtime_bridge status --json
+```
+
+This returns contract `1.0` with the fixed top-level keys
+`contract_version`, `schema_version`, `generated_at`, and `providers`.
+`providers` contains only `codex` and `claude`; each contains `status`, up to
+eight normalized schema `windows`, `source`, `last_updated`, and `freshness`.
+The derived status is `known`, `unknown`, `stale`, or `unavailable`. A stale
+snapshot remains stale, a missing/malformed Drive status is unavailable, and
+an unknown value is never converted to zero. Provider metadata and raw
+responses are not returned. `known` specifically means a fresh numeric quota
+from the verified Codex app-server or Claude statusline source; manual,
+synthetic, inferred, and local-estimate values remain `unknown`. Future
+timestamps beyond five minutes of clock skew are unavailable.
+
+`source` is a fixed safe label (`codex_app_server`, `claude_statusline`, or
+`unknown`), never upstream free text. Each window always contains a sanitized
+`name`; `duration_minutes`, `used_percent`, `remaining_percent`, and
+`resets_at` are optional. Duplicate normalized names keep the first window and
+at most eight windows are returned.
+
+`read_runtime_status()` is the self-contained Python boundary: it performs the
+Drive read, bounded validation, reliability/freshness classification, safe
+projection, and unavailable fallback, and fails closed to the same bounded
+contract even if projection or final contract validation itself raises.
+ChatGPT cannot call the local CLI or this Python function directly today; the
+next transport may call this one function without reading Drive itself. No
+MCP, connector, or HTTP integration is implemented in this phase.
+
+This contract assumes write access to the Drive `AI-RESOURCE-STATUS/status.json`
+SSOT is controlled: the file is downloaded and JSON-parsed before per-provider
+and per-window caps apply, so the SSOT file itself must be a trusted source.
+
 Successful JSON includes `contract_version`, compact project/task/handoff
 fields, request type, recommendation, estimate, quota summary/freshness,
 warnings, next action, generated prompt, and optional execution batches. It

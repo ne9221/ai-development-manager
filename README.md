@@ -183,8 +183,30 @@ active task/latest handoff and execution history, then reuses Dispatcher or
 Scheduler. JSON output is compact and transport-neutral.
 
 ```powershell
+python -m manager.runtime_bridge status --json
 python -m manager.runtime_bridge --project-id ai-development-manager --request "Continue Phase 9" --json
 ```
+
+The `status` command is the provider-neutral quota-only boundary. It reads the
+same Drive `AI-RESOURCE-STATUS/status.json` SSOT, returns only Codex and Claude
+normalized windows/source/freshness fields, and reports `known`, `unknown`,
+`stale`, or `unavailable` without inventing a percentage. `known` requires a
+fresh, verified official source; `unknown` never means 0%. `stale` preserves a
+verified snapshot older than the configured freshness limit, while malformed,
+future-dated, missing, or unreadable data is `unavailable`.
+
+External source labels are fixed safe values, and provider window names are
+allowlisted or replaced with stable generic names. Every window has `name`;
+`duration_minutes`, `used_percent`, `remaining_percent`, and `resets_at` are
+optional because providers expose different shapes. Duplicate names preserve
+the first window and output is capped at eight windows per provider.
+
+ChatGPT cannot call this local CLI directly yet. A future transport needs only
+to call the self-contained `manager.runtime_bridge.read_runtime_status`
+function; no transport, MCP, HTTP, or connector is implemented by this phase.
+This contract assumes write access to the Drive `AI-RESOURCE-STATUS/status.json`
+SSOT is controlled; the file is downloaded and parsed before per-provider/window
+caps apply.
 
 See `docs/CHATGPT-INTEGRATION.md` for the upper-level client contract, explicit
 fallback behavior, shared-rule priority, and optional Ponytail policy.

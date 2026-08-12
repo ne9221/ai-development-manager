@@ -4,19 +4,34 @@
 import argparse
 import hashlib
 import json
+import logging
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from collectors.publish_drive import build_service
 from manager.dispatcher import clean, dispatch
 from manager.executions import list_executions
-from manager.quota_reader import read_drive_status, summarize
+from manager.quota_reader import QuotaReaderError, parse_time, read_drive_status, summarize
 from manager.scheduler import schedule
 from manager.tasks import DriveRecords, MIME_FOLDER, ROOT_FOLDER_ID, ROOT_FOLDERS, TaskError, validate
 
 
+logger = logging.getLogger("runtime_bridge")
+
 RULES_PATH = Path(__file__).parents[1] / "AI-DEVELOPMENT-RULES.md"
+RUNTIME_STATUS_PROVIDERS = ("codex", "claude")
+RUNTIME_STATUS_WINDOW_FIELDS = ("name", "duration_minutes", "used_percent", "remaining_percent", "resets_at")
+RUNTIME_STATUS_CONTRACT_VERSION = "1.0"
+RUNTIME_STATUS_MAX_WINDOWS = 8
+RUNTIME_STATUS_MAX_INPUT_WINDOWS = 16
+RUNTIME_STATUS_MAX_PROVIDERS = 32
+RUNTIME_STATUS_SOURCES = {"codex": "codex_app_server", "claude": "claude_statusline"}
+RUNTIME_STATUS_WINDOW_NAMES = {
+    "codex": {"primary", "secondary"},
+    "claude": {"five_hour", "seven_day"},
+}
 
 
 def compact(value):
@@ -108,6 +123,173 @@ def redact(value):
     return clean(value) if isinstance(value, str) else value
 
 
+def iso_time(value):
+    return parse_time(value).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def unavailable_provider():
+    return {"status": "unavailable", "windows": [], "source": "unknown", "last_updated": None, "freshness": "unknown"}
+
+
+def safe_window(provider_id, window, index):
+    if not isinstance(window, dict) or not isinstance(window.get("name"), str):
+        raise QuotaReaderError("invalid runtime window")
+    name = window["name"] if window["name"] in RUNTIME_STATUS_WINDOW_NAMES[provider_id] else f"window_{index + 1}"
+    output = {"name": name}
+    for key in ("used_percent", "remaining_percent"):
+        if key in window:
+            value = window[key]
+            if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 100):
+                raise QuotaReaderError("invalid runtime percentage")
+            output[key] = value
+    if "duration_minutes" in window:
+        value = window["duration_minutes"]
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+            raise QuotaReaderError("invalid runtime duration")
+        output["duration_minutes"] = value
+    if "resets_at" in window:
+        output["resets_at"] = None if window["resets_at"] is None else iso_time(window["resets_at"])
+    return output
+
+
+def project_provider(provider_id, provider, max_age_minutes, now):
+    if not isinstance(provider, dict) or provider.get("provider") != provider_id:
+        raise QuotaReaderError("invalid runtime provider")
+    if not all(isinstance(provider.get(key), str) for key in ("source", "source_type", "confidence", "status", "last_updated")):
+        raise QuotaReaderError("invalid runtime provider fields")
+    raw_windows = provider.get("windows")
+    if not isinstance(raw_windows, list):
+        raise QuotaReaderError("invalid runtime windows")
+    windows, names = [], set()
+    for index, raw_window in enumerate(raw_windows[:RUNTIME_STATUS_MAX_INPUT_WINDOWS]):
+        window = safe_window(provider_id, raw_window, index)
+        if window["name"] in names:
+            continue
+        names.add(window["name"])
+        windows.append(window)
+        if len(windows) == RUNTIME_STATUS_MAX_WINDOWS:
+            break
+    bounded_provider = dict(provider)
+    bounded_provider["windows"] = windows
+    item = next(entry for entry in summarize({"providers": [bounded_provider]}, max_age_minutes, now)["providers"] if entry["provider"] == provider_id)
+    if item["future_skewed"]:
+        return unavailable_provider()
+    has_quota = any(window.get("remaining_percent") is not None for window in windows)
+    trusted = item["source_verified"] and item["status"] != "unknown" and has_quota
+    status = "stale" if trusted and item["stale"] else ("known" if trusted and item["has_reliable_quota"] else "unknown")
+    if status == "unknown":
+        windows = []
+    return {
+        "status": status,
+        "windows": windows,
+        "source": RUNTIME_STATUS_SOURCES[provider_id] if item["source_verified"] else "unknown",
+        "last_updated": iso_time(item["last_updated"]),
+        "freshness": item["freshness"],
+    }
+
+
+def validate_runtime_status_contract(document):
+    if set(document) != {"contract_version", "schema_version", "generated_at", "providers"}:
+        raise RuntimeError("runtime status contract key mismatch")
+    if document["contract_version"] != RUNTIME_STATUS_CONTRACT_VERSION or document["schema_version"] != "0.1.0":
+        raise RuntimeError("runtime status contract version mismatch")
+    iso_time(document["generated_at"])
+    if set(document["providers"]) != set(RUNTIME_STATUS_PROVIDERS):
+        raise RuntimeError("runtime status provider mismatch")
+    for provider in document["providers"].values():
+        if set(provider) != {"status", "windows", "source", "last_updated", "freshness"}:
+            raise RuntimeError("runtime status provider key mismatch")
+        if provider["status"] not in {"known", "unknown", "stale", "unavailable"} or provider["source"] not in {*RUNTIME_STATUS_SOURCES.values(), "unknown"}:
+            raise RuntimeError("runtime status provider value mismatch")
+        if not isinstance(provider["windows"], list) or len(provider["windows"]) > RUNTIME_STATUS_MAX_WINDOWS:
+            raise RuntimeError("runtime status window bound mismatch")
+        if provider["freshness"] not in {"fresh", "stale", "unknown"}:
+            raise RuntimeError("runtime status freshness mismatch")
+        if provider["last_updated"] is not None:
+            iso_time(provider["last_updated"])
+        if provider["status"] == "known" and provider["freshness"] != "fresh":
+            raise RuntimeError("known runtime status must be fresh")
+        if provider["status"] == "stale" and provider["freshness"] != "stale":
+            raise RuntimeError("stale runtime status must be stale")
+        if provider["status"] in {"unknown", "unavailable"} and provider["windows"]:
+            raise RuntimeError("unknown runtime status must not expose quota")
+        for window in provider["windows"]:
+            if not isinstance(window, dict) or not isinstance(window.get("name"), str) or not re.fullmatch(r"[a-z0-9_]{1,80}", window["name"]):
+                raise RuntimeError("runtime status window name mismatch")
+            if set(window) - set(RUNTIME_STATUS_WINDOW_FIELDS):
+                raise RuntimeError("runtime status window key mismatch")
+            for key in ("used_percent", "remaining_percent"):
+                value = window.get(key)
+                if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 100):
+                    raise RuntimeError("runtime status percentage mismatch")
+    return document
+
+
+def runtime_status_contract(document=None, max_age_minutes=60, now=None):
+    """Project a possibly partial Drive document into the bounded public contract."""
+    now = now or datetime.now(timezone.utc)
+    fallback = {
+        "contract_version": RUNTIME_STATUS_CONTRACT_VERSION, "schema_version": "0.1.0",
+        "generated_at": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "providers": {provider_id: unavailable_provider() for provider_id in RUNTIME_STATUS_PROVIDERS},
+    }
+    if not isinstance(document, dict) or document.get("schema_version") != "0.1.0" or not isinstance(document.get("providers"), list):
+        return validate_runtime_status_contract(fallback)
+    try:
+        generated_at = iso_time(document.get("generated_at"))
+    except (QuotaReaderError, TypeError, ValueError):
+        return validate_runtime_status_contract(fallback)
+    if len(document["providers"]) > RUNTIME_STATUS_MAX_PROVIDERS:
+        return validate_runtime_status_contract(fallback)
+    output = dict(fallback)
+    output["generated_at"] = generated_at
+    for provider_id in RUNTIME_STATUS_PROVIDERS:
+        matches = [item for item in document["providers"] if isinstance(item, dict) and item.get("provider") == provider_id]
+        if len(matches) != 1:
+            continue
+        try:
+            output["providers"][provider_id] = project_provider(provider_id, matches[0], max_age_minutes, now)
+        except (QuotaReaderError, AttributeError, KeyError, TypeError, ValueError):
+            continue
+    return validate_runtime_status_contract(output)
+
+
+def _static_unavailable_contract(now):
+    """Hand-built fallback that is never itself re-validated.
+
+    This is the last resort when even ``validate_runtime_status_contract``
+    cannot be trusted to run (e.g. a future maintenance regression), so it
+    must not depend on any of the logic it would otherwise be backstopping.
+    """
+    return {
+        "contract_version": RUNTIME_STATUS_CONTRACT_VERSION, "schema_version": "0.1.0",
+        "generated_at": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "providers": {provider_id: unavailable_provider() for provider_id in RUNTIME_STATUS_PROVIDERS},
+    }
+
+
+def read_runtime_status(service=None, max_age_minutes=60, now=None, reader=None):
+    """Read Drive and return a safe contract for CLI or a future transport.
+
+    This is the complete public trust boundary: a failure while reading Drive,
+    projecting the document, or in final contract validation itself (e.g. a
+    maintenance regression) all fail closed to a bounded unavailable contract.
+    No exception and no raw exception message ever leaves this function; only
+    the exception type is logged for debugging, never its message or args.
+    """
+    now = now or datetime.now(timezone.utc)
+    try:
+        reader = reader or read_drive_status
+        document = reader(service=service, validate_document=False)
+    except Exception:
+        document = None
+    try:
+        return runtime_status_contract(document, max_age_minutes, now)
+    except Exception as exc:
+        logger.warning("runtime status contract projection failed closed: %s", type(exc).__name__)
+        return _static_unavailable_contract(now)
+
+
 def request_type(user_request, task, multi_task):
     if multi_task:
         return "scheduling"
@@ -197,9 +379,26 @@ def human_summary(result):
     return f"推荐：{result['recommended_provider']}\nEffort：{result['effort']}\n预计：{result['estimated_minutes']} 分钟\nQuota：{result['quota_summary']}\n备选：{alternatives}\n下一步：{result['next_action']}"
 
 
-def main():
+def status_main(argv):
+    parser = argparse.ArgumentParser(prog="python -m manager.runtime_bridge status")
+    parser.add_argument("--max-age-minutes", type=float, default=60)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    result = read_runtime_status(max_age_minutes=args.max_age_minutes)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    else:
+        for provider, item in result["providers"].items():
+            print(f"{provider}: {item['status']} ({item['freshness']})")
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["status"]:
+        return status_main(argv[1:])
     parser = argparse.ArgumentParser(); parser.add_argument("--project-id"); parser.add_argument("--request", required=True); parser.add_argument("--task-id"); parser.add_argument("--task-type"); parser.add_argument("--complexity", choices=["low", "medium", "high"]); parser.add_argument("--preferred-provider"); parser.add_argument("--excluded-provider"); parser.add_argument("--multi-task", action="store_true"); parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(); data = {key: value for key, value in vars(args).items() if key != "json" and value is not None}; data["user_request"] = data.pop("request")
+    args = parser.parse_args(argv); data = {key: value for key, value in vars(args).items() if key != "json" and value is not None}; data["user_request"] = data.pop("request")
     try:
         service = build_service(); result = runtime_bridge(DriveRecords(service), service, data)
         print(json.dumps(result, ensure_ascii=False) if args.json else human_summary(result) + (f"\n\n```\n{result['generated_prompt']}\n```" if result["generated_prompt"] else "")); return 0
