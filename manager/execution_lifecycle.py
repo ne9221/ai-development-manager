@@ -1,11 +1,8 @@
 """Authoritative reservation-to-running lifecycle gate."""
 
-import io
-import json
-
 from manager.executions import quota_snapshot, task_snapshot
 from manager.quota_reader import read_drive_status
-from manager.tasks import MIME_JSON, TaskError, now_iso, validate
+from manager.tasks import TaskError, now_iso, validate
 from manager.worktree_locks import acquire, canonical_baseline, canonical_branch, canonical_repository, canonical_scope, release, repository_lock_id, validate_local_preflight
 
 
@@ -13,57 +10,20 @@ class TaskClaimConflict(TaskError):
     pass
 
 
-def _capture_headers(request):
-    if not hasattr(request, "postproc"):
-        raise TaskError("Drive client does not expose task record ETag")
-    headers, original = {}, request.postproc
-
-    def capture(response, content):
-        headers.update({str(key).lower(): value for key, value in response.items()})
-        return original(response, content)
-
-    request.postproc = capture
-    return request.execute(), headers
-
-
 def _read_task_version(store, project_id, task_id):
-    if hasattr(store, "read_task_for_claim"):
-        return store.read_task_for_claim(project_id, task_id)
-    _, filename, match = store._record_match("tasks", project_id, task_id)
-    try:
-        raw, headers = _capture_headers(store.files.get_media(fileId=match["id"]))
-        document = json.loads(raw.decode("utf-8"))
-        etag = headers.get("etag")
-        if not etag:
-            raise TaskError("Drive task record is missing ETag")
-        return document, {"file_id": match["id"], "etag": etag, "filename": filename}
-    except TaskError:
-        raise
-    except Exception as exc:
-        raise TaskError(f"could not read versioned Drive task: {filename}") from exc
+    if not hasattr(store, "read_task_for_claim") or not hasattr(store, "cas_task_claim"):
+        raise TaskError("running gate requires an authoritative cross-machine task claim CAS backend")
+    return store.read_task_for_claim(project_id, task_id)
 
 
 def _cas_task(store, project_id, task_id, version, document):
     validate("task", document)
-    if hasattr(store, "cas_task_claim"):
-        return store.cas_task_claim(project_id, task_id, version, document)
-    from googleapiclient.http import MediaIoBaseUpload
-    raw = (json.dumps(document, indent=2) + "\n").encode("utf-8")
-    media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=MIME_JSON, resumable=False)
-    request = store.files.update(fileId=version["file_id"], body={"name": version["filename"]}, media_body=media, fields="id")
-    if not hasattr(request, "headers"):
-        raise TaskError("Drive client does not support conditional task updates")
-    request.headers["If-Match"] = version["etag"]
     try:
-        request.execute()
+        return store.cas_task_claim(project_id, task_id, version, document)
     except Exception as exc:
         if getattr(getattr(exc, "resp", None), "status", None) == 412:
             raise TaskClaimConflict("task active execution claim changed concurrently") from exc
         raise
-    current, current_version = _read_task_version(store, project_id, task_id)
-    if current != document:
-        raise TaskClaimConflict("task active execution claim verification failed")
-    return current, current_version
 
 
 def _claimed_task(task, execution_id):

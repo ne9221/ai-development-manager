@@ -312,10 +312,12 @@ a concise handoff with actual time and quota/token usage when available.
 - Production lock input uses the canonical Project repository plus the
   reservation snapshot's working directory, full branch, baseline, and
   non-empty `allowed_paths`; missing or conflicting evidence fails closed.
-- One Drive ETag-conditional update sets the ready task to `in_progress` and
-  records `source_context.active_execution_id`; this is the task-level CAS
-  boundary for both read-only and production-write executions. Multiple
-  reservations may exist, but only one may claim a ready task.
+- A storage backend with authoritative cross-machine CAS must atomically set the
+  ready task to `in_progress` and record
+  `source_context.active_execution_id`. The current Drive v3 `DriveRecords`
+  backend has no such primitive, so the running gate fails closed before
+  preflight/acquire until a real task-claim backend is supplied. A read-then-put
+  or Drive ETag simulation is not task authority; Slice 4 remains blocked.
 - The task claim is persisted before the execution running record. An ordinary
   persistence exception after acquire rolls execution/task back and releases
   the lease only after both rollbacks are confirmed. An unconfirmed execution

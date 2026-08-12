@@ -1,13 +1,12 @@
 import io
 import inspect
-import json
 import tempfile
 import threading
 import unittest
 from copy import deepcopy
 from unittest.mock import Mock, patch
 
-from manager.execution_lifecycle import TaskClaimConflict, _cas_task, _read_task_version, enter_running_gate
+from manager.execution_lifecycle import TaskClaimConflict, enter_running_gate
 from manager.executions import main as executions_main, reserve_execution, start_execution
 from manager.gcs_lock_registry import RegistryConflict
 from manager.tasks import TaskError, create_project, create_task, validate
@@ -332,65 +331,19 @@ class ExecutionLifecycleTests(unittest.TestCase):
         self.assertEqual("in_progress", claimed["status"])
         self.assertEqual(winner, claimed["source_context"]["active_execution_id"])
 
-    def test_drive_etag_cas_rejects_a_stale_task_claim(self):
-        document = build_store(read_only=True).get("tasks", "p1", "t1")
+    def test_store_without_true_task_cas_fails_closed_before_acquire(self):
+        source = build_store(read_only=True)
 
-        class PreconditionFailed(Exception):
-            def __init__(self):
-                self.resp = type("Response", (), {"status": 412})()
+        class DriveLikeStore:
+            def get(self, *args): return source.get(*args)
+            def put(self, *args): return source.put(*args)
 
-        class Request:
-            def __init__(self, action):
-                self.action = action
-                self.headers = {}
-                self.postproc = lambda _response, content: content
-
-            def execute(self):
-                return self.action(self)
-
-        class Files:
-            def __init__(self):
-                self.document = deepcopy(document)
-                self.etag = '"1"'
-                self.seen_if_match = []
-
-            def get_media(self, fileId):
-                self.assert_file(fileId)
-                return Request(lambda request: request.postproc({"etag": self.etag}, (json.dumps(self.document) + "\n").encode()))
-
-            def update(self, fileId, body, media_body, **_kwargs):
-                self.assert_file(fileId)
-
-                def update(request):
-                    self.seen_if_match.append(request.headers.get("If-Match"))
-                    if request.headers.get("If-Match") != self.etag:
-                        raise PreconditionFailed()
-                    self.document = json.loads(media_body.getbytes(0, media_body.size()))
-                    self.etag = '"2"'
-                    return {"id": fileId}
-
-                return Request(update)
-
-            @staticmethod
-            def assert_file(file_id):
-                if file_id != "task-file":
-                    raise AssertionError(file_id)
-
-        class Store:
-            def __init__(self): self.files = Files()
-            def _record_match(self, _area, _project, _name):
-                return "parent", "t1.json", {"id": "task-file"}
-
-        store = Store()
-        first, first_version = _read_task_version(store, "p1", "t1")
-        _, stale_version = _read_task_version(store, "p1", "t1")
-        first["source_context"]["active_execution_id"] = "exec-a"
-        _cas_task(store, "p1", "t1", first_version, first)
-        stale = deepcopy(document); stale["source_context"]["active_execution_id"] = "exec-b"
-        with self.assertRaisesRegex(TaskClaimConflict, "changed concurrently"):
-            _cas_task(store, "p1", "t1", stale_version, stale)
-        self.assertEqual(['"1"', '"1"'], store.files.seen_if_match)
-        self.assertEqual("exec-a", store.files.document["source_context"]["active_execution_id"])
+        store = DriveLikeStore(); acquire_mock = Mock()
+        with patch("manager.execution_lifecycle.acquire", acquire_mock):
+            with self.assertRaisesRegex(TaskError, "cross-machine task claim CAS"):
+                enter_running_gate(store, object(), None, "p1", "t1", "exec-a", "codex", "read_only")
+        acquire_mock.assert_not_called()
+        self.assert_reserved_ready(source)
 
     def test_production_cannot_overwrite_an_existing_task_claim(self):
         store = build_store(); registry = MemoryRegistry()
