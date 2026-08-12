@@ -238,22 +238,22 @@ Phase 3C must never:
 - Existing Session Hardening, Runtime Quota Bridge, execution attribution,
   Dispatcher, Scheduler, and Lock P0 regressions remain green.
 
-## Explicit unresolved blocker
+## Slice 1 ownership blocker
 
-Working-tree Lock P0 currently requires `session_id` as part of the lease owner
+The Phase 3 Foundation baseline required `session_id` as part of the lease owner
 contract, while a provider session is normally created only after provider
-launch. Production-write launch must occur only after authoritative acquire, so
-the current ordering cannot satisfy both contracts.
+launch. Slice 1 resolves this ordering blocker by making the reserved execution
+and secret token authoritative and treating `session_id` only as optional,
+post-launch metadata.
 
 Required invariant:
 
 > A pre-launch writer lease must not depend on a provider session identity that
 > does not yet exist.
 
-Until Claude 3 completes the Working-tree Lock P0 second-round review and Slice
-1 resolves this owner-contract mismatch, the full Phase 3C lifecycle
-implementation is **BLOCKED**. This definition intentionally does not choose a
-schema or implementation fix in advance.
+The ownership blocker is resolved by Slice 1. Full Phase 3C lifecycle behavior
+remains unimplemented and must proceed through Slices 2-8; no later lifecycle
+guarantee is implied by the lock ownership change alone.
 
 ## Implementation slices
 

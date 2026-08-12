@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from manager.gcs_lock_registry import RegistryConflict
 from manager.tasks import TaskError
-from manager.worktree_locks import acquire, canonical_branch, canonical_repository, canonical_scope, check, inspect, list_locks, release, renew, repository_lock_id, semantic_lock, validate_local_preflight
+from manager.worktree_locks import acquire, canonical_branch, canonical_repository, canonical_scope, check, inspect, link_session, list_locks, release, renew, repository_lock_id, semantic_lock, validate_local_preflight
 
 
 NOW = datetime(2026, 8, 12, tzinfo=timezone.utc)
@@ -78,7 +78,7 @@ def acquire_args(execution_id="exec-a", **changes):
 
 
 def owner_from(result, **changes):
-    value = {key: result[key] for key in ("project_id", "task_id", "execution_id", "provider", "session_id")}
+    value = {key: result[key] for key in ("project_id", "task_id", "execution_id", "provider")}
     value.update(changes)
     return value
 
@@ -127,13 +127,50 @@ class WorktreeLockTests(unittest.TestCase):
         self.assertEqual(first["generation"], second["generation"])
         self.assertEqual(first["lease_token"], second["lease_token"])
 
+    def test_prelaunch_owner_renews_links_and_releases_without_reacquire(self):
+        registry = MemoryRegistry(); arguments = acquire_args(); arguments.pop("session_id")
+        result = acquire(registry, **arguments)
+        self.assertIsNone(result["session_id"])
+        renewed = renew(registry, result["lock_id"], **owner_from(result), lease_token=result["lease_token"])
+        self.assertIsNone(renewed["session_id"])
+        linked = link_session(registry, result["lock_id"], **owner_from(result), session_id="codex:session-a", lease_token=result["lease_token"])
+        self.assertEqual("codex:session-a", linked["session_id"])
+        self.assertEqual(result["generation"], linked["generation"])
+        renewed = renew(registry, result["lock_id"], **owner_from(result), lease_token=result["lease_token"])
+        self.assertEqual("codex:session-a", renewed["session_id"])
+        released = release(registry, result["lock_id"], **owner_from(result), lease_token=result["lease_token"])
+        self.assertEqual("released", released["status"])
+
+    def test_session_link_is_idempotent_metadata_not_owner(self):
+        registry = MemoryRegistry(); result = acquire(registry, **acquire_args(session_id=None))
+        first = link_session(registry, result["lock_id"], **owner_from(result), session_id="codex:session-a", lease_token=result["lease_token"])
+        version = registry.version
+        second = link_session(registry, result["lock_id"], **owner_from(result), session_id="codex:session-a", lease_token=result["lease_token"])
+        self.assertEqual(first, second); self.assertEqual(version, registry.version)
+        with self.assertRaisesRegex(TaskError, "another session"):
+            link_session(registry, result["lock_id"], **owner_from(result), session_id="codex:other", lease_token=result["lease_token"])
+
     def test_wrong_owner_cannot_release_or_renew(self):
         registry = MemoryRegistry(); result = acquire(registry, **acquire_args())
-        for change in ({"execution_id": "other"}, {"project_id": "other"}, {"provider": "claude"}, {"session_id": "claude:other"}):
+        for change in ({"execution_id": "other"}, {"project_id": "other"}, {"provider": "claude"}):
             with self.assertRaisesRegex(TaskError, "owner verification"):
                 release(registry, result["lock_id"], **owner_from(result, **change), lease_token=result["lease_token"])
             with self.assertRaisesRegex(TaskError, "owner verification"):
                 renew(registry, result["lock_id"], **owner_from(result, **change), lease_token=result["lease_token"])
+        with self.assertRaisesRegex(TaskError, "owner verification"):
+            renew(registry, result["lock_id"], **owner_from(result), lease_token="wrong-token" * 4)
+        with self.assertRaisesRegex(TaskError, "owner verification"):
+            release(registry, result["lock_id"], **owner_from(result), lease_token="wrong-token" * 4)
+
+    def test_legacy_session_owner_record_remains_safe(self):
+        registry = MemoryRegistry(); result = acquire(registry, **acquire_args())
+        self.assertEqual("codex:session-a", result["session_id"])
+        renewed = renew(registry, result["lock_id"], **owner_from(result), lease_token=result["lease_token"])
+        self.assertEqual("codex:session-a", renewed["session_id"])
+        same = link_session(registry, result["lock_id"], **owner_from(result), session_id="codex:session-a", lease_token=result["lease_token"])
+        self.assertEqual(renewed, same)
+        with self.assertRaisesRegex(TaskError, "owner verification"):
+            release(registry, result["lock_id"], **owner_from(result, execution_id="other"), lease_token=result["lease_token"])
 
     def test_correct_release_and_double_release(self):
         registry = MemoryRegistry(); result = acquire(registry, **acquire_args())

@@ -145,10 +145,12 @@ def token_hash(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def owner_fields(project_id, task_id, execution_id, provider, session_id):
-    values = {"project_id": project_id, "task_id": task_id, "execution_id": execution_id, "provider": provider, "session_id": session_id}
+def owner_fields(project_id, task_id, execution_id, provider, session_id=None):
+    values = {"project_id": project_id, "task_id": task_id, "execution_id": execution_id, "provider": provider}
     if any(not isinstance(value, str) or not value.strip() for value in values.values()):
-        raise TaskError("project/task/execution/provider/session owner fields are required")
+        raise TaskError("project/task/execution/provider owner fields are required")
+    if session_id is not None and (not isinstance(session_id, str) or not session_id.strip()):
+        raise TaskError("session metadata must be a non-empty string")
     return values
 
 
@@ -200,10 +202,10 @@ def read_registry(registry):
     return validate_registry(document), etag, server_time.astimezone(timezone.utc)
 
 
-def candidate(project_id, task_id, execution_id, provider, session_id, repository, branch, scope, baseline_head):
+def candidate(project_id, task_id, execution_id, provider, session_id=None, repository=None, branch=None, scope=None, baseline_head=None):
     owner = owner_fields(project_id, task_id, execution_id, provider, session_id)
     repository = canonical_repository(repository)
-    return {**owner, "lock_id": repository_lock_id(repository), "repository": repository, "branch": canonical_branch(branch), "scope": canonical_scope(scope), "baseline_head": canonical_baseline(baseline_head), "access": "production"}
+    return {**owner, "session_id": session_id, "lock_id": repository_lock_id(repository), "repository": repository, "branch": canonical_branch(branch), "scope": canonical_scope(scope), "baseline_head": canonical_baseline(baseline_head), "access": "production"}
 
 
 def check(registry, requested, working_directory=None, preflight_func=validate_local_preflight):
@@ -220,7 +222,7 @@ def check(registry, requested, working_directory=None, preflight_func=validate_l
     return {"authority": "advisory_only", "safe": not conflicts, "conflicts": conflicts, "candidate": {key: value for key, value in item.items() if key != "lease_token_hash"}}
 
 
-def acquire(registry, project_id, task_id, execution_id, provider, session_id, repository, branch, scope, baseline_head, working_directory, ttl_minutes=DEFAULT_TTL_MINUTES, lease_token=None, access="production", preflight_func=validate_local_preflight, attempts=5):
+def acquire(registry, project_id, task_id, execution_id, provider, session_id=None, repository=None, branch=None, scope=None, baseline_head=None, working_directory=None, ttl_minutes=DEFAULT_TTL_MINUTES, lease_token=None, access="production", preflight_func=validate_local_preflight, attempts=5):
     if access != "production":
         raise TaskError("read-only work cannot acquire or upgrade a writer lease")
     ttl = validate_ttl(ttl_minutes)
@@ -249,7 +251,7 @@ def acquire(registry, project_id, task_id, execution_id, provider, session_id, r
     raise TaskError("writer lease contention did not settle; production write blocked")
 
 
-def _owned_update(registry, lock_id, owner, lease_token, action, ttl_minutes=None, attempts=5):
+def _owned_update(registry, lock_id, owner, lease_token, action, ttl_minutes=None, session_id=None, attempts=5):
     digest = token_hash(lease_token)
     ttl = validate_ttl(ttl_minutes) if ttl_minutes is not None else None
     for _ in range(attempts):
@@ -261,10 +263,20 @@ def _owned_update(registry, lock_id, owner, lease_token, action, ttl_minutes=Non
             if not active(lock, now):
                 raise TaskError("expired lease cannot be renewed; acquire a new generation")
             changed = {**lock, "updated_at": iso(now), "expires_at": iso(now + timedelta(minutes=ttl))}
-        else:
+        elif action == "release":
             if lock["status"] == "released":
                 return public_lock(lock, now)
             changed = {**lock, "status": "released", "updated_at": iso(now), "released_at": iso(now)}
+        elif action == "link session":
+            if not active(lock, now):
+                raise TaskError("session cannot be linked to an inactive lease")
+            if lock.get("session_id") == session_id:
+                return public_lock(lock, now)
+            if lock.get("session_id") is not None:
+                raise TaskError("lease is already linked to another session")
+            changed = {**lock, "session_id": session_id, "updated_at": iso(now)}
+        else:
+            raise TaskError("invalid lease owner action")
         semantic_lock(changed, lock_id)
         updated = {**document, "locks": {**document["locks"], lock_id: changed}}
         try:
@@ -275,12 +287,17 @@ def _owned_update(registry, lock_id, owner, lease_token, action, ttl_minutes=Non
     raise TaskError(f"lease {action} contention did not settle; production write blocked")
 
 
-def renew(registry, lock_id, project_id, task_id, execution_id, provider, session_id, lease_token, ttl_minutes=DEFAULT_TTL_MINUTES):
+def renew(registry, lock_id, project_id, task_id, execution_id, provider, session_id=None, lease_token=None, ttl_minutes=DEFAULT_TTL_MINUTES):
     return _owned_update(registry, lock_id, owner_fields(project_id, task_id, execution_id, provider, session_id), lease_token, "renew", ttl_minutes)
 
 
-def release(registry, lock_id, project_id, task_id, execution_id, provider, session_id, lease_token):
+def release(registry, lock_id, project_id, task_id, execution_id, provider, session_id=None, lease_token=None):
     return _owned_update(registry, lock_id, owner_fields(project_id, task_id, execution_id, provider, session_id), lease_token, "release")
+
+
+def link_session(registry, lock_id, project_id, task_id, execution_id, provider, session_id, lease_token, attempts=5):
+    owner = owner_fields(project_id, task_id, execution_id, provider, session_id)
+    return _owned_update(registry, lock_id, owner, lease_token, "link session", session_id=session_id, attempts=attempts)
 
 
 def inspect(registry, lock_id):
@@ -306,9 +323,9 @@ def registry(args):
     return GCSLockRegistry.from_environment(args.gcs_bucket, args.gcs_object)
 
 
-def add_owner_arguments(parser):
+def add_owner_arguments(parser, session_required=False):
     parser.add_argument("project_id"); parser.add_argument("task_id"); parser.add_argument("execution_id")
-    parser.add_argument("--provider", required=True); parser.add_argument("--session-id", required=True)
+    parser.add_argument("--provider", required=True); parser.add_argument("--session-id", required=session_required)
 
 
 def add_candidate_arguments(parser, read_only=False):
@@ -329,6 +346,7 @@ def main():
     for command in ("renew", "release"):
         item = sub.add_parser(command); item.add_argument("lock_id"); add_owner_arguments(item); add_registry_arguments(item)
         if command == "renew": item.add_argument("--ttl-minutes", type=float, default=DEFAULT_TTL_MINUTES)
+    link = sub.add_parser("link-session"); link.add_argument("lock_id"); add_owner_arguments(link, session_required=True); add_registry_arguments(link)
     read = sub.add_parser("inspect"); read.add_argument("lock_id"); add_registry_arguments(read)
     listing = sub.add_parser("list"); listing.add_argument("--project-id"); add_registry_arguments(listing)
     args = parser.parse_args()
@@ -343,11 +361,13 @@ def main():
                     result = acquire(backend, **data, working_directory=args.working_directory, ttl_minutes=args.ttl_minutes, lease_token=os.environ.get(TOKEN_ENV))
                 else:
                     result = check(backend, {**data, "access": "read_only" if args.read_only else "production"}, args.working_directory)
-            elif args.command in ("renew", "release"):
+            elif args.command in ("renew", "release", "link-session"):
                 token = os.environ.get(TOKEN_ENV)
                 if not token: raise TaskError(f"lease token required via {TOKEN_ENV}")
                 owner = {key: getattr(args, key) for key in ("project_id", "task_id", "execution_id", "provider", "session_id")}
-                result = renew(backend, args.lock_id, **owner, lease_token=token, ttl_minutes=args.ttl_minutes) if args.command == "renew" else release(backend, args.lock_id, **owner, lease_token=token)
+                if args.command == "renew": result = renew(backend, args.lock_id, **owner, lease_token=token, ttl_minutes=args.ttl_minutes)
+                elif args.command == "release": result = release(backend, args.lock_id, **owner, lease_token=token)
+                else: result = link_session(backend, args.lock_id, **owner, lease_token=token)
             elif args.command == "inspect": result = inspect(backend, args.lock_id)
             else: result = list_locks(backend, args.project_id)
         print(json.dumps(result, indent=2)); return 0

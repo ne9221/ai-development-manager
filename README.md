@@ -230,9 +230,13 @@ credential-bearing URLs fail closed.
 Set `ADM_LOCK_GCS_BUCKET` and `ADM_LOCK_GCS_OBJECT`, then provision the registry
 once with `ifGenerationMatch=0`. Credentials use Application Default
 Credentials; Cloud Run's service account needs bucket-scoped Storage Object
-User (`roles/storage.objectUser`). `acquire` returns a lease token;
-store it privately and provide it through `AI_MANAGER_LEASE_TOKEN` for retry,
-renew, or release. GCS stores only its SHA-256 digest, and `inspect`/`list`
+User (`roles/storage.objectUser`). `acquire` returns a lease token and does not
+require a provider session. `link-session` may attach that metadata later
+without changing ownership or reacquiring. The execution ID and token remain
+authoritative. Existing records with a session remain readable without
+migration. Store the token privately and provide it through
+`AI_MANAGER_LEASE_TOKEN` for retry, renew, or release. GCS stores only its
+SHA-256 digest, and `inspect`/`list`
 never return either token form. The default lease is 60 minutes, bounded to 120
 minutes; an owner must renew before expiry. Expired leases cannot be revived.
 This subsystem is not yet wired into Dispatcher, Scheduler, or executions.
@@ -241,13 +245,14 @@ This subsystem is not yet wired into Dispatcher, Scheduler, or executions.
 $env:ADM_LOCK_GCS_BUCKET = "LOCK_BUCKET"
 $env:ADM_LOCK_GCS_OBJECT = "worktree-locks/global-registry.json"
 python -m manager.worktree_locks registry-init
-python -m manager.worktree_locks check example-project task-1 run-1 --provider codex --session-id codex:session-1 --repository https://github.com/example/repo.git --branch refs/heads/feature/a --baseline-head 0123456789abcdef0123456789abcdef01234567 --scope manager/tasks.py --working-directory C:\work\repo
-python -m manager.worktree_locks acquire example-project task-1 run-1 --provider codex --session-id codex:session-1 --repository git@github.com:example/repo.git --branch refs/heads/feature/a --baseline-head 0123456789abcdef0123456789abcdef01234567 --scope manager/tasks.py --working-directory C:\work\repo
+python -m manager.worktree_locks check example-project task-1 run-1 --provider codex --repository https://github.com/example/repo.git --branch refs/heads/feature/a --baseline-head 0123456789abcdef0123456789abcdef01234567 --scope manager/tasks.py --working-directory C:\work\repo
+python -m manager.worktree_locks acquire example-project task-1 run-1 --provider codex --repository git@github.com:example/repo.git --branch refs/heads/feature/a --baseline-head 0123456789abcdef0123456789abcdef01234567 --scope manager/tasks.py --working-directory C:\work\repo
 $env:AI_MANAGER_LEASE_TOKEN = "TOKEN_FROM_ACQUIRE"
-python -m manager.worktree_locks renew repo-SHA256 example-project task-1 run-1 --provider codex --session-id codex:session-1
+python -m manager.worktree_locks renew repo-SHA256 example-project task-1 run-1 --provider codex
+python -m manager.worktree_locks link-session repo-SHA256 example-project task-1 run-1 --provider codex --session-id codex:session-1
 python -m manager.worktree_locks inspect repo-SHA256
 python -m manager.worktree_locks list --project-id example-project
-python -m manager.worktree_locks release repo-SHA256 example-project task-1 run-1 --provider codex --session-id codex:session-1
+python -m manager.worktree_locks release repo-SHA256 example-project task-1 run-1 --provider codex
 ```
 
 For renames, callers must include both old and new repo-relative paths. P0 does
