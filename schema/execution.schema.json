@@ -7,13 +7,29 @@
     {
       "if": {"properties": {"status": {"const": "reserved"}}, "required": ["status"]},
       "then": {
-        "required": ["reserved_at"],
+        "required": ["reserved_at", "quota_evidence", "finished_at", "session_id", "provider_session_id"],
         "properties": {
           "reserved_at": {"type": "string", "format": "date-time"},
-          "started_at": {"type": "null"}
+          "started_at": {"type": "null"},
+          "completed_at": {"type": "null"},
+          "finished_at": {"type": "null"},
+          "session_id": {"type": "null"},
+          "provider_session_id": {"type": "null"},
+          "elapsed_minutes": {"type": "null"},
+          "quota_evidence": {"type": "object", "minProperties": 1},
+          "quota_before": {"type": "null"},
+          "quota_after": {"type": "null"},
+          "quota_delta": {"type": "null"},
+          "source_confidence": {"type": "null"}
         }
       },
-      "else": {"properties": {"started_at": {"type": "string", "format": "date-time"}}}
+      "else": {
+        "properties": {
+          "started_at": {"type": "string", "format": "date-time"},
+          "quota_before": {"type": "object"},
+          "source_confidence": {"type": "string"}
+        }
+      }
     }
   ],
   "required": ["execution_id", "task_id", "project_id", "provider", "mode", "effort", "started_at", "completed_at", "elapsed_minutes", "status", "quota_before", "quota_after", "quota_delta", "source_confidence", "notes", "task_snapshot"],
@@ -32,11 +48,11 @@
     "provider_session_id": {"type": ["string", "null"], "minLength": 1, "description": "Raw provider session ID for the primary linked session."},
     "elapsed_minutes": {"type": ["number", "null"], "minimum": 0},
     "status": {"enum": ["reserved", "running", "completed", "failed", "interrupted"]},
-    "quota_evidence": {"type": ["object", "null"], "description": "Assignment evidence copied from the task when reserved."},
-    "quota_before": {"type": "object"},
+    "quota_evidence": {"type": ["object", "null"], "description": "Caller-supplied quota decision evidence preserved by reservation."},
+    "quota_before": {"type": ["object", "null"]},
     "quota_after": {"type": ["object", "null"]},
     "quota_delta": {"type": ["object", "null"]},
-    "source_confidence": {"type": "string"},
+    "source_confidence": {"type": ["string", "null"]},
     "notes": {"type": "array", "items": {"type": "string"}},
     "task_snapshot": {"type": "object"}
   }

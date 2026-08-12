@@ -93,7 +93,12 @@ def quota_delta(before, after, started_at, completed_at):
 
 
 def task_snapshot(task):
-    keys = ("task_type", "complexity", "needs_repo_edit", "needs_research", "needs_browser", "parallelizable")
+    keys = (
+        "title", "task_type", "complexity", "expected_minutes", "needs_repo_edit",
+        "needs_research", "needs_browser", "parallelizable", "read_only", "scope",
+        "constraints", "acceptance_criteria", "working_directory", "branch",
+        "allowed_paths", "execution_policies",
+    )
     return {key: task.get(key) for key in keys if key in task}
 
 
@@ -152,14 +157,16 @@ def read_session_for_link(store, project_id, session_ref, provider=None):
     raise TaskError(f"session not found for link: {session_ref}")
 
 
-def reserve_execution(store, service, project_id, task_id, execution_id, provider, mode=None, effort=None, reserved_at=None, notes=None):
+def reserve_execution(store, project_id, task_id, execution_id, provider, quota_evidence, mode=None, effort=None, reserved_at=None, notes=None):
     """Create an idempotent execution reservation without starting work."""
+    if not isinstance(quota_evidence, dict) or not quota_evidence:
+        raise TaskError("quota_evidence must be a non-empty object")
     task = store.get("tasks", project_id, task_id)
     expected = {
         "execution_id": execution_id, "task_id": task_id, "project_id": project_id,
         "provider": provider, "mode": mode or task.get("mode"), "effort": effort or task.get("effort"),
         "notes": list(notes or []), "task_snapshot": task_snapshot(task),
-        "quota_evidence": task.get("quota_evidence"),
+        "quota_evidence": quota_evidence,
     }
     try:
         existing = store.get("executions", project_id, execution_id)
@@ -176,13 +183,12 @@ def reserve_execution(store, service, project_id, task_id, execution_id, provide
         raise TaskError(f"execution_id already exists with a different reservation: {execution_id}")
 
     reserved_at = reserved_at or now_iso()
-    before = quota_snapshot(read_drive_status(service=service), provider)
     execution = {
         **expected, "reserved_at": reserved_at, "started_at": None,
         "completed_at": None, "elapsed_minutes": None, "status": "reserved",
         "finished_at": None, "session_id": None, "provider_session_id": None,
-        "quota_before": before, "quota_after": None, "quota_delta": None,
-        "source_confidence": before.get("confidence", "unknown"),
+        "quota_before": None, "quota_after": None, "quota_delta": None,
+        "source_confidence": None,
     }
     validate("execution", execution)
     return store.put("executions", project_id, execution_id, execution)
@@ -264,7 +270,7 @@ def list_executions(store, project_id):
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
-    reserve = sub.add_parser("reserve"); reserve.add_argument("project_id"); reserve.add_argument("task_id"); reserve.add_argument("execution_id"); reserve.add_argument("--provider", required=True); reserve.add_argument("--mode"); reserve.add_argument("--effort"); reserve.add_argument("--note", action="append")
+    reserve = sub.add_parser("reserve"); reserve.add_argument("project_id"); reserve.add_argument("task_id"); reserve.add_argument("execution_id"); reserve.add_argument("--provider", required=True); reserve.add_argument("--quota-evidence-json", required=True); reserve.add_argument("--mode"); reserve.add_argument("--effort"); reserve.add_argument("--note", action="append")
     start = sub.add_parser("start"); start.add_argument("project_id"); start.add_argument("task_id"); start.add_argument("execution_id"); start.add_argument("--provider", required=True); start.add_argument("--mode"); start.add_argument("--effort"); start.add_argument("--note", action="append")
     start.add_argument("--session-id", help="Canonical session key or legacy raw Codex session ID")
     for command in ("finish", "fail", "interrupt"):
@@ -275,7 +281,7 @@ def main():
     try:
         service = build_service(); store = DriveRecords(service)
         if args.command == "reserve":
-            result = reserve_execution(store, service, args.project_id, args.task_id, args.execution_id, args.provider, args.mode, args.effort, notes=args.note)
+            result = reserve_execution(store, args.project_id, args.task_id, args.execution_id, args.provider, json.loads(args.quota_evidence_json), args.mode, args.effort, notes=args.note)
         elif args.command == "start":
             session = read_session_for_link(store, args.project_id, args.session_id, args.provider) if args.session_id else None
             result = start_execution(store, service, args.project_id, args.task_id, args.execution_id, args.provider, args.mode, args.effort, notes=args.note, session=session)

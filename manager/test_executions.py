@@ -1,9 +1,10 @@
+import io
 import unittest
 from copy import deepcopy
 from unittest.mock import patch
 
 from manager.estimator import estimate
-from manager.executions import finish_execution, link_execution_session, list_executions, quota_delta, quota_snapshot, read_execution, read_session_for_link, reserve_execution, start_execution, task_snapshot
+from manager.executions import finish_execution, link_execution_session, list_executions, main as executions_main, quota_delta, quota_snapshot, read_execution, read_session_for_link, reserve_execution, start_execution, task_snapshot
 from manager.sessions import manager_session_key
 from manager.tasks import DriveRecords, TaskError, create_task, validate
 from manager.test_tasks import FakeDriveService
@@ -28,7 +29,19 @@ def snapshot(windows, captured_at="2026-08-09T00:00:00Z"):
 
 
 def task():
-    return {"task_id": "t1", "project_id": "p1", "title": "Test", "task_type": "implementation", "complexity": "medium", "expected_minutes": 20, "needs_repo_edit": True, "scope": [], "constraints": [], "acceptance_criteria": [], "quota_evidence": {"codex": {"freshness": "fresh", "source_type": "official"}}}
+    return {
+        "task_id": "t1", "project_id": "p1", "title": "Test", "task_type": "implementation",
+        "complexity": "medium", "expected_minutes": 20, "needs_repo_edit": True,
+        "needs_research": False, "needs_browser": False, "parallelizable": False,
+        "read_only": False, "scope": ["manager/executions.py"], "constraints": ["Slice 2 only"],
+        "acceptance_criteria": ["reserved"], "working_directory": "C:/repo", "branch": "feature",
+        "allowed_paths": ["manager/executions.py"], "execution_policies": ["fail closed"],
+        "quota_evidence": {"stale-task-evidence": True},
+    }
+
+
+def decision(provider="codex", marker="fresh"):
+    return {"selected_provider": provider, "decision": marker}
 
 
 def execution(minutes, delta=2, status="completed"):
@@ -44,39 +57,92 @@ class ExecutionTests(unittest.TestCase):
         self.store = MemoryStore(); create_task(self.store, task(), assign=False)
 
     def test_reserve_is_idempotent_persists_evidence_and_does_not_start_task(self):
-        with patch("manager.executions.read_drive_status", return_value=quota([window()])) as reader:
-            first = reserve_execution(self.store, object(), "p1", "t1", "reserved-1", "codex", "code", "high", "2026-08-09T00:00:00Z", ["planned"])
-            second = reserve_execution(self.store, object(), "p1", "t1", "reserved-1", "codex", "code", "high", notes=["planned"])
-        self.assertEqual(first, second); reader.assert_called_once()
+        task_before = self.store.get("tasks", "p1", "t1")
+        with patch("manager.executions.read_drive_status") as reader:
+            first = reserve_execution(self.store, "p1", "t1", "reserved-1", "codex", decision(), "code", "high", "2026-08-09T00:00:00Z", ["planned"])
+            second = reserve_execution(self.store, "p1", "t1", "reserved-1", "codex", decision(), "code", "high", notes=["planned"])
+        self.assertEqual(first, second); reader.assert_not_called()
         self.assertEqual("reserved", first["status"]); self.assertEqual("2026-08-09T00:00:00Z", first["reserved_at"])
         self.assertIsNone(first["started_at"]); self.assertEqual(("codex", "code", "high"), (first["provider"], first["mode"], first["effort"]))
-        self.assertEqual(task_snapshot(self.store.get("tasks", "p1", "t1")), first["task_snapshot"])
-        self.assertEqual({"codex": {"freshness": "fresh", "source_type": "official"}}, first["quota_evidence"])
-        self.assertEqual("ready", self.store.get("tasks", "p1", "t1")["status"])
+        self.assertEqual(task_snapshot(task_before), first["task_snapshot"])
+        self.assertEqual(
+            {"title", "task_type", "complexity", "expected_minutes", "needs_repo_edit", "needs_research", "needs_browser", "parallelizable", "read_only", "scope", "constraints", "acceptance_criteria", "working_directory", "branch", "allowed_paths", "execution_policies"},
+            set(first["task_snapshot"]),
+        )
+        self.assertTrue({"status", "current_progress", "next_action", "updated_at"}.isdisjoint(first["task_snapshot"]))
+        self.assertEqual(decision(), first["quota_evidence"])
+        self.assertEqual(task_before, self.store.get("tasks", "p1", "t1"))
+        for field in ("started_at", "completed_at", "finished_at", "elapsed_minutes", "quota_before", "quota_after", "quota_delta", "session_id", "provider_session_id", "source_confidence"):
+            self.assertIsNone(first[field])
         invalid = deepcopy(first); invalid.pop("reserved_at")
         with self.assertRaisesRegex(TaskError, "reserved_at"):
             validate("execution", invalid)
 
-    def test_reserve_rejects_conflicting_duplicate_without_overwrite(self):
-        with patch("manager.executions.read_drive_status", return_value=quota([])):
-            original = reserve_execution(self.store, object(), "p1", "t1", "reserved-conflict", "codex", "code", "medium", "2026-08-09T00:00:00Z")
+    def test_reserve_rejects_payload_and_snapshot_conflicts_without_overwrite(self):
+        original = reserve_execution(self.store, "p1", "t1", "reserved-conflict", "codex", decision(), "code", "medium", "2026-08-09T00:00:00Z")
+        conflicts = [
+            ("claude", decision(), "code", "medium"),
+            ("codex", decision(), "analysis", "medium"),
+            ("codex", decision(), "code", "high"),
+            ("codex", decision(marker="changed"), "code", "medium"),
+        ]
+        for provider, evidence, mode, effort in conflicts:
+            with self.subTest(provider=provider, evidence=evidence, mode=mode, effort=effort):
+                with self.assertRaisesRegex(TaskError, "different reservation"):
+                    reserve_execution(self.store, "p1", "t1", "reserved-conflict", provider, evidence, mode, effort)
+                self.assertEqual(original, self.store.get("executions", "p1", "reserved-conflict"))
+        changed = self.store.get("tasks", "p1", "t1"); changed["scope"] = ["different.py"]
+        self.store.put("tasks", "p1", "t1", changed)
         with self.assertRaisesRegex(TaskError, "different reservation"):
-            reserve_execution(self.store, object(), "p1", "t1", "reserved-conflict", "claude", "analysis", "high")
+            reserve_execution(self.store, "p1", "t1", "reserved-conflict", "codex", decision(), "code", "medium")
         self.assertEqual(original, self.store.get("executions", "p1", "reserved-conflict"))
+        changed["scope"] = task()["scope"]; changed["current_progress"] = "workflow-only change"
+        self.store.put("tasks", "p1", "t1", changed)
+        self.assertEqual(original, reserve_execution(self.store, "p1", "t1", "reserved-conflict", "codex", decision(), "code", "medium"))
 
-    def test_reserve_cannot_overwrite_existing_running_execution(self):
-        with patch("manager.executions.read_drive_status", return_value=quota([])):
+    def test_reserve_rejects_running_terminal_and_malformed_existing_records(self):
+        with patch("manager.executions.read_drive_status", side_effect=[quota([]), quota([]), quota([])]):
             running = start_execution(self.store, object(), "p1", "t1", "already-running", "codex", started_at="2026-08-09T00:00:00Z")
-        with self.assertRaisesRegex(TaskError, "different reservation"):
-            reserve_execution(self.store, object(), "p1", "t1", "already-running", "codex")
-        self.assertEqual(running, self.store.get("executions", "p1", "already-running"))
+            start_execution(self.store, object(), "p1", "t1", "already-terminal", "codex", started_at="2026-08-09T00:00:00Z")
+            terminal = finish_execution(self.store, object(), "p1", "already-terminal", completed_at="2026-08-09T00:01:00Z")
+        for execution_id, existing in (("already-running", running), ("already-terminal", terminal)):
+            with self.assertRaisesRegex(TaskError, "different reservation"):
+                reserve_execution(self.store, "p1", "t1", execution_id, "codex", decision())
+            self.assertEqual(existing, self.store.get("executions", "p1", execution_id))
+        malformed = {"execution_id": "malformed", "status": "reserved"}
+        self.store.put("executions", "p1", "malformed", malformed)
+        with self.assertRaisesRegex(TaskError, "invalid execution"):
+            reserve_execution(self.store, "p1", "t1", "malformed", "codex", decision())
+        self.assertEqual(malformed, self.store.get("executions", "p1", "malformed"))
+
+    def test_reserve_rejects_invalid_quota_evidence(self):
+        for evidence in (None, {}, [], "fresh"):
+            with self.subTest(evidence=evidence), self.assertRaisesRegex(TaskError, "non-empty object"):
+                reserve_execution(self.store, "p1", "t1", "invalid-evidence", "codex", evidence)
+
+    def test_reserved_schema_enforces_unstarted_invariants_and_legacy_records(self):
+        reserved = reserve_execution(self.store, "p1", "t1", "schema-reserved", "codex", decision(), reserved_at="2026-08-09T00:00:00Z")
+        invalid_values = {
+            "started_at": "2026-08-09T00:00:00Z", "completed_at": "2026-08-09T00:00:00Z",
+            "finished_at": "2026-08-09T00:00:00Z", "elapsed_minutes": 0,
+            "quota_before": {}, "quota_after": {}, "quota_delta": {}, "session_id": "codex:s1",
+            "provider_session_id": "s1", "source_confidence": "official", "quota_evidence": {},
+        }
+        for field, value in invalid_values.items():
+            invalid = deepcopy(reserved); invalid[field] = value
+            with self.subTest(field=field), self.assertRaises(TaskError):
+                validate("execution", invalid)
+        with patch("manager.executions.read_drive_status", side_effect=[quota([]), quota([])]):
+            legacy = start_execution(self.store, object(), "p1", "t1", "legacy-running", "codex", started_at="2026-08-09T00:00:00Z")
+            validate("execution", legacy)
+            validate("execution", finish_execution(self.store, object(), "p1", "legacy-running", completed_at="2026-08-09T00:01:00Z"))
 
     def test_legacy_start_cannot_promote_or_overwrite_reservation(self):
-        with patch("manager.executions.read_drive_status", return_value=quota([])) as reader:
-            reserved = reserve_execution(self.store, object(), "p1", "t1", "reserved-gate", "codex", reserved_at="2026-08-09T00:00:00Z")
+        with patch("manager.executions.read_drive_status") as reader:
+            reserved = reserve_execution(self.store, "p1", "t1", "reserved-gate", "codex", decision(), reserved_at="2026-08-09T00:00:00Z")
             with self.assertRaisesRegex(TaskError, "authoritative running gate"):
                 start_execution(self.store, object(), "p1", "t1", "reserved-gate", "codex")
-        reader.assert_called_once()
+        reader.assert_not_called()
         self.assertEqual(reserved, self.store.get("executions", "p1", "reserved-gate"))
         self.assertEqual("ready", self.store.get("tasks", "p1", "t1")["status"])
 
@@ -104,6 +170,58 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(execution_ids, [record["execution_id"] for record in records])
         for execution_id in execution_ids:
             self.assertEqual(execution_id, read_execution(store, "p1", execution_id)["execution_id"])
+
+    def test_drive_reserved_read_list_and_duplicate_physical_records_fail_closed(self):
+        service = FakeDriveService(); store = DriveRecords(service)
+        create_task(store, task(), assign=False)
+        reserved = reserve_execution(store, "p1", "t1", "drive-reserved", "codex", decision(), "code", "high", "2026-08-09T00:00:00Z")
+        self.assertEqual(reserved, read_execution(store, "p1", "drive-reserved"))
+        self.assertEqual([reserved], list_executions(store, "p1"))
+        parent = store.project_folder("executions", "p1", create=False)
+        filename = store.record_filename("drive-reserved")
+        original_id = store.children(parent, filename)[0]["id"]
+        duplicate = deepcopy(service.transport.items[original_id])
+        duplicate["meta"]["id"] = "duplicate-execution-record"
+        service.transport.items["duplicate-execution-record"] = duplicate
+        with self.assertRaisesRegex(TaskError, "found 2"):
+            reserve_execution(store, "p1", "t1", "drive-reserved", "codex", decision(), "code", "high")
+        self.assertEqual(2, len(store.children(parent, filename)))
+
+    def test_finish_rejects_reserved_and_estimator_ignores_it(self):
+        reserved = reserve_execution(self.store, "p1", "t1", "not-running", "codex", decision(), "code", "medium", "2026-08-09T00:00:00Z")
+        with self.assertRaisesRegex(TaskError, "not running"):
+            finish_execution(self.store, object(), "p1", "not-running")
+        query = {"task_type": "implementation", "provider": "codex", "mode": "code", "effort": "medium", "complexity": "medium", "needs_repo_edit": True, "expected_minutes": 25}
+        result = estimate(query, [reserved, execution(18)])
+        self.assertEqual(1, result["sample_count"])
+        self.assertEqual(18, result["estimated_minutes"])
+
+    def test_reservation_write_failure_leaves_task_unchanged(self):
+        task_before = self.store.get("tasks", "p1", "t1")
+        real_put = self.store.put
+        def fail_execution_write(area, project, name, document):
+            if area == "executions":
+                raise TaskError("Drive write failed")
+            return real_put(area, project, name, document)
+        with patch.object(self.store, "put", side_effect=fail_execution_write):
+            with self.assertRaisesRegex(TaskError, "write failed"):
+                reserve_execution(self.store, "p1", "t1", "write-failure", "codex", decision())
+        self.assertEqual(task_before, self.store.get("tasks", "p1", "t1"))
+
+    def test_reserve_cli_success_idempotent_and_conflict_exit_behavior(self):
+        args = ["executions.py", "reserve", "p1", "t1", "cli-reserved", "--provider", "codex", "--quota-evidence-json", '{"decision":"fresh"}', "--mode", "code", "--effort", "high"]
+        with patch("manager.executions.build_service", return_value=object()), patch("manager.executions.DriveRecords", return_value=self.store), patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            with patch("sys.argv", args):
+                self.assertEqual(0, executions_main())
+            first = self.store.get("executions", "p1", "cli-reserved")
+            with patch("sys.argv", args):
+                self.assertEqual(0, executions_main())
+            self.assertEqual(first, self.store.get("executions", "p1", "cli-reserved"))
+            conflict = args[:]; conflict[conflict.index("codex")] = "claude"
+            with patch("sys.argv", conflict):
+                self.assertEqual(1, executions_main())
+        self.assertIn("different reservation", stderr.getvalue())
+        self.assertEqual(first, self.store.get("executions", "p1", "cli-reserved"))
 
     def test_single_missing_unknown_and_reset(self):
         known = quota_delta(quota_snapshot(quota([window()]), "codex"), quota_snapshot(quota([window(used=12)]), "codex"), "2026-08-09T00:00:00Z", "2026-08-09T00:10:00Z")

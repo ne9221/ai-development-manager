@@ -87,6 +87,11 @@ Phase 3C must never:
   snapshot, and quota evidence without claiming that work is running.
 - Reservation is idempotent for an explicitly supported retry identity and
   rejects conflicting duplicate execution IDs.
+- Slice 2 defines that retry identity as project-scoped `execution_id`: an
+  identical reservation payload returns the original record and timestamp;
+  any identity, task snapshot, or quota-evidence conflict fails closed.
+- Quota decision evidence is a caller-supplied, non-empty object preserved
+  verbatim. Reservation does not collect runtime usage evidence.
 - Reserving does not set the task to `in_progress`.
 
 ### 2. Authoritative write gate
@@ -286,6 +291,10 @@ a concise handoff with actual time and quota/token usage when available.
 - Likely files: `manager/executions.py`, execution schema, and execution tests.
 - Acceptance: reservation is distinct from running, preserves decision evidence,
   is conflict-safe, and does not mark the task `in_progress`.
+- Known integration risk: cross-machine simultaneous reservation for the same
+  `execution_id` is not yet backed by an atomic create-if-absent authority.
+- Legacy `start` CLI remains a bypass of the future Phase 3C lifecycle and must
+  be gated or retired in Slice 3 before it is a production lifecycle entrypoint.
 - Forbidden scope: acquire wiring, provider launch, heartbeat, terminal release,
   Dispatcher/Scheduler refactoring, or session import changes.
 
