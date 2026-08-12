@@ -62,6 +62,23 @@ class InterleavingRegistry(MemoryRegistry):
                 self.preferred_done.set()
 
 
+class LinkInterleavingRegistry(MemoryRegistry):
+    def __init__(self):
+        super().__init__()
+        self.barrier = threading.Barrier(2)
+        self.initial_reads = 0
+        self.armed = False
+
+    def read(self):
+        snapshot = super().read()
+        with self.mutex:
+            first_round = self.initial_reads < 2
+            self.initial_reads += 1
+        if self.armed and first_round:
+            self.barrier.wait(timeout=2)
+        return snapshot
+
+
 def no_preflight(*_args):
     return {}
 
@@ -149,6 +166,35 @@ class WorktreeLockTests(unittest.TestCase):
         self.assertEqual(first, second); self.assertEqual(version, registry.version)
         with self.assertRaisesRegex(TaskError, "another session"):
             link_session(registry, result["lock_id"], **owner_from(result), session_id="codex:other", lease_token=result["lease_token"])
+
+    def test_session_link_rejects_wrong_owner_token_and_noncanonical_identity(self):
+        registry = MemoryRegistry(); result = acquire(registry, **acquire_args(session_id=None))
+        for change in ({"project_id": "other"}, {"task_id": "other"}, {"execution_id": "other"}, {"provider": "claude"}):
+            session_id = "claude:session-a" if change.get("provider") == "claude" else "codex:session-a"
+            with self.assertRaisesRegex(TaskError, "owner verification"):
+                link_session(registry, result["lock_id"], **owner_from(result, **change), session_id=session_id, lease_token=result["lease_token"])
+        with self.assertRaisesRegex(TaskError, "owner verification"):
+            link_session(registry, result["lock_id"], **owner_from(result), session_id="codex:session-a", lease_token="wrong-token" * 4)
+        for session_id in ("raw-session", "claude:session-a", "codex:%"):
+            with self.assertRaisesRegex(TaskError, "canonical session provider"):
+                link_session(registry, result["lock_id"], **owner_from(result), session_id=session_id, lease_token=result["lease_token"])
+
+    def test_concurrent_different_session_links_have_one_winner(self):
+        registry = LinkInterleavingRegistry(); result = acquire(registry, **acquire_args(session_id=None))
+        registry.initial_reads = 0; registry.armed = True
+        results, errors = [], []
+
+        def run(session_id):
+            try:
+                results.append(link_session(registry, result["lock_id"], **owner_from(result), session_id=session_id, lease_token=result["lease_token"]))
+            except TaskError as exc:
+                errors.append(str(exc))
+
+        threads = [threading.Thread(target=run, args=(session_id,)) for session_id in ("codex:session-a", "codex:session-b")]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(timeout=3)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(1, len(results)); self.assertEqual(["lease is already linked to another session"], errors)
 
     def test_wrong_owner_cannot_release_or_renew(self):
         registry = MemoryRegistry(); result = acquire(registry, **acquire_args())

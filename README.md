@@ -232,12 +232,12 @@ once with `ifGenerationMatch=0`. Credentials use Application Default
 Credentials; Cloud Run's service account needs bucket-scoped Storage Object
 User (`roles/storage.objectUser`). `acquire` returns a lease token and does not
 require a provider session. `link-session` may attach that metadata later
-without changing ownership or reacquiring. The execution ID and token remain
-authoritative. Existing records with a session remain readable without
-migration. Store the token privately and provide it through
-`AI_MANAGER_LEASE_TOKEN` for retry, renew, or release. GCS stores only its
-SHA-256 digest, and `inspect`/`list`
-never return either token form. The default lease is 60 minutes, bounded to 120
+without changing ownership or reacquiring. Project, task, execution, provider,
+and token remain the authoritative owner tuple. Existing records with a session
+remain readable without migration. Store the token privately and provide it
+through `AI_MANAGER_LEASE_TOKEN` for retry, renew, or release. GCS stores only
+its SHA-256 digest, and `inspect`/`list` never return either token form. The
+default lease is 60 minutes, bounded to 120
 minutes; an owner must renew before expiry. Expired leases cannot be revived.
 This subsystem is not yet wired into Dispatcher, Scheduler, or executions.
 

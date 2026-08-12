@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from manager.gcs_lock_registry import GCSLockRegistry, RegistryConflict
+from manager.session_identity import parse_manager_session_key
 from manager.tasks import TaskError, validate
 
 
@@ -297,6 +298,9 @@ def release(registry, lock_id, project_id, task_id, execution_id, provider, sess
 
 def link_session(registry, lock_id, project_id, task_id, execution_id, provider, session_id, lease_token, attempts=5):
     owner = owner_fields(project_id, task_id, execution_id, provider, session_id)
+    parsed = parse_manager_session_key(session_id)
+    if not parsed or parsed[0] != provider:
+        raise TaskError("canonical session provider does not match lease provider")
     return _owned_update(registry, lock_id, owner, lease_token, "link session", session_id=session_id, attempts=attempts)
 
 
