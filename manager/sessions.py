@@ -682,11 +682,9 @@ def _session_freshness(record):
 
 
 def _read_session_copy(store, project_id, storage_key):
-    if not hasattr(store, "get_with_token"):
-        raise TaskError("session relocation requires conditional record reads")
-    record, token = store.get_with_token("sessions", project_id, storage_key)
+    record = store.get("sessions", project_id, storage_key)
     validate("session", record)
-    return record, token
+    return record
 
 
 def import_sessions(store, adapter, sessions_root=None, projects=None, repository_lookup=_repository_identity, session_ids=None):
@@ -717,11 +715,11 @@ def import_sessions(store, adapter, sessions_root=None, projects=None, repositor
         for project_id in sorted(partitions):
             for storage_key in dict.fromkeys((key, identity[1])):
                 try:
-                    existing, token = _read_session_copy(store, project_id, storage_key)
+                    existing = _read_session_copy(store, project_id, storage_key)
                 except (TaskError, KeyError):
                     continue
                 if session_provider_identity(existing) == identity:
-                    existing_copies.append((existing, project_id, storage_key, token))
+                    existing_copies.append((existing, project_id, storage_key))
 
         newest_existing = max(existing_copies, key=lambda item: _session_freshness(item[0]), default=None)
         if newest_existing and _session_freshness(newest_existing[0]) > _session_freshness(record):
@@ -729,15 +727,9 @@ def import_sessions(store, adapter, sessions_root=None, projects=None, repositor
             target = record["project_id"] or UNCLASSIFIED_PROJECT_ID
             key = session_manager_key(record)
 
-        stale = [item for item in existing_copies if item[1] != target or item[2] != key]
         current = next((item for item in existing_copies if item[1] == target and item[2] == key and item[0] == record), None)
         if current is None:
             store.put("sessions", target, key, record)
-        for _, project_id, storage_key, token in stale:
-            try:
-                store.delete("sessions", project_id, storage_key, expected=token)
-            except (TaskError, KeyError):
-                pass
         records.append(record)
     return records
 

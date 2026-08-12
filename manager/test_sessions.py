@@ -219,7 +219,7 @@ class SessionTests(unittest.TestCase):
             self.assertEqual([], records)
             self.assertEqual({}, store.records)
 
-    def test_reclassification_writes_new_location_then_removes_verified_stale_copies(self):
+    def test_reclassification_writes_new_location_and_retains_stale_copies(self):
         temp, root, _ = self.session_file(fixture("C:/elsewhere"))
         project_a = deepcopy(PROJECT)
         project_b = deepcopy(PROJECT); project_b.update(project_id="other-project", name="Other", aliases=[], repo="https://github.com/example/other", working_directory="C:/other")
@@ -233,7 +233,7 @@ class SessionTests(unittest.TestCase):
             self.assertIn(("sessions", "_unclassified", key), store.records)
 
             import_codex_sessions(store, root, [project_a, project_b], origin)
-            self.assertNotIn(("sessions", "_unclassified", key), store.records)
+            self.assertIn(("sessions", "_unclassified", key), store.records)
             self.assertIn(("sessions", project_a["project_id"], key), store.records)
 
             claude_key = "claude:session-123"
@@ -241,15 +241,16 @@ class SessionTests(unittest.TestCase):
             claude.update(session_id=claude_key, provider="claude", provider_session_id="session-123")
             store.records[("sessions", project_a["project_id"], claude_key)] = claude
             import_codex_sessions(store, root, [project_a, project_b], other)
-            self.assertNotIn(("sessions", project_a["project_id"], key), store.records)
+            self.assertIn(("sessions", project_a["project_id"], key), store.records)
             self.assertIn(("sessions", project_a["project_id"], claude_key), store.records)
             self.assertIn(("sessions", project_b["project_id"], key), store.records)
-            self.assertEqual([claude_key], [item["session_id"] for item in recent_sessions(store, project_a["project_id"], reviews=[])])
+            self.assertEqual({key, claude_key}, {item["session_id"] for item in recent_sessions(store, project_a["project_id"], reviews=[])})
             self.assertEqual([key], [item["session_id"] for item in recent_sessions(store, project_b["project_id"], reviews=[])])
 
-            deleted = list(store.deleted)
+            before = deepcopy(store.records)
             import_codex_sessions(store, root, [project_a, project_b], other)
-            self.assertEqual(deleted, store.deleted)
+            self.assertEqual(before, store.records)
+            self.assertEqual([], store.deleted)
 
     def test_reclassification_keeps_old_location_when_new_write_fails(self):
         temp, root, _ = self.session_file(fixture("C:/elsewhere"))
@@ -271,7 +272,7 @@ class SessionTests(unittest.TestCase):
             self.assertIn(key, store.records)
             self.assertEqual([], store.deleted)
 
-    def test_reclassification_cleanup_failure_or_concurrent_replacement_keeps_duplicate(self):
+    def test_reciprocal_relocation_never_deletes_either_partition(self):
         temp, root, _ = self.session_file(fixture("C:/elsewhere"))
         project_b = deepcopy(PROJECT); project_b.update(project_id="other-project", name="Other", aliases=[], repo="https://github.com/example/other", working_directory="C:/other")
         with temp:
@@ -279,38 +280,23 @@ class SessionTests(unittest.TestCase):
             other = lambda _cwd: {"git_root": "C:/work/b", "remote": project_b["repo"]}
             key = "codex:session-123"
 
-            failing = MemoryStore()
-            import_codex_sessions(failing, root, [PROJECT, project_b], origin)
+            store = MemoryStore()
+            import_codex_sessions(store, root, [PROJECT, project_b], origin)
             stale_key = ("sessions", PROJECT["project_id"], key)
-            failing.put("sessions", "_unclassified", key, failing.records[stale_key])
-            original_delete = failing.delete
-            def fail_one(area, project_id, name, expected=None):
-                if (area, project_id, name) == stale_key:
-                    raise TaskError("delete failed")
-                return original_delete(area, project_id, name, expected)
-            failing.delete = fail_one
-            import_codex_sessions(failing, root, [PROJECT, project_b], other)
-            self.assertIn(stale_key, failing.records)
-            self.assertNotIn(("sessions", "_unclassified", key), failing.records)
-            self.assertIn(("sessions", project_b["project_id"], key), failing.records)
+            import_codex_sessions(store, root, [PROJECT, project_b], other)
+            other_key = ("sessions", project_b["project_id"], key)
+            self.assertIn(stale_key, store.records)
+            self.assertIn(other_key, store.records)
 
-            concurrent = MemoryStore()
-            import_codex_sessions(concurrent, root, [PROJECT, project_b], origin)
-            original_delete = concurrent.delete
-            replaced = []
-            def replace_before_delete(area, project_id, name, expected=None):
-                if (area, project_id, name) == stale_key and not replaced:
-                    replacement = deepcopy(concurrent.records[stale_key])
-                    replacement.update(updated_at="2026-08-10T09:00:00Z", source_identifier="concurrent.jsonl")
-                    concurrent.put(*stale_key, replacement)
-                    replaced.append(True)
-                return original_delete(area, project_id, name, expected)
-            concurrent.delete = replace_before_delete
-            import_codex_sessions(concurrent, root, [PROJECT, project_b], other)
-            self.assertEqual("concurrent.jsonl", concurrent.records[stale_key]["source_identifier"])
-            self.assertIn(("sessions", project_b["project_id"], key), concurrent.records)
+            fresher = deepcopy(store.records[stale_key])
+            fresher.update(updated_at="2026-08-10T09:00:00Z", source_identifier="fresher.jsonl")
+            result = import_sessions(store, StaticAdapter([fresher]), projects=[PROJECT, project_b], repository_lookup=origin)
+            self.assertEqual("fresher.jsonl", result[0]["source_identifier"])
+            self.assertIn(stale_key, store.records)
+            self.assertIn(other_key, store.records)
+            self.assertEqual([], store.deleted)
 
-    def test_multiple_stale_copies_are_conditionally_removed(self):
+    def test_multiple_stale_copies_remain_readable_while_target_is_written(self):
         temp, root, _ = self.session_file(fixture("C:/elsewhere"))
         project_b = deepcopy(PROJECT); project_b.update(project_id="other-project", name="Other", aliases=[], repo="https://github.com/example/other", working_directory="C:/other")
         with temp:
@@ -322,9 +308,10 @@ class SessionTests(unittest.TestCase):
             duplicate = deepcopy(store.records[("sessions", "_unclassified", key)])
             store.put("sessions", PROJECT["project_id"], key, duplicate)
             import_codex_sessions(store, root, [PROJECT, project_b], other)
-            self.assertNotIn(("sessions", "_unclassified", key), store.records)
-            self.assertNotIn(("sessions", PROJECT["project_id"], key), store.records)
+            self.assertEqual(key, store.get("sessions", "_unclassified", key)["session_id"])
+            self.assertEqual(key, store.get("sessions", PROJECT["project_id"], key)["session_id"])
             self.assertIn(("sessions", project_b["project_id"], key), store.records)
+            self.assertEqual([], store.deleted)
 
     def test_duplicate_sources_and_registry_choose_deterministic_freshest_record(self):
         temp, root, _ = self.session_file()
@@ -350,7 +337,8 @@ class SessionTests(unittest.TestCase):
             result = import_sessions(registry, StaticAdapter([older]), projects=[PROJECT], repository_lookup=lambda _cwd: {"git_root": None, "remote": None})
             self.assertEqual("registry-newer.jsonl", result[0]["source_identifier"])
             self.assertIn(("sessions", "_unclassified", existing["session_id"]), registry.records)
-            self.assertNotIn(("sessions", PROJECT["project_id"], existing["session_id"]), registry.records)
+            self.assertIn(("sessions", PROJECT["project_id"], existing["session_id"]), registry.records)
+            self.assertEqual([], registry.deleted)
 
     def test_existing_title_wins_over_prompt_candidate(self):
         temp, root, _ = self.session_file()
