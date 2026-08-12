@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Atomic Drive-backed coarse repository writer leases."""
+"""Atomic GCS-backed coarse repository writer leases."""
 
 import argparse
 import hashlib
@@ -14,15 +14,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from collectors.publish_drive import build_service
-from manager.tasks import DriveConflict, DriveRecords, TaskError, validate
+from manager.gcs_lock_registry import GCSLockRegistry, RegistryConflict
+from manager.tasks import TaskError, validate
 
 
 DEFAULT_TTL_MINUTES = 60
 MAX_TTL_MINUTES = 120
-LOCK_NAMESPACE = "_global"
-REGISTRY_NAME = "registry"
-REGISTRY_ENV = "AI_MANAGER_LOCK_REGISTRY_FILE_ID"
 TOKEN_ENV = "AI_MANAGER_LEASE_TOKEN"
 REGISTRY_VERSION = "0.2.0"
 COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
@@ -196,19 +193,6 @@ def same_owner(lock, owner, lease_token):
     return all(lock[key] == value for key, value in owner.items()) and secrets.compare_digest(lock["lease_token_hash"], token_hash(lease_token))
 
 
-class DriveLockRegistry:
-    def __init__(self, records, file_id):
-        self.records, self.file_id = records, file_id
-
-    def read(self):
-        document, etag, server_time = self.records.read_versioned_json(self.file_id)
-        return validate_registry(document), etag, server_time
-
-    def cas(self, etag, document):
-        validate_registry(document)
-        return self.records.update_versioned_json(self.file_id, etag, document)
-
-
 def read_registry(registry):
     document, etag, server_time = registry.read()
     if not isinstance(server_time, datetime) or server_time.tzinfo is None:
@@ -260,7 +244,7 @@ def acquire(registry, project_id, task_id, execution_id, provider, session_id, r
         try:
             registry.cas(etag, updated)
             return {"authority": "acquired", **public_lock(record, now, lease_token)}
-        except DriveConflict:
+        except RegistryConflict:
             continue
     raise TaskError("writer lease contention did not settle; production write blocked")
 
@@ -286,7 +270,7 @@ def _owned_update(registry, lock_id, owner, lease_token, action, ttl_minutes=Non
         try:
             registry.cas(etag, updated)
             return public_lock(changed, now)
-        except DriveConflict:
+        except RegistryConflict:
             continue
     raise TaskError(f"lease {action} contention did not settle; production write blocked")
 
@@ -313,15 +297,13 @@ def list_locks(registry, project_id=None):
     return [public_lock(lock, now) for lock in sorted(locks, key=lambda value: value["lock_id"]) if not project_id or lock["project_id"] == project_id]
 
 
-def registry_id(args):
-    value = getattr(args, "registry_file_id", None) or os.environ.get(REGISTRY_ENV)
-    if not value:
-        raise TaskError(f"registry file ID required via --registry-file-id or {REGISTRY_ENV}")
-    return value
+def add_registry_arguments(parser):
+    parser.add_argument("--gcs-bucket")
+    parser.add_argument("--gcs-object")
 
 
-def add_registry_argument(parser):
-    parser.add_argument("--registry-file-id")
+def registry(args):
+    return GCSLockRegistry.from_environment(args.gcs_bucket, args.gcs_object)
 
 
 def add_owner_arguments(parser):
@@ -335,40 +317,39 @@ def add_candidate_arguments(parser, read_only=False):
     parser.add_argument("--baseline-head"); parser.add_argument("--working-directory")
     if read_only:
         parser.add_argument("--read-only", action="store_true")
-    add_registry_argument(parser)
+    add_registry_arguments(parser)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Drive CAS repository writer leases; check is advisory, acquire is authoritative")
+    parser = argparse.ArgumentParser(description="GCS generation-CAS repository writer leases; check is advisory, acquire is authoritative")
     sub = parser.add_subparsers(dest="command", required=True)
-    init = sub.add_parser("registry-init", help="one-time administrative registry provisioning")
+    init = sub.add_parser("registry-init", help="create the GCS registry object with ifGenerationMatch=0"); add_registry_arguments(init)
     acquire_parser = sub.add_parser("acquire"); add_candidate_arguments(acquire_parser); acquire_parser.add_argument("--ttl-minutes", type=float, default=DEFAULT_TTL_MINUTES)
     check_parser = sub.add_parser("check", help="advisory preview only; never authorizes writes"); add_candidate_arguments(check_parser, True)
     for command in ("renew", "release"):
-        item = sub.add_parser(command); item.add_argument("lock_id"); add_owner_arguments(item); add_registry_argument(item)
+        item = sub.add_parser(command); item.add_argument("lock_id"); add_owner_arguments(item); add_registry_arguments(item)
         if command == "renew": item.add_argument("--ttl-minutes", type=float, default=DEFAULT_TTL_MINUTES)
-    read = sub.add_parser("inspect"); read.add_argument("lock_id"); add_registry_argument(read)
-    listing = sub.add_parser("list"); listing.add_argument("--project-id"); add_registry_argument(listing)
+    read = sub.add_parser("inspect"); read.add_argument("lock_id"); add_registry_arguments(read)
+    listing = sub.add_parser("list"); listing.add_argument("--project-id"); add_registry_arguments(listing)
     args = parser.parse_args()
     try:
-        records = DriveRecords(build_service())
+        backend = registry(args)
         if args.command == "registry-init":
-            result = {"registry_file_id": records.provision_versioned_json("worktree_locks", LOCK_NAMESPACE, REGISTRY_NAME, {"schema_version": REGISTRY_VERSION, "locks": {}})}
+            result = {"generation": backend.create_if_absent({"schema_version": REGISTRY_VERSION, "locks": {}}), "bucket": backend.bucket, "object": backend.object_name}
         else:
-            registry = DriveLockRegistry(records, registry_id(args))
             if args.command in ("acquire", "check"):
                 data = {key: getattr(args, key) for key in ("project_id", "task_id", "execution_id", "provider", "session_id", "repository", "branch", "scope", "baseline_head")}
                 if args.command == "acquire":
-                    result = acquire(registry, **data, working_directory=args.working_directory, ttl_minutes=args.ttl_minutes, lease_token=os.environ.get(TOKEN_ENV))
+                    result = acquire(backend, **data, working_directory=args.working_directory, ttl_minutes=args.ttl_minutes, lease_token=os.environ.get(TOKEN_ENV))
                 else:
-                    result = check(registry, {**data, "access": "read_only" if args.read_only else "production"}, args.working_directory)
+                    result = check(backend, {**data, "access": "read_only" if args.read_only else "production"}, args.working_directory)
             elif args.command in ("renew", "release"):
                 token = os.environ.get(TOKEN_ENV)
                 if not token: raise TaskError(f"lease token required via {TOKEN_ENV}")
                 owner = {key: getattr(args, key) for key in ("project_id", "task_id", "execution_id", "provider", "session_id")}
-                result = renew(registry, args.lock_id, **owner, lease_token=token, ttl_minutes=args.ttl_minutes) if args.command == "renew" else release(registry, args.lock_id, **owner, lease_token=token)
-            elif args.command == "inspect": result = inspect(registry, args.lock_id)
-            else: result = list_locks(registry, args.project_id)
+                result = renew(backend, args.lock_id, **owner, lease_token=token, ttl_minutes=args.ttl_minutes) if args.command == "renew" else release(backend, args.lock_id, **owner, lease_token=token)
+            elif args.command == "inspect": result = inspect(backend, args.lock_id)
+            else: result = list_locks(backend, args.project_id)
         print(json.dumps(result, indent=2)); return 0
     except (TaskError, OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr); return 1

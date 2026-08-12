@@ -7,7 +7,6 @@ import json
 import re
 import sys
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 from collectors.publish_drive import build_service
@@ -24,10 +23,6 @@ MIME_FOLDER = "application/vnd.google-apps.folder"
 
 
 class TaskError(RuntimeError):
-    pass
-
-
-class DriveConflict(TaskError):
     pass
 
 
@@ -73,75 +68,6 @@ class DriveRecords:
                 raise TaskError("invalid or repeated Drive pagination token")
             seen.add(next_token)
             token = next_token
-
-    @staticmethod
-    def _execute_with_headers(request):
-        if not hasattr(request, "postproc"):
-            raise TaskError("Drive client does not expose response headers")
-        headers = {}
-        original = request.postproc
-
-        def capture(response, content):
-            headers.update({str(key).lower(): value for key, value in response.items()})
-            return original(response, content)
-
-        request.postproc = capture
-        return request.execute(), headers
-
-    def read_versioned_json(self, file_id):
-        try:
-            raw, headers = self._execute_with_headers(self.files.get_media(fileId=safe_id(file_id)))
-            etag, date = headers.get("etag"), headers.get("date")
-            if not etag or not date:
-                raise TaskError("Drive conditional record is missing ETag or server Date")
-            server_time = parsedate_to_datetime(date).astimezone(timezone.utc)
-            document = json.loads(raw.decode("utf-8"))
-            if not isinstance(document, dict):
-                raise ValueError("record is not a JSON object")
-            return document, etag, server_time
-        except TaskError:
-            raise
-        except Exception as exc:
-            raise TaskError("could not read versioned Drive JSON record") from exc
-
-    def update_versioned_json(self, file_id, expected_etag, document):
-        from googleapiclient.http import MediaIoBaseUpload
-        raw = (json.dumps(document, indent=2) + "\n").encode("utf-8")
-        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=MIME_JSON, resumable=False)
-        request = self.files.update(fileId=safe_id(file_id), body={}, media_body=media, fields="id")
-        if not hasattr(request, "headers"):
-            raise TaskError("Drive client does not support conditional request headers")
-        request.headers["If-Match"] = expected_etag
-        try:
-            request.execute()
-        except Exception as exc:
-            if getattr(getattr(exc, "resp", None), "status", None) == 412:
-                raise DriveConflict("Drive record changed concurrently") from exc
-            raise TaskError("Drive conditional update failed") from exc
-        return document
-
-    def provision_versioned_json(self, area, project_id, name, document):
-        """Create one separately provisioned CAS record; never used implicitly by acquire."""
-        from googleapiclient.http import MediaIoBaseUpload
-        parent = self.project_folder(area, project_id)
-        filename = f"{safe_id(name)}.json"
-        matches = [item for item in self.children(parent, filename) if item.get("mimeType") == MIME_JSON]
-        if len(matches) > 1:
-            raise TaskError(f"duplicate Drive record: {filename}")
-        if matches:
-            return matches[0]["id"]
-        response = self.files.generateIds(count=1, space="drive", type="files").execute()
-        ids = response.get("ids", []) if isinstance(response, dict) else []
-        if len(ids) != 1:
-            raise TaskError("Drive did not generate one registry file ID")
-        file_id = safe_id(ids[0])
-        raw = (json.dumps(document, indent=2) + "\n").encode("utf-8")
-        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=MIME_JSON, resumable=False)
-        self.files.create(body={"id": file_id, "name": filename, "parents": [parent], "mimeType": MIME_JSON}, media_body=media, fields="id").execute()
-        final = [item for item in self.children(parent, filename) if item.get("mimeType") == MIME_JSON]
-        if len(final) != 1 or final[0]["id"] != file_id:
-            raise TaskError("Drive registry provisioning is ambiguous; do not acquire")
-        return file_id
 
     def folder(self, parent, name, create=True):
         matches = [item for item in self.children(parent, name) if item.get("mimeType") == MIME_FOLDER]

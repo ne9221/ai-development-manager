@@ -5,7 +5,8 @@ import unittest
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
-from manager.tasks import DriveConflict, TaskError
+from manager.gcs_lock_registry import RegistryConflict
+from manager.tasks import TaskError
 from manager.worktree_locks import acquire, canonical_branch, canonical_repository, canonical_scope, check, inspect, list_locks, release, renew, repository_lock_id, semantic_lock, validate_local_preflight
 
 
@@ -28,7 +29,7 @@ class MemoryRegistry:
     def cas(self, version, document):
         with self.mutex:
             if version != str(self.version):
-                raise DriveConflict("stale")
+                raise RegistryConflict("stale")
             self.document = deepcopy(document)
             self.version += 1
 
@@ -137,7 +138,9 @@ class WorktreeLockTests(unittest.TestCase):
     def test_correct_release_and_double_release(self):
         registry = MemoryRegistry(); result = acquire(registry, **acquire_args())
         first = release(registry, result["lock_id"], **owner_from(result), lease_token=result["lease_token"])
+        self.assertEqual(3, registry.version)
         second = release(registry, result["lock_id"], **owner_from(result), lease_token=result["lease_token"])
+        self.assertEqual(3, registry.version)
         self.assertEqual("released", first["status"]); self.assertEqual(first, second)
         self.assertNotIn("lease_token", first); self.assertNotIn("lease_token_hash", first)
 
@@ -145,6 +148,7 @@ class WorktreeLockTests(unittest.TestCase):
         registry = MemoryRegistry(); first = acquire(registry, **acquire_args(ttl_minutes=10))
         registry.now += timedelta(minutes=5)
         renewed = renew(registry, first["lock_id"], **owner_from(first), lease_token=first["lease_token"], ttl_minutes=20)
+        self.assertEqual(3, registry.version)
         self.assertEqual("active", renewed["effective_status"])
         registry.now += timedelta(minutes=21)
         with self.assertRaisesRegex(TaskError, "expired lease cannot be renewed"):
@@ -153,6 +157,8 @@ class WorktreeLockTests(unittest.TestCase):
         self.assertEqual(first["generation"] + 1, second["generation"])
         with self.assertRaisesRegex(TaskError, "owner verification"):
             renew(registry, first["lock_id"], **owner_from(first), lease_token=first["lease_token"])
+        with self.assertRaisesRegex(TaskError, "owner verification"):
+            release(registry, first["lock_id"], **owner_from(first), lease_token=first["lease_token"])
 
     def test_repository_normalization_credentials_clones_and_fork(self):
         expected = "github:owner/repo"
@@ -205,9 +211,9 @@ class WorktreeLockTests(unittest.TestCase):
         with self.assertRaisesRegex(TaskError, "cannot acquire or upgrade"):
             acquire(registry, **acquire_args(access="read_only"))
 
-    def test_drive_unavailable_malformed_registry_and_redaction_fail_closed(self):
+    def test_backend_unavailable_malformed_registry_and_redaction_fail_closed(self):
         class Unavailable:
-            def read(self): raise OSError("Drive unavailable")
+            def read(self): raise OSError("registry unavailable")
         with self.assertRaises(OSError): acquire(Unavailable(), **acquire_args())
         malformed = MemoryRegistry({"schema_version": "0.2.0", "locks": {"bad": {}}})
         with self.assertRaises(TaskError): check(malformed, {**{k: v for k, v in acquire_args().items() if k not in ("working_directory", "preflight_func")}, "access": "production"}, "unused", no_preflight)

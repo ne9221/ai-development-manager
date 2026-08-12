@@ -36,10 +36,9 @@ human project assignment and its minimal reassignment audit. Legacy Codex raw
 session-ID review records remain readable. The review queue itself
 is generated from read-only session discovery plus these records.
 
-`WORKTREE-LOCKS/_global/registry.json` is a separately provisioned CAS registry
-for coarse repository writer leases. Its Drive file ID is configuration; lock
-operations never discover authority by filename. Canonical repository hashes
-key the `locks` object, and every mutation sends the prior ETag in `If-Match`,
-so concurrent writers have one winner. Lease owner tokens are returned only by
-acquire; Drive stores their hashes. Released and expired generations remain
-auditable but do not block a new owner.
+Working-tree lock authority is not stored in Drive. It is one explicitly
+configured Google Cloud Storage object; Drive remains the SSOT for existing
+task/session metadata only. Canonical repository hashes key its `locks` object,
+and every creation/update uses GCS `ifGenerationMatch=0/N`. Lease owner tokens
+are returned only by acquire; the registry stores their hashes. Released and
+expired generations remain auditable but do not block a new owner.

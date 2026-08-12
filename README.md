@@ -191,8 +191,8 @@ fallback behavior, shared-rule priority, and optional Ponytail policy.
 
 ## Working-tree preflight locks
 
-Working-tree P0 uses one pre-provisioned Drive JSON registry and ETag
-`If-Match` updates as the authoritative compare-and-swap boundary. The lock is
+Working-tree P0 uses one pre-provisioned Google Cloud Storage JSON object and
+object-generation preconditions as the authoritative compare-and-swap boundary. The lock is
 deliberately coarse: one production writer per canonical GitHub repository.
 Scope is validated repo-relative metadata, not an arbitration boundary.
 
@@ -203,18 +203,20 @@ clone origin, full branch ref, and current HEAD to match the request. Globs,
 absolute paths, unresolved `.`/`..`, detached HEAD, non-GitHub remotes, and
 credential-bearing URLs fail closed.
 
-Provision the registry once, then distribute only its Drive file ID as
-configuration. Every operational command requires that exact file ID, avoiding
-filename discovery as an authority boundary. `acquire` returns a lease token;
+Set `ADM_LOCK_GCS_BUCKET` and `ADM_LOCK_GCS_OBJECT`, then provision the registry
+once with `ifGenerationMatch=0`. Credentials use Application Default
+Credentials; Cloud Run's service account needs bucket-scoped Storage Object
+User (`roles/storage.objectUser`). `acquire` returns a lease token;
 store it privately and provide it through `AI_MANAGER_LEASE_TOKEN` for retry,
-renew, or release. Drive stores only its SHA-256 digest, and `inspect`/`list`
+renew, or release. GCS stores only its SHA-256 digest, and `inspect`/`list`
 never return either token form. The default lease is 60 minutes, bounded to 120
 minutes; an owner must renew before expiry. Expired leases cannot be revived.
 This subsystem is not yet wired into Dispatcher, Scheduler, or executions.
 
 ```powershell
+$env:ADM_LOCK_GCS_BUCKET = "LOCK_BUCKET"
+$env:ADM_LOCK_GCS_OBJECT = "worktree-locks/global-registry.json"
 python -m manager.worktree_locks registry-init
-$env:AI_MANAGER_LOCK_REGISTRY_FILE_ID = "DRIVE_FILE_ID"
 python -m manager.worktree_locks check example-project task-1 run-1 --provider codex --session-id codex:session-1 --repository https://github.com/example/repo.git --branch refs/heads/feature/a --baseline-head 0123456789abcdef0123456789abcdef01234567 --scope manager/tasks.py --working-directory C:\work\repo
 python -m manager.worktree_locks acquire example-project task-1 run-1 --provider codex --session-id codex:session-1 --repository git@github.com:example/repo.git --branch refs/heads/feature/a --baseline-head 0123456789abcdef0123456789abcdef01234567 --scope manager/tasks.py --working-directory C:\work\repo
 $env:AI_MANAGER_LEASE_TOKEN = "TOKEN_FROM_ACQUIRE"
