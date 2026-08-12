@@ -204,6 +204,9 @@ the first window and output is capped at eight windows per provider.
 ChatGPT cannot call this local CLI directly yet. A future transport needs only
 to call the self-contained `manager.runtime_bridge.read_runtime_status`
 function; no transport, MCP, HTTP, or connector is implemented by this phase.
+This contract assumes write access to the Drive `AI-RESOURCE-STATUS/status.json`
+SSOT is controlled; the file is downloaded and parsed before per-provider/window
+caps apply.
 
 See `docs/CHATGPT-INTEGRATION.md` for the upper-level client contract, explicit
 fallback behavior, shared-rule priority, and optional Ponytail policy.

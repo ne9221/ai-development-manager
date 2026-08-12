@@ -48,10 +48,15 @@ at most eight windows are returned.
 
 `read_runtime_status()` is the self-contained Python boundary: it performs the
 Drive read, bounded validation, reliability/freshness classification, safe
-projection, and unavailable fallback. ChatGPT cannot call the local CLI or
-this Python function directly today; the next transport may call this one
-function without reading Drive itself. No MCP, connector, or HTTP integration
-is implemented in this phase.
+projection, and unavailable fallback, and fails closed to the same bounded
+contract even if projection or final contract validation itself raises.
+ChatGPT cannot call the local CLI or this Python function directly today; the
+next transport may call this one function without reading Drive itself. No
+MCP, connector, or HTTP integration is implemented in this phase.
+
+This contract assumes write access to the Drive `AI-RESOURCE-STATUS/status.json`
+SSOT is controlled: the file is downloaded and JSON-parsed before per-provider
+and per-window caps apply, so the SSOT file itself must be a trusted source.
 
 Successful JSON includes `contract_version`, compact project/task/handoff
 fields, request type, recommendation, estimate, quota summary/freshness,

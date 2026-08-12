@@ -56,6 +56,18 @@ class ManagerTest(unittest.TestCase):
         self.assertTrue(far["providers"][0]["future_skewed"])
         self.assertFalse(far["providers"][0]["has_reliable_quota"])
 
+    def test_future_clock_skew_exact_five_minute_boundary_is_pinned(self):
+        exactly_five = quota(provider("codex", 90, NOW + timedelta(minutes=5)))
+        self.assertFalse(exactly_five["providers"][0]["future_skewed"])
+        one_second_over = quota(provider("codex", 90, NOW + timedelta(minutes=5, seconds=1)))
+        self.assertTrue(one_second_over["providers"][0]["future_skewed"])
+
+    def test_stale_exact_max_age_boundary_is_pinned(self):
+        exactly_max_age = quota(provider("codex", 90, NOW - timedelta(minutes=60)), max_age=60)
+        self.assertFalse(exactly_max_age["providers"][0]["stale"])
+        slightly_over = quota(provider("codex", 90, NOW - timedelta(minutes=60, seconds=1)), max_age=60)
+        self.assertTrue(slightly_over["providers"][0]["stale"])
+
     def test_naive_and_malformed_timestamps_are_rejected(self):
         for value in ("2026-08-09T04:00:00", "not-a-time"):
             with self.assertRaises(QuotaReaderError):

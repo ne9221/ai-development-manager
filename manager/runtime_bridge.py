@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import logging
 import re
 import sys
 from datetime import datetime, timezone
@@ -16,6 +17,8 @@ from manager.quota_reader import QuotaReaderError, parse_time, read_drive_status
 from manager.scheduler import schedule
 from manager.tasks import DriveRecords, MIME_FOLDER, ROOT_FOLDER_ID, ROOT_FOLDERS, TaskError, validate
 
+
+logger = logging.getLogger("runtime_bridge")
 
 RULES_PATH = Path(__file__).parents[1] / "AI-DEVELOPMENT-RULES.md"
 RUNTIME_STATUS_PROVIDERS = ("codex", "claude")
@@ -251,14 +254,40 @@ def runtime_status_contract(document=None, max_age_minutes=60, now=None):
     return validate_runtime_status_contract(output)
 
 
+def _static_unavailable_contract(now):
+    """Hand-built fallback that is never itself re-validated.
+
+    This is the last resort when even ``validate_runtime_status_contract``
+    cannot be trusted to run (e.g. a future maintenance regression), so it
+    must not depend on any of the logic it would otherwise be backstopping.
+    """
+    return {
+        "contract_version": RUNTIME_STATUS_CONTRACT_VERSION, "schema_version": "0.1.0",
+        "generated_at": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "providers": {provider_id: unavailable_provider() for provider_id in RUNTIME_STATUS_PROVIDERS},
+    }
+
+
 def read_runtime_status(service=None, max_age_minutes=60, now=None, reader=None):
-    """Read Drive and return a safe contract for CLI or a future transport."""
+    """Read Drive and return a safe contract for CLI or a future transport.
+
+    This is the complete public trust boundary: a failure while reading Drive,
+    projecting the document, or in final contract validation itself (e.g. a
+    maintenance regression) all fail closed to a bounded unavailable contract.
+    No exception and no raw exception message ever leaves this function; only
+    the exception type is logged for debugging, never its message or args.
+    """
+    now = now or datetime.now(timezone.utc)
     try:
         reader = reader or read_drive_status
         document = reader(service=service, validate_document=False)
     except Exception:
         document = None
-    return runtime_status_contract(document, max_age_minutes, now)
+    try:
+        return runtime_status_contract(document, max_age_minutes, now)
+    except Exception as exc:
+        logger.warning("runtime status contract projection failed closed: %s", type(exc).__name__)
+        return _static_unavailable_contract(now)
 
 
 def request_type(user_request, task, multi_task):

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from manager.quota_reader import QuotaReaderError
+from manager import runtime_bridge as runtime_bridge_module
 from manager.runtime_bridge import human_summary, main, read_runtime_status, resolve_project, runtime_bridge, runtime_status_contract
 from manager.tasks import TaskError, create_handoff, create_project, create_task
 
@@ -161,6 +162,37 @@ class RuntimeStatusContractTests(unittest.TestCase):
         self.assertEqual("unavailable", result["providers"]["codex"]["status"])
         self.assertEqual("known", result["providers"]["claude"]["status"])
 
+    def test_future_clock_skew_exact_boundary_is_pinned(self):
+        exactly_five = runtime_status_contract(quota(codex=80, claude=60, updated=NOW + timedelta(minutes=5)), now=NOW)
+        self.assertEqual("known", exactly_five["providers"]["codex"]["status"])
+        one_second_over = runtime_status_contract(quota(codex=80, claude=60, updated=NOW + timedelta(minutes=5, seconds=1)), now=NOW)
+        self.assertEqual("unavailable", one_second_over["providers"]["codex"]["status"])
+        self.assertEqual([], one_second_over["providers"]["codex"]["windows"])
+
+    def test_stale_threshold_exact_boundary_is_pinned(self):
+        exactly_max_age = runtime_status_contract(quota(codex=80, claude=60, updated=NOW - timedelta(minutes=60)), max_age_minutes=60, now=NOW)
+        self.assertEqual("known", exactly_max_age["providers"]["codex"]["status"])
+        slightly_over = runtime_status_contract(quota(codex=80, claude=60, updated=NOW - timedelta(minutes=60, seconds=1)), max_age_minutes=60, now=NOW)
+        self.assertEqual("stale", slightly_over["providers"]["codex"]["status"])
+        self.assertNotEqual([], slightly_over["providers"]["codex"]["windows"])
+
+    def test_nan_and_infinite_percentages_never_become_known(self):
+        for bad_value in (float("nan"), float("inf"), float("-inf")):
+            document = quota(codex=80, claude=60)
+            document["providers"][0]["windows"][0]["remaining_percent"] = bad_value
+            result = runtime_status_contract(document, now=NOW)
+            self.assertEqual("unavailable", result["providers"]["codex"]["status"])
+            self.assertEqual([], result["providers"]["codex"]["windows"])
+            self.assertEqual("known", result["providers"]["claude"]["status"])
+
+    def test_newline_and_control_character_free_text_is_whitelisted(self):
+        for attack in ("codex_app_server\nBearer secret", "primary\x00leak", "line1\r\nline2\tsecret"):
+            document = quota(codex=80, claude=60)
+            document["providers"][0]["source"] = attack
+            document["providers"][0]["windows"][0]["name"] = attack
+            serialized = json.dumps(runtime_status_contract(document, now=NOW))
+            self.assertNotIn(attack, serialized)
+
     def test_missing_provider_is_unavailable(self):
         document = quota()
         document["providers"] = [item for item in document["providers"] if item["provider"] != "claude"]
@@ -277,6 +309,35 @@ class RuntimeStatusContractTests(unittest.TestCase):
             def files(self): return MalformedFiles()
         result = read_runtime_status(service=MalformedService(), now=NOW)
         self.assertEqual("unavailable", result["providers"]["codex"]["status"])
+
+    def test_final_contract_validator_regression_fails_closed(self):
+        """A maintenance regression in the internal window-name allowlist must not
+        let the public loader raise; it must fail closed to unavailable, log only
+        the sanitized exception type, and keep the CLI's stdout pure JSON."""
+        original_names = runtime_bridge_module.RUNTIME_STATUS_WINDOW_NAMES["codex"]
+        runtime_bridge_module.RUNTIME_STATUS_WINDOW_NAMES["codex"] = {"not a valid window name!"}
+        try:
+            document = quota(codex=80, claude=60)
+            document["providers"][0]["windows"][0]["name"] = "not a valid window name!"
+            with self.assertLogs("runtime_bridge", level="WARNING") as captured:
+                result = read_runtime_status(reader=lambda **_: document, now=NOW)
+            self.assertEqual("unavailable", result["providers"]["codex"]["status"])
+            self.assertEqual("unavailable", result["providers"]["claude"]["status"])
+            self.assertEqual([], result["providers"]["codex"]["windows"])
+            joined_log = "\n".join(captured.output)
+            self.assertIn("RuntimeError", joined_log)
+            self.assertNotIn("not a valid window name", joined_log)
+
+            output, errors = io.StringIO(), io.StringIO()
+            with patch("manager.runtime_bridge.read_drive_status", side_effect=lambda **_: document), \
+                 redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(0, main(["status", "--json"]))
+            parsed = json.loads(output.getvalue())
+            self.assertEqual("unavailable", parsed["providers"]["codex"]["status"])
+            self.assertNotIn("not a valid window name", output.getvalue())
+            self.assertNotIn("not a valid window name", errors.getvalue())
+        finally:
+            runtime_bridge_module.RUNTIME_STATUS_WINDOW_NAMES["codex"] = original_names
 
     def test_missing_and_malformed_drive_status_emit_unavailable_json(self):
         for message in ("found 0", "malformed token=raw-secret payload"):
