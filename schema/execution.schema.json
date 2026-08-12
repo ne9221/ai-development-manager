@@ -3,6 +3,19 @@
   "title": "AI Development Manager Execution",
   "type": "object",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "reserved"}}, "required": ["status"]},
+      "then": {
+        "required": ["reserved_at"],
+        "properties": {
+          "reserved_at": {"type": "string", "format": "date-time"},
+          "started_at": {"type": "null"}
+        }
+      },
+      "else": {"properties": {"started_at": {"type": "string", "format": "date-time"}}}
+    }
+  ],
   "required": ["execution_id", "task_id", "project_id", "provider", "mode", "effort", "started_at", "completed_at", "elapsed_minutes", "status", "quota_before", "quota_after", "quota_delta", "source_confidence", "notes", "task_snapshot"],
   "properties": {
     "execution_id": {"type": "string", "minLength": 1},
@@ -11,13 +24,15 @@
     "provider": {"type": "string", "minLength": 1},
     "mode": {"type": ["string", "null"]},
     "effort": {"type": ["string", "null"]},
-    "started_at": {"type": "string", "format": "date-time"},
+    "reserved_at": {"type": ["string", "null"], "format": "date-time", "description": "Reservation timestamp; absent on legacy records."},
+    "started_at": {"type": ["string", "null"], "format": "date-time"},
     "completed_at": {"type": ["string", "null"], "format": "date-time"},
     "finished_at": {"type": ["string", "null"], "format": "date-time", "description": "Explicit execution finish timestamp; legacy records may use completed_at only."},
     "session_id": {"type": ["string", "null"], "minLength": 1, "description": "Primary manager canonical session identity."},
     "provider_session_id": {"type": ["string", "null"], "minLength": 1, "description": "Raw provider session ID for the primary linked session."},
     "elapsed_minutes": {"type": ["number", "null"], "minimum": 0},
-    "status": {"enum": ["running", "completed", "failed", "interrupted"]},
+    "status": {"enum": ["reserved", "running", "completed", "failed", "interrupted"]},
+    "quota_evidence": {"type": ["object", "null"], "description": "Assignment evidence copied from the task when reserved."},
     "quota_before": {"type": "object"},
     "quota_after": {"type": ["object", "null"]},
     "quota_delta": {"type": ["object", "null"]},

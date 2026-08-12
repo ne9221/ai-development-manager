@@ -3,7 +3,7 @@ from copy import deepcopy
 from unittest.mock import patch
 
 from manager.estimator import estimate
-from manager.executions import finish_execution, link_execution_session, list_executions, quota_delta, quota_snapshot, read_execution, read_session_for_link, start_execution
+from manager.executions import finish_execution, link_execution_session, list_executions, quota_delta, quota_snapshot, read_execution, read_session_for_link, reserve_execution, start_execution, task_snapshot
 from manager.sessions import manager_session_key
 from manager.tasks import DriveRecords, TaskError, create_task, validate
 from manager.test_tasks import FakeDriveService
@@ -28,7 +28,7 @@ def snapshot(windows, captured_at="2026-08-09T00:00:00Z"):
 
 
 def task():
-    return {"task_id": "t1", "project_id": "p1", "title": "Test", "task_type": "implementation", "complexity": "medium", "expected_minutes": 20, "needs_repo_edit": True, "scope": [], "constraints": [], "acceptance_criteria": []}
+    return {"task_id": "t1", "project_id": "p1", "title": "Test", "task_type": "implementation", "complexity": "medium", "expected_minutes": 20, "needs_repo_edit": True, "scope": [], "constraints": [], "acceptance_criteria": [], "quota_evidence": {"codex": {"freshness": "fresh", "source_type": "official"}}}
 
 
 def execution(minutes, delta=2, status="completed"):
@@ -42,6 +42,43 @@ def session(provider="codex", provider_session_id="s1", project_id="p1"):
 class ExecutionTests(unittest.TestCase):
     def setUp(self):
         self.store = MemoryStore(); create_task(self.store, task(), assign=False)
+
+    def test_reserve_is_idempotent_persists_evidence_and_does_not_start_task(self):
+        with patch("manager.executions.read_drive_status", return_value=quota([window()])) as reader:
+            first = reserve_execution(self.store, object(), "p1", "t1", "reserved-1", "codex", "code", "high", "2026-08-09T00:00:00Z", ["planned"])
+            second = reserve_execution(self.store, object(), "p1", "t1", "reserved-1", "codex", "code", "high", notes=["planned"])
+        self.assertEqual(first, second); reader.assert_called_once()
+        self.assertEqual("reserved", first["status"]); self.assertEqual("2026-08-09T00:00:00Z", first["reserved_at"])
+        self.assertIsNone(first["started_at"]); self.assertEqual(("codex", "code", "high"), (first["provider"], first["mode"], first["effort"]))
+        self.assertEqual(task_snapshot(self.store.get("tasks", "p1", "t1")), first["task_snapshot"])
+        self.assertEqual({"codex": {"freshness": "fresh", "source_type": "official"}}, first["quota_evidence"])
+        self.assertEqual("ready", self.store.get("tasks", "p1", "t1")["status"])
+        invalid = deepcopy(first); invalid.pop("reserved_at")
+        with self.assertRaisesRegex(TaskError, "reserved_at"):
+            validate("execution", invalid)
+
+    def test_reserve_rejects_conflicting_duplicate_without_overwrite(self):
+        with patch("manager.executions.read_drive_status", return_value=quota([])):
+            original = reserve_execution(self.store, object(), "p1", "t1", "reserved-conflict", "codex", "code", "medium", "2026-08-09T00:00:00Z")
+        with self.assertRaisesRegex(TaskError, "different reservation"):
+            reserve_execution(self.store, object(), "p1", "t1", "reserved-conflict", "claude", "analysis", "high")
+        self.assertEqual(original, self.store.get("executions", "p1", "reserved-conflict"))
+
+    def test_reserve_cannot_overwrite_existing_running_execution(self):
+        with patch("manager.executions.read_drive_status", return_value=quota([])):
+            running = start_execution(self.store, object(), "p1", "t1", "already-running", "codex", started_at="2026-08-09T00:00:00Z")
+        with self.assertRaisesRegex(TaskError, "different reservation"):
+            reserve_execution(self.store, object(), "p1", "t1", "already-running", "codex")
+        self.assertEqual(running, self.store.get("executions", "p1", "already-running"))
+
+    def test_legacy_start_cannot_promote_or_overwrite_reservation(self):
+        with patch("manager.executions.read_drive_status", return_value=quota([])) as reader:
+            reserved = reserve_execution(self.store, object(), "p1", "t1", "reserved-gate", "codex", reserved_at="2026-08-09T00:00:00Z")
+            with self.assertRaisesRegex(TaskError, "authoritative running gate"):
+                start_execution(self.store, object(), "p1", "t1", "reserved-gate", "codex")
+        reader.assert_called_once()
+        self.assertEqual(reserved, self.store.get("executions", "p1", "reserved-gate"))
+        self.assertEqual("ready", self.store.get("tasks", "p1", "t1")["status"])
 
     def test_start_finish_elapsed_and_dynamic_windows(self):
         before = quota([window(), window("secondary", 30)])
