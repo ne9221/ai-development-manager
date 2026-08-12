@@ -70,9 +70,12 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
     if handoff:
         handoff_text = f"{handoff.get('minimal_context', '')} Current state: {handoff.get('current_state', '')}. Next: {handoff.get('next_action', '')}."
     lines = [
+        f"AI: {provider.replace('_', ' ').title()}",
+        f"Project: {project['project_id']}",
+        f"Task: {task['task_id']}", "",
         "AI Development Manager execution brief", "",
         f"Provider adaptation: {ADAPTATION[provider]}",
-        f"Project: {project['name']}", f"Repo: {project['repo']}",
+        f"Project name: {project['name']}", f"Repo: {project['repo']}",
         f"Working directory: {project.get('working_directory') or 'resolve from repo'}",
         f"Branch: {project['default_branch']}", f"Baseline commit: {baseline}",
         f"Task goal: {task['title']}", f"Current state: {task.get('current_progress', 'Not started')}",

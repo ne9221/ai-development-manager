@@ -2,6 +2,7 @@ import unittest
 from copy import deepcopy
 
 from manager.dispatcher import dispatch, request_ok
+from manager.sessions import parse_identity_header
 from manager.tasks import TaskError, create_handoff, create_project, create_task
 
 
@@ -48,6 +49,18 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual("codex", result["recommended_provider"]); self.assertEqual(14, result["estimated_minutes"])
         self.assertEqual("Fix regression", self.store.get("tasks", "p1", "new-explicit-id")["title"])
         self.assertNotIn('"providers"', result["generated_prompt"])
+
+    def test_identity_header_round_trips_canonical_task_for_codex_and_claude(self):
+        for provider, task_id in (("codex", "canonical-task-id"), ("claude", "canonical_task_id")):
+            with self.subTest(provider=provider):
+                result = self.dispatch_case(request(task_id=task_id, title="Conversation label differs", preferred_provider=provider), quota(80, 80))
+                prompt = result["generated_prompt"]
+                expected = {"ai": provider.title(), "project": "p1", "task": task_id}
+                self.assertEqual(expected, parse_identity_header(prompt))
+                self.assertTrue(prompt.startswith(f"AI: {provider.title()}\nProject: p1\nTask: {task_id}\n\n"))
+                self.assertIn("Project name: Project One", prompt)
+                self.assertIn("Task goal: Conversation label differs", prompt)
+                self.assertNotIn("Conversation:", prompt)
 
     def test_existing_continuation_with_and_without_handoff(self):
         task = create_task(self.store, request(task_id="t1", current_progress="Parser fixed", next_action="Run tests"), assign=False)
