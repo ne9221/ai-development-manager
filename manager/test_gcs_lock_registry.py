@@ -22,6 +22,7 @@ class Response:
 class GenerationStore:
     def __init__(self):
         self.generation = None
+        self.generations = iter((101, 907, 4001, 99991))
         self.document = None
         self.lock = threading.Lock()
         self.unavailable = False
@@ -42,7 +43,7 @@ class GenerationStore:
         with self.lock:
             if (expected == 0 and self.generation is not None) or (expected != 0 and expected != self.generation):
                 return Response(412, {})
-            self.generation = (self.generation or 0) + 1
+            self.generation = next(self.generations)
             self.document = json.loads(data.decode("utf-8"))
             return Response(200 if expected else 201, {"generation": str(self.generation)})
 
@@ -61,13 +62,14 @@ class GCSLockRegistryTests(unittest.TestCase):
         threads = [threading.Thread(target=create, args=(backend,)) for backend in (first, second)]
         for thread in threads: thread.start()
         for thread in threads: thread.join()
-        self.assertEqual([1], winners); self.assertEqual([True], losers)
+        self.assertEqual(1, len(winners)); self.assertEqual([True], losers)
 
     def test_generation_update_and_stale_update(self):
         backend = self.backend(); backend.create_if_absent({"value": 1})
         document, generation, server_time = backend.read()
-        self.assertEqual({"value": 1}, document); self.assertEqual(1, generation); self.assertIsNotNone(server_time.tzinfo)
-        self.assertEqual(2, backend.compare_and_swap(generation, {"value": 2}))
+        self.assertEqual({"value": 1}, document); self.assertIsNotNone(server_time.tzinfo)
+        next_generation = backend.compare_and_swap(generation, {"value": 2})
+        self.assertNotEqual(generation, next_generation)
         with self.assertRaises(RegistryConflict): backend.compare_and_swap(generation, {"value": 3})
         self.assertEqual({"value": 2}, backend.read()[0])
 
