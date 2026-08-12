@@ -7,6 +7,7 @@ from mcp.types import ToolAnnotations
 
 from cloud.app import default_service_factory
 from manager.runtime_bridge import redact, runtime_bridge
+from manager.runtime_quota_tool import runtime_quota_status
 from manager.tasks import DriveRecords, TaskError
 
 
@@ -64,6 +65,9 @@ def adm_status(project_id: str | None = None, project_alias: str | None = None) 
         "contract_version", "project", "active_task", "latest_handoff_summary",
         "recommended_provider", "quota_summary", "quota_freshness", "warnings", "next_action",
     )}
+
+
+server.tool(name="adm_runtime_quota_status", annotations=READ_ONLY, structured_output=True)(runtime_quota_status)
 
 
 @server.tool(annotations=READ_ONLY, structured_output=True)
