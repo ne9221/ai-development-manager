@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Repository Writer Lease",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lock_id", "project_id", "task_id", "execution_id", "provider", "session_id", "repository", "branch", "scope", "baseline_head", "access", "status", "generation", "lease_token_hash", "created_at", "updated_at", "expires_at", "released_at"],
+  "properties": {
+    "lock_id": {"type": "string", "pattern": "^repo-[0-9a-f]{64}$"},
+    "project_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "execution_id": {"type": "string", "minLength": 1},
+    "provider": {"type": "string", "minLength": 1},
+    "session_id": {"type": "string", "minLength": 1},
+    "repository": {"type": "string", "pattern": "^github:[a-z0-9_.-]+/[a-z0-9_.-]+$"},
+    "branch": {"type": "string", "pattern": "^refs/heads/.+$"},
+    "scope": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "baseline_head": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+    "access": {"const": "production"},
+    "status": {"enum": ["active", "released"]},
+    "generation": {"type": "integer", "minimum": 1},
+    "lease_token_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "released_at": {"type": ["string", "null"], "format": "date-time"}
+  },
+  "allOf": [
+    {"if": {"properties": {"status": {"const": "active"}}}, "then": {"properties": {"released_at": {"type": "null"}}}},
+    {"if": {"properties": {"status": {"const": "released"}}}, "then": {"properties": {"released_at": {"type": "string", "format": "date-time"}}}}
+  ]
+}

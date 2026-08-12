@@ -34,3 +34,11 @@ never a full provider conversation transcript. Sessions without a deterministic 
 human project assignment and its minimal reassignment audit. Legacy Codex raw
 session-ID review records remain readable. The review queue itself
 is generated from read-only session discovery plus these records.
+
+Working-tree lock authority is not stored in the Drive tree above. Its
+authoritative registry is one explicitly configured Google Cloud Storage
+object. Drive remains the SSOT for existing task/session metadata only.
+Canonical repository hashes key its `locks` object,
+and every creation/update uses GCS `ifGenerationMatch=0/N`. Lease owner tokens
+are returned only by acquire; the registry stores their hashes. Released and
+expired generations remain auditable but do not block a new owner.

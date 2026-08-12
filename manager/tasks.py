@@ -18,8 +18,8 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 
 ROOT_FOLDER_ID = "1pXvl8BglU05ZrXMHIVIDyK-lOWNShXSO"
-ROOT_FOLDERS = {"tasks": "TASKS", "handoffs": "HANDOFFS", "history": "TASK-HISTORY", "projects": "PROJECTS", "executions": "EXECUTIONS", "sessions": "SESSIONS", "session_reviews": "SESSION-REVIEWS", "overviews": "OVERVIEWS"}
-SCHEMAS = {name: Path(__file__).parents[1] / "schema" / f"{name}.schema.json" for name in ("project", "project_preview", "task", "handoff", "execution", "session", "session_review", "overview")}
+ROOT_FOLDERS = {"tasks": "TASKS", "handoffs": "HANDOFFS", "history": "TASK-HISTORY", "projects": "PROJECTS", "executions": "EXECUTIONS", "sessions": "SESSIONS", "session_reviews": "SESSION-REVIEWS", "overviews": "OVERVIEWS", "worktree_locks": "WORKTREE-LOCKS"}
+SCHEMAS = {name: Path(__file__).parents[1] / "schema" / f"{name}.schema.json" for name in ("project", "project_preview", "task", "handoff", "execution", "session", "session_review", "overview", "worktree_lock", "worktree_lock_registry")}
 MIME_JSON = "application/json"
 MIME_FOLDER = "application/vnd.google-apps.folder"
 
@@ -83,7 +83,22 @@ class DriveRecords:
         query = f"'{parent}' in parents and trashed=false"
         if name:
             query += f" and name='{name}'"
-        return self.files.list(q=query, spaces="drive", fields="files(id,name,mimeType,parents,modifiedTime)", pageSize=100).execute().get("files", [])
+        items, token, seen = [], None, set()
+        while True:
+            options = {"q": query, "spaces": "drive", "fields": "nextPageToken,files(id,name,mimeType,parents,modifiedTime)", "pageSize": 100}
+            if token:
+                options["pageToken"] = token
+            response = self.files.list(**options).execute()
+            if not isinstance(response, dict) or not isinstance(response.get("files", []), list):
+                raise TaskError("malformed Drive listing response")
+            items.extend(response.get("files", []))
+            next_token = response.get("nextPageToken")
+            if next_token is None:
+                return items
+            if not isinstance(next_token, str) or not next_token or next_token in seen:
+                raise TaskError("invalid or repeated Drive pagination token")
+            seen.add(next_token)
+            token = next_token
 
     def folder(self, parent, name, create=True):
         matches = [item for item in self.children(parent, name) if item.get("mimeType") == MIME_FOLDER]
