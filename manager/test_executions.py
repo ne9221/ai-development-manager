@@ -3,9 +3,10 @@ from copy import deepcopy
 from unittest.mock import patch
 
 from manager.estimator import estimate
-from manager.executions import finish_execution, link_execution_session, quota_delta, quota_snapshot, read_execution, read_session_for_link, start_execution
+from manager.executions import finish_execution, link_execution_session, list_executions, quota_delta, quota_snapshot, read_execution, read_session_for_link, start_execution
 from manager.sessions import manager_session_key
-from manager.tasks import TaskError, create_task, validate
+from manager.tasks import DriveRecords, TaskError, create_task, validate
+from manager.test_tasks import FakeDriveService
 
 
 class MemoryStore:
@@ -54,6 +55,18 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual("codex:s1", run["session_id"])
         self.assertEqual(run, read_execution(self.store, "p1", "e1"))
         self.assertEqual("completed", self.store.get("tasks", "p1", "t1")["status"])
+
+    def test_drive_execution_ids_round_trip_through_create_list_and_read(self):
+        store = DriveRecords(FakeDriveService())
+        create_task(store, task(), assign=False)
+        execution_ids = ["exec-123", "exec:123", "exec 123", "執行:123", "exec/123", "exec\\123"]
+        with patch("manager.executions.read_drive_status", return_value=quota([])):
+            for execution_id in execution_ids:
+                start_execution(store, object(), "p1", "t1", execution_id, "codex", started_at="2026-08-09T00:00:00Z")
+        records = list_executions(store, "p1")
+        self.assertEqual(execution_ids, [record["execution_id"] for record in records])
+        for execution_id in execution_ids:
+            self.assertEqual(execution_id, read_execution(store, "p1", execution_id)["execution_id"])
 
     def test_single_missing_unknown_and_reset(self):
         known = quota_delta(quota_snapshot(quota([window()]), "codex"), quota_snapshot(quota([window(used=12)]), "codex"), "2026-08-09T00:00:00Z", "2026-08-09T00:10:00Z")
