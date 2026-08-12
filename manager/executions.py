@@ -206,13 +206,12 @@ def read_execution(store, project_id, execution_id):
 
 def list_executions(store, project_id):
     try:
-        parent = store.project_folder("executions", project_id, create=False)
+        store.project_folder("executions", project_id, create=False)
     except TaskError:
         return []
-    records = []
-    for item in store.children(parent):
-        if item["name"].endswith(".json"):
-            records.append(read_execution(store, project_id, item["name"][:-5]))
+    records = store.list_records("executions", project_id)
+    for record in records:
+        validate("execution", record)
     return records
 
 

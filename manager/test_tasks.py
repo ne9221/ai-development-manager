@@ -1,8 +1,9 @@
+import re
 import unittest
 from copy import deepcopy
 from unittest.mock import patch
 
-from manager.tasks import TaskError, complete_task, create_handoff, create_project, create_task, update_task, validate
+from manager.tasks import DriveRecords, TaskError, complete_task, create_handoff, create_project, create_task, logical_record_id, record_storage_id, update_task, validate
 
 
 class MemoryStore:
@@ -13,6 +14,44 @@ class MemoryStore:
     def latest(self, area, project, task):
         items = [value for (a, p, _), value in self.records.items() if a == area and p == project and value.get("task_id") == task]
         return max(items, key=lambda item: item["created_at"])
+
+
+class Request:
+    def __init__(self, value): self.value = value
+    def execute(self): return self.value() if callable(self.value) else self.value
+
+
+class FakeDriveFiles:
+    def __init__(self): self.items = {}; self.next_id = 1
+    def list(self, q, **_kwargs):
+        parent = re.search(r"'([^']+)' in parents", q).group(1)
+        name_match = re.search(r" and name='([^']*)'", q)
+        name = name_match.group(1) if name_match else None
+        def result():
+            values = [deepcopy(item["meta"]) for item in self.items.values() if parent in item["meta"].get("parents", []) and (name is None or item["meta"]["name"] == name)]
+            return {"files": values}
+        return Request(result)
+    def create(self, body, media_body=None, **_kwargs):
+        def result():
+            file_id = f"file-{self.next_id}"; self.next_id += 1
+            meta = dict(body, id=file_id)
+            raw = media_body.getbytes(0, media_body.size()) if media_body else b""
+            self.items[file_id] = {"meta": meta, "raw": raw}
+            return {"id": file_id}
+        return Request(result)
+    def update(self, fileId, body, media_body, **_kwargs):
+        def result():
+            self.items[fileId]["meta"].update(body)
+            self.items[fileId]["raw"] = media_body.getbytes(0, media_body.size())
+            return {"id": fileId}
+        return Request(result)
+    def get_media(self, fileId): return Request(lambda: self.items[fileId]["raw"])
+    def delete(self, fileId): return Request(lambda: self.items.pop(fileId) and {})
+
+
+class FakeDriveService:
+    def __init__(self): self.transport = FakeDriveFiles()
+    def files(self): return self.transport
 
 
 def task_input():
@@ -75,6 +114,41 @@ class TaskTests(unittest.TestCase):
     def test_project_record(self):
         project = {"project_id": "ai-development-manager", "name": "AI Development Manager", "repo": "https://github.com/ne9221/ai-development-manager", "default_branch": "main", "runtime_ssot": "Google Drive/AI Development Manager", "project_rules": ["Drive is runtime SSOT"], "active_tasks": ["phase-5"], "current_phase": "Phase 5", "important_constraints": ["Do not auto-start AI"]}
         self.assertEqual(project, create_project(self.store, project))
+
+    def test_drive_records_round_trip_logical_ids_without_filename_collisions(self):
+        service = FakeDriveService(); store = DriveRecords(service)
+        values = ["abc123", "claude:abc123", "codex:abc123", "abc:def", "abc%3Adef", "Unicode-é", "中文", "a/b", "a\\b", " spaced value "]
+        stems = [record_storage_id(value) for value in values]
+        self.assertEqual(len(stems), len(set(stems)))
+        self.assertEqual(values, [logical_record_id(value) for value in stems])
+        self.assertEqual("abc123", stems[0])
+        self.assertTrue(all(not re.search(r"[\\/ ]", stem) for stem in stems))
+        for index, value in enumerate(values):
+            document = {"logical_id": value, "index": index}
+            self.assertEqual(document, store.put("sessions", "project-a", value, document))
+            self.assertEqual(document, store.get("sessions", "project-a", value))
+        self.assertEqual(values, [item["logical_id"] for item in store.list_records("sessions", "project-a")])
+        for value in values:
+            self.assertTrue(store.delete("sessions", "project-a", value))
+        self.assertEqual([], store.list_records("sessions", "project-a"))
+
+    def test_drive_conditional_delete_preserves_replacement(self):
+        service = FakeDriveService(); store = DriveRecords(service)
+        logical_id = "claude:abc123"
+        store.put("sessions", "project-a", logical_id, {"version": 1})
+        _, token = store.get_with_token("sessions", "project-a", logical_id)
+        store.put("sessions", "project-a", logical_id, {"version": 2})
+        self.assertFalse(store.delete("sessions", "project-a", logical_id, expected=token))
+        self.assertEqual({"version": 2}, store.get("sessions", "project-a", logical_id))
+
+        _, token = store.get_with_token("sessions", "project-a", logical_id)
+        parent = store.project_folder("sessions", "project-a", create=False)
+        filename = store.record_filename(logical_id)
+        old_id = store.children(parent, filename)[0]["id"]
+        service.transport.items.pop(old_id)
+        store.put("sessions", "project-a", logical_id, {"version": 3})
+        self.assertFalse(store.delete("sessions", "project-a", logical_id, expected=token))
+        self.assertEqual({"version": 3}, store.get("sessions", "project-a", logical_id))
 
 
 if __name__ == "__main__": unittest.main()

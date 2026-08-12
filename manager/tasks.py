@@ -2,6 +2,8 @@
 """Minimal Drive-backed project, task, handoff, and history manager."""
 
 import argparse
+import base64
+import hashlib
 import io
 import json
 import re
@@ -44,6 +46,35 @@ def safe_id(value):
     return value
 
 
+RECORD_ID_PREFIX = "~"
+
+
+def record_storage_id(value):
+    """Map a logical record ID to one collision-free Drive filename stem."""
+    if not isinstance(value, str) or not value:
+        raise TaskError(f"unsafe record id: {value!r}")
+    if re.fullmatch(r"[A-Za-z0-9._-]+", value):
+        return value
+    encoded = base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
+    return RECORD_ID_PREFIX + encoded
+
+
+def logical_record_id(value):
+    """Decode a Drive filename stem while retaining legacy safe IDs verbatim."""
+    if not isinstance(value, str) or not value:
+        raise TaskError(f"unsafe record id: {value!r}")
+    if not value.startswith(RECORD_ID_PREFIX):
+        return safe_id(value)
+    encoded = value[len(RECORD_ID_PREFIX):]
+    try:
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise TaskError(f"invalid encoded record id: {value!r}") from exc
+    if record_storage_id(raw) != value:
+        raise TaskError(f"invalid encoded record id: {value!r}")
+    return raw
+
+
 class DriveRecords:
     def __init__(self, service):
         self.files = service.files()
@@ -68,10 +99,22 @@ class DriveRecords:
         root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS[area], create)
         return self.folder(root, safe_id(project_id), create)
 
+    @staticmethod
+    def record_filename(name):
+        return f"{record_storage_id(name)}.json"
+
+    def _record_match(self, area, project_id, name):
+        parent = self.project_folder(area, project_id, create=False)
+        filename = self.record_filename(name)
+        matches = [item for item in self.children(parent, filename) if item.get("mimeType") == MIME_JSON]
+        if len(matches) != 1:
+            raise TaskError(f"expected one Drive record {filename}; found {len(matches)}")
+        return parent, filename, matches[0]
+
     def put(self, area, project_id, name, document):
         from googleapiclient.http import MediaIoBaseUpload
         parent = self.project_folder(area, project_id)
-        filename = f"{safe_id(name)}.json"
+        filename = self.record_filename(name)
         matches = [item for item in self.children(parent, filename) if item.get("mimeType") == MIME_JSON]
         if len(matches) > 1:
             raise TaskError(f"duplicate Drive record: {filename}")
@@ -89,25 +132,40 @@ class DriveRecords:
         return document
 
     def get(self, area, project_id, name):
-        parent = self.project_folder(area, project_id, create=False)
-        filename = f"{safe_id(name)}.json"
-        matches = self.children(parent, filename)
-        if len(matches) != 1:
-            raise TaskError(f"expected one Drive record {filename}; found {len(matches)}")
+        document, _ = self.get_with_token(area, project_id, name)
+        return document
+
+    def get_with_token(self, area, project_id, name):
+        _, filename, match = self._record_match(area, project_id, name)
         try:
-            return json.loads(self.files.get_media(fileId=matches[0]["id"]).execute().decode("utf-8"))
+            raw = self.files.get_media(fileId=match["id"]).execute()
+            document = json.loads(raw.decode("utf-8"))
         except Exception as exc:
             raise TaskError(f"could not read Drive record: {filename}") from exc
+        return document, {"file_id": match["id"], "sha256": hashlib.sha256(raw).hexdigest()}
+
+    def delete(self, area, project_id, name, expected=None):
+        parent, filename, match = self._record_match(area, project_id, name)
+        if expected is not None:
+            if match["id"] != expected.get("file_id"):
+                return False
+            raw = self.files.get_media(fileId=match["id"]).execute()
+            if hashlib.sha256(raw).hexdigest() != expected.get("sha256"):
+                return False
+        self.files.delete(fileId=match["id"]).execute()
+        if any(item["id"] == match["id"] for item in self.children(parent, filename)):
+            raise TaskError(f"Drive delete verification failed: {filename}")
+        return True
 
     def list_records(self, area, project_id):
         parent = self.project_folder(area, project_id, create=False)
-        names = [item["name"][:-5] for item in self.children(parent) if item.get("name", "").endswith(".json")]
+        names = [logical_record_id(item["name"][:-5]) for item in self.children(parent) if item.get("name", "").endswith(".json")]
         return [self.get(area, project_id, name) for name in names]
 
     def latest(self, area, project_id, task_id):
         parent = self.project_folder(area, project_id, create=False)
         candidates = [item for item in self.children(parent) if item["name"].endswith(".json")]
-        records = [self.get(area, project_id, item["name"][:-5]) for item in candidates]
+        records = [self.get(area, project_id, logical_record_id(item["name"][:-5])) for item in candidates]
         records = [item for item in records if item.get("task_id") == task_id]
         if not records:
             raise TaskError(f"no handoff found for task: {task_id}")

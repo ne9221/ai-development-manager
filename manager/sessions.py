@@ -9,7 +9,7 @@ import re
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from collectors.publish_drive import build_service
@@ -552,18 +552,25 @@ def assign_review(store, session, project_id, projects, timestamp):
     if len(matches) != 1:
         raise TaskError(f"manual assignment requires one valid project_id: {project_id}")
     key = session_manager_key(session)
+    identity = session_provider_identity(session)
     storage_key = key
     try:
         existing = store.get("session_reviews", REVIEW_PROJECT_ID, key)
-        validate("session_review", existing)
     except (TaskError, KeyError):
+        existing = None
+    else:
+        validate("session_review", existing)
+        if session_provider_identity(existing) != identity:
+            raise TaskError(f"session review identity conflict at canonical key: {key}")
+    if existing is None:
         try:
             # Existing Codex review files were named with the raw provider ID.
-            storage_key = session_provider_identity(session)[1]
+            storage_key = identity[1]
             existing = store.get("session_reviews", REVIEW_PROJECT_ID, storage_key)
             validate("session_review", existing)
-            if session_provider_identity(existing) != session_provider_identity(session):
+            if session_provider_identity(existing) != identity:
                 existing = None
+                storage_key = key
         except (TaskError, KeyError):
             existing = None
             storage_key = key
@@ -574,7 +581,7 @@ def assign_review(store, session, project_id, projects, timestamp):
     history.append({"previous_project_id": previous, "new_project_id": project_id, "assigned_at": timestamp})
     record = {
         "session_id": existing["session_id"] if existing else key, "provider": session["provider"],
-        "provider_session_id": session_provider_identity(session)[1], "project_id": project_id,
+        "provider_session_id": identity[1], "project_id": project_id,
         "classification_method": "manual_review", "classification_status": "classified",
         "mapping_source": "manual_review",
         "source_identifier": session.get("source_identifier"), "assigned_at": timestamp,
@@ -662,17 +669,67 @@ def load_preview_projects(path):
     return document["projects"]
 
 
+def _session_freshness(record):
+    """Order duplicate identity records by time, then stable source evidence."""
+    value = record.get("updated_at") or record.get("started_at")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00")) if value else datetime.min.replace(tzinfo=timezone.utc)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+    except (AttributeError, ValueError):
+        parsed = datetime.min.replace(tzinfo=timezone.utc)
+    return (parsed.astimezone(timezone.utc), record.get("source_identifier") or "", record.get("content_hash") or "")
+
+
+def _read_session_copy(store, project_id, storage_key):
+    record = store.get("sessions", project_id, storage_key)
+    validate("session", record)
+    return record
+
+
 def import_sessions(store, adapter, sessions_root=None, projects=None, repository_lookup=_repository_identity, session_ids=None):
     projects = read_projects(store) if projects is None else projects
     requested = set(session_ids or [])
-    records = []
+    discovered = []
     for record in adapter.discover(sessions_root):
         if requested and not any(_session_matches_reference(record, value) for value in requested):
             continue
         record = classify_project(record, projects, repository_lookup)
         record.pop("_candidate_signals", None)
         validate("session", record)
-        store.put("sessions", record["project_id"] or UNCLASSIFIED_PROJECT_ID, session_manager_key(record), record)
+        discovered.append(record)
+
+    winners = {}
+    for record in discovered:
+        identity = session_provider_identity(record)
+        if identity not in winners or _session_freshness(record) > _session_freshness(winners[identity]):
+            winners[identity] = record
+
+    records = []
+    partitions = {UNCLASSIFIED_PROJECT_ID, *(project["project_id"] for project in projects)}
+    for identity in sorted(winners):
+        record = winners[identity]
+        target = record["project_id"] or UNCLASSIFIED_PROJECT_ID
+        key = session_manager_key(record)
+        existing_copies = []
+        for project_id in sorted(partitions):
+            for storage_key in dict.fromkeys((key, identity[1])):
+                try:
+                    existing = _read_session_copy(store, project_id, storage_key)
+                except (TaskError, KeyError):
+                    continue
+                if session_provider_identity(existing) == identity:
+                    existing_copies.append((existing, project_id, storage_key))
+
+        newest_existing = max(existing_copies, key=lambda item: _session_freshness(item[0]), default=None)
+        if newest_existing and _session_freshness(newest_existing[0]) > _session_freshness(record):
+            record = newest_existing[0]
+            target = record["project_id"] or UNCLASSIFIED_PROJECT_ID
+            key = session_manager_key(record)
+
+        current = next((item for item in existing_copies if item[1] == target and item[2] == key and item[0] == record), None)
+        if current is None:
+            store.put("sessions", target, key, record)
         records.append(record)
     return records
 

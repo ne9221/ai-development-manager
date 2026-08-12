@@ -17,13 +17,19 @@ def parse_manager_session_key(value):
     if not isinstance(value, str) or value.count(":") != 1:
         return None
     provider, provider_session_id = (unquote(part) for part in value.split(":", 1))
-    return (provider, provider_session_id) if provider and provider_session_id else None
+    if not provider or not provider_session_id:
+        return None
+    identity = (provider, provider_session_id)
+    return identity if manager_session_key(*identity) == value else None
 
 
 def session_provider_identity(record):
     """Get provider identity, including legacy records that predate the new field."""
     provider = record.get("provider")
-    provider_session_id = record.get("provider_session_id") or record.get("session_id")
+    provider_session_id = record.get("provider_session_id")
+    if not provider_session_id:
+        parsed = parse_manager_session_key(record.get("session_id"))
+        provider_session_id = parsed[1] if parsed and parsed[0] == provider else record.get("session_id")
     if not isinstance(provider, str) or not provider or not isinstance(provider_session_id, str) or not provider_session_id:
         raise TaskError("session record is missing provider-aware identity")
     return (provider, provider_session_id)
