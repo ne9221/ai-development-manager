@@ -183,8 +183,14 @@ active task/latest handoff and execution history, then reuses Dispatcher or
 Scheduler. JSON output is compact and transport-neutral.
 
 ```powershell
+python -m manager.runtime_bridge status --json
 python -m manager.runtime_bridge --project-id ai-development-manager --request "Continue Phase 9" --json
 ```
+
+The `status` command is the provider-neutral quota-only boundary. It reads the
+same Drive `AI-RESOURCE-STATUS/status.json` SSOT, returns only Codex and Claude
+normalized windows/source/freshness fields, and reports `unknown`, `stale`, or
+`unavailable` without inventing a percentage.
 
 See `docs/CHATGPT-INTEGRATION.md` for the upper-level client contract, explicit
 fallback behavior, shared-rule priority, and optional Ponytail policy.

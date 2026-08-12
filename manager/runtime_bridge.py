@@ -6,17 +6,22 @@ import hashlib
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-from collectors.publish_drive import build_service
+from collectors.publish_drive import PublisherError, build_service
 from manager.dispatcher import clean, dispatch
 from manager.executions import list_executions
-from manager.quota_reader import read_drive_status, summarize
+from manager.quota_reader import QuotaReaderError, read_drive_status, summarize
 from manager.scheduler import schedule
 from manager.tasks import DriveRecords, MIME_FOLDER, ROOT_FOLDER_ID, ROOT_FOLDERS, TaskError, validate
 
 
 RULES_PATH = Path(__file__).parents[1] / "AI-DEVELOPMENT-RULES.md"
+RUNTIME_STATUS_PROVIDERS = ("codex", "claude")
+RUNTIME_STATUS_WINDOW_FIELDS = ("name", "duration_minutes", "used_percent", "remaining_percent", "resets_at")
+RUNTIME_STATUS_CONTRACT_VERSION = "1.0"
+RUNTIME_STATUS_MAX_WINDOWS = 8
 
 
 def compact(value):
@@ -108,6 +113,42 @@ def redact(value):
     return clean(value) if isinstance(value, str) else value
 
 
+def runtime_status_contract(document=None, max_age_minutes=60, now=None):
+    """Return a bounded quota view of the Drive status SSOT."""
+    now = now or datetime.now(timezone.utc)
+    raw = {item.get("provider"): item for item in (document or {}).get("providers", []) if isinstance(item, dict)}
+    summarized = {item["provider"]: item for item in summarize(document, max_age_minutes, now)["providers"]} if document else {}
+    providers = {}
+    for provider_id in RUNTIME_STATUS_PROVIDERS:
+        item = summarized.get(provider_id)
+        if not item or provider_id not in raw:
+            providers[provider_id] = {
+                "status": "unavailable", "windows": [], "source": "not_reported",
+                "last_updated": None, "freshness": "unknown",
+            }
+            continue
+        windows = []
+        for window in item["windows"][:RUNTIME_STATUS_MAX_WINDOWS]:
+            if not isinstance(window, dict):
+                continue
+            bounded = {key: window.get(key) for key in RUNTIME_STATUS_WINDOW_FIELDS if key in window}
+            if isinstance(bounded.get("name"), str):
+                bounded["name"] = bounded["name"][:80]
+            windows.append(bounded)
+        has_value = any(window.get("remaining_percent") is not None or window.get("used_percent") is not None for window in windows)
+        status = "stale" if item["stale"] else ("known" if item["status"] != "unknown" and has_value else "unknown")
+        providers[provider_id] = {
+            "status": status, "windows": windows, "source": item["source"][:160],
+            "last_updated": item["last_updated"], "freshness": item["freshness"],
+        }
+    return redact({
+        "contract_version": RUNTIME_STATUS_CONTRACT_VERSION,
+        "schema_version": (document or {}).get("schema_version", "0.1.0"),
+        "generated_at": (document or {}).get("generated_at") or now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "providers": providers,
+    })
+
+
 def request_type(user_request, task, multi_task):
     if multi_task:
         return "scheduling"
@@ -197,9 +238,29 @@ def human_summary(result):
     return f"推荐：{result['recommended_provider']}\nEffort：{result['effort']}\n预计：{result['estimated_minutes']} 分钟\nQuota：{result['quota_summary']}\n备选：{alternatives}\n下一步：{result['next_action']}"
 
 
-def main():
+def status_main(argv):
+    parser = argparse.ArgumentParser(prog="python -m manager.runtime_bridge status")
+    parser.add_argument("--max-age-minutes", type=float, default=60)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        result = runtime_status_contract(read_drive_status(service=build_service()), args.max_age_minutes)
+    except (PublisherError, QuotaReaderError, OSError, ValueError):
+        result = runtime_status_contract()
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    else:
+        for provider, item in result["providers"].items():
+            print(f"{provider}: {item['status']} ({item['freshness']})")
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["status"]:
+        return status_main(argv[1:])
     parser = argparse.ArgumentParser(); parser.add_argument("--project-id"); parser.add_argument("--request", required=True); parser.add_argument("--task-id"); parser.add_argument("--task-type"); parser.add_argument("--complexity", choices=["low", "medium", "high"]); parser.add_argument("--preferred-provider"); parser.add_argument("--excluded-provider"); parser.add_argument("--multi-task", action="store_true"); parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(); data = {key: value for key, value in vars(args).items() if key != "json" and value is not None}; data["user_request"] = data.pop("request")
+    args = parser.parse_args(argv); data = {key: value for key, value in vars(args).items() if key != "json" and value is not None}; data["user_request"] = data.pop("request")
     try:
         service = build_service(); result = runtime_bridge(DriveRecords(service), service, data)
         print(json.dumps(result, ensure_ascii=False) if args.json else human_summary(result) + (f"\n\n```\n{result['generated_prompt']}\n```" if result["generated_prompt"] else "")); return 0

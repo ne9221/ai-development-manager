@@ -22,6 +22,21 @@ For every development request, the upper-level client should:
 
 ## Stable JSON boundary
 
+For quota/status only, without project or task context:
+
+```powershell
+python -m manager.runtime_bridge status --json
+```
+
+This returns contract `1.0` with the fixed top-level keys
+`contract_version`, `schema_version`, `generated_at`, and `providers`.
+`providers` contains only `codex` and `claude`; each contains `status`, up to
+eight normalized schema `windows`, `source`, `last_updated`, and `freshness`.
+The derived status is `known`, `unknown`, `stale`, or `unavailable`. A stale
+snapshot remains stale, a missing/malformed Drive status is unavailable, and
+an unknown value is never converted to zero. Provider metadata and raw
+responses are not returned.
+
 Successful JSON includes `contract_version`, compact project/task/handoff
 fields, request type, recommendation, estimate, quota summary/freshness,
 warnings, next action, generated prompt, and optional execution batches. It

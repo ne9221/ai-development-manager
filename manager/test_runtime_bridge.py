@@ -1,9 +1,13 @@
 import json
+import io
 import unittest
 from copy import deepcopy
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
-from manager.runtime_bridge import human_summary, resolve_project, runtime_bridge
+from manager.quota_reader import QuotaReaderError
+from manager.runtime_bridge import human_summary, main, resolve_project, runtime_bridge, runtime_status_contract
 from manager.tasks import TaskError, create_handoff, create_project, create_task
 
 
@@ -110,6 +114,65 @@ class RuntimeBridgeTests(unittest.TestCase):
     def test_malformed_input(self):
         with self.assertRaises(TaskError): runtime_bridge(self.store, object(), {}, quota(), [])
         with self.assertRaises(TaskError): runtime_bridge(self.store, object(), {"project_id": "missing", "user_request": "work"}, quota(), [])
+
+
+class RuntimeStatusContractTests(unittest.TestCase):
+    def contract(self, **changes):
+        document = quota(codex=80, claude=60, updated=NOW)
+        for provider in document["providers"]:
+            provider.update(changes.get(provider["provider"], {}))
+        return runtime_status_contract(document, now=NOW)
+
+    def test_codex_and_claude_known(self):
+        result = self.contract()
+        self.assertEqual("known", result["providers"]["codex"]["status"])
+        self.assertEqual(80, result["providers"]["codex"]["windows"][0]["remaining_percent"])
+        self.assertEqual("known", result["providers"]["claude"]["status"])
+        self.assertEqual(60, result["providers"]["claude"]["windows"][0]["remaining_percent"])
+
+    def test_unknown_and_stale_are_not_zero(self):
+        unknown = self.contract(claude={"status": "unknown", "windows": []})
+        self.assertEqual("unknown", unknown["providers"]["claude"]["status"])
+        self.assertEqual([], unknown["providers"]["claude"]["windows"])
+        stale = runtime_status_contract(quota(updated=NOW - timedelta(hours=2)), now=NOW)
+        self.assertEqual("stale", stale["providers"]["codex"]["status"])
+        self.assertEqual("stale", stale["providers"]["codex"]["freshness"])
+
+    def test_missing_provider_is_unavailable(self):
+        document = quota()
+        document["providers"] = [item for item in document["providers"] if item["provider"] != "claude"]
+        result = runtime_status_contract(document, now=NOW)
+        self.assertEqual("unavailable", result["providers"]["claude"]["status"])
+        self.assertIsNone(result["providers"]["claude"]["last_updated"])
+
+    def test_contract_keys_are_stable_and_bounded(self):
+        result = self.contract()
+        self.assertEqual({"contract_version", "schema_version", "generated_at", "providers"}, set(result))
+        self.assertEqual({"codex", "claude"}, set(result["providers"]))
+        for provider in result["providers"].values():
+            self.assertEqual({"status", "windows", "source", "last_updated", "freshness"}, set(provider))
+        self.assertLessEqual(len(result["providers"]["codex"]["windows"]), 8)
+
+    def test_no_metadata_secrets_or_raw_payload_leak(self):
+        document = quota(codex=80, claude=60)
+        document["providers"][0]["metadata"] = {"raw_payload": {"access_token": "raw-secret"}}
+        document["providers"][0]["source"] = "codex_app_server token=raw-secret"
+        serialized = json.dumps(runtime_status_contract(document, now=NOW))
+        self.assertNotIn("metadata", serialized)
+        self.assertNotIn("raw_payload", serialized)
+        self.assertNotIn("raw-secret", serialized)
+
+    def test_missing_and_malformed_drive_status_emit_unavailable_json(self):
+        for message in ("found 0", "malformed token=raw-secret payload"):
+            output = io.StringIO()
+            with patch("manager.runtime_bridge.build_service", return_value=object()), \
+                 patch("manager.runtime_bridge.read_drive_status", side_effect=QuotaReaderError(message)), \
+                 redirect_stdout(output):
+                self.assertEqual(0, main(["status", "--json"]))
+            result = json.loads(output.getvalue())
+            self.assertEqual("unavailable", result["providers"]["codex"]["status"])
+            self.assertEqual("unavailable", result["providers"]["claude"]["status"])
+            self.assertNotIn("raw-secret", output.getvalue())
 
 
 if __name__ == "__main__": unittest.main()
