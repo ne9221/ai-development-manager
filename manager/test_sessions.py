@@ -6,7 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from manager.sessions import CanonicalSession, ClaudeSessionAdapter, CodexSessionAdapter, REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_claude_sessions, discover_codex_sessions, extract_repository_urls, import_claude_sessions, import_codex_sessions, load_preview_projects, manager_session_key, parse_identity_header, parse_manager_session_key, preview_claude_sessions, preview_codex_sessions, project_preview_snapshot, review_queue, search_sessions
+from manager.sessions import CanonicalSession, ClaudeSessionAdapter, CodexSessionAdapter, REVIEW_PROJECT_ID, _repository_identity, assign_review, candidate_title, classify_project, discover_claude_sessions, discover_codex_sessions, extract_repository_urls, global_search_sessions, import_claude_sessions, import_codex_sessions, load_preview_projects, manager_session_key, parse_identity_header, parse_manager_session_key, preview_claude_sessions, preview_codex_sessions, project_preview_snapshot, registry_sessions, review_queue, search_sessions
 from manager.tasks import validate
 
 
@@ -21,6 +21,11 @@ class MemoryStore:
         return document
     def get(self, area, project_id, name): return deepcopy(self.records[(area, project_id, name)])
     def list_records(self, area, project_id): return [deepcopy(value) for (record_area, record_project, _), value in self.records.items() if record_area == area and record_project == project_id]
+    def latest(self, area, project_id, task_id):
+        candidates = [value for (record_area, record_project, _), value in self.records.items() if record_area == area and record_project == project_id and value.get("task_id") == task_id]
+        if not candidates:
+            raise KeyError(task_id)
+        return deepcopy(max(candidates, key=lambda item: item.get("created_at", "")))
 
 
 def fixture(cwd="C:/work/ai-development-manager"):
@@ -361,6 +366,78 @@ class SessionTests(unittest.TestCase):
             record = classify_project(discover_codex_sessions(root)[0], [PROJECT], lambda _cwd: {"git_root": None, "remote": None})
             search_sessions([record], query="registry")
             self.assertEqual(before, path.read_bytes())
+
+    def test_search_multi_token_and_across_fields_case_insensitive(self):
+        match = search_record("wb-1", title="WB Session", conversation_label="跨页", first_user_prompt="limit 4000 rows")
+        missing_token = search_record("wb-2", title="WB Session", conversation_label="跨页", first_user_prompt="limit 500 rows")
+        other = search_record("wb-3", title="Other", conversation_label=None, first_user_prompt="unrelated")
+        records = [match, missing_token, other]
+        self.assertEqual(["wb-1"], [item["session_id"] for item in search_sessions(records, query="wb 跨页 4000")])
+        self.assertEqual([], search_sessions(records, query="WB 跨页 9999"))
+
+    def test_registry_sessions_dedupe_legacy_project_and_unclassified_copies(self):
+        store = MemoryStore()
+        record = search_record("codex:dup", provider="codex", provider_session_id="dup", project_id="ai-development-manager")
+        store.put("sessions", "ai-development-manager", "codex:dup", record)
+        store.put("sessions", "_unclassified", "codex:dup", dict(record, project_id=None))
+        records = registry_sessions(store, project_ids=["ai-development-manager"])
+        self.assertEqual(1, len(records))
+        self.assertEqual("ai-development-manager", records[0]["project_id"])
+
+    def test_global_search_cross_project_provider_and_related_joins(self):
+        store = MemoryStore()
+        codex_session = search_record("codex:s1", provider="codex", provider_session_id="s1", project_id="proj-a", task_id="task-a", title="WB rollout", conversation_label="跨页", first_user_prompt="limit 4000 rows")
+        claude_session = search_record("claude:s2", provider="claude", provider_session_id="s2", project_id="proj-b", task_id="task-b", title="Other work", conversation_label=None, first_user_prompt="not related")
+        store.put("sessions", "proj-a", "codex:s1", codex_session)
+        store.put("sessions", "proj-b", "claude:s2", claude_session)
+        store.put("executions", "proj-a", "exec-1", {"execution_id": "exec-1", "task_id": "task-a", "project_id": "proj-a", "provider": "codex", "status": "completed", "started_at": "2026-08-09T00:00:00Z", "completed_at": "2026-08-09T00:10:00Z", "finished_at": "2026-08-09T00:10:00Z", "notes": [], "session_id": "codex:s1"})
+        store.put("handoffs", "proj-a", "handoff-1", {"handoff_id": "handoff-1", "task_id": "task-a", "project_id": "proj-a", "created_at": "2026-08-09T00:20:00Z", "reason": "continue", "current_state": "ready", "next_action": "ship it", "commits": ["abc1111 WB rollout"]})
+        result = global_search_sessions(store, query="wb 跨页 4000", project_ids=["proj-a", "proj-b"])
+        self.assertEqual("manager_import_registry", result["source"])
+        self.assertEqual(["codex:s1"], [item["session_id"] for item in result["results"]])
+        related = result["results"][0]["related"]
+        self.assertEqual("exec-1", related["execution"]["execution_id"])
+        self.assertEqual(["abc1111 WB rollout"], related["handoff"]["commits"])
+        both = global_search_sessions(store, project_ids=["proj-a", "proj-b"], include_related=False)["results"]
+        self.assertEqual({"codex:s1", "claude:s2"}, {item["session_id"] for item in both})
+
+    def test_related_execution_requires_exact_session_link(self):
+        store = MemoryStore()
+        session_a = search_record("codex:a", provider="codex", provider_session_id="a", project_id="proj-a", task_id="task-a")
+        session_b = search_record("codex:b", provider="codex", provider_session_id="b", project_id="proj-a", task_id="task-a")
+        store.put("sessions", "proj-a", "codex:a", session_a)
+        store.put("sessions", "proj-a", "codex:b", session_b)
+        store.put("executions", "proj-a", "exec-1", {"execution_id": "exec-1", "task_id": "task-a", "project_id": "proj-a", "provider": "codex", "status": "completed", "started_at": "2026-08-09T00:00:00Z", "notes": [], "session_id": "codex:a"})
+        by_id = {item["session_id"]: item for item in global_search_sessions(store, project_ids=["proj-a"])["results"]}
+        self.assertIsNotNone(by_id["codex:a"]["related"]["execution"])
+        self.assertIsNone(by_id["codex:b"]["related"]["execution"])
+
+    def test_global_search_provider_filter_and_identical_raw_id_not_deduped(self):
+        store = MemoryStore()
+        codex = search_record("codex:abc", provider="codex", provider_session_id="abc", project_id="proj-a")
+        claude = search_record("claude:abc", provider="claude", provider_session_id="abc", project_id="proj-a")
+        store.put("sessions", "proj-a", "codex:abc", codex)
+        store.put("sessions", "proj-a", "claude:abc", claude)
+        all_results = global_search_sessions(store, project_ids=["proj-a"], include_related=False)["results"]
+        self.assertEqual({"codex:abc", "claude:abc"}, {item["session_id"] for item in all_results})
+        codex_only = global_search_sessions(store, provider="codex", project_ids=["proj-a"], include_related=False)["results"]
+        self.assertEqual(["codex:abc"], [item["session_id"] for item in codex_only])
+        self.assertEqual("codex", global_search_sessions(store, provider="codex", project_ids=["proj-a"])["provider_filter"])
+
+    def test_global_search_applies_manual_review_overlay(self):
+        store = MemoryStore()
+        session = search_record("codex:rev", provider="codex", provider_session_id="rev", project_id=None, classification_status="needs_review")
+        store.put("sessions", "_unclassified", "codex:rev", session)
+        review = {"session_id": "codex:rev", "provider": "codex", "provider_session_id": "rev", "project_id": "ai-development-manager", "classification_method": "manual_review", "classification_status": "classified", "source_identifier": "sessions/rev.jsonl", "assigned_at": "2026-08-10T00:00:00Z", "assignment_history": [{"previous_project_id": None, "new_project_id": "ai-development-manager", "assigned_at": "2026-08-10T00:00:00Z"}]}
+        store.put("session_reviews", REVIEW_PROJECT_ID, "codex:rev", review)
+        result = global_search_sessions(store, project="ai-development-manager", project_ids=["ai-development-manager"], include_related=False)
+        self.assertEqual(["codex:rev"], [item["session_id"] for item in result["results"]])
+
+    def test_global_search_includes_freshness_note(self):
+        result = global_search_sessions(MemoryStore(), project_ids=["ai-development-manager"])
+        self.assertIn("already-imported", result["freshness_note"])
+        self.assertEqual("all", result["provider_filter"])
+        self.assertEqual([], result["results"])
 
 
 if __name__ == "__main__": unittest.main()

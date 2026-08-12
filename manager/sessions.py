@@ -588,6 +588,11 @@ def _search_text(value):
     return re.sub(r"\s+", " ", value or "").casefold().strip()
 
 
+def _search_tokens(query):
+    """Split a query into case-insensitive AND terms; tokens may match in any field."""
+    return [token for token in _search_text(query).split(" ") if token]
+
+
 def apply_manual_reviews(records, review_records=()):
     reviews = {session_provider_identity(record): record for record in review_records}
     result = []
@@ -608,7 +613,7 @@ def search_sessions(records, query=None, project=None, task=None, status=None, s
             since_date = date.fromisoformat(since)
         except ValueError as exc:
             raise TaskError("--since must use YYYY-MM-DD") from exc
-    query = _search_text(query)
+    query_tokens = _search_tokens(query)
     project = _search_text(project)
     task = _search_text(task)
     status = _search_text(status)
@@ -624,7 +629,8 @@ def search_sessions(records, query=None, project=None, task=None, status=None, s
         if since_date and (not record_date or date.fromisoformat(record_date) < since_date):
             continue
         fields = ("session_id", "title", "first_user_prompt", "project_id", "task_id", "conversation_label", "provider", "working_directory", "repository", "classification_status", "started_at", "updated_at")
-        if query and query not in _search_text(" ".join(str(record.get(field) or "") for field in fields)):
+        joined = _search_text(" ".join(str(record.get(field) or "") for field in fields))
+        if query_tokens and not all(token in joined for token in query_tokens):
             continue
         results.append({
             "session_id": record["session_id"], "date": record.get("updated_at") or record.get("started_at"),
@@ -634,6 +640,85 @@ def search_sessions(records, query=None, project=None, task=None, status=None, s
             "source_identifier": record.get("source_identifier"),
         })
     return results
+
+
+def _project_records(store, area, project_id):
+    try:
+        return store.list_records(area, project_id)
+    except (TaskError, KeyError):
+        return []
+
+
+def registry_sessions(store, project_ids=None):
+    """Read persisted Session Registry metadata across projects; never reads provider transcripts.
+
+    Results reflect whatever has already been imported via ``import-codex``/
+    ``import-claude``; sessions not yet imported will not appear.
+    """
+    ids = list(project_ids) if project_ids is not None else [project["project_id"] for project in read_projects(store)]
+    ordered_ids = list(dict.fromkeys([*[project_id for project_id in ids if project_id], UNCLASSIFIED_PROJECT_ID]))
+    merged = {}
+    for project_id in ordered_ids:
+        for record in _project_records(store, "sessions", project_id):
+            merged.setdefault(session_manager_key(record), record)
+    return list(merged.values())
+
+
+def _filter_provider(records, provider):
+    if not provider or _search_text(provider) == "all":
+        return records
+    return [record for record in records if _search_text(record.get("provider")) == _search_text(provider)]
+
+
+def related_session_metadata(store, record):
+    """Bounded join: session -> task -> execution (exact link) and latest handoff (project+task).
+
+    Execution is matched by the canonical session_id link only; handoff is
+    matched by project_id + task_id, never by the free-text handoff.from_session
+    field. Only whitelisted fields are returned; no transcript is read.
+    """
+    project_id, task_id = record.get("project_id"), record.get("task_id")
+    execution = None
+    if project_id:
+        key = session_manager_key(record)
+        for item in _project_records(store, "executions", project_id):
+            if item.get("session_id") == key and (execution is None or (item.get("started_at") or "") > (execution.get("started_at") or "")):
+                execution = item
+    handoff = None
+    if project_id and task_id:
+        try:
+            handoff = store.latest("handoffs", project_id, task_id)
+        except (TaskError, KeyError):
+            handoff = None
+    return {
+        "execution": {key: execution.get(key) for key in ("execution_id", "provider", "status", "started_at", "completed_at", "finished_at")} if execution else None,
+        "handoff": {key: handoff.get(key) for key in ("handoff_id", "reason", "current_state", "next_action", "commits")} if handoff else None,
+    }
+
+
+REGISTRY_FRESHNESS_NOTE = "Results reflect the Manager's already-imported Session Registry on Drive; sessions not yet imported via 'import-codex'/'import-claude' will not appear until the next import."
+
+
+def global_search_sessions(store, query=None, project=None, task=None, status=None, since=None, provider=None, project_ids=None, include_related=True):
+    """Read-only search across the persisted Drive Session Registry: cross-project, cross-provider.
+
+    Source is the Session Registry (SESSIONS/<project_id>/), not a live
+    rescan of ~/.codex/sessions or ~/.claude/projects; see REGISTRY_FRESHNESS_NOTE.
+    """
+    records = _filter_provider(registry_sessions(store, project_ids), provider)
+    reviews = list_review_records(store)
+    results = search_sessions(records, query, project, task, status, since, reviews)
+    if include_related:
+        effective = {item["session_id"]: item for item in apply_manual_reviews(records, reviews)}
+        for result in results:
+            full = effective.get(result["session_id"])
+            result["related"] = related_session_metadata(store, full) if full else None
+    return {
+        "source": "manager_import_registry",
+        "freshness_note": REGISTRY_FRESHNESS_NOTE,
+        "provider_filter": _search_text(provider) or "all",
+        "results": results,
+    }
 
 
 def load_review_records_file(path):
@@ -712,12 +797,16 @@ def main():
     review_assign.add_argument("--sessions-root", type=Path, default=None)
     review_assign.add_argument("--projects-file", type=Path, default=None)
     review_assign.add_argument("--provider", choices=("codex", "claude"), default="codex")
-    search = sub.add_parser("search", help="Read-only deterministic Codex session search")
+    search = sub.add_parser("search", help="Read-only deterministic Codex session search (live local rescan; unchanged)")
     search.add_argument("--query"); search.add_argument("--project"); search.add_argument("--task")
     search.add_argument("--status"); search.add_argument("--since")
     search.add_argument("--sessions-root", type=Path, default=None)
     search.add_argument("--projects-file", type=Path, default=None)
     search.add_argument("--reviews-file", type=Path, default=None, help="Temporary exported manual review records")
+    search_registry = sub.add_parser("search-registry", help="Read-only search across the persisted Drive Session Registry; cross-project, cross-provider. Reflects already-imported sessions only, not a live rescan.")
+    search_registry.add_argument("--query"); search_registry.add_argument("--project"); search_registry.add_argument("--task")
+    search_registry.add_argument("--status"); search_registry.add_argument("--since")
+    search_registry.add_argument("--provider", choices=("codex", "claude", "all"), default="all")
     args = parser.parse_args()
     try:
         if args.command == "export-project-preview":
@@ -727,6 +816,10 @@ def main():
             records = [classify_project(record, projects) for record in discover_codex_sessions(args.sessions_root)]
             reviews = load_review_records_file(args.reviews_file) if args.reviews_file else []
             print(json.dumps(search_sessions(records, args.query, args.project, args.task, args.status, args.since, reviews), indent=2))
+        elif args.command == "search-registry":
+            store = DriveRecords(build_service())
+            result = global_search_sessions(store, args.query, args.project, args.task, args.status, args.since, args.provider)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
         elif args.command in ("review-list", "review-assign"):
             store = DriveRecords(build_service())
             projects = load_preview_projects(args.projects_file) if args.projects_file else read_projects(store)

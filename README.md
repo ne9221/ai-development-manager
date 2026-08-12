@@ -100,18 +100,56 @@ The snapshot contains only `project_id`, `name`, `aliases`, `repo`, and
 `working_directory`; it never contains credentials, task data, handoffs, or
 session transcripts.
 
+## Global Session Registry search
+
+`search` (above) is a live local rescan of Codex-owned files and is unchanged.
+`search-registry` instead searches the persisted Drive Session Registry
+(`SESSIONS/<project_id>/`) across every project and provider:
+
+```powershell
+python -m manager.sessions search-registry --query "WB rollout 4000" --provider all
+```
+
+**Freshness note: `search-registry` only reflects sessions that have already
+been imported via `import-codex` / `import-claude`.** A session that exists
+locally but has not yet been imported will not appear until the next import;
+this is unavoidable for a search that must cover other machines and both
+providers, so it intentionally reads the registry instead of rescanning
+`~/.codex/sessions` or `~/.claude/projects`. `--query` splits on whitespace
+into case-insensitive AND terms that may match in any indexed field (title,
+prompt snippet, task, provider, working directory, repository, ...) - for
+example `WB 跨页 4000` matches a session only if all three terms appear
+somewhere in its metadata. `--provider {codex,claude,all}` filters by
+provider (default `all`). Each result includes a bounded `related` join:
+the exactly-linked execution (by canonical `session_id`) and the task's
+latest handoff (by `project_id` + `task_id`, including `handoff.commits`) -
+never a full provider transcript.
+
 ## Continuation context pack
 
 Read bounded continuation context from Drive without writing session data:
 
 ```powershell
 python -m manager.context_pack --project-id ai-development-manager --request "continue session organizer" --json
+python -m manager.context_pack --project-id ai-development-manager --request "continue session organizer" --for claude
+python -m manager.context_pack --project-id ai-development-manager --request "continue session organizer" --for codex
 ```
 
-The pack includes the project, active task, latest handoff, all shared rules,
-and at most five recent session metadata records. It deliberately excludes full
+The pack includes the project, active task, latest handoff (including
+`commits`), the active task's latest execution (bounded to
+`execution_id`/`provider`/`status`/timestamps/`notes`/`session_id`; never the
+`quota_before`/`quota_after`/`quota_delta` objects), all shared rules, and at
+most five recent session metadata records. It deliberately excludes full
 provider transcripts and directs the next AI to resume current progress and
 the handoff before exploring completed work.
+
+The JSON contract (`--json`, or the default output) stays provider-neutral.
+`--for claude` / `--for codex` render the same contract as a plain-text
+continuation prompt instead: Claude's includes an explicit `AI:` / `Mode:` /
+`Project:` / `Task:` / `Conversation:` / `Run/Session:` identity header, and
+Codex's is a concise execution-oriented prompt. Neither renderer invents a
+value for a field the pack does not have; missing fields render as
+`(unknown)`.
 
 ## Development Overview
 
