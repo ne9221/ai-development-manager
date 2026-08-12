@@ -10,7 +10,10 @@ The adapter uses the official MCP Python SDK 2.0. Streamable HTTP is the product
 
 - `adm_dispatch`: accepts a project ID or alias, user request, and optional task/provider controls. It returns the existing sanitized runtime bridge contract `1.0`, including the existing generated prompt.
 - `adm_status`: returns only active task, latest handoff summary, recommendation, compact quota summary/freshness, warnings, and next action.
+- `adm_runtime_quota_status`: returns the existing bounded runtime quota contract `1.0` for Codex and Claude. Its only optional argument is `max_age_minutes` (an integer from 1 through 1440); the Drive file and raw source cannot be selected by callers.
 - `adm_health`: returns service, MCP adapter, and runtime contract versions without reading Drive.
+
+MCP SDK 2.0's generated function schema does not emit `additionalProperties: false`; unmodeled fields are ignored by the SDK and are not forwarded to the quota loader.
 
 All tools declare MCP `readOnlyHint=true` and `destructiveHint=false`. Every bridge call uses `read_only=True`; there are no create, update, completion, handoff, execution, or AI-launch tools.
 
