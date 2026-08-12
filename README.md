@@ -17,6 +17,8 @@ developable.
   planned per-provider sources.
 - `docs/QUOTA-SOURCES.md` - PoC findings on where each provider's quota data
   can (or cannot) be read from.
+- `docs/PHASE-3C-EXECUTION-LIFECYCLE.md` - Phase 3C lifecycle scope,
+  acceptance criteria, blockers, and implementation slices.
 
 ## What lives on Google Drive instead (not in this repo)
 
