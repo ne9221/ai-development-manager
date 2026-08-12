@@ -312,10 +312,18 @@ a concise handoff with actual time and quota/token usage when available.
 - Production lock input uses the canonical Project repository plus the
   reservation snapshot's working directory, full branch, baseline, and
   non-empty `allowed_paths`; missing or conflicting evidence fails closed.
-- An ordinary persistence exception after acquire rolls execution/task back and
-  releases the lease. A process crash before running persistence leaves the
-  reservation unchanged and relies on bounded lease expiry; crash reconciliation
-  remains deferred.
+- One Drive ETag-conditional update sets the ready task to `in_progress` and
+  records `source_context.active_execution_id`; this is the task-level CAS
+  boundary for both read-only and production-write executions. Multiple
+  reservations may exist, but only one may claim a ready task.
+- The task claim is persisted before the execution running record. An ordinary
+  persistence exception after acquire rolls execution/task back and releases
+  the lease only after both rollbacks are confirmed. An unconfirmed execution
+  rollback retains the task claim; any unconfirmed rollback is recovery-required
+  and retains the production lease until bounded expiry. A process crash after
+  task claim but before running persistence leaves the task claimed/in-progress,
+  the execution reserved, and no launch authority; production writer authority
+  still expires with the lease, while claim reconciliation remains deferred.
 - Forbidden scope: provider-specific launch logic, session linking, heartbeat,
   terminal policy, quota scoring changes, or advisory `check()` as authority.
 

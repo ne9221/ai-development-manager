@@ -40,6 +40,13 @@
     {
       "if": {"properties": {"access": {"const": "read_only"}}, "required": ["access"]},
       "then": {"required": ["lease_evidence"], "properties": {"lease_evidence": {"type": "null"}}}
+    },
+    {
+      "if": {
+        "properties": {"reserved_at": {"type": "string"}, "status": {"const": "running"}},
+        "required": ["reserved_at", "status"]
+      },
+      "then": {"required": ["access", "lease_evidence"], "properties": {"access": {"enum": ["production_write", "read_only"]}}}
     }
   ],
   "required": ["execution_id", "task_id", "project_id", "provider", "mode", "effort", "started_at", "completed_at", "elapsed_minutes", "status", "quota_before", "quota_after", "quota_delta", "source_confidence", "notes", "task_snapshot"],

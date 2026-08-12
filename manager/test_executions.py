@@ -159,6 +159,26 @@ class ExecutionTests(unittest.TestCase):
             validate("execution", legacy)
             validate("execution", finish_execution(self.store, object(), "p1", "legacy-running", completed_at="2026-08-09T00:01:00Z"))
 
+    def test_new_lifecycle_running_schema_requires_access_and_matching_lease_contract(self):
+        reserved = reserve_execution(self.store, "p1", "t1", "schema-running", "codex", decision(), reserved_at="2026-08-09T00:00:00Z")
+        running = {
+            **reserved, "status": "running", "started_at": "2026-08-09T00:01:00Z",
+            "quota_before": {}, "source_confidence": "official",
+            "access": "production_write",
+            "lease_evidence": {
+                "authority": "acquired", "lock_id": "repo-" + "0" * 64, "generation": 1,
+                "repository": "github:ne9221/ai-development-manager", "branch": "refs/heads/main",
+                "scope": ["manager/executions.py"], "baseline_head": "0" * 40,
+            },
+        }
+        validate("execution", running)
+        for changes in ({"access": None}, {"lease_evidence": None}):
+            invalid = {**running, **changes}
+            with self.subTest(changes=changes), self.assertRaises(TaskError):
+                validate("execution", invalid)
+        read_only = {**running, "access": "read_only", "lease_evidence": None}
+        validate("execution", read_only)
+
     def test_legacy_start_cannot_promote_or_overwrite_reservation(self):
         with patch("manager.executions.read_drive_status") as reader:
             reserved = reserve_execution(self.store, "p1", "t1", "reserved-gate", "codex", decision(), reserved_at="2026-08-09T00:00:00Z")

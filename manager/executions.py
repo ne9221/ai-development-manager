@@ -198,60 +198,6 @@ def start_execution(*_args, **_kwargs):
     raise TaskError("legacy start is retired; reserve first and use the authoritative running gate")
 
 
-def _mark_execution_running(store, project_id, task_id, execution_id, provider, access, lease_evidence, quota_before, source_confidence, started_at=None):
-    """Persist the running execution first, then its task transition."""
-    execution = store.get("executions", project_id, execution_id)
-    validate("execution", execution)
-    requested_identity = {"project_id": project_id, "task_id": task_id, "execution_id": execution_id, "provider": provider}
-    if any(execution.get(key) != value for key, value in requested_identity.items()):
-        raise TaskError("running identity does not match the reservation")
-    if execution["status"] != "reserved":
-        raise TaskError("running transition requires a reserved execution")
-    task = store.get("tasks", project_id, task_id)
-    validate("task", task)
-    if task["status"] != "ready":
-        raise TaskError("running transition requires the task to remain ready")
-    if access == "production_write":
-        if not isinstance(lease_evidence, dict) or lease_evidence.get("authority") != "acquired":
-            raise TaskError("production running transition requires acquired lease evidence")
-    elif access == "read_only":
-        if lease_evidence is not None:
-            raise TaskError("read-only running transition cannot carry writer lease evidence")
-    else:
-        raise TaskError("access must be production_write or read_only")
-    if not isinstance(quota_before, dict) or not isinstance(source_confidence, str):
-        raise TaskError("running transition requires quota-before evidence")
-
-    execution_before, task_before = execution, task
-    execution_write_attempted = task_write_attempted = False
-    try:
-        running = {
-            **execution, "access": access, "lease_evidence": lease_evidence,
-            "started_at": started_at or now_iso(), "status": "running",
-            "quota_before": quota_before, "source_confidence": source_confidence,
-        }
-        validate("execution", running)
-        execution_write_attempted = True
-        store.put("executions", project_id, execution_id, running)
-        task_write_attempted = True
-        update_task(store, project_id, task_id, status="in_progress", assigned_provider=provider, blocked_reason=None, current_progress=f"Execution {execution_id} running", next_action="Launch provider after the running gate")
-    except Exception as exc:
-        cleanup_errors = []
-        for attempted, area, name, document in (
-            (execution_write_attempted, "executions", execution_id, execution_before),
-            (task_write_attempted, "tasks", task_id, task_before),
-        ):
-            if attempted:
-                try:
-                    store.put(area, project_id, name, document)
-                except Exception as cleanup_exc:
-                    cleanup_errors.append(f"{area} rollback failed: {cleanup_exc}")
-        if cleanup_errors:
-            raise TaskError(f"running transition failed and rollback was incomplete: {'; '.join(cleanup_errors)}") from exc
-        raise
-    return running
-
-
 def finish_execution(store, service, project_id, execution_id, status="completed", completed_at=None, note=None):
     if status not in ("completed", "failed", "interrupted"):
         raise TaskError(f"invalid terminal execution status: {status}")
