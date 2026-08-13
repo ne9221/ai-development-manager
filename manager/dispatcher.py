@@ -167,6 +167,7 @@ def dispatch(store, service, request, quota_document=None, executions=None):
     generated = prompt_for(project, task, handoff, selected, selected_estimate, summary, warnings, request.get("shared_rules"), request.get("ponytail_available"))
     return {
         "recommended_provider": selected, "mode": CAPABILITIES[selected]["mode"], "effort": decision["recommended_effort"],
+        "quota_evidence": decision["quota_evidence"],
         "estimated_minutes": selected_estimate["estimated_minutes"], "split_recommended": selected_estimate["split_recommended"], "phase_count": selected_estimate["suggested_phases"],
         "alternatives": alternatives, "quota_summary": summary, "warnings": warnings, "generated_prompt": generated,
     }

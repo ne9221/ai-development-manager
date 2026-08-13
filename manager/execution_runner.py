@@ -1,10 +1,21 @@
 """Minimal reserved-to-terminal Codex execution runner."""
 
-from manager.codex_launcher import CodexLauncher, LaunchRequest
+import argparse
+import json
+import os
+import sys
+import uuid
+
+from collectors.publish_drive import build_service
+from manager.codex_launcher import CodexLaunchError, CodexLauncher, LaunchRequest
+from manager.dispatcher import dispatch
 from manager.execution_lifecycle import enter_running_gate, terminalize_execution
-from manager.executions import link_execution_session
+from manager.executions import link_execution_session, reserve_execution
+from manager.gcs_lock_registry import GCSLockRegistry
+from manager.quota_reader import read_drive_status
 from manager.session_identity import manager_session_key
-from manager.tasks import TaskError, validate
+from manager.task_claims import task_claim_registry
+from manager.tasks import DriveRecords, TaskError, validate
 from manager.worktree_locks import link_session as link_writer_session
 
 
@@ -76,6 +87,37 @@ def _failure_summary(error):
     return f"Codex runner interrupted: {str(classification)[:200]}"
 
 
+def _dispatch_request(task):
+    return {
+        "project_id": task["project_id"], "task_id": task["task_id"], "title": task["title"],
+        "task_type": task["task_type"], "complexity": task["complexity"],
+        "expected_minutes": task["expected_minutes"], "scope": task.get("scope", []),
+        "constraints": task.get("constraints", []), "acceptance_criteria": task.get("acceptance_criteria", []),
+        "needs_repo_edit": task.get("needs_repo_edit", True),
+        "needs_research": task.get("needs_research", False), "needs_browser": task.get("needs_browser", False),
+        "preferred_provider": "codex",
+    }
+
+
+def launch_task(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
+                execution_id=None, model=None, timeout_seconds=30.0, quota_document=None, executions=None):
+    """Dispatch, reserve, and run one ready task; callers supply real authorities."""
+    task = store.get("tasks", project_id, task_id)
+    validate("task", task)
+    dispatched = dispatch(store, service, _dispatch_request(task), quota_document, executions)
+    if dispatched["recommended_provider"] != "codex":
+        raise TaskError("dispatch did not select Codex")
+    execution_id = execution_id or f"{task_id}-{uuid.uuid4().hex[:12]}"
+    reserve_execution(store, project_id, task_id, execution_id, "codex", dispatched["quota_evidence"],
+                      dispatched["mode"], dispatched["effort"])
+    request = LaunchRequest(task["working_directory"], model=model, reasoning_effort=dispatched["effort"], timeout_seconds=timeout_seconds)
+    result = run_execution(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
+                           execution_id, dispatched["generated_prompt"], request,
+                           access="read_only" if task["read_only"] else "production_write",
+                           baseline_head=task.get("baseline_head"))
+    return {"execution_id": execution_id, "dispatch": dispatched, **result}
+
+
 def run_execution(store, service, writer_registry, claim_registry, launcher: CodexLauncher,
                   project_id, task_id, execution_id, prompt, launch_request: LaunchRequest,
                   access="production_write", baseline_head=None):
@@ -140,3 +182,48 @@ def run_execution(store, service, writer_registry, claim_registry, launcher: Cod
         close_error.add_note(f"provider outcome remained {status}")
         raise close_error
     return {"terminal": terminal, "provider_outcome": outcome, "session": session}
+
+
+def _safe_error(exc):
+    classification = getattr(exc, "classification", None) or type(exc).__name__
+    return {"kind": str(classification)[:100], "message": "execution failed"}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Dispatch, reserve, and run one Codex task")
+    parser.add_argument("project_id"); parser.add_argument("task_id")
+    parser.add_argument("--execution-id"); parser.add_argument("--model")
+    parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    args = parser.parse_args(argv)
+    execution_id = args.execution_id or f"{args.task_id}-{uuid.uuid4().hex[:12]}"
+    store = None
+    try:
+        service = build_service(); store = DriveRecords(service)
+        task = store.get("tasks", args.project_id, args.task_id); validate("task", task)
+        claim_registry = task_claim_registry(os.environ.get("ADM_LOCK_GCS_BUCKET"), args.project_id, args.task_id)
+        writer_registry = None if task["read_only"] else GCSLockRegistry.from_environment()
+        result = launch_task(store, service, writer_registry, claim_registry, CodexLauncher(), args.project_id,
+                             args.task_id, execution_id, args.model, args.timeout_seconds,
+                             quota_document=read_drive_status(service=service))
+        execution_id = result["execution_id"]
+        output = {"status": result["terminal"]["execution"]["status"], "execution_id": execution_id,
+                  "session_id": result["session"]["session_id"], "cleanup": result["terminal"]["cleanup"]}
+        print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
+        return 0 if output["status"] == "completed" else 1
+    except (KeyboardInterrupt, CodexLaunchError, TaskError, OSError, ValueError) as exc:
+        terminal = None
+        if store is not None:
+            try:
+                candidate = store.get("executions", args.project_id, execution_id)
+                if candidate.get("status") in ("completed", "failed", "interrupted"):
+                    terminal = candidate
+            except (TaskError, KeyError):
+                pass
+        print(json.dumps({"status": terminal["status"] if terminal else "error", "execution_id": execution_id,
+                          "session_id": terminal.get("session_id") if terminal else None,
+                          "error": _safe_error(exc)}, ensure_ascii=False, separators=(",", ":")), file=sys.stdout)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

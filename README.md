@@ -147,6 +147,20 @@ The legacy direct `start` command is retired. Production running transitions use
 `manager.execution_lifecycle.enter_running_gate()` after reservation and
 authoritative writer acquire.
 
+## Start one Codex task execution
+
+With Drive auth and the existing GCS lock/claim environment configured, start
+exactly one ready task through dispatch, reservation, the running gate, Codex,
+and terminal persistence:
+
+```powershell
+python -m manager.execution_runner ai-development-manager phase-7-task --execution-id phase-7-run-1
+```
+
+Stdout is one machine-readable JSON object. Exit code `0` means `completed`;
+`1` means the run failed, was interrupted, or could not start. Provider prompt,
+transcript, stderr, and raw provider error details are never printed or stored.
+
 The estimator uses medians from similar completed executions. Estimates over
 20 minutes recommend multiple phases; they do not split or execute tasks.
 
