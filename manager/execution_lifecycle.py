@@ -2,28 +2,9 @@
 
 from manager.executions import quota_snapshot, task_snapshot
 from manager.quota_reader import read_drive_status
+from manager.task_claims import CLAIM_SCHEMA_VERSION, TaskClaimConflict, claim_task_execution, release_task_execution_claim
 from manager.tasks import TaskError, now_iso, validate
 from manager.worktree_locks import acquire, canonical_baseline, canonical_branch, canonical_repository, canonical_scope, release, repository_lock_id, validate_local_preflight
-
-
-class TaskClaimConflict(TaskError):
-    pass
-
-
-def _read_task_version(store, project_id, task_id):
-    if not hasattr(store, "read_task_for_claim") or not hasattr(store, "cas_task_claim"):
-        raise TaskError("running gate requires an authoritative cross-machine task claim CAS backend")
-    return store.read_task_for_claim(project_id, task_id)
-
-
-def _cas_task(store, project_id, task_id, version, document):
-    validate("task", document)
-    try:
-        return store.cas_task_claim(project_id, task_id, version, document)
-    except Exception as exc:
-        if getattr(getattr(exc, "resp", None), "status", None) == 412:
-            raise TaskClaimConflict("task active execution claim changed concurrently") from exc
-        raise
 
 
 def _claimed_task(task, execution_id):
@@ -37,15 +18,16 @@ def _claimed_task(task, execution_id):
     return claimed
 
 
-def _rollback_task_claim(store, project_id, task_id, execution_id, original):
-    current, version = _read_task_version(store, project_id, task_id)
+def _rollback_task_record(store, project_id, task_id, execution_id, original):
+    current = store.get("tasks", project_id, task_id)
     if current == original:
         return True
     if (current.get("source_context") or {}).get("active_execution_id") != execution_id:
-        # Another CAS winner owns the task; this invocation has nothing to undo.
+        # The GCS claim, not this Drive field, is authoritative. Never overwrite
+        # evidence that no longer identifies this execution during recovery.
         return True
-    _cas_task(store, project_id, task_id, version, original)
-    return _read_task_version(store, project_id, task_id)[0] == original
+    store.put("tasks", project_id, task_id, original)
+    return store.get("tasks", project_id, task_id) == original
 
 
 def _rollback_execution(store, project_id, execution_id, original):
@@ -58,7 +40,7 @@ def _rollback_execution(store, project_id, execution_id, original):
     return store.get("executions", project_id, execution_id) == original
 
 
-def enter_running_gate(store, service, registry, project_id, task_id, execution_id, provider, access, baseline_head=None, started_at=None):
+def enter_running_gate(store, service, registry, project_id, task_id, execution_id, provider, access, baseline_head=None, started_at=None, task_claim_registry=None):
     """Validate and authorize one reservation; never launches a provider."""
     try:
         execution = store.get("executions", project_id, execution_id)
@@ -74,13 +56,15 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
         raise TaskError("requested running identity does not match the reservation")
     if execution["status"] != "reserved":
         raise TaskError("running gate requires an existing reserved execution")
-    task, task_version = _read_task_version(store, project_id, task_id)
+    task = store.get("tasks", project_id, task_id)
     validate("task", task)
     if task["status"] != "ready":
         raise TaskError("running gate requires the task to remain ready")
     snapshot = execution["task_snapshot"]
     if task_snapshot(task) != snapshot:
         raise TaskError("current task contract does not match the reservation snapshot")
+    if task_claim_registry is None:
+        raise TaskError("authoritative task claim registry is required")
 
     lease = None
     expected_lock_id = None
@@ -132,17 +116,58 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
     else:
         raise TaskError("access must be production_write or read_only")
 
+    claim = None
+    claim_time = started_at or now_iso()
+    try:
+        claim = claim_task_execution(task_claim_registry, project_id, task_id, execution_id, provider, claim_time)
+        expected_claim = {
+            "schema_version": CLAIM_SCHEMA_VERSION, "project_id": project_id, "task_id": task_id,
+            "execution_id": execution_id, "provider": provider,
+        }
+        if (not isinstance(claim, dict) or not isinstance(claim.get("generation"), int)
+                or claim["generation"] < 1 or any(claim.get(key) != value for key, value in expected_claim.items())):
+            raise TaskError("authoritative task claim did not return owned generation evidence")
+    except TaskClaimConflict as exc:
+        if lease:
+            try:
+                release(registry, lease["lock_id"], project_id, task_id, execution_id, provider, lease_token=lease["lease_token"])
+            except Exception as cleanup_exc:
+                raise TaskError(f"task claim conflict and writer lease release failed: {cleanup_exc}") from exc
+        raise
+    except Exception as exc:
+        generation = claim.get("generation") if isinstance(claim, dict) else None
+        if isinstance(generation, int) and generation >= 1:
+            try:
+                release_task_execution_claim(task_claim_registry, project_id, task_id, execution_id, generation)
+            except Exception as cleanup_exc:
+                raise TaskError(f"task claim validation failed and claim cleanup failed; writer lease retained when present: {cleanup_exc}") from exc
+            if lease:
+                try:
+                    release(registry, lease["lock_id"], project_id, task_id, execution_id, provider, lease_token=lease["lease_token"])
+                except Exception as cleanup_exc:
+                    raise TaskError(f"task claim validation failed and writer lease release failed: {cleanup_exc}") from exc
+        elif lease:
+            raise TaskError("task claim acquisition could not be proven; writer lease retained for recovery") from exc
+        raise
+
     running = None
     try:
+        current_task = store.get("tasks", project_id, task_id)
+        validate("task", current_task)
+        if current_task != task:
+            raise TaskError("task changed after authoritative claim; running transition blocked")
         before = quota_snapshot(read_drive_status(service=service), provider)
-        claimed = _claimed_task(task, execution_id)
+        claimed = _claimed_task(current_task, execution_id)
         in_progress = {
             **claimed, "status": "in_progress", "assigned_provider": provider,
             "blocked_reason": None, "updated_at": now_iso(),
             "current_progress": f"Execution {execution_id} running",
             "next_action": "Launch provider after the running gate",
         }
-        _cas_task(store, project_id, task_id, task_version, in_progress)
+        validate("task", in_progress)
+        store.put("tasks", project_id, task_id, in_progress)
+        if store.get("tasks", project_id, task_id) != in_progress:
+            raise TaskError("in-progress task persistence verification failed")
         running = {
             **execution, "access": access, "lease_evidence": lease_evidence,
             "started_at": started_at or now_iso(), "status": "running",
@@ -162,18 +187,22 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
         task_recovered = False
         if execution_recovered:
             try:
-                task_recovered = _rollback_task_claim(store, project_id, task_id, execution_id, task)
+                task_recovered = _rollback_task_record(store, project_id, task_id, execution_id, task)
             except Exception as recovery_exc:
-                recovery_errors.append(f"task claim rollback failed: {recovery_exc}")
+                recovery_errors.append(f"task record rollback failed: {recovery_exc}")
         else:
-            recovery_errors.append("task claim retained because execution rollback was not confirmed")
+            recovery_errors.append("task record and authoritative claim retained because execution rollback was not confirmed")
         if not execution_recovered or not task_recovered:
             details = "; ".join(recovery_errors) or "persistent state could not be confirmed"
-            raise TaskError(f"running gate recovery required; lease retained when present: {details}") from exc
+            raise TaskError(f"running gate recovery required; claims and lease retained when present: {details}") from exc
+        try:
+            release_task_execution_claim(task_claim_registry, project_id, task_id, execution_id, claim["generation"])
+        except Exception as cleanup_exc:
+            raise TaskError(f"running gate failed and task claim release failed; writer lease retained when present: {cleanup_exc}") from exc
         if lease:
             try:
                 release(registry, lease["lock_id"], project_id, task_id, execution_id, provider, lease_token=lease["lease_token"])
             except Exception as cleanup_exc:
                 raise TaskError(f"running gate failed and lease release failed: {cleanup_exc}") from exc
         raise
-    return {"execution": running, "lease": lease}
+    return {"execution": running, "lease": lease, "task_claim": claim}

@@ -9,7 +9,9 @@ from unittest.mock import Mock, patch
 from manager.execution_lifecycle import TaskClaimConflict, enter_running_gate
 from manager.executions import main as executions_main, reserve_execution, start_execution
 from manager.gcs_lock_registry import RegistryConflict
+from manager.task_claims import claim_task_execution
 from manager.tasks import TaskError, create_project, create_task, validate
+from manager.test_task_claims import MemoryClaimRegistry
 from manager.test_worktree_locks import HEAD, REPO, InterleavingRegistry, MemoryRegistry, fake_git, no_preflight
 from manager.worktree_locks import acquire, release, validate_local_preflight
 
@@ -51,6 +53,8 @@ class MemoryStore:
                 self.events.append("task:in_progress")
                 if self.fail_task:
                     raise TaskError("task persistence failed")
+            if area == "tasks" and document.get("status") == "ready" and current and current.get("status") == "in_progress" and self.fail_task_rollback:
+                raise TaskError("task record rollback failed")
             self.records[(area, project, name)] = deepcopy(document)
             self.versions[(area, project, name)] = self.versions.get((area, project, name), 0) + 1
             return document
@@ -124,17 +128,18 @@ class ExecutionLifecycleTests(unittest.TestCase):
         preflight_func = kwargs.pop("preflight_func", no_preflight)
         acquire_func = kwargs.pop("acquire_func", acquire)
         release_func = kwargs.pop("release_func", release)
+        task_claim_registry = kwargs.pop("task_claim_registry", MemoryClaimRegistry())
         options = {"baseline_head": HEAD, "started_at": "2026-08-13T00:01:00Z"}
         options.update(kwargs)
         with patch("manager.execution_lifecycle.validate_local_preflight", side_effect=preflight_func), patch("manager.execution_lifecycle.acquire", side_effect=acquire_func), patch("manager.execution_lifecycle.release", side_effect=release_func):
-            return enter_running_gate(store, object(), registry, "p1", "t1", execution_id, "codex", access, **options)
+            return enter_running_gate(store, object(), registry, "p1", "t1", execution_id, "codex", access, task_claim_registry=task_claim_registry, **options)
 
     def assert_reserved_ready(self, store, execution_id="exec-a"):
         self.assertEqual("reserved", store.get("executions", "p1", execution_id)["status"])
         self.assertEqual("ready", store.get("tasks", "p1", "t1")["status"])
 
     def test_production_happy_path_orders_preflight_acquire_quota_execution_task(self):
-        store = build_store(); registry = MemoryRegistry()
+        store = build_store(); registry = MemoryRegistry(); claim_registry = MemoryClaimRegistry()
 
         def preflight(*_args):
             store.events.append("preflight")
@@ -148,7 +153,7 @@ class ExecutionLifecycleTests(unittest.TestCase):
             return quota_document()
 
         with patch("manager.execution_lifecycle.read_drive_status", side_effect=read_quota):
-            result = self.gate(store, registry, preflight_func=preflight, acquire_func=ordered_acquire)
+            result = self.gate(store, registry, task_claim_registry=claim_registry, preflight_func=preflight, acquire_func=ordered_acquire)
         self.assertEqual(["preflight", "acquire", "preflight", "quota", "task:in_progress", "execution:running"], store.events)
         running = result["execution"]
         self.assertEqual("running", running["status"])
@@ -165,6 +170,8 @@ class ExecutionLifecycleTests(unittest.TestCase):
             validate("execution", invalid)
         self.assertEqual("in_progress", store.get("tasks", "p1", "t1")["status"])
         self.assertEqual("active", result["lease"]["effective_status"])
+        self.assertEqual("exec-a", claim_registry.document["execution_id"])
+        self.assertEqual(claim_registry.generation, result["task_claim"]["generation"])
 
     def test_two_execution_ids_compete_for_one_writer(self):
         store = build_store()
@@ -194,7 +201,7 @@ class ExecutionLifecycleTests(unittest.TestCase):
             arguments = {"task_id": "t1", "provider": "codex", **changes}
             with patch("manager.execution_lifecycle.validate_local_preflight", preflight), patch("manager.execution_lifecycle.acquire", acquire_mock):
                 with self.subTest(changes=changes), self.assertRaises(TaskError):
-                    enter_running_gate(store, object(), MemoryRegistry(), "p1", arguments["task_id"], "exec-a", arguments["provider"], "production_write", baseline_head=HEAD)
+                    enter_running_gate(store, object(), MemoryRegistry(), "p1", arguments["task_id"], "exec-a", arguments["provider"], "production_write", baseline_head=HEAD, task_claim_registry=MemoryClaimRegistry())
             preflight.assert_not_called(); acquire_mock.assert_not_called(); self.assert_reserved_ready(store)
 
         store = build_store(); changed = store.get("tasks", "p1", "t1"); changed["scope"] = ["changed.py"]
@@ -303,18 +310,18 @@ class ExecutionLifecycleTests(unittest.TestCase):
             "scope": ["manager/executions.py"], "baseline_head": HEAD,
         }
         with self.assertRaises(TypeError):
-            enter_running_gate(store, object(), MemoryRegistry(), "p1", "t1", "exec-a", "codex", "production_write", lease_evidence=fake)
+            enter_running_gate(store, object(), MemoryRegistry(), "p1", "t1", "exec-a", "codex", "production_write", lease_evidence=fake, task_claim_registry=MemoryClaimRegistry())
         self.assert_reserved_ready(store)
 
     def test_two_read_only_reservations_can_only_claim_task_once(self):
         store = build_store(read_only=True)
         reserve_execution(store, "p1", "t1", "exec-b", "codex", {"decision": "fresh"}, "code", "high", "2026-08-13T00:00:01Z")
-        store.claim_read_barrier = threading.Barrier(2)
+        claim_registry = MemoryClaimRegistry()
         results, errors = [], []
 
         def run(execution_id):
             try:
-                result = enter_running_gate(store, object(), None, "p1", "t1", execution_id, "codex", "read_only", started_at="2026-08-13T00:01:00Z")
+                result = enter_running_gate(store, object(), None, "p1", "t1", execution_id, "codex", "read_only", started_at="2026-08-13T00:01:00Z", task_claim_registry=claim_registry)
                 results.append(result["execution"]["execution_id"])
             except TaskError as exc:
                 errors.append(str(exc))
@@ -330,8 +337,9 @@ class ExecutionLifecycleTests(unittest.TestCase):
         claimed = store.get("tasks", "p1", "t1")
         self.assertEqual("in_progress", claimed["status"])
         self.assertEqual(winner, claimed["source_context"]["active_execution_id"])
+        self.assertEqual(winner, claim_registry.document["execution_id"])
 
-    def test_store_without_true_task_cas_fails_closed_before_acquire(self):
+    def test_drive_store_needs_no_forged_task_cas_when_gcs_claim_is_authority(self):
         source = build_store(read_only=True)
 
         class DriveLikeStore:
@@ -339,11 +347,10 @@ class ExecutionLifecycleTests(unittest.TestCase):
             def put(self, *args): return source.put(*args)
 
         store = DriveLikeStore(); acquire_mock = Mock()
-        with patch("manager.execution_lifecycle.acquire", acquire_mock):
-            with self.assertRaisesRegex(TaskError, "cross-machine task claim CAS"):
-                enter_running_gate(store, object(), None, "p1", "t1", "exec-a", "codex", "read_only")
+        with patch("manager.execution_lifecycle.acquire", acquire_mock), patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+            result = enter_running_gate(store, object(), None, "p1", "t1", "exec-a", "codex", "read_only", task_claim_registry=MemoryClaimRegistry())
         acquire_mock.assert_not_called()
-        self.assert_reserved_ready(source)
+        self.assertEqual("running", result["execution"]["status"])
 
     def test_production_cannot_overwrite_an_existing_task_claim(self):
         store = build_store(); registry = MemoryRegistry()
@@ -355,6 +362,97 @@ class ExecutionLifecycleTests(unittest.TestCase):
                 self.gate(store, registry)
         self.assert_reserved_ready(store)
         self.assertEqual("other-execution", store.get("tasks", "p1", "t1")["source_context"]["active_execution_id"])
+        self.assertEqual("released", next(iter(registry.document["locks"].values()))["status"])
+
+    def test_authoritative_claim_conflict_releases_loser_lease_and_preserves_winner(self):
+        store = build_store(execution_id="exec-b"); registry = MemoryRegistry(); claim_registry = MemoryClaimRegistry()
+        winner = claim_task_execution(claim_registry, "p1", "t1", "exec-a", "codex", "2026-08-13T00:00:00Z")
+        with self.assertRaisesRegex(TaskClaimConflict, "already claimed by execution exec-a"):
+            self.gate(store, registry, execution_id="exec-b", task_claim_registry=claim_registry)
+        self.assert_reserved_ready(store, "exec-b")
+        self.assertEqual(winner["generation"], claim_registry.generation)
+        self.assertEqual("exec-a", claim_registry.document["execution_id"])
+        self.assertEqual("released", next(iter(registry.document["locks"].values()))["status"])
+
+    def test_ambiguous_claim_self_recognition_enters_running(self):
+        store = build_store(); claim_registry = MemoryClaimRegistry()
+        claim_registry.ambiguous_queue.append(ConnectionError("timeout after create"))
+        with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+            result = self.gate(store, MemoryRegistry(), task_claim_registry=claim_registry)
+        self.assertEqual("running", result["execution"]["status"])
+        self.assertEqual(1, claim_registry.generation)
+
+    def test_post_claim_failure_releases_claim_and_writer_lease(self):
+        store = build_store(); store.fail_running = True
+        registry = MemoryRegistry(); claim_registry = MemoryClaimRegistry()
+        with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+            with self.assertRaisesRegex(TaskError, "running persistence failed"):
+                self.gate(store, registry, task_claim_registry=claim_registry)
+        self.assert_reserved_ready(store)
+        self.assertIsNone(claim_registry.document)
+        self.assertEqual("released", next(iter(registry.document["locks"].values()))["status"])
+
+    def test_claim_owner_replacement_is_not_deleted_during_cleanup(self):
+        store = build_store(); store.fail_running = True
+        registry = MemoryRegistry(); claim_registry = MemoryClaimRegistry()
+
+        original_put = store.put
+        def replace_claim_before_failure(area, project_id, name, document):
+            if area == "executions" and document.get("status") == "running":
+                with claim_registry.mutex:
+                    claim_registry.generation += 1
+                    claim_registry.document = {
+                        "schema_version": "0.1.0", "project_id": "p1", "task_id": "t1",
+                        "execution_id": "exec-b", "provider": "claude", "claimed_at": "2026-08-13T00:02:00Z",
+                    }
+            return original_put(area, project_id, name, document)
+
+        store.put = replace_claim_before_failure
+        with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+            with self.assertRaisesRegex(TaskError, "running persistence failed"):
+                self.gate(store, registry, task_claim_registry=claim_registry)
+        self.assertEqual("exec-b", claim_registry.document["execution_id"])
+        self.assertEqual("released", next(iter(registry.document["locks"].values()))["status"])
+
+    def test_claim_generation_change_blocks_cleanup_and_retains_writer_lease(self):
+        store = build_store(); store.fail_running = True
+        registry = MemoryRegistry(); claim_registry = MemoryClaimRegistry()
+
+        original_put = store.put
+        def change_generation_before_failure(area, project_id, name, document):
+            if area == "executions" and document.get("status") == "running":
+                with claim_registry.mutex:
+                    claim_registry.generation += 1
+            return original_put(area, project_id, name, document)
+
+        store.put = change_generation_before_failure
+        with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+            with self.assertRaisesRegex(TaskError, "task claim release failed; writer lease retained"):
+                self.gate(store, registry, task_claim_registry=claim_registry)
+        self.assertEqual("exec-a", claim_registry.document["execution_id"])
+        self.assertEqual("active", next(iter(registry.document["locks"].values()))["status"])
+
+    def test_duplicate_running_gate_retry_fails_closed_without_mutating_claim(self):
+        store = build_store(); registry = MemoryRegistry(); claim_registry = MemoryClaimRegistry()
+        with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+            self.gate(store, registry, task_claim_registry=claim_registry)
+        generation = claim_registry.generation
+        with self.assertRaisesRegex(TaskError, "reserved execution"):
+            self.gate(store, registry, task_claim_registry=claim_registry)
+        self.assertEqual(generation, claim_registry.generation)
+        self.assertEqual("exec-a", claim_registry.document["execution_id"])
+        self.assertEqual("active", next(iter(registry.document["locks"].values()))["status"])
+
+    def test_forged_claim_evidence_never_authorizes_running(self):
+        store = build_store(); registry = MemoryRegistry(); claim_registry = MemoryClaimRegistry()
+        forged = {
+            "schema_version": "0.1.0", "project_id": "p1", "task_id": "t1",
+            "execution_id": "forged", "provider": "codex", "claimed_at": "2026-08-13T00:01:00Z", "generation": 1,
+        }
+        with patch("manager.execution_lifecycle.claim_task_execution", return_value=forged):
+            with self.assertRaisesRegex(TaskError, "owned generation evidence"):
+                self.gate(store, registry, task_claim_registry=claim_registry)
+        self.assert_reserved_ready(store)
         self.assertEqual("released", next(iter(registry.document["locks"].values()))["status"])
 
     def test_acquire_validation_failure_releases_real_lease(self):
@@ -442,7 +540,7 @@ class ExecutionLifecycleTests(unittest.TestCase):
             launch()
 
         with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
-            with self.assertRaisesRegex(TaskError, "recovery required; lease retained"):
+            with self.assertRaisesRegex(TaskError, "recovery required; claims and lease retained"):
                 attempt()
         launch.assert_not_called()
         self.assertEqual("running", store.get("executions", "p1", "exec-a")["status"])
@@ -461,7 +559,7 @@ class ExecutionLifecycleTests(unittest.TestCase):
             launch()
 
         with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
-            with self.assertRaisesRegex(TaskError, "recovery required; lease retained"):
+            with self.assertRaisesRegex(TaskError, "recovery required; claims and lease retained"):
                 attempt()
         launch.assert_not_called()
         self.assertEqual("reserved", store.get("executions", "p1", "exec-a")["status"])
