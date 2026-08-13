@@ -49,6 +49,10 @@ def recover_task_claim(store, claim_registry, project_id, task_id):
     if task.get("status") != expected_task_status:
         return _refused("terminal_drive_state_is_incomplete", claim)
     cleanup = execution.get("cleanup_evidence") or {}
+    if (cleanup.get("provider_outcome") != execution["status"]
+            or cleanup.get("persistence") != "complete"
+            or cleanup.get("persisted") != ["execution", "handoff", "task"]):
+        return _refused("authoritative_terminal_cleanup_not_confirmed", claim)
     if execution.get("access") == "production_write" and cleanup.get("writer_release") != "released":
         return _refused("writer_authority_not_confirmed_released", claim)
     released = release_task_execution_claim(claim_registry, project_id, task_id,

@@ -6,19 +6,25 @@ from unittest.mock import patch
 
 from manager.execution_lifecycle import enter_running_gate, terminalize_execution
 from manager.execution_recovery import main, recover_task_claim
+from manager.executions import finish_execution
 from manager.task_claims import claim_task_execution
 from manager.tasks import TaskError
 from manager.test_execution_lifecycle import build_store, quota_document
 from manager.test_task_claims import MemoryClaimRegistry
+from manager.test_worktree_locks import HEAD, MemoryRegistry
 
 
 class RecoveryTests(unittest.TestCase):
     def terminal_claim(self, read_only=True):
-        store, claim = build_store(read_only=read_only), MemoryClaimRegistry()
-        with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
-            gate = enter_running_gate(store, object(), None, "p1", "t1", "exec-a", "codex", "read_only", task_claim_registry=claim)
+        store, claim, writer = build_store(read_only=read_only), MemoryClaimRegistry(), None if read_only else MemoryRegistry()
+        with patch("manager.execution_lifecycle.validate_local_preflight"), patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+            gate = enter_running_gate(store, object(), writer, "p1", "t1", "exec-a", "codex",
+                                      "read_only" if read_only else "production_write",
+                                      baseline_head=None if read_only else HEAD, task_claim_registry=claim)
         with patch("manager.executions.read_drive_status", return_value=quota_document()):
-            terminalize_execution(store, object(), None, claim, "p1", "t1", "exec-a", "codex", "completed", gate["task_claim"]["generation"], True)
+            terminalize_execution(store, object(), writer, claim, "p1", "t1", "exec-a", "codex", "completed",
+                                  gate["task_claim"]["generation"], True,
+                                  lease_token=gate["lease"]["lease_token"] if gate["lease"] else None)
         return store, claim_task_execution(claim, "p1", "t1", "exec-a", "codex", "2026-08-13T01:00:00Z"), claim
 
     def test_terminal_execution_stale_claim_releases_and_repeats_safely(self):
@@ -26,6 +32,28 @@ class RecoveryTests(unittest.TestCase):
         result = recover_task_claim(store, claim, "p1", "t1")
         self.assertEqual("released", result["status"]); self.assertEqual(stale["generation"], result["generation"])
         self.assertEqual({"status": "clean", "released": False, "reason": "no_active_claim"}, recover_task_claim(store, claim, "p1", "t1"))
+
+    def test_legacy_read_only_terminal_without_cleanup_evidence_refuses(self):
+        for status in ("completed", "failed", "interrupted"):
+            with self.subTest(status=status):
+                store, claim = build_store(read_only=True), MemoryClaimRegistry()
+                with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+                    enter_running_gate(store, object(), None, "p1", "t1", "exec-a", "codex", "read_only", task_claim_registry=claim)
+                with patch("manager.executions.read_drive_status", return_value=quota_document()):
+                    finish_execution(store, object(), "p1", "exec-a", status)
+                result = recover_task_claim(store, claim, "p1", "t1")
+                self.assertEqual("authoritative_terminal_cleanup_not_confirmed", result["reason"])
+                self.assertIsNotNone(claim.document)
+
+    def test_production_terminal_requires_released_writer(self):
+        store, _, claim = self.terminal_claim(read_only=False)
+        self.assertEqual("released", recover_task_claim(store, claim, "p1", "t1")["status"])
+        store, _, claim = self.terminal_claim(read_only=False)
+        execution = store.get("executions", "p1", "exec-a")
+        execution["cleanup_evidence"]["writer_release"] = "retained"
+        store.put("executions", "p1", "exec-a", execution)
+        self.assertEqual("writer_authority_not_confirmed_released", recover_task_claim(store, claim, "p1", "t1")["reason"])
+        self.assertIsNotNone(claim.document)
 
     def test_generation_change_refuses_without_deleting_new_claim(self):
         class ChangesGeneration(MemoryClaimRegistry):
@@ -54,8 +82,6 @@ class RecoveryTests(unittest.TestCase):
     def test_incomplete_terminal_or_writer_authority_refuses(self):
         store, _, claim = self.terminal_claim(); task = store.get("tasks", "p1", "t1"); task["status"] = "in_progress"; store.put("tasks", "p1", "t1", task)
         self.assertEqual("terminal_drive_state_is_incomplete", recover_task_claim(store, claim, "p1", "t1")["reason"])
-        store, _, claim = self.terminal_claim(); item = store.get("executions", "p1", "exec-a"); item["access"] = "production_write"; item["lease_evidence"] = {"authority":"acquired","lock_id":"repo-" + "0" * 64,"generation":1,"repository":"github:ne9221/ai-development-manager","branch":"refs/heads/main","scope":["manager/x.py"],"baseline_head":"0" * 40}; item["cleanup_evidence"] = {"writer_release":"retained"}; store.put("executions", "p1", "exec-a", item)
-        self.assertEqual("writer_authority_not_confirmed_released", recover_task_claim(store, claim, "p1", "t1")["reason"])
 
     def test_ambiguous_delete_is_self_confirmed(self):
         class AmbiguousDelete(MemoryClaimRegistry):
