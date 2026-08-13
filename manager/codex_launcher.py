@@ -8,6 +8,7 @@ import queue
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,6 +99,21 @@ def _rpc_error(error: Any) -> str:
     return f"code={code}; {safe_message}" if code is not None else safe_message
 
 
+def _trusted_session_path(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        return None
+    root = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    return str(resolved)
+
+
 class _AppServerClient:
     def __init__(self, process: Any, timeout: float):
         self.process = process
@@ -107,6 +123,7 @@ class _AppServerClient:
         self._lock = threading.Lock()
         self._next_id = 1
         self._closed = False
+        self._failure: CodexLaunchError | None = None
         self._stderr_tail = ""
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
@@ -117,24 +134,49 @@ class _AppServerClient:
                 try:
                     message = json.loads(line)
                 except (json.JSONDecodeError, TypeError):
-                    self._notifications.put(("protocol_error", "malformed JSON from app-server"))
-                    continue
+                    self._fail(CodexLaunchError("protocol_error", "malformed JSON from app-server"))
+                    break
                 if not isinstance(message, dict):
-                    self._notifications.put(("protocol_error", "non-object JSON-RPC message"))
-                    continue
-                request_id = message.get("id")
-                with self._lock:
-                    target = self._responses.get(request_id)
-                if request_id is not None and target is not None:
+                    self._fail(CodexLaunchError("protocol_error", "non-object JSON-RPC message"))
+                    break
+                if "id" in message and "method" not in message:
+                    if ("result" in message) == ("error" in message):
+                        self._fail(CodexLaunchError("protocol_error", "invalid JSON-RPC response envelope"))
+                        break
+                    request_id = message["id"]
+                    with self._lock:
+                        target = next((target for expected, target in self._responses.items()
+                                       if type(request_id) is type(expected) and request_id == expected), None)
+                    if target is None:
+                        self._fail(CodexLaunchError("protocol_error", "response has an unknown request id"))
+                        break
                     target.put(message)
-                else:
+                elif "id" not in message and isinstance(message.get("method"), str) and message["method"]:
                     self._notifications.put(("notification", message))
+                else:
+                    self._fail(CodexLaunchError("protocol_error", "invalid JSON-RPC envelope"))
+                    break
         finally:
-            self._notifications.put(("eof", self.process.poll()))
-            with self._lock:
-                targets = list(self._responses.values())
-            for target in targets:
-                target.put(None)
+            code = self.process.poll()
+            classification = "process_exit" if code is not None else "stdout_eof"
+            self._fail(CodexLaunchError(classification, f"app-server closed stdout; exit_code={code}"))
+
+    def _fail(self, failure: CodexLaunchError):
+        with self._lock:
+            if self._failure is not None:
+                return
+            self._failure = failure
+            targets = list(self._responses.values())
+        for target in targets:
+            target.put(failure)
+        self._notifications.put(("failure", failure))
+        self.close()
+
+    def raise_if_failed(self):
+        with self._lock:
+            failure = self._failure
+        if failure is not None:
+            raise failure
 
     def _drain_stderr(self):
         try:
@@ -144,13 +186,18 @@ class _AppServerClient:
             pass
 
     def send(self, message: dict):
+        self.raise_if_failed()
         if self.process.poll() is not None:
-            raise CodexLaunchError("process_exit", f"app-server exited with code {self.process.returncode}")
+            failure = CodexLaunchError("process_exit", f"app-server exited with code {self.process.returncode}")
+            self._fail(failure)
+            raise failure
         try:
             self.process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
             self.process.stdin.flush()
         except (OSError, ValueError) as exc:
-            raise CodexLaunchError("transport_error", "could not write to app-server") from exc
+            failure = CodexLaunchError("transport_error", "could not write to app-server")
+            self._fail(failure)
+            raise failure from exc
 
     def notify(self, method: str, params: dict | None = None):
         message = {"method": method}
@@ -173,24 +220,26 @@ class _AppServerClient:
                 response = response_queue.get(timeout=self.timeout)
             except queue.Empty as exc:
                 raise CodexLaunchError("timeout", f"{method} timed out") from exc
-            if response is None:
-                code = self.process.poll()
-                classification = "process_exit" if code is not None else "stdout_eof"
-                raise CodexLaunchError(classification, f"app-server closed stdout; exit_code={code}")
+            if isinstance(response, CodexLaunchError):
+                raise response
             if "error" in response:
                 raise CodexLaunchError("protocol_error", f"{method}: {_rpc_error(response['error'])}")
             if "result" not in response:
                 raise CodexLaunchError("protocol_error", f"{method}: response has no result")
+            self.raise_if_failed()
             return response["result"]
         finally:
             with self._lock:
                 self._responses.pop(request_id, None)
 
     def next_event(self, timeout: float):
+        self.raise_if_failed()
         try:
-            return self._notifications.get(timeout=timeout)
+            event = self._notifications.get(timeout=timeout)
         except queue.Empty as exc:
             raise CodexLaunchError("timeout", "turn completion timed out") from exc
+        self.raise_if_failed()
+        return event
 
     def close(self):
         with self._lock:
@@ -216,7 +265,7 @@ class CodexLauncher:
         self.executable = executable
         self._popen = popen
 
-    def _spawn(self, request: LaunchRequest) -> _AppServerClient:
+    def _spawn(self, timeout: float) -> _AppServerClient:
         executable = resolve_codex_executable(self.executable)
         command = [executable, "app-server"]
         if executable.lower().endswith((".cmd", ".bat")):
@@ -228,13 +277,14 @@ class CodexLauncher:
             )
         except OSError as exc:
             raise CodexLaunchError("spawn_failed", "failed to start Codex app-server") from exc
-        return _AppServerClient(process, _timeout(request.timeout_seconds))
+        return _AppServerClient(process, timeout)
 
     def prepare(self, request: LaunchRequest) -> PreparedLaunch:
+        timeout = _timeout(request.timeout_seconds)
         cwd = Path(request.working_directory)
         if not cwd.is_absolute() or not cwd.is_dir():
             raise CodexLaunchError("invalid_request", "working_directory must be an existing absolute directory")
-        client = self._spawn(request)
+        client = self._spawn(timeout)
         try:
             initialized = client.request("initialize", {"clientInfo": {
                 "name": "ai_development_manager", "title": "AI Development Manager", "version": "0.1.0"
@@ -252,17 +302,17 @@ class CodexLauncher:
             result = client.request("thread/start", params)
             thread = result.get("thread") if isinstance(result, dict) else None
             thread_id = thread.get("id") if isinstance(thread, dict) else None
-            if not isinstance(thread_id, str) or not thread_id:
+            if not isinstance(thread_id, str) or not thread_id.strip():
                 raise CodexLaunchError("protocol_error", "thread/start returned no thread id")
-            session_path = thread.get("path")
-            if session_path is not None and not isinstance(session_path, str):
-                raise CodexLaunchError("protocol_error", "thread/start returned an invalid session path")
+            session_path = _trusted_session_path(thread.get("path"))
+            client.raise_if_failed()
             return PreparedLaunch(thread_id, session_path, process_pid(client.process), utc_now(), client, request)
         except Exception:
             client.close()
             raise
 
     def start(self, prepared: PreparedLaunch, prompt: str) -> RunningLaunch:
+        prepared._client.raise_if_failed()
         if prepared._started:
             raise CodexLaunchError("invalid_state", "prepared launch has already started")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -285,13 +335,14 @@ class CodexLauncher:
 
     def wait(self, running: RunningLaunch) -> LaunchOutcome:
         client = running.prepared._client
+        deadline = time.monotonic() + client.timeout
         while True:
-            kind, payload = client.next_event(client.timeout)
-            if kind == "protocol_error":
-                raise CodexLaunchError("protocol_error", payload)
-            if kind == "eof":
-                classification = "process_exit" if payload is not None else "stdout_eof"
-                raise CodexLaunchError(classification, f"app-server closed stdout; exit_code={payload}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CodexLaunchError("timeout", "turn completion timed out")
+            kind, payload = client.next_event(remaining)
+            if kind == "failure":
+                raise payload
             if not isinstance(payload, dict) or payload.get("method") != "turn/completed":
                 continue
             params = payload.get("params")
