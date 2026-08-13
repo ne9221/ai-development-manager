@@ -153,5 +153,14 @@ def release_task_execution_claim(registry, project_id, task_id, execution_id, ge
     except RegistryConflict as exc:
         raise TaskClaimConflict("task claim changed concurrently; release aborted") from exc
     except Exception as exc:
-        raise TaskError("task claim backend unavailable during release") from exc
+        # A delete timeout may mean that GCS committed the conditional delete
+        # before the client lost the response. Re-read once: absence proves our
+        # exact generation is gone; any present or unreadable state stays closed.
+        try:
+            confirmed = check_task_execution_claim(registry, project_id, task_id)
+        except Exception as reread_exc:
+            raise TaskError("task claim release outcome is ambiguous") from reread_exc
+        if confirmed is None:
+            return {"released": True, "generation": current_generation, "confirmed_after_ambiguous_delete": True}
+        raise TaskError("task claim release outcome is ambiguous") from exc
     return {"released": True, "generation": current_generation}
