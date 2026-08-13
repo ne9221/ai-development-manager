@@ -217,7 +217,8 @@ def _verify_terminal_authority(store, writer_registry, claim_registry, project_i
     claim = check_task_execution_claim(claim_registry, project_id, task_id)
     if not claim or claim.get("execution_id") != execution_id or claim.get("provider") != provider or claim.get("generation") != claim_generation:
         raise TaskError("terminal callback does not hold the exact task claim generation")
-    if execution.get("access") == "production_write":
+    cleanup = execution.get("cleanup_evidence") or {}
+    if execution.get("access") == "production_write" and cleanup.get("writer_release") != "released":
         lease = execution.get("lease_evidence") or {}
         document, _, server_time = read_registry(writer_registry)
         current = document["locks"].get(lease.get("lock_id"))
@@ -232,8 +233,10 @@ def _verify_terminal_authority(store, writer_registry, claim_registry, project_i
 
 def cleanup_execution(writer_registry, claim_registry, execution, claim_generation, lease_token=None):
     """Release writer authority first; release only the supplied claim generation last."""
-    evidence = {"writer_release": "not_required", "task_claim_release": "not_attempted", "errors": []}
-    if execution.get("access") == "production_write":
+    previous = execution.get("cleanup_evidence") or {}
+    writer_release = "released" if previous.get("writer_release") == "released" else "not_required"
+    evidence = {"writer_release": writer_release, "task_claim_release": "not_attempted", "errors": []}
+    if execution.get("access") == "production_write" and writer_release != "released":
         try:
             release(writer_registry, execution["lease_evidence"]["lock_id"], execution["project_id"], execution["task_id"], execution["execution_id"], execution["provider"], lease_token=lease_token)
             evidence["writer_release"] = "released"
@@ -259,8 +262,57 @@ def _terminal_handoff(execution, status, summary, timestamp):
         "completed_work": [summary] if status == "completed" else [], "current_state": status,
         "next_action": "" if status == "completed" else "Review outcome and decide whether to resume",
         "minimal_context": summary,
+        "files_changed": [], "commits": [], "tests": [], "known_issues": [], "do_not_touch": [],
         "acceptance_criteria": execution["task_snapshot"].get("acceptance_criteria", []),
     }
+
+
+def _optional_record(store, area, project_id, record_id):
+    try:
+        return store.get(area, project_id, record_id)
+    except KeyError:
+        return None
+    except TaskError as exc:
+        if "found 0" in str(exc) or "not found" in str(exc):
+            return None
+        raise
+
+
+def _expected_terminal_task(task, execution_id, status, summary, timestamp):
+    if (task.get("source_context") or {}).get("active_execution_id") != execution_id:
+        raise TaskError("task no longer identifies the terminal execution")
+    expected = {**task, "status": "completed" if status == "completed" else "blocked", "updated_at": timestamp,
+                "blocked_reason": None if status == "completed" else f"Execution {status}: {summary}",
+                "current_progress": summary,
+                "next_action": "" if status == "completed" else "Review outcome and decide whether to resume"}
+    if status == "completed":
+        expected["completed_at"] = timestamp
+    validate("task", expected)
+    return expected
+
+
+def _terminal_state(execution, task, handoff, status, summary, timestamp):
+    expected_handoff = _terminal_handoff(execution, status, summary, timestamp)
+    expected_task = _expected_terminal_task(task, execution["execution_id"], status, summary, timestamp)
+    return expected_handoff, expected_task, handoff == expected_handoff and task == expected_task
+
+
+def _retain_terminal_authority(store, execution, status, persisted, error):
+    writer_release = "released" if (execution.get("cleanup_evidence") or {}).get("writer_release") == "released" else ("retained" if execution.get("access") == "production_write" else "not_required")
+    audit = {
+        "provider_outcome": status, "persistence": "incomplete" if not persisted else "partial",
+        "persisted": persisted,
+        "writer_release": writer_release,
+        "task_claim_release": "retained", "errors": [f"persistence failed: {error}"],
+    }
+    try:
+        current = store.get("executions", execution["project_id"], execution["execution_id"])
+        current["cleanup_evidence"] = audit
+        validate("execution", current)
+        store.put("executions", execution["project_id"], execution["execution_id"], current)
+    except Exception as audit_exc:
+        error.add_note(f"terminal recovery audit persistence failed: {audit_exc}")
+    return audit
 
 
 def terminalize_execution(store, service, writer_registry, claim_registry, project_id, task_id, execution_id, provider, status, claim_generation, provider_stopped, lease_token=None, completed_at=None, summary=None):
@@ -272,52 +324,78 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
     identity = {"project_id": project_id, "task_id": task_id, "execution_id": execution_id, "provider": provider}
     if any(existing.get(key) != value for key, value in identity.items()):
         raise TaskError("terminal callback identity does not match execution")
-    if existing.get("status") in ("completed", "failed", "interrupted"):
-        if existing["status"] == status:
-            return {"execution": existing, "cleanup": existing.get("cleanup_evidence"), "idempotent": True}
+    terminal_statuses = ("completed", "failed", "interrupted")
+    if existing.get("status") in terminal_statuses and existing["status"] != status:
         raise TaskError("conflicting duplicate terminal outcome")
-    execution = _verify_terminal_authority(store, writer_registry, claim_registry, project_id, task_id, execution_id, provider, claim_generation, lease_token)
-    if execution.get("status") != "running":
+    if existing.get("status") not in ("running", status):
         raise TaskError("terminalization requires a running execution")
 
-    timestamp = completed_at or now_iso()
-    summary = summary or f"Execution {execution_id} {status}"
-    primary_error = None
+    if existing.get("status") == status:
+        timestamp = existing["completed_at"]
+        summary = existing["notes"][-1] if existing.get("notes") else f"Execution {execution_id} {status}"
+        task = store.get("tasks", project_id, task_id)
+        handoff_id = f"{task_id}-{status}-{execution_id}"
+        handoff = _optional_record(store, "handoffs", project_id, handoff_id)
+        _, _, state_complete = _terminal_state(existing, task, handoff, status, summary, timestamp)
+        audit = existing.get("cleanup_evidence") or {}
+        cleanup_complete = audit.get("writer_release") in ("released", "not_required") and audit.get("task_claim_release") == "released"
+        if state_complete and audit.get("persistence") == "complete" and cleanup_complete:
+            return {"execution": existing, "cleanup": audit, "idempotent": True}
+    execution = _verify_terminal_authority(store, writer_registry, claim_registry, project_id, task_id, execution_id, provider, claim_generation, lease_token)
+
+    timestamp = execution.get("completed_at") or completed_at or now_iso()
+    summary = (execution["notes"][-1] if execution.get("status") == status and execution.get("notes")
+               else summary or f"Execution {execution_id} {status}")
     terminal = execution
     persisted = []
     try:
-        terminal = persist_terminal(store, service, project_id, execution_id, status, timestamp, summary)
+        if execution.get("status") == "running":
+            terminal = persist_terminal(store, service, project_id, execution_id, status, timestamp, summary)
         persisted.append("execution")
-        create_handoff(store, _terminal_handoff(terminal, status, summary, timestamp))
+        expected_handoff = _terminal_handoff(terminal, status, summary, timestamp)
+        handoff = _optional_record(store, "handoffs", project_id, expected_handoff["handoff_id"])
+        if handoff is None:
+            create_handoff(store, expected_handoff)
+            if store.get("handoffs", project_id, expected_handoff["handoff_id"]) != expected_handoff:
+                raise TaskError("terminal handoff persistence verification failed")
+        elif handoff != expected_handoff:
+            raise TaskError("deterministic terminal handoff conflicts with persisted content")
         persisted.append("handoff")
         task = store.get("tasks", project_id, task_id)
-        if (task.get("source_context") or {}).get("active_execution_id") != execution_id:
-            raise TaskError("task no longer identifies the terminal execution")
-        task.update(status="completed" if status == "completed" else "blocked", updated_at=timestamp,
-                    blocked_reason=None if status == "completed" else f"Execution {status}: {summary}",
-                    current_progress=summary,
-                    next_action="" if status == "completed" else "Review outcome and decide whether to resume")
-        if status == "completed":
-            task["completed_at"] = timestamp
-        validate("task", task)
-        store.put("tasks", project_id, task_id, task)
+        expected_task = _expected_terminal_task(task, execution_id, status, summary, timestamp)
+        if task != expected_task:
+            store.put("tasks", project_id, task_id, expected_task)
+            if store.get("tasks", project_id, task_id) != expected_task:
+                raise TaskError("terminal task persistence verification failed")
         persisted.append("task")
     except Exception as exc:
-        primary_error = exc
-    finally:
-        cleanup = cleanup_execution(writer_registry, claim_registry, execution, claim_generation, lease_token)
-        audit = {**cleanup, "provider_outcome": status, "persisted": persisted}
-        try:
-            current = store.get("executions", project_id, execution_id)
-            if current.get("status") == status:
-                current["cleanup_evidence"] = audit
-                validate("execution", current)
-                store.put("executions", project_id, execution_id, current)
-                terminal = current
-        except Exception as audit_exc:
-            cleanup["errors"].append(f"cleanup audit persistence failed: {audit_exc}")
-    if primary_error:
-        if cleanup["errors"]:
-            primary_error.add_note("cleanup: " + "; ".join(cleanup["errors"]))
-        raise primary_error
+        _retain_terminal_authority(store, execution, status, persisted, exc)
+        raise
+
+    pre_cleanup = {
+        "provider_outcome": status, "persistence": "complete", "persisted": persisted,
+        "writer_release": "released" if (execution.get("cleanup_evidence") or {}).get("writer_release") == "released" else ("retained" if execution.get("access") == "production_write" else "not_required"),
+        "task_claim_release": "retained", "errors": [],
+    }
+    terminal = store.get("executions", project_id, execution_id)
+    terminal["cleanup_evidence"] = pre_cleanup
+    try:
+        validate("execution", terminal)
+        store.put("executions", project_id, execution_id, terminal)
+        if store.get("executions", project_id, execution_id) != terminal:
+            raise TaskError("complete persistence audit verification failed")
+    except Exception as exc:
+        pre_cleanup["errors"].append(f"complete persistence audit failed; authority retained: {exc}")
+        return {"execution": terminal, "cleanup": pre_cleanup, "idempotent": False}
+
+    cleanup = cleanup_execution(writer_registry, claim_registry, terminal, claim_generation, lease_token)
+    audit = {**cleanup, "provider_outcome": status, "persistence": "complete", "persisted": persisted}
+    try:
+        terminal["cleanup_evidence"] = audit
+        validate("execution", terminal)
+        store.put("executions", project_id, execution_id, terminal)
+        if store.get("executions", project_id, execution_id) != terminal:
+            raise TaskError("cleanup audit persistence verification failed")
+    except Exception as audit_exc:
+        cleanup["errors"].append(f"cleanup audit persistence failed: {audit_exc}")
     return {"execution": terminal, "cleanup": cleanup, "idempotent": False}

@@ -220,6 +220,8 @@ def persist_terminal(store, service, project_id, execution_id, status="completed
         execution["notes"].append(note)
     validate("execution", execution)
     store.put("executions", project_id, execution_id, execution)
+    if store.get("executions", project_id, execution_id) != execution:
+        raise TaskError("terminal execution persistence verification failed")
     return execution
 
 
