@@ -161,6 +161,19 @@ Stdout is one machine-readable JSON object. Exit code `0` means `completed`;
 `1` means the run failed, was interrupted, or could not start. Provider prompt,
 transcript, stderr, and raw provider error details are never printed or stored.
 
+## Windows desktop launcher
+
+`manager\launch_task.ps1` is a shortcut-compatible thin wrapper around the
+command above. Double-click it or make a shortcut that targets PowerShell with
+`-File` and it will ask for a project and task ID. It displays only starting,
+completed, or failed/interrupted status; lifecycle authority remains entirely in
+the Python runner. Per-launch safe diagnostic summaries are local-only under
+`%LOCALAPPDATA%\AI Development Manager\logs`; Drive and GitHub remain SSOT.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\manager\launch_task.ps1
+```
+
 The estimator uses medians from similar completed executions. Estimates over
 20 minutes recommend multiple phases; they do not split or execute tasks.
 
