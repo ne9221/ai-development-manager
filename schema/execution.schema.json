@@ -24,14 +24,27 @@
           "access": {"type": "null"},
           "lease_evidence": {"type": "null"}
         }
-      },
-      "else": {
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "cancelled"}}, "required": ["status"]},
+      "then": {
+        "required": ["reserved_at", "quota_evidence", "finished_at", "session_id", "provider_session_id", "access", "lease_evidence"],
         "properties": {
-          "started_at": {"type": "string", "format": "date-time"},
-          "quota_before": {"type": "object"},
-          "source_confidence": {"type": "string"}
+          "reserved_at": {"type": "string", "format": "date-time"},
+          "started_at": {"type": "null"}, "completed_at": {"type": "null"},
+          "finished_at": {"type": "string", "format": "date-time"},
+          "session_id": {"type": "null"}, "provider_session_id": {"type": "null"},
+          "elapsed_minutes": {"const": 0}, "quota_evidence": {"type": "object", "minProperties": 1},
+          "quota_before": {"type": "null"}, "quota_after": {"type": "null"}, "quota_delta": {"type": "null"},
+          "source_confidence": {"type": "null"}, "access": {"type": "null"}, "lease_evidence": {"type": "null"},
+          "cleanup_evidence": {"type": ["null"]}
         }
       }
+    },
+    {
+      "if": {"properties": {"status": {"enum": ["running", "completed", "failed", "interrupted"]}}, "required": ["status"]},
+      "then": {"properties": {"started_at": {"type": "string", "format": "date-time"}, "quota_before": {"type": "object"}, "source_confidence": {"type": "string"}}}
     },
     {
       "if": {"properties": {"access": {"const": "production_write"}}, "required": ["access"]},
@@ -64,7 +77,7 @@
     "session_id": {"type": ["string", "null"], "minLength": 1, "description": "Primary manager canonical session identity."},
     "provider_session_id": {"type": ["string", "null"], "minLength": 1, "description": "Raw provider session ID for the primary linked session."},
     "elapsed_minutes": {"type": ["number", "null"], "minimum": 0},
-    "status": {"enum": ["reserved", "running", "completed", "failed", "interrupted"]},
+    "status": {"enum": ["reserved", "running", "completed", "failed", "interrupted", "cancelled"]},
     "quota_evidence": {"type": ["object", "null"], "description": "Caller-supplied quota decision evidence preserved by reservation."},
     "quota_before": {"type": ["object", "null"]},
     "quota_after": {"type": ["object", "null"]},

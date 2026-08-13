@@ -9,10 +9,12 @@ from datetime import datetime, timezone
 from collectors.publish_drive import build_service
 from manager.quota_reader import read_drive_status
 from manager.session_identity import manager_session_key, parse_manager_session_key, session_provider_identity
+from manager.task_claims import check_task_execution_claim
 from manager.tasks import DriveRecords, TaskError, complete_task, now_iso, update_task, validate
 
 
 MAX_SNAPSHOT_AGE_MINUTES = 60
+MAX_CANCELLATION_REASON_CHARS = 300
 
 
 def parse_time(value):
@@ -196,6 +198,67 @@ def reserve_execution(store, project_id, task_id, execution_id, provider, quota_
 
 def start_execution(*_args, **_kwargs):
     raise TaskError("legacy start is retired; reserve first and use the authoritative running gate")
+
+
+def cancel_reserved_execution(store, claim_registry, project_id, execution_id, reason, cancelled_at=None):
+    """Cancel only a reservation that provably never acquired running authority."""
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_CANCELLATION_REASON_CHARS:
+        raise TaskError("cancellation reason must be non-empty and at most 300 characters")
+    execution = store.get("executions", project_id, execution_id)
+    validate("execution", execution)
+    if execution.get("status") == "cancelled":
+        if execution.get("notes", [])[-1:] == [reason]:
+            return execution
+        raise TaskError("execution reservation is already cancelled with a different reason")
+    if execution.get("status") != "reserved":
+        raise TaskError("only a reserved execution can be cancelled before start")
+    for field in ("started_at", "session_id", "provider_session_id", "access", "lease_evidence"):
+        if execution.get(field) is not None:
+            raise TaskError(f"reservation has running authority evidence: {field}")
+    if check_task_execution_claim(claim_registry, project_id, execution["task_id"]) is not None:
+        raise TaskError("reservation cannot be cancelled while a task claim exists")
+    cancelled = {**execution, "status": "cancelled", "finished_at": cancelled_at or now_iso(),
+                 "elapsed_minutes": 0, "access": None, "lease_evidence": None,
+                 "cleanup_evidence": None, "notes": [*execution.get("notes", []), reason]}
+    validate("execution", cancelled)
+    store.put("executions", project_id, execution_id, cancelled)
+    if store.get("executions", project_id, execution_id) != cancelled:
+        raise TaskError("cancelled reservation persistence verification failed")
+    return cancelled
+
+
+def prepare_task_retry(store, claim_registry, project_id, task_id, prior_execution_id):
+    """Return one safely cleaned-up failed/interrupted task to ready."""
+    task = store.get("tasks", project_id, task_id)
+    validate("task", task)
+    prior = store.get("executions", project_id, prior_execution_id)
+    validate("execution", prior)
+    if prior.get("task_id") != task_id or prior.get("status") not in ("failed", "interrupted"):
+        raise TaskError("retry requires the task's failed or interrupted prior execution")
+    cleanup = prior.get("cleanup_evidence") or {}
+    if cleanup.get("persistence") != "complete" or cleanup.get("task_claim_release") != "released":
+        raise TaskError("retry requires complete persistence and released task claim")
+    if prior.get("access") == "production_write" and cleanup.get("writer_release") != "released":
+        raise TaskError("retry requires released writer authority")
+    if check_task_execution_claim(claim_registry, project_id, task_id) is not None:
+        raise TaskError("retry requires no active task claim")
+    executions = store.list_records("executions", project_id)
+    if any(item.get("task_id") == task_id and item.get("status") in ("running", "reserved") for item in executions):
+        raise TaskError("retry requires all running or reserved executions to be resolved")
+    context = dict(task.get("source_context") or {})
+    active = context.get("active_execution_id")
+    if task.get("status") == "ready" and active is None and task.get("blocked_reason") is None:
+        return task
+    if task.get("status") != "blocked" or active != prior_execution_id:
+        raise TaskError("retry requires a blocked task linked to the prior execution")
+    context.pop("active_execution_id", None)
+    ready = {**task, "status": "ready", "blocked_reason": None, "source_context": context,
+             "updated_at": now_iso(), "current_progress": "Retry ready", "next_action": "Retry execution"}
+    validate("task", ready)
+    store.put("tasks", project_id, task_id, ready)
+    if store.get("tasks", project_id, task_id) != ready:
+        raise TaskError("retry task persistence verification failed")
+    return ready
 
 
 def persist_terminal(store, service, project_id, execution_id, status="completed", completed_at=None, note=None):

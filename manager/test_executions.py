@@ -5,7 +5,9 @@ from unittest.mock import patch
 
 from manager import executions as executions_module
 from manager.estimator import estimate
-from manager.executions import finish_execution, link_execution_session, list_executions, main as executions_main, quota_delta, quota_snapshot, read_execution, read_session_for_link, reserve_execution, start_execution, task_snapshot
+from manager.executions import cancel_reserved_execution, finish_execution, link_execution_session, list_executions, main as executions_main, prepare_task_retry, quota_delta, quota_snapshot, read_execution, read_session_for_link, reserve_execution, start_execution, task_snapshot
+from manager.task_claims import claim_task_execution
+from manager.test_task_claims import MemoryClaimRegistry
 from manager.sessions import manager_session_key
 from manager.tasks import DriveRecords, TaskError, create_task, update_task, validate
 from manager.test_tasks import FakeDriveService
@@ -15,6 +17,7 @@ class MemoryStore:
     def __init__(self): self.records = {}
     def put(self, area, project, name, document): self.records[(area, project, name)] = deepcopy(document); return document
     def get(self, area, project, name): return deepcopy(self.records[(area, project, name)])
+    def list_records(self, area, project): return [deepcopy(v) for (a, p, _), v in self.records.items() if a == area and p == project]
 
 
 def quota(windows, generated="2026-08-09T00:00:00Z", provider="codex"):
@@ -99,6 +102,71 @@ class ExecutionTests(unittest.TestCase):
         invalid = deepcopy(first); invalid.pop("reserved_at")
         with self.assertRaisesRegex(TaskError, "reserved_at"):
             validate("execution", invalid)
+
+    def test_cancel_never_started_reservation_is_strict_and_idempotent(self):
+        reserved = reserve_execution(self.store, "p1", "t1", "cancel-me", "codex", decision(), reserved_at="2026-08-09T00:00:00Z")
+        cancelled = cancel_reserved_execution(self.store, MemoryClaimRegistry(), "p1", "cancel-me", "retry requested", "2026-08-09T00:01:00Z")
+        self.assertEqual("cancelled", cancelled["status"]); self.assertEqual(0, cancelled["elapsed_minutes"])
+        self.assertIsNone(cancelled["completed_at"]); self.assertEqual("2026-08-09T00:01:00Z", cancelled["finished_at"])
+        for field in ("started_at", "session_id", "provider_session_id", "access", "lease_evidence", "cleanup_evidence"):
+            self.assertIsNone(cancelled[field])
+        self.assertEqual(cancelled, cancel_reserved_execution(self.store, MemoryClaimRegistry(), "p1", "cancel-me", "retry requested"))
+        invalid = deepcopy(cancelled); invalid["session_id"] = "codex:s1"
+        with self.assertRaises(TaskError): validate("execution", invalid)
+        with self.assertRaisesRegex(TaskError, "different reason"):
+            cancel_reserved_execution(self.store, MemoryClaimRegistry(), "p1", "cancel-me", "other")
+
+        claimed = reserve_execution(self.store, "p1", "t1", "claimed", "codex", decision())
+        registry = MemoryClaimRegistry(); claim_task_execution(registry, "p1", "t1", "claimed", "codex", "2026-08-09T00:00:00Z")
+        with self.assertRaisesRegex(TaskError, "task claim exists"):
+            cancel_reserved_execution(self.store, registry, "p1", "claimed", "no")
+
+    def test_cancel_rejects_running_and_terminal_states(self):
+        for status in ("running", "completed", "failed", "interrupted"):
+            reserved = reserve_execution(self.store, "p1", "t1", f"no-{status}", "codex", decision())
+            record = {**reserved, "status": status, "started_at": "2026-08-09T00:00:00Z", "quota_before": {}, "source_confidence": "official", "access": "read_only", "lease_evidence": None}
+            if status != "running": record.update(completed_at="2026-08-09T00:01:00Z", finished_at="2026-08-09T00:01:00Z", elapsed_minutes=1, quota_after={}, quota_delta={})
+            self.store.put("executions", "p1", f"no-{status}", record)
+            with self.subTest(status=status), self.assertRaisesRegex(TaskError, "only a reserved"):
+                cancel_reserved_execution(self.store, MemoryClaimRegistry(), "p1", f"no-{status}", "no")
+
+    def test_retry_requires_terminal_cleanup_and_clears_stale_task_fields(self):
+        prior = reserve_execution(self.store, "p1", "t1", "prior", "codex", decision())
+        prior.update(status="interrupted", started_at="2026-08-09T00:00:00Z", completed_at="2026-08-09T00:01:00Z",
+                     finished_at="2026-08-09T00:01:00Z", elapsed_minutes=1, quota_before={}, quota_after={}, quota_delta={},
+                     source_confidence="official", access="read_only", lease_evidence=None,
+                     cleanup_evidence={"persistence":"complete","task_claim_release":"released","writer_release":"not_required"})
+        self.store.put("executions", "p1", "prior", prior)
+        task_record = self.store.get("tasks", "p1", "t1"); task_record.update(status="blocked", blocked_reason="old", source_context={"active_execution_id":"prior","keep":True})
+        self.store.put("tasks", "p1", "t1", task_record)
+        ready = prepare_task_retry(self.store, MemoryClaimRegistry(), "p1", "t1", "prior")
+        self.assertEqual("ready", ready["status"]); self.assertIsNone(ready["blocked_reason"])
+        self.assertNotIn("active_execution_id", ready["source_context"]); self.assertTrue(ready["source_context"]["keep"])
+        self.assertEqual(ready, prepare_task_retry(self.store, MemoryClaimRegistry(), "p1", "t1", "prior"))
+
+    def test_retry_rejects_incomplete_cleanup_claim_writer_and_active_execution(self):
+        base = reserve_execution(self.store, "p1", "t1", "prior", "codex", decision())
+        base.update(status="failed", started_at="2026-08-09T00:00:00Z", completed_at="2026-08-09T00:01:00Z", finished_at="2026-08-09T00:01:00Z",
+                    elapsed_minutes=1, quota_before={}, quota_after={}, quota_delta={}, source_confidence="official", access="read_only", lease_evidence=None,
+                    cleanup_evidence={"persistence":"complete","task_claim_release":"released","writer_release":"not_required"})
+        self.store.put("executions", "p1", "prior", base)
+        task_record=self.store.get("tasks","p1","t1"); task_record.update(status="blocked",blocked_reason="x",source_context={"active_execution_id":"prior"}); self.store.put("tasks","p1","t1",task_record)
+        lease = {"authority":"acquired","lock_id":"repo-"+"0"*64,"generation":1,"repository":"github:ne9221/ai-development-manager","branch":"refs/heads/main","scope":["manager/executions.py"],"baseline_head":"0"*40}
+        cases = [({"cleanup_evidence":{"persistence":"partial","task_claim_release":"released","writer_release":"not_required"}}, MemoryClaimRegistry(), "complete persistence"),
+                 ({"cleanup_evidence":{"persistence":"complete","task_claim_release":"retained","writer_release":"not_required"}}, MemoryClaimRegistry(), "released task claim"),
+                 ({"access":"production_write","lease_evidence":lease,"cleanup_evidence":{"persistence":"complete","task_claim_release":"released","writer_release":"retained"}}, MemoryClaimRegistry(), "writer authority")]
+        for changes, registry, message in cases:
+            record=deepcopy(base); record.update(changes); self.store.put("executions","p1","prior",record)
+            with self.subTest(message=message), self.assertRaisesRegex(TaskError,message): prepare_task_retry(self.store,registry,"p1","t1","prior")
+        self.store.put("executions","p1","prior",base); pending=reserve_execution(self.store,"p1","t1","pending","codex",decision())
+        with self.assertRaisesRegex(TaskError,"running or reserved"): prepare_task_retry(self.store,MemoryClaimRegistry(),"p1","t1","prior")
+        pending.update(status="running",started_at="2026-08-09T00:02:00Z",quota_before={},source_confidence="official",access="read_only",lease_evidence=None)
+        self.store.put("executions","p1","pending",pending)
+        with self.assertRaisesRegex(TaskError,"running or reserved"): prepare_task_retry(self.store,MemoryClaimRegistry(),"p1","t1","prior")
+
+        self.store.records.pop(("executions","p1","pending")); registry=MemoryClaimRegistry()
+        claim_task_execution(registry,"p1","t1","other","codex","2026-08-09T00:03:00Z")
+        with self.assertRaisesRegex(TaskError,"no active task claim"): prepare_task_retry(self.store,registry,"p1","t1","prior")
 
     def test_reserve_rejects_payload_and_snapshot_conflicts_without_overwrite(self):
         original = reserve_execution(self.store, "p1", "t1", "reserved-conflict", "codex", decision(), "code", "medium", "2026-08-09T00:00:00Z")
