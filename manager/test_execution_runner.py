@@ -26,6 +26,7 @@ class Launcher:
 
     def prepare(self, request):
         self.events.append("prepare")
+        self.request = request
         if self.failure == "prepare":
             self.process.live = False  # CodexLauncher.prepare() owns cleanup before returning.
             raise CodexLaunchError("spawn_failed", "raw secret from prepare")

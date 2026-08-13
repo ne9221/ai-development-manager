@@ -89,7 +89,7 @@ class LauncherTests(unittest.TestCase):
         self.process = FakeProcess(handler)
         return CodexLauncher(executable=__file__, popen=lambda *args, **kwargs: self.process)
 
-    def request(self, timeout=0.3): return LaunchRequest(self.cwd, model="gpt-test", reasoning_effort="medium", timeout_seconds=timeout)
+    def request(self, timeout=0.3): return LaunchRequest(self.cwd, model="gpt-test", reasoning_effort="medium", timeout_seconds=timeout, turn_timeout_seconds=timeout)
 
     def prepare(self, handler=happy_handler): return self.launcher(handler).prepare(self.request())
 
@@ -251,6 +251,11 @@ class LauncherTests(unittest.TestCase):
         launcher = CodexLauncher(executable=__file__, popen=lambda *args, **kwargs: calls.append(1))
         with self.assertRaisesRegex(CodexLaunchError, "timeout_seconds"):
             launcher.prepare(self.request(timeout=0))
+        self.assertEqual([], calls)
+
+        launcher = CodexLauncher(executable=__file__, popen=lambda *args, **kwargs: calls.append(1))
+        with self.assertRaisesRegex(CodexLaunchError, "turn_timeout_seconds"):
+            launcher.prepare(LaunchRequest(self.cwd, turn_timeout_seconds=1201))
         self.assertEqual([], calls)
 
     def test_stderr_is_continuously_drained_and_bounded(self):

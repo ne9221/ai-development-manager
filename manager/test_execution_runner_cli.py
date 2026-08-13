@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from manager.codex_launcher import CodexLaunchError
-from manager.execution_runner import launch_task, main
+from manager.execution_runner import launch_task, main, task_turn_timeout
 from manager.task_claims import TaskClaimConflict
 from manager.tasks import TaskError
 from manager.test_execution_lifecycle import build_store, quota_document
@@ -37,11 +37,25 @@ class RunnerEntrypointTests(unittest.TestCase):
                                launcher or Launcher(), "p1", "t1", "e2e-a", quota_document=quota_document(), executions=[])
 
     def test_mocked_e2e_dispatch_reserve_run_and_terminal_output(self):
-        result = self.launch()
+        launcher = Launcher(); result = self.launch(launcher=launcher)
         self.assertEqual("e2e-a", result["execution_id"])
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
         self.assertEqual("codex", result["dispatch"]["recommended_provider"])
         self.assertEqual("codex:thread-1", result["session"]["session_id"])
+        self.assertEqual(1200, launcher.request.turn_timeout_seconds)
+        self.assertEqual(30, launcher.request.timeout_seconds)
+
+    def test_task_aware_timeout_bounds_and_explicit_override(self):
+        task = self.store.get("tasks", "p1", "t1"); task["expected_minutes"] = 5
+        self.store.put("tasks", "p1", "t1", task)
+        launcher = Launcher(); self.launch(launcher=launcher)
+        self.assertEqual(300, launcher.request.turn_timeout_seconds)
+        self.assertEqual(30, task_turn_timeout(0.1))
+        self.assertEqual(1200, task_turn_timeout(60))
+        self.assertEqual(45, task_turn_timeout(5, 45))
+        for invalid in (0, -1, 1201, True):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(TaskError, "timeout_seconds"):
+                task_turn_timeout(5, invalid)
 
     def test_claim_conflict_stops_before_provider_prepare(self):
         claim = MemoryClaimRegistry()

@@ -19,6 +19,19 @@ from manager.tasks import DriveRecords, TaskError, validate
 from manager.worktree_locks import link_session as link_writer_session
 
 
+RPC_TIMEOUT_SECONDS = 30.0
+MIN_TURN_TIMEOUT_SECONDS = 30.0
+MAX_TURN_TIMEOUT_SECONDS = 20 * 60.0
+
+
+def task_turn_timeout(expected_minutes, override=None):
+    if override is not None:
+        if isinstance(override, bool) or not isinstance(override, (int, float)) or not 0 < override <= MAX_TURN_TIMEOUT_SECONDS:
+            raise TaskError(f"timeout_seconds must be within (0, {MAX_TURN_TIMEOUT_SECONDS:g}]")
+        return float(override)
+    return min(MAX_TURN_TIMEOUT_SECONDS, max(MIN_TURN_TIMEOUT_SECONDS, float(expected_minutes) * 60.0))
+
+
 def _thread_id(prepared):
     value = prepared.thread_id
     if not isinstance(value, str) or value != value.strip() or not value or len(value) > 500 or any(ord(char) < 32 for char in value):
@@ -100,17 +113,19 @@ def _dispatch_request(task):
 
 
 def launch_task(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
-                execution_id=None, model=None, timeout_seconds=30.0, quota_document=None, executions=None):
+                execution_id=None, model=None, timeout_seconds=None, quota_document=None, executions=None):
     """Dispatch, reserve, and run one ready task; callers supply real authorities."""
     task = store.get("tasks", project_id, task_id)
     validate("task", task)
+    turn_timeout = task_turn_timeout(task["expected_minutes"], timeout_seconds)
     dispatched = dispatch(store, service, _dispatch_request(task), quota_document, executions)
     if dispatched["recommended_provider"] != "codex":
         raise TaskError("dispatch did not select Codex")
     execution_id = execution_id or f"{task_id}-{uuid.uuid4().hex[:12]}"
     reserve_execution(store, project_id, task_id, execution_id, "codex", dispatched["quota_evidence"],
                       dispatched["mode"], dispatched["effort"])
-    request = LaunchRequest(task["working_directory"], model=model, reasoning_effort=dispatched["effort"], timeout_seconds=timeout_seconds)
+    request = LaunchRequest(task["working_directory"], model=model, reasoning_effort=dispatched["effort"],
+                            timeout_seconds=RPC_TIMEOUT_SECONDS, turn_timeout_seconds=turn_timeout)
     result = run_execution(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                            execution_id, dispatched["generated_prompt"], request,
                            access="read_only" if task["read_only"] else "production_write",
@@ -193,7 +208,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Dispatch, reserve, and run one Codex task")
     parser.add_argument("project_id"); parser.add_argument("task_id")
     parser.add_argument("--execution-id"); parser.add_argument("--model")
-    parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--timeout-seconds", type=float, help="Override bounded turn-completion timeout")
     args = parser.parse_args(argv)
     execution_id = args.execution_id or f"{args.task_id}-{uuid.uuid4().hex[:12]}"
     store = None

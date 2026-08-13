@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 
 MAX_TIMEOUT_SECONDS = 300.0
+MAX_TURN_TIMEOUT_SECONDS = 1200.0
 MAX_ERROR_CHARS = 1000
 MAX_STDERR_CHARS = 8192
 
@@ -73,6 +74,7 @@ class LaunchRequest:
     sandbox: str | None = None
     approval_policy: str | None = None
     timeout_seconds: float = 30.0
+    turn_timeout_seconds: float = 30.0
 
 
 @dataclass
@@ -107,6 +109,12 @@ class LaunchOutcome:
 def _timeout(value: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= MAX_TIMEOUT_SECONDS:
         raise CodexLaunchError("invalid_request", f"timeout_seconds must be within (0, {MAX_TIMEOUT_SECONDS:g}]")
+    return float(value)
+
+
+def _turn_timeout(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= MAX_TURN_TIMEOUT_SECONDS:
+        raise CodexLaunchError("invalid_request", f"turn_timeout_seconds must be within (0, {MAX_TURN_TIMEOUT_SECONDS:g}]")
     return float(value)
 
 
@@ -302,6 +310,7 @@ class CodexLauncher:
 
     def prepare(self, request: LaunchRequest) -> PreparedLaunch:
         timeout = _timeout(request.timeout_seconds)
+        _turn_timeout(request.turn_timeout_seconds)
         cwd = Path(request.working_directory)
         if not cwd.is_absolute() or not cwd.is_dir():
             raise CodexLaunchError("invalid_request", "working_directory must be an existing absolute directory")
@@ -356,7 +365,7 @@ class CodexLauncher:
 
     def wait(self, running: RunningLaunch) -> LaunchOutcome:
         client = running.prepared._client
-        deadline = time.monotonic() + client.timeout
+        deadline = time.monotonic() + _turn_timeout(running.prepared._request.turn_timeout_seconds)
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
