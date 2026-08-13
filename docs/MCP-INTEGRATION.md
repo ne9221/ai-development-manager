@@ -1,5 +1,19 @@
 # MCP Read-only Integration
 
+## Local Windows stdio transport
+
+Start the existing adapter as a long-running local MCP process from the repository root:
+
+`python -m manager.mcp_adapter`
+
+Configure an MCP client with that command and this repository as its working directory. The process communicates only through MCP JSON-RPC on stdin/stdout and exposes the same four tools documented below. It does not start Codex, Claude, or any execution runner.
+
+The stdio entrypoint uses the existing desktop OAuth service factory; the Cloud Run ASGI entrypoint continues to use application-default credentials with its read-only service account.
+
+For B2, call `adm_runtime_quota_status` first, then call read-only `adm_dispatch` with `project_id`, `user_request`, and optional `task_id`. `adm_health` verifies that the local adapter process and runtime contract are available without exposing environment or Drive details.
+
+Transport inputs are capped at 200 characters for identifiers and 4,000 characters for the request. Responses above 65,536 UTF-8 bytes fail closed. Backend exception text, credentials, OAuth data, raw provider responses, and Drive documents are never returned.
+
 The existing `adm-runtime-bridge` Cloud Run service exposes a standard stateless Streamable HTTP MCP endpoint at:
 
 `https://adm-runtime-bridge-551449082603.asia-east1.run.app/mcp/`
