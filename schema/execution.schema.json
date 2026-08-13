@@ -89,6 +89,10 @@
         }
       ]
     },
+    "cleanup_evidence": {
+      "type": ["object", "null"],
+      "description": "Bounded terminal cleanup audit; never contains a lease token."
+    },
     "notes": {"type": "array", "items": {"type": "string"}},
     "task_snapshot": {"type": "object"}
   }

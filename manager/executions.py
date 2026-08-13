@@ -198,7 +198,11 @@ def start_execution(*_args, **_kwargs):
     raise TaskError("legacy start is retired; reserve first and use the authoritative running gate")
 
 
-def finish_execution(store, service, project_id, execution_id, status="completed", completed_at=None, note=None):
+def persist_terminal(store, service, project_id, execution_id, status="completed", completed_at=None, note=None):
+    """Persist only the provider's terminal execution outcome.
+
+    Task, handoff, and authority cleanup are lifecycle orchestration concerns.
+    """
     if status not in ("completed", "failed", "interrupted"):
         raise TaskError(f"invalid terminal execution status: {status}")
     execution = store.get("executions", project_id, execution_id)
@@ -216,8 +220,13 @@ def finish_execution(store, service, project_id, execution_id, status="completed
         execution["notes"].append(note)
     validate("execution", execution)
     store.put("executions", project_id, execution_id, execution)
+    return execution
+
+
+def finish_execution(store, service, project_id, execution_id, status="completed", completed_at=None, note=None):
+    execution = persist_terminal(store, service, project_id, execution_id, status, completed_at, note)
     if status == "completed":
-        complete_task(store, project_id, execution["task_id"], note or f"Execution {execution_id} completed", execution["provider"], execution_id)
+        complete_task(store, project_id, execution["task_id"], note or f"Execution {execution_id} completed", execution["provider"], execution.get("session_id"))
     else:
         update_task(store, project_id, execution["task_id"], status="blocked", blocked_reason=f"Execution {status}: {note or 'no details'}", current_progress=f"Execution {execution_id} {status}", next_action="Review failure and decide whether to resume")
     return execution
