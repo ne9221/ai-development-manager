@@ -115,6 +115,40 @@ class TaskTests(unittest.TestCase):
         project = {"project_id": "ai-development-manager", "name": "AI Development Manager", "repo": "https://github.com/ne9221/ai-development-manager", "default_branch": "main", "runtime_ssot": "Google Drive/AI Development Manager", "project_rules": ["Drive is runtime SSOT"], "active_tasks": ["phase-5"], "current_phase": "Phase 5", "important_constraints": ["Do not auto-start AI"]}
         self.assertEqual(project, create_project(self.store, project))
 
+    def test_project_governance_fields_match_drive_ssot_and_remain_strict(self):
+        project = {
+            "project_id": "ai-development-manager", "name": "AI Development Manager",
+            "repo": "https://github.com/ne9221/ai-development-manager", "default_branch": "main",
+            "runtime_ssot": "Google Drive/AI Development Manager", "project_rules": [],
+            "active_tasks": [], "current_phase": "Phase 3C", "important_constraints": [],
+            "updated_at": "2026-08-13T00:31:00+08:00",
+            "priority_roadmap": [{"priority": "P0", "order": 1, "id": "task-centric-foundation",
+                                  "title": "Task-centric foundation", "goal": "Make tasks the primary unit."}],
+            "task_management_policy": {
+                "relationship": "Project -> Task -> Execution -> Session", "primary_unit": "task",
+                "conversation_role": "metadata_only", "default_task_minutes_max": 20,
+                "quota_read_required_before_dispatch": True,
+                "parallel_write_requires_isolated_worktree": True,
+                "execution_loop": ["compile context", "launch provider", "persist terminal state"],
+                "human_intervention_only_when": ["requirements conflict"],
+            },
+            "reference_architecture": [
+                {"project": "Agent Orchestrator", "use_for": ["worktree isolation"]},
+                {"project": "CAS", "use_for": ["context model"],
+                 "storage_policy": "reference only; do not copy local-first SSOT"},
+            ],
+        }
+        validate("project", project)
+
+        malformed = []
+        unexpected = deepcopy(project); unexpected["unexpected"] = True; malformed.append(unexpected)
+        roadmap = deepcopy(project); roadmap["priority_roadmap"][0]["order"] = "first"; malformed.append(roadmap)
+        policy = deepcopy(project); policy["task_management_policy"]["quota_read_required_before_dispatch"] = "yes"; malformed.append(policy)
+        architecture = deepcopy(project); architecture["reference_architecture"][0]["unknown"] = True; malformed.append(architecture)
+        for record in malformed:
+            with self.assertRaises(TaskError):
+                validate("project", record)
+
     def test_drive_records_round_trip_logical_ids_without_filename_collisions(self):
         service = FakeDriveService(); store = DriveRecords(service)
         values = ["abc123", "claude:abc123", "codex:abc123", "abc:def", "abc%3Adef", "Unicode-é", "中文", "a/b", "a\\b", " spaced value "]

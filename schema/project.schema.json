@@ -17,6 +17,50 @@
     "active_tasks": {"type": "array", "items": {"type": "string"}},
     "current_phase": {"type": "string"},
     "important_constraints": {"type": "array", "items": {"type": "string"}},
-    "execution_policies": {"type": "array", "items": {"type": "string"}}
+    "execution_policies": {"type": "array", "items": {"type": "string"}},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "priority_roadmap": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["priority", "order", "id", "title", "goal"],
+        "properties": {
+          "priority": {"type": "string", "minLength": 1},
+          "order": {"type": "integer", "minimum": 1},
+          "id": {"type": "string", "minLength": 1},
+          "title": {"type": "string", "minLength": 1},
+          "goal": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "task_management_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relationship", "primary_unit", "conversation_role", "default_task_minutes_max", "quota_read_required_before_dispatch", "parallel_write_requires_isolated_worktree", "execution_loop", "human_intervention_only_when"],
+      "properties": {
+        "relationship": {"type": "string", "minLength": 1},
+        "primary_unit": {"type": "string", "minLength": 1},
+        "conversation_role": {"type": "string", "minLength": 1},
+        "default_task_minutes_max": {"type": "integer", "minimum": 1},
+        "quota_read_required_before_dispatch": {"type": "boolean"},
+        "parallel_write_requires_isolated_worktree": {"type": "boolean"},
+        "execution_loop": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "human_intervention_only_when": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "reference_architecture": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["project", "use_for"],
+        "properties": {
+          "project": {"type": "string", "minLength": 1},
+          "use_for": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "storage_policy": {"type": "string", "minLength": 1}
+        }
+      }
+    }
   }
 }
