@@ -13,8 +13,8 @@ developable.
 - `schema/status.schema.json` - provider-neutral quota/usage status schema
   (v0.1), plus `schema/status.example.json` showing real PoC-derived values
   for Codex / Claude Code / Antigravity / Gemini App.
-- `collectors/` - not yet implemented; see `collectors/README.md` for the
-  planned per-provider sources.
+- `collectors/` - provider quota collectors and Drive publication support;
+  see `collectors/README.md` for supported sources and setup.
 - `docs/QUOTA-SOURCES.md` - PoC findings on where each provider's quota data
   can (or cannot) be read from.
 - `docs/PHASE-3C-EXECUTION-LIFECYCLE.md` - Phase 3C lifecycle scope,
@@ -22,16 +22,27 @@ developable.
 
 ## What lives on Google Drive instead (not in this repo)
 
-Runtime state - `PROJECTS.md`, `AI-RESOURCE-STATUS/status.json`, `TASKS/`,
-`HANDOFFS/`, `TASK-HISTORY/`, `CHANGELOG.md` - is the Drive folder's
-responsibility, not this repo's. This repo holds code, schema, and version
-history; Drive holds the live/mutable data. See `docs/DRIVE-STRUCTURE.md`
-for the exact folder layout to create.
+Google Drive is the runtime SSOT for Projects, Tasks, Executions, Sessions,
+Handoffs, task history, and quota/runtime records. This repo holds code,
+schemas, tests, documentation, and Git version history. GCS is the
+authoritative concurrency/ownership surface for per-task execution claims and
+the production writer registry. See `docs/DRIVE-STRUCTURE.md` for the Drive
+layout.
 
 ## Status
 
-v0.1 - skeleton only. No collectors, no scheduler, no Drive/Sheets sync, no
-task/handoff workflow yet.
+Phase 3C real-use candidate. The first real Windows desktop-to-Codex read-only
+execution completed end to end, so automatic single-task Codex execution is
+dogfood-ready. The production-write path has authority primitives and test
+coverage but has not completed dedicated real production-write dogfood. This
+integration branch still requires final adversarial review and closure before
+merging to `main`.
+
+```text
+Google Drive ready Task -> desktop launcher -> quota/dispatch -> reservation
+-> running gate -> GCS task claim -> Codex app-server -> canonical Session
+-> terminal Execution/Handoff/Task persistence -> authority cleanup
+```
 
 ## Unified quota reader and assignment
 
@@ -161,6 +172,25 @@ Stdout is one machine-readable JSON object. Exit code `0` means `completed`;
 `1` means the run failed, was interrupted, or could not start. Provider prompt,
 transcript, stderr, and raw provider error details are never printed or stored.
 
+The Task must be in a valid `ready` state. Startup RPCs use a separate bounded
+timeout from turn completion. The turn timeout is derived from
+`expected_minutes`, with a 20-minute maximum; `--timeout-seconds` explicitly
+overrides it but remains subject to that maximum.
+
+### Windows prerequisites
+
+- Python with the Google authentication dependencies and
+  `google-cloud-storage` available.
+- Node.js and Codex installed and authenticated (`codex login status`).
+- `CODEX_BIN` may point to a standard npm `codex.cmd`. The manager resolves
+  that shim to its packaged native `codex.exe`, which owns app-server pipes.
+- `ADM_LOCK_GCS_BUCKET` is required for the per-task execution claim.
+- Production-write execution additionally requires `ADM_LOCK_GCS_OBJECT` for
+  the writer registry.
+
+Use environment-specific resource names and normal Google credentials; never
+put tokens, credential contents, or production bucket names in this repo.
+
 ## Windows desktop launcher
 
 `manager\launch_task.ps1` is a shortcut-compatible thin wrapper around the
@@ -171,8 +201,33 @@ the Python runner. Per-launch safe diagnostic summaries are local-only under
 `%LOCALAPPDATA%\AI Development Manager\logs`; Drive and GitHub remain SSOT.
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\manager\launch_task.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\manager\launch_task.ps1 `
+  -ProjectId '<project>' `
+  -TaskId '<task>' `
+  -ExecutionId '<execution-id>'
 ```
+
+The launcher owns no lifecycle, claim, cancellation, or writer authority. Its
+stdout and local diagnostic record contain only bounded safe status. Raw
+prompts, transcripts, stderr, credentials, and provider errors are not
+persisted.
+
+## Retry lifecycle
+
+A reservation that provably never started may transition from `reserved` to
+`cancelled` through `manager.executions.cancel_reserved_execution`; it cannot
+masquerade as completed, failed, or interrupted. A blocked Task linked to an
+interrupted or failed execution may return to `ready` through
+`manager.executions.prepare_task_retry` only after authoritative terminal
+persistence and claim cleanup are complete, including writer release for
+production-write work. Resolve any other running or reserved execution first.
+Do not edit Drive JSON or delete a GCS claim manually to bypass these gates.
+
+Terminal cleanup is fail-closed: the provider must be proven stopped before
+terminal persistence and authority release. Read-only executions require the
+per-task GCS claim but no writer lease. Production-write executions require
+both the task claim and repository writer lease. Manual claim deletion is not
+a normal recovery mechanism.
 
 The estimator uses medians from similar completed executions. Estimates over
 20 minutes recommend multiple phases; they do not split or execute tasks.
@@ -271,7 +326,9 @@ through `AI_MANAGER_LEASE_TOKEN` for retry, renew, or release. GCS stores only
 its SHA-256 digest, and `inspect`/`list` never return either token form. The
 default lease is 60 minutes, bounded to 120
 minutes; an owner must renew before expiry. Expired leases cannot be revived.
-This subsystem is not yet wired into Dispatcher, Scheduler, or executions.
+The execution runner uses this registry for production-write authority.
+Dispatcher and Scheduler describe or group work but do not independently
+acquire writer authority or start providers.
 
 ```powershell
 $env:ADM_LOCK_GCS_BUCKET = "LOCK_BUCKET"
@@ -290,3 +347,17 @@ python -m manager.worktree_locks release repo-SHA256 example-project task-1 run-
 For renames, callers must include both old and new repo-relative paths. P0 does
 not resolve symlinks or infer generated outputs; use scope `.` when those effects
 cannot be enumerated. The coarse repository lease remains the safety boundary.
+
+## Current limitations and next work
+
+- Codex single-task execution has completed real read-only Windows dogfood;
+  production-write real E2E still needs a dedicated safe dogfood run.
+- A Claude automatic runner is not part of the current Phase 3C real-use path.
+- Automatic review and CI-feedback loops are next-stage work.
+- A richer GUI, installer, scheduler UI, and tray application are not current
+  core requirements; `manager/launch_task.ps1` remains the desktop entrypoint.
+- Antigravity remains a manual channel rather than an automatic runner.
+- Runtime schema compatibility and migrations require ongoing governance as
+  the Drive SSOT evolves.
+- Development remains real-use-first: dogfood should expose the next concrete
+  need before more machinery is added.
