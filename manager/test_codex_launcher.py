@@ -3,6 +3,7 @@ import queue
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -108,10 +109,10 @@ class LauncherTests(unittest.TestCase):
             self.prepare(handler)
         self.assertEqual(1, self.process.terminate_count)
 
-    def test_thread_start_success_parses_id_and_path(self):
+    def test_thread_start_success_preserves_id_and_ignores_untrusted_path(self):
         prepared = self.prepare()
         self.assertEqual("thread-1", prepared.thread_id)
-        self.assertEqual("C:/sessions/thread-1.jsonl", prepared.session_path)
+        self.assertIsNone(prepared.session_path)
         self.assertRegex(prepared.prepared_at, r"Z$")
 
     def test_thread_start_failure_closes_process(self):
@@ -128,6 +129,21 @@ class LauncherTests(unittest.TestCase):
             elif message.get("method") == "thread/start": process.reply(message, {"thread": {}})
         with self.assertRaisesRegex(CodexLaunchError, "no thread id"):
             self.prepare(handler)
+
+    def test_whitespace_thread_id_is_rejected(self):
+        def handler(process, message):
+            if message.get("method") == "initialize": process.reply(message, {})
+            elif message.get("method") == "thread/start": process.reply(message, {"thread": {"id": "  \t"}})
+        with self.assertRaisesRegex(CodexLaunchError, "no thread id"):
+            self.prepare(handler)
+
+    def test_relative_session_path_is_ignored(self):
+        def handler(process, message):
+            if message.get("method") == "initialize": process.reply(message, {})
+            elif message.get("method") == "thread/start": process.reply(message, {"thread": {"id": "Canonical-ID", "path": "../../untrusted.jsonl"}})
+        prepared = self.prepare(handler)
+        self.assertEqual("Canonical-ID", prepared.thread_id)
+        self.assertIsNone(prepared.session_path)
 
     def test_turn_start_success_maps_prompt_and_effort(self):
         launcher = self.launcher(); prepared = launcher.prepare(self.request())
@@ -148,11 +164,33 @@ class LauncherTests(unittest.TestCase):
         outcome = launcher.wait(running)
         self.assertEqual("failed", outcome.status); self.assertEqual("turn_failed", outcome.failure_classification)
 
-    def test_malformed_json_is_protocol_error(self):
-        launcher = self.launcher(); running = launcher.start(launcher.prepare(self.request()), "work")
-        self.process.stdout.put("not-json\n")
+    def test_malformed_json_before_initialize_response_fails_prepare_closed(self):
+        def handler(process, message):
+            if message.get("method") == "initialize":
+                process.stdout.put("not-json\n"); process.reply(message, {})
         with self.assertRaisesRegex(CodexLaunchError, "malformed JSON"):
-            launcher.wait(running)
+            self.prepare(handler)
+        self.assertNotIn("turn/start", [item["method"] for item in self.process.messages])
+        self.assertEqual(1, self.process.terminate_count)
+
+    def test_malformed_json_after_thread_start_fails_prepare_closed(self):
+        def handler(process, message):
+            if message.get("method") == "initialize": process.reply(message, {})
+            elif message.get("method") == "thread/start":
+                process.reply(message, {"thread": {"id": "thread-1"}}); process.stdout.put("not-json\n")
+        with self.assertRaisesRegex(CodexLaunchError, "malformed JSON"):
+            self.prepare(handler)
+        methods = [item["method"] for item in self.process.messages]
+        self.assertNotIn("turn/start", methods)
+        self.assertFalse(any("input" in item.get("params", {}) for item in self.process.messages))
+
+    def test_boolean_response_id_does_not_match_integer_request_id(self):
+        def handler(process, message):
+            if message.get("method") == "initialize":
+                process.stdout.put(json.dumps({"id": True, "result": {}}) + "\n")
+        with self.assertRaisesRegex(CodexLaunchError, "unknown request id"):
+            self.prepare(handler)
+        self.assertEqual(["initialize"], [item["method"] for item in self.process.messages])
 
     def test_stdout_eof_without_process_exit(self):
         launcher = self.launcher(); running = launcher.start(launcher.prepare(self.request()), "work")
@@ -175,6 +213,29 @@ class LauncherTests(unittest.TestCase):
         launcher = self.launcher(); running = launcher.start(launcher.prepare(self.request(timeout=0.02)), "work")
         with self.assertRaisesRegex(CodexLaunchError, "completion timed out"):
             launcher.wait(running)
+
+    def test_notifications_do_not_extend_wait_deadline(self):
+        def handler(process, message):
+            happy_handler(process, message)
+            if message.get("method") == "turn/start":
+                def flood():
+                    end = time.monotonic() + 0.25
+                    while time.monotonic() < end and process.poll() is None:
+                        process.notify("irrelevant/event", {}); threading.Event().wait(0.003)
+                threading.Thread(target=flood, daemon=True).start()
+        launcher = self.launcher(handler)
+        running = launcher.start(launcher.prepare(self.request(timeout=0.03)), "work")
+        started = time.monotonic()
+        with self.assertRaisesRegex(CodexLaunchError, "completion timed out"):
+            launcher.wait(running)
+        self.assertLess(time.monotonic() - started, 0.18)
+
+    def test_invalid_timeout_is_rejected_before_popen(self):
+        calls = []
+        launcher = CodexLauncher(executable=__file__, popen=lambda *args, **kwargs: calls.append(1))
+        with self.assertRaisesRegex(CodexLaunchError, "timeout_seconds"):
+            launcher.prepare(self.request(timeout=0))
+        self.assertEqual([], calls)
 
     def test_stderr_is_continuously_drained_and_bounded(self):
         prepared = self.prepare()
