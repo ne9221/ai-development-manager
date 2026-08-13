@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import queue
 import shutil
 import subprocess
@@ -43,6 +44,25 @@ def resolve_codex_executable(explicit: str | None = None) -> str:
     if not path:
         raise CodexLaunchError("executable_not_found", "Codex CLI was not found")
     return str(Path(path).resolve())
+
+
+def _windows_npm_native_binary(executable: str) -> str | None:
+    shim = Path(executable)
+    if shim.stem.lower() != "codex" or shim.suffix.lower() not in (".cmd", ".bat"):
+        return None
+    machine = platform.machine().lower()
+    targets = {"amd64": "x86_64-pc-windows-msvc", "x86_64": "x86_64-pc-windows-msvc",
+               "arm64": "aarch64-pc-windows-msvc", "aarch64": "aarch64-pc-windows-msvc"}
+    target = targets.get(machine)
+    if target is None:
+        return None
+    package = "codex-win32-arm64" if target.startswith("aarch64") else "codex-win32-x64"
+    codex_package = shim.parent / "node_modules" / "@openai" / "codex"
+    for node_modules in (codex_package / "node_modules", shim.parent / "node_modules"):
+        candidate = node_modules / "@openai" / package / "vendor" / target / "bin" / "codex.exe"
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return None
 
 
 @dataclass(frozen=True)
@@ -267,8 +287,9 @@ class CodexLauncher:
 
     def _spawn(self, timeout: float) -> _AppServerClient:
         executable = resolve_codex_executable(self.executable)
-        command = [executable, "app-server"]
-        if executable.lower().endswith((".cmd", ".bat")):
+        native_executable = _windows_npm_native_binary(executable)
+        command = [native_executable or executable, "app-server"]
+        if native_executable is None and executable.lower().endswith((".cmd", ".bat")):
             command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", f'""{executable}" app-server"']
         try:
             process = self._popen(

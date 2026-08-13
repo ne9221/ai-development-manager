@@ -96,6 +96,22 @@ class LauncherTests(unittest.TestCase):
     def test_resolve_executable_prefers_explicit_path(self):
         self.assertEqual(str(Path(__file__).resolve()), resolve_codex_executable(__file__))
 
+    def test_windows_npm_shim_launches_native_protocol_owner(self):
+        root = Path(self.temp.name)
+        shim = root / "codex.cmd"
+        native = (root / "node_modules" / "@openai" / "codex" / "node_modules" / "@openai" /
+                  "codex-win32-x64" / "vendor" / "x86_64-pc-windows-msvc" / "bin" / "codex.exe")
+        shim.write_text("@node codex.js %*", encoding="utf-8")
+        native.parent.mkdir(parents=True)
+        native.write_bytes(b"")
+        calls = []
+        self.process = FakeProcess()
+        launcher = CodexLauncher(executable=str(shim), popen=lambda *args, **kwargs: calls.append((args, kwargs)) or self.process)
+        with patch("manager.codex_launcher.platform.machine", return_value="AMD64"):
+            prepared = launcher.prepare(self.request())
+        self.assertEqual([str(native.resolve()), "app-server"], calls[0][0][0])
+        launcher.close(prepared)
+
     def test_initialize_success_and_prepare_does_not_start_turn(self):
         prepared = self.prepare()
         self.assertEqual("thread-1", prepared.thread_id)
