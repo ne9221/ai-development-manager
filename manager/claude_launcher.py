@@ -19,13 +19,27 @@ version has no provider/cwd/branch/model fields and carries a Codex-only
 app-server client object, and widening the shared dataclass would risk Codex
 regressions for a shape only Claude needs.
 
-`start()`/turn execution (writing the actual task prompt over the stream-json
-stdin channel and reading streamed responses) is deliberately out of scope
-here -- this module only covers the `prepare()` contract.
+`start(prepared, prompt)`/`wait(running)` complete the execution half: start()
+writes one stream-json user-message envelope to stdin and closes it (ADM
+dispatches one bounded task per launch, not an open-ended chat, so a single
+input turn followed by EOF is the right shape); wait() blocks for process
+exit and extracts the final `type: "result"` event from the stdout file sink.
+The stream-json envelope and result-event shapes below follow the Claude
+Agent SDK / Claude Code stream-json conventions as best understood from
+`claude --help` and general knowledge of the protocol -- they have **not**
+been verified against a real `claude -p --input-format stream-json
+--output-format stream-json` invocation (out of scope this round: no real
+launch). This needs empirical corroboration in a later real-smoke phase
+before anything relies on it end-to-end.
+
+`RunningLaunch`/`LaunchOutcome` are imported from `codex_launcher` unchanged
+(reused, not duplicated): both are already fully provider-neutral dataclasses
+with no Codex-specific fields, unlike `PreparedLaunch`.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -35,10 +49,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from manager.codex_launcher import LaunchRequest, process_creation_identity, process_pid, utc_now
+from manager.codex_launcher import (
+    LaunchOutcome, LaunchRequest, RunningLaunch,
+    process_creation_identity, process_pid, utc_now,
+)
 
 
 MAX_ERROR_CHARS = 1000
+MAX_STDOUT_READ_BYTES = 2_000_000  # bounded read of the file sink; audit evidence stays on disk regardless
 
 # The only sandbox/approval_policy combination ADM's task policy layer
 # currently emits for read_only tasks (execution_runner.py's
@@ -141,6 +159,47 @@ class PreparedLaunch:
     _process: Any = field(repr=False)
     _request: LaunchRequest = field(repr=False)
     _closed: bool = field(default=False, repr=False)
+    _started: bool = field(default=False, repr=False)
+
+
+def _encode_stream_json_input(prompt: str) -> bytes:
+    """Encode one user turn as a newline-delimited stream-json input line.
+
+    json.dumps escapes embedded quotes/newlines/control characters within the
+    JSON string value, so a multiline or quote-containing prompt still lands
+    on exactly one ndjson line; ensure_ascii=False plus explicit utf-8
+    encoding keeps non-ASCII text intact rather than \\u-escaped.
+    """
+    envelope = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}}
+    return (json.dumps(envelope, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _read_output_text(path: str) -> str:
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_STDOUT_READ_BYTES)
+    except OSError:
+        return ""
+    return raw.decode("utf-8", errors="replace")
+
+
+def _extract_stream_json_result(raw_text: str) -> dict | None:
+    """Return the last well-formed `type: "result"` ndjson event, or None if
+    none is present -- malformed lines are skipped rather than raising, but
+    the absence of any result event is reported to the caller as None so it
+    can fail closed instead of guessing an outcome."""
+    result = None
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            result = event
+    return result
 
 
 class ClaudeLauncher:
@@ -232,7 +291,77 @@ class ClaudeLauncher:
             _request=request,
         )
 
-    def close(self, prepared: PreparedLaunch) -> None:
+    def start(self, prepared: PreparedLaunch, prompt: str) -> RunningLaunch:
+        if prepared._closed:
+            raise ClaudeLaunchError("invalid_state", "prepared launch has already been closed")
+        if prepared._started:
+            raise ClaudeLaunchError("invalid_state", "prepared launch has already started")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ClaudeLaunchError("invalid_request", "prompt must be non-empty")
+        process = prepared._process
+        if process.poll() is not None:
+            raise ClaudeLaunchError(
+                "protocol_error", f"Claude process exited before start (code {process.returncode})"
+            )
+        payload = _encode_stream_json_input(prompt)
+        try:
+            process.stdin.write(payload)
+            process.stdin.flush()
+            # One bounded task per launch: a single input turn followed by
+            # EOF, not an open-ended chat -- Claude processes it and exits.
+            process.stdin.close()
+        except (BrokenPipeError, OSError) as exc:
+            self._kill_quietly(process)
+            raise ClaudeLaunchError("spawn_failed", f"failed to write prompt to Claude stdin: {exc}") from exc
+        prepared._started = True
+        return RunningLaunch(prepared, prepared.provider_session_id, utc_now())
+
+    def wait(self, running: RunningLaunch) -> LaunchOutcome:
+        prepared = running.prepared
+        process = prepared._process
+        turn_timeout = prepared._request.turn_timeout_seconds
+        try:
+            exit_code = process.wait(timeout=turn_timeout)
+        except subprocess.TimeoutExpired as exc:
+            self._kill_quietly(process)
+            raise ClaudeLaunchError("timeout", "turn completion timed out") from exc
+
+        completed_at = utc_now()
+        result = _extract_stream_json_result(_read_output_text(prepared.stdout_path))
+
+        if exit_code != 0:
+            detail = (result or {}).get("error") or f"Claude exited with code {exit_code}"
+            return LaunchOutcome(
+                "failed", prepared.provider_session_id, running.turn_id, completed_at,
+                "provider_error", str(detail)[:MAX_ERROR_CHARS],
+            )
+        if result is None:
+            return LaunchOutcome(
+                "failed", prepared.provider_session_id, running.turn_id, completed_at,
+                "malformed_output", "no result event found in Claude stream-json output",
+            )
+
+        # Fail closed rather than trust output-reported identity: the
+        # provider-native session id is authority-assigned by ADM at prepare()
+        # time, never learned or re-derived from provider output afterward.
+        reported_session_id = result.get("session_id")
+        if reported_session_id is not None and reported_session_id != prepared.provider_session_id:
+            return LaunchOutcome(
+                "failed", prepared.provider_session_id, running.turn_id, completed_at,
+                "session_id_mismatch",
+                f"result reported session_id={reported_session_id!r}, expected {prepared.provider_session_id!r}",
+            )
+
+        if result.get("is_error"):
+            detail = result.get("result") or result.get("error") or "Claude reported is_error=true"
+            return LaunchOutcome(
+                "failed", prepared.provider_session_id, running.turn_id, completed_at,
+                "turn_failed", str(detail)[:MAX_ERROR_CHARS],
+            )
+        return LaunchOutcome("completed", prepared.provider_session_id, running.turn_id, completed_at)
+
+    def close(self, handle: PreparedLaunch | RunningLaunch) -> None:
+        prepared = handle.prepared if isinstance(handle, RunningLaunch) else handle
         if prepared._closed:
             return
         try:

@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import tempfile
@@ -7,9 +8,10 @@ from pathlib import Path
 
 from manager.claude_launcher import (
     ClaudeLaunchError, ClaudeLauncher, PreparedLaunch,
-    resolve_claude_executable, _build_argv, _permission_profile,
+    resolve_claude_executable, _build_argv, _encode_stream_json_input,
+    _extract_stream_json_result, _permission_profile, _read_output_text,
 )
-from manager.codex_launcher import LaunchRequest, process_creation_identity
+from manager.codex_launcher import LaunchOutcome, LaunchRequest, RunningLaunch, process_creation_identity
 
 
 class FakeProcess:
@@ -23,6 +25,7 @@ class FakeProcess:
         self.returncode = exit_immediately_with
         self.stdin = _FakeStdin()
         self.terminate_count = self.kill_count = 0
+        self.wait_timeout = None
 
     def poll(self):
         return self.returncode
@@ -37,10 +40,31 @@ class FakeProcess:
         if self.returncode is None:
             self.returncode = -9
 
+    def wait(self, timeout=None):
+        self.wait_timeout = timeout
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("claude", timeout)
+        return self.returncode
+
 
 class _FakeStdin:
-    def __init__(self):
+    def __init__(self, fail_write=False, fail_flush=False):
         self.closed = False
+        self.written = []
+        self.flush_count = 0
+        self.fail_write = fail_write
+        self.fail_flush = fail_flush
+
+    def write(self, data):
+        if self.fail_write:
+            raise BrokenPipeError("simulated broken pipe on write")
+        self.written.append(data)
+        return len(data)
+
+    def flush(self):
+        if self.fail_flush:
+            raise OSError("simulated broken pipe on flush")
+        self.flush_count += 1
 
     def close(self):
         self.closed = True
@@ -250,6 +274,231 @@ class ClaudeLauncherTests(unittest.TestCase):
         launcher = self.launcher()
         launcher.close(prepared)
         self.assertEqual(self.process.kill_count, 0)
+
+
+class StartWaitTests(unittest.TestCase):
+    """start()/wait() -- the execution half of the launcher, all against a
+    mocked process/file sink; no real Claude invocation this round."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.cwd = str(Path(self.temp.name).resolve())
+        self.process = None
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _popen(self, *args, **kwargs):
+        return self.process
+
+    def launcher(self):
+        return ClaudeLauncher(executable=__file__, popen=self._popen, log_dir=self.temp.name)
+
+    def request(self):
+        return LaunchRequest(self.cwd, model="claude-sonnet-5", sandbox="read-only", approval_policy="never")
+
+    def prepared(self, fail_write=False, fail_flush=False):
+        self.process = FakeProcess(pid=os.getpid())
+        self.process.stdin = _FakeStdin(fail_write=fail_write, fail_flush=fail_flush)
+        launcher = self.launcher()
+        return launcher, launcher.prepare(self.request())
+
+    @staticmethod
+    def write_result_line(prepared, event):
+        with open(prepared.stdout_path, "ab") as handle:
+            handle.write((json.dumps(event) + "\n").encode("utf-8"))
+
+    # 1. start writes the correct stream-json frame
+    def test_start_writes_correct_stream_json_frame(self):
+        launcher, prepared = self.prepared()
+        running = launcher.start(prepared, "do the task")
+        self.assertEqual(1, len(self.process.stdin.written))
+        frame = json.loads(self.process.stdin.written[0].decode("utf-8"))
+        self.assertEqual(
+            {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "do the task"}]}},
+            frame,
+        )
+        self.assertIsInstance(running, RunningLaunch)
+        self.assertIs(running.prepared, prepared)
+
+    def test_start_frame_matches_encode_helper_exactly(self):
+        launcher, prepared = self.prepared()
+        launcher.start(prepared, "consistent encoding")
+        self.assertEqual(_encode_stream_json_input("consistent encoding"), self.process.stdin.written[0])
+
+    # 2. Unicode/multiline prompt
+    def test_unicode_and_multiline_prompt_survive_encoding_as_one_ndjson_line(self):
+        launcher, prepared = self.prepared()
+        prompt = "line one\nline two 你好 emoji \U0001F389 \"quoted\""
+        launcher.start(prepared, prompt)
+        raw = self.process.stdin.written[0]
+        self.assertEqual(1, raw.count(b"\n"))  # exactly one trailing newline: one ndjson line
+        frame = json.loads(raw.decode("utf-8"))
+        self.assertEqual(prompt, frame["message"]["content"][0]["text"])
+
+    # 3. stdin flush/close semantics
+    def test_stdin_flushed_and_closed_after_start(self):
+        launcher, prepared = self.prepared()
+        launcher.start(prepared, "task")
+        self.assertEqual(1, self.process.stdin.flush_count)
+        self.assertTrue(self.process.stdin.closed)
+
+    # 4. broken pipe
+    def test_broken_pipe_on_write_fails_closed_and_kills_process(self):
+        launcher, prepared = self.prepared(fail_write=True)
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            launcher.start(prepared, "task")
+        self.assertEqual("spawn_failed", ctx.exception.classification)
+        self.assertEqual(1, self.process.kill_count)
+
+    def test_broken_pipe_on_flush_fails_closed_and_kills_process(self):
+        launcher, prepared = self.prepared(fail_flush=True)
+        with self.assertRaises(ClaudeLaunchError):
+            launcher.start(prepared, "task")
+        self.assertEqual(1, self.process.kill_count)
+
+    # 5. process already exited before start
+    def test_process_already_exited_before_start_fails_closed(self):
+        launcher, prepared = self.prepared()
+        self.process.returncode = 1
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            launcher.start(prepared, "task")
+        self.assertEqual("protocol_error", ctx.exception.classification)
+
+    def test_start_twice_raises_invalid_state(self):
+        launcher, prepared = self.prepared()
+        launcher.start(prepared, "task")
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            launcher.start(prepared, "task again")
+        self.assertEqual("invalid_state", ctx.exception.classification)
+
+    def test_start_rejects_empty_prompt(self):
+        launcher, prepared = self.prepared()
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            launcher.start(prepared, "   ")
+        self.assertEqual("invalid_request", ctx.exception.classification)
+
+    # 6. wait success exit=0
+    def test_wait_success_returns_completed_outcome(self):
+        launcher, prepared = self.prepared()
+        running = launcher.start(prepared, "task")
+        self.write_result_line(prepared, {"type": "system", "subtype": "init"})
+        self.write_result_line(prepared, {"type": "result", "is_error": False,
+                                          "session_id": prepared.provider_session_id, "result": "done"})
+        self.process.returncode = 0
+        outcome = launcher.wait(running)
+        self.assertIsInstance(outcome, LaunchOutcome)
+        self.assertEqual("completed", outcome.status)
+        self.assertIsNone(outcome.failure_classification)
+
+    # 7. wait nonzero exit
+    def test_wait_nonzero_exit_fails_closed(self):
+        launcher, prepared = self.prepared()
+        running = launcher.start(prepared, "task")
+        self.process.returncode = 1
+        outcome = launcher.wait(running)
+        self.assertEqual("failed", outcome.status)
+        self.assertEqual("provider_error", outcome.failure_classification)
+
+    # 8. malformed output
+    def test_wait_malformed_output_classified_and_fails_closed(self):
+        launcher, prepared = self.prepared()
+        running = launcher.start(prepared, "task")
+        with open(prepared.stdout_path, "ab") as handle:
+            handle.write(b"not valid json at all\n{also not json}\n")
+        self.process.returncode = 0
+        outcome = launcher.wait(running)
+        self.assertEqual("failed", outcome.status)
+        self.assertEqual("malformed_output", outcome.failure_classification)
+
+    # 9. empty output
+    def test_wait_empty_output_classified_and_fails_closed(self):
+        launcher, prepared = self.prepared()
+        running = launcher.start(prepared, "task")
+        self.process.returncode = 0
+        outcome = launcher.wait(running)
+        self.assertEqual("failed", outcome.status)
+        self.assertEqual("malformed_output", outcome.failure_classification)
+
+    # 10. final result extraction: last result event wins over earlier noise
+    def test_wait_extracts_the_last_result_event_among_stream_noise(self):
+        launcher, prepared = self.prepared()
+        running = launcher.start(prepared, "task")
+        self.write_result_line(prepared, {"type": "assistant", "message": {"content": []}})
+        self.write_result_line(prepared, {"type": "result", "is_error": False,
+                                          "session_id": prepared.provider_session_id, "result": "superseded"})
+        self.write_result_line(prepared, {"type": "result", "is_error": False,
+                                          "session_id": prepared.provider_session_id, "result": "final"})
+        self.process.returncode = 0
+        outcome = launcher.wait(running)
+        self.assertEqual("completed", outcome.status)
+
+    # 11. session-id mismatch fails closed; the assigned UUID is never replaced
+    def test_wait_session_id_mismatch_fails_closed(self):
+        launcher, prepared = self.prepared()
+        running = launcher.start(prepared, "task")
+        self.write_result_line(prepared, {"type": "result", "is_error": False,
+                                          "session_id": "not-the-assigned-uuid", "result": "done"})
+        self.process.returncode = 0
+        outcome = launcher.wait(running)
+        self.assertEqual("failed", outcome.status)
+        self.assertEqual("session_id_mismatch", outcome.failure_classification)
+        self.assertEqual(prepared.provider_session_id, outcome.thread_id)  # never overwritten by output
+
+    def test_wait_is_error_true_fails_closed(self):
+        launcher, prepared = self.prepared()
+        running = launcher.start(prepared, "task")
+        self.write_result_line(prepared, {"type": "result", "is_error": True,
+                                          "session_id": prepared.provider_session_id, "result": "provider refused"})
+        self.process.returncode = 0
+        outcome = launcher.wait(running)
+        self.assertEqual("failed", outcome.status)
+        self.assertEqual("turn_failed", outcome.failure_classification)
+
+    # 12. stdout/stderr file-sink behavior
+    def test_wait_reads_output_from_file_sink_path_not_a_pipe(self):
+        launcher, prepared = self.prepared()
+        launcher.start(prepared, "task")
+        self.assertTrue(Path(prepared.stdout_path).exists())
+        self.assertEqual("", _read_output_text(prepared.stdout_path))  # nothing written by the fake provider yet
+        self.write_result_line(prepared, {"type": "result", "is_error": False, "session_id": prepared.provider_session_id})
+        self.assertIn("result", _read_output_text(prepared.stdout_path))
+
+    # 13. close idempotent after wait, and accepts a RunningLaunch (mirrors CodexLauncher.close())
+    def test_close_idempotent_after_wait_and_accepts_running_launch(self):
+        launcher, prepared = self.prepared()
+        running = launcher.start(prepared, "task")
+        self.write_result_line(prepared, {"type": "result", "is_error": False, "session_id": prepared.provider_session_id})
+        self.process.returncode = 0
+        launcher.wait(running)
+        launcher.close(running)
+        launcher.close(prepared)  # idempotent regardless of which handle shape is passed
+        self.assertEqual(0, self.process.kill_count)  # already exited: no kill needed
+        self.assertTrue(prepared._closed)
+
+    # 14. failure cleanup: no orphan process left behind
+    def test_wait_timeout_kills_process_no_orphan(self):
+        launcher, prepared = self.prepared()
+        running = launcher.start(prepared, "task")
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            launcher.wait(running)  # returncode stays None: FakeProcess.wait() raises TimeoutExpired
+        self.assertEqual("timeout", ctx.exception.classification)
+        self.assertEqual(1, self.process.kill_count)
+
+    # 15. execution_runner-shaped fake integration: prepare -> start -> wait end to end
+    def test_full_prepare_start_wait_cycle_matches_execution_runner_contract(self):
+        launcher, prepared = self.prepared()
+        self.assertIsInstance(prepared, PreparedLaunch)
+        running = launcher.start(prepared, "read the file and summarize it")
+        self.assertEqual(prepared.provider_session_id, running.turn_id)
+        self.write_result_line(prepared, {"type": "result", "is_error": False,
+                                          "session_id": prepared.provider_session_id, "result": "summary text"})
+        self.process.returncode = 0
+        outcome = launcher.wait(running)
+        self.assertEqual("completed", outcome.status)
+        self.assertEqual(prepared.provider_session_id, outcome.thread_id)
+        launcher.close(running)
+        self.assertTrue(prepared._closed)
 
 
 class PermissionProfileTests(unittest.TestCase):
