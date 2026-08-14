@@ -12,6 +12,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
+
+
+# Deliberately includes "cancelled" unlike the recovery-arbitration TERMINAL
+# sets elsewhere in this package: this constant governs what the UI must
+# display, not what recovery is allowed to act on.
+TERMINAL_EXECUTION_STATUSES = frozenset({"completed", "failed", "interrupted", "cancelled"})
 
 
 HTML = """<!doctype html>
@@ -131,6 +138,7 @@ class LiveSession:
     provider: str = "codex"
     idle_seconds: float = 15.0
     correlated: bool = False
+    status_source: Callable[[], str | None] | None = field(default=None, repr=False)
     _size: int = field(init=False)
     _latest: float = field(default_factory=time.time, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -146,6 +154,14 @@ class LiveSession:
                 self._size = size
                 self._latest = now
             latest = self._latest
+        # Authoritative ADM lifecycle status always wins over transcript
+        # activity: an execution can only be "completed"/"failed"/etc. on
+        # explicit SSOT evidence, never inferred from transcript inactivity.
+        authoritative_status = self.status_source() if self.status_source else None
+        if authoritative_status in TERMINAL_EXECUTION_STATUSES:
+            current_state = authoritative_status
+        else:
+            current_state = "running" if now - latest < self.idle_seconds else "waiting"
         return {
             "provider": self.provider,
             "project_id": self.project_id,
@@ -155,7 +171,7 @@ class LiveSession:
             "cwd": self.cwd,
             "branch": self.branch or "—",
             "started_at": self.started_at,
-            "current_state": "running" if now - latest < self.idle_seconds else "waiting",
+            "current_state": current_state,
             "latest_activity": utc_iso(latest),
             "correlated": self.correlated,
         }
@@ -187,16 +203,42 @@ def handler_for(session: LiveSession):
     return Handler
 
 
+def drive_status_source(store, project_id: str, execution_id: str) -> Callable[[], str | None]:
+    """Re-read the authoritative Drive execution status; never raise into the poll loop."""
+    def read() -> str | None:
+        try:
+            record = store.get("executions", project_id, execution_id)
+        except (KeyError, RuntimeError):
+            return None
+        status = record.get("status") if isinstance(record, dict) else None
+        return status if isinstance(status, str) else None
+    return read
+
+
+def file_status_source(execution_file: Path, provider_session_id: str, provider_cwd: str) -> Callable[[], str | None]:
+    """Re-read the ADM Execution JSON snapshot's status; never raise into the poll loop."""
+    def read() -> str | None:
+        try:
+            record = validate_execution(
+                json.loads(execution_file.read_text(encoding="utf-8")), provider_session_id, provider_cwd
+            )
+        except (OSError, json.JSONDecodeError, SessionCenterError):
+            return None
+        status = record.get("status")
+        return status if isinstance(status, str) else None
+    return read
+
+
 def build_session(args: argparse.Namespace) -> LiveSession:
     execution = None
+    store = None
     provider_session_id = args.provider_session_id
     if args.execution_project_id or args.execution_id:
         if not args.execution_project_id or not args.execution_id or args.execution_file or provider_session_id:
             raise SessionCenterError("execution project/id mode cannot be combined with another identity source")
         from manager.tasks import DriveRecords, build_service
-        execution = wait_for_execution(
-            DriveRecords(build_service()), args.execution_project_id, args.execution_id, args.wait_seconds
-        )
+        store = DriveRecords(build_service())
+        execution = wait_for_execution(store, args.execution_project_id, args.execution_id, args.wait_seconds)
         provider_session_id = execution["provider_session_id"]
     if not provider_session_id:
         raise SessionCenterError("provider session ID or execution project/id is required")
@@ -207,12 +249,14 @@ def build_session(args: argparse.Namespace) -> LiveSession:
         return LiveSession(
             provider_session_id, session_file, meta["cwd"], meta["started_at"], execution["project_id"],
             execution["task_id"], execution["execution_id"], execution["branch"], execution["provider"], args.idle_seconds, True,
+            status_source=drive_status_source(store, execution["project_id"], execution["execution_id"]),
         )
     if args.execution_file:
         execution = load_execution(args.execution_file, provider_session_id, meta["cwd"])
         return LiveSession(
             provider_session_id, session_file, meta["cwd"], meta["started_at"], execution["project_id"],
             execution["task_id"], execution["execution_id"], execution["branch"], execution["provider"], args.idle_seconds, True,
+            status_source=file_status_source(args.execution_file, provider_session_id, meta["cwd"]),
         )
     if not args.project_id or not args.task_id:
         raise SessionCenterError("project/task are required when no ADM Execution JSON is provided")
