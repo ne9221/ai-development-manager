@@ -124,22 +124,22 @@ class DecideTests(unittest.TestCase):
     def test_new_target_with_no_prior_state_respawns_without_killing(self):
         target = cmd(execution_id="fresh-exec")
         result = decide((None, None, None), target)
-        self.assertEqual({"action": "respawn", "execution_id": "fresh-exec", "project_id": "p1", "kill_pid": None}, result)
+        self.assertEqual({"action": "respawn", "execution_id": "fresh-exec", "project_id": "p1", "provider": "codex", "kill_pid": None}, result)
 
     def test_same_target_but_process_stopped_respawns_without_killing(self):
         with patch("manager.session_center_supervisor.process_identity_state", return_value="stopped"):
             result = decide((111, "exec-a", "id-111"), cmd(execution_id="exec-a"))
-        self.assertEqual({"action": "respawn", "execution_id": "exec-a", "project_id": "p1", "kill_pid": None}, result)
+        self.assertEqual({"action": "respawn", "execution_id": "exec-a", "project_id": "p1", "provider": "codex", "kill_pid": None}, result)
 
     def test_same_target_but_pid_reused_by_different_process_respawns_without_killing_the_impostor(self):
         with patch("manager.session_center_supervisor.process_identity_state", return_value="replaced"):
             result = decide((111, "exec-a", "id-111"), cmd(execution_id="exec-a"))
-        self.assertEqual({"action": "respawn", "execution_id": "exec-a", "project_id": "p1", "kill_pid": None}, result)
+        self.assertEqual({"action": "respawn", "execution_id": "exec-a", "project_id": "p1", "provider": "codex", "kill_pid": None}, result)
 
     def test_same_target_but_identity_unreadable_fails_closed_and_respawns_without_killing(self):
         with patch("manager.session_center_supervisor.process_identity_state", return_value="unknown"):
             result = decide((111, "exec-a", "id-111"), cmd(execution_id="exec-a"))
-        self.assertEqual({"action": "respawn", "execution_id": "exec-a", "project_id": "p1", "kill_pid": None}, result)
+        self.assertEqual({"action": "respawn", "execution_id": "exec-a", "project_id": "p1", "provider": "codex", "kill_pid": None}, result)
 
     def test_same_target_and_verified_live_is_idempotent_noop(self):
         with patch("manager.session_center_supervisor.process_identity_state", return_value="live"):
@@ -149,12 +149,12 @@ class DecideTests(unittest.TestCase):
     def test_target_switch_with_verified_old_child_kills_old_and_spawns_new(self):
         with patch("manager.session_center_supervisor.process_identity_state", return_value="live"):
             result = decide((111, "exec-old", "id-111"), cmd(execution_id="exec-new"))
-        self.assertEqual({"action": "respawn", "execution_id": "exec-new", "project_id": "p1", "kill_pid": 111}, result)
+        self.assertEqual({"action": "respawn", "execution_id": "exec-new", "project_id": "p1", "provider": "codex", "kill_pid": 111}, result)
 
     def test_target_switch_with_unverified_old_child_spawns_new_without_killing(self):
         with patch("manager.session_center_supervisor.process_identity_state", return_value="unknown"):
             result = decide((111, "exec-old", "id-111"), cmd(execution_id="exec-new"))
-        self.assertEqual({"action": "respawn", "execution_id": "exec-new", "project_id": "p1", "kill_pid": None}, result)
+        self.assertEqual({"action": "respawn", "execution_id": "exec-new", "project_id": "p1", "provider": "codex", "kill_pid": None}, result)
 
 
 class PortProbeTests(unittest.TestCase):

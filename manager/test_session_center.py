@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import tempfile
 import threading
 import time
@@ -7,11 +8,13 @@ import unittest
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from manager.session_center import (
     LiveSession, SessionCenterError, SessionView, build_pending, drive_status_source, file_status_source,
-    handler_for, load_execution, read_codex_meta, resolve_session, wait_for_execution,
+    find_claude_session, handler_for, load_execution, read_claude_meta, read_codex_meta,
+    resolve_provider_meta, resolve_session, wait_for_execution,
 )
 
 
@@ -19,7 +22,7 @@ def bootstrap_args(**overrides):
     base = {
         "provider_session_id": None, "execution_file": None, "execution_project_id": None,
         "execution_id": None, "wait_seconds": 5.0, "project_id": None, "task_id": None,
-        "branch": None, "port": 0, "idle_seconds": 15.0,
+        "branch": None, "port": 0, "idle_seconds": 15.0, "provider": "codex",
     }
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -403,6 +406,365 @@ class BootstrapTests(unittest.TestCase):
     def _run_and_fail(view, args):
         from manager.session_center import _resolve_and_swap
         _resolve_and_swap(view, args)
+
+
+class ClaudeResolverTests(unittest.TestCase):
+    """find_claude_session/read_claude_meta/resolve_provider_meta in isolation."""
+
+    def test_exact_match_returns_the_agent(self):
+        agents = [{"pid": 111, "cwd": "C:/proj", "sessionId": "uuid-target", "startedAt": 1786727643476,
+                   "kind": "background", "name": "n"}]
+        with patch("manager.session_center.shutil.which", return_value="claude.exe"), \
+             patch("manager.session_center.subprocess.run",
+                   return_value=SimpleNamespace(returncode=0, stdout=json.dumps(agents), stderr="")):
+            agent = find_claude_session("uuid-target")
+        self.assertEqual(111, agent["pid"])
+
+    def test_read_claude_meta_converts_epoch_ms_startedAt_to_iso(self):
+        meta = read_claude_meta({"pid": 111, "cwd": "C:/proj", "startedAt": 1786727643476})
+        self.assertEqual("C:/proj", meta["cwd"])
+        self.assertEqual(111, meta["pid"])
+        self.assertTrue(meta["started_at"].endswith("Z"))
+
+    # item 4: same cwd, wrong session id -> rejected, not selected by proximity
+    def test_same_cwd_wrong_session_id_is_rejected(self):
+        agents = [{"pid": 999, "cwd": "C:/target/cwd", "sessionId": "decoy-uuid", "startedAt": 1000000}]
+        with patch("manager.session_center.shutil.which", return_value="claude.exe"), \
+             patch("manager.session_center.subprocess.run",
+                   return_value=SimpleNamespace(returncode=0, stdout=json.dumps(agents), stderr="")):
+            with self.assertRaises(SessionCenterError):
+                find_claude_session("real-target-uuid")
+
+    # item 5: same pid, wrong session id -> rejected, not selected by proximity
+    def test_same_pid_wrong_session_id_is_rejected(self):
+        agents = [{"pid": 4242, "cwd": "C:/somewhere", "sessionId": "decoy-uuid", "startedAt": 1000000}]
+        with patch("manager.session_center.shutil.which", return_value="claude.exe"), \
+             patch("manager.session_center.subprocess.run",
+                   return_value=SimpleNamespace(returncode=0, stdout=json.dumps(agents), stderr="")):
+            with self.assertRaises(SessionCenterError):
+                find_claude_session("real-target-uuid")
+
+    def test_executable_missing_raises(self):
+        with patch("manager.session_center.shutil.which", return_value=None):
+            with self.assertRaises(SessionCenterError):
+                find_claude_session("any-uuid")
+
+    def test_nonzero_exit_raises(self):
+        with patch("manager.session_center.shutil.which", return_value="claude.exe"), \
+             patch("manager.session_center.subprocess.run",
+                   return_value=SimpleNamespace(returncode=1, stdout="", stderr="boom")):
+            with self.assertRaises(SessionCenterError):
+                find_claude_session("any-uuid")
+
+    def test_malformed_json_raises(self):
+        with patch("manager.session_center.shutil.which", return_value="claude.exe"), \
+             patch("manager.session_center.subprocess.run",
+                   return_value=SimpleNamespace(returncode=0, stdout="not json {{{", stderr="")):
+            with self.assertRaises(SessionCenterError):
+                find_claude_session("any-uuid")
+
+    def test_empty_agent_list_raises(self):
+        with patch("manager.session_center.shutil.which", return_value="claude.exe"), \
+             patch("manager.session_center.subprocess.run",
+                   return_value=SimpleNamespace(returncode=0, stdout="[]", stderr="")):
+            with self.assertRaises(SessionCenterError):
+                find_claude_session("any-uuid")
+
+    def test_resolve_provider_meta_unknown_provider_fails_closed_never_falls_back_to_codex(self):
+        with patch("manager.session_center.find_codex_session") as codex_resolver:
+            with self.assertRaises(SessionCenterError):
+                resolve_provider_meta("gemini_app", "some-id")
+        codex_resolver.assert_not_called()
+
+
+class ClaudeBootstrapTests(unittest.TestCase):
+    """End-to-end correlation flow through the real HTTP server, mirroring
+    BootstrapTests but for provider="claude"."""
+
+    def start_server(self, view):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(view))
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, port
+
+    def get(self, port, path):
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as response:
+            return response.status, json.loads(response.read())
+
+    @staticmethod
+    def _run_and_fail(view, args):
+        from manager.session_center import _resolve_and_swap
+        _resolve_and_swap(view, args)
+
+    # items 1, 11, 12: provider=claude chosen, pending view visible with deterministic identity before resolver runs
+    def test_claude_pending_view_visible_before_resolver_success(self):
+        args = bootstrap_args(execution_project_id="adm", execution_id="run-claude-1", provider="claude")
+        view = SessionView(build_pending(args))
+        server, port = self.start_server(view)
+        try:
+            status, body = self.get(port, "/api/session")
+            self.assertEqual(200, status)
+            self.assertEqual("claude", body["provider"])
+            self.assertEqual("correlating", body["current_state"])
+            self.assertFalse(body["correlated"])
+            self.assertEqual("run-claude-1", body["execution_id"])
+            self.assertEqual("adm", body["project_id"])
+            for field in ("provider_session_id", "cwd", "branch", "started_at"):
+                self.assertIsNone(body[field], f"{field} must not be faked while correlating")
+        finally:
+            server.shutdown(); server.server_close()
+
+    # items 3, 6, 13, 14: exact-UUID correlation, appears after retry, LiveSession swap, provider stays claude
+    def test_claude_execution_appearing_after_retry_correlates_with_exact_session_id(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            target_uuid = "11111111-1111-1111-1111-111111111111"
+            record = {
+                "provider": "claude", "project_id": "adm", "task_id": "task-1", "execution_id": "run-1",
+                "provider_session_id": target_uuid, "mode": "plan",
+                "task_snapshot": {"working_directory": cwd, "branch": "main"},
+            }
+            agents_response = [{"pid": 4242, "cwd": cwd, "sessionId": target_uuid, "startedAt": 1786727643476,
+                                "kind": "background", "name": "n"}]
+
+            class DelayedStore:
+                def __init__(self):
+                    self.calls = 0
+
+                def get(self, area, project_id, execution_id):
+                    self.calls += 1
+                    if self.calls < 3:
+                        raise KeyError("not yet")
+                    return record
+
+            args = bootstrap_args(execution_project_id="adm", execution_id="run-1", wait_seconds=5.0, provider="claude")
+            view = SessionView(build_pending(args))
+            server, port = self.start_server(view)
+            try:
+                status, body = self.get(port, "/api/session")
+                self.assertEqual("correlating", body["current_state"], "must be visible before correlation resolves")
+                self.assertEqual("claude", body["provider"])
+
+                delayed_store = DelayedStore()
+                with patch("manager.session_center.shutil.which", return_value="claude.exe"), \
+                     patch("manager.session_center.subprocess.run",
+                           return_value=SimpleNamespace(returncode=0, stdout=json.dumps(agents_response), stderr="")), \
+                     patch("manager.tasks.build_service", return_value=object()), \
+                     patch("manager.tasks.DriveRecords", return_value=delayed_store):
+                    live_session = resolve_session(args, time.monotonic() + 5.0)
+                view.resolve(live_session)  # exactly what _resolve_and_swap does on success
+
+                status, body = self.get(port, "/api/session")
+                self.assertEqual(200, status)
+                self.assertTrue(body["correlated"])
+                self.assertEqual("claude", body["provider"])
+                self.assertEqual(target_uuid, body["provider_session_id"])
+                self.assertEqual(4242, body["pid"])
+                self.assertEqual("plan", body["mode"])
+                self.assertNotEqual("correlating", body["current_state"])
+                self.assertGreaterEqual(delayed_store.calls, 3, "must have retried, not failed on first miss")
+            finally:
+                server.shutdown(); server.server_close()
+
+    # item 7: malformed agents JSON stays in the retry loop instead of failing on first miss
+    def test_malformed_agents_json_is_retried_until_recovery(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            target_uuid = "22222222-2222-2222-2222-222222222222"
+            record = {
+                "provider": "claude", "project_id": "adm", "task_id": "task-1", "execution_id": "run-2",
+                "provider_session_id": target_uuid,
+                "task_snapshot": {"working_directory": cwd, "branch": "main"},
+            }
+            good_agents = [{"pid": 1, "cwd": cwd, "sessionId": target_uuid, "startedAt": 1000000,
+                            "kind": "background", "name": "n"}]
+
+            class Store:
+                def get(self, *_a):
+                    return record
+
+            calls = {"n": 0}
+
+            def flaky_run(argv, capture_output, text, timeout):
+                calls["n"] += 1
+                if calls["n"] < 2:
+                    return SimpleNamespace(returncode=0, stdout="not valid json {{{", stderr="")
+                return SimpleNamespace(returncode=0, stdout=json.dumps(good_agents), stderr="")
+
+            args = bootstrap_args(execution_project_id="adm", execution_id="run-2", wait_seconds=5.0, provider="claude")
+            with patch("manager.session_center.shutil.which", return_value="claude.exe"), \
+                 patch("manager.session_center.subprocess.run", side_effect=flaky_run), \
+                 patch("manager.tasks.build_service", return_value=object()), \
+                 patch("manager.tasks.DriveRecords", return_value=Store()):
+                live_session = resolve_session(args, time.monotonic() + 5.0)
+            self.assertTrue(live_session.correlated)
+            self.assertGreaterEqual(calls["n"], 2)
+
+    # item 8: CLI failure (missing executable) is bounded, never crashes the server
+    def test_claude_cli_missing_is_bounded_and_server_survives(self):
+        args = bootstrap_args(execution_project_id="adm", execution_id="run-missing-cli", wait_seconds=0.3, provider="claude")
+        view = SessionView(build_pending(args))
+        server, port = self.start_server(view)
+        try:
+            class NeverStore:
+                def get(self, *_a):
+                    raise KeyError("never appears")
+
+            with patch("manager.tasks.build_service", return_value=object()), \
+                 patch("manager.tasks.DriveRecords", return_value=NeverStore()):
+                thread = threading.Thread(target=self._run_and_fail, args=(view, args), daemon=True)
+                thread.start()
+                thread.join(timeout=5)
+
+            status, body = self.get(port, "/api/session")
+            self.assertEqual(200, status, "server must still be up and answering after a resolution failure")
+            self.assertFalse(body["correlated"])
+        finally:
+            server.shutdown(); server.server_close()
+
+    # items 9, 10: bounded timeout -> correlation_failed, HTTP stays healthy throughout
+    def test_claude_timeout_reports_correlation_failed_and_http_stays_healthy(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            target_uuid = "33333333-3333-3333-3333-333333333333"
+            record = {
+                "provider": "claude", "project_id": "adm", "task_id": "task-1", "execution_id": "run-timeout",
+                "provider_session_id": target_uuid,
+                "task_snapshot": {"working_directory": cwd, "branch": "main"},
+            }
+
+            class Store:
+                def get(self, *_a):
+                    return record
+
+            args = bootstrap_args(execution_project_id="adm", execution_id="run-timeout", wait_seconds=0.3, provider="claude")
+            view = SessionView(build_pending(args))
+            server, port = self.start_server(view)
+            try:
+                with patch("manager.session_center.shutil.which", return_value="claude.exe"), \
+                     patch("manager.session_center.subprocess.run",
+                           return_value=SimpleNamespace(returncode=0, stdout="[]", stderr="")), \
+                     patch("manager.tasks.build_service", return_value=object()), \
+                     patch("manager.tasks.DriveRecords", return_value=Store()):
+                    thread = threading.Thread(target=self._run_and_fail, args=(view, args), daemon=True)
+                    thread.start()
+                    thread.join(timeout=5)
+
+                status, _ = self.get(port, "/health")
+                self.assertEqual(200, status)
+                status, body = self.get(port, "/api/session")
+                self.assertEqual(200, status)
+                self.assertFalse(body["correlated"])
+                self.assertEqual("correlation_failed", body["current_state"])
+            finally:
+                server.shutdown(); server.server_close()
+
+    # item 15: Codex regression through the same generalized resolve_session() entry point
+    def test_codex_flow_through_generalized_resolver_is_unaffected(self):
+        with tempfile.TemporaryDirectory() as codex_home, tempfile.TemporaryDirectory() as cwd:
+            sessions_dir = Path(codex_home) / "sessions"
+            sessions_dir.mkdir()
+            session_path = sessions_dir / "rollout-provider-1.jsonl"
+            session_path.write_text(json.dumps({
+                "timestamp": "2026-08-14T09:31:49.290Z", "type": "session_meta",
+                "payload": {"id": "provider-1", "cwd": cwd},
+            }) + "\n", encoding="utf-8")
+            record = {
+                "provider": "codex", "project_id": "adm", "task_id": "task-1", "execution_id": "run-codex-1",
+                "provider_session_id": "provider-1", "task_snapshot": {"working_directory": cwd, "branch": "main"},
+            }
+
+            class Store:
+                def get(self, *_a):
+                    return record
+
+            args = bootstrap_args(execution_project_id="adm", execution_id="run-codex-1", wait_seconds=5.0, provider="codex")
+            with patch.dict("os.environ", {"CODEX_HOME": codex_home}), \
+                 patch("manager.tasks.build_service", return_value=object()), \
+                 patch("manager.tasks.DriveRecords", return_value=Store()):
+                live_session = resolve_session(args, time.monotonic() + 5.0)
+            self.assertTrue(live_session.correlated)
+            self.assertEqual("codex", live_session.provider)
+            self.assertIsNone(live_session.pid)  # Codex resolver never fabricates a pid
+
+    # item 16: concurrent /api/session reads during the pending -> live swap
+    def test_concurrent_reads_during_pending_to_live_swap_never_error(self):
+        args = bootstrap_args(execution_project_id="adm", execution_id="run-concurrent", provider="claude")
+        view = SessionView(build_pending(args))
+        server, port = self.start_server(view)
+        errors = []
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    self.get(port, "/api/session")
+                except Exception as exc:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=reader, daemon=True) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        try:
+            time.sleep(0.05)
+            with tempfile.TemporaryDirectory() as cwd:
+                live = LiveSession("uuid-x", None, cwd, "2026-01-01T00:00:00Z", "adm", "task-1",
+                                   "run-concurrent", "main", "claude", correlated=True, pid=1)
+                view.resolve(live)
+            time.sleep(0.05)
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join(timeout=2)
+            server.shutdown(); server.server_close()
+        self.assertEqual([], errors)
+
+
+class LauncherToSessionCenterIntegrationTest(unittest.TestCase):
+    """Component test: ClaudeLauncher.prepare()'s pre-assigned UUID threads
+    unchanged through Execution evidence and into Session Center's exact-match
+    correlation -- no ID is ever regenerated or guessed along the way."""
+
+    def test_claude_launcher_uuid_threads_unchanged_into_correlated_session(self):
+        from manager.claude_launcher import ClaudeLauncher
+        from manager.codex_launcher import LaunchRequest
+
+        with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as log_dir:
+            class FakeProcess:
+                def __init__(self):
+                    self.pid = os.getpid()
+                    self.returncode = None
+
+                def poll(self):
+                    return self.returncode
+
+            process = FakeProcess()
+            launcher = ClaudeLauncher(executable=__file__, popen=lambda *a, **k: process, log_dir=log_dir)
+            request = LaunchRequest(cwd, model="claude-sonnet-5", sandbox="read-only", approval_policy="never")
+            prepared = launcher.prepare(request)
+            uuid_x = prepared.provider_session_id  # authority-assigned before any spawn observation
+
+            record = {
+                "provider": "claude", "project_id": "adm", "task_id": "task-1", "execution_id": "run-int",
+                "provider_session_id": uuid_x, "task_snapshot": {"working_directory": cwd, "branch": "main"},
+            }
+            agents_response = [{"pid": prepared.pid, "cwd": cwd, "sessionId": uuid_x, "startedAt": 1786727643476,
+                                "kind": "background", "name": "n"}]
+
+            class Store:
+                def get(self, *_a):
+                    return record
+
+            args = bootstrap_args(execution_project_id="adm", execution_id="run-int", wait_seconds=5.0, provider="claude")
+            with patch("manager.session_center.shutil.which", return_value="claude.exe"), \
+                 patch("manager.session_center.subprocess.run",
+                       return_value=SimpleNamespace(returncode=0, stdout=json.dumps(agents_response), stderr="")), \
+                 patch("manager.tasks.build_service", return_value=object()), \
+                 patch("manager.tasks.DriveRecords", return_value=Store()):
+                live_session = resolve_session(args, time.monotonic() + 5.0)
+
+            self.assertTrue(live_session.correlated)
+            self.assertEqual(uuid_x, live_session.provider_session_id)  # never regenerated
+            self.assertEqual("claude", live_session.provider)
+            self.assertEqual(prepared.pid, live_session.pid)
 
 
 if __name__ == "__main__":
