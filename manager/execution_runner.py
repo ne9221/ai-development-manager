@@ -91,6 +91,12 @@ def _persist_session_link(store, writer_registry, execution, prepared, request, 
 
 def _stopped(prepared):
     process = getattr(getattr(prepared, "_client", None), "process", None)
+    wait = getattr(process, "wait", None)
+    if callable(wait):
+        try:
+            wait(timeout=5)
+        except Exception:
+            pass
     poll = getattr(process, "poll", None)
     return callable(poll) and poll() is not None
 
@@ -125,6 +131,8 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     reserve_execution(store, project_id, task_id, execution_id, "codex", dispatched["quota_evidence"],
                       dispatched["mode"], dispatched["effort"])
     request = LaunchRequest(task["working_directory"], model=model, reasoning_effort=dispatched["effort"],
+                            sandbox="read-only" if task["read_only"] else None,
+                            approval_policy="never" if task["read_only"] else None,
                             timeout_seconds=RPC_TIMEOUT_SECONDS, turn_timeout_seconds=turn_timeout)
     result = run_execution(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                            execution_id, dispatched["generated_prompt"], request,

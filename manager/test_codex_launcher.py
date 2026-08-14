@@ -174,6 +174,38 @@ class LauncherTests(unittest.TestCase):
         self.process.notify("turn/completed", {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}})
         self.assertEqual("completed", launcher.wait(running).status)
 
+    def test_server_approval_request_is_denied_without_protocol_failure(self):
+        def handler(process, message):
+            happy_handler(process, message)
+            if message.get("method") == "turn/start":
+                process.stdout.put(json.dumps({
+                    "id": "approval-1", "method": "item/commandExecution/requestApproval", "params": {},
+                }) + "\n")
+            elif message.get("id") == "approval-1" and "method" not in message:
+                process.notify("turn/completed", {
+                    "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"},
+                })
+        launcher = self.launcher(handler)
+        running = launcher.start(launcher.prepare(self.request()), "work")
+        self.assertEqual("completed", launcher.wait(running).status)
+        response = next(item for item in self.process.messages if item.get("id") == "approval-1")
+        self.assertEqual({"decision": "decline"}, response["result"])
+
+    def test_unsupported_server_request_gets_bounded_jsonrpc_error(self):
+        def handler(process, message):
+            happy_handler(process, message)
+            if message.get("method") == "turn/start":
+                process.stdout.put(json.dumps({"id": 90, "method": "currentTime/read", "params": {}}) + "\n")
+            elif message.get("id") == 90 and "method" not in message:
+                process.notify("turn/completed", {
+                    "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"},
+                })
+        launcher = self.launcher(handler)
+        running = launcher.start(launcher.prepare(self.request()), "work")
+        self.assertEqual("completed", launcher.wait(running).status)
+        response = next(item for item in self.process.messages if item.get("id") == 90)
+        self.assertEqual(-32601, response["error"]["code"])
+
     def test_turn_failed(self):
         launcher = self.launcher(); running = launcher.start(launcher.prepare(self.request()), "work")
         self.process.notify("turn/completed", {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "failed", "error": {"message": "provider failed"}}})

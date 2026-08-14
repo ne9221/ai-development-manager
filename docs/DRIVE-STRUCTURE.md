@@ -42,3 +42,4 @@ Canonical repository hashes key its `locks` object,
 and every creation/update uses GCS `ifGenerationMatch=0/N`. Lease owner tokens
 are returned only by acquire; the registry stores their hashes. Released and
 expired generations remain auditable but do not block a new owner.
+`COMMANDS/<project_id>/<command_id>.json` is the bounded ChatGPT-to-Windows command queue. A ChatGPT client writes a schema-valid `queued` command that references an existing Drive `TASKS` record. The Windows watcher moves it through `claimed`, `running`, and terminal `completed`/`failed`, writing only a compact execution/session/error-category result. It never stores raw prompts, transcripts, credentials, OAuth data, or provider responses.

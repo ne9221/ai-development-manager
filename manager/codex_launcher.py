@@ -149,6 +149,7 @@ class _AppServerClient:
         self._responses: dict[int, queue.Queue] = {}
         self._notifications: queue.Queue = queue.Queue()
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
         self._next_id = 1
         self._closed = False
         self._failure: CodexLaunchError | None = None
@@ -179,6 +180,8 @@ class _AppServerClient:
                         self._fail(CodexLaunchError("protocol_error", "response has an unknown request id"))
                         break
                     target.put(message)
+                elif "id" in message and isinstance(message.get("method"), str) and message["method"]:
+                    self._reply_to_server_request(message)
                 elif "id" not in message and isinstance(message.get("method"), str) and message["method"]:
                     self._notifications.put(("notification", message))
                 else:
@@ -188,6 +191,23 @@ class _AppServerClient:
             code = self.process.poll()
             classification = "process_exit" if code is not None else "stdout_eof"
             self._fail(CodexLaunchError(classification, f"app-server closed stdout; exit_code={code}"))
+
+    def _reply_to_server_request(self, message: dict):
+        """Deny unattended approval requests and reject unsupported callbacks."""
+        method = message["method"]
+        decisions = {
+            "item/commandExecution/requestApproval": {"decision": "decline"},
+            "item/fileChange/requestApproval": {"decision": "decline"},
+            "execCommandApproval": {"decision": {"denied": {"rejection": "unattended approval denied"}}},
+            "applyPatchApproval": {"decision": {"denied": {"rejection": "unattended approval denied"}}},
+        }
+        if method in decisions:
+            response = {"id": message["id"], "result": decisions[method]}
+        else:
+            response = {"id": message["id"], "error": {
+                "code": -32601, "message": "unsupported unattended server request",
+            }}
+        self.send(response)
 
     def _fail(self, failure: CodexLaunchError):
         with self._lock:
@@ -220,8 +240,9 @@ class _AppServerClient:
             self._fail(failure)
             raise failure
         try:
-            self.process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
-            self.process.stdin.flush()
+            with self._write_lock:
+                self.process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+                self.process.stdin.flush()
         except (OSError, ValueError) as exc:
             failure = CodexLaunchError("transport_error", "could not write to app-server")
             self._fail(failure)

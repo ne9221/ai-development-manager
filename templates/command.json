@@ -1,0 +1,18 @@
+{
+  "command_id": "example-read-only-codex",
+  "project_id": "ai-development-manager",
+  "task_id": "existing-read-only-task",
+  "provider": "codex",
+  "model": null,
+  "fallback_model": null,
+  "mode": null,
+  "effort": null,
+  "selection_reason": [],
+  "quota_evidence": null,
+  "created_at": "2026-08-14T00:00:00Z",
+  "status": "queued",
+  "execution_id": null,
+  "claimed_at": null,
+  "completed_at": null,
+  "result": null
+}

@@ -67,6 +67,32 @@ Windows logon and every 15 minutes; overlapping executions are ignored by Task
 Scheduler and rejected by the runtime file lock. The task does not require an
 open terminal or an active Codex/Claude conversation window.
 
+## Drive command watcher (Windows)
+
+ChatGPT writes a schema-valid `queued` record from `templates/command.json` under
+`COMMANDS/<project_id>/`, referencing an existing Drive task. Install the hidden
+per-user watcher once; it runs at logon and every minute with overlapping
+instances ignored:
+
+```powershell
+./manager/install_command_watcher.ps1 -PythonPath C:\path\python.exe `
+  -RepositoryPath C:\path\ai-development-manager -ManagerHome $env:LOCALAPPDATA\AI-Development-Manager `
+  -CodexBin C:\path\codex.exe -CodexHome $env:USERPROFILE\.codex -PythonDeps C:\path\site-packages `
+  -GcsBucket your-authority-bucket -GcsObject worktree-locks/global-registry.json
+```
+
+The watcher polls Drive at a bounded rate and supports `provider: "codex"` only.
+It claims a command with a deterministic execution ID, then delegates exactly to
+`manager.execution_runner`; reservation, quota/dispatch, GCS task claim, writer
+authority, Codex, and terminal execution/handoff/task persistence remain owned by
+the existing runner. A claimed/running command is reconciled but never retried by
+the watcher, so restart/duplicate polling cannot start it twice. Requeue requires
+a new command ID after review.
+
+Command results include the future selection contract fields `provider`, `model`,
+`mode`, `effort`, `selection_reason`, `fallback_model`, and `quota_evidence`.
+Model values are optional and no model is hard-coded by the watcher.
+
 ## Tasks and handoffs
 
 Drive-backed runtime records use `schema/project.schema.json`,
