@@ -89,6 +89,17 @@ def _persist_session_link(store, writer_registry, execution, prepared, request, 
     return session
 
 
+def _terminalize_session(store, session, terminal):
+    timestamp = terminal["execution"]["completed_at"]
+    expected = {**session, "status": "completed" if terminal["execution"]["status"] == "completed" else "unknown",
+                "updated_at": timestamp}
+    validate("session", expected)
+    store.put("sessions", expected["project_id"], expected["session_id"], expected)
+    if store.get("sessions", expected["project_id"], expected["session_id"]) != expected:
+        raise TaskError("terminal session persistence verification failed")
+    return expected
+
+
 def _stopped(prepared):
     process = getattr(getattr(prepared, "_client", None), "process", None)
     wait = getattr(process, "wait", None)
@@ -218,6 +229,8 @@ def run_execution(store, service, writer_registry, claim_registry, launcher: Cod
         status, gate["task_claim"]["generation"], provider_stopped, lease_token=lease_token,
         completed_at=outcome.completed_at if outcome else None, summary=summary,
     )
+    if session is not None:
+        session = _terminalize_session(store, session, terminal)
     if operation_error:
         operation_error.add_note("execution terminalized as interrupted after provider stop was proven")
         raise operation_error
