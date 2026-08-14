@@ -47,8 +47,15 @@ class DispatcherTests(unittest.TestCase):
     def test_new_task_codex_and_drive_consistency(self):
         result = self.dispatch_case(request(task_id="new-explicit-id"), records=history())
         self.assertEqual("codex", result["recommended_provider"]); self.assertEqual(14, result["estimated_minutes"])
+        self.assertEqual("codex", result["provider"]); self.assertIsNone(result["model"])
+        self.assertIn("selection_reason", result); self.assertIn("quota_evidence", result)
         self.assertEqual("Fix regression", self.store.get("tasks", "p1", "new-explicit-id")["title"])
         self.assertNotIn('"providers"', result["generated_prompt"])
+
+    def test_future_model_contract_is_optional_and_validated(self):
+        result = self.dispatch_case(request(title="Model contract", model="gpt-test", fallback_model="gpt-fallback"))
+        self.assertEqual("gpt-test", result["model"]); self.assertEqual("gpt-fallback", result["fallback_model"])
+        with self.assertRaises(TaskError): request_ok(request(model=""))
 
     def test_identity_header_round_trips_canonical_task_for_codex_and_claude(self):
         for provider, task_id in (("codex", "canonical-task-id"), ("claude", "canonical_task_id")):

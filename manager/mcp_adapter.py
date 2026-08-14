@@ -1,5 +1,6 @@
-"""Read-only MCP adapter for the existing runtime bridge."""
+"""Read-only MCP adapter and local stdio transport for the runtime bridge."""
 
+import json
 from typing import Any
 
 from mcp.server import MCPServer
@@ -12,6 +13,10 @@ from manager.tasks import DriveRecords, TaskError
 
 
 MCP_ADAPTER_VERSION = "1.0"
+MAX_REFERENCE_LENGTH = 200
+MAX_REQUEST_LENGTH = 4000
+MAX_RESPONSE_BYTES = 65536
+LOCAL_SERVICE_FACTORY = None
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 server = MCPServer(
     "AI Development Manager",
@@ -20,16 +25,32 @@ server = MCPServer(
 )
 
 
-def invoke_bridge(request, service_factory=default_service_factory, bridge_func=runtime_bridge):
-    service = service_factory()
-    return redact(bridge_func(DriveRecords(service), service, request, read_only=True))
+def invoke_bridge(request, service_factory=None, bridge_func=None):
+    service_factory = service_factory or LOCAL_SERVICE_FACTORY or default_service_factory
+    bridge_func = bridge_func or runtime_bridge
+    try:
+        service = service_factory()
+        result = redact(bridge_func(DriveRecords(service), service, request, read_only=True))
+    except TaskError:
+        raise TaskError("runtime request is invalid") from None
+    except Exception:
+        raise TaskError("runtime data is unavailable") from None
+    if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_RESPONSE_BYTES:
+        raise TaskError("runtime response exceeds transport limit")
+    return result
+
+
+def bounded_text(name, value, maximum, required=False):
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise TaskError(f"{name} is invalid")
+    return value.strip()
 
 
 def project_reference(project_id, project_alias):
     reference = project_id or project_alias
-    if not isinstance(reference, str) or not reference.strip():
-        raise TaskError("project_id or project_alias is required")
-    return reference.strip()
+    return bounded_text("project_id or project_alias", reference, MAX_REFERENCE_LENGTH, required=True)
 
 
 @server.tool(annotations=READ_ONLY, structured_output=True)
@@ -43,16 +64,14 @@ def adm_dispatch(
     multi_task: bool = False,
 ) -> dict[str, Any]:
     """Return the sanitized runtime bridge contract and generated prompt without writing runtime data."""
-    if not isinstance(user_request, str) or not user_request.strip():
-        raise TaskError("user_request is required")
     request = {
         "project_id": project_reference(project_id, project_alias),
-        "user_request": user_request.strip(),
+        "user_request": bounded_text("user_request", user_request, MAX_REQUEST_LENGTH, required=True),
         "multi_task": multi_task,
     }
     for key, value in (("task_id", task_id), ("preferred_provider", preferred_provider), ("excluded_provider", excluded_provider)):
         if value is not None:
-            request[key] = value
+            request[key] = bounded_text(key, value, MAX_REFERENCE_LENGTH)
     return invoke_bridge(request)
 
 
@@ -74,3 +93,14 @@ server.tool(name="adm_runtime_quota_status", annotations=READ_ONLY, structured_o
 def adm_health() -> dict[str, Any]:
     """Return MCP adapter and runtime contract versions without accessing Drive."""
     return {"status": "ok", "mcp_adapter_version": MCP_ADAPTER_VERSION, "runtime_contract_version": "1.0"}
+
+
+def main():
+    global LOCAL_SERVICE_FACTORY
+    from collectors.publish_drive import build_service
+    LOCAL_SERVICE_FACTORY = build_service
+    server.run("stdio")
+
+
+if __name__ == "__main__":
+    main()

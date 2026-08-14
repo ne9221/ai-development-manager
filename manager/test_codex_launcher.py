@@ -1,4 +1,5 @@
 import json
+import os
 import queue
 import subprocess
 import tempfile
@@ -8,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from manager.codex_launcher import CodexLaunchError, CodexLauncher, LaunchRequest, resolve_codex_executable
+from manager.codex_launcher import CodexLaunchError, CodexLauncher, LaunchRequest, RunningLaunch, resolve_codex_executable
 
 
 _END = object()
@@ -36,7 +37,7 @@ class FakeProcess:
 
     def __init__(self, handler=None):
         FakeProcess.next_pid += 1
-        self.pid = FakeProcess.next_pid
+        self.pid = os.getpid()
         self.handler = handler or happy_handler
         self.stdout, self.stderr = QueueStream(), QueueStream()
         self.stdin = FakeStdin(self)
@@ -174,6 +175,38 @@ class LauncherTests(unittest.TestCase):
         self.process.notify("turn/completed", {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}})
         self.assertEqual("completed", launcher.wait(running).status)
 
+    def test_server_approval_request_is_denied_without_protocol_failure(self):
+        def handler(process, message):
+            happy_handler(process, message)
+            if message.get("method") == "turn/start":
+                process.stdout.put(json.dumps({
+                    "id": "approval-1", "method": "item/commandExecution/requestApproval", "params": {},
+                }) + "\n")
+            elif message.get("id") == "approval-1" and "method" not in message:
+                process.notify("turn/completed", {
+                    "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"},
+                })
+        launcher = self.launcher(handler)
+        running = launcher.start(launcher.prepare(self.request()), "work")
+        self.assertEqual("completed", launcher.wait(running).status)
+        response = next(item for item in self.process.messages if item.get("id") == "approval-1")
+        self.assertEqual({"decision": "decline"}, response["result"])
+
+    def test_unsupported_server_request_gets_bounded_jsonrpc_error(self):
+        def handler(process, message):
+            happy_handler(process, message)
+            if message.get("method") == "turn/start":
+                process.stdout.put(json.dumps({"id": 90, "method": "currentTime/read", "params": {}}) + "\n")
+            elif message.get("id") == 90 and "method" not in message:
+                process.notify("turn/completed", {
+                    "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"},
+                })
+        launcher = self.launcher(handler)
+        running = launcher.start(launcher.prepare(self.request()), "work")
+        self.assertEqual("completed", launcher.wait(running).status)
+        response = next(item for item in self.process.messages if item.get("id") == 90)
+        self.assertEqual(-32601, response["error"]["code"])
+
     def test_turn_failed(self):
         launcher = self.launcher(); running = launcher.start(launcher.prepare(self.request()), "work")
         self.process.notify("turn/completed", {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "failed", "error": {"message": "provider failed"}}})
@@ -230,6 +263,14 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaisesRegex(CodexLaunchError, "completion timed out"):
             launcher.wait(running)
 
+    def test_provider_event_heartbeats_are_throttled_to_one_per_minute(self):
+        running = RunningLaunch(self.prepare(), "turn-1", "2026-08-14T00:00:00Z")
+        events = []; running._heartbeat = events.append; running._last_heartbeat = 100
+        with patch("manager.codex_launcher.time.monotonic", side_effect=(120, 160)):
+            CodexLauncher._emit_heartbeat(running, "provider_event")
+            CodexLauncher._emit_heartbeat(running, "provider_event")
+        self.assertEqual(["provider_event"], events)
+
     def test_notifications_do_not_extend_wait_deadline(self):
         def handler(process, message):
             happy_handler(process, message)
@@ -255,7 +296,7 @@ class LauncherTests(unittest.TestCase):
 
         launcher = CodexLauncher(executable=__file__, popen=lambda *args, **kwargs: calls.append(1))
         with self.assertRaisesRegex(CodexLaunchError, "turn_timeout_seconds"):
-            launcher.prepare(LaunchRequest(self.cwd, turn_timeout_seconds=1201))
+            launcher.prepare(LaunchRequest(self.cwd, turn_timeout_seconds=7201))
         self.assertEqual([], calls)
 
     def test_stderr_is_continuously_drained_and_bounded(self):
