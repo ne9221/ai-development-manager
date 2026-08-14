@@ -491,3 +491,49 @@ def process_creation_identity(pid: int) -> str | None:
     except (OSError, IndexError, UnicodeError, ValueError):
         return None
     return f"linux-proc:{boot_id}:{start_ticks}" if boot_id and start_ticks.isdigit() else None
+
+
+def process_identity_state(pid, expected_identity):
+    """Verify a specific (pid, expected creation identity) pair is still the
+    same live OS process -- shared by Recovery's provider-liveness check and
+    Session Center's supervisor, so PID-reuse handling is implemented once.
+
+    Returns one of:
+    - "unknown": malformed input, or existence/identity could not be proven.
+      Never a safe substitute for "live" -- callers must not treat it as
+      healthy, and must not kill a PID they could not verify.
+    - "stopped": the PID does not currently identify a running process.
+    - "live": the PID exists and its creation identity matches exactly.
+    - "replaced": the PID exists but belongs to a different process now
+      (the original one exited and the PID was reused).
+    """
+    if not isinstance(pid, int) or pid <= 0 or not isinstance(expected_identity, str) or not expected_identity:
+        return "unknown"
+    if os.name == "nt":
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if handle:
+            exit_code = ctypes.c_ulong()
+            queried = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            kernel32.CloseHandle(handle)
+            if not queried:
+                return "unknown"
+            if exit_code.value != 259:
+                return "stopped"
+        else:
+            return "stopped" if kernel32.GetLastError() == 87 else "unknown"
+    else:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "stopped"
+        except (OSError, PermissionError):
+            return "unknown"
+    current_identity = process_creation_identity(pid)
+    if current_identity is None:
+        return "unknown"
+    return "live" if current_identity == expected_identity else "replaced"

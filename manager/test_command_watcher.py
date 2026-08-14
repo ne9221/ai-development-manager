@@ -1,12 +1,18 @@
+import json
+import tempfile
+import threading
 import unittest
 import os
 import socket
 from copy import deepcopy
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 from manager.codex_launcher import process_creation_identity
-from manager.command_watcher import CLAIM_TIMEOUT_SECONDS, _provider_state, poll_once, process_command
+from manager.command_watcher import (
+    CLAIM_TIMEOUT_SECONDS, REQUIRED_TASK_POLICIES, _provider_state, load_allowlist, poll_once, process_command,
+)
 from manager.execution_lifecycle import enter_running_gate
 from manager.executions import execution_health, heartbeat_execution, reserve_execution
 from manager.task_claims import TaskClaimConflict
@@ -41,8 +47,18 @@ def command(**changes):
 
 
 class CommandWatcherTests(unittest.TestCase):
+    ALLOWLIST = frozenset({("p1", "t1")})
+
+    @staticmethod
+    def allowlist_compliant_store():
+        store = Store(); create_project(store, project()); create_task(store, task(read_only=True), assign=False)
+        compliant = store.get("tasks", "p1", "t1")
+        compliant["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)
+        store.put("tasks", "p1", "t1", compliant)
+        return store
+
     def setUp(self):
-        self.store = Store(); create_project(self.store, project()); create_task(self.store, task(read_only=True), assign=False)
+        self.store = self.allowlist_compliant_store()
 
     @staticmethod
     def complete(execution_id):
@@ -85,8 +101,8 @@ class CommandWatcherTests(unittest.TestCase):
         runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])
         with patch("manager.command_watcher.launch_task", runner):
             self.store.put("commands", "p1", "cmd-1", command())
-            first = poll_once(self.store, object(), claim_factory=self.claim_factory)
-            second = poll_once(self.store, object(), claim_factory=self.claim_factory)
+            first = poll_once(self.store, object(), allowlist=self.ALLOWLIST, claim_factory=self.claim_factory, health_check=lambda: True, quota_check=lambda service: True)
+            second = poll_once(self.store, object(), allowlist=self.ALLOWLIST, claim_factory=self.claim_factory, health_check=lambda: True, quota_check=lambda service: True)
         self.assertEqual("completed", first[0]["status"]); self.assertEqual([], second); runner.assert_called_once()
         stored = self.store.get("commands", "p1", "cmd-1")
         self.assertEqual("command-cmd-1", stored["execution_id"]); self.assertEqual("completed", stored["result"]["status"])
@@ -106,7 +122,7 @@ class CommandWatcherTests(unittest.TestCase):
             states.append(self.store.get("commands", "p1", "cmd-1")["status"])
             return self.complete(args[7])
         with patch("manager.command_watcher.launch_task", side_effect=runner):
-            process_command(self.store, object(), command(), claim_factory=self.claim_factory)
+            process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
         self.assertEqual(["claimed", "running"], states)
 
     def test_orphaned_claim_times_out_without_relaunch(self):
@@ -124,7 +140,7 @@ class CommandWatcherTests(unittest.TestCase):
     def test_task_claim_collision_and_missing_writer_authority_do_not_launch(self):
         collision = Mock(side_effect=TaskClaimConflict("already claimed"))
         with patch("manager.command_watcher.launch_task", collision):
-            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory)
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
         self.assertEqual("failed", result["status"]); collision.assert_called_once()
         stored = self.store.get("commands", "p1", "cmd-1")
         self.assertEqual("TaskClaimConflict", stored["result"]["error_kind"])
@@ -133,20 +149,20 @@ class CommandWatcherTests(unittest.TestCase):
         self.store.put("tasks", "p1", "t1", writable)
         launch = Mock()
         with patch("manager.command_watcher.launch_task", launch):
-            result = process_command(self.store, object(), command(command_id="cmd-2"), claim_factory=self.claim_factory, writer_factory=Mock(side_effect=TaskError("no writer authority")))
-        self.assertEqual("failed", result["status"]); launch.assert_not_called()
+            result = process_command(self.store, object(), command(command_id="cmd-2"), claim_factory=self.claim_factory, writer_factory=Mock(side_effect=TaskError("no writer authority")), allowlist=self.ALLOWLIST)
+        self.assertEqual("attention", result["status"]); launch.assert_not_called()
 
     def test_provider_failure_terminalizes_and_drive_failure_never_fakes_completed(self):
         failed = Mock(side_effect=TaskError("provider launch failed"))
         with patch("manager.command_watcher.launch_task", failed):
-            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory)
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
         self.assertEqual("failed", result["status"])
 
-        self.store = Store(); create_project(self.store, project()); create_task(self.store, task(read_only=True), assign=False)
+        self.store = self.allowlist_compliant_store()
         self.store.fail_command_terminal = True
         with patch("manager.command_watcher.launch_task", Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])):
             with self.assertRaisesRegex(TaskError, "Drive unavailable"):
-                process_command(self.store, object(), command(), claim_factory=self.claim_factory)
+                process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
         self.assertEqual("running", self.store.get("commands", "p1", "cmd-1")["status"])
 
     def test_health_contract_distinguishes_healthy_stale_and_over_expected(self):
@@ -180,7 +196,7 @@ class CommandWatcherTests(unittest.TestCase):
         active, claim, execution = self.running_command(pid=os.getpid())
         execution["provider_evidence"]["creation_identity"] = "original-process"
         self.store.put("executions", "p1", "command-cmd-1", execution)
-        with patch("manager.command_watcher.process_creation_identity", return_value="reused-process"):
+        with patch("manager.codex_launcher.process_creation_identity", return_value="reused-process"):
             self.assertEqual("replaced", _provider_state(execution))
             result = process_command(self.store, object(), active, claim_factory=lambda *_: claim)
         self.assertEqual("attention", result["status"])
@@ -216,10 +232,216 @@ class CommandWatcherTests(unittest.TestCase):
             reserve_execution(self.store, "p1", "t1", args[7], "codex", {"decision": "fresh"})
             raise TaskError("preflight failed")
         with patch("manager.command_watcher.launch_task", side_effect=reserve_then_fail):
-            result = process_command(self.store, object(), command(), claim_factory=lambda *_: MemoryClaimRegistry())
+            result = process_command(self.store, object(), command(), claim_factory=lambda *_: MemoryClaimRegistry(), allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
         self.assertEqual("failed", result["status"])
         self.assertEqual("cancelled", self.store.get("executions", "p1", "command-cmd-1")["status"])
         self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+
+    def test_no_allowlist_means_zero_launch(self):
+        self.store.put("commands", "p1", "cmd-1", command())
+        launch = Mock()
+        with patch("manager.command_watcher.launch_task", launch):
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory)
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+        self.assertEqual("queued", self.store.get("commands", "p1", "cmd-1")["status"])
+
+    def test_other_project_or_task_not_in_allowlist_means_zero_launch(self):
+        self.store.put("commands", "p1", "cmd-1", command())
+        launch = Mock()
+        unrelated = frozenset({("other-project", "t1"), ("p1", "other-task")})
+        with patch("manager.command_watcher.launch_task", launch):
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=unrelated)
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+        self.assertEqual("queued", self.store.get("commands", "p1", "cmd-1")["status"])
+
+    def test_allowlisted_but_policy_violation_means_zero_launch(self):
+        incomplete = self.store.get("tasks", "p1", "t1")
+        incomplete["execution_policies"] = ["disposable", "read_only"]  # missing no_repo_writes/no_external_writes
+        self.store.put("tasks", "p1", "t1", incomplete)
+        launch = Mock()
+        with patch("manager.command_watcher.launch_task", launch):
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST)
+        self.assertEqual("attention", result["status"]); launch.assert_not_called()
+        self.assertEqual("allowlisted_task_policy_not_satisfied", self.store.get("commands", "p1", "cmd-1")["recovery_reason"])
+
+    def test_allowlisted_disposable_read_only_is_eligible(self):
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])
+        with patch("manager.command_watcher.launch_task", runner):
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
+        runner.assert_called_once()
+        self.assertEqual("completed", result["status"])
+
+    def test_session_center_unhealthy_blocks_new_launch_but_never_touches_running_authority(self):
+        self.store.put("commands", "p1", "cmd-1", command())
+        launch = Mock()
+        with patch("manager.command_watcher.launch_task", launch):
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: False)
+        self.assertEqual({"status": "rejected", "reason": "session_center_unavailable"}, result)
+        launch.assert_not_called()
+        self.assertEqual("queued", self.store.get("commands", "p1", "cmd-1")["status"])
+
+        # An already-running execution must never be touched by health status.
+        active, claim, _ = self.running_command(heartbeat_minutes=0)
+        result = process_command(self.store, object(), active, claim_factory=lambda *_: claim, health_check=lambda: False)
+        self.assertEqual("running", result["status"])
+
+    def test_stale_or_unreliable_codex_quota_blocks_new_launch_but_never_touches_running_authority(self):
+        self.store.put("commands", "p1", "cmd-1", command())
+        launch = Mock()
+        with patch("manager.command_watcher.launch_task", launch):
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory,
+                                     allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: False)
+        self.assertEqual({"status": "rejected", "reason": "quota_unreliable"}, result)
+        launch.assert_not_called()
+        self.assertEqual("queued", self.store.get("commands", "p1", "cmd-1")["status"])
+
+        # An already-running execution must never be touched by quota status.
+        active, claim, _ = self.running_command(heartbeat_minutes=0)
+        result = process_command(self.store, object(), active, claim_factory=lambda *_: claim, quota_check=lambda service: False)
+        self.assertEqual("running", result["status"])
+
+    def test_codex_quota_reliable_fails_closed_on_stale_unknown_or_unreachable(self):
+        from manager.command_watcher import codex_quota_reliable
+        fresh_reliable = {
+            "providers": [{"provider": "codex", "has_reliable_quota": True}],
+        }
+        stale_or_unknown = {
+            "providers": [{"provider": "codex", "has_reliable_quota": False}],
+        }
+        with patch("manager.command_watcher.read_drive_status", return_value={}), \
+             patch("manager.command_watcher.summarize", return_value=fresh_reliable):
+            self.assertTrue(codex_quota_reliable(object()))
+        with patch("manager.command_watcher.read_drive_status", return_value={}), \
+             patch("manager.command_watcher.summarize", return_value=stale_or_unknown):
+            self.assertFalse(codex_quota_reliable(object()))
+        with patch("manager.command_watcher.read_drive_status", side_effect=RuntimeError("Drive unavailable")):
+            self.assertFalse(codex_quota_reliable(object()))
+        with patch("manager.command_watcher.read_drive_status", return_value={}), \
+             patch("manager.command_watcher.summarize", return_value={"providers": []}):
+            self.assertFalse(codex_quota_reliable(object()))  # no codex entry at all
+
+    def test_session_center_healthy_probe_fails_closed_on_any_error(self):
+        from manager.command_watcher import session_center_healthy
+        import urllib.error
+        with patch("manager.command_watcher.urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
+            self.assertFalse(session_center_healthy("http://127.0.0.1:8765/health"))
+        with patch("manager.command_watcher.urllib.request.urlopen") as opened:
+            opened.return_value.__enter__.return_value.status = 500
+            self.assertFalse(session_center_healthy("http://127.0.0.1:8765/health"))
+        with patch("manager.command_watcher.urllib.request.urlopen") as opened:
+            opened.return_value.__enter__.return_value.status = 200
+            opened.return_value.__enter__.return_value.read.return_value = b"not json"
+            self.assertFalse(session_center_healthy("http://127.0.0.1:8765/health"))
+        with patch("manager.command_watcher.urllib.request.urlopen") as opened:
+            opened.return_value.__enter__.return_value.status = 200
+            opened.return_value.__enter__.return_value.read.return_value = b'{"status":"ok"}'
+            self.assertTrue(session_center_healthy("http://127.0.0.1:8765/health"))
+
+    def test_production_write_even_allowlisted_never_launches(self):
+        writable = create_task(self.store, task(read_only=False), assign=False, persist=False)
+        writable["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)  # everything else compliant except read_only
+        self.store.put("tasks", "p1", "t1", writable)
+        launch = Mock()
+        with patch("manager.command_watcher.launch_task", launch):
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST)
+        self.assertEqual("attention", result["status"]); launch.assert_not_called()
+        self.assertEqual("allowlisted_task_policy_not_satisfied", self.store.get("commands", "p1", "cmd-1")["recovery_reason"])
+
+    def test_stray_attention_command_is_never_relaunched_even_with_permissive_allowlist(self):
+        stray = command(status="attention", stale_at=now_iso(), recovery_reason="legacy")
+        self.store.put("commands", "p1", "cmd-1", stray)
+        launch = Mock()
+        with patch("manager.command_watcher.launch_task", launch):
+            result = process_command(self.store, object(), stray, claim_factory=self.claim_factory, allowlist=self.ALLOWLIST)
+        launch.assert_not_called()
+        self.assertNotEqual("running", result.get("status"))
+
+    def test_load_allowlist_fails_closed_on_missing_or_malformed_config(self):
+        self.assertEqual(frozenset(), load_allowlist(None))
+        self.assertEqual(frozenset(), load_allowlist("/no/such/file.json"))
+        with tempfile.TemporaryDirectory() as directory:
+            malformed = Path(directory) / "bad.json"
+            malformed.write_text("not json", encoding="utf-8")
+            self.assertEqual(frozenset(), load_allowlist(str(malformed)))
+
+            wrong_shape = Path(directory) / "wrong_shape.json"
+            wrong_shape.write_text(json.dumps({"entries": "not-a-list"}), encoding="utf-8")
+            self.assertEqual(frozenset(), load_allowlist(str(wrong_shape)))
+
+            partial = Path(directory) / "partial.json"
+            partial.write_text(json.dumps({"entries": [
+                {"project_id": "p1", "task_id": "t1"},
+                {"project_id": "p1"},  # missing task_id: dropped, not crashed
+                "not-a-dict",
+            ]}), encoding="utf-8")
+            self.assertEqual(frozenset({("p1", "t1")}), load_allowlist(str(partial)))
+
+    def test_load_allowlist_reads_env_var_when_path_not_given(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "allowlist.json"
+            config.write_text(json.dumps({"entries": [{"project_id": "p1", "task_id": "t1"}]}), encoding="utf-8")
+            with patch.dict(os.environ, {"ADM_WATCHER_ALLOWLIST_PATH": str(config)}):
+                self.assertEqual(frozenset({("p1", "t1")}), load_allowlist())
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(frozenset(), load_allowlist())
+
+
+class WatcherSessionCenterBootstrapIntegrationTests(unittest.TestCase):
+    """Reproduces the exact deadlock the reviewer found and proves the fix:
+    Session Center used to block its own HTTP bind on wait_for_execution(),
+    so /health never came up until an Execution already existed -- but the
+    watcher requires /health before it will create that Execution. No Codex
+    involved; this only exercises the real HTTP bind and the real gate."""
+
+    def test_health_gate_crosses_before_correlation_completes_no_livelock(self):
+        from http.server import ThreadingHTTPServer
+        from manager.command_watcher import session_center_healthy
+        from manager.session_center import SessionView, build_pending, handler_for
+
+        port = 18899
+        url = f"http://127.0.0.1:{port}/health"
+
+        # Before Session Center exists at all, the gate correctly reports
+        # unavailable -- this is normal sequencing, not the livelock.
+        self.assertFalse(session_center_healthy(url, timeout=0.5))
+
+        args = argparse_namespace(execution_project_id="p1", execution_id="cmd-1", port=port)
+        view = SessionView(build_pending(args))
+        server = ThreadingHTTPServer(("127.0.0.1", port), handler_for(view))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # The fix: /health answers immediately, before any Execution
+            # exists and before correlation has even been attempted.
+            self.assertTrue(session_center_healthy(url, timeout=2))
+
+            store = CommandWatcherTests.allowlist_compliant_store()
+            store.put("commands", "p1", "cmd-1", command())
+            runner = Mock(side_effect=lambda *a, **kw: (kw["on_running"](None), CommandWatcherTests.complete(a[7]))[1])
+            with patch("manager.command_watcher.launch_task", runner):
+                result = process_command(
+                    store, object(), command(), claim_factory=CommandWatcherTests.claim_factory,
+                    allowlist=frozenset({("p1", "t1")}), health_check=lambda: session_center_healthy(url, timeout=2),
+                    quota_check=lambda service: True,
+                )
+            runner.assert_called_once()
+            self.assertEqual("completed", result["status"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+def argparse_namespace(**overrides):
+    import argparse
+    base = {
+        "provider_session_id": None, "execution_file": None, "execution_project_id": None,
+        "execution_id": None, "wait_seconds": 5.0, "project_id": None, "task_id": None,
+        "branch": None, "port": 0, "idle_seconds": 15.0,
+    }
+    base.update(overrides)
+    return argparse.Namespace(**base)
 
 
 if __name__ == "__main__": unittest.main()

@@ -1,19 +1,20 @@
 """Bounded, Drive-backed command watcher that delegates every launch to execution_runner."""
 
 import argparse
-import ctypes
 import json
 import os
 import socket
 import time
+import urllib.request
 from datetime import datetime, timezone
 
 from collectors.publish_drive import build_service
-from manager.codex_launcher import CodexLauncher, process_creation_identity
+from manager.codex_launcher import CodexLauncher, process_identity_state
 from manager.execution_lifecycle import terminalize_execution
 from manager.execution_runner import launch_task
 from manager.executions import cancel_reserved_execution, execution_health, prepare_task_retry
 from manager.gcs_lock_registry import GCSLockRegistry
+from manager.quota_reader import read_drive_status, summarize
 from manager.runtime_bridge import all_projects
 from manager.task_claims import check_task_execution_claim, task_claim_registry
 from manager.tasks import DriveRecords, TaskError, now_iso, validate
@@ -24,9 +25,81 @@ MAX_POLL_SECONDS = 900
 CLAIM_TIMEOUT_SECONDS = 20 * 60
 MAX_COMMANDS_PER_POLL = 4
 
+# A queued command may only be launched if its (project_id, task_id) is an
+# exact entry in this allowlist AND the live Task still satisfies every one
+# of these policies. Absence of a config (unset env var, missing/unreadable/
+# malformed file) means an empty allowlist -- zero launches -- never "assume
+# permissive because nothing else is queued."
+REQUIRED_TASK_POLICIES = frozenset({"disposable", "read_only", "no_repo_writes", "no_external_writes"})
+
 
 def execution_id(command):
     return f"command-{command['command_id']}"
+
+
+def load_allowlist(path=None):
+    """Read the hands-off launch allowlist; any failure degrades to empty (no launches)."""
+    path = path or os.environ.get("ADM_WATCHER_ALLOWLIST_PATH")
+    if not path:
+        return frozenset()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return frozenset()
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return frozenset()
+    allowed = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        project_id, task_id = entry.get("project_id"), entry.get("task_id")
+        if isinstance(project_id, str) and project_id and isinstance(task_id, str) and task_id:
+            allowed.add((project_id, task_id))
+    return frozenset(allowed)
+
+
+def _policy_satisfied(task):
+    """Even an allowlisted task must independently prove it is still disposable/read-only."""
+    if task.get("read_only") is not True:
+        return False
+    policies = task.get("execution_policies")
+    return isinstance(policies, list) and REQUIRED_TASK_POLICIES.issubset(set(policies))
+
+
+def session_center_healthy(url=None, timeout=2.0):
+    """Fail-closed liveness probe: any unreachable/unexpected response is unhealthy.
+
+    Deliberately hits only /health (no Drive dependency of its own), so this
+    can never be confused with an already-running execution's authority --
+    that is handled entirely by the existing recovery/lifecycle path and is
+    never touched by this check.
+    """
+    url = url or os.environ.get("ADM_SESSION_CENTER_HEALTH_URL", "http://127.0.0.1:8765/health")
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            if response.status != 200:
+                return False
+            body = json.loads(response.read())
+    except Exception:
+        return False
+    return isinstance(body, dict) and body.get("status") == "ok"
+
+
+def codex_quota_reliable(service):
+    """Fail-closed: stale/unknown/unreachable quota is never treated as
+    "enough to launch". This reuses quota_reader.summarize()'s own
+    reliability computation unchanged -- no scoring/routing rework, just a
+    pre-launch gate on the same has_reliable_quota signal dispatch() already
+    computes but does not itself hard-block on.
+    """
+    try:
+        quota = summarize(read_drive_status(service=service), max_age_minutes=60)
+    except Exception:
+        return False
+    codex = next((provider for provider in quota["providers"] if provider["provider"] == "codex"), None)
+    return bool(codex and codex.get("has_reliable_quota"))
 
 
 def _result(status, execution_id_value, session_id=None, error_kind=None):
@@ -75,38 +148,7 @@ def _provider_state(execution):
     evidence = execution.get("provider_evidence") or {}
     if evidence.get("host") != socket.gethostname()[:100]:
         return "unknown"
-    pid = evidence.get("pid")
-    expected_identity = evidence.get("creation_identity")
-    if not isinstance(pid, int) or pid <= 0 or not isinstance(expected_identity, str) or not expected_identity:
-        return "unknown"
-    if os.name == "nt":
-        kernel32 = ctypes.windll.kernel32
-        kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
-        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-        handle = kernel32.OpenProcess(0x1000, False, pid)
-        if handle:
-            exit_code = ctypes.c_ulong()
-            queried = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-            kernel32.CloseHandle(handle)
-            if not queried:
-                return "unknown"
-            if exit_code.value != 259:
-                return "stopped"
-        else:
-            return "stopped" if kernel32.GetLastError() == 87 else "unknown"
-    else:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return "stopped"
-        except (OSError, PermissionError):
-            return "unknown"
-    current_identity = process_creation_identity(pid)
-    if current_identity is None:
-        return "unknown"
-    return "live" if current_identity == expected_identity else "replaced"
+    return process_identity_state(evidence.get("pid"), evidence.get("creation_identity"))
 
 
 def _block_prelaunch_task(store, command, reason):
@@ -225,7 +267,8 @@ def _existing_terminal(store, command):
 
 
 def process_command(store, service, command, launcher_factory=CodexLauncher, writer_factory=GCSLockRegistry.from_environment,
-                    claim_factory=task_claim_registry):
+                    claim_factory=task_claim_registry, allowlist=frozenset(), health_check=session_center_healthy,
+                    quota_check=codex_quota_reliable):
     """Claim/reconcile one command; a claimed command is never automatically relaunched."""
     try:
         validate("command", command)
@@ -234,9 +277,30 @@ def process_command(store, service, command, launcher_factory=CodexLauncher, wri
     if command["status"] in ("completed", "failed"):
         return {"status": command["status"], "skipped": True}
     if command["status"] in ("claimed", "running", "attention"):
+        # Already-running authority is governed entirely by existing
+        # recovery/lifecycle; Session Center health never factors in here.
         return _reconcile_active(store, service, command, claim_factory)
     if command["status"] != "queued" or command["provider"] != "codex":
         return {"status": "rejected"}
+    if (command["project_id"], command["task_id"]) not in allowlist:
+        # Out of scope, not an anomaly: leave the command untouched (no write)
+        # so unrelated projects/tasks are never mutated by this watcher.
+        return {"status": "rejected", "reason": "not_allowlisted"}
+    try:
+        candidate_task = store.get("tasks", command["project_id"], command["task_id"])
+        validate("task", candidate_task)
+    except TaskError:
+        return _attention(store, command, None, "allowlisted_task_missing_or_invalid")
+    if not _policy_satisfied(candidate_task):
+        return _attention(store, command, None, "allowlisted_task_policy_not_satisfied")
+    if not health_check():
+        # Transient/recoverable, not a policy problem: leave queued untouched,
+        # no write, so this is retried automatically on the next poll.
+        return {"status": "rejected", "reason": "session_center_unavailable"}
+    if not quota_check(service):
+        # Same treatment: stale/unknown Codex quota is transient, not a
+        # policy violation -- retried automatically once quota data refreshes.
+        return {"status": "rejected", "reason": "quota_unreliable"}
 
     retry_count = command.get("retry_count", 0)
     retry_of = command.get("retry_of_execution_id")
@@ -286,7 +350,9 @@ def process_command(store, service, command, launcher_factory=CodexLauncher, wri
     return {"status": final["status"], "execution_id": claimed["execution_id"]}
 
 
-def poll_once(store, service, **factories):
+def poll_once(store, service, allowlist=None, **factories):
+    if allowlist is None:
+        allowlist = load_allowlist()
     results = []
     for project in all_projects(store):
         try:
@@ -298,7 +364,7 @@ def poll_once(store, service, **factories):
                 continue
             if len(results) == MAX_COMMANDS_PER_POLL:
                 return results
-            results.append(process_command(store, service, command, **factories))
+            results.append(process_command(store, service, command, allowlist=allowlist, **factories))
     return results
 
 
