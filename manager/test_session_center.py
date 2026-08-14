@@ -2,11 +2,13 @@ import json
 import tempfile
 import time
 import unittest
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from manager.session_center import (
-    LiveSession, SessionCenterError, drive_status_source, file_status_source, load_execution, read_codex_meta,
-    wait_for_execution,
+    LiveSession, SessionCenterError, drive_status_source, file_status_source, handler_for, load_execution,
+    read_codex_meta, wait_for_execution,
 )
 
 
@@ -224,6 +226,29 @@ class SessionCenterTest(unittest.TestCase):
                 "cleanup_evidence": {"task_claim_release": "released", "writer_release": "released"},
             }
             self.assertEqual("completed", session.snapshot()["current_state"])
+
+    def test_health_endpoint_is_independent_of_drive_and_correlation_state(self):
+        """The watcher's launch gate must be able to check liveness alone,
+        without that check depending on Drive reachability or on whether
+        this particular session ever correlates -- those stay /api/session's
+        job. An UNLINKED, uncorrelated session must still answer /health."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.session_file(directory)
+            meta = read_codex_meta(path, "provider-1")
+            session = LiveSession("provider-1", path, meta["cwd"], meta["started_at"], "adm", "task-1", None, "branch")
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(session))
+            port = server.server_address[1]
+            import threading
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as response:
+                    self.assertEqual(200, response.status)
+                    self.assertEqual({"status": "ok"}, json.loads(response.read()))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
 
 
 if __name__ == "__main__":

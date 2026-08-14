@@ -217,6 +217,11 @@ def handler_for(session: LiveSession):
                 self._send(200, "text/html; charset=utf-8", HTML.encode())
             elif self.path == "/api/session":
                 self._send(200, "application/json", json.dumps(session.snapshot()).encode())
+            elif self.path == "/health":
+                # Liveness only: the HTTP server itself is up and serving.
+                # Deliberately independent of Drive reachability or
+                # correlation state -- those are what /api/session reports.
+                self._send(200, "application/json", b'{"status":"ok"}')
             else:
                 self._send(404, "application/json", b'{"error":"not found"}')
 
