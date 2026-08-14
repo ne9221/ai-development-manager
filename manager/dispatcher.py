@@ -39,6 +39,9 @@ def request_ok(request):
         raise TaskError("invalid dispatcher input: expected_minutes")
     if request.get("preferred_provider") and request.get("preferred_provider") == request.get("excluded_provider"):
         raise TaskError("preferred_provider cannot also be excluded")
+    for key in ("model", "fallback_model"):
+        if request.get(key) is not None and (not isinstance(request[key], str) or not request[key].strip() or len(request[key]) > 200):
+            raise TaskError(f"invalid dispatcher input: {key}")
 
 
 def quota_line(provider):
@@ -166,7 +169,10 @@ def dispatch(store, service, request, quota_document=None, executions=None):
     summary = quota_line(selected_quota)
     generated = prompt_for(project, task, handoff, selected, selected_estimate, summary, warnings, request.get("shared_rules"), request.get("ponytail_available"))
     return {
-        "recommended_provider": selected, "mode": CAPABILITIES[selected]["mode"], "effort": decision["recommended_effort"],
+        "recommended_provider": selected, "provider": selected,
+        "model": request.get("model"), "fallback_model": request.get("fallback_model"),
+        "mode": CAPABILITIES[selected]["mode"], "effort": decision["recommended_effort"],
+        "selection_reason": decision["reasons"],
         "quota_evidence": decision["quota_evidence"],
         "estimated_minutes": selected_estimate["estimated_minutes"], "split_recommended": selected_estimate["split_recommended"], "phase_count": selected_estimate["suggested_phases"],
         "alternatives": alternatives, "quota_summary": summary, "warnings": warnings, "generated_prompt": generated,

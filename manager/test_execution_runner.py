@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from manager.codex_launcher import CodexLaunchError, LaunchOutcome, LaunchRequest
-from manager.execution_runner import run_execution
+from manager.execution_runner import launch_task, run_execution
 from manager.task_claims import check_task_execution_claim
 from manager.tasks import TaskError
 from manager.test_execution_lifecycle import build_store, quota_document
@@ -17,6 +17,11 @@ from manager.worktree_locks import link_session
 class Process:
     def __init__(self): self.live = True
     def poll(self): return None if self.live else 0
+
+
+class DelayedProcess(Process):
+    def wait(self, timeout=None):
+        self.live = False
 
 
 class Launcher:
@@ -31,13 +36,18 @@ class Launcher:
             self.process.live = False  # CodexLauncher.prepare() owns cleanup before returning.
             raise CodexLaunchError("spawn_failed", "raw secret from prepare")
         client = SimpleNamespace(process=self.process)
-        self.prepared = SimpleNamespace(thread_id="thread-1", session_path=None, prepared_at="2026-08-13T13:00:00Z", _client=client)
+        self.prepared = SimpleNamespace(thread_id="thread-1", session_path=None, pid=4242,
+                                        process_creation_identity="test-process:4242",
+                                        prepared_at="2026-08-13T13:00:00Z", _client=client)
         return self.prepared
 
     def start(self, prepared, prompt):
         self.events.append("start")
         if self.failure == "start": raise CodexLaunchError("protocol_error", "raw secret from start")
-        return SimpleNamespace(prepared=prepared)
+        return SimpleNamespace(prepared=prepared, started_at="2026-08-13T13:00:01Z")
+
+    def set_heartbeat(self, running, callback):
+        running.heartbeat = callback
 
     def wait(self, running):
         self.events.append("wait")
@@ -83,7 +93,7 @@ class RunnerTests(unittest.TestCase):
         store.put = ordered_put
         with patch("manager.execution_runner.link_writer_session", side_effect=lambda *args, **kwargs: (events.append("writer-link"), link_session(*args, **kwargs))[1]):
             _, writer, _, _, result = self.execute(launcher=launcher, store=store)
-        self.assertEqual(["prepare", "session", "execution-link", "writer-link", "start", "wait", "close"], events)
+        self.assertEqual(["prepare", "session", "execution-link", "writer-link", "start", "execution-link", "wait", "execution-link", "close"], events)
         self.assertEqual("codex:thread-1", result["session"]["session_id"])
         self.assertEqual("codex:thread-1", next(iter(writer.document["locks"].values()))["session_id"])
 
@@ -123,6 +133,11 @@ class RunnerTests(unittest.TestCase):
             self.execute(launcher=launcher)
         terminalize.assert_not_called()
 
+    def test_close_wait_proves_delayed_provider_stop(self):
+        launcher = Launcher(); launcher.process = DelayedProcess(); launcher.prepared = None
+        store, _, _, _, result = self.execute(launcher=launcher)
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+
     def test_terminal_persistence_failure_retains_authority(self):
         store = build_store(working_directory=self.request.working_directory); real_put = store.put
         def fail_terminal(area, project, name, document):
@@ -149,6 +164,19 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("released", write_result["terminal"]["cleanup"]["task_claim_release"])
         self.assertIsNone(claim.document)
         self.assertEqual("released", next(iter(writer.document["locks"].values()))["status"])
+
+    def test_read_only_launch_is_explicitly_sandboxed_without_approval_prompts(self):
+        store = build_store(read_only=True, working_directory=self.request.working_directory)
+        launcher = Launcher()
+        with patch("manager.execution_runner.dispatch", return_value={
+            "recommended_provider": "codex", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
+            "generated_prompt": "bounded read-only task",
+        }), patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-sandbox")
+        self.assertEqual("read-only", launcher.request.sandbox)
+        self.assertEqual("never", launcher.request.approval_policy)
 
     def test_prompt_transcript_stderr_and_raw_failure_are_not_persisted(self):
         store, _, _, _, _ = self.execute(launcher=Launcher(outcome="failed"))

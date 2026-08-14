@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from mcp import Client
 
-from manager.mcp_adapter import invoke_bridge, server
+from manager.mcp_adapter import MAX_REQUEST_LENGTH, MAX_RESPONSE_BYTES, invoke_bridge, server
 from manager.runtime_quota_tool import read_runtime_status
 from manager.tasks import TaskError
 
@@ -89,6 +89,16 @@ class MCPAdapterTests(unittest.TestCase):
         self.assertTrue(all(item["status"] == "unavailable" and item["windows"] == [] for item in unavailable["providers"].values()))
         self.assertNotIn("backend-secret", json.dumps(unavailable))
 
+    def test_runtime_quota_stale_round_trip(self):
+        document = quota_document()
+        old = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
+        document["generated_at"] = old
+        for provider in document["providers"]:
+            provider["last_updated"] = old
+        with patch("manager.runtime_bridge.read_drive_status", return_value=document):
+            stale = structured(asyncio.run(tool("adm_runtime_quota_status", {})))
+        self.assertTrue(all(item["status"] == "stale" for item in stale["providers"].values()))
+
     def test_runtime_quota_valid_boundaries_reach_loader(self):
         with patch("manager.runtime_bridge.read_drive_status", return_value=quota_document()), \
              patch("manager.runtime_quota_tool.read_runtime_status", wraps=read_runtime_status) as loader:
@@ -148,11 +158,44 @@ class MCPAdapterTests(unittest.TestCase):
         self.assertEqual([True], calls); self.assertEqual("1.0", result["contract_version"])
         self.assertNotIn("hunter2", json.dumps(result))
 
+    def test_backend_exception_and_oversized_output_are_fixed_safe_errors(self):
+        with patch("manager.mcp_adapter.default_service_factory", side_effect=RuntimeError("Bearer backend-secret")):
+            unavailable = asyncio.run(tool("adm_dispatch", {"project_id": "adm", "user_request": "work"}))
+        self.assertTrue(unavailable.is_error)
+        self.assertIn("runtime data is unavailable", str(unavailable.content))
+        self.assertNotIn("backend-secret", str(unavailable.content))
+
+        def oversized(*_args, **_kwargs):
+            return contract(generated_prompt="x" * MAX_RESPONSE_BYTES)
+        class Service:
+            def files(self): return object()
+        with self.assertRaisesRegex(TaskError, "transport limit"):
+            invoke_bridge({"project_id": "adm", "user_request": "work"}, Service, oversized)
+
     def test_invalid_project_and_malformed_input(self):
         with patch("manager.mcp_adapter.invoke_bridge", side_effect=TaskError("project resolution expected one match; found 0")):
             self.assertTrue(asyncio.run(tool("adm_dispatch", {"project_id": "missing", "user_request": "work"})).is_error)
         self.assertTrue(asyncio.run(tool("adm_dispatch", {"project_id": "adm"})).is_error)
         self.assertTrue(asyncio.run(tool("adm_status", {})).is_error)
+        self.assertTrue(asyncio.run(tool("adm_dispatch", {"project_id": "adm", "task_id": "x" * 201, "user_request": "work"})).is_error)
+        self.assertTrue(asyncio.run(tool("adm_dispatch", {"project_id": "adm", "user_request": "x" * (MAX_REQUEST_LENGTH + 1)})).is_error)
+
+    def test_invalid_project_task_and_raw_exception_messages_are_not_exposed(self):
+        for failure in (TaskError("missing task token=task-secret"), RuntimeError("Bearer backend-secret")):
+            with patch("manager.mcp_adapter.default_service_factory", return_value=object()), \
+                 patch("manager.mcp_adapter.runtime_bridge", side_effect=failure):
+                result = asyncio.run(tool("adm_dispatch", {"project_id": "adm", "task_id": "missing", "user_request": "work"}))
+            serialized = str(result.content)
+            self.assertTrue(result.is_error)
+            self.assertNotIn("task-secret", serialized)
+            self.assertNotIn("backend-secret", serialized)
+
+    def test_module_exposes_stdio_entrypoint(self):
+        source = subprocess.run(
+            [sys.executable, "-c", "import manager.mcp_adapter as m; assert callable(m.main)"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(0, source.returncode, source.stderr)
 
 
 if __name__ == "__main__": unittest.main()

@@ -50,9 +50,12 @@ at most eight windows are returned.
 Drive read, bounded validation, reliability/freshness classification, safe
 projection, and unavailable fallback, and fails closed to the same bounded
 contract even if projection or final contract validation itself raises.
-ChatGPT cannot call the local CLI or this Python function directly today; the
-next transport may call this one function without reading Drive itself. No
-MCP, connector, or HTTP integration is implemented in this phase.
+The local MCP stdio transport exposes this function as
+`adm_runtime_quota_status` without reading or parsing quota itself. Start it
+from the repository root with `python -m manager.mcp_adapter`; an MCP client
+can then call quota status and read-only `adm_dispatch` without a Codex or
+Claude conversation. See `docs/MCP-INTEGRATION.md` for the complete tool and
+security contract.
 
 This contract assumes write access to the Drive `AI-RESOURCE-STATUS/status.json`
 SSOT is controlled: the file is downloaded and JSON-parsed before per-provider

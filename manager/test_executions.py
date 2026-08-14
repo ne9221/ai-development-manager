@@ -142,7 +142,19 @@ class ExecutionTests(unittest.TestCase):
         ready = prepare_task_retry(self.store, MemoryClaimRegistry(), "p1", "t1", "prior")
         self.assertEqual("ready", ready["status"]); self.assertIsNone(ready["blocked_reason"])
         self.assertNotIn("active_execution_id", ready["source_context"]); self.assertTrue(ready["source_context"]["keep"])
+        self.assertEqual(1, ready["source_context"]["retry_count"])
+        self.assertEqual("prior", ready["source_context"]["retry_of_execution_id"])
         self.assertEqual(ready, prepare_task_retry(self.store, MemoryClaimRegistry(), "p1", "t1", "prior"))
+
+    def test_retry_reservation_is_bounded_and_linked_to_prior_execution(self):
+        retry = reserve_execution(self.store, "p1", "t1", "retry-1", "codex", decision(),
+                                  retry_count=1, retry_of_execution_id="prior")
+        self.assertEqual(1, retry["retry_count"]); self.assertEqual("prior", retry["retry_of_execution_id"])
+        with self.assertRaisesRegex(TaskError, "from 0 to 2"):
+            reserve_execution(self.store, "p1", "t1", "retry-3", "codex", decision(),
+                              retry_count=3, retry_of_execution_id="retry-2")
+        with self.assertRaisesRegex(TaskError, "link every retry"):
+            reserve_execution(self.store, "p1", "t1", "unlinked", "codex", decision(), retry_count=1)
 
     def test_retry_rejects_incomplete_cleanup_claim_writer_and_active_execution(self):
         base = reserve_execution(self.store, "p1", "t1", "prior", "codex", decision())

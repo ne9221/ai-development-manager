@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Drive Command",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["command_id", "project_id", "task_id", "provider", "model", "fallback_model", "mode", "effort", "selection_reason", "quota_evidence", "created_at", "status", "execution_id", "claimed_at", "completed_at", "result"],
+  "properties": {
+    "command_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
+    "project_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
+    "task_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
+    "provider": {"const": "codex"},
+    "model": {"type": ["string", "null"], "maxLength": 200},
+    "fallback_model": {"type": ["string", "null"], "maxLength": 200},
+    "mode": {"type": ["string", "null"], "maxLength": 80},
+    "effort": {"type": ["string", "null"], "maxLength": 80},
+    "selection_reason": {"type": "array", "items": {"type": "string", "maxLength": 500}, "maxItems": 8},
+    "quota_evidence": {"type": ["object", "null"]},
+    "created_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["queued", "claimed", "running", "attention", "completed", "failed"]},
+    "execution_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9._-]{1,200}$"},
+    "claimed_at": {"type": ["string", "null"], "format": "date-time"},
+    "completed_at": {"type": ["string", "null"], "format": "date-time"},
+    "stale_at": {"type": ["string", "null"], "format": "date-time"},
+    "recovery_reason": {"type": ["string", "null"], "maxLength": 300},
+    "retry_count": {"type": "integer", "minimum": 0, "maximum": 2},
+    "retry_of_execution_id": {"type": ["string", "null"], "maxLength": 200},
+    "result": {"type": ["object", "null"], "additionalProperties": false, "properties": {"status": {"enum": ["completed", "failed", "interrupted", "error"]}, "execution_id": {"type": ["string", "null"], "maxLength": 200}, "session_id": {"type": ["string", "null"], "maxLength": 600}, "error_kind": {"type": ["string", "null"], "maxLength": 100}}}
+  }
+}

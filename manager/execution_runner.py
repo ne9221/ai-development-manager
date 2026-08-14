@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import socket
 import sys
 import uuid
 
@@ -10,7 +11,7 @@ from collectors.publish_drive import build_service
 from manager.codex_launcher import CodexLaunchError, CodexLauncher, LaunchRequest
 from manager.dispatcher import dispatch
 from manager.execution_lifecycle import enter_running_gate, terminalize_execution
-from manager.executions import link_execution_session, reserve_execution
+from manager.executions import MAX_HARD_TIMEOUT_SECONDS, heartbeat_execution, hard_timeout_seconds, link_execution_session, reserve_execution
 from manager.gcs_lock_registry import GCSLockRegistry
 from manager.quota_reader import read_drive_status
 from manager.session_identity import manager_session_key
@@ -20,8 +21,7 @@ from manager.worktree_locks import link_session as link_writer_session
 
 
 RPC_TIMEOUT_SECONDS = 30.0
-MIN_TURN_TIMEOUT_SECONDS = 30.0
-MAX_TURN_TIMEOUT_SECONDS = 20 * 60.0
+MAX_TURN_TIMEOUT_SECONDS = float(MAX_HARD_TIMEOUT_SECONDS)
 
 
 def task_turn_timeout(expected_minutes, override=None):
@@ -29,7 +29,7 @@ def task_turn_timeout(expected_minutes, override=None):
         if isinstance(override, bool) or not isinstance(override, (int, float)) or not 0 < override <= MAX_TURN_TIMEOUT_SECONDS:
             raise TaskError(f"timeout_seconds must be within (0, {MAX_TURN_TIMEOUT_SECONDS:g}]")
         return float(override)
-    return min(MAX_TURN_TIMEOUT_SECONDS, max(MIN_TURN_TIMEOUT_SECONDS, float(expected_minutes) * 60.0))
+    return hard_timeout_seconds(expected_minutes)
 
 
 def _thread_id(prepared):
@@ -91,6 +91,12 @@ def _persist_session_link(store, writer_registry, execution, prepared, request, 
 
 def _stopped(prepared):
     process = getattr(getattr(prepared, "_client", None), "process", None)
+    wait = getattr(process, "wait", None)
+    if callable(wait):
+        try:
+            wait(timeout=5)
+        except Exception:
+            pass
     poll = getattr(process, "poll", None)
     return callable(poll) and poll() is not None
 
@@ -113,7 +119,8 @@ def _dispatch_request(task):
 
 
 def launch_task(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
-                execution_id=None, model=None, timeout_seconds=None, quota_document=None, executions=None):
+                execution_id=None, model=None, timeout_seconds=None, quota_document=None, executions=None,
+                retry_count=0, retry_of_execution_id=None, on_running=None):
     """Dispatch, reserve, and run one ready task; callers supply real authorities."""
     task = store.get("tasks", project_id, task_id)
     validate("task", task)
@@ -123,19 +130,22 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
         raise TaskError("dispatch did not select Codex")
     execution_id = execution_id or f"{task_id}-{uuid.uuid4().hex[:12]}"
     reserve_execution(store, project_id, task_id, execution_id, "codex", dispatched["quota_evidence"],
-                      dispatched["mode"], dispatched["effort"])
+                      dispatched["mode"], dispatched["effort"], retry_count=retry_count,
+                      retry_of_execution_id=retry_of_execution_id)
     request = LaunchRequest(task["working_directory"], model=model, reasoning_effort=dispatched["effort"],
+                            sandbox="read-only" if task["read_only"] else None,
+                            approval_policy="never" if task["read_only"] else None,
                             timeout_seconds=RPC_TIMEOUT_SECONDS, turn_timeout_seconds=turn_timeout)
     result = run_execution(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                            execution_id, dispatched["generated_prompt"], request,
                            access="read_only" if task["read_only"] else "production_write",
-                           baseline_head=task.get("baseline_head"))
+                           baseline_head=task.get("baseline_head"), on_running=on_running)
     return {"execution_id": execution_id, "dispatch": dispatched, **result}
 
 
 def run_execution(store, service, writer_registry, claim_registry, launcher: CodexLauncher,
                   project_id, task_id, execution_id, prompt, launch_request: LaunchRequest,
-                  access="production_write", baseline_head=None):
+                  access="production_write", baseline_head=None, on_running=None):
     """Run one reserved Codex execution through the reviewed lifecycle gates.
 
     ``provider_stopped`` is derived only after prepare-owned cleanup or after
@@ -146,6 +156,7 @@ def run_execution(store, service, writer_registry, claim_registry, launcher: Cod
     gate = enter_running_gate(
         store, service, writer_registry, project_id, task_id, execution_id, "codex", access,
         baseline_head=baseline_head, task_claim_registry=claim_registry,
+        hard_timeout=launch_request.turn_timeout_seconds,
     )
     execution = gate["execution"]
     lease_token = gate["lease"]["lease_token"] if gate["lease"] else None
@@ -153,12 +164,29 @@ def run_execution(store, service, writer_registry, claim_registry, launcher: Cod
     operation_error = close_error = None
     status, summary = "interrupted", "Codex runner interrupted"
     try:
+        if on_running:
+            on_running(execution)
         if launch_request.working_directory != execution["task_snapshot"].get("working_directory"):
             raise TaskError("launch working directory does not match the reserved execution")
         prepared = launcher.prepare(launch_request)
+        provider_evidence = {
+            "host": socket.gethostname()[:100], "pid": prepared.pid,
+            "creation_identity": prepared.process_creation_identity,
+            "started_at": prepared.prepared_at,
+        }
+        heartbeat_execution(store, project_id, execution_id, "provider_prepared",
+                            at=prepared.prepared_at, provider_evidence=provider_evidence)
         session = _persist_session_link(store, writer_registry, execution, prepared, launch_request, lease_token)
         running = launcher.start(prepared, prompt)
+        heartbeat_execution(store, project_id, execution_id, "turn_started", at=running.started_at)
+        set_heartbeat = getattr(launcher, "set_heartbeat", None)
+        if callable(set_heartbeat):
+            set_heartbeat(running, lambda event: heartbeat_execution(
+                store, project_id, execution_id, event, provider_evidence=provider_evidence,
+                progress=event == "provider_event",
+            ))
         outcome = launcher.wait(running)
+        heartbeat_execution(store, project_id, execution_id, "turn_terminal", at=outcome.completed_at)
         status = outcome.status if outcome.status in ("completed", "failed", "interrupted") else "failed"
         summary = f"Codex turn {status}"
         if outcome.failure_classification:

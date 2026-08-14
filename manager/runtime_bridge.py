@@ -346,6 +346,7 @@ def runtime_bridge(store, service, request, quota_document=None, executions=None
             "needs_research": task.get("needs_research", False) if task else False,
             "needs_browser": task.get("needs_browser", False) if task else False,
             "preferred_provider": request.get("preferred_provider"), "excluded_provider": request.get("excluded_provider"),
+            "model": request.get("model"), "fallback_model": request.get("fallback_model"),
             "shared_rules": shared_rules, "ponytail_available": request.get("ponytail_available"),
             "persist_task": not read_only,
         }
@@ -367,7 +368,9 @@ def runtime_bridge(store, service, request, quota_document=None, executions=None
         "contract_version": "1.0",
         "project": {key: project.get(key) for key in ("project_id", "name", "repo", "default_branch", "working_directory", "baseline_commit")},
         "request_type": kind, "active_task": compact_task(task), "latest_handoff_summary": handoff_summary(store, project_id, task),
-        "recommended_provider": provider, "mode": result.get("mode"), "effort": result.get("effort"), "estimated_minutes": result.get("estimated_minutes"),
+        "recommended_provider": provider, "provider": result.get("provider", provider), "model": result.get("model"),
+        "fallback_model": result.get("fallback_model"), "mode": result.get("mode"), "effort": result.get("effort"),
+        "selection_reason": result.get("selection_reason", []), "quota_evidence": result.get("quota_evidence"), "estimated_minutes": result.get("estimated_minutes"),
         "split_recommended": result.get("split_recommended", False), "alternatives": result.get("alternatives", []), "quota_summary": result.get("quota_summary"),
         "quota_freshness": provider_quota["freshness"] if provider_quota else "unknown", "warnings": warnings,
         "next_action": next_action, "generated_prompt": result.get("generated_prompt"), "execution_batches": batches,
