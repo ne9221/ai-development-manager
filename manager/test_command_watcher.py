@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 import os
 import socket
@@ -385,6 +386,62 @@ class CommandWatcherTests(unittest.TestCase):
                 self.assertEqual(frozenset({("p1", "t1")}), load_allowlist())
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(frozenset(), load_allowlist())
+
+
+class WatcherSessionCenterBootstrapIntegrationTests(unittest.TestCase):
+    """Reproduces the exact deadlock the reviewer found and proves the fix:
+    Session Center used to block its own HTTP bind on wait_for_execution(),
+    so /health never came up until an Execution already existed -- but the
+    watcher requires /health before it will create that Execution. No Codex
+    involved; this only exercises the real HTTP bind and the real gate."""
+
+    def test_health_gate_crosses_before_correlation_completes_no_livelock(self):
+        from http.server import ThreadingHTTPServer
+        from manager.command_watcher import session_center_healthy
+        from manager.session_center import SessionView, build_pending, handler_for
+
+        port = 18899
+        url = f"http://127.0.0.1:{port}/health"
+
+        # Before Session Center exists at all, the gate correctly reports
+        # unavailable -- this is normal sequencing, not the livelock.
+        self.assertFalse(session_center_healthy(url, timeout=0.5))
+
+        args = argparse_namespace(execution_project_id="p1", execution_id="cmd-1", port=port)
+        view = SessionView(build_pending(args))
+        server = ThreadingHTTPServer(("127.0.0.1", port), handler_for(view))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # The fix: /health answers immediately, before any Execution
+            # exists and before correlation has even been attempted.
+            self.assertTrue(session_center_healthy(url, timeout=2))
+
+            store = CommandWatcherTests.allowlist_compliant_store()
+            store.put("commands", "p1", "cmd-1", command())
+            runner = Mock(side_effect=lambda *a, **kw: (kw["on_running"](None), CommandWatcherTests.complete(a[7]))[1])
+            with patch("manager.command_watcher.launch_task", runner):
+                result = process_command(
+                    store, object(), command(), claim_factory=CommandWatcherTests.claim_factory,
+                    allowlist=frozenset({("p1", "t1")}), health_check=lambda: session_center_healthy(url, timeout=2),
+                    quota_check=lambda service: True,
+                )
+            runner.assert_called_once()
+            self.assertEqual("completed", result["status"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+def argparse_namespace(**overrides):
+    import argparse
+    base = {
+        "provider_session_id": None, "execution_file": None, "execution_project_id": None,
+        "execution_id": None, "wait_seconds": 5.0, "project_id": None, "task_id": None,
+        "branch": None, "port": 0, "idle_seconds": 15.0,
+    }
+    base.update(overrides)
+    return argparse.Namespace(**base)
 
 
 if __name__ == "__main__": unittest.main()

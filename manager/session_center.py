@@ -210,13 +210,69 @@ class LiveSession:
         }
 
 
-def handler_for(session: LiveSession):
+@dataclass
+class PendingCorrelation:
+    """Displayed while the HTTP server is already up but the target
+    Execution/session has not been observed yet -- the deterministic
+    execution_id is known immediately (from the CLI args that name it), so
+    this is never a guess and never fakes a provider_session_id or a
+    running/completed state."""
+    project_id: str | None
+    task_id: str | None
+    execution_id: str | None
+    provider: str = "codex"
+    error: str | None = None
+
+    def snapshot(self) -> dict:
+        return {
+            "provider": self.provider,
+            "project_id": self.project_id,
+            "task_id": self.task_id,
+            "execution_id": self.execution_id or "UNLINKED",
+            "provider_session_id": None,
+            "cwd": None,
+            "branch": None,
+            "started_at": None,
+            "current_state": "correlation_failed" if self.error else "correlating",
+            "latest_activity": None,
+            "correlated": False,
+        }
+
+
+class SessionView:
+    """Thread-safe holder the HTTP handler reads through. Starts as a
+    PendingCorrelation and is swapped, at most once, for a resolved
+    LiveSession -- in place, no server restart -- once correlation succeeds.
+    """
+    def __init__(self, pending: PendingCorrelation):
+        self._lock = threading.Lock()
+        self._current: PendingCorrelation | LiveSession = pending
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            current = self._current
+        return current.snapshot()
+
+    def resolve(self, live_session: LiveSession) -> None:
+        with self._lock:
+            self._current = live_session
+
+    def fail(self, message: str) -> None:
+        with self._lock:
+            if isinstance(self._current, PendingCorrelation):
+                self._current = PendingCorrelation(
+                    self._current.project_id, self._current.task_id,
+                    self._current.execution_id, self._current.provider, error=message,
+                )
+
+
+def handler_for(view: SessionView):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/":
                 self._send(200, "text/html; charset=utf-8", HTML.encode())
             elif self.path == "/api/session":
-                self._send(200, "application/json", json.dumps(session.snapshot()).encode())
+                self._send(200, "application/json", json.dumps(view.snapshot()).encode())
             elif self.path == "/health":
                 # Liveness only: the HTTP server itself is up and serving.
                 # Deliberately independent of Drive reachability or
@@ -265,41 +321,90 @@ def file_status_source(execution_file: Path, provider_session_id: str, provider_
     return read
 
 
-def build_session(args: argparse.Namespace) -> LiveSession:
-    execution = None
-    store = None
-    provider_session_id = args.provider_session_id
+def _validate_identity_args(args: argparse.Namespace) -> None:
+    """Pure, non-blocking input validation. Anything that requires waiting
+    on Drive or the filesystem is deferred to the background resolver so it
+    can never delay the HTTP server binding."""
     if args.execution_project_id or args.execution_id:
-        if not args.execution_project_id or not args.execution_id or args.execution_file or provider_session_id:
+        if not args.execution_project_id or not args.execution_id or args.execution_file or args.provider_session_id:
             raise SessionCenterError("execution project/id mode cannot be combined with another identity source")
-        from manager.tasks import DriveRecords, build_service
-        store = DriveRecords(build_service())
-        execution = wait_for_execution(store, args.execution_project_id, args.execution_id, args.wait_seconds)
-        provider_session_id = execution["provider_session_id"]
-    if not provider_session_id:
+        return
+    if not args.provider_session_id:
         raise SessionCenterError("provider session ID or execution project/id is required")
-    session_file = find_codex_session(provider_session_id)
-    meta = read_codex_meta(session_file, provider_session_id)
-    if execution:
-        execution = validate_execution(execution, provider_session_id, meta["cwd"])
-        return LiveSession(
-            provider_session_id, session_file, meta["cwd"], meta["started_at"], execution["project_id"],
-            execution["task_id"], execution["execution_id"], execution["branch"], execution["provider"], args.idle_seconds, True,
-            status_source=drive_status_source(store, execution["project_id"], execution["execution_id"]),
-        )
-    if args.execution_file:
-        execution = load_execution(args.execution_file, provider_session_id, meta["cwd"])
-        return LiveSession(
-            provider_session_id, session_file, meta["cwd"], meta["started_at"], execution["project_id"],
-            execution["task_id"], execution["execution_id"], execution["branch"], execution["provider"], args.idle_seconds, True,
-            status_source=file_status_source(args.execution_file, provider_session_id, meta["cwd"]),
-        )
-    if not args.project_id or not args.task_id:
+    if not args.execution_file and (not args.project_id or not args.task_id):
         raise SessionCenterError("project/task are required when no ADM Execution JSON is provided")
-    return LiveSession(
-        provider_session_id, session_file, meta["cwd"], meta["started_at"], args.project_id, args.task_id,
-        None, args.branch or current_branch(meta["cwd"]), "codex", args.idle_seconds, False,
-    )
+
+
+def build_pending(args: argparse.Namespace) -> PendingCorrelation:
+    """Fast: figures out the deterministic identity to display while
+    correlating, without touching Drive or the filesystem."""
+    _validate_identity_args(args)
+    if args.execution_project_id:
+        return PendingCorrelation(args.execution_project_id, None, args.execution_id)
+    return PendingCorrelation(args.project_id, args.task_id, None)
+
+
+def _resolve_execution_mode(args: argparse.Namespace, deadline: float) -> LiveSession:
+    from manager.tasks import DriveRecords, build_service
+    store = DriveRecords(build_service())
+    execution = wait_for_execution(store, args.execution_project_id, args.execution_id, max(0.1, deadline - time.monotonic()))
+    provider_session_id = execution["provider_session_id"]
+    last_error: SessionCenterError | None = None
+    while time.monotonic() < deadline:
+        try:
+            session_file = find_codex_session(provider_session_id)
+            meta = read_codex_meta(session_file, provider_session_id)
+            execution = validate_execution(execution, provider_session_id, meta["cwd"])
+            return LiveSession(
+                provider_session_id, session_file, meta["cwd"], meta["started_at"], execution["project_id"],
+                execution["task_id"], execution["execution_id"], execution["branch"], execution["provider"], args.idle_seconds, True,
+                status_source=drive_status_source(store, execution["project_id"], execution["execution_id"]),
+            )
+        except SessionCenterError as exc:
+            last_error = exc
+            time.sleep(.25)
+    raise last_error or SessionCenterError("timed out waiting for the Codex session file")
+
+
+def _resolve_provider_session_mode(args: argparse.Namespace, deadline: float) -> LiveSession:
+    provider_session_id = args.provider_session_id
+    last_error: SessionCenterError | None = None
+    while time.monotonic() < deadline:
+        try:
+            session_file = find_codex_session(provider_session_id)
+            meta = read_codex_meta(session_file, provider_session_id)
+            if args.execution_file:
+                execution = load_execution(args.execution_file, provider_session_id, meta["cwd"])
+                return LiveSession(
+                    provider_session_id, session_file, meta["cwd"], meta["started_at"], execution["project_id"],
+                    execution["task_id"], execution["execution_id"], execution["branch"], execution["provider"], args.idle_seconds, True,
+                    status_source=file_status_source(args.execution_file, provider_session_id, meta["cwd"]),
+                )
+            return LiveSession(
+                provider_session_id, session_file, meta["cwd"], meta["started_at"], args.project_id, args.task_id,
+                None, args.branch or current_branch(meta["cwd"]), "codex", args.idle_seconds, False,
+            )
+        except SessionCenterError as exc:
+            last_error = exc
+            time.sleep(.25)
+    raise last_error or SessionCenterError("timed out waiting for the Codex session file")
+
+
+def resolve_session(args: argparse.Namespace, deadline: float) -> LiveSession:
+    if args.execution_project_id:
+        return _resolve_execution_mode(args, deadline)
+    return _resolve_provider_session_mode(args, deadline)
+
+
+def _resolve_and_swap(view: SessionView, args: argparse.Namespace) -> None:
+    """Runs in a background thread; never blocks HTTP server startup."""
+    deadline = time.monotonic() + args.wait_seconds
+    try:
+        live_session = resolve_session(args, deadline)
+    except SessionCenterError as exc:
+        view.fail(str(exc))
+        return
+    view.resolve(live_session)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -322,12 +427,21 @@ def main() -> int:
     if not 1 <= args.port <= 65535 or args.idle_seconds <= 0 or args.wait_seconds <= 0:
         raise SystemExit("invalid port or idle timeout")
     try:
-        session = build_session(args)
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(session))
-    except (SessionCenterError, OSError) as exc:
+        pending = build_pending(args)
+    except SessionCenterError as exc:
         print(f"ERROR: {exc}", file=__import__("sys").stderr)
         return 1
-    print(json.dumps({"url": f"http://127.0.0.1:{args.port}", "provider_session_id": session.provider_session_id}))
+    view = SessionView(pending)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(view))
+    except OSError as exc:
+        print(f"ERROR: {exc}", file=__import__("sys").stderr)
+        return 1
+    # /health is reachable the instant this prints -- correlation (which may
+    # depend on the watcher having launched a provider yet) happens after,
+    # in the background, so a health-gated launcher can never deadlock on it.
+    print(json.dumps({"url": f"http://127.0.0.1:{args.port}"}))
+    threading.Thread(target=_resolve_and_swap, args=(view, args), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

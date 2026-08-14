@@ -1,15 +1,28 @@
+import argparse
 import json
 import tempfile
+import threading
 import time
 import unittest
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from manager.session_center import (
-    LiveSession, SessionCenterError, drive_status_source, file_status_source, handler_for, load_execution,
-    read_codex_meta, wait_for_execution,
+    LiveSession, SessionCenterError, SessionView, build_pending, drive_status_source, file_status_source,
+    handler_for, load_execution, read_codex_meta, resolve_session, wait_for_execution,
 )
+
+
+def bootstrap_args(**overrides):
+    base = {
+        "provider_session_id": None, "execution_file": None, "execution_project_id": None,
+        "execution_id": None, "wait_seconds": 5.0, "project_id": None, "task_id": None,
+        "branch": None, "port": 0, "idle_seconds": 15.0,
+    }
+    base.update(overrides)
+    return argparse.Namespace(**base)
 
 
 class SessionCenterTest(unittest.TestCase):
@@ -249,6 +262,147 @@ class SessionCenterTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
+
+
+class BootstrapTests(unittest.TestCase):
+    """Session Center must bind /health before any Execution/session
+    correlation is even attempted -- otherwise a watcher that gates new
+    launches on /health can never launch the very Execution this process is
+    waiting to observe (the livelock the reviewer found)."""
+
+    def session_file(self, directory: str) -> Path:
+        path = Path(directory) / "session.jsonl"
+        path.write_text(json.dumps({
+            "timestamp": "2026-08-14T09:31:49.290Z", "type": "session_meta",
+            "payload": {"id": "provider-1", "cwd": directory},
+        }) + "\n", encoding="utf-8")
+        return path
+
+    def start_server(self, view):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(view))
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, port
+
+    def get(self, port, path):
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as response:
+            return response.status, json.loads(response.read())
+
+    def test_server_binds_and_health_is_ok_before_any_execution_exists(self):
+        args = bootstrap_args(execution_project_id="adm", execution_id="run-1")
+        view = SessionView(build_pending(args))
+        server, port = self.start_server(view)
+        try:
+            status, body = self.get(port, "/health")
+            self.assertEqual(200, status)
+            self.assertEqual({"status": "ok"}, body)
+        finally:
+            server.shutdown(); server.server_close()
+
+    def test_api_session_shows_correlating_and_never_fakes_unknown_fields(self):
+        args = bootstrap_args(execution_project_id="adm", execution_id="run-1")
+        view = SessionView(build_pending(args))
+        server, port = self.start_server(view)
+        try:
+            status, body = self.get(port, "/api/session")
+            self.assertEqual(200, status)
+            self.assertEqual("correlating", body["current_state"])
+            self.assertFalse(body["correlated"])
+            self.assertEqual("run-1", body["execution_id"])
+            self.assertEqual("adm", body["project_id"])
+            self.assertIsNone(body["task_id"])
+            for field in ("provider_session_id", "cwd", "branch", "started_at", "latest_activity"):
+                self.assertIsNone(body[field], f"{field} must not be faked while correlating")
+        finally:
+            server.shutdown(); server.server_close()
+
+    def test_provider_session_mode_also_shows_correlating_not_a_startup_failure(self):
+        args = bootstrap_args(provider_session_id="provider-1", project_id="adm", task_id="task-1")
+        view = SessionView(build_pending(args))
+        server, port = self.start_server(view)
+        try:
+            status, body = self.get(port, "/api/session")
+            self.assertEqual(200, status)
+            self.assertEqual("correlating", body["current_state"])
+            self.assertFalse(body["correlated"])
+        finally:
+            server.shutdown(); server.server_close()
+
+    def test_execution_appearing_later_transitions_the_same_process_to_correlated(self):
+        with tempfile.TemporaryDirectory() as codex_home, tempfile.TemporaryDirectory() as cwd:
+            sessions_dir = Path(codex_home) / "sessions"
+            sessions_dir.mkdir()
+            session_path = sessions_dir / "rollout-provider-1.jsonl"
+            session_path.write_text(json.dumps({
+                "timestamp": "2026-08-14T09:31:49.290Z", "type": "session_meta",
+                "payload": {"id": "provider-1", "cwd": cwd},
+            }) + "\n", encoding="utf-8")
+            record = {
+                "provider": "codex", "project_id": "adm", "task_id": "task-1", "execution_id": "run-1",
+                "provider_session_id": "provider-1", "task_snapshot": {"working_directory": cwd, "branch": "main"},
+            }
+
+            class DelayedStore:
+                def __init__(self):
+                    self.calls = 0
+
+                def get(self, area, project_id, execution_id):
+                    self.calls += 1
+                    if self.calls < 3:
+                        raise KeyError("not yet")
+                    return record
+
+            args = bootstrap_args(execution_project_id="adm", execution_id="run-1", wait_seconds=5.0)
+            view = SessionView(build_pending(args))
+            server, port = self.start_server(view)
+            try:
+                status, body = self.get(port, "/api/session")
+                self.assertEqual("correlating", body["current_state"], "must be visible before correlation resolves")
+
+                delayed_store = DelayedStore()
+                with patch.dict("os.environ", {"CODEX_HOME": codex_home}), \
+                     patch("manager.tasks.build_service", return_value=object()), \
+                     patch("manager.tasks.DriveRecords", return_value=delayed_store):
+                    live_session = resolve_session(args, time.monotonic() + 5.0)
+                view.resolve(live_session)  # exactly what _resolve_and_swap does on success
+
+                status, body = self.get(port, "/api/session")
+                self.assertEqual(200, status)
+                self.assertTrue(body["correlated"])
+                self.assertEqual("provider-1", body["provider_session_id"])
+                self.assertNotEqual("correlating", body["current_state"])
+                self.assertGreaterEqual(delayed_store.calls, 3, "must have retried, not failed on first miss")
+            finally:
+                server.shutdown(); server.server_close()
+
+    def test_resolution_timeout_reports_failure_without_crashing_the_server(self):
+        args = bootstrap_args(execution_project_id="adm", execution_id="run-timeout", wait_seconds=0.3)
+        view = SessionView(build_pending(args))
+        server, port = self.start_server(view)
+        try:
+
+            class NeverStore:
+                def get(self, area, project_id, execution_id):
+                    raise KeyError("never appears")
+
+            with patch("manager.tasks.build_service", return_value=object()), \
+                 patch("manager.tasks.DriveRecords", return_value=NeverStore()):
+                thread = threading.Thread(target=self._run_and_fail, args=(view, args), daemon=True)
+                thread.start()
+                thread.join(timeout=5)
+
+            status, body = self.get(port, "/api/session")
+            self.assertEqual(200, status, "server must still be up and answering after a resolution timeout")
+            self.assertFalse(body["correlated"])
+            self.assertNotEqual("completed", body["current_state"])
+        finally:
+            server.shutdown(); server.server_close()
+
+    @staticmethod
+    def _run_and_fail(view, args):
+        from manager.session_center import _resolve_and_swap
+        _resolve_and_swap(view, args)
 
 
 if __name__ == "__main__":
