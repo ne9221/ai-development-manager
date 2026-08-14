@@ -66,6 +66,11 @@ class MemoryStore:
                 raise TaskError("running persistence verification failed")
             return deepcopy(self.records[(area, project, name)])
 
+    def list_records(self, area, project):
+        with self.mutex:
+            return [deepcopy(value) for (record_area, record_project, _), value in self.records.items()
+                    if record_area == area and record_project == project]
+
     def read_task_for_claim(self, project, name):
         with self.mutex:
             key = ("tasks", project, name)

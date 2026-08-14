@@ -74,13 +74,13 @@ class CommandWatcherTests(unittest.TestCase):
     @staticmethod
     def iso(value): return value.isoformat().replace("+00:00", "Z")
 
-    def running_command(self, heartbeat_minutes=0, started_minutes=1, pid=None, legacy=False):
+    def running_command(self, heartbeat_minutes=0, started_minutes=1, pid=None, legacy=False, provider="codex"):
         now = datetime.now(timezone.utc)
         started = self.iso(now - timedelta(minutes=started_minutes))
-        reserve_execution(self.store, "p1", "t1", "command-cmd-1", "codex", {"decision": "fresh"})
+        reserve_execution(self.store, "p1", "t1", "command-cmd-1", provider, {"decision": "fresh"})
         claim = MemoryClaimRegistry()
         with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
-            enter_running_gate(self.store, object(), None, "p1", "t1", "command-cmd-1", "codex",
+            enter_running_gate(self.store, object(), None, "p1", "t1", "command-cmd-1", provider,
                                "read_only", started_at=started, task_claim_registry=claim)
         execution = self.store.get("executions", "p1", "command-cmd-1")
         execution["heartbeat_at"] = self.iso(now - timedelta(minutes=heartbeat_minutes))
@@ -96,7 +96,7 @@ class CommandWatcherTests(unittest.TestCase):
             for key in ("heartbeat_at", "progress_updated_at", "provider_evidence", "last_provider_event", "hard_timeout_at"):
                 execution[key] = None
         self.store.put("executions", "p1", "command-cmd-1", execution)
-        active = command(status="running", execution_id="command-cmd-1", claimed_at=started)
+        active = command(status="running", execution_id="command-cmd-1", claimed_at=started, provider=provider)
         self.store.put("commands", "p1", "cmd-1", active)
         return active, claim, execution
 
@@ -221,6 +221,34 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertEqual("interrupted", self.store.get("executions", "p1", "command-cmd-1")["status"])
         self.assertEqual("failed", self.store.get("commands", "p1", "cmd-1")["status"])
         self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+
+    # Phase 4E parity gate item: process identity / PID reuse safety and the
+    # full stale-provider auto-recovery path, reproduced exactly for
+    # provider="claude" -- byte-identical scenario to the Codex test above,
+    # just with the provider substituted, proving the recovery path carries
+    # no Codex-only assumption.
+    def test_proven_dead_read_only_claude_provider_terminalizes_and_writes_command_task(self):
+        active, claim, _ = self.running_command(heartbeat_minutes=16, pid=99_999_999, provider="claude")
+        with patch("manager.executions.read_drive_status", return_value=quota_document()):
+            result = process_command(self.store, object(), active, claim_factory=lambda *_: claim)
+        self.assertEqual("failed", result["status"]); self.assertIsNone(claim.document)
+        execution = self.store.get("executions", "p1", "command-cmd-1")
+        self.assertEqual("interrupted", execution["status"])
+        self.assertEqual("claude", execution["provider"])
+        self.assertEqual("failed", self.store.get("commands", "p1", "cmd-1")["status"])
+        self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+
+    def test_same_pid_with_different_creation_identity_is_not_live_for_claude_provider(self):
+        # PID-reuse safety is implemented once in process_identity_state()
+        # (shared by both providers) -- this proves a Claude execution gets
+        # the same "replaced" fail-closed treatment a Codex one already does.
+        active, claim, execution = self.running_command(pid=os.getpid(), provider="claude")
+        execution["provider_evidence"]["creation_identity"] = "impersonated-identity"
+        self.store.put("executions", "p1", "command-cmd-1", execution)
+        with patch("manager.executions.read_drive_status", return_value=quota_document()):
+            result = process_command(self.store, object(), active, claim_factory=lambda *_: claim)
+        self.assertEqual("attention", result["status"])
+        self.assertIsNotNone(claim.document)  # never released against an unverified/impersonated process
 
     def test_legacy_uncertain_execution_and_claim_are_not_mutated(self):
         active, claim, execution = self.running_command(heartbeat_minutes=99, started_minutes=999, legacy=True)
