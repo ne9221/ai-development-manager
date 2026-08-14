@@ -1,11 +1,18 @@
 import unittest
+import os
+import socket
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 from manager.command_watcher import CLAIM_TIMEOUT_SECONDS, poll_once, process_command
+from manager.execution_lifecycle import enter_running_gate
+from manager.executions import execution_health, reserve_execution
 from manager.task_claims import TaskClaimConflict
 from manager.tasks import TaskError, create_project, create_task, now_iso
 from manager.test_execution_lifecycle import project, task
+from manager.test_execution_lifecycle import quota_document
+from manager.test_task_claims import MemoryClaimRegistry
 
 
 class Store:
@@ -44,13 +51,38 @@ class CommandWatcherTests(unittest.TestCase):
     @staticmethod
     def claim_factory(*_args): return object()
 
+    @staticmethod
+    def iso(value): return value.isoformat().replace("+00:00", "Z")
+
+    def running_command(self, heartbeat_minutes=0, started_minutes=1, pid=None, legacy=False):
+        now = datetime.now(timezone.utc)
+        started = self.iso(now - timedelta(minutes=started_minutes))
+        reserve_execution(self.store, "p1", "t1", "command-cmd-1", "codex", {"decision": "fresh"})
+        claim = MemoryClaimRegistry()
+        with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+            enter_running_gate(self.store, object(), None, "p1", "t1", "command-cmd-1", "codex",
+                               "read_only", started_at=started, task_claim_registry=claim)
+        execution = self.store.get("executions", "p1", "command-cmd-1")
+        execution["heartbeat_at"] = self.iso(now - timedelta(minutes=heartbeat_minutes))
+        execution["provider_evidence"] = {
+            "host": socket.gethostname()[:100], "pid": pid or os.getpid(), "started_at": started,
+        }
+        execution["last_provider_event"] = "provider_wait"
+        if legacy:
+            for key in ("heartbeat_at", "provider_evidence", "last_provider_event", "hard_timeout_at"):
+                execution[key] = None
+        self.store.put("executions", "p1", "command-cmd-1", execution)
+        active = command(status="running", execution_id="command-cmd-1", claimed_at=started)
+        self.store.put("commands", "p1", "cmd-1", active)
+        return active, claim, execution
+
     def test_duplicate_polling_runs_once_and_persists_terminal_result(self):
-        runner = Mock(side_effect=lambda *args: self.complete(args[7]))
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])
         with patch("manager.command_watcher.launch_task", runner):
             self.store.put("commands", "p1", "cmd-1", command())
             first = poll_once(self.store, object(), claim_factory=self.claim_factory)
             second = poll_once(self.store, object(), claim_factory=self.claim_factory)
-        self.assertEqual("completed", first[0]["status"]); self.assertTrue(second[0]["skipped"]); runner.assert_called_once()
+        self.assertEqual("completed", first[0]["status"]); self.assertEqual([], second); runner.assert_called_once()
         stored = self.store.get("commands", "p1", "cmd-1")
         self.assertEqual("command-cmd-1", stored["execution_id"]); self.assertEqual("completed", stored["result"]["status"])
         self.assertEqual("code", stored["mode"]); self.assertEqual(["fresh quota"], stored["selection_reason"])
@@ -60,6 +92,17 @@ class CommandWatcherTests(unittest.TestCase):
         runner = Mock()
         result = process_command(self.store, object(), claimed, launcher_factory=runner)
         self.assertEqual("claimed", result["status"]); runner.assert_not_called()
+
+    def test_command_becomes_running_only_after_running_gate_callback(self):
+        states = []
+        def runner(*args, **kwargs):
+            states.append(self.store.get("commands", "p1", "cmd-1")["status"])
+            kwargs["on_running"](None)
+            states.append(self.store.get("commands", "p1", "cmd-1")["status"])
+            return self.complete(args[7])
+        with patch("manager.command_watcher.launch_task", side_effect=runner):
+            process_command(self.store, object(), command(), claim_factory=self.claim_factory)
+        self.assertEqual(["claimed", "running"], states)
 
     def test_orphaned_claim_times_out_without_relaunch(self):
         claimed = command(status="claimed", execution_id="command-cmd-1", claimed_at="2000-01-01T00:00:00Z")
@@ -96,10 +139,59 @@ class CommandWatcherTests(unittest.TestCase):
 
         self.store = Store(); create_project(self.store, project()); create_task(self.store, task(read_only=True), assign=False)
         self.store.fail_command_terminal = True
-        with patch("manager.command_watcher.launch_task", Mock(side_effect=lambda *args: self.complete(args[7]))):
+        with patch("manager.command_watcher.launch_task", Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])):
             with self.assertRaisesRegex(TaskError, "Drive unavailable"):
                 process_command(self.store, object(), command(), claim_factory=self.claim_factory)
         self.assertEqual("running", self.store.get("commands", "p1", "cmd-1")["status"])
+
+    def test_health_contract_distinguishes_healthy_stale_and_over_expected(self):
+        _, _, healthy = self.running_command()
+        self.assertEqual("healthy", execution_health(healthy)["state"])
+
+        healthy["started_at"] = self.iso(datetime.now(timezone.utc) - timedelta(minutes=20))
+        healthy["heartbeat_at"] = self.iso(datetime.now(timezone.utc) - timedelta(minutes=16))
+        self.assertEqual("heartbeat_stale", execution_health(healthy)["reason"])
+
+        healthy["started_at"] = self.iso(datetime.now(timezone.utc) - timedelta(minutes=21))
+        healthy["heartbeat_at"] = now_iso()
+        healthy["hard_timeout_at"] = self.iso(datetime.now(timezone.utc) + timedelta(minutes=39))
+        result = execution_health(healthy)
+        self.assertEqual("healthy", result["state"]); self.assertTrue(result["over_expected"])
+
+    def test_stale_live_provider_is_attention_and_never_reclaimed(self):
+        active, claim, _ = self.running_command(heartbeat_minutes=16, pid=os.getpid())
+        result = process_command(self.store, object(), active, claim_factory=lambda *_: claim)
+        self.assertEqual("attention", result["status"])
+        self.assertEqual("command-cmd-1", claim.document["execution_id"])
+        self.assertEqual(1, claim.generation)
+        self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+
+    def test_proven_dead_read_only_provider_terminalizes_and_writes_command_task(self):
+        active, claim, _ = self.running_command(heartbeat_minutes=16, pid=99_999_999)
+        with patch("manager.executions.read_drive_status", return_value=quota_document()):
+            result = process_command(self.store, object(), active, claim_factory=lambda *_: claim)
+        self.assertEqual("failed", result["status"]); self.assertIsNone(claim.document)
+        self.assertEqual("interrupted", self.store.get("executions", "p1", "command-cmd-1")["status"])
+        self.assertEqual("failed", self.store.get("commands", "p1", "cmd-1")["status"])
+        self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+
+    def test_legacy_uncertain_execution_and_claim_are_not_mutated(self):
+        active, claim, execution = self.running_command(heartbeat_minutes=99, started_minutes=999, legacy=True)
+        before_claim = deepcopy(claim.document); before_generation = claim.generation
+        result = process_command(self.store, object(), active, claim_factory=lambda *_: claim)
+        self.assertEqual("attention", result["status"])
+        self.assertEqual(execution, self.store.get("executions", "p1", "command-cmd-1"))
+        self.assertEqual(before_claim, claim.document); self.assertEqual(before_generation, claim.generation)
+
+    def test_prelaunch_reservation_is_cancelled_and_not_left_running(self):
+        def reserve_then_fail(*args, **kwargs):
+            reserve_execution(self.store, "p1", "t1", args[7], "codex", {"decision": "fresh"})
+            raise TaskError("preflight failed")
+        with patch("manager.command_watcher.launch_task", side_effect=reserve_then_fail):
+            result = process_command(self.store, object(), command(), claim_factory=lambda *_: MemoryClaimRegistry())
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("cancelled", self.store.get("executions", "p1", "command-cmd-1")["status"])
+        self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
 
 
 if __name__ == "__main__": unittest.main()

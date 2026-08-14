@@ -78,6 +78,28 @@
     "provider_session_id": {"type": ["string", "null"], "minLength": 1, "description": "Raw provider session ID for the primary linked session."},
     "elapsed_minutes": {"type": ["number", "null"], "minimum": 0},
     "status": {"enum": ["reserved", "running", "completed", "failed", "interrupted", "cancelled"]},
+    "retry_count": {"type": "integer", "minimum": 0, "maximum": 2},
+    "retry_of_execution_id": {"type": ["string", "null"], "minLength": 1},
+    "heartbeat_at": {"type": ["string", "null"], "format": "date-time", "description": "Authoritative meaningful lifecycle/progress activity timestamp."},
+    "hard_timeout_at": {"type": ["string", "null"], "format": "date-time"},
+    "last_provider_event": {"type": ["string", "null"], "maxLength": 100},
+    "provider_evidence": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["host", "pid", "started_at"],
+          "properties": {
+            "host": {"type": "string", "minLength": 1, "maxLength": 100},
+            "pid": {"type": "integer", "minimum": 1},
+            "started_at": {"type": "string", "format": "date-time"}
+          }
+        }
+      ]
+    },
+    "stale_at": {"type": ["string", "null"], "format": "date-time"},
+    "recovery_reason": {"type": ["string", "null"], "maxLength": 300},
+    "terminal_reason": {"type": ["string", "null"], "maxLength": 300},
     "quota_evidence": {"type": ["object", "null"], "description": "Caller-supplied quota decision evidence preserved by reservation."},
     "quota_before": {"type": ["object", "null"]},
     "quota_after": {"type": ["object", "null"]},

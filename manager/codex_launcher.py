@@ -17,7 +17,8 @@ from typing import Any, Callable
 
 
 MAX_TIMEOUT_SECONDS = 300.0
-MAX_TURN_TIMEOUT_SECONDS = 1200.0
+MAX_TURN_TIMEOUT_SECONDS = 7200.0
+HEARTBEAT_INTERVAL_SECONDS = 60.0
 MAX_ERROR_CHARS = 1000
 MAX_STDERR_CHARS = 8192
 
@@ -94,6 +95,8 @@ class RunningLaunch:
     turn_id: str
     started_at: str
     _cancelled: bool = field(default=False, repr=False)
+    _heartbeat: Callable[[str], Any] | None = field(default=None, repr=False)
+    _last_heartbeat: float = field(default=0.0, repr=False)
 
 
 @dataclass(frozen=True)
@@ -391,9 +394,16 @@ class CodexLauncher:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise CodexLaunchError("timeout", "turn completion timed out")
-            kind, payload = client.next_event(remaining)
+            try:
+                kind, payload = client.next_event(min(remaining, HEARTBEAT_INTERVAL_SECONDS))
+            except CodexLaunchError as exc:
+                if exc.classification == "timeout" and time.monotonic() < deadline:
+                    self._emit_heartbeat(running, "provider_wait")
+                    continue
+                raise
             if kind == "failure":
                 raise payload
+            self._emit_heartbeat(running, "provider_event")
             if not isinstance(payload, dict) or payload.get("method") != "turn/completed":
                 continue
             params = payload.get("params")
@@ -407,6 +417,17 @@ class CodexLauncher:
             detail = str(error.get("message") or f"turn ended with status {status}")[:MAX_ERROR_CHARS]
             classification = "cancelled" if running._cancelled and status == "interrupted" else "turn_failed"
             return LaunchOutcome(status if status in ("failed", "interrupted") else "failed", running.prepared.thread_id, running.turn_id, utc_now(), classification, detail)
+
+    def set_heartbeat(self, running: RunningLaunch, callback: Callable[[str], Any]):
+        running._heartbeat = callback
+        running._last_heartbeat = time.monotonic()
+
+    @staticmethod
+    def _emit_heartbeat(running: RunningLaunch, event: str):
+        now = time.monotonic()
+        if running._heartbeat and now - running._last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+            running._heartbeat(event)
+            running._last_heartbeat = now
 
     def cancel(self, running: RunningLaunch, reason: str | None = None):
         del reason  # Deliberately not sent or logged; it may contain sensitive text.

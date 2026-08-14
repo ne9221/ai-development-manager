@@ -36,13 +36,17 @@ class Launcher:
             self.process.live = False  # CodexLauncher.prepare() owns cleanup before returning.
             raise CodexLaunchError("spawn_failed", "raw secret from prepare")
         client = SimpleNamespace(process=self.process)
-        self.prepared = SimpleNamespace(thread_id="thread-1", session_path=None, prepared_at="2026-08-13T13:00:00Z", _client=client)
+        self.prepared = SimpleNamespace(thread_id="thread-1", session_path=None, pid=4242,
+                                        prepared_at="2026-08-13T13:00:00Z", _client=client)
         return self.prepared
 
     def start(self, prepared, prompt):
         self.events.append("start")
         if self.failure == "start": raise CodexLaunchError("protocol_error", "raw secret from start")
-        return SimpleNamespace(prepared=prepared)
+        return SimpleNamespace(prepared=prepared, started_at="2026-08-13T13:00:01Z")
+
+    def set_heartbeat(self, running, callback):
+        running.heartbeat = callback
 
     def wait(self, running):
         self.events.append("wait")
@@ -88,7 +92,7 @@ class RunnerTests(unittest.TestCase):
         store.put = ordered_put
         with patch("manager.execution_runner.link_writer_session", side_effect=lambda *args, **kwargs: (events.append("writer-link"), link_session(*args, **kwargs))[1]):
             _, writer, _, _, result = self.execute(launcher=launcher, store=store)
-        self.assertEqual(["prepare", "session", "execution-link", "writer-link", "start", "wait", "close"], events)
+        self.assertEqual(["prepare", "session", "execution-link", "writer-link", "start", "execution-link", "wait", "execution-link", "close"], events)
         self.assertEqual("codex:thread-1", result["session"]["session_id"])
         self.assertEqual("codex:thread-1", next(iter(writer.document["locks"].values()))["session_id"])
 

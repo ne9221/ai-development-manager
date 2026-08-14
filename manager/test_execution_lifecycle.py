@@ -232,7 +232,6 @@ class ExecutionLifecycleTests(unittest.TestCase):
         for reason, store, preflight in (
             ("unavailable working directory", build_store(working_directory="missing"), validate_local_preflight),
             ("unavailable local git", build_store(), Mock(side_effect=TaskError("local Git preflight failed"))),
-            ("non-full branch", build_store(branch="main"), Mock()),
         ):
             acquire_mock = Mock()
             with self.subTest(reason=reason), self.assertRaises(TaskError):

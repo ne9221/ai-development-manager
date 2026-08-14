@@ -4,7 +4,7 @@
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from collectors.publish_drive import build_service
 from manager.quota_reader import read_drive_status
@@ -15,10 +15,54 @@ from manager.tasks import DriveRecords, TaskError, complete_task, now_iso, updat
 
 MAX_SNAPSHOT_AGE_MINUTES = 60
 MAX_CANCELLATION_REASON_CHARS = 300
+STALE_AFTER_SECONDS = 15 * 60
+MIN_HARD_TIMEOUT_SECONDS = 30 * 60
+MAX_HARD_TIMEOUT_SECONDS = 2 * 60 * 60
+MAX_RETRY_COUNT = 2
 
 
 def parse_time(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def hard_timeout_seconds(expected_minutes):
+    """Planning estimates never become authority; hard runtime remains bounded."""
+    return min(MAX_HARD_TIMEOUT_SECONDS, max(MIN_HARD_TIMEOUT_SECONDS, float(expected_minutes) * 3 * 60))
+
+
+def execution_health(execution, now=None):
+    """Classify persisted lifecycle evidence without changing execution authority."""
+    now = now or datetime.now(timezone.utc)
+    if execution.get("status") != "running":
+        return {"state": execution.get("status"), "reason": None, "over_expected": False}
+    started = parse_time(execution["started_at"])
+    heartbeat = parse_time(execution.get("heartbeat_at") or execution["started_at"])
+    expected = float((execution.get("task_snapshot") or {}).get("expected_minutes") or 20) * 60
+    elapsed = (now - started).total_seconds()
+    idle = (now - heartbeat).total_seconds()
+    hard = execution.get("hard_timeout_at")
+    if heartbeat < started or heartbeat > now + timedelta(minutes=5):
+        return {"state": "attention", "reason": "activity_timestamp_inconsistent", "over_expected": elapsed > expected}
+    if execution.get("session_id") and not execution.get("provider_evidence"):
+        return {"state": "attention", "reason": "provider_evidence_missing", "over_expected": elapsed > expected}
+    if hard and now >= parse_time(hard):
+        return {"state": "attention", "reason": "hard_timeout_exceeded", "over_expected": elapsed > expected}
+    if idle > STALE_AFTER_SECONDS:
+        return {"state": "attention", "reason": "heartbeat_stale", "over_expected": elapsed > expected}
+    return {"state": "healthy", "reason": None, "over_expected": elapsed > expected}
+
+
+def heartbeat_execution(store, project_id, execution_id, event, at=None, provider_evidence=None):
+    """Persist the single authoritative activity clock plus bounded provider evidence."""
+    execution = store.get("executions", project_id, execution_id)
+    if execution.get("status") != "running":
+        raise TaskError("heartbeat requires a running execution")
+    execution["heartbeat_at"] = at or now_iso()
+    execution["last_provider_event"] = str(event)[:100]
+    if provider_evidence is not None:
+        execution["provider_evidence"] = provider_evidence
+    validate("execution", execution)
+    return store.put("executions", project_id, execution_id, execution)
 
 
 def quota_snapshot(document, provider_id):
@@ -159,16 +203,22 @@ def read_session_for_link(store, project_id, session_ref, provider=None):
     raise TaskError(f"session not found for link: {session_ref}")
 
 
-def reserve_execution(store, project_id, task_id, execution_id, provider, quota_evidence, mode=None, effort=None, reserved_at=None, notes=None):
+def reserve_execution(store, project_id, task_id, execution_id, provider, quota_evidence, mode=None, effort=None, reserved_at=None, notes=None,
+                      retry_count=0, retry_of_execution_id=None):
     """Create an idempotent execution reservation without starting work."""
     if not isinstance(quota_evidence, dict) or not quota_evidence:
         raise TaskError("quota_evidence must be a non-empty object")
     task = store.get("tasks", project_id, task_id)
+    if isinstance(retry_count, bool) or not isinstance(retry_count, int) or not 0 <= retry_count <= MAX_RETRY_COUNT:
+        raise TaskError(f"retry_count must be from 0 to {MAX_RETRY_COUNT}")
+    if (retry_count == 0) != (retry_of_execution_id is None):
+        raise TaskError("retry metadata must link every retry to its prior execution")
     expected = {
         "execution_id": execution_id, "task_id": task_id, "project_id": project_id,
         "provider": provider, "mode": mode or task.get("mode"), "effort": effort or task.get("effort"),
         "notes": list(notes or []), "task_snapshot": task_snapshot(task),
         "quota_evidence": quota_evidence,
+        "retry_count": retry_count, "retry_of_execution_id": retry_of_execution_id,
     }
     try:
         existing = store.get("executions", project_id, execution_id)
@@ -191,6 +241,9 @@ def reserve_execution(store, project_id, task_id, execution_id, provider, quota_
         "finished_at": None, "session_id": None, "provider_session_id": None,
         "quota_before": None, "quota_after": None, "quota_delta": None,
         "source_confidence": None,
+        "heartbeat_at": None, "hard_timeout_at": None, "last_provider_event": None,
+        "provider_evidence": None, "stale_at": None, "recovery_reason": None,
+        "terminal_reason": None,
     }
     validate("execution", execution)
     return store.put("executions", project_id, execution_id, execution)
@@ -227,12 +280,16 @@ def cancel_reserved_execution(store, claim_registry, project_id, execution_id, r
     return cancelled
 
 
-def prepare_task_retry(store, claim_registry, project_id, task_id, prior_execution_id):
+def prepare_task_retry(store, claim_registry, project_id, task_id, prior_execution_id, retry_count=1):
     """Return one safely cleaned-up failed/interrupted task to ready."""
     task = store.get("tasks", project_id, task_id)
     validate("task", task)
     prior = store.get("executions", project_id, prior_execution_id)
     validate("execution", prior)
+    if isinstance(retry_count, bool) or not isinstance(retry_count, int) or not 1 <= retry_count <= MAX_RETRY_COUNT:
+        raise TaskError(f"retry_count must be from 1 to {MAX_RETRY_COUNT}")
+    if retry_count != int(prior.get("retry_count", 0)) + 1:
+        raise TaskError("retry_count must increment the prior execution exactly once")
     if prior.get("task_id") != task_id or prior.get("status") not in ("failed", "interrupted"):
         raise TaskError("retry requires the task's failed or interrupted prior execution")
     cleanup = prior.get("cleanup_evidence") or {}
@@ -248,10 +305,13 @@ def prepare_task_retry(store, claim_registry, project_id, task_id, prior_executi
     context = dict(task.get("source_context") or {})
     active = context.get("active_execution_id")
     if task.get("status") == "ready" and active is None and task.get("blocked_reason") is None:
-        return task
+        if context.get("retry_count") == retry_count and context.get("retry_of_execution_id") == prior_execution_id:
+            return task
+        raise TaskError("ready task retry linkage does not match the prior execution")
     if task.get("status") != "blocked" or active != prior_execution_id:
         raise TaskError("retry requires a blocked task linked to the prior execution")
     context.pop("active_execution_id", None)
+    context.update(retry_count=retry_count, retry_of_execution_id=prior_execution_id)
     ready = {**task, "status": "ready", "blocked_reason": None, "source_context": context,
              "updated_at": now_iso(), "current_progress": "Retry ready", "next_action": "Retry execution"}
     validate("task", ready)
@@ -278,6 +338,7 @@ def persist_terminal(store, service, project_id, execution_id, status="completed
         completed_at=completed_at, elapsed_minutes=round(elapsed, 6), status=status,
         finished_at=completed_at,
         quota_after=after, quota_delta=quota_delta(execution["quota_before"], after, execution["started_at"], completed_at),
+        heartbeat_at=completed_at, last_provider_event="terminal", terminal_reason=(note or status)[:300],
     )
     if note:
         execution["notes"].append(note)

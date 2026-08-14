@@ -1,6 +1,8 @@
 """Authoritative reservation-to-running lifecycle gate."""
 
-from manager.executions import persist_terminal, quota_snapshot, task_snapshot
+from datetime import timedelta
+
+from manager.executions import MAX_HARD_TIMEOUT_SECONDS, hard_timeout_seconds, parse_time, persist_terminal, quota_snapshot, task_snapshot
 from manager.quota_reader import read_drive_status
 from manager.task_claims import CLAIM_SCHEMA_VERSION, TaskClaimConflict, check_task_execution_claim, claim_task_execution, release_task_execution_claim
 from manager.tasks import TaskError, create_handoff, now_iso, validate
@@ -40,8 +42,12 @@ def _rollback_execution(store, project_id, execution_id, original):
     return store.get("executions", project_id, execution_id) == original
 
 
-def enter_running_gate(store, service, registry, project_id, task_id, execution_id, provider, access, baseline_head=None, started_at=None, task_claim_registry=None):
+def enter_running_gate(store, service, registry, project_id, task_id, execution_id, provider, access, baseline_head=None,
+                       started_at=None, task_claim_registry=None, hard_timeout=None):
     """Validate and authorize one reservation; never launches a provider."""
+    if hard_timeout is not None and (isinstance(hard_timeout, bool) or not isinstance(hard_timeout, (int, float))
+                                     or not 0 < hard_timeout <= MAX_HARD_TIMEOUT_SECONDS):
+        raise TaskError("hard execution timeout is invalid")
     try:
         execution = store.get("executions", project_id, execution_id)
     except KeyError as exc:
@@ -78,8 +84,6 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
         project = store.get("projects", project_id, project_id)
         validate("project", project)
         branch = snapshot.get("branch")
-        if not isinstance(branch, str) or not branch.startswith("refs/heads/"):
-            raise TaskError("production running gate requires a full branch ref")
         repository_request = project["repo"]
         repository = canonical_repository(repository_request)
         expected_lock_id = repository_lock_id(repository)
@@ -168,10 +172,16 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
         store.put("tasks", project_id, task_id, in_progress)
         if store.get("tasks", project_id, task_id) != in_progress:
             raise TaskError("in-progress task persistence verification failed")
+        running_started = started_at or now_iso()
+        hard_timeout_at = (parse_time(running_started) + timedelta(
+            seconds=hard_timeout if hard_timeout is not None else hard_timeout_seconds(snapshot.get("expected_minutes") or 20)
+        )).isoformat(timespec="seconds").replace("+00:00", "Z")
         running = {
             **execution, "access": access, "lease_evidence": lease_evidence,
-            "started_at": started_at or now_iso(), "status": "running",
+            "started_at": running_started, "status": "running",
             "quota_before": before, "source_confidence": before.get("confidence", "unknown"),
+            "heartbeat_at": running_started, "hard_timeout_at": hard_timeout_at,
+            "last_provider_event": "running_gate", "recovery_reason": None, "stale_at": None,
         }
         validate("execution", running)
         store.put("executions", project_id, execution_id, running)

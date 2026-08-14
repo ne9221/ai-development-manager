@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from manager.codex_launcher import CodexLaunchError, CodexLauncher, LaunchRequest, resolve_codex_executable
+from manager.codex_launcher import CodexLaunchError, CodexLauncher, LaunchRequest, RunningLaunch, resolve_codex_executable
 
 
 _END = object()
@@ -262,6 +262,14 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaisesRegex(CodexLaunchError, "completion timed out"):
             launcher.wait(running)
 
+    def test_provider_event_heartbeats_are_throttled_to_one_per_minute(self):
+        running = RunningLaunch(self.prepare(), "turn-1", "2026-08-14T00:00:00Z")
+        events = []; running._heartbeat = events.append; running._last_heartbeat = 100
+        with patch("manager.codex_launcher.time.monotonic", side_effect=(120, 160)):
+            CodexLauncher._emit_heartbeat(running, "provider_event")
+            CodexLauncher._emit_heartbeat(running, "provider_event")
+        self.assertEqual(["provider_event"], events)
+
     def test_notifications_do_not_extend_wait_deadline(self):
         def handler(process, message):
             happy_handler(process, message)
@@ -287,7 +295,7 @@ class LauncherTests(unittest.TestCase):
 
         launcher = CodexLauncher(executable=__file__, popen=lambda *args, **kwargs: calls.append(1))
         with self.assertRaisesRegex(CodexLaunchError, "turn_timeout_seconds"):
-            launcher.prepare(LaunchRequest(self.cwd, turn_timeout_seconds=1201))
+            launcher.prepare(LaunchRequest(self.cwd, turn_timeout_seconds=7201))
         self.assertEqual([], calls)
 
     def test_stderr_is_continuously_drained_and_bounded(self):

@@ -14,5 +14,9 @@
   "execution_id": null,
   "claimed_at": null,
   "completed_at": null,
+  "stale_at": null,
+  "recovery_reason": null,
+  "retry_count": 0,
+  "retry_of_execution_id": null,
   "result": null
 }

@@ -57,6 +57,25 @@ dispatch + fresh quota decision
 -> release lease in finally
 ```
 
+## Stale and timeout recovery contract
+
+- `heartbeat_at` on the Execution is the single activity clock; Drive file
+  modification time and Command timestamps are not heartbeat authority.
+- No meaningful activity for 15 minutes is stale. `expected_minutes` is only a
+  planning estimate and exceeding it alone does not release or terminate work.
+- The provider turn hard timeout is three times `expected_minutes`, bounded to
+  30–120 minutes, and is persisted as `hard_timeout_at`.
+- Stale work with a live, remote-host, missing, or otherwise unknown provider
+  becomes Command `attention`. No claim or writer authority is released and no
+  duplicate execution is started.
+- Same-host PID absence proves the recorded provider process stopped. The
+  watcher may terminalize only read-only work because it can release that exact
+  task-claim generation. Production-write recovery still requires the private
+  writer token and therefore remains fail-closed.
+- A pre-authority `reserved` execution with no task claim is cancelled and
+  written back as a failed Command plus blocked Task. Retries are explicit,
+  linked to the prior execution, and limited to two.
+
 The authoritative acquire is a mandatory ordering boundary for production
 writes. Session discovery occurs after provider launch because the provider
 owns and creates its session identity.

@@ -199,9 +199,13 @@ Stdout is one machine-readable JSON object. Exit code `0` means `completed`;
 transcript, stderr, and raw provider error details are never printed or stored.
 
 The Task must be in a valid `ready` state. Startup RPCs use a separate bounded
-timeout from turn completion. The turn timeout is derived from
-`expected_minutes`, with a 20-minute maximum; `--timeout-seconds` explicitly
-overrides it but remains subject to that maximum.
+timeout from turn completion. `expected_minutes` remains a planning estimate;
+the hard turn timeout is three times that estimate, bounded to 30–120 minutes.
+`--timeout-seconds` explicitly overrides it within the same 120-minute ceiling.
+The runner writes the authoritative execution `heartbeat_at` at the running
+gate, provider prepare/start, provider events, and at least once per minute
+while waiting. No heartbeat for 15 minutes is stale even when the expected
+duration has not elapsed; exceeding the estimate alone is not stale.
 
 ### Windows prerequisites
 
@@ -248,6 +252,14 @@ interrupted or failed execution may return to `ready` through
 persistence and claim cleanup are complete, including writer release for
 production-write work. Resolve any other running or reserved execution first.
 Do not edit Drive JSON or delete a GCS claim manually to bypass these gates.
+
+Retries are linked and bounded: `retry_count` is 0–2 and every nonzero retry
+must name `retry_of_execution_id`. The watcher never creates an automatic
+duplicate. A stale execution with a live or unknown provider becomes Command
+`attention`; its task claim and writer authority remain held. A same-host,
+proven-dead read-only provider may be terminalized as interrupted. A
+production-write execution remains recovery-required without the private
+writer token, even when its provider is proven stopped.
 
 Terminal cleanup is fail-closed: the provider must be proven stopped before
 terminal persistence and authority release. Read-only executions require the

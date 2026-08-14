@@ -1,6 +1,7 @@
 """Bounded, Drive-backed command watcher that delegates every launch to execution_runner."""
 
 import argparse
+import ctypes
 import json
 import os
 import socket
@@ -9,10 +10,12 @@ from datetime import datetime, timezone
 
 from collectors.publish_drive import build_service
 from manager.codex_launcher import CodexLauncher
+from manager.execution_lifecycle import terminalize_execution
 from manager.execution_runner import launch_task
+from manager.executions import cancel_reserved_execution, execution_health, prepare_task_retry
 from manager.gcs_lock_registry import GCSLockRegistry
 from manager.runtime_bridge import all_projects
-from manager.task_claims import task_claim_registry
+from manager.task_claims import check_task_execution_claim, task_claim_registry
 from manager.tasks import DriveRecords, TaskError, now_iso, validate
 
 
@@ -42,7 +45,149 @@ def _claimed(command):
 
 
 def _terminal(command, status, result):
-    return {**command, "status": status, "completed_at": now_iso(), "result": result}
+    return {**command, "status": status, "completed_at": now_iso(), "result": result,
+            "recovery_reason": command.get("recovery_reason"), "stale_at": command.get("stale_at")}
+
+
+def _attention(store, command, execution, reason):
+    timestamp = command.get("stale_at") or now_iso()
+    # Legacy uncertain executions have no heartbeat/process contract. Surface
+    # their Command, but do not rewrite the execution authority record.
+    if execution and (execution.get("heartbeat_at") or execution.get("provider_evidence")):
+        execution.update(stale_at=execution.get("stale_at") or timestamp, recovery_reason=reason)
+        validate("execution", execution)
+        store.put("executions", command["project_id"], command["execution_id"], execution)
+        task = store.get("tasks", command["project_id"], command["task_id"])
+        if (task.get("source_context") or {}).get("active_execution_id") == command["execution_id"]:
+            task.update(status="blocked", updated_at=timestamp,
+                        blocked_reason=f"Execution recovery required: {reason}",
+                        current_progress="Execution requires attention",
+                        next_action="Verify provider/process and authority evidence; do not start a duplicate")
+            validate("task", task)
+            store.put("tasks", command["project_id"], command["task_id"], task)
+    marked = {**command, "status": "attention", "stale_at": timestamp,
+              "recovery_reason": reason, "completed_at": None, "result": None}
+    _write(store, marked)
+    return {"status": "attention", "execution_id": command.get("execution_id"), "recovery_reason": reason}
+
+
+def _provider_state(execution):
+    evidence = execution.get("provider_evidence") or {}
+    if evidence.get("host") != socket.gethostname()[:100]:
+        return "unknown"
+    pid = evidence.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return "unknown"
+    if os.name == "nt":
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if handle:
+            exit_code = ctypes.c_ulong()
+            queried = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            ctypes.windll.kernel32.CloseHandle(handle)
+            if not queried:
+                return "unknown"
+            return "live" if exit_code.value == 259 else "stopped"
+        return "stopped" if ctypes.windll.kernel32.GetLastError() == 87 else "unknown"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "stopped"
+    except (OSError, PermissionError):
+        return "unknown"
+    return "live"
+
+
+def _block_prelaunch_task(store, command, reason):
+    task = store.get("tasks", command["project_id"], command["task_id"])
+    task.update(status="blocked", blocked_reason=f"Execution failed before provider authority: {reason}",
+                updated_at=now_iso(), current_progress="Execution did not start",
+                next_action="Correct the task contract and submit a linked bounded retry")
+    validate("task", task)
+    store.put("tasks", command["project_id"], command["task_id"], task)
+
+
+def _claim_registry(command, claim_factory):
+    return claim_factory(os.environ.get("ADM_LOCK_GCS_BUCKET"), command["project_id"], command["task_id"])
+
+
+def _reconcile_active(store, service, command, claim_factory):
+    terminal = _existing_terminal(store, command)
+    if terminal:
+        _write(store, terminal)
+        return {"status": terminal["status"], "reconciled": True}
+    try:
+        execution = store.get("executions", command["project_id"], command["execution_id"])
+        validate("execution", execution)
+    except TaskError:
+        if command["status"] == "claimed" and not _claim_expired(command):
+            return {"status": "claimed", "skipped": True}
+        if command["status"] == "claimed" and _claim_expired(command):
+            failed = _terminal(command, "failed", _result("error", command["execution_id"], error_kind="claim_timeout"))
+            _write(store, failed)
+            return {"status": "failed", "reconciled": True}
+        return _attention(store, command, None, "execution_record_missing_or_invalid")
+
+    claim_registry = _claim_registry(command, claim_factory)
+    if execution["status"] == "reserved":
+        try:
+            cancelled = cancel_reserved_execution(
+                store, claim_registry, command["project_id"], command["execution_id"],
+                "prelaunch failure left a reservation without provider authority",
+            )
+        except TaskError:
+            return _attention(store, command, execution, "reserved_execution_authority_inconsistent")
+        _block_prelaunch_task(store, command, "prelaunch_contract_or_gate_failure")
+        failed = _terminal(command, "failed", _result("error", cancelled["execution_id"], error_kind="prelaunch_failed"))
+        failed["recovery_reason"] = "prelaunch_contract_or_gate_failure"
+        _write(store, failed)
+        return {"status": "failed", "reconciled": True}
+    if execution["status"] == "cancelled":
+        _block_prelaunch_task(store, command, "prelaunch_execution_cancelled")
+        failed = _terminal(command, "failed", _result("error", command["execution_id"], error_kind="prelaunch_failed"))
+        _write(store, failed)
+        return {"status": "failed", "reconciled": True}
+    if execution["status"] != "running":
+        return _attention(store, command, execution, "execution_lifecycle_inconsistent")
+
+    health = execution_health(execution)
+    provider = _provider_state(execution)
+    if health["state"] == "healthy" and provider != "stopped":
+        if command["status"] == "attention":
+            healthy = {**command, "status": "running", "stale_at": None, "recovery_reason": None}
+            _write(store, healthy)
+            task = store.get("tasks", command["project_id"], command["task_id"])
+            if (task.get("source_context") or {}).get("active_execution_id") == command["execution_id"]:
+                task.update(status="in_progress", updated_at=now_iso(), blocked_reason=None,
+                            current_progress=f"Execution {command['execution_id']} running",
+                            next_action="Continue provider supervision")
+                validate("task", task)
+                store.put("tasks", command["project_id"], command["task_id"], task)
+        return {"status": "running", "healthy": True, "over_expected": health["over_expected"]}
+
+    if provider == "stopped" and health["state"] == "healthy":
+        health = {**health, "state": "attention", "reason": "provider_process_stopped"}
+    try:
+        claim = check_task_execution_claim(claim_registry, command["project_id"], command["task_id"])
+    except TaskError:
+        claim = None
+    exact_claim = claim and claim.get("execution_id") == execution["execution_id"]
+    if provider == "stopped" and exact_claim and execution.get("access") == "read_only":
+        terminalize_execution(
+            store, service, None, claim_registry, command["project_id"], command["task_id"],
+            execution["execution_id"], execution["provider"], "interrupted", claim["generation"], True,
+            summary=f"Recovery: {health['reason']}; provider stop proven on owning host",
+        )
+        terminal = _existing_terminal(store, command)
+        _write(store, terminal)
+        return {"status": terminal["status"], "reconciled": True, "provider_state": provider}
+    reason = health["reason"]
+    if provider == "stopped" and execution.get("access") == "production_write":
+        reason = "provider_stopped_writer_authority_retained"
+    elif not exact_claim:
+        reason = "task_claim_missing_or_mismatched"
+    elif provider != "stopped":
+        reason = f"{reason}_provider_{provider}"
+    return _attention(store, command, execution, reason)
 
 
 def _claim_expired(command, now=None):
@@ -74,19 +219,22 @@ def process_command(store, service, command, launcher_factory=CodexLauncher, wri
         return {"status": "rejected"}
     if command["status"] in ("completed", "failed"):
         return {"status": command["status"], "skipped": True}
-    if command["status"] in ("claimed", "running"):
-        terminal = _existing_terminal(store, command)
-        if terminal:
-            _write(store, terminal)
-            return {"status": terminal["status"], "reconciled": True}
-        if command["status"] == "claimed" and _claim_expired(command):
-            failed = _terminal(command, "failed", _result("error", command["execution_id"], error_kind="claim_timeout"))
-            _write(store, failed)
-            return {"status": "failed", "reconciled": True}
-        return {"status": command["status"], "skipped": True}
+    if command["status"] in ("claimed", "running", "attention"):
+        return _reconcile_active(store, service, command, claim_factory)
     if command["status"] != "queued" or command["provider"] != "codex":
         return {"status": "rejected"}
 
+    retry_count = command.get("retry_count", 0)
+    retry_of = command.get("retry_of_execution_id")
+    if retry_count:
+        try:
+            prepare_task_retry(store, _claim_registry(command, claim_factory), command["project_id"],
+                               command["task_id"], retry_of, retry_count)
+        except (TaskError, KeyError):
+            failed = _terminal(command, "failed", _result("error", None, error_kind="retry_refused"))
+            failed["recovery_reason"] = "retry_authority_or_linkage_not_proven"
+            _write(store, failed)
+            return {"status": "failed", "reconciled": True}
     claimed = _claimed(command)
     _write(store, claimed)
     try:
@@ -95,9 +243,10 @@ def process_command(store, service, command, launcher_factory=CodexLauncher, wri
         claim_registry = claim_factory(os.environ.get("ADM_LOCK_GCS_BUCKET"), claimed["project_id"], claimed["task_id"])
         writer_registry = None if task.get("read_only") else writer_factory()
         running = {**claimed, "status": "running"}
-        _write(store, running)
+        retry = ({"retry_count": retry_count, "retry_of_execution_id": retry_of} if retry_count else {})
         outcome = launch_task(store, service, writer_registry, claim_registry, launcher_factory(),
-                              claimed["project_id"], claimed["task_id"], claimed["execution_id"], claimed["model"])
+                              claimed["project_id"], claimed["task_id"], claimed["execution_id"], claimed["model"],
+                              on_running=lambda _execution: _write(store, running), **retry)
         terminal = outcome["terminal"]["execution"]
         dispatch = outcome["dispatch"]
         selected = {**running, "provider": dispatch["provider"], "model": dispatch["model"] or claimed["model"],
@@ -114,7 +263,7 @@ def process_command(store, service, command, launcher_factory=CodexLauncher, wri
             try:
                 existing = store.get("executions", claimed["project_id"], claimed["execution_id"])
                 if existing.get("status") in ("reserved", "running"):
-                    return {"status": "running", "skipped": True}
+                    return _reconcile_active(store, service, running, claim_factory)
             except TaskError:
                 pass
             kind = getattr(exc, "classification", None) or type(exc).__name__
@@ -131,6 +280,8 @@ def poll_once(store, service, **factories):
         except TaskError:
             continue
         for command in commands:
+            if command.get("status") in ("completed", "failed"):
+                continue
             if len(results) == MAX_COMMANDS_PER_POLL:
                 return results
             results.append(process_command(store, service, command, **factories))
