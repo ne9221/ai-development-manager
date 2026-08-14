@@ -37,27 +37,31 @@ def execution_health(execution, now=None):
         return {"state": execution.get("status"), "reason": None, "over_expected": False}
     started = parse_time(execution["started_at"])
     heartbeat = parse_time(execution.get("heartbeat_at") or execution["started_at"])
+    progress = parse_time(execution.get("progress_updated_at") or execution.get("heartbeat_at") or execution["started_at"])
     expected = float((execution.get("task_snapshot") or {}).get("expected_minutes") or 20) * 60
     elapsed = (now - started).total_seconds()
-    idle = (now - heartbeat).total_seconds()
+    idle = (now - progress).total_seconds()
     hard = execution.get("hard_timeout_at")
-    if heartbeat < started or heartbeat > now + timedelta(minutes=5):
+    if any(value < started or value > now + timedelta(minutes=5) for value in (heartbeat, progress)):
         return {"state": "attention", "reason": "activity_timestamp_inconsistent", "over_expected": elapsed > expected}
     if execution.get("session_id") and not execution.get("provider_evidence"):
         return {"state": "attention", "reason": "provider_evidence_missing", "over_expected": elapsed > expected}
     if hard and now >= parse_time(hard):
         return {"state": "attention", "reason": "hard_timeout_exceeded", "over_expected": elapsed > expected}
     if idle > STALE_AFTER_SECONDS:
-        return {"state": "attention", "reason": "heartbeat_stale", "over_expected": elapsed > expected}
+        return {"state": "attention", "reason": "provider_progress_stale", "over_expected": elapsed > expected}
     return {"state": "healthy", "reason": None, "over_expected": elapsed > expected}
 
 
-def heartbeat_execution(store, project_id, execution_id, event, at=None, provider_evidence=None):
-    """Persist the single authoritative activity clock plus bounded provider evidence."""
+def heartbeat_execution(store, project_id, execution_id, event, at=None, provider_evidence=None, progress=True):
+    """Persist orchestrator liveness and, only when true, meaningful provider progress."""
     execution = store.get("executions", project_id, execution_id)
     if execution.get("status") != "running":
         raise TaskError("heartbeat requires a running execution")
-    execution["heartbeat_at"] = at or now_iso()
+    timestamp = at or now_iso()
+    execution["heartbeat_at"] = timestamp
+    if progress:
+        execution["progress_updated_at"] = timestamp
     execution["last_provider_event"] = str(event)[:100]
     if provider_evidence is not None:
         execution["provider_evidence"] = provider_evidence
@@ -241,7 +245,7 @@ def reserve_execution(store, project_id, task_id, execution_id, provider, quota_
         "finished_at": None, "session_id": None, "provider_session_id": None,
         "quota_before": None, "quota_after": None, "quota_delta": None,
         "source_confidence": None,
-        "heartbeat_at": None, "hard_timeout_at": None, "last_provider_event": None,
+        "heartbeat_at": None, "progress_updated_at": None, "hard_timeout_at": None, "last_provider_event": None,
         "provider_evidence": None, "stale_at": None, "recovery_reason": None,
         "terminal_reason": None,
     }
@@ -338,7 +342,8 @@ def persist_terminal(store, service, project_id, execution_id, status="completed
         completed_at=completed_at, elapsed_minutes=round(elapsed, 6), status=status,
         finished_at=completed_at,
         quota_after=after, quota_delta=quota_delta(execution["quota_before"], after, execution["started_at"], completed_at),
-        heartbeat_at=completed_at, last_provider_event="terminal", terminal_reason=(note or status)[:300],
+        heartbeat_at=completed_at, progress_updated_at=completed_at,
+        last_provider_event="terminal", terminal_reason=(note or status)[:300],
     )
     if note:
         execution["notes"].append(note)

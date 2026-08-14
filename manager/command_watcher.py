@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 
 from collectors.publish_drive import build_service
-from manager.codex_launcher import CodexLauncher
+from manager.codex_launcher import CodexLauncher, process_creation_identity
 from manager.execution_lifecycle import terminalize_execution
 from manager.execution_runner import launch_task
 from manager.executions import cancel_reserved_execution, execution_health, prepare_task_retry
@@ -76,25 +76,37 @@ def _provider_state(execution):
     if evidence.get("host") != socket.gethostname()[:100]:
         return "unknown"
     pid = evidence.get("pid")
-    if not isinstance(pid, int) or pid <= 0:
+    expected_identity = evidence.get("creation_identity")
+    if not isinstance(pid, int) or pid <= 0 or not isinstance(expected_identity, str) or not expected_identity:
         return "unknown"
     if os.name == "nt":
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        handle = kernel32.OpenProcess(0x1000, False, pid)
         if handle:
             exit_code = ctypes.c_ulong()
-            queried = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-            ctypes.windll.kernel32.CloseHandle(handle)
+            queried = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            kernel32.CloseHandle(handle)
             if not queried:
                 return "unknown"
-            return "live" if exit_code.value == 259 else "stopped"
-        return "stopped" if ctypes.windll.kernel32.GetLastError() == 87 else "unknown"
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return "stopped"
-    except (OSError, PermissionError):
+            if exit_code.value != 259:
+                return "stopped"
+        else:
+            return "stopped" if kernel32.GetLastError() == 87 else "unknown"
+    else:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "stopped"
+        except (OSError, PermissionError):
+            return "unknown"
+    current_identity = process_creation_identity(pid)
+    if current_identity is None:
         return "unknown"
-    return "live"
+    return "live" if current_identity == expected_identity else "replaced"
 
 
 def _block_prelaunch_task(store, command, reason):
@@ -151,7 +163,7 @@ def _reconcile_active(store, service, command, claim_factory):
 
     health = execution_health(execution)
     provider = _provider_state(execution)
-    if health["state"] == "healthy" and provider != "stopped":
+    if health["state"] == "healthy" and provider == "live":
         if command["status"] == "attention":
             healthy = {**command, "status": "running", "stale_at": None, "recovery_reason": None}
             _write(store, healthy)
@@ -180,11 +192,13 @@ def _reconcile_active(store, service, command, claim_factory):
         terminal = _existing_terminal(store, command)
         _write(store, terminal)
         return {"status": terminal["status"], "reconciled": True, "provider_state": provider}
-    reason = health["reason"]
+    reason = health["reason"] or "provider_state_inconsistent"
     if provider == "stopped" and execution.get("access") == "production_write":
         reason = "provider_stopped_writer_authority_retained"
     elif not exact_claim:
         reason = "task_claim_missing_or_mismatched"
+    elif provider == "replaced":
+        reason = "provider_process_identity_replaced"
     elif provider != "stopped":
         reason = f"{reason}_provider_{provider}"
     return _attention(store, command, execution, reason)

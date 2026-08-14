@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import platform
@@ -83,6 +84,7 @@ class PreparedLaunch:
     thread_id: str
     session_path: str | None
     pid: int
+    process_creation_identity: str
     prepared_at: str
     _client: "_AppServerClient" = field(repr=False)
     _request: LaunchRequest = field(repr=False)
@@ -97,6 +99,7 @@ class RunningLaunch:
     _cancelled: bool = field(default=False, repr=False)
     _heartbeat: Callable[[str], Any] | None = field(default=None, repr=False)
     _last_heartbeat: float = field(default=0.0, repr=False)
+    _last_progress: float = field(default=0.0, repr=False)
 
 
 @dataclass(frozen=True)
@@ -360,7 +363,11 @@ class CodexLauncher:
                 raise CodexLaunchError("protocol_error", "thread/start returned no thread id")
             session_path = _trusted_session_path(thread.get("path"))
             client.raise_if_failed()
-            return PreparedLaunch(thread_id, session_path, process_pid(client.process), utc_now(), client, request)
+            pid = process_pid(client.process)
+            creation_identity = process_creation_identity(pid)
+            if creation_identity is None:
+                raise CodexLaunchError("process_identity_unavailable", "could not verify app-server process creation identity")
+            return PreparedLaunch(thread_id, session_path, pid, creation_identity, utc_now(), client, request)
         except Exception:
             client.close()
             raise
@@ -421,13 +428,15 @@ class CodexLauncher:
     def set_heartbeat(self, running: RunningLaunch, callback: Callable[[str], Any]):
         running._heartbeat = callback
         running._last_heartbeat = time.monotonic()
+        running._last_progress = running._last_heartbeat
 
     @staticmethod
     def _emit_heartbeat(running: RunningLaunch, event: str):
         now = time.monotonic()
-        if running._heartbeat and now - running._last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+        clock = "_last_progress" if event == "provider_event" else "_last_heartbeat"
+        if running._heartbeat and now - getattr(running, clock) >= HEARTBEAT_INTERVAL_SECONDS:
             running._heartbeat(event)
-            running._last_heartbeat = now
+            setattr(running, clock, now)
 
     def cancel(self, running: RunningLaunch, reason: str | None = None):
         del reason  # Deliberately not sent or logged; it may contain sensitive text.
@@ -448,3 +457,37 @@ def process_pid(process: Any) -> int:
     if not isinstance(pid, int) or pid <= 0:
         raise CodexLaunchError("protocol_error", "app-server process has no valid PID")
     return pid
+
+
+def process_creation_identity(pid: int) -> str | None:
+    """Return a boot-scoped OS process creation identity, or None when it cannot be proven."""
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if os.name == "nt":
+        class FILETIME(ctypes.Structure):
+            _fields_ = (("low", ctypes.c_ulong), ("high", ctypes.c_ulong))
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetProcessTimes.argtypes = (ctypes.c_void_p, ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
+                                             ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME))
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            created, exited, kernel, user = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+            if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                            ctypes.byref(kernel), ctypes.byref(user)):
+                return None
+            return f"windows-filetime:{(created.high << 32) | created.low}"
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        start_ticks = stat[stat.rfind(")") + 2:].split()[19]
+    except (OSError, IndexError, UnicodeError, ValueError):
+        return None
+    return f"linux-proc:{boot_id}:{start_ticks}" if boot_id and start_ticks.isdigit() else None

@@ -5,9 +5,10 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
-from manager.command_watcher import CLAIM_TIMEOUT_SECONDS, poll_once, process_command
+from manager.codex_launcher import process_creation_identity
+from manager.command_watcher import CLAIM_TIMEOUT_SECONDS, _provider_state, poll_once, process_command
 from manager.execution_lifecycle import enter_running_gate
-from manager.executions import execution_health, reserve_execution
+from manager.executions import execution_health, heartbeat_execution, reserve_execution
 from manager.task_claims import TaskClaimConflict
 from manager.tasks import TaskError, create_project, create_task, now_iso
 from manager.test_execution_lifecycle import project, task
@@ -64,12 +65,16 @@ class CommandWatcherTests(unittest.TestCase):
                                "read_only", started_at=started, task_claim_registry=claim)
         execution = self.store.get("executions", "p1", "command-cmd-1")
         execution["heartbeat_at"] = self.iso(now - timedelta(minutes=heartbeat_minutes))
+        execution["progress_updated_at"] = execution["heartbeat_at"]
+        provider_pid = pid or os.getpid()
         execution["provider_evidence"] = {
-            "host": socket.gethostname()[:100], "pid": pid or os.getpid(), "started_at": started,
+            "host": socket.gethostname()[:100], "pid": provider_pid,
+            "creation_identity": process_creation_identity(provider_pid) or "test-process:missing",
+            "started_at": started,
         }
         execution["last_provider_event"] = "provider_wait"
         if legacy:
-            for key in ("heartbeat_at", "provider_evidence", "last_provider_event", "hard_timeout_at"):
+            for key in ("heartbeat_at", "progress_updated_at", "provider_evidence", "last_provider_event", "hard_timeout_at"):
                 execution[key] = None
         self.store.put("executions", "p1", "command-cmd-1", execution)
         active = command(status="running", execution_id="command-cmd-1", claimed_at=started)
@@ -149,14 +154,37 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertEqual("healthy", execution_health(healthy)["state"])
 
         healthy["started_at"] = self.iso(datetime.now(timezone.utc) - timedelta(minutes=20))
-        healthy["heartbeat_at"] = self.iso(datetime.now(timezone.utc) - timedelta(minutes=16))
-        self.assertEqual("heartbeat_stale", execution_health(healthy)["reason"])
+        healthy["progress_updated_at"] = self.iso(datetime.now(timezone.utc) - timedelta(minutes=16))
+        self.assertEqual("provider_progress_stale", execution_health(healthy)["reason"])
 
         healthy["started_at"] = self.iso(datetime.now(timezone.utc) - timedelta(minutes=21))
         healthy["heartbeat_at"] = now_iso()
+        healthy["progress_updated_at"] = healthy["heartbeat_at"]
         healthy["hard_timeout_at"] = self.iso(datetime.now(timezone.utc) + timedelta(minutes=39))
         result = execution_health(healthy)
         self.assertEqual("healthy", result["state"]); self.assertTrue(result["over_expected"])
+
+    def test_provider_wait_without_progress_cannot_keep_execution_healthy(self):
+        active, claim, execution = self.running_command(started_minutes=20)
+        stale_progress = self.iso(datetime.now(timezone.utc) - timedelta(minutes=16))
+        execution["progress_updated_at"] = stale_progress
+        self.store.put("executions", "p1", "command-cmd-1", execution)
+        heartbeat_execution(self.store, "p1", "command-cmd-1", "provider_wait", progress=False)
+        refreshed = self.store.get("executions", "p1", "command-cmd-1")
+        self.assertEqual(stale_progress, refreshed["progress_updated_at"])
+        self.assertEqual("provider_progress_stale", execution_health(refreshed)["reason"])
+        self.assertEqual("attention", process_command(
+            self.store, object(), active, claim_factory=lambda *_: claim)["status"])
+
+    def test_same_pid_with_different_creation_identity_is_not_live(self):
+        active, claim, execution = self.running_command(pid=os.getpid())
+        execution["provider_evidence"]["creation_identity"] = "original-process"
+        self.store.put("executions", "p1", "command-cmd-1", execution)
+        with patch("manager.command_watcher.process_creation_identity", return_value="reused-process"):
+            self.assertEqual("replaced", _provider_state(execution))
+            result = process_command(self.store, object(), active, claim_factory=lambda *_: claim)
+        self.assertEqual("attention", result["status"])
+        self.assertEqual("command-cmd-1", claim.document["execution_id"])
 
     def test_stale_live_provider_is_attention_and_never_reclaimed(self):
         active, claim, _ = self.running_command(heartbeat_minutes=16, pid=os.getpid())

@@ -84,6 +84,8 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
         project = store.get("projects", project_id, project_id)
         validate("project", project)
         branch = snapshot.get("branch")
+        if not isinstance(branch, str) or not branch.startswith("refs/heads/"):
+            raise TaskError("production running gate requires a full branch ref")
         repository_request = project["repo"]
         repository = canonical_repository(repository_request)
         expected_lock_id = repository_lock_id(repository)
@@ -180,7 +182,8 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
             **execution, "access": access, "lease_evidence": lease_evidence,
             "started_at": running_started, "status": "running",
             "quota_before": before, "source_confidence": before.get("confidence", "unknown"),
-            "heartbeat_at": running_started, "hard_timeout_at": hard_timeout_at,
+            "heartbeat_at": running_started, "progress_updated_at": running_started,
+            "hard_timeout_at": hard_timeout_at,
             "last_provider_event": "running_gate", "recovery_reason": None, "stale_at": None,
         }
         validate("execution", running)

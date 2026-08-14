@@ -171,6 +171,7 @@ def run_execution(store, service, writer_registry, claim_registry, launcher: Cod
         prepared = launcher.prepare(launch_request)
         provider_evidence = {
             "host": socket.gethostname()[:100], "pid": prepared.pid,
+            "creation_identity": prepared.process_creation_identity,
             "started_at": prepared.prepared_at,
         }
         heartbeat_execution(store, project_id, execution_id, "provider_prepared",
@@ -181,7 +182,8 @@ def run_execution(store, service, writer_registry, claim_registry, launcher: Cod
         set_heartbeat = getattr(launcher, "set_heartbeat", None)
         if callable(set_heartbeat):
             set_heartbeat(running, lambda event: heartbeat_execution(
-                store, project_id, execution_id, event, provider_evidence=provider_evidence
+                store, project_id, execution_id, event, provider_evidence=provider_evidence,
+                progress=event == "provider_event",
             ))
         outcome = launcher.wait(running)
         heartbeat_execution(store, project_id, execution_id, "turn_terminal", at=outcome.completed_at)

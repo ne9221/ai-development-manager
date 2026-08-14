@@ -1,4 +1,5 @@
 import json
+import os
 import queue
 import subprocess
 import tempfile
@@ -36,7 +37,7 @@ class FakeProcess:
 
     def __init__(self, handler=None):
         FakeProcess.next_pid += 1
-        self.pid = FakeProcess.next_pid
+        self.pid = os.getpid()
         self.handler = handler or happy_handler
         self.stdout, self.stderr = QueueStream(), QueueStream()
         self.stdin = FakeStdin(self)

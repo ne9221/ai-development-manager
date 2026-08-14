@@ -37,6 +37,7 @@ class Launcher:
             raise CodexLaunchError("spawn_failed", "raw secret from prepare")
         client = SimpleNamespace(process=self.process)
         self.prepared = SimpleNamespace(thread_id="thread-1", session_path=None, pid=4242,
+                                        process_creation_identity="test-process:4242",
                                         prepared_at="2026-08-13T13:00:00Z", _client=client)
         return self.prepared
 
