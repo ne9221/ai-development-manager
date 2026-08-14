@@ -118,27 +118,28 @@ what a hand-rolled ADM runtime layer would otherwise need to build — but
 this spike could not verify any of it actually *executes* correctly for
 Codex/Claude subscription workflows on Windows, because Phase C didn't run.
 
-## Adoption decision
+## Adoption decision — FINAL (2026-08-15)
 
-**Not a clean A/B/C/D/E** — the spike is inconclusive on the one thing
-that matters most (does the subscription bridge actually work end-to-end
-on Windows), because Phase C was blocked at the permission layer before
-any live call was made. Two separate findings stand on their own:
+**E. REJECT for current P0.**
 
-1. Install and CLI surface: real, works natively on Windows, no dangerous
-   flags needed to explore it. (Would support DIRECT ADOPT WITH CONFIG or
-   THIN ADAPTER on this axis alone.)
-2. Subscription-reuse mechanism is a reverse-engineered private-API token
-   bridge, not an official-CLI subprocess wrapper. This is a real
-   trust/ToS/stability risk that argues for caution regardless of whether
-   Phase C succeeds — it should be weighed explicitly by whoever decides
-   to adopt this, not silently accepted because "it reuses your existing
-   login."
+Rationale (user-confirmed, closing this spike without completing Phase C):
 
-**Recommendation: do not finalize an Adoption Decision on this spike.**
-Next step is either (a) the user runs `openh auth codex-login` /
-`claude-login` themselves in an interactive terminal (or adds a Bash
-permission rule so I can) and reports back what `openh auth status` /
-`openh provider list` show, so a real Phase C can run, or (b) the user
-decides the private-endpoint risk alone is disqualifying and this moves
-straight to E. REJECT without spending more time on live testing.
+- Windows CLI install/runtime works natively — this part is not the
+  blocker.
+- Claude/Codex "subscription reuse" is **not** through the official local
+  CLI (`claude.exe` / `codex`/`codex.cmd`). It works by reading the CLIs'
+  stored OAuth credentials (`~/.claude/.credentials.json`,
+  `~/.codex/auth.json`) and calling undocumented private backends directly
+  (`chatgpt.com/backend-api/codex/responses`; Anthropic's OAuth/inference
+  endpoints using Claude Code's own `client_id` and beta headers) — see
+  Phase B above for the exact source evidence.
+- Current P0 requires official-CLI-based access. This mechanism does not
+  meet that bar, independent of whether it would technically work — so
+  Phase C was intentionally not completed and no further OpenHarness
+  investigation is planned.
+
+This branch (`spike/openharness-direct-adoption`) is kept as a pushed,
+disposable record only. No further Phase C/E2E, no auth binding, and no
+OpenHarness source changes were made or are planned. Harness research for
+this P0 stops here — no new candidate is queued as a follow-up from this
+task.
