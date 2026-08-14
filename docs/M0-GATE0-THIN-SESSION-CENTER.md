@@ -58,3 +58,18 @@ python -m manager.session_center `
 The page starts only after ADM persists the provider-native session link. The
 runner also terminalizes the Session Registry record after the Task and
 Execution terminal state is durable.
+
+### Verified Phase 3 run
+
+- Task: `m0-gate0-visible-auto-launch-20260814-1926-c2`
+- Execution: `m0-gate0-visible-auto-launch-20260814-1926-c2-run-2`
+- Provider session: `01a0001b-4d1d-74d1-b87d-4db6b5c355e0`
+- Result: Task, Execution, and Session Registry all reached `completed`; the
+  Session Center card was automatically `CORRELATED` from the Drive Execution.
+- Access: disposable read-only; writer lease not required; task claim released.
+- No scheduled watcher or hands-off dispatch was enabled.
+
+The default CLI history load was blocked by a newer recovery Execution whose
+fields are not yet in this branch's schema. The spike reused the existing
+`launch_task(..., executions=[])` entry point to skip optional historical
+estimation without changing the recovery branch or bypassing lifecycle gates.
