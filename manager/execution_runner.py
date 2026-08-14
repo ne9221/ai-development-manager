@@ -1,4 +1,8 @@
-"""Minimal reserved-to-terminal Codex execution runner."""
+"""Minimal reserved-to-terminal execution runner.
+
+launch_task()/run_execution() are provider-parameterized (default "codex" for
+backward compatibility); main()'s CLI entry point remains Codex-only.
+"""
 
 import argparse
 import json
@@ -32,32 +36,39 @@ def task_turn_timeout(expected_minutes, override=None):
     return hard_timeout_seconds(expected_minutes)
 
 
-def _thread_id(prepared):
-    value = prepared.thread_id
+def _provider_session_id(prepared):
+    # CodexLauncher's PreparedLaunch names this field thread_id; ClaudeLauncher's
+    # names it provider_session_id (its provider-native session id is known
+    # before spawn, not assigned by the provider afterward). Both adapters are
+    # accepted here via duck typing rather than forcing one launcher's naming
+    # onto the other's PreparedLaunch shape.
+    value = getattr(prepared, "provider_session_id", None)
+    if value is None:
+        value = getattr(prepared, "thread_id", None)
     if not isinstance(value, str) or value != value.strip() or not value or len(value) > 500 or any(ord(char) < 32 for char in value):
-        raise TaskError("prepared Codex thread id is invalid")
+        raise TaskError("prepared provider session id is invalid")
     return value
 
 
-def _session(execution, prepared, request):
-    thread_id = _thread_id(prepared)
-    session_id = manager_session_key("codex", thread_id)
-    # session_path is adapter-validated advisory evidence; identity is thread_id.
+def _session(execution, prepared, request, provider):
+    provider_session_id = _provider_session_id(prepared)
+    session_id = manager_session_key(provider, provider_session_id)
+    # session_path is adapter-validated advisory evidence; identity is provider_session_id.
     return {
-        "session_id": session_id, "provider": "codex", "provider_session_id": thread_id,
+        "session_id": session_id, "provider": provider, "provider_session_id": provider_session_id,
         "project_id": execution["project_id"], "task_id": execution["task_id"],
         "conversation_label": None, "title": None, "summary": None,
         "started_at": prepared.prepared_at, "updated_at": prepared.prepared_at,
         "working_directory": request.working_directory, "repository": None,
-        "source_identifier": thread_id, "source_path": prepared.session_path,
+        "source_identifier": provider_session_id, "source_path": prepared.session_path,
         "classification_method": "working_directory", "classification_confidence": "high",
         "classification_status": "classified", "status": "active", "message_count": 0,
         "model": request.model, "first_user_prompt": None,
     }
 
 
-def _persist_session_link(store, writer_registry, execution, prepared, request, lease_token):
-    session = _session(execution, prepared, request)
+def _persist_session_link(store, writer_registry, execution, prepared, request, lease_token, provider):
+    session = _session(execution, prepared, request, provider)
     validate("session", session)
     try:
         existing = store.get("sessions", execution["project_id"], session["session_id"])
@@ -70,13 +81,13 @@ def _persist_session_link(store, writer_registry, execution, prepared, request, 
     if existing is None:
         store.put("sessions", execution["project_id"], session["session_id"], session)
     elif existing != session:
-        raise TaskError("canonical Codex session conflicts with persisted content")
+        raise TaskError("canonical provider session conflicts with persisted content")
     if store.get("sessions", execution["project_id"], session["session_id"]) != session:
-        raise TaskError("canonical Codex session persistence verification failed")
+        raise TaskError("canonical provider session persistence verification failed")
 
     link_execution_session(store, execution["project_id"], execution["execution_id"], session)
     linked = store.get("executions", execution["project_id"], execution["execution_id"])
-    if linked.get("session_id") != session["session_id"] or linked.get("provider_session_id") != prepared.thread_id:
+    if linked.get("session_id") != session["session_id"] or linked.get("provider_session_id") != _provider_session_id(prepared):
         raise TaskError("execution session link persistence verification failed")
     if execution.get("access") == "production_write":
         lease = link_writer_session(
@@ -112,12 +123,12 @@ def _stopped(prepared):
     return callable(poll) and poll() is not None
 
 
-def _failure_summary(error):
+def _failure_summary(error, provider):
     classification = getattr(error, "classification", None) or type(error).__name__
-    return f"Codex runner interrupted: {str(classification)[:200]}"
+    return f"{provider} runner interrupted: {str(classification)[:200]}"
 
 
-def _dispatch_request(task):
+def _dispatch_request(task, provider):
     return {
         "project_id": task["project_id"], "task_id": task["task_id"], "title": task["title"],
         "task_type": task["task_type"], "complexity": task["complexity"],
@@ -125,22 +136,30 @@ def _dispatch_request(task):
         "constraints": task.get("constraints", []), "acceptance_criteria": task.get("acceptance_criteria", []),
         "needs_repo_edit": task.get("needs_repo_edit", True),
         "needs_research": task.get("needs_research", False), "needs_browser": task.get("needs_browser", False),
-        "preferred_provider": "codex",
+        "preferred_provider": provider,
     }
 
 
 def launch_task(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                 execution_id=None, model=None, timeout_seconds=None, quota_document=None, executions=None,
-                retry_count=0, retry_of_execution_id=None, on_running=None):
-    """Dispatch, reserve, and run one ready task; callers supply real authorities."""
+                retry_count=0, retry_of_execution_id=None, on_running=None, provider="codex"):
+    """Dispatch, reserve, and run one ready task; callers supply real authorities.
+
+    `provider` names which provider this launcher belongs to (the caller
+    already chose the launcher/quota gate for it); dispatch() is forced to
+    that exact provider via preferred_provider, and every downstream record
+    (Execution, task claim, Session) is written with this same provider
+    string rather than a hardcoded one, so evidence never disagrees with the
+    launcher actually used.
+    """
     task = store.get("tasks", project_id, task_id)
     validate("task", task)
     turn_timeout = task_turn_timeout(task["expected_minutes"], timeout_seconds)
-    dispatched = dispatch(store, service, _dispatch_request(task), quota_document, executions)
-    if dispatched["recommended_provider"] != "codex":
-        raise TaskError("dispatch did not select Codex")
+    dispatched = dispatch(store, service, _dispatch_request(task, provider), quota_document, executions)
+    if dispatched["recommended_provider"] != provider:
+        raise TaskError(f"dispatch did not select {provider}")
     execution_id = execution_id or f"{task_id}-{uuid.uuid4().hex[:12]}"
-    reserve_execution(store, project_id, task_id, execution_id, "codex", dispatched["quota_evidence"],
+    reserve_execution(store, project_id, task_id, execution_id, provider, dispatched["quota_evidence"],
                       dispatched["mode"], dispatched["effort"], retry_count=retry_count,
                       retry_of_execution_id=retry_of_execution_id)
     request = LaunchRequest(task["working_directory"], model=model, reasoning_effort=dispatched["effort"],
@@ -150,14 +169,14 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     result = run_execution(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                            execution_id, dispatched["generated_prompt"], request,
                            access="read_only" if task["read_only"] else "production_write",
-                           baseline_head=task.get("baseline_head"), on_running=on_running)
+                           baseline_head=task.get("baseline_head"), on_running=on_running, provider=provider)
     return {"execution_id": execution_id, "dispatch": dispatched, **result}
 
 
-def run_execution(store, service, writer_registry, claim_registry, launcher: CodexLauncher,
+def run_execution(store, service, writer_registry, claim_registry, launcher,
                   project_id, task_id, execution_id, prompt, launch_request: LaunchRequest,
-                  access="production_write", baseline_head=None, on_running=None):
-    """Run one reserved Codex execution through the reviewed lifecycle gates.
+                  access="production_write", baseline_head=None, on_running=None, provider="codex"):
+    """Run one reserved execution through the reviewed lifecycle gates.
 
     ``provider_stopped`` is derived only after prepare-owned cleanup or after
     ``close()`` plus process-exit evidence; it is never assumed by the caller.
@@ -165,7 +184,7 @@ def run_execution(store, service, writer_registry, claim_registry, launcher: Cod
     persisted by this runner.
     """
     gate = enter_running_gate(
-        store, service, writer_registry, project_id, task_id, execution_id, "codex", access,
+        store, service, writer_registry, project_id, task_id, execution_id, provider, access,
         baseline_head=baseline_head, task_claim_registry=claim_registry,
         hard_timeout=launch_request.turn_timeout_seconds,
     )
@@ -173,7 +192,7 @@ def run_execution(store, service, writer_registry, claim_registry, launcher: Cod
     lease_token = gate["lease"]["lease_token"] if gate["lease"] else None
     prepared = running = outcome = session = None
     operation_error = close_error = None
-    status, summary = "interrupted", "Codex runner interrupted"
+    status, summary = "interrupted", f"{provider} runner interrupted"
     try:
         if on_running:
             on_running(execution)
@@ -187,7 +206,7 @@ def run_execution(store, service, writer_registry, claim_registry, launcher: Cod
         }
         heartbeat_execution(store, project_id, execution_id, "provider_prepared",
                             at=prepared.prepared_at, provider_evidence=provider_evidence)
-        session = _persist_session_link(store, writer_registry, execution, prepared, launch_request, lease_token)
+        session = _persist_session_link(store, writer_registry, execution, prepared, launch_request, lease_token, provider)
         running = launcher.start(prepared, prompt)
         heartbeat_execution(store, project_id, execution_id, "turn_started", at=running.started_at)
         set_heartbeat = getattr(launcher, "set_heartbeat", None)
@@ -199,12 +218,12 @@ def run_execution(store, service, writer_registry, claim_registry, launcher: Cod
         outcome = launcher.wait(running)
         heartbeat_execution(store, project_id, execution_id, "turn_terminal", at=outcome.completed_at)
         status = outcome.status if outcome.status in ("completed", "failed", "interrupted") else "failed"
-        summary = f"Codex turn {status}"
+        summary = f"{provider} turn {status}"
         if outcome.failure_classification:
             summary += f": {outcome.failure_classification[:200]}"
     except (Exception, KeyboardInterrupt) as exc:
         operation_error = exc
-        summary = _failure_summary(exc)
+        summary = _failure_summary(exc, provider)
     finally:
         if prepared is not None:
             try:
@@ -217,7 +236,7 @@ def run_execution(store, service, writer_registry, claim_registry, launcher: Cod
     if prepared is not None:
         provider_stopped = _stopped(prepared)
     if not provider_stopped:
-        error = TaskError("Codex provider stop could not be proven; terminal authority retained")
+        error = TaskError(f"{provider} provider stop could not be proven; terminal authority retained")
         if operation_error:
             error.add_note(f"runner: {operation_error}")
         if close_error:
@@ -225,7 +244,7 @@ def run_execution(store, service, writer_registry, claim_registry, launcher: Cod
         raise error
 
     terminal = terminalize_execution(
-        store, service, writer_registry, claim_registry, project_id, task_id, execution_id, "codex",
+        store, service, writer_registry, claim_registry, project_id, task_id, execution_id, provider,
         status, gate["task_claim"]["generation"], provider_stopped, lease_token=lease_token,
         completed_at=outcome.completed_at if outcome else None, summary=summary,
     )

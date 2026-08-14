@@ -114,11 +114,11 @@ def task(read_only=False, allowed_paths=None, working_directory="unused", branch
     }
 
 
-def build_store(read_only=False, allowed_paths=None, execution_id="exec-a", working_directory="unused", branch="refs/heads/main", baseline_head=HEAD):
+def build_store(read_only=False, allowed_paths=None, execution_id="exec-a", working_directory="unused", branch="refs/heads/main", baseline_head=HEAD, provider="codex"):
     store = MemoryStore()
     create_project(store, project())
     create_task(store, task(read_only, allowed_paths, working_directory, branch, baseline_head), assign=False)
-    reserve_execution(store, "p1", "t1", execution_id, "codex", {"decision": "fresh"}, "code", "high", "2026-08-13T00:00:00Z")
+    reserve_execution(store, "p1", "t1", execution_id, provider, {"decision": "fresh"}, "code", "high", "2026-08-13T00:00:00Z")
     store.events.clear()
     return store
 

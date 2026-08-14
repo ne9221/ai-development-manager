@@ -9,9 +9,12 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
-from manager.codex_launcher import process_creation_identity
+from manager.claude_launcher import ClaudeLauncher
+from manager.codex_launcher import CodexLauncher, process_creation_identity
 from manager.command_watcher import (
-    CLAIM_TIMEOUT_SECONDS, REQUIRED_TASK_POLICIES, _provider_state, load_allowlist, poll_once, process_command,
+    CLAIM_TIMEOUT_SECONDS, PROVIDER_RUNTIMES, REQUIRED_TASK_POLICIES, _provider_state,
+    claude_quota_reliable, codex_quota_reliable, load_allowlist, poll_once, process_command,
+    provider_quota_reliable, resolve_provider_runtime,
 )
 from manager.execution_lifecycle import enter_running_gate
 from manager.executions import execution_health, heartbeat_execution, reserve_execution
@@ -386,6 +389,149 @@ class CommandWatcherTests(unittest.TestCase):
                 self.assertEqual(frozenset({("p1", "t1")}), load_allowlist())
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(frozenset(), load_allowlist())
+
+    # -- Phase 4C: provider routing + Claude quota fail-closed wiring --
+
+    # 1 & 2: provider resolves the correct launcher/quota-gate pairing
+    def test_codex_provider_resolves_codex_launcher_and_quota_gate(self):
+        runtime = resolve_provider_runtime("codex")
+        self.assertIs(runtime["launcher_factory"], CodexLauncher)
+        self.assertIs(runtime["quota_check"], codex_quota_reliable)
+
+    def test_claude_provider_resolves_claude_launcher_and_quota_gate(self):
+        runtime = resolve_provider_runtime("claude")
+        self.assertIs(runtime["launcher_factory"], ClaudeLauncher)
+        self.assertIs(runtime["quota_check"], claude_quota_reliable)
+
+    # 3: unknown provider fails closed, never falls back to Codex
+    def test_unknown_provider_resolves_to_none_never_falls_back_to_codex(self):
+        self.assertIsNone(resolve_provider_runtime("gemini_app"))
+        self.assertIsNone(resolve_provider_runtime(""))
+        self.assertIsNone(resolve_provider_runtime(None))
+
+    def test_unknown_provider_command_is_rejected_without_touching_codex_defaults(self):
+        # command.schema.json's provider enum (codex/claude only) already
+        # rejects this at validate("command", ...) before dispatch resolution
+        # is even reached -- an even earlier fail-closed point than
+        # resolve_provider_runtime()'s own None-return, which is exercised
+        # directly (and does return None for unknown providers) in
+        # test_unknown_provider_resolves_to_none_never_falls_back_to_codex.
+        with patch("manager.command_watcher.CodexLauncher") as codex_ctor, \
+             patch("manager.command_watcher.launch_task") as runner:
+            result = process_command(
+                self.store, object(), command(provider="gemini_app"),
+                claim_factory=self.claim_factory, allowlist=frozenset({("p1", "t1")}),
+                health_check=lambda: True, quota_check=lambda service: True,
+            )
+        self.assertEqual({"status": "rejected"}, result)
+        codex_ctor.assert_not_called()
+        runner.assert_not_called()
+
+    def test_command_schema_now_accepts_claude_provider(self):
+        # A regression guard on the schema.provider const->enum widening this
+        # phase required: an invalid command must still be rejected up front.
+        self.assertEqual({"status": "rejected"}, process_command(self.store, object(), {"command_id": "bad"}))
+
+    # 4 & 5: Claude quota gate blocks before any launcher is even constructed
+    def test_claude_stale_or_unknown_quota_blocks_before_prepare(self):
+        with patch("manager.command_watcher.ClaudeLauncher") as claude_ctor, \
+             patch("manager.command_watcher.launch_task") as runner:
+            result = process_command(
+                self.store, object(), command(provider="claude"),
+                claim_factory=self.claim_factory, allowlist=frozenset({("p1", "t1")}),
+                health_check=lambda: True, quota_check=lambda service: False,
+            )
+        self.assertEqual({"status": "rejected", "reason": "quota_unreliable"}, result)
+        claude_ctor.assert_not_called()
+        runner.assert_not_called()
+
+    # 6: reliable fresh Claude quota lets the command reach launch_task with the right launcher/provider
+    def test_claude_reliable_quota_allows_mocked_prepare_path(self):
+        runner = Mock(return_value=self.complete("exec-claude"))
+        with patch("manager.command_watcher.launch_task", runner):
+            result = process_command(
+                self.store, object(), command(provider="claude"),
+                claim_factory=self.claim_factory, allowlist=frozenset({("p1", "t1")}),
+                health_check=lambda: True, quota_check=lambda service: True,
+            )
+        runner.assert_called_once()
+        _, kwargs = runner.call_args
+        self.assertEqual("claude", kwargs.get("provider"))
+        self.assertEqual("completed", result["status"])
+
+    # 8: Claude and Codex quota gates never cross-contaminate on the same document
+    def test_claude_and_codex_quota_do_not_cross_contaminate(self):
+        mixed = {"providers": [
+            {"provider": "codex", "has_reliable_quota": True},
+            {"provider": "claude", "has_reliable_quota": False},
+        ]}
+        with patch("manager.command_watcher.read_drive_status", return_value={}), \
+             patch("manager.command_watcher.summarize", return_value=mixed):
+            self.assertTrue(codex_quota_reliable(object()))
+            self.assertFalse(claude_quota_reliable(object()))
+
+        mixed_reversed = {"providers": [
+            {"provider": "codex", "has_reliable_quota": False},
+            {"provider": "claude", "has_reliable_quota": True},
+        ]}
+        with patch("manager.command_watcher.read_drive_status", return_value={}), \
+             patch("manager.command_watcher.summarize", return_value=mixed_reversed):
+            self.assertFalse(codex_quota_reliable(object()))
+            self.assertTrue(claude_quota_reliable(object()))
+
+    def test_claude_quota_reliable_fails_closed_on_stale_unknown_or_unreachable(self):
+        fresh_reliable = {"providers": [{"provider": "claude", "has_reliable_quota": True}]}
+        stale_or_unknown = {"providers": [{"provider": "claude", "has_reliable_quota": False}]}
+        with patch("manager.command_watcher.read_drive_status", return_value={}), \
+             patch("manager.command_watcher.summarize", return_value=fresh_reliable):
+            self.assertTrue(claude_quota_reliable(object()))
+        with patch("manager.command_watcher.read_drive_status", return_value={}), \
+             patch("manager.command_watcher.summarize", return_value=stale_or_unknown):
+            self.assertFalse(claude_quota_reliable(object()))
+        with patch("manager.command_watcher.read_drive_status", side_effect=RuntimeError("Drive unavailable")):
+            self.assertFalse(claude_quota_reliable(object()))
+        with patch("manager.command_watcher.read_drive_status", return_value={}), \
+             patch("manager.command_watcher.summarize", return_value={"providers": []}):
+            self.assertFalse(claude_quota_reliable(object()))  # no claude entry at all
+
+    # 12: existing allowlist/policy gates still run before launch for Claude too
+    def test_claude_command_off_allowlist_means_zero_launch(self):
+        with patch("manager.command_watcher.launch_task") as runner:
+            result = process_command(
+                self.store, object(), command(provider="claude"),
+                claim_factory=self.claim_factory, allowlist=frozenset(),  # empty: nothing allowlisted
+                health_check=lambda: True, quota_check=lambda service: True,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        runner.assert_not_called()
+
+    def test_claude_command_policy_violation_still_blocks_before_launch(self):
+        store = Store(); create_project(store, project())
+        create_task(store, task(read_only=False), assign=False)  # not disposable/read-only
+        with patch("manager.command_watcher.launch_task") as runner:
+            result = process_command(
+                store, object(), command(provider="claude"),
+                claim_factory=self.claim_factory, allowlist=frozenset({("p1", "t1")}),
+                health_check=lambda: True, quota_check=lambda service: True,
+            )
+        self.assertEqual("attention", result["status"])
+        runner.assert_not_called()
+
+    def test_explicit_override_still_wins_over_provider_registry(self):
+        # The existing single-factory override pattern tests already rely on
+        # must keep working even though defaults are now provider-resolved.
+        sentinel_launcher = Mock(return_value="sentinel-launcher-instance")
+        runner = Mock(return_value=self.complete("exec-override"))
+        with patch("manager.command_watcher.launch_task", runner):
+            process_command(
+                self.store, object(), command(provider="claude"), launcher_factory=sentinel_launcher,
+                claim_factory=self.claim_factory, allowlist=frozenset({("p1", "t1")}),
+                health_check=lambda: True, quota_check=lambda service: True,
+            )
+        runner.assert_called_once()
+        args, _ = runner.call_args
+        self.assertEqual("sentinel-launcher-instance", args[4])
+        sentinel_launcher.assert_called_once()
 
 
 class WatcherSessionCenterBootstrapIntegrationTests(unittest.TestCase):

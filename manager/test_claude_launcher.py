@@ -209,10 +209,16 @@ class ClaudeLauncherTests(unittest.TestCase):
         prepared = self.prepare()
         self.assertIsInstance(prepared, PreparedLaunch)
         for attr in ("provider", "provider_session_id", "pid", "process_creation_identity",
-                     "cwd", "branch", "started_at", "model", "mode", "argv",
-                     "stdout_path", "stderr_path"):
+                     "cwd", "branch", "prepared_at", "model", "mode", "argv",
+                     "stdout_path", "stderr_path", "session_path"):
             self.assertTrue(hasattr(prepared, attr))
         self.assertEqual(prepared.provider, "claude")
+
+    def test_session_path_is_deterministic_and_includes_session_id(self):
+        prepared = self.prepare()
+        self.assertIsNotNone(prepared.session_path)
+        self.assertIn(prepared.provider_session_id, prepared.session_path)
+        self.assertTrue(prepared.session_path.endswith(".jsonl"))
 
     def test_branch_evidence_threaded_through_when_supplied(self):
         self.process = FakeProcess()

@@ -106,6 +106,23 @@ def _build_argv(executable: str, session_id: str, permission_mode: str,
     return argv
 
 
+def claude_session_transcript_path(cwd: str, session_id: str) -> str:
+    """Deterministic advisory path to Claude's own session transcript, mirroring
+    Codex's PreparedLaunch.session_path ("adapter-validated advisory evidence;
+    identity is the provider session id, not this path"). The sanitization
+    rule below (replace path separators, drive-letter colon, and dots with
+    "-") is inferred from a single real, empirically observed example on this
+    host (C:\\Users\\EE\\.ai-development-manager -> C--Users-EE--ai-development-manager)
+    -- it has not been verified against Claude Code's own source/spec, and
+    should be corroborated with more real cwd shapes before anything treats
+    this path as more than advisory.
+    """
+    sanitized = cwd
+    for char in (":", "\\", "/", "."):
+        sanitized = sanitized.replace(char, "-")
+    return str(Path.home() / ".claude" / "projects" / sanitized / f"{session_id}.jsonl")
+
+
 @dataclass
 class PreparedLaunch:
     provider: str
@@ -114,12 +131,13 @@ class PreparedLaunch:
     process_creation_identity: str
     cwd: str
     branch: str | None
-    started_at: str
+    prepared_at: str
     model: str | None
     mode: str
     argv: list  # safe to log/persist: no secrets appear in these flags
     stdout_path: str
     stderr_path: str
+    session_path: str | None
     _process: Any = field(repr=False)
     _request: LaunchRequest = field(repr=False)
     _closed: bool = field(default=False, repr=False)
@@ -203,12 +221,13 @@ class ClaudeLauncher:
             process_creation_identity=identity,
             cwd=str(cwd),
             branch=branch,
-            started_at=utc_now(),
+            prepared_at=utc_now(),
             model=request.model,
             mode=permission_mode,
             argv=list(argv),
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
+            session_path=claude_session_transcript_path(str(cwd), session_id),
             _process=process,
             _request=request,
         )

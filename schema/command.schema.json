@@ -8,7 +8,7 @@
     "command_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
     "project_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
     "task_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
-    "provider": {"const": "codex"},
+    "provider": {"enum": ["codex", "claude"]},
     "model": {"type": ["string", "null"], "maxLength": 200},
     "fallback_model": {"type": ["string", "null"], "maxLength": 200},
     "mode": {"type": ["string", "null"], "maxLength": 80},
