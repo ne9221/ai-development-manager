@@ -113,6 +113,21 @@ The snapshot contains only `project_id`, `name`, `aliases`, `repo`, and
 `working_directory`; it never contains credentials, task data, handoffs, or
 session transcripts.
 
+## Thin Windows Session Center
+
+Show one live Codex session in a minimal localhost UI without AASC, native Node
+modules, or a scheduled watcher:
+
+```powershell
+python -m manager.session_center --provider-session-id <native-thread-id> `
+  --project-id <project> --task-id <task> --branch <branch>
+```
+
+Open `http://127.0.0.1:8765`. Pass `--execution-file <execution.json>` instead
+of manual project/task metadata to enable deterministic ADM correlation; the
+provider session ID and cwd must match exactly. See
+`docs/M0-GATE0-THIN-SESSION-CENTER.md` for the Windows Gate 0 evidence.
+
 ## Continuation context pack
 
 Read bounded continuation context from Drive without writing session data:
