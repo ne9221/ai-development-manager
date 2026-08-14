@@ -69,6 +69,10 @@ def load_execution(path: Path, provider_session_id: str, provider_cwd: str) -> d
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SessionCenterError("could not read ADM Execution JSON") from exc
+    return validate_execution(record, provider_session_id, provider_cwd)
+
+
+def validate_execution(record: dict, provider_session_id: str, provider_cwd: str) -> dict:
     required = ("provider", "project_id", "task_id", "execution_id", "provider_session_id")
     if not isinstance(record, dict) or any(not isinstance(record.get(key), str) or not record[key] for key in required):
         raise SessionCenterError("ADM Execution JSON is missing identity fields")
@@ -84,6 +88,24 @@ def load_execution(path: Path, provider_session_id: str, provider_cwd: str) -> d
     if os.path.normcase(os.path.abspath(cwd)) != os.path.normcase(os.path.abspath(provider_cwd)):
         raise SessionCenterError("ADM Execution cwd does not match provider session")
     return {**record, "cwd": cwd, "branch": branch}
+
+
+def wait_for_execution(store, project_id: str, execution_id: str, wait_seconds: float) -> dict:
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            record = store.get("executions", project_id, execution_id)
+        except KeyError:
+            record = None
+        except RuntimeError as exc:
+            if "expected one Drive record" not in str(exc) or "found 0" not in str(exc):
+                raise
+            record = None
+        if isinstance(record, dict) and isinstance(record.get("provider_session_id"), str):
+            return record
+        if time.monotonic() >= deadline:
+            raise SessionCenterError("timed out waiting for ADM Execution session link")
+        time.sleep(.25)
 
 
 def current_branch(cwd: str) -> str | None:
@@ -166,26 +188,47 @@ def handler_for(session: LiveSession):
 
 
 def build_session(args: argparse.Namespace) -> LiveSession:
-    session_file = find_codex_session(args.provider_session_id)
-    meta = read_codex_meta(session_file, args.provider_session_id)
-    if args.execution_file:
-        execution = load_execution(args.execution_file, args.provider_session_id, meta["cwd"])
+    execution = None
+    provider_session_id = args.provider_session_id
+    if args.execution_project_id or args.execution_id:
+        if not args.execution_project_id or not args.execution_id or args.execution_file or provider_session_id:
+            raise SessionCenterError("execution project/id mode cannot be combined with another identity source")
+        from manager.tasks import DriveRecords, build_service
+        execution = wait_for_execution(
+            DriveRecords(build_service()), args.execution_project_id, args.execution_id, args.wait_seconds
+        )
+        provider_session_id = execution["provider_session_id"]
+    if not provider_session_id:
+        raise SessionCenterError("provider session ID or execution project/id is required")
+    session_file = find_codex_session(provider_session_id)
+    meta = read_codex_meta(session_file, provider_session_id)
+    if execution:
+        execution = validate_execution(execution, provider_session_id, meta["cwd"])
         return LiveSession(
-            args.provider_session_id, session_file, meta["cwd"], meta["started_at"], execution["project_id"],
+            provider_session_id, session_file, meta["cwd"], meta["started_at"], execution["project_id"],
+            execution["task_id"], execution["execution_id"], execution["branch"], execution["provider"], args.idle_seconds, True,
+        )
+    if args.execution_file:
+        execution = load_execution(args.execution_file, provider_session_id, meta["cwd"])
+        return LiveSession(
+            provider_session_id, session_file, meta["cwd"], meta["started_at"], execution["project_id"],
             execution["task_id"], execution["execution_id"], execution["branch"], execution["provider"], args.idle_seconds, True,
         )
     if not args.project_id or not args.task_id:
         raise SessionCenterError("project/task are required when no ADM Execution JSON is provided")
     return LiveSession(
-        args.provider_session_id, session_file, meta["cwd"], meta["started_at"], args.project_id, args.task_id,
+        provider_session_id, session_file, meta["cwd"], meta["started_at"], args.project_id, args.task_id,
         None, args.branch or current_branch(meta["cwd"]), "codex", args.idle_seconds, False,
     )
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("--provider-session-id", required=True)
+    result.add_argument("--provider-session-id")
     result.add_argument("--execution-file", type=Path)
+    result.add_argument("--execution-project-id")
+    result.add_argument("--execution-id")
+    result.add_argument("--wait-seconds", type=float, default=60.0)
     result.add_argument("--project-id")
     result.add_argument("--task-id")
     result.add_argument("--branch")
@@ -196,7 +239,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
-    if not 1 <= args.port <= 65535 or args.idle_seconds <= 0:
+    if not 1 <= args.port <= 65535 or args.idle_seconds <= 0 or args.wait_seconds <= 0:
         raise SystemExit("invalid port or idle timeout")
     try:
         session = build_session(args)

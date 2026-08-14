@@ -77,14 +77,15 @@ class RunnerTests(unittest.TestCase):
         store = build_store(working_directory=self.request.working_directory)
         real_put = store.put
         def ordered_put(area, project, name, document):
-            if area == "sessions": events.append("session")
+            if area == "sessions": events.append("session" if document["status"] == "active" else "session-terminal")
             if area == "executions" and document.get("session_id") and document.get("status") == "running": events.append("execution-link")
             return real_put(area, project, name, document)
         store.put = ordered_put
         with patch("manager.execution_runner.link_writer_session", side_effect=lambda *args, **kwargs: (events.append("writer-link"), link_session(*args, **kwargs))[1]):
             _, writer, _, _, result = self.execute(launcher=launcher, store=store)
-        self.assertEqual(["prepare", "session", "execution-link", "writer-link", "start", "wait", "close"], events)
+        self.assertEqual(["prepare", "session", "execution-link", "writer-link", "start", "wait", "close", "session-terminal"], events)
         self.assertEqual("codex:thread-1", result["session"]["session_id"])
+        self.assertEqual("completed", result["session"]["status"])
         self.assertEqual("codex:thread-1", next(iter(writer.document["locks"].values()))["session_id"])
 
     def test_session_link_failure_never_starts_and_closes(self):

@@ -1,6 +1,6 @@
 # M0 Gate 0 — Thin Windows Session Center
 
-Status: Gate 0-A PASS; Gate 0-B awaiting an authoritative ADM Execution record.
+Status: Gate 0-A PASS; Gate 0-B PASS.
 
 The Windows PoC deliberately bypasses AASC runtime dependencies. It is one
 Python standard-library HTTP server bound to `127.0.0.1`. The browser polls the
@@ -39,8 +39,22 @@ The server marks the session `CORRELATED` only after exact
 Project, Task ID, Execution ID, cwd, and branch. Without that record it displays
 `UNLINKED`; it never guesses from timestamps or cwd.
 
-Gate 0-B is not claimed for the current external Codex Desktop session because
-an authoritative Execution record was not available locally and Google Drive
-SSOT access was not approved. The shortest completion path is an ADM-launched
-disposable read-only Codex execution, whose existing runner persists the native
-thread ID as `provider_session_id` before the turn starts.
+The external Codex Desktop session remains intentionally unlinked because it
+has no authoritative ADM Execution. Gate 0-B was instead proven by resuming an
+existing read-only Execution using the same provider-native ID.
+
+## Visible auto-launch
+
+Session Center can wait directly on the Drive Execution SSOT before the runner
+starts:
+
+```powershell
+python -m manager.session_center `
+  --execution-project-id ai-development-manager `
+  --execution-id <execution-id> `
+  --wait-seconds 180
+```
+
+The page starts only after ADM persists the provider-native session link. The
+runner also terminalizes the Session Registry record after the Task and
+Execution terminal state is durable.

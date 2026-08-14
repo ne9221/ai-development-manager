@@ -4,7 +4,7 @@ import time
 import unittest
 from pathlib import Path
 
-from manager.session_center import LiveSession, SessionCenterError, load_execution, read_codex_meta
+from manager.session_center import LiveSession, SessionCenterError, load_execution, read_codex_meta, wait_for_execution
 
 
 class SessionCenterTest(unittest.TestCase):
@@ -40,6 +40,15 @@ class SessionCenterTest(unittest.TestCase):
             self.assertEqual(load_execution(path, "provider-1", directory)["execution_id"], "run-1")
             with self.assertRaisesRegex(SessionCenterError, "provider_session_id"):
                 load_execution(path, "provider-2", directory)
+
+    def test_wait_for_execution_requires_native_session_link(self):
+        linked = {"execution_id": "run-1", "provider_session_id": "provider-1"}
+        class Store:
+            calls = 0
+            def get(self, *_args):
+                self.calls += 1
+                return {} if self.calls == 1 else linked
+        self.assertIs(wait_for_execution(Store(), "adm", "run-1", 1), linked)
 
 
 if __name__ == "__main__":

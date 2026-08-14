@@ -128,6 +128,15 @@ of manual project/task metadata to enable deterministic ADM correlation; the
 provider session ID and cwd must match exactly. See
 `docs/M0-GATE0-THIN-SESSION-CENTER.md` for the Windows Gate 0 evidence.
 
+For a visible ADM launch, start the page before the runner; it waits for the
+authoritative Execution session link and correlates without a local metadata
+copy:
+
+```powershell
+python -m manager.session_center --execution-project-id ai-development-manager `
+  --execution-id <execution-id> --wait-seconds 180
+```
+
 ## Continuation context pack
 
 Read bounded continuation context from Drive without writing session data:
