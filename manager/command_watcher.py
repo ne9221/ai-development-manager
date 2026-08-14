@@ -1,7 +1,6 @@
 """Bounded, Drive-backed command watcher that delegates every launch to execution_runner."""
 
 import argparse
-import ctypes
 import json
 import os
 import socket
@@ -10,7 +9,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 from collectors.publish_drive import build_service
-from manager.codex_launcher import CodexLauncher, process_creation_identity
+from manager.codex_launcher import CodexLauncher, process_identity_state
 from manager.execution_lifecycle import terminalize_execution
 from manager.execution_runner import launch_task
 from manager.executions import cancel_reserved_execution, execution_health, prepare_task_retry
@@ -149,38 +148,7 @@ def _provider_state(execution):
     evidence = execution.get("provider_evidence") or {}
     if evidence.get("host") != socket.gethostname()[:100]:
         return "unknown"
-    pid = evidence.get("pid")
-    expected_identity = evidence.get("creation_identity")
-    if not isinstance(pid, int) or pid <= 0 or not isinstance(expected_identity, str) or not expected_identity:
-        return "unknown"
-    if os.name == "nt":
-        kernel32 = ctypes.windll.kernel32
-        kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
-        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-        handle = kernel32.OpenProcess(0x1000, False, pid)
-        if handle:
-            exit_code = ctypes.c_ulong()
-            queried = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-            kernel32.CloseHandle(handle)
-            if not queried:
-                return "unknown"
-            if exit_code.value != 259:
-                return "stopped"
-        else:
-            return "stopped" if kernel32.GetLastError() == 87 else "unknown"
-    else:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return "stopped"
-        except (OSError, PermissionError):
-            return "unknown"
-    current_identity = process_creation_identity(pid)
-    if current_identity is None:
-        return "unknown"
-    return "live" if current_identity == expected_identity else "replaced"
+    return process_identity_state(evidence.get("pid"), evidence.get("creation_identity"))
 
 
 def _block_prelaunch_task(store, command, reason):

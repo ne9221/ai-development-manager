@@ -195,7 +195,7 @@ class CommandWatcherTests(unittest.TestCase):
         active, claim, execution = self.running_command(pid=os.getpid())
         execution["provider_evidence"]["creation_identity"] = "original-process"
         self.store.put("executions", "p1", "command-cmd-1", execution)
-        with patch("manager.command_watcher.process_creation_identity", return_value="reused-process"):
+        with patch("manager.codex_launcher.process_creation_identity", return_value="reused-process"):
             self.assertEqual("replaced", _provider_state(execution))
             result = process_command(self.store, object(), active, claim_factory=lambda *_: claim)
         self.assertEqual("attention", result["status"])
