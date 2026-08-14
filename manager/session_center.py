@@ -20,6 +20,39 @@ from typing import Callable
 # display, not what recovery is allowed to act on.
 TERMINAL_EXECUTION_STATUSES = frozenset({"completed", "failed", "interrupted", "cancelled"})
 
+# terminalize_execution() writes execution.status as terminal before
+# cleanup_execution() has released task-claim/writer-lease authority (an
+# interim cleanup_evidence with "retained" values is persisted first, then
+# overwritten once release actually completes). Never surface a terminal
+# status from that window: it would show "completed" while ADM authority is
+# still held, which hands-off automation must never treat as done.
+FINISHING = "finishing"
+
+
+def _cleanup_confirmed(record: dict) -> bool:
+    """Fail-closed: True only when cleanup evidence proves the task claim,
+    and (for anything but an explicit read-only access) the writer lease,
+    have actually been released."""
+    evidence = record.get("cleanup_evidence")
+    if not isinstance(evidence, dict) or evidence.get("task_claim_release") != "released":
+        return False
+    writer_release = evidence.get("writer_release")
+    if record.get("access") == "read_only":
+        return writer_release in ("released", "not_required")
+    return writer_release == "released"
+
+
+def _authoritative_state(record: dict) -> str | None:
+    """Map a raw Execution record to what the UI may display: non-terminal
+    statuses pass through unchanged; a terminal status only passes through
+    once cleanup is confirmed, otherwise it degrades to FINISHING."""
+    status = record.get("status") if isinstance(record, dict) else None
+    if not isinstance(status, str):
+        return None
+    if status not in TERMINAL_EXECUTION_STATUSES:
+        return status
+    return status if _cleanup_confirmed(record) else FINISHING
+
 
 HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -158,7 +191,7 @@ class LiveSession:
         # activity: an execution can only be "completed"/"failed"/etc. on
         # explicit SSOT evidence, never inferred from transcript inactivity.
         authoritative_status = self.status_source() if self.status_source else None
-        if authoritative_status in TERMINAL_EXECUTION_STATUSES:
+        if authoritative_status in TERMINAL_EXECUTION_STATUSES or authoritative_status == FINISHING:
             current_state = authoritative_status
         else:
             current_state = "running" if now - latest < self.idle_seconds else "waiting"
@@ -204,19 +237,18 @@ def handler_for(session: LiveSession):
 
 
 def drive_status_source(store, project_id: str, execution_id: str) -> Callable[[], str | None]:
-    """Re-read the authoritative Drive execution status; never raise into the poll loop."""
+    """Re-read the authoritative Drive execution state; never raise into the poll loop."""
     def read() -> str | None:
         try:
             record = store.get("executions", project_id, execution_id)
         except (KeyError, RuntimeError):
             return None
-        status = record.get("status") if isinstance(record, dict) else None
-        return status if isinstance(status, str) else None
+        return _authoritative_state(record) if isinstance(record, dict) else None
     return read
 
 
 def file_status_source(execution_file: Path, provider_session_id: str, provider_cwd: str) -> Callable[[], str | None]:
-    """Re-read the ADM Execution JSON snapshot's status; never raise into the poll loop."""
+    """Re-read the ADM Execution JSON snapshot's state; never raise into the poll loop."""
     def read() -> str | None:
         try:
             record = validate_execution(
@@ -224,8 +256,7 @@ def file_status_source(execution_file: Path, provider_session_id: str, provider_
             )
         except (OSError, json.JSONDecodeError, SessionCenterError):
             return None
-        status = record.get("status")
-        return status if isinstance(status, str) else None
+        return _authoritative_state(record)
     return read
 
 
