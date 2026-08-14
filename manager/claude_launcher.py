@@ -116,6 +116,7 @@ def _build_argv(executable: str, session_id: str, permission_mode: str,
         "--session-id", session_id,
         "--input-format", "stream-json",
         "--output-format", "stream-json",
+        "--verbose",
         "--permission-mode", permission_mode,
         "--allowed-tools", ",".join(allowed_tools),
     ]
