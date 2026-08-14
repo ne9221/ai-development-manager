@@ -112,7 +112,15 @@ def _terminalize_session(store, session, terminal):
 
 
 def _stopped(prepared):
+    # CodexLauncher's PreparedLaunch keeps the raw subprocess behind
+    # _client.process (the app-server client wraps it); ClaudeLauncher's
+    # PreparedLaunch holds it directly as _process (no app-server client
+    # exists for Claude's single-subprocess stream-json protocol). Duck-type
+    # across both shapes the same way _provider_session_id() already does
+    # for provider_session_id/thread_id, rather than assuming Codex's shape.
     process = getattr(getattr(prepared, "_client", None), "process", None)
+    if process is None:
+        process = getattr(prepared, "_process", None)
     wait = getattr(process, "wait", None)
     if callable(wait):
         try:
