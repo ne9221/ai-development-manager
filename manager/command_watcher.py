@@ -9,6 +9,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 from collectors.publish_drive import build_service
+from manager.claude_account_selector import load_claude_accounts
 from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_identity_state
 from manager.execution_lifecycle import terminalize_execution
@@ -174,6 +175,17 @@ def _provider_state(execution):
     if evidence.get("host") != socket.gethostname()[:100]:
         return "unknown"
     return process_identity_state(evidence.get("pid"), evidence.get("creation_identity"))
+
+
+def _claude_account_registry():
+    """Load the Claude account registry from CLAUDE_ACCOUNTS_CONFIG if set,
+    else None -- not []. None means "no registry configured", which keeps
+    launch_task() on its pre-P0.1.5 single-account path untouched (today's
+    already-logged-in account, no CLAUDE_CONFIG_DIR override); an explicitly
+    configured-but-empty registry is a real, different state (nothing
+    enabled) and correctly fails closed instead."""
+    path = os.environ.get("CLAUDE_ACCOUNTS_CONFIG")
+    return load_claude_accounts(path) if path else None
 
 
 def _block_prelaunch_task(store, command, reason):
@@ -360,7 +372,8 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         retry = ({"retry_count": retry_count, "retry_of_execution_id": retry_of} if retry_count else {})
         outcome = launch_task(store, service, writer_registry, claim_registry, launcher_factory(),
                               claimed["project_id"], claimed["task_id"], claimed["execution_id"], claimed["model"],
-                              on_running=lambda _execution: _write(store, running), provider=claimed["provider"], **retry)
+                              on_running=lambda _execution: _write(store, running), provider=claimed["provider"],
+                              claude_accounts=_claude_account_registry(), **retry)
         terminal = outcome["terminal"]["execution"]
         dispatch = outcome["dispatch"]
         selected = {**running, "provider": dispatch["provider"], "model": dispatch["model"] or claimed["model"],

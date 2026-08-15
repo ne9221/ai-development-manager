@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from manager.claude_account_selector import AccountSelectionError
 from manager.claude_launcher import ClaudeLaunchError
 from manager.codex_launcher import CodexLaunchError, LaunchOutcome, LaunchRequest
 from manager.execution_runner import _stopped, launch_task, run_execution
@@ -257,6 +258,70 @@ class RunnerTests(unittest.TestCase):
             launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-sandbox")
         self.assertEqual("read-only", launcher.request.sandbox)
         self.assertEqual("never", launcher.request.approval_policy)
+
+    def test_launch_task_resolves_claude_account_registry_and_threads_it_to_launcher(self):
+        store = build_store(read_only=True, working_directory=self.request.working_directory, provider="claude")
+        launcher = AccountAwareClaudeStyleLauncher()
+        registry = [
+            {"account_id": "account-a", "enabled": True, "config_dir": None},
+            {"account_id": "account-b", "enabled": True, "config_dir": r"C:\accounts\b\.claude"},
+        ]
+        document = {"schema_version": "0.1.0", "generated_at": "2026-08-15T02:00:00Z", "providers": [{
+            "provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic",
+            "source": "test", "source_type": "official", "confidence": "official",
+            "last_updated": "2026-08-15T02:00:00Z", "status": "ok", "windows": [],
+            "account_id": "account-b",
+        }]}
+        with patch("manager.execution_runner.dispatch", return_value={
+            "recommended_provider": "claude", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
+            "generated_prompt": "bounded read-only task",
+        }), patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-sandbox",
+                       provider="claude", quota_document=document, claude_accounts=registry)
+        self.assertEqual("account-b", launcher.received_account_id)
+        self.assertEqual(r"C:\accounts\b\.claude", launcher.received_config_dir)
+
+    def test_launch_task_claude_accounts_ambiguous_fails_closed_before_launching(self):
+        store = build_store(read_only=True, working_directory=self.request.working_directory, provider="claude")
+        launcher = AccountAwareClaudeStyleLauncher()
+        registry = [
+            {"account_id": "account-a", "enabled": True, "config_dir": None},
+            {"account_id": "account-b", "enabled": True, "config_dir": r"C:\accounts\b\.claude"},
+        ]
+        document = {"schema_version": "0.1.0", "generated_at": "2026-08-15T02:00:00Z", "providers": [
+            {"provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic", "source": "test",
+             "source_type": "official", "confidence": "official", "last_updated": "2026-08-15T02:00:00Z",
+             "status": "ok", "windows": [], "account_id": "account-a"},
+            {"provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic", "source": "test",
+             "source_type": "official", "confidence": "official", "last_updated": "2026-08-15T02:00:00Z",
+             "status": "ok", "windows": [], "account_id": "account-b"},
+        ]}
+        with patch("manager.execution_runner.dispatch", return_value={
+            "recommended_provider": "claude", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
+            "generated_prompt": "bounded read-only task",
+        }), patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            with self.assertRaises(AccountSelectionError):
+                launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-sandbox",
+                           provider="claude", quota_document=document, claude_accounts=registry)
+        self.assertEqual([], launcher.events)  # never even reached prepare()
+
+    def test_launch_task_codex_ignores_claude_accounts_registry_signature_unchanged(self):
+        store = build_store(read_only=True, working_directory=self.request.working_directory)
+        launcher = Launcher()
+        registry = [{"account_id": "account-a", "enabled": True, "config_dir": None}]
+        with patch("manager.execution_runner.dispatch", return_value={
+            "recommended_provider": "codex", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
+            "generated_prompt": "bounded read-only task",
+        }), patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-sandbox",
+                       claude_accounts=registry)
+        self.assertEqual(["prepare", "start", "wait", "close"], launcher.events)
 
     def test_prompt_transcript_stderr_and_raw_failure_are_not_persisted(self):
         store, _, _, _, _ = self.execute(launcher=Launcher(outcome="failed"))

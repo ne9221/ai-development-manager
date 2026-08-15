@@ -12,6 +12,7 @@ import sys
 import uuid
 
 from collectors.publish_drive import build_service
+from manager.claude_account_selector import resolve_claude_account
 from manager.codex_launcher import CodexLaunchError, CodexLauncher, LaunchRequest
 from manager.dispatcher import dispatch
 from manager.execution_lifecycle import enter_running_gate, terminalize_execution
@@ -159,7 +160,7 @@ def _dispatch_request(task, provider):
 def launch_task(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                 execution_id=None, model=None, timeout_seconds=None, quota_document=None, executions=None,
                 retry_count=0, retry_of_execution_id=None, on_running=None, provider="codex",
-                account_id=None, config_dir=None):
+                account_id=None, config_dir=None, claude_accounts=None):
     """Dispatch, reserve, and run one ready task; callers supply real authorities.
 
     `provider` names which provider this launcher belongs to (the caller
@@ -170,13 +171,28 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     launcher actually used.
 
     `account_id`/`config_dir` are additive and default to None (today's
-    single-account behavior, unchanged); when supplied they are passed
-    through to `run_execution()` -> `launcher.prepare()` only for launchers
-    that accept them (ClaudeLauncher), never forced onto CodexLauncher.
+    single-account behavior, unchanged); when supplied directly (and
+    `claude_accounts` is not given) they are passed through to
+    `run_execution()` -> `launcher.prepare()` only for launchers that accept
+    them (ClaudeLauncher), never forced onto CodexLauncher.
+
+    `claude_accounts` is the additive routing path: a loaded account
+    registry (`manager.claude_account_selector.load_claude_accounts()`).
+    When given for provider="claude", it is authoritative -- it (re)resolves
+    account_id/config_dir via `resolve_claude_account()`, validating any
+    explicitly-supplied `account_id` against the registry+quota (fail-closed
+    on unknown/disabled/ambiguous/all-stale, exactly like
+    `select_claude_account()`) rather than trusting it blindly. It is a
+    no-op for any other provider and when omitted (default None), so every
+    existing single-account/Codex caller is unaffected.
     """
     task = store.get("tasks", project_id, task_id)
     validate("task", task)
     turn_timeout = task_turn_timeout(task["expected_minutes"], timeout_seconds)
+    if provider == "claude" and claude_accounts is not None:
+        quota_document = quota_document or read_drive_status(service=service)
+        resolved = resolve_claude_account(claude_accounts, quota_document, explicit_account_id=account_id)
+        account_id, config_dir = resolved["account_id"], resolved["config_dir"]
     dispatched = dispatch(store, service, _dispatch_request(task, provider), quota_document, executions)
     if dispatched["recommended_provider"] != provider:
         raise TaskError(f"dispatch did not select {provider}")
