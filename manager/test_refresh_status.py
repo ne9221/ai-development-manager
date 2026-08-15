@@ -88,6 +88,19 @@ class RefreshTests(unittest.TestCase):
         claude = next(x for x in result["document"]["providers"] if x["provider"] == "claude")
         self.assertEqual(50, claude["windows"][0]["remaining_percent"])
 
+    def test_claude_never_official_stays_unavailable_without_fabricating(self):
+        # Reproduces the real P0.0 finding: statusLine is unreachable from
+        # both headless ClaudeLauncher dispatch and Desktop-app sessions, so
+        # the payload file never gets rate_limits. Refresh must report
+        # "unavailable" and must not fabricate a percentage or bump
+        # last_updated on the untouched claude entry.
+        result, old, _ = self.run_refresh()
+        self.assertEqual("unavailable", result["providers"]["claude"])
+        claude = next(x for x in result["document"]["providers"] if x["provider"] == "claude")
+        self.assertEqual([], claude["windows"])
+        self.assertEqual("unknown", claude["confidence"])
+        self.assertEqual(old["providers"][1]["last_updated"], claude["last_updated"])
+
     def test_overlapping_refresh_is_blocked(self):
         with runtime_lock(self.base / "refresh.lock"):
             with self.assertRaises(RefreshError):

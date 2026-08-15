@@ -33,6 +33,52 @@ unless explicitly marked.
   31.3`, `resets_at`, `confidence: "local_estimate"`; `seven_day` fields were
   all `null`.
 
+### P0.0 root-cause update (2026-08-15) - why capture went stale for 6 days
+
+Real, reproducible evidence that the `statusLine` channel is structurally
+unreachable from either of the two ways Claude is actually run today, not a
+collector/refresh code defect:
+
+- `collectors/claude.py::normalize()` and `manager/refresh_status.py` were
+  re-read line by line; both already handle a rate-limits-less payload
+  correctly (empty `windows`, `confidence: "unknown"`, no fabricated
+  percentage, old official snapshot preserved if one exists). All 12
+  `collectors` tests and 52 `manager` tests (including
+  `test_refresh_status.py`'s `test_unavailable_provider_preserves_old_value`
+  and `test_empty_claude_capture_preserves_official_snapshot`) already cover
+  this and pass. No code bug found.
+- `~/.claude/statusline-payload.json` was last written 2026-08-09 (by
+  whatever the last real *interactive terminal* session was) and even that
+  snapshot has no `rate_limits` key at all - it was captured before the
+  session's first API response (`cost.total_api_duration_ms: 0`).
+- `manager/claude_launcher.py::_build_argv()` (the real, already-shipped
+  `ClaudeLauncher` - not re-implemented this round) always invokes
+  `claude -p --session-id ... --input-format stream-json --output-format
+  stream-json --verbose ...`. Reproduced that exact invocation shape
+  directly against the real, currently-logged-in Pro account:
+  `claude -p "Reply with exactly: OK"` returned a real `OK` (a genuine API
+  turn happened) but `statusline-payload.json`'s mtime was byte-for-byte
+  unchanged before and after (`1786248538` both times). `-p`/headless mode
+  does not invoke the `statusLine` hook at all - confirmed empirically, not
+  assumed from docs.
+- Checked for an alternative official headless source: `claude --help` has
+  no `usage`/`quota`/`rate-limit` subcommand; `claude auth status --json`
+  (real, logged-in) returns only `{loggedIn, authMethod, apiProvider, email,
+  orgId, orgName, subscriptionType}` - no rate-limit fields anywhere.
+- Conclusion: the *only* official source of `rate_limits.five_hour` /
+  `seven_day` is the interactive-terminal `statusLine` hook, which fires on
+  the ink-based TUI's render loop. Neither of Claude's two real usage
+  patterns on this machine - (a) `ClaudeLauncher`'s headless `-p` dispatch,
+  (b) this Desktop-app chat session itself (its own `statusline-payload.json`
+  mtime never moved across an entire long multi-turn real session) - drives
+  that render loop. This is a platform constraint external to this repo, not
+  a defect in the collection/refresh pipeline, which is why fixing it
+  requires either an unattended tool like `claude-monitor`
+  (non-official, `confidence: local_estimate`, needs a new pip dependency -
+  deliberately deferred to a separate task rather than added under this P0.0
+  fix) or a periodic human-attended interactive session - not a change to
+  `collectors/claude.py` or `manager/refresh_status.py`.
+
 ## Antigravity - manual in v0.1, CDP path inconclusive
 
 - Filesystem scan of `AppData\Roaming\Antigravity\` (app_storage.json,
