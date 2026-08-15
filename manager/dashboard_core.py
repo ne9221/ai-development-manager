@@ -46,12 +46,14 @@ def determine_execution_state(execution: dict, now: datetime) -> str:
             return "correlating"
         
         # Check heartbeat for waiting status
-        heartbeat_str = execution.get("heartbeat_at")
-        heartbeat = parse_time(heartbeat_str)
-        if heartbeat:
-            age_seconds = (now - heartbeat).total_seconds()
-            if age_seconds >= 900:  # 15 minutes
-                return "waiting"
+        provider = execution.get("provider", "").lower()
+        if provider != "claude":
+            heartbeat_str = execution.get("heartbeat_at")
+            heartbeat = parse_time(heartbeat_str)
+            if heartbeat:
+                age_seconds = (now - heartbeat).total_seconds()
+                if age_seconds >= 900:  # 15 minutes
+                    return "waiting"
         return "running"
 
     return status
@@ -70,6 +72,10 @@ def is_execution_stale(execution: dict, now: datetime) -> bool:
         hard_timeout = parse_time(hard_timeout_str)
         if hard_timeout and now > hard_timeout:
             return True
+
+    provider = execution.get("provider", "").lower()
+    if provider == "claude":
+        return False
 
     # Check heartbeat
     heartbeat_str = execution.get("heartbeat_at")
