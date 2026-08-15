@@ -131,9 +131,9 @@ def collect_codex_telemetry(codex_home=None, store=None):
                 try:
                     tokens = int(tokens)
                 except (ValueError, TypeError):
-                    tokens = 0
+                    tokens = None
             else:
-                tokens = 0
+                tokens = None
                 
             reasoning_effort = row_dict.get("reasoning_effort")
             title = row_dict.get("title")
@@ -141,7 +141,7 @@ def collect_codex_telemetry(codex_home=None, store=None):
             
             rec = {
                 "provider": "codex",
-                "account_id": "codex-account",
+                "account_id": None,
                 "session_id": str(thread_id),
                 "project": project_id,
                 "model": row_dict.get("model") or "unknown",
@@ -151,7 +151,7 @@ def collect_codex_telemetry(codex_home=None, store=None):
                 "updated_at": updated_at,
                 "tokens": tokens,
                 "source": str(db_path),
-                "confidence": "official"
+                "confidence": "confirmed"
             }
             records.append(sanitize_record(rec))
     except Exception as e:
@@ -171,10 +171,12 @@ def parse_claude_jsonl(file_path, account_name, projects):
     first_timestamp = None
     last_timestamp = None
     total_tokens = 0
+    has_token_reports = False
     cwd = None
     last_event_type = None
-    last_text_snippet = None
-    model = "claude-3-5-sonnet"
+    last_tool_name = None
+    last_status = None
+    model = None
     
     # Read line-by-line for isolation and memory efficiency
     with open(file_path, "r", encoding="utf-8") as f:
@@ -206,60 +208,86 @@ def parse_claude_jsonl(file_path, account_name, projects):
             if m:
                 model = m
                 
+            # Parse status
+            status = data.get("status")
+            if status:
+                last_status = status
+                
             msg = data.get("message")
             if isinstance(msg, dict):
                 if "model" in msg:
                     model = msg["model"]
                 usage = msg.get("usage")
                 if isinstance(usage, dict):
-                    in_tok = usage.get("input_tokens") or usage.get("inputTokens") or 0
-                    out_tok = usage.get("output_tokens") or usage.get("outputTokens") or 0
-                    try:
-                        total_tokens += int(in_tok) + int(out_tok)
-                    except (ValueError, TypeError):
-                        pass
+                    in_tok = usage.get("input_tokens") or usage.get("inputTokens")
+                    out_tok = usage.get("output_tokens") or usage.get("outputTokens")
+                    if in_tok is not None or out_tok is not None:
+                        try:
+                            in_val = int(in_tok) if in_tok is not None else 0
+                            out_val = int(out_tok) if out_tok is not None else 0
+                            total_tokens += in_val + out_val
+                            has_token_reports = True
+                        except (ValueError, TypeError):
+                            pass
+                
+                # Extract tool name from content tool_use block without transcript text
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            name = block.get("name")
+                            if name:
+                                last_tool_name = name
+                
+                # Check for tool_calls structured metadata
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    first_call = tool_calls[0]
+                    if isinstance(first_call, dict) and first_call.get("name"):
+                        last_tool_name = first_call.get("name")
                         
             ev_type = data.get("type")
             if ev_type:
                 last_event_type = ev_type
                 
-            if isinstance(msg, dict):
-                content = msg.get("content")
-                if isinstance(content, list) and content:
-                    first_block = content[0]
-                    if isinstance(first_block, dict) and first_block.get("type") == "text":
-                        text = first_block.get("text")
-                        if text:
-                            last_text_snippet = text[:50]
-                elif isinstance(content, str):
-                    last_text_snippet = content[:50]
+            tool_name = data.get("tool") or data.get("tool_name") or data.get("toolName")
+            if tool_name:
+                last_tool_name = tool_name
 
     if not first_timestamp:
         return None
         
     project_id = map_cwd_to_project(cwd, projects) or "_unclassified"
     
-    # Derived activity label
+    # Derived activity label strictly from structured metadata
     activity = f"Event: {last_event_type}" if last_event_type else "Active session"
-    if last_text_snippet:
-        activity = f"{activity} ({last_text_snippet}...)"
+    if last_tool_name:
+        activity = f"{activity} (Tool: {last_tool_name})"
+    if last_status:
+        activity = f"{activity} [Status: {last_status}]"
         
     started_at = format_timestamp(first_timestamp)
     updated_at = format_timestamp(last_timestamp)
     
+    # Semantic verification for confidence
+    if model is None or model == "unknown":
+        confidence = "unknown"
+    else:
+        confidence = "derived"
+        
     rec = {
         "provider": "claude",
         "account_id": account_name,
         "session_id": str(session_id),
         "project": project_id,
-        "model": model,
+        "model": model or "unknown",
         "reasoning_effort": None,
         "activity": activity,
         "started_at": started_at,
         "updated_at": updated_at,
-        "tokens": total_tokens,
+        "tokens": total_tokens if has_token_reports else None,
         "source": str(file_path),
-        "confidence": "derived"
+        "confidence": confidence
     }
     return sanitize_record(rec)
 
@@ -304,7 +332,7 @@ def collect_antigravity_telemetry():
         "activity": "Telemetry unavailable",
         "started_at": None,
         "updated_at": None,
-        "tokens": 0,
+        "tokens": None,
         "source": "unavailable",
         "confidence": "unavailable"
     }
