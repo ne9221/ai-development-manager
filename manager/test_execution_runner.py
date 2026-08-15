@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from manager.claude_launcher import ClaudeLaunchError
 from manager.codex_launcher import CodexLaunchError, LaunchOutcome, LaunchRequest
-from manager.execution_runner import launch_task, run_execution
+from manager.execution_runner import _stopped, launch_task, run_execution
 from manager.task_claims import check_task_execution_claim
 from manager.tasks import TaskError
 from manager.test_execution_lifecycle import build_store, quota_document
@@ -262,6 +262,23 @@ class RunnerTests(unittest.TestCase):
         self.assertNotEqual("running", execution["status"])
         self.assertEqual("interrupted", execution["status"])
         self.assertIsNone(launcher.prepared)
+
+    # -- regression coverage for 5d86fcd: _stopped() must duck-type Claude's
+    # PreparedLaunch shape too, not only Codex's _client.process --
+
+    def test_stopped_falls_back_to_process_attribute_when_no_client_is_present(self):
+        # ClaudeLauncher's real PreparedLaunch holds the subprocess directly as
+        # `_process` and has no `_client` field at all (unlike Codex's
+        # app-server-wrapped `_client.process`). Before 5d86fcd, _stopped()
+        # only ever read _client.process and silently returned False forever
+        # for a real Claude execution even after a clean exit, so
+        # terminalize_execution() could never be reached.
+        process = Process()
+        prepared = SimpleNamespace(_process=process)
+        self.assertFalse(hasattr(prepared, "_client"))
+        self.assertFalse(_stopped(prepared))
+        process.live = False
+        self.assertTrue(_stopped(prepared))
 
 
 if __name__ == "__main__":

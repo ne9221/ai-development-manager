@@ -514,6 +514,10 @@ class PermissionProfileTests(unittest.TestCase):
         self.assertIn("-p", argv)
         self.assertIn("--output-format", argv)
         self.assertIn("stream-json", argv)
+        # 7ca8708: real claude.exe rejects --print/-p --output-format=stream-json
+        # without --verbose ("requires --verbose"); every real launch failed at
+        # spawn before this flag was added.
+        self.assertIn("--verbose", argv)
 
 
 if __name__ == "__main__":
