@@ -161,6 +161,8 @@ class PreparedLaunch:
     _request: LaunchRequest = field(repr=False)
     _closed: bool = field(default=False, repr=False)
     _started: bool = field(default=False, repr=False)
+    account_id: str | None = None
+    config_dir: str | None = None
 
 
 def _encode_stream_json_input(prompt: str) -> bytes:
@@ -226,15 +228,33 @@ class ClaudeLauncher:
         except Exception:
             pass
 
-    def prepare(self, request: LaunchRequest, branch: str | None = None) -> PreparedLaunch:
+    def prepare(self, request: LaunchRequest, branch: str | None = None,
+                account_id: str | None = None, config_dir: str | None = None) -> PreparedLaunch:
+        """`account_id`/`config_dir` are additive, optional, and default to
+        None (today's single-account behavior: env=None, i.e. the child
+        inherits this process's environment unchanged -- identical to before
+        this parameter existed). When `config_dir` is given, the child gets a
+        copy of the parent environment with only CLAUDE_CONFIG_DIR overridden,
+        so a second Claude account's config directory never leaks into (or
+        gets clobbered by) the first. `account_id` is carried on the returned
+        PreparedLaunch purely as attribution evidence for the caller to persist
+        onto the session/execution record -- ClaudeLauncher itself does not
+        interpret or validate it against any account registry.
+        """
         cwd = Path(request.working_directory)
         if not cwd.is_absolute() or not cwd.is_dir():
             raise ClaudeLaunchError("invalid_request", "working_directory must be an existing absolute directory")
+        if config_dir is not None and not str(config_dir).strip():
+            raise ClaudeLaunchError("invalid_request", "config_dir must be a non-empty string when provided")
 
         permission_mode, allowed_tools = _permission_profile(request)
         executable = resolve_claude_executable(self.executable)
         session_id = _new_session_id()
         argv = _build_argv(executable, session_id, permission_mode, allowed_tools, request.model)
+        env = None
+        if config_dir is not None:
+            env = dict(os.environ)
+            env["CLAUDE_CONFIG_DIR"] = str(config_dir)
 
         log_dir = Path(self._log_dir) if self._log_dir else Path(tempfile.gettempdir())
         stdout_path = log_dir / f"claude-{session_id}.stdout.log"
@@ -249,7 +269,7 @@ class ClaudeLauncher:
             try:
                 process = self._popen(
                     argv, cwd=str(cwd), stdin=subprocess.PIPE,
-                    stdout=stdout_handle, stderr=stderr_handle, shell=False,
+                    stdout=stdout_handle, stderr=stderr_handle, shell=False, env=env,
                 )
             except OSError as exc:
                 raise ClaudeLaunchError("spawn_failed", f"failed to start Claude CLI: {exc}") from exc
@@ -281,6 +301,8 @@ class ClaudeLauncher:
             process_creation_identity=identity,
             cwd=str(cwd),
             branch=branch,
+            account_id=account_id,
+            config_dir=config_dir,
             prepared_at=utc_now(),
             model=request.model,
             mode=permission_mode,

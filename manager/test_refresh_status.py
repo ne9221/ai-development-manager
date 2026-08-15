@@ -101,6 +101,31 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual("unknown", claude["confidence"])
         self.assertEqual(old["providers"][1]["last_updated"], claude["last_updated"])
 
+    def test_second_claude_account_captured_independently_no_cross_contamination(self):
+        payload_b = self.base / "claude-b.json"
+        payload_b.write_text(json.dumps({"rate_limits": {
+            "five_hour": {"used_percentage": 12, "resets_at": None},
+        }}), encoding="utf-8")
+        result, _, _ = self.run_refresh(claude_accounts={"account-b": payload_b})
+        self.assertEqual("unavailable", result["providers"]["claude"])
+        self.assertEqual("success", result["providers"]["claude:account-b"])
+        claude_entries = [x for x in result["document"]["providers"] if x["provider"] == "claude"]
+        self.assertEqual(2, len(claude_entries))
+        default_entry = next(x for x in claude_entries if x.get("account_id") is None)
+        account_b_entry = next(x for x in claude_entries if x.get("account_id") == "account-b")
+        self.assertEqual([], default_entry["windows"])
+        self.assertEqual(88, account_b_entry["windows"][0]["remaining_percent"])
+
+    def test_two_claude_accounts_do_not_overwrite_each_others_entry_on_republish(self):
+        old = status()
+        old["providers"][1] = provider("claude", [{"name": "seven_day", "used_percent": 50, "remaining_percent": 50, "resets_at": None}])
+        old["providers"].append({**provider("claude", [{"name": "five_hour", "used_percent": 10, "remaining_percent": 90, "resets_at": None}]), "account_id": "account-b"})
+        result, _, _ = self.run_refresh(reader=lambda **_: deepcopy(old))
+        claude_entries = [x for x in result["document"]["providers"] if x["provider"] == "claude"]
+        self.assertEqual(2, len(claude_entries))
+        account_b_entry = next(x for x in claude_entries if x.get("account_id") == "account-b")
+        self.assertEqual(90, account_b_entry["windows"][0]["remaining_percent"])
+
     def test_overlapping_refresh_is_blocked(self):
         with runtime_lock(self.base / "refresh.lock"):
             with self.assertRaises(RefreshError):

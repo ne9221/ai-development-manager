@@ -8,6 +8,7 @@
     "session_id": {"type": "string", "minLength": 1, "description": "Manager provider-aware key; legacy Codex records may retain the raw ID."},
     "provider": {"type": "string", "minLength": 1},
     "provider_session_id": {"type": ["string", "null"], "minLength": 1, "description": "Provider-owned raw session ID; null is accepted only for legacy compatibility."},
+    "account_id": {"type": ["string", "null"], "minLength": 1, "description": "Provider account/profile identity (e.g. distinguishes two Claude accounts); null means the single default/legacy account."},
     "project_id": {"type": ["string", "null"]},
     "task_id": {"type": ["string", "null"]},
     "conversation_label": {"type": ["string", "null"], "maxLength": 500},

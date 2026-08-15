@@ -76,6 +76,7 @@
     "finished_at": {"type": ["string", "null"], "format": "date-time", "description": "Explicit execution finish timestamp; legacy records may use completed_at only."},
     "session_id": {"type": ["string", "null"], "minLength": 1, "description": "Primary manager canonical session identity."},
     "provider_session_id": {"type": ["string", "null"], "minLength": 1, "description": "Raw provider session ID for the primary linked session."},
+    "account_id": {"type": ["string", "null"], "minLength": 1, "description": "Provider account/profile identity (e.g. distinguishes two Claude accounts); null means the single default/legacy account."},
     "elapsed_minutes": {"type": ["number", "null"], "minimum": 0},
     "status": {"enum": ["reserved", "running", "completed", "failed", "interrupted", "cancelled"]},
     "retry_count": {"type": "integer", "minimum": 0, "maximum": 2},

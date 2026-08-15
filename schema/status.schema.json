@@ -39,6 +39,10 @@
           "type": "string",
           "description": "Stable machine-readable id, e.g. \"codex\", \"claude_code\", \"antigravity\", \"gemini_app\"."
         },
+        "account_id": {
+          "type": ["string", "null"],
+          "description": "Provider account/profile identity, e.g. distinguishing two Claude accounts under provider=\"claude\". Null means the single default/legacy account. When a provider has more than one entry in providers[], (provider, account_id) - not provider alone - is the unique key; consumers must not assume one entry per provider."
+        },
         "display_name": {
           "type": "string",
           "description": "Human-readable label for UI/report use, e.g. \"Codex\", \"Claude Code\", \"Antigravity\", \"Gemini App / Google AI Pro\"."

@@ -62,6 +62,45 @@ class Launcher:
         if self.close_stops: self.process.live = False
 
 
+class AccountAwareClaudeStyleLauncher:
+    """Like ClaudeStyleLauncher, but accepts account_id/config_dir like the
+    real ClaudeLauncher.prepare() does now, and records what it received so
+    tests can assert run_execution() actually threads them through."""
+
+    def __init__(self, outcome="completed"):
+        self.outcome = outcome
+        self.events, self.process, self.prepared = [], Process(), None
+        self.received_account_id = self.received_config_dir = "unset"
+
+    def prepare(self, request, account_id=None, config_dir=None):
+        self.events.append("prepare")
+        self.request = request
+        self.received_account_id, self.received_config_dir = account_id, config_dir
+        client = SimpleNamespace(process=self.process)
+        self.prepared = SimpleNamespace(
+            provider_session_id="claude-session-1", session_path="/tmp/claude.jsonl",
+            pid=4343, process_creation_identity="test-process:4343",
+            prepared_at="2026-08-13T13:00:00Z", _client=client,
+            account_id=account_id, config_dir=config_dir,
+        )
+        return self.prepared
+
+    def start(self, prepared, prompt):
+        self.events.append("start")
+        return SimpleNamespace(prepared=prepared, started_at="2026-08-13T13:00:01Z")
+
+    def set_heartbeat(self, running, callback):
+        running.heartbeat = callback
+
+    def wait(self, running):
+        self.events.append("wait")
+        return LaunchOutcome(self.outcome, "claude-session-1", "turn-1", "2026-08-13T13:01:00Z", None, None)
+
+    def close(self, handle):
+        self.events.append("close")
+        self.process.live = False
+
+
 class ClaudeStyleLauncher:
     """A launcher double shaped like ClaudeLauncher: prepare() returns
     provider_session_id/session_path (not Codex's thread_id/session_path
@@ -107,7 +146,7 @@ class RunnerTests(unittest.TestCase):
 
     def tearDown(self): self.temp.cleanup()
 
-    def execute(self, read_only=False, launcher=None, store=None, provider="codex"):
+    def execute(self, read_only=False, launcher=None, store=None, provider="codex", account_id=None, config_dir=None):
         store = store or build_store(read_only=read_only, working_directory=self.request.working_directory, provider=provider)
         writer = None if read_only else MemoryRegistry()
         claim = MemoryClaimRegistry()
@@ -117,7 +156,8 @@ class RunnerTests(unittest.TestCase):
              patch("manager.executions.read_drive_status", return_value=quota_document()):
             result = run_execution(store, object(), writer, claim, launcher, "p1", "t1", "exec-a", "secret prompt", self.request,
                                    access="read_only" if read_only else "production_write",
-                                   baseline_head=None if read_only else "a" * 40, provider=provider)
+                                   baseline_head=None if read_only else "a" * 40, provider=provider,
+                                   account_id=account_id, config_dir=config_dir)
         return store, writer, claim, launcher, result
 
     def test_prepare_link_start_wait_close_order_and_session_readback(self):
@@ -239,6 +279,26 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("claude:claude-session-1", session["session_id"])
         self.assertEqual("claude", session["provider"])
         self.assertEqual("claude-session-1", session["provider_session_id"])
+
+    def test_account_id_and_config_dir_thread_through_to_launcher_and_session(self):
+        launcher = AccountAwareClaudeStyleLauncher()
+        store = build_store(read_only=True, working_directory=self.request.working_directory, provider="claude")
+        _, _, _, launcher, result = self.execute(
+            read_only=True, launcher=launcher, store=store, provider="claude",
+            account_id="account-b", config_dir=r"C:\accounts\b\.claude",
+        )
+        self.assertEqual("account-b", launcher.received_account_id)
+        self.assertEqual(r"C:\accounts\b\.claude", launcher.received_config_dir)
+        self.assertEqual("account-b", result["session"]["account_id"])
+        execution = store.get("executions", "p1", "exec-a")
+        self.assertEqual("account-b", execution["account_id"])
+
+    def test_no_account_id_leaves_codex_launcher_call_signature_unchanged(self):
+        # CodexLauncher.prepare(request) takes no account_id/config_dir kwargs
+        # at all; run_execution() must not pass them unless supplied.
+        launcher = Launcher()
+        self.execute(launcher=launcher)
+        self.assertEqual(["prepare", "start", "wait", "close"], launcher.events)
 
     def test_provider_session_id_accepts_both_thread_id_and_provider_session_id_naming(self):
         # Codex's PreparedLaunch names this field thread_id; Claude's names it

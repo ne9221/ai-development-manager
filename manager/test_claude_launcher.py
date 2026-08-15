@@ -249,6 +249,51 @@ class ClaudeLauncherTests(unittest.TestCase):
         prepared = self.launcher().prepare(self.request(), branch="feature/example")
         self.assertEqual(prepared.branch, "feature/example")
 
+    def test_no_account_id_or_config_dir_is_fully_backward_compatible(self):
+        # Default (single-account) behavior: env=None means the child
+        # inherits this process's environment unchanged, exactly as before
+        # account_id/config_dir existed.
+        prepared = self.prepare()
+        _, kwargs = self.calls[-1]
+        self.assertIsNone(kwargs["env"])
+        self.assertIsNone(prepared.account_id)
+        self.assertIsNone(prepared.config_dir)
+
+    def test_config_dir_sets_claude_config_dir_in_child_env_only(self):
+        self.process = FakeProcess()
+        prepared = self.launcher().prepare(
+            self.request(), account_id="account-b", config_dir=r"C:\accounts\b\.claude",
+        )
+        _, kwargs = self.calls[-1]
+        env = kwargs["env"]
+        self.assertIsNotNone(env)
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], r"C:\accounts\b\.claude")
+        # Every other inherited variable must survive untouched.
+        for key, value in os.environ.items():
+            if key != "CLAUDE_CONFIG_DIR":
+                self.assertEqual(env.get(key), value)
+        self.assertEqual(prepared.account_id, "account-b")
+        self.assertEqual(prepared.config_dir, r"C:\accounts\b\.claude")
+
+    def test_two_accounts_get_isolated_non_overlapping_envs(self):
+        self.process = FakeProcess()
+        launcher = self.launcher()
+        prepared_a = launcher.prepare(self.request(), account_id="account-a", config_dir=r"C:\accounts\a\.claude")
+        self.process = FakeProcess()
+        prepared_b = launcher.prepare(self.request(), account_id="account-b", config_dir=r"C:\accounts\b\.claude")
+        env_a = self.calls[-2][1]["env"]
+        env_b = self.calls[-1][1]["env"]
+        self.assertNotEqual(env_a["CLAUDE_CONFIG_DIR"], env_b["CLAUDE_CONFIG_DIR"])
+        self.assertNotEqual(prepared_a.provider_session_id, prepared_b.provider_session_id)
+        self.assertNotEqual(prepared_a.account_id, prepared_b.account_id)
+
+    def test_empty_config_dir_fails_closed(self):
+        launcher = self.launcher()
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            launcher.prepare(self.request(), config_dir="   ")
+        self.assertEqual(ctx.exception.classification, "invalid_request")
+        self.assertEqual(self.calls, [])
+
     def test_stdout_stderr_use_file_sink_not_pipe(self):
         prepared = self.prepare()
         _, kwargs = self.calls[-1]

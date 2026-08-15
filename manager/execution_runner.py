@@ -53,9 +53,17 @@ def _provider_session_id(prepared):
 def _session(execution, prepared, request, provider):
     provider_session_id = _provider_session_id(prepared)
     session_id = manager_session_key(provider, provider_session_id)
+    # account_id is duck-typed like provider_session_id above: only
+    # ClaudeLauncher's PreparedLaunch carries it today (CodexLauncher's does
+    # not), and getattr(..., None) makes both single-account Claude and all
+    # Codex records identical to before this field existed. It is evidence
+    # attribution only -- provider_session_id (a UUID ADM assigns itself)
+    # already guarantees no two sessions collide, with or without account_id.
+    account_id = getattr(prepared, "account_id", None)
     # session_path is adapter-validated advisory evidence; identity is provider_session_id.
     return {
         "session_id": session_id, "provider": provider, "provider_session_id": provider_session_id,
+        "account_id": account_id,
         "project_id": execution["project_id"], "task_id": execution["task_id"],
         "conversation_label": None, "title": None, "summary": None,
         "started_at": prepared.prepared_at, "updated_at": prepared.prepared_at,
@@ -150,7 +158,8 @@ def _dispatch_request(task, provider):
 
 def launch_task(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                 execution_id=None, model=None, timeout_seconds=None, quota_document=None, executions=None,
-                retry_count=0, retry_of_execution_id=None, on_running=None, provider="codex"):
+                retry_count=0, retry_of_execution_id=None, on_running=None, provider="codex",
+                account_id=None, config_dir=None):
     """Dispatch, reserve, and run one ready task; callers supply real authorities.
 
     `provider` names which provider this launcher belongs to (the caller
@@ -159,6 +168,11 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     (Execution, task claim, Session) is written with this same provider
     string rather than a hardcoded one, so evidence never disagrees with the
     launcher actually used.
+
+    `account_id`/`config_dir` are additive and default to None (today's
+    single-account behavior, unchanged); when supplied they are passed
+    through to `run_execution()` -> `launcher.prepare()` only for launchers
+    that accept them (ClaudeLauncher), never forced onto CodexLauncher.
     """
     task = store.get("tasks", project_id, task_id)
     validate("task", task)
@@ -177,19 +191,27 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     result = run_execution(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                            execution_id, dispatched["generated_prompt"], request,
                            access="read_only" if task["read_only"] else "production_write",
-                           baseline_head=task.get("baseline_head"), on_running=on_running, provider=provider)
+                           baseline_head=task.get("baseline_head"), on_running=on_running, provider=provider,
+                           account_id=account_id, config_dir=config_dir)
     return {"execution_id": execution_id, "dispatch": dispatched, **result}
 
 
 def run_execution(store, service, writer_registry, claim_registry, launcher,
                   project_id, task_id, execution_id, prompt, launch_request: LaunchRequest,
-                  access="production_write", baseline_head=None, on_running=None, provider="codex"):
+                  access="production_write", baseline_head=None, on_running=None, provider="codex",
+                  account_id=None, config_dir=None):
     """Run one reserved execution through the reviewed lifecycle gates.
 
     ``provider_stopped`` is derived only after prepare-owned cleanup or after
     ``close()`` plus process-exit evidence; it is never assumed by the caller.
     Full prompt, transcript, stderr, and raw provider failure text are not
     persisted by this runner.
+
+    ``account_id``/``config_dir`` are only forwarded to ``launcher.prepare()``
+    when at least one is supplied, and only as extra keyword arguments -- this
+    keeps every existing CodexLauncher call (whose ``prepare(request)`` takes
+    no such arguments) byte-for-byte identical to before these parameters
+    existed.
     """
     gate = enter_running_gate(
         store, service, writer_registry, project_id, task_id, execution_id, provider, access,
@@ -206,7 +228,12 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
             on_running(execution)
         if launch_request.working_directory != execution["task_snapshot"].get("working_directory"):
             raise TaskError("launch working directory does not match the reserved execution")
-        prepared = launcher.prepare(launch_request)
+        prepare_kwargs = {}
+        if account_id is not None:
+            prepare_kwargs["account_id"] = account_id
+        if config_dir is not None:
+            prepare_kwargs["config_dir"] = config_dir
+        prepared = launcher.prepare(launch_request, **prepare_kwargs)
         provider_evidence = {
             "host": socket.gethostname()[:100], "pid": prepared.pid,
             "creation_identity": prepared.process_creation_identity,

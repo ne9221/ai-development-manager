@@ -162,6 +162,7 @@ def session_link_fields(execution, session):
     return {
         "session_id": manager_session_key(provider, provider_session_id),
         "provider_session_id": provider_session_id,
+        "account_id": session.get("account_id"),
     }
 
 
@@ -242,7 +243,7 @@ def reserve_execution(store, project_id, task_id, execution_id, provider, quota_
     execution = {
         **expected, "reserved_at": reserved_at, "started_at": None,
         "completed_at": None, "elapsed_minutes": None, "status": "reserved",
-        "finished_at": None, "session_id": None, "provider_session_id": None,
+        "finished_at": None, "session_id": None, "provider_session_id": None, "account_id": None,
         "quota_before": None, "quota_after": None, "quota_delta": None,
         "source_confidence": None,
         "heartbeat_at": None, "progress_updated_at": None, "hard_timeout_at": None, "last_provider_event": None,
