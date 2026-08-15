@@ -136,8 +136,10 @@ def collect_codex_telemetry(codex_home=None, store=None):
                 tokens = None
                 
             reasoning_effort = row_dict.get("reasoning_effort")
-            title = row_dict.get("title")
-            activity = f"Thread: {title}" if title else "Active turn"
+            # Activity is a fixed, structured label. `title` is user/model-authored
+            # free text (often prompt- or transcript-shaped, sometimes tens of KB)
+            # and must never be echoed into telemetry output, truncated or not.
+            activity = "Codex thread"
             
             rec = {
                 "provider": "codex",

@@ -127,6 +127,81 @@ class TestTelemetryAdapter(unittest.TestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 collect_codex_telemetry(codex_home=str(self.temp_path))
 
+    def test_codex_no_transcript_text_leak(self):
+        # Codex `threads.title` is user/model-authored free text (real captures show
+        # 55/93 titles >200 chars, some ~74KB, and prompt/transcript-shaped content).
+        # activity must never echo it, truncated or not - only a fixed structured label.
+        db_path = self.temp_path / "state_5.sqlite"
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                created_at INTEGER,
+                updated_at INTEGER,
+                model TEXT,
+                tokens_used INTEGER,
+                cwd TEXT,
+                title TEXT,
+                source TEXT
+            )
+        """)
+
+        long_title = "A" * 5000  # 1. very long title
+        prompt_title = "Please write a function that connects to the database using password hunter2 and return all user emails"  # 2. prompt-shaped
+        multiline_title = "Fix bug in login flow\nStack trace:\n  at foo()\n  at bar()\nSee attached transcript"  # 3. multiline
+        unicode_title = "修復登入流程 🔒 emoji test 日本語タイトル"  # 4. unicode
+        code_title = 'def handler():\n    return "SELECT * FROM users WHERE token=\'abc123\'"'  # 5. code/quotes
+
+        rows = [
+            ("thread-long", long_title),
+            ("thread-prompt", prompt_title),
+            ("thread-multiline", multiline_title),
+            ("thread-unicode", unicode_title),
+            ("thread-code", code_title),
+            ("thread-notitle", None),  # 6. missing/null title
+        ]
+        for i, (thread_id, title) in enumerate(rows):
+            cursor.execute(
+                "INSERT INTO threads (id, created_at, updated_at, model, tokens_used, cwd, title, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (thread_id, 1771112400000 + i, 1771112500000 + i, "gpt-5-codex", 1234, "/proj", title, "cli"),
+            )
+        conn.commit()
+        conn.close()
+
+        results = collect_codex_telemetry(codex_home=str(self.temp_path))
+        self.assertEqual(len(results), len(rows))
+
+        by_id = {r["session_id"]: r for r in results}
+
+        suspicious_fragments = [
+            "AAAA", "hunter2", "connects to the database", "Stack trace", "at foo()",
+            "at bar()", "修復登入流程", "SELECT * FROM users", "abc123", "token=",
+        ]
+        for r in results:
+            activity = r["activity"]
+            # 8. activity contains no raw title substring
+            for fragment in suspicious_fragments:
+                self.assertNotIn(fragment, activity)
+            self.assertNotIn("\n", activity)  # no multiline leakage
+            # 9. activity bounded length - fixed short label, not proportional to title size
+            self.assertLessEqual(len(activity), 64)
+            # activity must be the fixed structured label, never derived from title content
+            self.assertEqual(activity, "Codex thread")
+
+        # 7. normal, non-content telemetry metadata is still preserved
+        r = by_id["thread-long"]
+        self.assertEqual(r["model"], "gpt-5-codex")
+        self.assertEqual(r["tokens"], 1234)
+        self.assertEqual(r["session_id"], "thread-long")
+        self.assertIn("confidence", r)
+        self.assertEqual(r["confidence"], "confirmed")
+
+        # missing title must not crash and must still produce the fixed label
+        r_no_title = by_id["thread-notitle"]
+        self.assertEqual(r_no_title["activity"], "Codex thread")
+
     def test_claude_ab_roots_isolation(self):
         # Create default root ~/.claude (account-a) and ~/.claude-b (account-b)
         root_a = self.temp_path / "claude-a"
