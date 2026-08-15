@@ -81,6 +81,29 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+from manager.tasks import DriveRecords, logical_record_id
+
+def list_records_isolated(store, area, project_id):
+    records = []
+    warnings = []
+    try:
+        parent = store.project_folder(area, project_id, create=False)
+        items = store.children(parent)
+        for item in items:
+            name = item.get("name", "")
+            if name.endswith(".json"):
+                storage_id = name[:-5]
+                try:
+                    logical_id = logical_record_id(storage_id)
+                    doc = store.get(area, project_id, logical_id)
+                    records.append(doc)
+                except Exception as exc:
+                    warnings.append(f"Malformed record '{name}' in '{area}' for project '{project_id}': {exc}")
+    except Exception:
+        # Ignore normal missing folder cases
+        pass
+    return records, warnings
+
 # Cache data loading to prevent unnecessary Drive API calls on interaction
 @st.cache_data(ttl=60)
 def load_all_data():
@@ -99,6 +122,7 @@ def load_all_data():
         all_executions = []
         handoffs_dict = {}
         sessions_dict = {}
+        all_warnings = []
         
         for project in projects:
             p_id = project.get("project_id")
@@ -106,41 +130,33 @@ def load_all_data():
                 continue
             
             # Read Tasks
-            try:
-                tasks = store.list_records("tasks", p_id)
-                all_tasks.extend(tasks)
-            except Exception:
-                pass
+            tasks, t_warns = list_records_isolated(store, "tasks", p_id)
+            all_tasks.extend(tasks)
+            all_warnings.extend(t_warns)
                 
             # Read Executions
-            try:
-                executions = store.list_records("executions", p_id)
-                all_executions.extend(executions)
-            except Exception:
-                pass
+            executions, e_warns = list_records_isolated(store, "executions", p_id)
+            all_executions.extend(executions)
+            all_warnings.extend(e_warns)
                 
             # Read Handoffs
-            try:
-                handoffs = store.list_records("handoffs", p_id)
-                for ho in handoffs:
-                    t_id = ho.get("task_id")
-                    if t_id:
-                        key = (p_id, t_id)
-                        existing = handoffs_dict.get(key)
-                        if not existing or ho.get("created_at", "") > existing.get("created_at", ""):
-                            handoffs_dict[key] = ho
-            except Exception:
-                pass
+            handoffs, h_warns = list_records_isolated(store, "handoffs", p_id)
+            all_warnings.extend(h_warns)
+            for ho in handoffs:
+                t_id = ho.get("task_id")
+                if t_id:
+                    key = (p_id, t_id)
+                    existing = handoffs_dict.get(key)
+                    if not existing or ho.get("created_at", "") > existing.get("created_at", ""):
+                        handoffs_dict[key] = ho
                 
             # Read Sessions
-            try:
-                sessions = store.list_records("sessions", p_id)
-                for s in sessions:
-                    s_id = s.get("id") or s.get("provider_session_id")
-                    if s_id:
-                        sessions_dict[(p_id, s_id)] = s
-            except Exception:
-                pass
+            sessions, s_warns = list_records_isolated(store, "sessions", p_id)
+            all_warnings.extend(s_warns)
+            for s in sessions:
+                s_id = s.get("id") or s.get("provider_session_id")
+                if s_id:
+                    sessions_dict[(p_id, s_id)] = s
                 
         return {
             "success": True,
@@ -150,6 +166,7 @@ def load_all_data():
             "all_executions": all_executions,
             "handoffs_dict": handoffs_dict,
             "sessions_dict": sessions_dict,
+            "warnings": all_warnings,
             "error": None
         }
     except Exception as e:
@@ -161,6 +178,7 @@ def load_all_data():
             "all_executions": [],
             "handoffs_dict": {},
             "sessions_dict": {},
+            "warnings": [],
             "error": str(e)
         }
 
@@ -197,6 +215,7 @@ all_tasks = data["all_tasks"]
 all_executions = data["all_executions"]
 handoffs_dict = data["handoffs_dict"]
 sessions_dict = data["sessions_dict"]
+all_warnings = data.get("warnings", [])
 
 now = datetime.now(timezone.utc)
 
@@ -240,37 +259,65 @@ with m4:
 
 # Layout: 1. Quota Columns
 st.header("⚡ Provider / Quota Center")
-quota_cols = st.columns(len(quota_summary["providers"]))
-
-for idx, p in enumerate(quota_summary["providers"]):
-    with quota_cols[idx]:
-        st.markdown(f"### {p['display_name']}")
-        
-        status_val = p.get("status", "unknown").upper()
-        freshness_val = p.get("freshness", "stale").upper()
-        
-        status_class = "badge-ok" if status_val == "OK" else "badge-attention"
-        fresh_class = "badge-fresh" if freshness_val == "FRESH" else "badge-stale"
-        
-        st.markdown(f"""
-        <span class="badge {status_class}">Status: {status_val}</span>
-        <span class="badge {fresh_class}">{freshness_val}</span>
-        """, unsafe_allow_html=True)
-        
-        # Display window remaining percentage if exists
-        windows = p.get("windows", [])
-        if windows and not p.get("stale"):
-            for w in windows:
-                rem_pct = w.get("remaining_percent", 0)
-                st.progress(rem_pct / 100.0)
-                st.write(f"Remaining: **{rem_pct}%** (Used: {w.get('used_percent', 0)}%)")
-        else:
-            st.warning("No fresh quota window data")
-            
-        st.write(f"Confidence: `{p.get('confidence', 'unknown')}`")
-        st.write(f"Source: `{p.get('source', 'unknown')}`")
-        st.write(f"Reset Clock: `{p.get('nearest_reset_at') or '—'}`")
-        st.caption(f"Last updated: {p.get('last_updated') or 'never'}")
+providers_list = quota_summary.get("providers", [])
+if not providers_list:
+    st.info("No AI providers configured in quota status.")
+else:
+    quota_cols = st.columns(len(providers_list))
+    for idx, p in enumerate(providers_list):
+        with quota_cols[idx]:
+            try:
+                st.markdown(f"### {p['display_name']}")
+                
+                status_val = p.get("status", "unknown").upper()
+                freshness_val = p.get("freshness", "stale").upper()
+                
+                # UI distinction
+                if p.get("stale"):
+                    fresh_class = "badge-stale"
+                    freshness_text = "STALE"
+                else:
+                    fresh_class = "badge-fresh"
+                    freshness_text = "FRESH"
+                    
+                status_class = "badge-ok" if status_val == "OK" else "badge-attention"
+                
+                st.markdown(f"""
+                <span class="badge {status_class}">Status: {status_val}</span>
+                <span class="badge {fresh_class}">{freshness_text}</span>
+                """, unsafe_allow_html=True)
+                
+                # Display window remaining percentage if exists
+                windows = p.get("windows", [])
+                if windows:
+                    for w in windows:
+                        w_name = w.get("name", "quota")
+                        rem_pct = w.get("remaining_percent")
+                        used_pct = w.get("used_percent")
+                        
+                        if p.get("stale"):
+                            st.warning(f"**{w_name}**: Stale Quota (Remaining: {rem_pct if rem_pct is not None else 'Unknown'}%)")
+                        elif rem_pct is not None:
+                            try:
+                                rem_val = float(rem_pct)
+                                st.progress(rem_val / 100.0)
+                                st.write(f"**{w_name}**: Remaining: **{rem_pct}%** (Used: {used_pct if used_pct is not None else '—'}%)")
+                            except (ValueError, TypeError):
+                                st.write(f"**{w_name}**: Remaining: **Unknown** (Used: {used_pct if used_pct is not None else '—'}%)")
+                        else:
+                            st.info(f"**{w_name}**: Percentage not reported (Used: {used_pct if used_pct is not None else '—'}%)")
+                else:
+                    if p.get("stale"):
+                        st.warning("Quota data is stale")
+                    else:
+                        st.write("No quota windows defined")
+                    
+                st.write(f"Confidence: `{p.get('confidence', 'unknown')}`")
+                st.write(f"Source: `{p.get('source', 'unknown')}`")
+                st.write(f"Reset Clock: `{p.get('nearest_reset_at') or '—'}`")
+                st.caption(f"Last updated: {p.get('last_updated') or 'never'}")
+            except Exception as e:
+                st.error(f"Error rendering provider {p.get('display_name', 'Unknown')}: {e}")
 
 st.markdown("---")
 
@@ -437,3 +484,9 @@ else:
                         st.write(commits)
             else:
                 st.write("No handoff records found for this task.")
+
+if all_warnings:
+    st.markdown("---")
+    with st.expander("⚠️ Partial Data Warnings (Record-level Failures)"):
+        for w in all_warnings:
+            st.warning(w)

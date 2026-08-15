@@ -90,6 +90,15 @@ class TestDashboardCore(unittest.TestCase):
         }
         self.assertEqual(determine_execution_state(running_waiting, now), "waiting")
 
+        # Claude: Running and linked, old heartbeat (remains running)
+        claude_running = {
+            "status": "running",
+            "provider": "claude",
+            "provider_session_id": "sess-2",
+            "heartbeat_at": "2026-08-15T02:30:00Z" # 30 mins ago
+        }
+        self.assertEqual(determine_execution_state(claude_running, now), "running")
+
     def test_is_execution_stale(self):
         now = datetime(2026, 8, 15, 3, 0, 0, tzinfo=timezone.utc)
         
@@ -110,6 +119,14 @@ class TestDashboardCore(unittest.TestCase):
             "heartbeat_at": "2026-08-15T02:44:00Z" # 16 mins ago
         }
         self.assertTrue(is_execution_stale(exec_old_hb, now))
+
+        # Claude: Heartbeat >= 15 mins (not stale)
+        claude_exec_old = {
+            "status": "running",
+            "provider": "Claude",
+            "heartbeat_at": "2026-08-15T02:30:00Z" # 30 mins ago
+        }
+        self.assertFalse(is_execution_stale(claude_exec_old, now))
         
         # Heartbeat < 15 mins
         exec_fresh = {
