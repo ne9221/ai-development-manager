@@ -34,6 +34,7 @@
     "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
     "recommended_provider": {"type": ["string", "null"]},
     "assigned_provider": {"type": ["string", "null"]},
+    "account_id": {"type": ["string", "null"], "minLength": 1, "description": "Explicit provider account identity, used as a fallback when the launching Command does not set its own account_id; non-secret, resolved against the local account registry only -- never a config_dir/credential."},
     "mode": {"type": ["string", "null"]},
     "effort": {"type": ["string", "null"]},
     "depends_on": {"type": "array", "items": {"type": "string"}},

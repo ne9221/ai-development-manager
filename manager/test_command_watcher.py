@@ -487,6 +487,118 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertEqual("claude", kwargs.get("provider"))
         self.assertEqual("completed", result["status"])
 
+    # -- P0.4: explicit account_id contract (Command > Task > None) --
+
+    REGISTRY = [
+        {"account_id": "account-a", "enabled": True, "config_dir": None},
+        {"account_id": "account-b", "enabled": True, "config_dir": r"C:\accounts\b\.claude"},
+        {"account_id": "account-disabled", "enabled": False, "config_dir": r"C:\accounts\d\.claude"},
+    ]
+
+    _NO_OVERRIDE = object()
+
+    def _run_explicit(self, cmd, quota_reliable=False, registry=_NO_OVERRIDE):
+        runner = Mock(return_value=self.complete("exec-claude"))
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher._claude_account_registry",
+                   return_value=self.REGISTRY if registry is self._NO_OVERRIDE else registry):
+            result = process_command(
+                self.store, object(), cmd,
+                claim_factory=self.claim_factory, allowlist=frozenset({("p1", "t1")}),
+                health_check=lambda: True, quota_check=lambda service: quota_reliable,
+            )
+        return result, runner
+
+    def test_command_explicit_account_a_threads_through_to_launch_task(self):
+        result, runner = self._run_explicit(command(provider="claude", account_id="account-a"))
+        runner.assert_called_once()
+        _, kwargs = runner.call_args
+        self.assertEqual("account-a", kwargs.get("account_id"))
+        self.assertEqual(self.REGISTRY, kwargs.get("claude_accounts"))
+        self.assertEqual("completed", result["status"])
+
+    def test_command_explicit_account_b_threads_through_to_launch_task(self):
+        result, runner = self._run_explicit(command(provider="claude", account_id="account-b"))
+        runner.assert_called_once()
+        _, kwargs = runner.call_args
+        self.assertEqual("account-b", kwargs.get("account_id"))
+        self.assertEqual("completed", result["status"])
+
+    def test_task_explicit_account_id_used_as_fallback_when_command_has_none(self):
+        task_record = self.store.get("tasks", "p1", "t1")
+        task_record["account_id"] = "account-b"
+        self.store.put("tasks", "p1", "t1", task_record)
+        result, runner = self._run_explicit(command(provider="claude"))
+        runner.assert_called_once()
+        _, kwargs = runner.call_args
+        self.assertEqual("account-b", kwargs.get("account_id"))
+        self.assertEqual("completed", result["status"])
+
+    def test_command_account_id_takes_priority_over_task_account_id(self):
+        task_record = self.store.get("tasks", "p1", "t1")
+        task_record["account_id"] = "account-b"
+        self.store.put("tasks", "p1", "t1", task_record)
+        result, runner = self._run_explicit(command(provider="claude", account_id="account-a"))
+        runner.assert_called_once()
+        _, kwargs = runner.call_args
+        self.assertEqual("account-a", kwargs.get("account_id"))
+
+    def test_unknown_explicit_account_id_rejected(self):
+        result, runner = self._run_explicit(command(provider="claude", account_id="account-ghost"))
+        self.assertEqual({"status": "rejected", "reason": "unknown_or_disabled_claude_account"}, result)
+        runner.assert_not_called()
+
+    def test_disabled_explicit_account_id_rejected(self):
+        result, runner = self._run_explicit(command(provider="claude", account_id="account-disabled"))
+        self.assertEqual({"status": "rejected", "reason": "unknown_or_disabled_claude_account"}, result)
+        runner.assert_not_called()
+
+    def test_explicit_account_id_with_no_registry_configured_rejected(self):
+        # An explicit account_id with no local registry at all cannot be
+        # validated or resolved to a config_dir -- must fail closed, not
+        # silently fall through to the single-account default.
+        result, runner = self._run_explicit(command(provider="claude", account_id="account-a"), registry=None)
+        self.assertEqual({"status": "rejected", "reason": "unknown_or_disabled_claude_account"}, result)
+        runner.assert_not_called()
+
+    def test_claude_explicit_valid_account_bypasses_quota_gate_even_when_unreliable(self):
+        # This is the core of Blocker 2: quota_check is never even called
+        # when an explicit, validated account_id is present.
+        quota_check = Mock(return_value=False)
+        runner = Mock(return_value=self.complete("exec-claude"))
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher._claude_account_registry", return_value=self.REGISTRY):
+            result = process_command(
+                self.store, object(), command(provider="claude", account_id="account-a"),
+                claim_factory=self.claim_factory, allowlist=frozenset({("p1", "t1")}),
+                health_check=lambda: True, quota_check=quota_check,
+            )
+        quota_check.assert_not_called()
+        runner.assert_called_once()
+        self.assertEqual("completed", result["status"])
+
+    def test_claude_no_explicit_account_and_unreliable_quota_still_rejected(self):
+        # Same unreliable-quota condition as above, but with no explicit
+        # account_id: the AUTO-selection quota gate still applies unchanged.
+        result, runner = self._run_explicit(command(provider="claude"), quota_reliable=False)
+        self.assertEqual({"status": "rejected", "reason": "quota_unreliable"}, result)
+        runner.assert_not_called()
+
+    def test_codex_explicit_account_id_field_is_ignored_quota_gate_unchanged(self):
+        # account_id is meaningless for Codex; an unreliable Codex quota must
+        # still block exactly as before, even if a (nonsensical) account_id
+        # were ever present on the command.
+        result, runner = self._run_explicit(command(provider="codex", account_id="account-a"), quota_reliable=False)
+        self.assertEqual({"status": "rejected", "reason": "quota_unreliable"}, result)
+        runner.assert_not_called()
+
+    def test_command_schema_rejects_config_dir_field(self):
+        # config_dir must never be persisted to Drive Command/Task records --
+        # only the local registry may resolve account_id -> config_dir.
+        from manager.tasks import TaskError as _TaskError, validate as _validate
+        with self.assertRaises(_TaskError):
+            _validate("command", command(provider="claude", account_id="account-a", config_dir=r"C:\accounts\a\.claude"))
+
     # 8: Claude and Codex quota gates never cross-contaminate on the same document
     def test_claude_and_codex_quota_do_not_cross_contaminate(self):
         mixed = {"providers": [

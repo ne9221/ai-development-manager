@@ -9,6 +9,7 @@
     "project_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
     "task_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
     "provider": {"enum": ["codex", "claude"]},
+    "account_id": {"type": ["string", "null"], "minLength": 1, "description": "Explicit provider account identity (e.g. which Claude account); non-secret, resolved against the local account registry only -- never a config_dir/credential. Null/absent means automatic selection."},
     "model": {"type": ["string", "null"], "maxLength": 200},
     "fallback_model": {"type": ["string", "null"], "maxLength": 200},
     "mode": {"type": ["string", "null"], "maxLength": 80},

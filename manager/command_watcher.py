@@ -177,6 +177,25 @@ def _provider_state(execution):
     return process_identity_state(evidence.get("pid"), evidence.get("creation_identity"))
 
 
+def _explicit_account_id(command, task):
+    """Command's own account_id wins over Task's -- Command is the concrete
+    per-launch intent (closer to "what should run right now"), Task is a
+    standing default. Both are optional/nullable; None means "no explicit
+    choice", which is a real, different state from an invalid one and must
+    fall through to automatic selection, not be rejected."""
+    return command.get("account_id") or task.get("account_id")
+
+
+def _explicit_account_is_valid(registry, account_id):
+    """True only if a local registry is actually configured and the id
+    names one of its enabled accounts. No registry configured (None) can
+    never validate an explicit id -- there would be no config_dir to
+    resolve it to, so this fails closed rather than trusting the bare id."""
+    if registry is None:
+        return False
+    return any(account["account_id"] == account_id and account["enabled"] for account in registry)
+
+
 def _claude_account_registry():
     """Load the Claude account registry from CLAUDE_ACCOUNTS_CONFIG if set,
     else None -- not []. None means "no registry configured", which keeps
@@ -345,9 +364,26 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         # Transient/recoverable, not a policy problem: leave queued untouched,
         # no write, so this is retried automatically on the next poll.
         return {"status": "rejected", "reason": "session_center_unavailable"}
-    if not quota_check(service):
-        # Same treatment: stale/unknown Codex quota is transient, not a
-        # policy violation -- retried automatically once quota data refreshes.
+
+    explicit_account_id = _explicit_account_id(command, candidate_task) if command["provider"] == "claude" else None
+    claude_accounts = _claude_account_registry()
+    if explicit_account_id is not None:
+        # Human/system explicit account selection overrides the quota-based
+        # AUTO-selection gate below -- it does not fabricate quota. Every
+        # other safety gate above and below this block (allowlist, task
+        # policy, Session Center health, task claim, launcher permission
+        # profile) still applies unchanged; this only skips the
+        # reliable-quota precondition, and only after independently proving
+        # the id names a real, enabled, locally-registered account.
+        if not _explicit_account_is_valid(claude_accounts, explicit_account_id):
+            return {"status": "rejected", "reason": "unknown_or_disabled_claude_account"}
+    elif not quota_check(service):
+        # Same treatment: stale/unknown quota is transient, not a policy
+        # violation -- retried automatically once quota data refreshes.
+        # Unchanged for Codex, and unchanged for Claude when no explicit
+        # account_id was given (P0.0: official Claude quota is not reliably
+        # available headless today, so automatic selection correctly stays
+        # blocked until that changes).
         return {"status": "rejected", "reason": "quota_unreliable"}
 
     retry_count = command.get("retry_count", 0)
@@ -373,7 +409,7 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         outcome = launch_task(store, service, writer_registry, claim_registry, launcher_factory(),
                               claimed["project_id"], claimed["task_id"], claimed["execution_id"], claimed["model"],
                               on_running=lambda _execution: _write(store, running), provider=claimed["provider"],
-                              claude_accounts=_claude_account_registry(), **retry)
+                              claude_accounts=claude_accounts, account_id=explicit_account_id, **retry)
         terminal = outcome["terminal"]["execution"]
         dispatch = outcome["dispatch"]
         selected = {**running, "provider": dispatch["provider"], "model": dispatch["model"] or claimed["model"],
