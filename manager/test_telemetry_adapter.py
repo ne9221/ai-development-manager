@@ -106,7 +106,8 @@ class TestTelemetryAdapter(unittest.TestCase):
         self.assertEqual(r["session_id"], "thread-123")
         self.assertEqual(r["model"], "o1-preview")
         self.assertEqual(r["started_at"], "2026-02-14T23:40:00Z")
-        self.assertEqual(r["tokens"], 0)  # fallback
+        self.assertIsNone(r["tokens"])  # fallback to None, not 0
+        self.assertIsNone(r["account_id"])  # must not hardcode or decode secrets
         self.assertIsNone(r["reasoning_effort"])  # fallback
         
         # Assert database connection check: URI contains mode=ro (strictly read-only)
@@ -140,10 +141,11 @@ class TestTelemetryAdapter(unittest.TestCase):
             "sessionId": "sess-a1",
             "cwd": "/path/to/project-a",
             "type": "assistant",
+            "model": "claude-3-5",
             "message": {"role": "assistant", "usage": {"input_tokens": 10, "output_tokens": 5}}
         }) + "\n")
         
-        # Setup files for b
+        # Setup files for b (no model, no tokens reported)
         proj_dir_b = root_b / "projects" / "project-b-encoded"
         proj_dir_b.mkdir(parents=True)
         jsonl_b = proj_dir_b / "sess-b1.jsonl"
@@ -164,7 +166,6 @@ class TestTelemetryAdapter(unittest.TestCase):
         results = collect_local_telemetry(codex_home=str(self.temp_path / "missing-codex"), claude_roots=claude_roots)
         
         # We expect: 1 session for a, 1 for b, and 1 static for antigravity
-        # Total = 3
         claude_records = [r for r in results if r["provider"] == "claude"]
         self.assertEqual(len(claude_records), 2)
         
@@ -174,9 +175,13 @@ class TestTelemetryAdapter(unittest.TestCase):
         self.assertEqual(rec_a["session_id"], "sess-a1")
         self.assertEqual(rec_a["project"], "_unclassified")
         self.assertEqual(rec_a["tokens"], 15)
+        self.assertEqual(rec_a["model"], "claude-3-5")
+        self.assertEqual(rec_a["confidence"], "derived")
         
         self.assertEqual(rec_b["session_id"], "sess-b1")
-        self.assertEqual(rec_b["tokens"], 0)
+        self.assertEqual(rec_b["model"], "unknown")
+        self.assertEqual(rec_b["confidence"], "unknown") # no model -> confidence unknown
+        self.assertIsNone(rec_b["tokens"]) # no token usage reported -> None, not 0
 
     def test_claude_malformed_jsonl_line_isolation(self):
         root_path = self.temp_path / "claude"
@@ -207,15 +212,17 @@ class TestTelemetryAdapter(unittest.TestCase):
         self.assertEqual(ag_results[0]["provider"], "antigravity")
         self.assertEqual(ag_results[0]["confidence"], "unavailable")
         self.assertEqual(ag_results[0]["model"], "unknown")
+        self.assertIsNone(ag_results[0]["tokens"]) # Antigravity tokens must be None
         
         # 2. Confidence mappings overall check
-        # Codex = official, Claude = derived, Antigravity = unavailable
+        # Codex = confirmed, Claude = derived (if model present), Antigravity = unavailable
         root_a = self.temp_path / "claude-a"
         proj_dir_a = root_a / "projects" / "project-a-encoded"
         proj_dir_a.mkdir(parents=True)
         (proj_dir_a / "sess.jsonl").write_text(json.dumps({
             "timestamp": "2026-08-15T11:00:00Z",
-            "sessionId": "sess-a"
+            "sessionId": "sess-a",
+            "model": "claude-3-sonnet"
         }) + "\n")
         
         db_path = self.temp_path / "state_5.sqlite"
@@ -233,9 +240,42 @@ class TestTelemetryAdapter(unittest.TestCase):
         claude_recs = [r for r in results if r["provider"] == "claude"]
         ag_recs = [r for r in results if r["provider"] == "antigravity"]
         
-        self.assertEqual(codex_recs[0]["confidence"], "official")
+        self.assertEqual(codex_recs[0]["confidence"], "confirmed")
         self.assertEqual(claude_recs[0]["confidence"], "derived")
         self.assertEqual(ag_recs[0]["confidence"], "unavailable")
+        
+        # Verify that all confidence values in the result are within the vocabulary:
+        # confirmed, derived, unknown, unavailable
+        vocab = {"confirmed", "derived", "unknown", "unavailable"}
+        for r in results:
+            self.assertIn(r["confidence"], vocab)
+            self.assertNotEqual(r["confidence"], "official") # confidence vocabulary has no official
+
+    def test_claude_no_transcript_text_leak(self):
+        # Even if JSONL message contains secrets or text body, activity must only come from structured event/tool
+        root_path = self.temp_path / "claude"
+        proj_dir = root_path / "projects" / "proj-encoded"
+        proj_dir.mkdir(parents=True)
+        jsonl_file = proj_dir / "sess-123.jsonl"
+        
+        jsonl_file.write_text(json.dumps({
+            "timestamp": "2026-08-15T10:00:00Z",
+            "sessionId": "sess-123",
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "This is secret output snippet sk-abcdef12345"}]
+            }
+        }) + "\n")
+        
+        records = collect_claude_telemetry_for_root(str(root_path), "account-a")
+        self.assertEqual(len(records), 1)
+        r = records[0]
+        
+        # Activity must not contain transcript text
+        self.assertNotIn("secret", r["activity"])
+        self.assertNotIn("sk-abcdef", r["activity"])
+        self.assertEqual(r["activity"], "Event: assistant")
 
 if __name__ == "__main__":
     unittest.main()
