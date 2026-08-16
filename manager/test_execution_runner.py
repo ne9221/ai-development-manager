@@ -372,6 +372,90 @@ class RunnerTests(unittest.TestCase):
                        claude_accounts=registry)
         self.assertEqual(["prepare", "start", "wait", "close"], launcher.events)
 
+    # -- raw-passthrough account validation hardening (P2) --
+
+    def test_raw_passthrough_unknown_account_id_without_registry_fails_closed(self):
+        """Direct/raw launch_task() callers cannot bypass account validation
+        by omitting claude_accounts: an explicit account_id for provider
+        "claude" with no registry to check it against must fail closed
+        before dispatch/reservation/spawn, never fall through to
+        run_execution() -> launcher.prepare() with an unvalidated account_id
+        (which would mean config_dir stays None -- ambient/default Claude
+        config)."""
+        store = build_store(read_only=True, working_directory=self.request.working_directory, provider="claude")
+        launcher = AccountAwareClaudeStyleLauncher()
+        with patch("manager.execution_runner.dispatch") as dispatch_mock, \
+             patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            with self.assertRaises(AccountSelectionError) as ctx:
+                launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-sandbox",
+                           provider="claude", account_id="totally-unknown-account", claude_accounts=None)
+        # requested account_id is preserved in the error for audit evidence.
+        self.assertIn("totally-unknown-account", str(ctx.exception))
+        # fails before dispatch/reservation -- not merely before spawn.
+        dispatch_mock.assert_not_called()
+        # zero provider spawn: prepare() (the only thing that can Popen) never ran.
+        self.assertEqual([], launcher.events)
+
+    def test_raw_passthrough_disabled_account_with_registry_fails_closed(self):
+        store = build_store(read_only=True, working_directory=self.request.working_directory, provider="claude")
+        launcher = AccountAwareClaudeStyleLauncher()
+        registry = [{"account_id": "account-a", "enabled": False, "config_dir": None}]
+        with patch("manager.execution_runner.dispatch") as dispatch_mock, \
+             patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            with self.assertRaises(AccountSelectionError):
+                launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-sandbox",
+                           provider="claude", account_id="account-a", claude_accounts=registry,
+                           quota_document={"schema_version": "0.1.0", "providers": []})
+        dispatch_mock.assert_not_called()
+        self.assertEqual([], launcher.events)
+
+    def test_raw_passthrough_no_explicit_account_id_keeps_legacy_default_path(self):
+        """provider="claude" with neither account_id nor claude_accounts
+        supplied is the pre-P0.1.5 single-account default -- must remain
+        completely unaffected by the new fail-closed branch."""
+        store = build_store(read_only=True, working_directory=self.request.working_directory, provider="claude")
+        launcher = AccountAwareClaudeStyleLauncher()
+        with patch("manager.execution_runner.dispatch", return_value={
+            "recommended_provider": "claude", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
+            "generated_prompt": "bounded read-only task",
+        }), patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-sandbox",
+                       provider="claude")
+        self.assertIsNone(launcher.received_account_id)
+        self.assertIsNone(launcher.received_config_dir)
+        self.assertEqual(["prepare", "start", "wait", "close"], launcher.events)
+
+    def test_raw_passthrough_codex_with_bare_account_id_unaffected(self):
+        """The new fail-closed branch only applies to provider="claude" --
+        a Codex caller passing a bare account_id (meaningless for Codex, but
+        should never be rejected because of this Claude-only hardening) must
+        reach run_execution() unchanged, not be intercepted by the new
+        AccountSelectionError branch. run_execution() itself is stubbed out
+        here because CodexLauncher/its test double never accepted an
+        account_id kwarg even before this fix -- that pre-existing,
+        unrelated shape mismatch is out of scope for this P2."""
+        store = build_store(read_only=True, working_directory=self.request.working_directory)
+        launcher = Launcher()
+        with patch("manager.execution_runner.dispatch", return_value={
+            "recommended_provider": "codex", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
+            "generated_prompt": "bounded read-only task",
+        }), patch("manager.execution_runner.run_execution", return_value={
+            "terminal": {"execution": {"status": "completed"}}, "session": {},
+        }) as run_execution_mock, \
+             patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-sandbox",
+                       provider="codex", account_id="whatever", claude_accounts=None)
+        run_execution_mock.assert_called_once()
+        self.assertEqual("whatever", run_execution_mock.call_args.kwargs.get("account_id"))
+
     def test_prompt_transcript_stderr_and_raw_failure_are_not_persisted(self):
         store, _, _, _, _ = self.execute(launcher=Launcher(outcome="failed"))
         persisted = repr(store.records)

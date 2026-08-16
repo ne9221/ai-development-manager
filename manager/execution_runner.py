@@ -12,7 +12,7 @@ import sys
 import uuid
 
 from collectors.publish_drive import build_service
-from manager.claude_account_selector import resolve_claude_account
+from manager.claude_account_selector import AccountSelectionError, resolve_claude_account
 from manager.claude_config_locks import acquire_claude_config_lock, release_claude_config_lock
 from manager.codex_launcher import CodexLaunchError, CodexLauncher, LaunchRequest
 from manager.dispatcher import dispatch
@@ -186,6 +186,17 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     `select_claude_account()`) rather than trusting it blindly. It is a
     no-op for any other provider and when omitted (default None), so every
     existing single-account/Codex caller is unaffected.
+
+    A raw/direct caller that supplies an explicit `account_id` for
+    provider="claude" but omits `claude_accounts` has no registry to
+    validate that id against -- there would be no way to prove it names a
+    real, enabled account, or to resolve its correct config_dir. Rather than
+    silently trusting the bare id through to `run_execution()` (where a
+    missing/unresolvable config_dir means the child process falls back to
+    whatever Claude config is ambient/default on this machine), this fails
+    closed with `AccountSelectionError` before dispatch/reservation/spawn.
+    The pre-P0.1.5 single-account default path -- provider="claude" with
+    neither `account_id` nor `claude_accounts` supplied -- is unaffected.
     """
     task = store.get("tasks", project_id, task_id)
     validate("task", task)
@@ -194,6 +205,12 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
         quota_document = quota_document or read_drive_status(service=service)
         resolved = resolve_claude_account(claude_accounts, quota_document, explicit_account_id=account_id)
         account_id, config_dir = resolved["account_id"], resolved["config_dir"]
+    elif provider == "claude" and account_id is not None:
+        raise AccountSelectionError(
+            f"explicit Claude account_id {account_id!r} was supplied without an account registry "
+            "(claude_accounts=None); refusing to launch against an unvalidated account instead of "
+            "falling back to ambient/default Claude config"
+        )
     dispatched = dispatch(store, service, _dispatch_request(task, provider, account_id), quota_document, executions)
     if dispatched["recommended_provider"] != provider:
         raise TaskError(f"dispatch did not select {provider}")
