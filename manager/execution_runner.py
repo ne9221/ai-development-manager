@@ -13,6 +13,7 @@ import uuid
 
 from collectors.publish_drive import build_service
 from manager.claude_account_selector import resolve_claude_account
+from manager.claude_config_locks import acquire_claude_config_lock, release_claude_config_lock
 from manager.codex_launcher import CodexLaunchError, CodexLauncher, LaunchRequest
 from manager.dispatcher import dispatch
 from manager.execution_lifecycle import enter_running_gate, terminalize_execution
@@ -236,7 +237,7 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
     )
     execution = gate["execution"]
     lease_token = gate["lease"]["lease_token"] if gate["lease"] else None
-    prepared = running = outcome = session = None
+    prepared = running = outcome = session = config_lock = None
     operation_error = close_error = None
     status, summary = "interrupted", f"{provider} runner interrupted"
     try:
@@ -249,6 +250,18 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
             prepare_kwargs["account_id"] = account_id
         if config_dir is not None:
             prepare_kwargs["config_dir"] = config_dir
+        if provider == "claude":
+            # Acquired here (after account/config_dir are resolved, immediately
+            # before the child Claude process is spawned) so ADM never runs two
+            # of its own Claude launches against the same on-disk config
+            # directory at once -- see manager.claude_config_locks for why this
+            # is a local, not cross-machine, resource, and why a busy directory
+            # fails closed (CLAUDE_CONFIG_BUSY) instead of queueing or silently
+            # falling back to a different account.
+            config_lock = acquire_claude_config_lock(
+                config_dir, account_id=account_id, project_id=project_id,
+                task_id=task_id, execution_id=execution_id,
+            )
         prepared = launcher.prepare(launch_request, **prepare_kwargs)
         provider_evidence = {
             "host": socket.gethostname()[:100], "pid": prepared.pid,
@@ -281,6 +294,11 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
                 launcher.close(running or prepared)
             except (Exception, KeyboardInterrupt) as exc:
                 close_error = exc
+        if config_lock is not None:
+            # Best-effort, ABA-safe release; never raises, so it can never
+            # mask operation_error/close_error above (see
+            # release_claude_config_lock's own docstring).
+            release_claude_config_lock(config_lock)
 
     # prepare() owns and closes a spawned process until it returns a handle.
     provider_stopped = prepared is None and operation_error is not None
