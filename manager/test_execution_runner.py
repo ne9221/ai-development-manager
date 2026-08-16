@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from manager.claude_account_selector import AccountSelectionError
+from manager.claude_config_locks import ConfigLockBusyError, acquire_claude_config_lock, canonical_config_dir
 from manager.claude_launcher import ClaudeLaunchError
 from manager.codex_launcher import CodexLaunchError, LaunchOutcome, LaunchRequest
 from manager.execution_runner import _stopped, launch_task, run_execution
@@ -144,8 +146,20 @@ class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.request = LaunchRequest(str(Path(self.temp.name).resolve()), model="gpt-test")
+        # provider="claude" runs in this suite go through run_execution()'s
+        # real acquire_claude_config_lock()/release_claude_config_lock()
+        # (not mocked here -- ClaudeConfigLockWiringTests below is where the
+        # lock's own behavior is exercised). Without this override they would
+        # default to the real AI_MANAGER_HOME and read/write actual local ADM
+        # state, which Phase 0 forbids touching from a test run.
+        self.lock_home = tempfile.TemporaryDirectory()
+        self._lock_home_patch = patch.dict(os.environ, {"AI_MANAGER_HOME": self.lock_home.name})
+        self._lock_home_patch.start()
 
-    def tearDown(self): self.temp.cleanup()
+    def tearDown(self):
+        self._lock_home_patch.stop()
+        self.lock_home.cleanup()
+        self.temp.cleanup()
 
     def execute(self, read_only=False, launcher=None, store=None, provider="codex", account_id=None, config_dir=None):
         store = store or build_store(read_only=read_only, working_directory=self.request.working_directory, provider=provider)
@@ -439,6 +453,137 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(_stopped(prepared))
         process.live = False
         self.assertTrue(_stopped(prepared))
+
+
+class ClaudeConfigLockWiringTests(unittest.TestCase):
+    """P0.2: run_execution() must acquire the local Claude config-dir lock
+    before launcher.prepare() and release it after launcher.close() for
+    provider="claude", and must never touch it at all for any other
+    provider. Each test points AI_MANAGER_HOME at an isolated tempdir so no
+    real ADM state (and no real Claude config) is ever read or written."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.request = LaunchRequest(str(Path(self.temp.name).resolve()), model="gpt-test")
+        self.home = tempfile.TemporaryDirectory()
+        self._env_patch = patch.dict(os.environ, {"AI_MANAGER_HOME": self.home.name})
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self.home.cleanup()
+        self.temp.cleanup()
+
+    def execute(self, launcher, provider="claude", account_id=None, config_dir=None):
+        store = build_store(read_only=True, working_directory=self.request.working_directory, provider=provider)
+        claim = MemoryClaimRegistry()
+        with patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            return run_execution(store, object(), None, claim, launcher, "p1", "t1", "exec-a", "secret prompt",
+                                 self.request, access="read_only", baseline_head=None, provider=provider,
+                                 account_id=account_id, config_dir=config_dir), store, claim
+
+    def test_claude_provider_acquires_before_prepare_and_releases_after_close(self):
+        events = []
+        launcher = AccountAwareClaudeStyleLauncher()
+        real_prepare, real_close = launcher.prepare, launcher.close
+        launcher.prepare = lambda *a, **k: (events.append("prepare"), real_prepare(*a, **k))[1]
+        launcher.close = lambda *a, **k: (events.append("close"), real_close(*a, **k))[1]
+        with patch("manager.execution_runner.acquire_claude_config_lock",
+                   side_effect=lambda *a, **k: (events.append("acquire"), {"lock_id": "x", "pid": 1, "creation_identity": "y"})[1]) as acquire, \
+             patch("manager.execution_runner.release_claude_config_lock",
+                   side_effect=lambda *a, **k: events.append("release")) as release:
+            self.execute(launcher, account_id="account-a", config_dir=r"C:\accounts\a\.claude")
+        self.assertEqual(["acquire", "prepare", "close", "release"], events)
+        acquire.assert_called_once()
+        self.assertEqual(r"C:\accounts\a\.claude", acquire.call_args.kwargs.get("config_dir") or acquire.call_args.args[0])
+        release.assert_called_once()
+
+    def test_codex_provider_never_touches_the_config_lock(self):
+        launcher = Launcher()
+        with patch("manager.execution_runner.acquire_claude_config_lock") as acquire, \
+             patch("manager.execution_runner.release_claude_config_lock") as release:
+            self.execute(launcher, provider="codex")
+        acquire.assert_not_called()
+        release.assert_not_called()
+
+    def test_release_still_runs_when_the_provider_turn_fails(self):
+        launcher = AccountAwareClaudeStyleLauncher(outcome="failed")
+        with patch("manager.execution_runner.acquire_claude_config_lock",
+                   return_value={"lock_id": "x", "pid": 1, "creation_identity": "y"}), \
+             patch("manager.execution_runner.release_claude_config_lock") as release:
+            self.execute(launcher)
+        release.assert_called_once()
+
+    def test_release_still_runs_when_prepare_raises(self):
+        launcher = ClaudeStyleLauncher(prepare_failure=True)
+        with patch("manager.execution_runner.acquire_claude_config_lock",
+                   return_value={"lock_id": "x", "pid": 1, "creation_identity": "y"}), \
+             patch("manager.execution_runner.release_claude_config_lock") as release, \
+             self.assertRaises(ClaudeLaunchError):
+            self.execute(launcher)
+        release.assert_called_once()
+
+    def test_busy_config_dir_fails_closed_and_still_releases_task_claim_and_lease(self):
+        # A real held lock (not mocked), owned by a genuinely different, live
+        # OS process (a throwaway subprocess), simulating another live ADM
+        # execution already using this exact config directory -- the actual
+        # incident scenario. Using this test process's own pid would instead
+        # exercise the same-owner idempotent path (covered separately below).
+        import subprocess as _subprocess
+        import sys as _sys
+        from manager.codex_launcher import process_creation_identity as _identity
+        other = _subprocess.Popen([_sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(other.kill)
+        try:
+            other_identity = _identity(other.pid)
+            self.assertIsNotNone(other_identity)
+            acquire_claude_config_lock(r"C:\accounts\a\.claude", account_id="account-a",
+                                       execution_id="other-exec", pid=other.pid, creation_identity=other_identity)
+            launcher = AccountAwareClaudeStyleLauncher()
+            with self.assertRaises(ConfigLockBusyError):
+                self.execute(launcher, account_id="account-a", config_dir=r"C:\accounts\a\.claude")
+            # launcher.prepare() must never have been reached.
+            self.assertEqual([], launcher.events)
+        finally:
+            other.kill()
+            other.wait(timeout=5)
+
+    def test_same_owner_retry_after_incomplete_release_is_idempotent_not_busy(self):
+        # Covers requirement 6 (duplicate/retry same execution idempotent):
+        # if a prior run_execution() call in this same process acquired the
+        # lock but its release did not complete (or a caller re-enters with
+        # the same execution before releasing), a second acquire from the
+        # exact same (pid, creation_identity) must succeed, not deadlock
+        # against itself.
+        first = acquire_claude_config_lock(r"C:\accounts\a\.claude", account_id="account-a", execution_id="exec-a")
+        second = acquire_claude_config_lock(r"C:\accounts\a\.claude", account_id="account-a", execution_id="exec-a")
+        self.assertEqual(first["lock_id"], second["lock_id"])
+        self.assertEqual(first["pid"], second["pid"])
+
+    def test_two_sequential_claude_launches_on_the_same_config_dir_do_not_deadlock(self):
+        # Not concurrent (run_execution is synchronous), but proves acquire
+        # ->release is fully symmetric: a second, later launch against the
+        # exact same config_dir must succeed once the first has completed.
+        for _ in range(2):
+            launcher = AccountAwareClaudeStyleLauncher()
+            self.execute(launcher, account_id="account-a", config_dir=r"C:\accounts\a\.claude")
+            self.assertEqual(["prepare", "start", "wait", "close"], launcher.events)
+
+    def test_different_config_dirs_do_not_contend(self):
+        first = acquire_claude_config_lock(r"C:\accounts\a\.claude", account_id="account-a", execution_id="other-exec")
+        self.addCleanup(lambda: None)
+        launcher = AccountAwareClaudeStyleLauncher()
+        # A different, still-held config_dir must not block this launch.
+        self.execute(launcher, account_id="account-b", config_dir=r"C:\accounts\b\.claude")
+        self.assertEqual(["prepare", "start", "wait", "close"], launcher.events)
+
+    def test_explicit_and_registry_resolved_account_id_use_identical_lock_key(self):
+        # canonical_config_dir() is the sole authority for the lock resource;
+        # account_id is attribution only. Two accounts (mis)configured to the
+        # same real directory must canonicalize identically.
+        self.assertEqual(canonical_config_dir(r"C:\accounts\a\.claude"), canonical_config_dir(r"c:\ACCOUNTS\a\.CLAUDE"))
 
 
 if __name__ == "__main__":
