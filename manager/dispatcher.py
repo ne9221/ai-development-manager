@@ -39,7 +39,7 @@ def request_ok(request):
         raise TaskError("invalid dispatcher input: expected_minutes")
     if request.get("preferred_provider") and request.get("preferred_provider") == request.get("excluded_provider"):
         raise TaskError("preferred_provider cannot also be excluded")
-    for key in ("model", "fallback_model"):
+    for key in ("model", "fallback_model", "account_id"):
         if request.get(key) is not None and (not isinstance(request[key], str) or not request[key].strip() or len(request[key]) > 200):
             raise TaskError(f"invalid dispatcher input: {key}")
 
@@ -47,7 +47,9 @@ def request_ok(request):
 def quota_line(provider):
     windows = [f"{item['name']}: {item.get('remaining_percent')}% remaining" for item in provider["windows"] if item.get("remaining_percent") is not None]
     detail = ", ".join(windows) if windows else "quota unknown"
-    return f"{detail}; {provider['source_type']}; {provider['freshness']}; confidence {provider['confidence']}"
+    account_id = provider.get("account_id")
+    account_prefix = f"account {account_id}; " if account_id else ""
+    return f"{account_prefix}{detail}; {provider['source_type']}; {provider['freshness']}; confidence {provider['confidence']}"
 
 
 def phase_goals(scope, count):
@@ -148,7 +150,13 @@ def dispatch(store, service, request, quota_document=None, executions=None):
     if decision["recommended_mode"] == "split_task" and not selected_estimate["split_recommended"]:
         minutes = task_input["expected_minutes"]
         selected_estimate = {**selected_estimate, "estimated_minutes": minutes, "split_recommended": True, "suggested_phases": math.ceil(minutes / 20), "basis": selected_estimate["basis"] + "; task input exceeds 20 minutes"}
-    selected_quota = next(item for item in quota["providers"] if item["provider"] == selected)
+    account_id = request.get("account_id")
+    if selected == "claude" and account_id:
+        selected_quota = next((item for item in quota["accounts"] if item["provider"] == "claude" and item["account_id"] == account_id), None)
+        if selected_quota is None:
+            raise TaskError(f"unknown Claude account_id: {account_id}")
+    else:
+        selected_quota = next(item for item in quota["providers"] if item["provider"] == selected)
     warnings = [item for item in [decision.get("warning")] if item]
     if request.get("preferred_provider"):
         warnings.append(f"Preferred provider override selected: {selected}")
@@ -170,6 +178,7 @@ def dispatch(store, service, request, quota_document=None, executions=None):
     generated = prompt_for(project, task, handoff, selected, selected_estimate, summary, warnings, request.get("shared_rules"), request.get("ponytail_available"))
     return {
         "recommended_provider": selected, "provider": selected,
+        "account_id": selected_quota.get("account_id"),
         "model": request.get("model"), "fallback_model": request.get("fallback_model"),
         "mode": CAPABILITIES[selected]["mode"], "effort": decision["recommended_effort"],
         "selection_reason": decision["reasons"],

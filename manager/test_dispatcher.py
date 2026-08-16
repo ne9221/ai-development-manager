@@ -39,6 +39,18 @@ def history(minutes=14):
     return [{"provider": "codex", "mode": "code", "effort": "medium", "status": "completed", "elapsed_minutes": minutes, "task_snapshot": {"task_type": "implementation", "complexity": "medium", "needs_repo_edit": True}, "quota_delta": {"status": "known", "windows": [{"name": "primary", "status": "known", "used_percent_delta": 2}]}}]
 
 
+def two_claude_accounts(a_confidence="official", a_remaining=90, a_updated="2026-08-09T05:00:00Z", b_confidence="unknown", b_remaining=None, b_updated="2026-08-09T05:00:00Z"):
+    def entry(account_id, confidence, remaining, updated):
+        windows = [] if remaining is None else [{"name": "primary", "remaining_percent": remaining, "used_percent": 100 - remaining, "resets_at": None}]
+        return {"provider": "claude", "account_id": account_id, "display_name": "claude", "collection_mode": "automatic", "source": "test", "source_type": "official" if confidence == "official" else "manual", "confidence": confidence, "last_updated": updated, "status": "ok" if windows else "unknown", "windows": windows}
+    providers = [
+        entry("claude-a", a_confidence, a_remaining, a_updated),
+        entry("claude-b", b_confidence, b_remaining, b_updated),
+        {"provider": "codex", "display_name": "codex", "collection_mode": "automatic", "source": "test", "source_type": "official", "confidence": "official", "last_updated": a_updated, "status": "ok", "windows": [{"name": "primary", "remaining_percent": 80, "used_percent": 20, "resets_at": None}]},
+    ]
+    return {"schema_version": "0.1.0", "generated_at": a_updated, "providers": providers}
+
+
 class DispatcherTests(unittest.TestCase):
     def setUp(self): self.store = MemoryStore(); create_project(self.store, project())
 
@@ -94,6 +106,64 @@ class DispatcherTests(unittest.TestCase):
         stale = self.dispatch_case(request(title="Secret task", constraints=["token=sensitive-value", "credential:private"]), quota(updated="2020-01-01T00:00:00Z"))
         self.assertNotIn("sensitive-value", stale["generated_prompt"]); self.assertNotIn("private", stale["generated_prompt"]); self.assertTrue(stale["warnings"])
         self.assertEqual(20, stale["estimated_minutes"])
+
+    def test_account_id_selects_matching_claude_account_quota(self):
+        doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
+        result_a = self.dispatch_case(request(title="Account A", preferred_provider="claude", account_id="claude-a"), doc)
+        self.assertIn("claude-a", result_a["quota_summary"]); self.assertIn("90% remaining", result_a["quota_summary"])
+        result_b = self.dispatch_case(request(title="Account B", preferred_provider="claude", account_id="claude-b"), doc)
+        self.assertIn("claude-b", result_b["quota_summary"]); self.assertIn("40% remaining", result_b["quota_summary"])
+        self.assertNotIn("90% remaining", result_b["quota_summary"])
+
+    def test_account_id_selection_is_order_independent(self):
+        doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
+        doc_swapped = dict(doc); doc_swapped["providers"] = list(reversed(doc["providers"]))
+        result = self.dispatch_case(request(title="Account B swapped", preferred_provider="claude", account_id="claude-b"), doc_swapped)
+        self.assertIn("claude-b", result["quota_summary"]); self.assertIn("40% remaining", result["quota_summary"])
+
+    def test_account_id_reliability_not_laundered_across_accounts(self):
+        doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="unknown", b_remaining=None)
+        result_b = self.dispatch_case(request(title="Unreliable account B", preferred_provider="claude", account_id="claude-b"), doc)
+        self.assertIn("claude-b", result_b["quota_summary"]); self.assertIn("quota unknown", result_b["quota_summary"])
+        self.assertIn("confidence unknown", result_b["quota_summary"])
+        self.assertTrue(any("unknown" in item or "stale" in item for item in result_b["warnings"]))
+
+    def test_account_id_does_not_silently_switch_stale_to_fresh(self):
+        doc = two_claude_accounts(a_confidence="official", a_remaining=70, a_updated="2020-01-01T00:00:00Z", b_confidence="official", b_remaining=40, b_updated="2026-08-09T05:00:00Z")
+        result_a = self.dispatch_case(request(title="Stale account A", preferred_provider="claude", account_id="claude-a"), doc)
+        self.assertIn("claude-a", result_a["quota_summary"]); self.assertNotIn("claude-b", result_a["quota_summary"])
+        self.assertNotIn("40% remaining", result_a["quota_summary"])
+        self.assertTrue(any("stale" in item or "unknown" in item for item in result_a["warnings"]))
+
+    def test_account_id_unknown_fails_closed(self):
+        doc = two_claude_accounts()
+        with self.assertRaises(TaskError):
+            self.dispatch_case(request(title="Missing account", preferred_provider="claude", account_id="claude-does-not-exist"), doc)
+
+    def test_no_account_id_keeps_legacy_provider_level_behavior(self):
+        doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
+        result = self.dispatch_case(request(title="Legacy path", preferred_provider="claude"), doc)
+        self.assertNotIn("claude-a", result["quota_summary"]); self.assertNotIn("claude-b", result["quota_summary"])
+        self.assertIn("90% remaining", result["quota_summary"])
+
+    def test_codex_dispatch_unaffected_by_account_id(self):
+        doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
+        result = self.dispatch_case(request(title="Codex still works", preferred_provider="codex", account_id="claude-a"), doc)
+        self.assertEqual("codex", result["recommended_provider"]); self.assertIn("80% remaining", result["quota_summary"])
+
+    def test_all_claude_accounts_unknown_no_fabricated_selection(self):
+        doc = two_claude_accounts(a_confidence="unknown", a_remaining=None, b_confidence="unknown", b_remaining=None)
+        result = self.dispatch_case(request(title="All unknown", preferred_provider="claude"), doc)
+        self.assertEqual("claude", result["recommended_provider"]); self.assertIn("quota unknown", result["quota_summary"])
+        self.assertNotIn("claude-a", result["quota_summary"]); self.assertNotIn("claude-b", result["quota_summary"])
+
+    def test_account_identity_shown_without_credentials(self):
+        doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
+        result = self.dispatch_case(request(title="Attribution only", preferred_provider="claude", account_id="claude-a"), doc)
+        for blob in (result["quota_summary"], result["generated_prompt"]):
+            self.assertIn("claude-a", blob)
+            for forbidden in ("config_dir", "token", "credential", "CLAUDE_CONFIG_DIR"):
+                self.assertNotIn(forbidden, blob)
 
     def test_malformed_input_rejected(self):
         with self.assertRaises(TaskError): request_ok({"project_id": "p1"})
