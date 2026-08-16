@@ -51,6 +51,20 @@ def two_claude_accounts(a_confidence="official", a_remaining=90, a_updated="2026
     return {"schema_version": "0.1.0", "generated_at": a_updated, "providers": providers}
 
 
+def duplicate_claude_account(first_remaining, second_remaining, updated="2026-08-09T05:00:00Z"):
+    """Two source records sharing the same account_id="claude-a" -- the
+    upstream data-quality bug this test class guards against."""
+    def entry(remaining):
+        windows = [{"name": "primary", "remaining_percent": remaining, "used_percent": 100 - remaining, "resets_at": None}]
+        return {"provider": "claude", "account_id": "claude-a", "display_name": "claude", "collection_mode": "automatic", "source": "test", "source_type": "official", "confidence": "official", "last_updated": updated, "status": "ok", "windows": windows}
+    providers = [
+        entry(first_remaining),
+        entry(second_remaining),
+        {"provider": "codex", "display_name": "codex", "collection_mode": "automatic", "source": "test", "source_type": "official", "confidence": "official", "last_updated": updated, "status": "ok", "windows": [{"name": "primary", "remaining_percent": 80, "used_percent": 20, "resets_at": None}]},
+    ]
+    return {"schema_version": "0.1.0", "generated_at": updated, "providers": providers}
+
+
 class DispatcherTests(unittest.TestCase):
     def setUp(self): self.store = MemoryStore(); create_project(self.store, project())
 
@@ -139,6 +153,21 @@ class DispatcherTests(unittest.TestCase):
         doc = two_claude_accounts()
         with self.assertRaises(TaskError):
             self.dispatch_case(request(title="Missing account", preferred_provider="claude", account_id="claude-does-not-exist"), doc)
+
+    def test_account_id_lookup_deterministic_when_source_has_duplicate_records(self):
+        """Regression for the duplicate-key bug: if two source records
+        share account_id="claude-a", quota["accounts"] must already be
+        deduplicated to one entry by the time dispatch() does its next()
+        lookup, so the result is the deliberate last-wins record -- not
+        whichever duplicate happened to come first."""
+        doc = duplicate_claude_account(first_remaining=12, second_remaining=47)
+        result = self.dispatch_case(request(title="Duplicate account record", preferred_provider="claude", account_id="claude-a"), doc)
+        self.assertIn("47% remaining", result["quota_summary"])
+        self.assertNotIn("12% remaining", result["quota_summary"])
+        doc_swapped = duplicate_claude_account(first_remaining=47, second_remaining=12)
+        result_swapped = self.dispatch_case(request(title="Duplicate account record swapped", preferred_provider="claude", account_id="claude-a"), doc_swapped)
+        self.assertIn("12% remaining", result_swapped["quota_summary"])
+        self.assertNotIn("47% remaining", result_swapped["quota_summary"])
 
     def test_no_account_id_keeps_legacy_provider_level_behavior(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
