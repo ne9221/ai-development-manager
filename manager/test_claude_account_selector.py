@@ -188,6 +188,61 @@ class ResolveClaudeAccountTests(unittest.TestCase):
         with self.assertRaises(AccountSelectionError):
             resolve_claude_account(self.registry, document, now=NOW)
 
+    def test_two_reliable_accounts_higher_remaining_selected(self):
+        w_a = [{"name": "five_hour", "remaining_percent": 80.0, "used_percent": 20.0, "resets_at": "2026-08-15T05:00:00Z"}]
+        w_b = [{"name": "five_hour", "remaining_percent": 20.0, "used_percent": 80.0, "resets_at": "2026-08-15T05:00:00Z"}]
+        entry_a = {**claude_entry("account-a"), "windows": w_a}
+        entry_b = {**claude_entry("account-b"), "windows": w_b}
+        document = quota_doc(entry_a, entry_b)
+        result = resolve_claude_account(self.registry, document, now=NOW)
+        self.assertEqual("account-a", result["account_id"])
+
+    def test_two_reliable_accounts_reset_waste_risk_priority(self):
+        # A: 80% remaining, resets in 1h (waste risk -> URGENT/SUGGEST_CONSUME)
+        w_a = [{"name": "five_hour", "remaining_percent": 80.0, "used_percent": 20.0, "resets_at": "2026-08-15T03:00:00Z"}]
+        # B: 80% remaining, resets in 10h (NORMAL_USE)
+        w_b = [{"name": "five_hour", "remaining_percent": 80.0, "used_percent": 20.0, "resets_at": "2026-08-15T12:00:00Z"}]
+        entry_a = {**claude_entry("account-a"), "windows": w_a}
+        entry_b = {**claude_entry("account-b"), "windows": w_b}
+        h_a = {**claude_entry("account-a", last_updated="2026-08-15T01:00:00Z"), "windows": [{"name": "five_hour", "remaining_percent": 90.0, "resets_at": "2026-08-15T03:00:00Z"}]}
+        h_b = {**claude_entry("account-b", last_updated="2026-08-15T01:00:00Z"), "windows": [{"name": "five_hour", "remaining_percent": 90.0, "resets_at": "2026-08-15T12:00:00Z"}]}
+        document = quota_doc(entry_a, entry_b)
+        result = resolve_claude_account(self.registry, document, history=[h_a, h_b], now=NOW)
+        self.assertEqual("account-a", result["account_id"])
+
+    def test_two_reliable_accounts_likely_exhaust_demoted(self):
+        # A: 80% remaining, but burns at 50%/h with reset in 3h -> exhausts in 1.6h -> CONSERVE
+        w_a = [{"name": "five_hour", "remaining_percent": 80.0, "used_percent": 20.0, "resets_at": "2026-08-15T05:00:00Z"}]
+        h_a = {**claude_entry("account-a", last_updated="2026-08-15T01:00:00Z"), "windows": [{"name": "five_hour", "remaining_percent": 130.0, "resets_at": "2026-08-15T05:00:00Z"}]}  # delta 50%
+        # B: 40% remaining, burns at 5%/h with reset in 3h -> healthy -> NORMAL_USE
+        w_b = [{"name": "five_hour", "remaining_percent": 40.0, "used_percent": 60.0, "resets_at": "2026-08-15T05:00:00Z"}]
+        h_b = {**claude_entry("account-b", last_updated="2026-08-15T01:00:00Z"), "windows": [{"name": "five_hour", "remaining_percent": 45.0, "resets_at": "2026-08-15T05:00:00Z"}]}
+        document = quota_doc({**claude_entry("account-a"), "windows": w_a}, {**claude_entry("account-b"), "windows": w_b})
+        result = resolve_claude_account(self.registry, document, history=[h_a, h_b], now=NOW)
+        self.assertEqual("account-b", result["account_id"])
+
+    def test_multi_window_conserve_veto_in_account_selection(self):
+        # Account A: 5h suggests consume (80%, reset 1h), but 7d requires CONSERVE (20%, reset in 48h, burn 2%/h)
+        w_a_5h = {"name": "five_hour", "remaining_percent": 80.0, "used_percent": 20.0, "resets_at": "2026-08-15T03:00:00Z"}
+        w_a_7d = {"name": "seven_day", "remaining_percent": 20.0, "used_percent": 80.0, "resets_at": "2026-08-17T02:00:00Z"}
+        h_a = {**claude_entry("account-a", last_updated="2026-08-15T01:00:00Z"), "windows": [
+            {"name": "five_hour", "remaining_percent": 90.0, "resets_at": "2026-08-15T03:00:00Z"},
+            {"name": "seven_day", "remaining_percent": 22.0, "resets_at": "2026-08-17T02:00:00Z"},
+        ]}
+        # Account B: 5h normal (50%, reset in 4h), 7d healthy (60%, reset in 48h)
+        w_b_5h = {"name": "five_hour", "remaining_percent": 50.0, "used_percent": 50.0, "resets_at": "2026-08-15T06:00:00Z"}
+        w_b_7d = {"name": "seven_day", "remaining_percent": 60.0, "used_percent": 40.0, "resets_at": "2026-08-17T02:00:00Z"}
+        h_b = {**claude_entry("account-b", last_updated="2026-08-15T01:00:00Z"), "windows": [
+            {"name": "five_hour", "remaining_percent": 55.0, "resets_at": "2026-08-15T06:00:00Z"},
+            {"name": "seven_day", "remaining_percent": 61.0, "resets_at": "2026-08-17T02:00:00Z"},
+        ]}
+        entry_a = {**claude_entry("account-a"), "windows": [w_a_5h, w_a_7d]}
+        entry_b = {**claude_entry("account-b"), "windows": [w_b_5h, w_b_7d]}
+        document = quota_doc(entry_a, entry_b)
+        result = resolve_claude_account(self.registry, document, history=[h_a, h_b], now=NOW)
+        self.assertEqual("account-b", result["account_id"])
+
+
 
 class ResolvedAccountReachesRealClaudeLauncherTests(unittest.TestCase):
     """Closes the loop end-to-end with the real (non-double) ClaudeLauncher:

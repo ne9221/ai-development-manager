@@ -503,7 +503,7 @@ def forecast_window(
         )
     elif est_remaining_at_reset > 10.0:
         warning_lvl = WarningLevel.ATTENTION
-        risk = RiskStatus.CONSERVE
+        risk = RiskStatus.CONSUME_FASTER
         action = ActionRecommendation.SUGGEST_CONSUME
         reason = (
             f"Moderate leftover: projected {est_remaining_at_reset:.1f}% unspent at reset "
@@ -639,11 +639,35 @@ def forecast_account(
     overall_risk = primary.risk_status if primary else RiskStatus.UNKNOWN
     overall_action = primary.action_recommendation if primary else ActionRecommendation.HOLD
 
-    # Dispatchability
+    # Multi-window protection policy (Phase E):
+    # 1. If any window is exhausted (0% remaining), the account is exhausted
+    if any(w.remaining_percent == 0.0 or w.risk_status == RiskStatus.EXHAUSTED for w in window_forecasts):
+        overall_risk = RiskStatus.EXHAUSTED
+        overall_action = ActionRecommendation.HOLD
+    # 2. If any secondary/longer window requires CONSERVE / LIKELY_EXHAUST_BEFORE_RESET,
+    # it vetoes consumption and enforces conservation
+    elif any(
+        w.action_recommendation == ActionRecommendation.CONSERVE
+        or w.risk_status == RiskStatus.LIKELY_EXHAUST_BEFORE_RESET
+        for w in window_forecasts
+    ):
+        conserve_w = next(
+            w for w in window_forecasts
+            if w.action_recommendation == ActionRecommendation.CONSERVE
+            or w.risk_status == RiskStatus.LIKELY_EXHAUST_BEFORE_RESET
+        )
+        overall_risk = RiskStatus.LIKELY_EXHAUST_BEFORE_RESET
+        overall_action = ActionRecommendation.CONSERVE
+        if overall_warning == WarningLevel.UNKNOWN or _WARNING_SEVERITY.get(overall_warning, 0) < _WARNING_SEVERITY.get(WarningLevel.WARNING, 0):
+            overall_warning = WarningLevel.WARNING
+        overall_reason = f"Multi-window protection: window '{conserve_w.window_name}' requires conservation"
+
+    # Dispatchability: primary positive and no window is 0%
     has_positive_remaining = (
         primary is not None
         and primary.remaining_percent is not None
         and primary.remaining_percent > 0
+        and not any(w.remaining_percent == 0.0 for w in window_forecasts)
     )
     dispatchable = (
         not stale
@@ -779,3 +803,67 @@ def forecast_to_dict(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [forecast_to_dict(item) for item in obj]
     return obj
+
+
+def score_account_forecast(fc: AccountQuotaForecast) -> Tuple[bool, float, float, float, str]:
+    """Calculate quota-aware ranking tuple for an account.
+
+    Higher tuple values indicate higher dispatch/routing priority.
+
+    Tuple structure:
+    1. is_eligible (bool): Must be dispatchable (reliable, fresh, positive remaining)
+    2. action_tier (float):
+       - URGENT_CONSUME: 4.0
+       - SUGGEST_CONSUME: 3.0
+       - NORMAL_USE / HEALTHY (or fresh with insufficient history): 2.0
+       - CONSERVE / LIKELY_EXHAUST_BEFORE_RESET: 1.0
+       - HOLD / EXHAUSTED / UNKNOWN: 0.0
+    3. remaining_percent (float): e.g. 80.0 > 20.0
+    4. reset_urgency (float): Preference for accounts with soonest reset when surplus exists
+    5. account_id (str): Deterministic tie-breaker
+    """
+    if not fc.dispatchable or fc.stale or not fc.has_reliable_quota:
+        return (False, 0.0, 0.0, 0.0, str(fc.account_id or ""))
+
+    if fc.overall_action_recommendation == ActionRecommendation.URGENT_CONSUME:
+        action_tier = 4.0
+    elif fc.overall_action_recommendation == ActionRecommendation.SUGGEST_CONSUME:
+        action_tier = 3.0
+    elif (
+        fc.overall_action_recommendation == ActionRecommendation.CONSERVE
+        or fc.overall_risk_status == RiskStatus.LIKELY_EXHAUST_BEFORE_RESET
+    ):
+        action_tier = 1.0
+    elif (
+        fc.overall_risk_status == RiskStatus.EXHAUSTED
+        or fc.overall_action_recommendation == ActionRecommendation.HOLD
+    ):
+        # If HOLD was solely due to insufficient history on a fresh reliable account with positive quota:
+        # Fall back to standard tier (tier 2.0) with remaining_percent as differentiator
+        if (
+            fc.primary_window
+            and fc.primary_window.remaining_percent is not None
+            and fc.primary_window.remaining_percent > 0
+        ):
+            action_tier = 2.0
+        else:
+            action_tier = 0.0
+    else:
+        action_tier = 2.0
+
+    rem = (
+        fc.primary_window.remaining_percent
+        if fc.primary_window and fc.primary_window.remaining_percent is not None
+        else 0.0
+    )
+
+    reset_urgency = 0.0
+    if (
+        action_tier >= 2.0
+        and fc.primary_window
+        and fc.primary_window.hours_to_reset is not None
+        and fc.primary_window.hours_to_reset > 0
+    ):
+        reset_urgency = max(0.0, 24.0 - fc.primary_window.hours_to_reset)
+
+    return (True, action_tier, rem, reset_urgency, str(fc.account_id or ""))

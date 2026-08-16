@@ -58,12 +58,12 @@ def _is_stale(entry, now, max_age_seconds):
     return (now - parsed).total_seconds() > max_age_seconds
 
 
-def select_claude_account(accounts, *, explicit_account_id=None, max_age_seconds=None, now=None):
+def select_claude_account(accounts, *, explicit_account_id=None, max_age_seconds=None, now=None, history=None):
     """Select exactly one Claude account_id from a list of account quota
     entries, or raise AccountSelectionError.
 
     accounts: iterable of dicts with at least {"account_id", "confidence"};
-    optionally "enabled" (default True) and "last_updated".
+    optionally "enabled" (default True), "last_updated", "windows", etc.
 
     - explicit_account_id, if given, is honored as long as that account is
       present and enabled -- this is the escape hatch for a caller that
@@ -72,8 +72,10 @@ def select_claude_account(accounts, *, explicit_account_id=None, max_age_seconds
       automatic reliability heuristics by design.
     - Otherwise: accounts with confidence in (None, "unknown"), or older
       than max_age_seconds when that is given, are excluded as unreliable.
-      Exactly one remaining candidate is required; zero or more than one
-      both fail closed rather than guessing.
+      If exactly one reliable candidate remains, it is returned.
+      If multiple reliable candidates remain, they are evaluated and ranked
+      via quota forecast evidence. If still completely ambiguous (e.g. no quota
+      windows at all), it fails closed.
     """
     now = now or datetime.now(timezone.utc)
     enabled = [dict(a) for a in accounts if a.get("enabled", True)]
@@ -98,13 +100,31 @@ def select_claude_account(accounts, *, explicit_account_id=None, max_age_seconds
             "every Claude account has unknown, missing, or stale quota confidence; "
             "refusing to guess -- pass an explicit account_id instead"
         )
-    if len(reliable) > 1:
+    if len(reliable) == 1:
+        return reliable[0]["account_id"]
+
+    # Multiple reliable accounts: rank via forecast evidence and score
+    from manager.quota_forecast import forecast_account, score_account_forecast
+
+    max_age_min = (max_age_seconds / 60.0) if max_age_seconds is not None else 60.0
+    scored = []
+    for item in reliable:
+        fc = forecast_account(item, history=history, now=now, max_age_minutes=max_age_min)
+        score = score_account_forecast(fc)
+        scored.append((score, item, fc))
+
+    # If no candidate has eligible/informative quota windows, fail closed on ambiguity
+    eligible = [c for c in scored if c[0][0]]
+    if not eligible:
         candidates = ", ".join(sorted(a["account_id"] for a in reliable))
         raise AccountSelectionError(
             f"multiple Claude accounts have reliable quota data ({candidates}); "
             "pass an explicit account_id instead of relying on automatic selection"
         )
-    return reliable[0]["account_id"]
+
+    # Sort descending by score tuple
+    eligible.sort(key=lambda c: c[0], reverse=True)
+    return eligible[0][1]["account_id"]
 
 
 # Keys that would indicate a credential leaked into the registry. Checked
@@ -165,7 +185,7 @@ def load_claude_accounts(path):
 
 
 def resolve_claude_account(accounts, quota_document=None, *, explicit_account_id=None,
-                            max_age_seconds=None, now=None):
+                            max_age_seconds=None, now=None, history=None):
     """Combine a loaded account registry with a runtime status document's
     per-account claude quota entries to pick exactly one launch-ready
     account, or raise. Returns {"account_id": ..., "config_dir": ...} --
@@ -180,22 +200,31 @@ def resolve_claude_account(accounts, quota_document=None, *, explicit_account_id
     the registry but never captured is not evidence of anything.
     """
     quota_by_account = {}
-    for item in (quota_document or {}).get("providers", []):
-        if item.get("provider") == "claude":
+    doc_items = []
+    if isinstance(quota_document, dict):
+        doc_items = quota_document.get("accounts", []) or quota_document.get("providers", [])
+    for item in doc_items:
+        if isinstance(item, dict) and item.get("provider") == "claude":
             quota_by_account[item.get("account_id")] = item
 
     selection_input = [
         {
             "account_id": account["account_id"],
             "enabled": account["enabled"],
+            "provider": "claude",
             "confidence": quota_by_account.get(account["account_id"], {}).get("confidence"),
+            "source": quota_by_account.get(account["account_id"], {}).get("source", "not_reported"),
+            "source_type": quota_by_account.get(account["account_id"], {}).get("source_type", "manual"),
             "last_updated": quota_by_account.get(account["account_id"], {}).get("last_updated"),
+            "windows": quota_by_account.get(account["account_id"], {}).get("windows", []),
+            "status": quota_by_account.get(account["account_id"], {}).get("status", "unknown"),
+            "stale": quota_by_account.get(account["account_id"], {}).get("stale", False),
         }
         for account in accounts
     ]
     selected_id = select_claude_account(
         selection_input, explicit_account_id=explicit_account_id,
-        max_age_seconds=max_age_seconds, now=now,
+        max_age_seconds=max_age_seconds, now=now, history=history,
     )
     selected = next(account for account in accounts if account["account_id"] == selected_id)
     return {"account_id": selected["account_id"], "config_dir": selected["config_dir"]}

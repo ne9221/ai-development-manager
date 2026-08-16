@@ -341,6 +341,54 @@ class QuotaForecastCoreTests(unittest.TestCase):
         self.assertIsInstance(d["windows"], list)
         self.assertEqual(d["overall_warning_level"], "UNKNOWN")
 
+    # P2 Regression Test: ATTENTION + suggest consume must not output RiskStatus.CONSERVE
+    def test_p2_note1_moderate_leftover_risk_is_consume_faster_not_conserve(self):
+        reset_time = NOW + timedelta(hours=4)
+        h0 = make_account_item("claude", "A", windows=[make_window("five_hour", 65.0, resets_at=reset_time)], last_updated=NOW - timedelta(hours=1))
+        current = make_account_item("claude", "A", windows=[make_window("five_hour", 55.0, resets_at=reset_time)], last_updated=NOW)
+        # burn rate: 10%/h. Reset in 4h -> burns 40%. est_remaining_at_reset = 55 - 40 = 15.0% (> 10.0 and <= 20.0).
+        fc = forecast_account(current, history=[h0], now=NOW)
+        w = fc.windows[0]
+        self.assertEqual(w.warning_level, WarningLevel.ATTENTION)
+        self.assertEqual(w.action_recommendation, ActionRecommendation.SUGGEST_CONSUME)
+        self.assertEqual(w.risk_status, RiskStatus.CONSUME_FASTER)
+        self.assertNotEqual(w.risk_status, RiskStatus.CONSERVE)
+
+    # Multi-window protection test: weekly CONSERVE vetoes five_hour SUGGEST_CONSUME
+    def test_multi_window_conserve_veto_overrides_five_hour_suggest_consume(self):
+        reset_5h = NOW + timedelta(hours=1)
+        reset_week = NOW + timedelta(days=2)
+        # 5h window has 80% remaining, resets in 1h -> SUGGEST_CONSUME
+        w_5h_0 = make_window("five_hour", remaining=90.0, resets_at=reset_5h, duration=300)
+        w_5h_1 = make_window("five_hour", remaining=80.0, resets_at=reset_5h, duration=300)
+        # 7d window has 20% remaining, burning at 2%/h, resets in 48h -> exhausts in 10h (<48h) -> CONSERVE
+        w_7d_0 = make_window("seven_day", remaining=22.0, resets_at=reset_week, duration=10080)
+        w_7d_1 = make_window("seven_day", remaining=20.0, resets_at=reset_week, duration=10080)
+
+        h0 = make_account_item("claude", "A", windows=[w_5h_0, w_7d_0], last_updated=NOW - timedelta(hours=1))
+        current = make_account_item("claude", "A", windows=[w_5h_1, w_7d_1], last_updated=NOW)
+
+        fc = forecast_account(current, history=[h0], now=NOW)
+        # Primary window (5h) by itself is SUGGEST_CONSUME
+        fw_5h = next(w for w in fc.windows if w.window_name == "five_hour")
+        self.assertEqual(fw_5h.action_recommendation, ActionRecommendation.URGENT_CONSUME)
+        # But overall account action is CONSERVE due to 7d window protection
+        self.assertEqual(fc.overall_action_recommendation, ActionRecommendation.CONSERVE)
+        self.assertEqual(fc.overall_risk_status, RiskStatus.LIKELY_EXHAUST_BEFORE_RESET)
+        self.assertIn("Multi-window protection", fc.overall_warning_reason)
+
+    # Multi-window protection test: exhausted window (0%) sets overall EXHAUSTED / HOLD / dispatchable=False
+    def test_multi_window_exhausted_window_overrides_to_hold(self):
+        reset_5h = NOW + timedelta(hours=2)
+        reset_week = NOW + timedelta(days=2)
+        w_5h = make_window("five_hour", remaining=80.0, resets_at=reset_5h, duration=300)
+        w_7d = make_window("seven_day", remaining=0.0, resets_at=reset_week, duration=10080)
+        current = make_account_item("claude", "A", windows=[w_5h, w_7d], last_updated=NOW)
+        fc = forecast_account(current, now=NOW)
+        self.assertEqual(fc.overall_risk_status, RiskStatus.EXHAUSTED)
+        self.assertEqual(fc.overall_action_recommendation, ActionRecommendation.HOLD)
+        self.assertFalse(fc.dispatchable)
+
 
 if __name__ == "__main__":
     unittest.main()
