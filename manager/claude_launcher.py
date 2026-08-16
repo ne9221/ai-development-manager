@@ -157,6 +157,17 @@ def check_claude_auth_ready(executable: str, env: dict | None, *,
         raise ClaudeLaunchError(
             "authentication_check_failed", "Claude authentication status check returned an unexpected shape"
         )
+    # The only two self-consistent exit-code/body combinations: a successful
+    # check (rc=0) reporting loggedIn=True, or a clean not-logged-in check
+    # (rc=1) reporting loggedIn=False. Exit code and body are two independent
+    # signals from the same subprocess; trusting either one alone lets a
+    # skewed/inconsistent result (e.g. rc=1 with loggedIn=True) slip through
+    # as READY. Any other combination fails closed instead of picking a side.
+    if (completed.returncode, logged_in) not in ((0, True), (1, False)):
+        raise ClaudeLaunchError(
+            "authentication_check_failed",
+            "Claude authentication status check returned an inconsistent exit code/body combination",
+        )
     return logged_in
 
 
