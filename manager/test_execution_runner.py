@@ -283,6 +283,41 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("account-b", launcher.received_account_id)
         self.assertEqual(r"C:\accounts\b\.claude", launcher.received_config_dir)
 
+    def test_launch_task_forwards_resolved_claude_account_id_to_dispatch(self):
+        """The account_id resolved via claude_accounts (or supplied directly)
+        is the one that will actually launch -- dispatch()'s quota summary
+        must be computed for that same account, not the legacy provider-level
+        representative, or the AI/log can be shown a different account's
+        quota than the one it is actually running under."""
+        store = build_store(read_only=True, working_directory=self.request.working_directory, provider="claude")
+        launcher = AccountAwareClaudeStyleLauncher()
+        registry = [
+            {"account_id": "account-a", "enabled": True, "config_dir": None},
+            {"account_id": "account-b", "enabled": True, "config_dir": r"C:\accounts\b\.claude"},
+        ]
+        document = {"schema_version": "0.1.0", "generated_at": "2026-08-15T02:00:00Z", "providers": [{
+            "provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic",
+            "source": "test", "source_type": "official", "confidence": "official",
+            "last_updated": "2026-08-15T02:00:00Z", "status": "ok", "windows": [],
+            "account_id": "account-b",
+        }]}
+        captured = {}
+
+        def fake_dispatch(store, service, request, quota_document=None, executions=None):
+            captured["request"] = request
+            return {
+                "recommended_provider": "claude", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
+                "generated_prompt": "bounded read-only task",
+            }
+
+        with patch("manager.execution_runner.dispatch", side_effect=fake_dispatch), \
+             patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-sandbox",
+                       provider="claude", quota_document=document, claude_accounts=registry)
+        self.assertEqual("account-b", captured["request"].get("account_id"))
+
     def test_launch_task_claude_accounts_ambiguous_fails_closed_before_launching(self):
         store = build_store(read_only=True, working_directory=self.request.working_directory, provider="claude")
         launcher = AccountAwareClaudeStyleLauncher()

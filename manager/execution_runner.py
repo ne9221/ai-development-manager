@@ -145,7 +145,7 @@ def _failure_summary(error, provider):
     return f"{provider} runner interrupted: {str(classification)[:200]}"
 
 
-def _dispatch_request(task, provider):
+def _dispatch_request(task, provider, account_id=None):
     return {
         "project_id": task["project_id"], "task_id": task["task_id"], "title": task["title"],
         "task_type": task["task_type"], "complexity": task["complexity"],
@@ -153,7 +153,7 @@ def _dispatch_request(task, provider):
         "constraints": task.get("constraints", []), "acceptance_criteria": task.get("acceptance_criteria", []),
         "needs_repo_edit": task.get("needs_repo_edit", True),
         "needs_research": task.get("needs_research", False), "needs_browser": task.get("needs_browser", False),
-        "preferred_provider": provider,
+        "preferred_provider": provider, "account_id": account_id,
     }
 
 
@@ -193,7 +193,7 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
         quota_document = quota_document or read_drive_status(service=service)
         resolved = resolve_claude_account(claude_accounts, quota_document, explicit_account_id=account_id)
         account_id, config_dir = resolved["account_id"], resolved["config_dir"]
-    dispatched = dispatch(store, service, _dispatch_request(task, provider), quota_document, executions)
+    dispatched = dispatch(store, service, _dispatch_request(task, provider, account_id), quota_document, executions)
     if dispatched["recommended_provider"] != provider:
         raise TaskError(f"dispatch did not select {provider}")
     execution_id = execution_id or f"{task_id}-{uuid.uuid4().hex[:12]}"
