@@ -232,7 +232,8 @@ class ResolvedAccountReachesRealClaudeLauncherTests(unittest.TestCase):
         resolved = resolve_claude_account(registry, document, now=NOW)
         self.assertEqual({"account_id": "account-b", "config_dir": r"C:\accounts\b\.claude"}, resolved)
 
-        launcher = self.ClaudeLauncher(executable=__file__, popen=self._popen, log_dir=self.temp.name)
+        launcher = self.ClaudeLauncher(executable=__file__, popen=self._popen, log_dir=self.temp.name,
+                                       auth_check=lambda *a, **k: True)
         request = self.LaunchRequest(self.temp.name, sandbox="read-only", approval_policy="never")
         prepared = launcher.prepare(request, **resolved)
 
@@ -245,7 +246,8 @@ class ResolvedAccountReachesRealClaudeLauncherTests(unittest.TestCase):
         document = quota_doc(claude_entry("account-a", confidence="official"))
         resolved = resolve_claude_account(registry, document, now=NOW)
 
-        launcher = self.ClaudeLauncher(executable=__file__, popen=self._popen, log_dir=self.temp.name)
+        launcher = self.ClaudeLauncher(executable=__file__, popen=self._popen, log_dir=self.temp.name,
+                                       auth_check=lambda *a, **k: True)
         request = self.LaunchRequest(self.temp.name, sandbox="read-only", approval_policy="never")
         launcher.prepare(request, **resolved)
 

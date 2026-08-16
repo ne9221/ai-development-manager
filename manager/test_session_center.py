@@ -737,7 +737,8 @@ class LauncherToSessionCenterIntegrationTest(unittest.TestCase):
                     return self.returncode
 
             process = FakeProcess()
-            launcher = ClaudeLauncher(executable=__file__, popen=lambda *a, **k: process, log_dir=log_dir)
+            launcher = ClaudeLauncher(executable=__file__, popen=lambda *a, **k: process, log_dir=log_dir,
+                                      auth_check=lambda *a, **k: True)
             request = LaunchRequest(cwd, model="claude-sonnet-5", sandbox="read-only", approval_policy="never")
             prepared = launcher.prepare(request)
             uuid_x = prepared.provider_session_id  # authority-assigned before any spawn observation

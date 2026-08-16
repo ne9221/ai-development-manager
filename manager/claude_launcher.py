@@ -102,6 +102,64 @@ def _permission_profile(request: LaunchRequest) -> tuple[str, tuple[str, ...]]:
     )
 
 
+AUTH_STATUS_TIMEOUT_SECONDS = 10.0
+
+
+def check_claude_auth_ready(executable: str, env: dict | None, *,
+                            timeout: float = AUTH_STATUS_TIMEOUT_SECONDS,
+                            run: Callable[..., Any] = subprocess.run) -> bool:
+    """P0.2 authentication readiness preflight: `claude auth status --json`
+    against the exact executable/env (CLAUDE_CONFIG_DIR override or ambient
+    default) the real launch would use, run as its own short-lived,
+    non-interactive subprocess -- never the credential-carrying account
+    itself, never logged in/out.
+
+    Returns True (AUTH_READY) or False (AUTH_UNAVAILABLE -- confirmed not
+    logged in / expired / no usable credential) only when the check produced
+    an unambiguous `loggedIn` boolean. Anything else (unexpected exit code,
+    unparseable/malformed output, timeout, OS error starting the check)
+    raises ClaudeLaunchError("authentication_check_failed", ...) instead of
+    guessing readiness (AUTH_UNKNOWN) -- kept as a distinct classification
+    from "authentication_unavailable" so a confirmed logged-out account is
+    never confused with a broken/uncertain check, and from every other
+    ClaudeLaunchError classification so a real provider crash is never
+    mislabeled as an auth problem.
+
+    Only the `loggedIn` boolean is ever read out of the check's JSON output;
+    the rest (email, orgId, authMethod, ...) and raw stdout/stderr are
+    discarded and never appear in a raised error's detail.
+    """
+    try:
+        completed = run([executable, "auth", "status", "--json"], capture_output=True,
+                        text=True, timeout=timeout, env=env, shell=False)
+    except subprocess.TimeoutExpired as exc:
+        raise ClaudeLaunchError(
+            "authentication_check_failed", "Claude authentication status check timed out"
+        ) from exc
+    except OSError as exc:
+        raise ClaudeLaunchError(
+            "authentication_check_failed", f"could not run Claude authentication status check: {exc}"
+        ) from exc
+
+    if completed.returncode not in (0, 1):
+        raise ClaudeLaunchError(
+            "authentication_check_failed",
+            f"Claude authentication status check exited with unexpected code {completed.returncode}",
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ClaudeLaunchError(
+            "authentication_check_failed", "Claude authentication status check returned unparseable output"
+        ) from exc
+    logged_in = payload.get("loggedIn") if isinstance(payload, dict) else None
+    if not isinstance(logged_in, bool):
+        raise ClaudeLaunchError(
+            "authentication_check_failed", "Claude authentication status check returned an unexpected shape"
+        )
+    return logged_in
+
+
 def _new_session_id() -> str:
     session_id = str(uuid.uuid4())
     if str(uuid.UUID(session_id)) != session_id:
@@ -211,10 +269,11 @@ class ClaudeLauncher:
     Codex's app-server protocol."""
 
     def __init__(self, executable: str | None = None, popen: Callable[..., Any] = subprocess.Popen,
-                 log_dir: str | None = None):
+                 log_dir: str | None = None, auth_check: Callable[[str, dict | None], bool] = check_claude_auth_ready):
         self.executable = executable
         self._popen = popen
         self._log_dir = log_dir
+        self._auth_check = auth_check
 
     @staticmethod
     def _kill_quietly(process: Any) -> None:
@@ -240,6 +299,13 @@ class ClaudeLauncher:
         PreparedLaunch purely as attribution evidence for the caller to persist
         onto the session/execution record -- ClaudeLauncher itself does not
         interpret or validate it against any account registry.
+
+        Before spawning, `self._auth_check` (default `check_claude_auth_ready`)
+        gates on whether this exact config_dir/env is actually authenticated,
+        raising ClaudeLaunchError("authentication_unavailable", ...) closed
+        rather than letting a registered-but-logged-out account reach a
+        provider subprocess. See check_claude_auth_ready's docstring for the
+        AUTH_READY/AUTH_UNAVAILABLE/AUTH_UNKNOWN contract this implements.
         """
         cwd = Path(request.working_directory)
         if not cwd.is_absolute() or not cwd.is_dir():
@@ -249,12 +315,31 @@ class ClaudeLauncher:
 
         permission_mode, allowed_tools = _permission_profile(request)
         executable = resolve_claude_executable(self.executable)
-        session_id = _new_session_id()
-        argv = _build_argv(executable, session_id, permission_mode, allowed_tools, request.model)
+
         env = None
         if config_dir is not None:
             env = dict(os.environ)
             env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+
+        # P0.2: registered + enabled + config_dir-set is not the same thing as
+        # actually logged in -- a real `claude login` may never have happened,
+        # or may have expired/been revoked out of band. Check readiness against
+        # the exact executable/env this launch is about to use, before any
+        # session id, log file, or task subprocess exists, so a not-ready
+        # account fails closed with zero side effects rather than a wasted or
+        # ambiguous spawn. This is independent of and never influenced by
+        # quota confidence/staleness (no quota input reaches this check at
+        # all), and it never falls back to a different account -- prepare()
+        # is always called for exactly one already-resolved account_id.
+        if not self._auth_check(executable, env):
+            raise ClaudeLaunchError(
+                "authentication_unavailable",
+                "Claude account is not authenticated for this profile (not logged in, login expired, "
+                "or credential unavailable)" + (f"; account_id={account_id!r}" if account_id else ""),
+            )
+
+        session_id = _new_session_id()
+        argv = _build_argv(executable, session_id, permission_mode, allowed_tools, request.model)
 
         log_dir = Path(self._log_dir) if self._log_dir else Path(tempfile.gettempdir())
         stdout_path = log_dir / f"claude-{session_id}.stdout.log"
