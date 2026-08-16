@@ -108,6 +108,22 @@ def _summarize_item(provider_id, display_name, item, now, max_age_minutes):
     }
 
 
+def unknown_account_summary(provider_id, display_name, account_id, now=None, max_age_minutes=60):
+    """Synthesize an unknown/unavailable quota summary for an explicit
+    account_id that has no captured per-account entry in the SSOT yet.
+
+    This is deliberately built from an empty source item (via
+    _summarize_item), never from another account's or the provider-level
+    legacy representative's real data -- callers that ask about one specific,
+    uncaptured account must see unknown/stale evidence scoped to exactly that
+    account_id, not borrowed numbers that would misrepresent it as reliable
+    or as sharing another account's standing."""
+    now = now or datetime.now(timezone.utc)
+    summary = _summarize_item(provider_id, display_name, {}, now, max_age_minutes)
+    summary["account_id"] = account_id
+    return summary
+
+
 def _dedupe_last_wins(candidates):
     """Collapse duplicate entries that share the same account_id within a
     single provider's candidate list. Keeps the last (highest document-order)

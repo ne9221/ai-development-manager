@@ -11,7 +11,7 @@ from collectors.publish_drive import build_service
 from manager.assignment import CAPABILITIES, decide
 from manager.estimator import estimate
 from manager.executions import list_executions
-from manager.quota_reader import read_drive_status, summarize
+from manager.quota_reader import EXPECTED_PROVIDERS, read_drive_status, summarize, unknown_account_summary
 from manager.tasks import DriveRecords, TaskError, create_task, safe_id, validate
 
 
@@ -154,9 +154,34 @@ def dispatch(store, service, request, quota_document=None, executions=None):
     if selected == "claude" and account_id:
         selected_quota = next((item for item in quota["accounts"] if item["provider"] == "claude" and item["account_id"] == account_id), None)
         if selected_quota is None:
-            raise TaskError(f"unknown Claude account_id: {account_id}")
+            # No quota has been captured yet for this specific account_id --
+            # dispatch() cannot know whether it is actually launchable, and
+            # must not fail closed here or guess by borrowing another
+            # account's/the legacy representative's real numbers. The
+            # explicit account_id is preserved and given distinct unknown
+            # evidence; only ClaudeLauncher's real auth preflight (which runs
+            # later, against this exact account's config_dir) decides whether
+            # the launch can actually proceed.
+            selected_quota = unknown_account_summary("claude", EXPECTED_PROVIDERS["claude"], account_id)
     else:
         selected_quota = next(item for item in quota["providers"] if item["provider"] == selected)
+    if selected == "claude" and account_id:
+        # decision["quota_evidence"]["claude"] was computed by decide() from
+        # quota["providers"] (the provider-level legacy representative) --
+        # a different real account's numbers, or stale/None data, depending
+        # on what happens to be the representative. That is exactly the
+        # "borrowed evidence" this account-scoped dispatch must never carry:
+        # replace it with evidence built from the account-scoped
+        # selected_quota resolved above, so the persisted audit trail
+        # (Task/Execution/Command quota_evidence) matches quota_summary and
+        # the warnings, not a different account entirely. historical_estimate
+        # is provider-level (not account-specific quota data), so it is kept.
+        decision["quota_evidence"]["claude"] = {
+            "freshness": selected_quota["freshness"], "source_type": selected_quota["source_type"],
+            "confidence": selected_quota["confidence"], "windows": selected_quota["windows"],
+            "nearest_reset_at": selected_quota["nearest_reset_at"],
+            "historical_estimate": decision["quota_evidence"]["claude"].get("historical_estimate"),
+        }
     warnings = [item for item in [decision.get("warning")] if item]
     if request.get("preferred_provider"):
         warnings.append(f"Preferred provider override selected: {selected}")
