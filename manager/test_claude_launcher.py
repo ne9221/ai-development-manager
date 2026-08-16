@@ -8,8 +8,9 @@ from pathlib import Path
 
 from manager.claude_launcher import (
     ClaudeLaunchError, ClaudeLauncher, PreparedLaunch,
-    resolve_claude_executable, _build_argv, _encode_stream_json_input,
-    _extract_stream_json_result, _permission_profile, _read_output_text,
+    check_claude_auth_ready, resolve_claude_executable, _build_argv,
+    _encode_stream_json_input, _extract_stream_json_result, _permission_profile,
+    _read_output_text,
 )
 from manager.codex_launcher import LaunchOutcome, LaunchRequest, RunningLaunch, process_creation_identity
 
@@ -84,8 +85,9 @@ class ClaudeLauncherTests(unittest.TestCase):
         self.calls.append((args, kwargs))
         return self.process
 
-    def launcher(self, log_dir=None):
-        return ClaudeLauncher(executable=__file__, popen=self._popen, log_dir=log_dir or self.temp.name)
+    def launcher(self, log_dir=None, auth_check=None):
+        return ClaudeLauncher(executable=__file__, popen=self._popen, log_dir=log_dir or self.temp.name,
+                               auth_check=auth_check or (lambda *a, **k: True))
 
     def request(self, cwd=None, model="claude-sonnet-5", sandbox="read-only", approval_policy="never"):
         return LaunchRequest(cwd or self.cwd, model=model, sandbox=sandbox, approval_policy=approval_policy)
@@ -198,7 +200,8 @@ class ClaudeLauncherTests(unittest.TestCase):
     def test_spawn_failure_raises_and_leaves_no_prepared_launch(self):
         def failing_popen(*args, **kwargs):
             raise OSError("no such file or directory")
-        launcher = ClaudeLauncher(executable=__file__, popen=failing_popen, log_dir=self.temp.name)
+        launcher = ClaudeLauncher(executable=__file__, popen=failing_popen, log_dir=self.temp.name,
+                                  auth_check=lambda *a, **k: True)
         with self.assertRaises(ClaudeLaunchError) as ctx:
             launcher.prepare(self.request())
         self.assertEqual(ctx.exception.classification, "spawn_failed")
@@ -321,6 +324,246 @@ class ClaudeLauncherTests(unittest.TestCase):
         self.assertEqual(self.process.kill_count, 0)
 
 
+class AuthPreflightTests(unittest.TestCase):
+    """P0.2: an account can be registered/enabled/config_dir-set yet not
+    actually logged in (never authenticated, expired, logged out). These
+    tests cover the FAIL-before contract for a preflight authentication
+    readiness gate in ClaudeLauncher.prepare(), before P0.2 implementation
+    exists -- every test in this class is expected to fail against baseline
+    ed1d40e (no `auth_check` parameter, no authentication_* classifications)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.cwd = str(Path(self.temp.name).resolve())
+        self.calls = []
+        self.process = None
+        self.auth_check_calls = []
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _popen(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.process
+
+    def _recording_auth_check(self, result):
+        def _check(executable, env):
+            self.auth_check_calls.append((executable, env))
+            if isinstance(result, Exception):
+                raise result
+            return result
+        return _check
+
+    def launcher(self, auth_check):
+        return ClaudeLauncher(executable=__file__, popen=self._popen, log_dir=self.temp.name, auth_check=auth_check)
+
+    def request(self, cwd=None, model="claude-sonnet-5"):
+        return LaunchRequest(cwd or self.cwd, model=model, sandbox="read-only", approval_policy="never")
+
+    # Case 1: registered + enabled + auth ready -> normal launch, unaffected.
+    def test_auth_ready_allows_normal_launch(self):
+        self.process = FakeProcess()
+        prepared = self.launcher(self._recording_auth_check(True)).prepare(
+            self.request(), account_id="account-a", config_dir=r"C:\accounts\a\.claude",
+        )
+        self.assertEqual("account-a", prepared.account_id)
+        self.assertEqual(1, len(self.calls))  # the real task subprocess was spawned
+
+    # Case 2: registered + enabled + auth unavailable -> fail closed before the
+    # real task subprocess is ever spawned, classified distinctly.
+    def test_auth_unavailable_fails_closed_before_spawn(self):
+        self.process = FakeProcess()
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            self.launcher(self._recording_auth_check(False)).prepare(
+                self.request(), account_id="account-a", config_dir=r"C:\accounts\a\.claude",
+            )
+        self.assertEqual("authentication_unavailable", ctx.exception.classification)
+        self.assertEqual([], self.calls)  # no task subprocess spawned
+
+    # Case 3: Account B auth failure -> never falls back to Account A. Since
+    # prepare() is called once per resolved account, proving no task
+    # subprocess was spawned proves no fallback launch happened either.
+    def test_account_b_auth_failure_does_not_fall_back_to_account_a(self):
+        self.process = FakeProcess()
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            self.launcher(self._recording_auth_check(False)).prepare(
+                self.request(), account_id="account-b", config_dir=r"C:\accounts\b\.claude",
+            )
+        self.assertEqual("authentication_unavailable", ctx.exception.classification)
+        self.assertEqual([], self.calls)
+        self.assertEqual(1, len(self.auth_check_calls))  # only account B's env was ever checked
+        self.assertEqual(r"C:\accounts\b\.claude", self.auth_check_calls[0][1]["CLAUDE_CONFIG_DIR"])
+
+    # Case 4: symmetric -- Account A auth failure never falls back to B.
+    def test_account_a_auth_failure_does_not_fall_back_to_account_b(self):
+        self.process = FakeProcess()
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            self.launcher(self._recording_auth_check(False)).prepare(
+                self.request(), account_id="account-a", config_dir=r"C:\accounts\a\.claude",
+            )
+        self.assertEqual("authentication_unavailable", ctx.exception.classification)
+        self.assertEqual([], self.calls)
+        self.assertEqual(r"C:\accounts\a\.claude", self.auth_check_calls[0][1]["CLAUDE_CONFIG_DIR"])
+
+    # Case 5/6: the auth gate takes no quota input at all -- it cannot be
+    # confused by unknown or stale quota confidence, because prepare()/
+    # check_claude_auth_ready never receive a quota document or confidence
+    # value. Auth-ready must allow the launch regardless.
+    def test_auth_ready_allows_launch_with_no_quota_context_supplied(self):
+        self.process = FakeProcess()
+        prepared = self.launcher(self._recording_auth_check(True)).prepare(self.request())
+        self.assertIsNotNone(prepared)
+        # the injected auth_check signature carries no quota/confidence argument
+        executable, env = self.auth_check_calls[0]
+        self.assertIsInstance(executable, str)
+
+    # Case 8: legacy single-account path (no account_id/config_dir) keeps
+    # working when auth is ready, and is now also protected when it is not --
+    # extending coverage, not breaking the existing default behavior.
+    def test_legacy_single_account_path_auth_ready_unaffected(self):
+        self.process = FakeProcess()
+        prepared = self.launcher(self._recording_auth_check(True)).prepare(self.request())
+        self.assertIsNone(prepared.account_id)
+        self.assertIsNone(prepared.config_dir)
+        self.assertIsNone(self.auth_check_calls[0][1])  # env=None: ambient/default config dir checked
+
+    def test_legacy_single_account_path_auth_unavailable_fails_closed(self):
+        self.process = FakeProcess()
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            self.launcher(self._recording_auth_check(False)).prepare(self.request())
+        self.assertEqual("authentication_unavailable", ctx.exception.classification)
+        self.assertEqual([], self.calls)
+
+    # Case 9: a generic crash after a ready auth check must keep its own
+    # classification -- never mislabeled as an authentication failure.
+    def test_generic_spawn_crash_after_auth_ready_is_not_mislabeled_as_auth_failure(self):
+        def failing_popen(*args, **kwargs):
+            raise OSError("no such file or directory")
+        launcher = ClaudeLauncher(executable=__file__, popen=failing_popen, log_dir=self.temp.name,
+                                  auth_check=self._recording_auth_check(True))
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            launcher.prepare(self.request())
+        self.assertEqual("spawn_failed", ctx.exception.classification)
+        self.assertEqual(1, len(self.auth_check_calls))  # the gate ran, and then allowed the real attempt
+
+    def test_immediate_process_exit_after_auth_ready_is_not_mislabeled_as_auth_failure(self):
+        self.process = FakeProcess(exit_immediately_with=1)
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            self.launcher(self._recording_auth_check(True)).prepare(self.request())
+        self.assertEqual("spawn_failed", ctx.exception.classification)
+
+    # Ambiguous/unverifiable auth-check outcomes fail closed too, but under a
+    # distinct classification from a confirmed "not logged in" -- so ops can
+    # tell "definitely not authenticated" apart from "could not determine".
+    def test_auth_check_raising_ambiguous_error_fails_closed_distinctly(self):
+        self.process = FakeProcess()
+        ambiguous = ClaudeLaunchError("authentication_check_failed", "Claude auth status check returned unparseable output")
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            self.launcher(self._recording_auth_check(ambiguous)).prepare(self.request())
+        self.assertEqual("authentication_check_failed", ctx.exception.classification)
+        self.assertEqual([], self.calls)
+
+    # Case 10: credential/config contents never leak into the raised error.
+    def test_authentication_unavailable_error_never_leaks_config_dir(self):
+        self.process = FakeProcess()
+        secret_looking_dir = r"C:\accounts\b\.claude-secret-profile-xyz"
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            self.launcher(self._recording_auth_check(False)).prepare(
+                self.request(), account_id="account-b", config_dir=secret_looking_dir,
+            )
+        self.assertNotIn(secret_looking_dir, ctx.exception.detail)
+        self.assertNotIn("token", ctx.exception.detail.lower())
+        self.assertNotIn("secret", ctx.exception.detail.lower())
+
+    # No account is available to preflight-check without an explicit gate:
+    # this documents that the auth gate runs strictly before any UUID/log
+    # file allocation, keeping a rejected launch side-effect-free.
+    def test_auth_gate_runs_before_session_id_and_log_file_allocation(self):
+        self.process = FakeProcess()
+        launcher = self.launcher(self._recording_auth_check(False))
+        with self.assertRaises(ClaudeLaunchError):
+            launcher.prepare(self.request())
+        self.assertEqual(0, len(list(Path(self.temp.name).glob("claude-*.stdout.log"))))
+
+
+class CheckClaudeAuthReadyTests(unittest.TestCase):
+    """Direct unit tests for the standalone auth-status subprocess wrapper,
+    with `run` fully injected (no real `claude` invocation)."""
+
+    class _CompletedProcess:
+        def __init__(self, returncode, stdout=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def _run(self, result):
+        self.run_calls = []
+
+        def _fake_run(argv, **kwargs):
+            self.run_calls.append((argv, kwargs))
+            if isinstance(result, Exception):
+                raise result
+            return result
+        return _fake_run
+
+    def test_logged_in_true_returns_true(self):
+        result = check_claude_auth_ready(
+            "claude.exe", {"CLAUDE_CONFIG_DIR": "x"},
+            run=self._run(self._CompletedProcess(0, json.dumps({"loggedIn": True, "email": "user@example.com"}))),
+        )
+        self.assertTrue(result)
+
+    def test_logged_in_false_returns_false(self):
+        result = check_claude_auth_ready(
+            "claude.exe", None,
+            run=self._run(self._CompletedProcess(1, json.dumps({"loggedIn": False, "authMethod": "none"}))),
+        )
+        self.assertFalse(result)
+
+    def test_forwards_executable_and_env_to_run_unchanged(self):
+        env = {"CLAUDE_CONFIG_DIR": r"C:\accounts\b\.claude"}
+        check_claude_auth_ready("claude.exe", env, run=self._run(self._CompletedProcess(0, json.dumps({"loggedIn": True}))))
+        argv, kwargs = self.run_calls[0]
+        self.assertEqual(["claude.exe", "auth", "status", "--json"], argv)
+        self.assertIs(kwargs["env"], env)
+        self.assertFalse(kwargs.get("shell", False))
+
+    def test_unexpected_exit_code_fails_closed_distinctly(self):
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            check_claude_auth_ready("claude.exe", None, run=self._run(self._CompletedProcess(2, "{}")))
+        self.assertEqual("authentication_check_failed", ctx.exception.classification)
+
+    def test_unparseable_output_fails_closed_and_does_not_echo_it(self):
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            check_claude_auth_ready("claude.exe", None, run=self._run(self._CompletedProcess(0, "not json at all")))
+        self.assertEqual("authentication_check_failed", ctx.exception.classification)
+        self.assertNotIn("not json at all", ctx.exception.detail)
+
+    def test_missing_logged_in_field_fails_closed(self):
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            check_claude_auth_ready("claude.exe", None, run=self._run(self._CompletedProcess(0, json.dumps({"authMethod": "none"}))))
+        self.assertEqual("authentication_check_failed", ctx.exception.classification)
+
+    def test_subprocess_timeout_fails_closed(self):
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            check_claude_auth_ready("claude.exe", None, run=self._run(subprocess.TimeoutExpired("claude", 10)))
+        self.assertEqual("authentication_check_failed", ctx.exception.classification)
+
+    def test_subprocess_os_error_fails_closed(self):
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            check_claude_auth_ready("claude.exe", None, run=self._run(OSError("no such file or directory")))
+        self.assertEqual("authentication_check_failed", ctx.exception.classification)
+
+    def test_error_detail_never_contains_raw_stdout_payload(self):
+        payload = json.dumps({"loggedIn": True, "email": "user@example.com", "orgId": "org-secret-id"})
+        # A malformed shape (loggedIn not a bool) still must not echo the payload.
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            check_claude_auth_ready("claude.exe", None, run=self._run(self._CompletedProcess(0, json.dumps({"loggedIn": "yes"}))))
+        self.assertNotIn("user@example.com", ctx.exception.detail)
+        self.assertNotIn("org-secret-id", ctx.exception.detail)
+        self.assertNotIn(payload, ctx.exception.detail)
+
+
 class StartWaitTests(unittest.TestCase):
     """start()/wait() -- the execution half of the launcher, all against a
     mocked process/file sink; no real Claude invocation this round."""
@@ -337,7 +580,8 @@ class StartWaitTests(unittest.TestCase):
         return self.process
 
     def launcher(self):
-        return ClaudeLauncher(executable=__file__, popen=self._popen, log_dir=self.temp.name)
+        return ClaudeLauncher(executable=__file__, popen=self._popen, log_dir=self.temp.name,
+                               auth_check=lambda *a, **k: True)
 
     def request(self):
         return LaunchRequest(self.cwd, model="claude-sonnet-5", sandbox="read-only", approval_policy="never")
