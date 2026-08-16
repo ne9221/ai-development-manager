@@ -156,7 +156,7 @@ def calculate_window_burn_rate(
     """Calculate the observed burn rate (% per hour) for a specific window.
 
     Strict rules applied:
-    - Independent per window (no cross-window math).
+    - Strictly isolated per (provider, account_id, window_name).
     - Deduplicates snapshots sharing the exact same timestamp.
     - Sorts samples chronologically.
     - Detects reset/replenishment boundaries (quota increases, reset timestamp change,
@@ -167,10 +167,22 @@ def calculate_window_burn_rate(
     now = now or datetime.now(timezone.utc)
     all_snapshots = ([s for s in history if isinstance(s, dict)] if history else []) + [current_item]
 
+    target_provider = current_item.get("provider")
+    target_account = current_item.get("account_id")
+
     # Extract valid points (timestamp, remaining_percent, resets_at_str, resets_at_dt)
     extracted = []
     for snap in all_snapshots:
-        ts = parse_iso_time(snap.get("last_updated"))
+        # Strict isolation by provider and account_id
+        if snap is not current_item:
+            snap_provider = snap.get("provider")
+            snap_account = snap.get("account_id")
+            if snap_provider is not None and target_provider is not None and snap_provider != target_provider:
+                continue
+            if snap_account != target_account:
+                continue
+
+        ts = parse_iso_time(snap.get("last_updated") or snap.get("observed_at"))
         if ts is None:
             continue
         w = _extract_window(snap, window_name)
@@ -206,8 +218,8 @@ def calculate_window_burn_rate(
             active_start_idx = i + 1
             continue
 
-        # 2. Reset timestamp changed between valid values
-        if resets_curr and resets_next and resets_curr != resets_next:
+        # 2. Reset timestamp changed between valid values (compared via parsed datetimes)
+        if resets_dt_curr and resets_dt_next and resets_dt_curr != resets_dt_next:
             active_start_idx = i + 1
             continue
 
@@ -265,7 +277,7 @@ def forecast_window(
     confidence = current_item.get("confidence", "unknown")
 
     # Evaluate item staleness
-    updated_dt = parse_iso_time(current_item.get("last_updated"))
+    updated_dt = parse_iso_time(current_item.get("last_updated") or current_item.get("observed_at"))
     age_minutes = None if updated_dt is None else (now - updated_dt).total_seconds() / 60.0
     future_skewed = age_minutes is not None and age_minutes < -FUTURE_SKEW_MINUTES
     stale = (
@@ -572,7 +584,7 @@ def forecast_account(
     confidence = current_account_item.get("confidence", "unknown")
 
     # Evaluate staleness
-    updated_dt = parse_iso_time(current_account_item.get("last_updated"))
+    updated_dt = parse_iso_time(current_account_item.get("last_updated") or current_account_item.get("observed_at"))
     age_minutes = None if updated_dt is None else (now - updated_dt).total_seconds() / 60.0
     future_skewed = age_minutes is not None and age_minutes < -FUTURE_SKEW_MINUTES
     stale = (
@@ -680,7 +692,7 @@ def forecast_account(
         account_id=account_id,
         display_name=display_name,
         status=status,
-        last_updated=current_account_item.get("last_updated"),
+        last_updated=current_account_item.get("last_updated") or current_account_item.get("observed_at"),
         stale=stale,
         freshness=freshness,
         source=source,

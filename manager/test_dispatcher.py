@@ -462,4 +462,36 @@ class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
         self.assertNotEqual(RiskStatus.CONSERVE.value, fc_info.get("overall_risk_status"))
 
 
+    # 14. Dispatcher uses QuotaHistoryStore to power forecast routing
+    def test_dispatcher_uses_history_store_for_forecast_routing(self):
+        from datetime import datetime, timezone, timedelta
+        from manager.quota_history import QuotaHistoryStore
+        now = datetime.now(timezone.utc)
+        reset_soon = now + timedelta(hours=1)
+        reset_later = now + timedelta(hours=10)
+        doc = self.make_fresh_doc(a_rem=80.0, b_rem=80.0, a_resets=reset_soon, b_resets=reset_later)
+
+        store = QuotaHistoryStore()
+        h_a = {
+            "provider": "claude", "account_id": "claude-a", "last_updated": (now - timedelta(hours=1)).isoformat(),
+            "windows": [{"name": "five_hour", "remaining_percent": 90.0, "resets_at": reset_soon.isoformat()}],
+        }
+        store.append_snapshot(h_a)
+
+        res = dispatch(self.store, object(), request(title="Store routing test", preferred_provider="claude"), doc, [], history_store=store)
+        self.assertEqual("claude-a", res["account_id"])
+        self.assertIn("claude-a", res["quota_summary"])
+
+    # 15. History store unavailable -> Dispatcher maintains current-quota fallback
+    def test_dispatcher_history_store_unavailable_falls_back_safely(self):
+        class BrokenHistoryStore:
+            def get_history(self, *_, **__):
+                raise IOError("storage unreachable")
+
+        doc = self.make_fresh_doc(a_rem=80.0, b_rem=20.0)
+        res = dispatch(self.store, object(), request(title="Broken store test", preferred_provider="claude"), doc, [], history_store=BrokenHistoryStore())
+        self.assertEqual("claude-a", res["account_id"])
+        self.assertEqual("claude", res["recommended_provider"])
+
+
 if __name__ == "__main__": unittest.main()

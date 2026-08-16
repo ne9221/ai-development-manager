@@ -133,5 +133,36 @@ class RefreshTests(unittest.TestCase):
                     pass
 
 
+    def test_refresh_appends_to_history_store(self):
+        from manager.quota_history import QuotaHistoryStore
+        history_path = self.base / "quota_history.json"
+        store = QuotaHistoryStore(history_path)
+        payload_b = self.base / "claude-b.json"
+        payload_b.write_text(json.dumps({"rate_limits": {
+            "five_hour": {"used_percentage": 10, "resets_at": "2026-08-17T05:00:00Z"},
+        }}), encoding="utf-8")
+        result, _, _ = self.run_refresh(
+            claude_accounts={"account-b": payload_b},
+            history_store=store,
+        )
+        history = store.get_history()
+        self.assertTrue(len(history) >= 2) # Codex and Claude:account-b
+        codex_h = store.get_history(provider="codex")
+        claude_b_h = store.get_history(provider="claude", account_id="account-b")
+        self.assertEqual(1, len(codex_h))
+        self.assertEqual(1, len(claude_b_h))
+        self.assertEqual(90.0, claude_b_h[0]["windows"][0]["remaining_percent"])
+
+    def test_refresh_history_store_failure_is_fail_safe(self):
+        class BrokenStore:
+            def append_snapshot(self, *_, **__):
+                raise IOError("disk failure")
+        # Should not raise RefreshError when history store fails
+        result, _, published = self.run_refresh(history_store=BrokenStore())
+        self.assertEqual(1, len(published))
+        codex_entry = next(x for x in result["document"]["providers"] if x["provider"] == "codex")
+        self.assertEqual(95, codex_entry["windows"][0]["remaining_percent"])
+
+
 if __name__ == "__main__":
     unittest.main()
