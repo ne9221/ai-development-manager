@@ -4,7 +4,9 @@ from unittest.mock import patch
 
 from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
 from manager.command_watcher import poll_once
-from manager.tasks import DriveRecords, TaskError, create_project, validate
+from manager.dispatch_requests import claim_dispatch_request
+from manager.dispatcher import dispatch as dispatcher_dispatch
+from manager.tasks import DriveRecords, TaskError, create_project, now_iso, update_task, validate
 from manager.test_dispatcher import quota as quota_fixture
 from manager.test_task_claims import MemoryClaimRegistry
 from manager.test_tasks import FakeDriveService
@@ -183,6 +185,81 @@ class DispatchIngressTests(unittest.TestCase):
         with self.assertRaises(DispatchIngressError) as ctx:
             handle_dispatch(self.store, self.service, broken_factory, payload())
         self.assertEqual("idempotency_backend_unavailable", ctx.exception.code)
+
+    def test_orphan_claim_without_backing_task_or_command_does_not_report_fake_success(self):
+        """Regression for the live-discovered bug (2026-08-17 golden E2E):
+        a claim record can exist -- e.g. the original request died after
+        the CAS claim landed but before Task/Command creation ever ran --
+        with no backing Task/Command ever created. A retry with the same
+        request_id must never report accepted: true for state that was
+        never actually persisted; it must fail closed instead."""
+        registry = self.registries.factory("p1", "req-orphan")
+        claim_dispatch_request(registry, "p1", "req-orphan", "dispatch-req-orphan", "dispatch-req-orphan", now_iso())
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-orphan"))
+        self.assertEqual("dispatch_incomplete", ctx.exception.code)
+        with self.assertRaises(TaskError):
+            self.store.get("tasks", "p1", "dispatch-req-orphan")
+        with self.assertRaises(TaskError):
+            self.store.get("commands", "p1", "dispatch-req-orphan")
+
+    def test_partial_state_task_exists_but_command_missing_fails_closed(self):
+        """The original claimant died between finishing the Task write and
+        the later, separate Command write -- Task alone existing must not
+        be mistaken for a completed, retryable-as-success dispatch."""
+        registry = self.registries.factory("p1", "req-partial")
+        claim_dispatch_request(registry, "p1", "req-partial", "dispatch-req-partial", "dispatch-req-partial", now_iso())
+        internal_request = {
+            "project_id": "p1", "task_id": "dispatch-req-partial", "title": "Partial",
+            "task_type": "general", "complexity": "medium",
+            "source_context": {"origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": "req-partial",
+                                "goal": "g", "admission_version": ADMISSION_VERSION},
+        }
+        dispatcher_dispatch(self.store, self.service, internal_request)
+        update_task(self.store, "p1", "dispatch-req-partial", priority="normal",
+                    read_only=True, execution_policies=sorted(REQUIRED_TASK_POLICIES))
+        self.store.get("tasks", "p1", "dispatch-req-partial")  # sanity: Task really was written
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-partial"))
+        self.assertEqual("dispatch_incomplete", ctx.exception.code)
+        with self.assertRaises(TaskError):
+            self.store.get("commands", "p1", "dispatch-req-partial")
+
+    def test_command_with_mismatched_request_id_fails_closed(self):
+        """A Command found at the claimed id whose own request_id linkage
+        does not match the request being resolved must not be trusted as
+        that request's result (request_id collision / corrupted record)."""
+        self.call(payload(request_id="req-mismatch"))
+        command = self.store.get("commands", "p1", "dispatch-req-mismatch")
+        command["request_id"] = "some-other-request"
+        self.store.put("commands", "p1", "dispatch-req-mismatch", command)
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-mismatch"))
+        self.assertEqual("dispatch_state_inconsistent", ctx.exception.code)
+
+    def test_command_with_mismatched_task_id_fails_closed(self):
+        self.call(payload(request_id="req-mismatch-task"))
+        command = self.store.get("commands", "p1", "dispatch-req-mismatch-task")
+        command["task_id"] = "dispatch-some-other-task"
+        self.store.put("commands", "p1", "dispatch-req-mismatch-task", command)
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-mismatch-task"))
+        self.assertEqual("dispatch_state_inconsistent", ctx.exception.code)
+
+    def test_malformed_claim_record_fails_closed(self):
+        registry = self.registries.factory("p1", "req-malformed")
+        registry.document = {"schema_version": "0.1.0", "project_id": "p1"}  # missing required fields
+        registry.generation = 1
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-malformed"))
+        self.assertEqual("idempotency_backend_unavailable", ctx.exception.code)
+
+    def test_valid_idempotent_retry_returns_existing_result_without_rewriting(self):
+        first = self.call(payload(request_id="req-idem"))
+        command_before = self.store.get("commands", "p1", "dispatch-req-idem")
+        second = self.call(payload(request_id="req-idem"))
+        self.assertEqual(first, second)
+        self.assertEqual(command_before, self.store.get("commands", "p1", "dispatch-req-idem"))
 
     def test_queued_command_is_recognized_by_command_watcher_and_left_alone(self):
         """The Command Watcher must recognize the record contract this
