@@ -563,6 +563,29 @@ class CheckClaudeAuthReadyTests(unittest.TestCase):
         self.assertNotIn("org-secret-id", ctx.exception.detail)
         self.assertNotIn(payload, ctx.exception.detail)
 
+    # Only two exit-code/body combinations are ever self-consistent: a
+    # successful check (rc=0) reporting loggedIn=True, and a clean "not
+    # logged in" check (rc=1) reporting loggedIn=False. Every other
+    # combination -- including the two below, where the process exit code
+    # and the reported loggedIn boolean disagree -- must fail closed with
+    # "authentication_check_failed" rather than trust either signal alone.
+
+    def test_exit_1_with_logged_in_true_fails_closed_not_ready(self):
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            check_claude_auth_ready(
+                "claude.exe", None,
+                run=self._run(self._CompletedProcess(1, json.dumps({"loggedIn": True}))),
+            )
+        self.assertEqual("authentication_check_failed", ctx.exception.classification)
+
+    def test_exit_0_with_logged_in_false_fails_closed(self):
+        with self.assertRaises(ClaudeLaunchError) as ctx:
+            check_claude_auth_ready(
+                "claude.exe", None,
+                run=self._run(self._CompletedProcess(0, json.dumps({"loggedIn": False}))),
+            )
+        self.assertEqual("authentication_check_failed", ctx.exception.classification)
+
 
 class StartWaitTests(unittest.TestCase):
     """start()/wait() -- the execution half of the launcher, all against a
