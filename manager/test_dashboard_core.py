@@ -1,6 +1,8 @@
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
+from cloud.dispatch_ingress import handle_dispatch
 from manager.dashboard_core import (
     parse_time,
     is_cleanup_confirmed,
@@ -23,6 +25,10 @@ from manager.quota_forecast import (
     RiskStatus,
     ActionRecommendation
 )
+from manager.tasks import DriveRecords, create_project
+from manager.test_dispatcher import quota as quota_fixture
+from manager.test_task_claims import MemoryClaimRegistry
+from manager.test_tasks import FakeDriveService
 
 
 class TestDashboardCore(unittest.TestCase):
@@ -416,6 +422,79 @@ class TestDashboardCore(unittest.TestCase):
         codex_vm = brief.accounts[0]
         self.assertIsNone(codex_vm.five_hour_burn_rate)
         self.assertEqual(codex_vm.formatted_five_hour_burn_rate, "—")
+
+
+class DirectDispatchDashboardVisibilityTests(unittest.TestCase):
+    """Targeted proof that the PC Dashboard's existing data mapping
+    (map_task_board/get_global_summary) needs no changes to show a Task
+    created through the Direct Dispatch ingress: it loads every Task per
+    project unconditionally, with no filter on origin/source_context, so
+    an ingress-created Task is visible the same way any other Task is --
+    through its lifecycle from Ready to In progress/active session to
+    Completed, exactly like the existing PROJECT/TASK/EXECUTION contract
+    already relied on by dashboard.py."""
+
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+        create_project(self.store, {
+            "project_id": "p1", "name": "Project One", "repo": "https://github.com/example/project",
+            "default_branch": "main", "runtime_ssot": "Drive", "project_rules": [], "active_tasks": [],
+            "current_phase": "Phase 1", "important_constraints": [],
+        })
+        self.registry = MemoryClaimRegistry()
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=quota_fixture())
+        self.quota_patch.start()
+        self.addCleanup(self.quota_patch.stop)
+
+    def create_ingress_task(self, request_id="req-1"):
+        result = handle_dispatch(
+            self.store, self.service, lambda project_id, request_id: self.registry,
+            {"request_id": request_id, "project_id": "p1", "title": "Investigate flaky test", "goal": "Read logs only"},
+        )
+        return self.store.get("tasks", "p1", result["task_id"]), result
+
+    def test_freshly_created_ingress_task_appears_on_the_ready_board(self):
+        task, _ = self.create_ingress_task()
+        now = datetime.now(timezone.utc)
+        board = map_task_board([task], {}, now)
+        self.assertEqual(1, len(board["Ready"]))
+        self.assertEqual("dispatch-req-1", board["Ready"][0]["task_id"])
+        for bucket in ("In progress", "Blocked / Attention", "Completed"):
+            self.assertEqual(0, len(board[bucket]))
+        summary = get_global_summary([], [task], [])
+        self.assertEqual(0, summary["running_tasks_count"])
+        self.assertEqual(0, summary["blocked_tasks_count"])
+
+    def test_running_execution_moves_ingress_task_to_in_progress_with_active_session(self):
+        task, result = self.create_ingress_task(request_id="req-2")
+        task["status"] = "in_progress"  # what the Command Watcher's on_running callback drives
+        execution = {
+            "project_id": "p1", "task_id": task["task_id"], "execution_id": f"command-{result['command_id']}",
+            "status": "running", "provider": "codex",
+        }
+        now = datetime.now(timezone.utc)
+        active_executions = [e for e in [execution] if e.get("status") not in {"completed", "failed", "interrupted", "cancelled"}]
+        active_executions_dict = {(e.get("project_id"), e.get("task_id")): e for e in active_executions}
+        board = map_task_board([task], active_executions_dict, now)
+        self.assertEqual(1, len(board["In progress"]))
+        summary = get_global_summary([], [task], active_executions)
+        self.assertEqual(1, summary["running_tasks_count"])
+        self.assertEqual(1, summary["active_sessions_count"])
+
+    def test_completed_execution_moves_ingress_task_to_completed_and_drops_active_session(self):
+        task, result = self.create_ingress_task(request_id="req-3")
+        task["status"] = "completed"
+        execution = {
+            "project_id": "p1", "task_id": task["task_id"], "execution_id": f"command-{result['command_id']}",
+            "status": "completed", "provider": "codex",
+        }
+        now = datetime.now(timezone.utc)
+        active_executions = [e for e in [execution] if e.get("status") not in {"completed", "failed", "interrupted", "cancelled"}]
+        board = map_task_board([task], {}, now)
+        self.assertEqual(1, len(board["Completed"]))
+        summary = get_global_summary([], [task], active_executions)
+        self.assertEqual(0, summary["active_sessions_count"])
 
 
 if __name__ == "__main__":
