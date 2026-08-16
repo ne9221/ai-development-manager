@@ -228,4 +228,238 @@ class DispatcherTests(unittest.TestCase):
         with self.assertRaises(TaskError): request_ok(request(preferred_provider="codex", excluded_provider="codex"))
 
 
+class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
+    """Regression test suite for M1 Slice 2: Forecast Evidence -> Account-aware Quota Routing."""
+
+    def setUp(self):
+        self.store = MemoryStore()
+        create_project(self.store, project())
+
+    def make_fresh_doc(self, a_rem=80.0, b_rem=20.0, a_resets=None, b_resets=None,
+                       a_stale=False, b_stale=False, a_conf="official", b_conf="official",
+                       a_extra_windows=None, b_extra_windows=None):
+        from datetime import datetime, timezone, timedelta
+        now_dt = datetime.now(timezone.utc)
+        fresh_ts = (now_dt - timedelta(minutes=2)).isoformat()
+        stale_ts = (now_dt - timedelta(hours=3)).isoformat()
+
+        def make_entry(acc_id, rem, resets, stale, conf, extra_windows=None):
+            w = []
+            if rem is not None:
+                w.append({
+                    "name": "five_hour",
+                    "remaining_percent": rem,
+                    "used_percent": 100.0 - rem,
+                    "resets_at": resets.isoformat() if isinstance(resets, datetime) else resets,
+                })
+            if extra_windows:
+                w.extend(extra_windows)
+            return {
+                "provider": "claude",
+                "account_id": acc_id,
+                "display_name": "Claude Code",
+                "collection_mode": "automatic",
+                "source": "claude_code_statusline_rate_limits",
+                "source_type": "official" if conf == "official" else "manual",
+                "confidence": conf,
+                "status": "ok" if rem is not None else "unknown",
+                "stale": stale,
+                "last_updated": stale_ts if stale else fresh_ts,
+                "windows": w,
+            }
+
+        providers = [
+            make_entry("claude-a", a_rem, a_resets, a_stale, a_conf, a_extra_windows),
+            make_entry("claude-b", b_rem, b_resets, b_stale, b_conf, b_extra_windows),
+            {
+                "provider": "codex", "display_name": "Codex", "collection_mode": "automatic",
+                "source": "codex_app_server", "source_type": "official", "confidence": "official",
+                "status": "ok", "stale": False, "last_updated": fresh_ts,
+                "windows": [{"name": "primary", "remaining_percent": 50.0, "used_percent": 50.0, "resets_at": None}],
+            },
+        ]
+        return {"schema_version": "0.1.0", "generated_at": fresh_ts, "providers": providers}
+
+    # 1. A fresh 80%, B fresh 20% -> A prioritized
+    def test_fresh_a_80_b_20_selects_a(self):
+        doc = self.make_fresh_doc(a_rem=80.0, b_rem=20.0)
+        res = dispatch(self.store, object(), request(title="Quota test", preferred_provider="claude"), doc, [])
+        self.assertEqual("claude-a", res["account_id"])
+        self.assertIn("claude-a", res["quota_summary"])
+        self.assertIn("80", res["quota_summary"])
+        self.assertEqual(80.0, res["quota_evidence"]["claude"]["windows"][0]["remaining_percent"])
+
+    # 2. A 80% about to reset with waste risk -> A prioritized for consumption
+    def test_a_80_reset_waste_risk_prioritized_over_b_80_healthy(self):
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        reset_soon = now + timedelta(hours=1)
+        reset_later = now + timedelta(hours=10)
+        doc = self.make_fresh_doc(a_rem=80.0, b_rem=80.0, a_resets=reset_soon, b_resets=reset_later)
+        # Add history: A burned 10% in last hour (80% left with 1h to reset -> waste risk)
+        h_a = {
+            "provider": "claude", "account_id": "claude-a", "last_updated": (now - timedelta(hours=1)).isoformat(),
+            "windows": [{"name": "five_hour", "remaining_percent": 90.0, "resets_at": reset_soon.isoformat()}],
+        }
+        res = dispatch(self.store, object(), request(title="Waste risk test", preferred_provider="claude"), doc, [h_a])
+        self.assertEqual("claude-a", res["account_id"])
+        self.assertIn("claude-a", res["quota_summary"])
+
+    # 3. A 80% likely exhaust before reset, B 40% healthy -> selects B
+    def test_a_80_likely_exhaust_selects_b_40_healthy(self):
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        reset_time = now + timedelta(hours=3)
+        doc = self.make_fresh_doc(a_rem=80.0, b_rem=40.0, a_resets=reset_time, b_resets=reset_time)
+        # A was 130% (burned 50% in 1h, will exhaust in 1.6h < 3h -> CONSERVE)
+        h_a = {
+            "provider": "claude", "account_id": "claude-a", "last_updated": (now - timedelta(hours=1)).isoformat(),
+            "windows": [{"name": "five_hour", "remaining_percent": 130.0, "resets_at": reset_time.isoformat()}],
+        }
+        # B was 45% (burned 5% in 1h -> healthy)
+        h_b = {
+            "provider": "claude", "account_id": "claude-b", "last_updated": (now - timedelta(hours=1)).isoformat(),
+            "windows": [{"name": "five_hour", "remaining_percent": 45.0, "resets_at": reset_time.isoformat()}],
+        }
+        res = dispatch(self.store, object(), request(title="Exhaust test", preferred_provider="claude"), doc, [h_a, h_b])
+        self.assertEqual("claude-b", res["account_id"])
+        self.assertIn("claude-b", res["quota_summary"])
+
+    # 4. A stale 90%, B fresh 40% -> selects B
+    def test_stale_a_90_fresh_b_40_selects_b(self):
+        doc = self.make_fresh_doc(a_rem=90.0, b_rem=40.0, a_stale=True, b_stale=False)
+        res = dispatch(self.store, object(), request(title="Stale test", preferred_provider="claude"), doc, [])
+        self.assertEqual("claude-b", res["account_id"])
+        self.assertIn("claude-b", res["quota_summary"])
+        self.assertNotIn("90", res["quota_summary"])
+
+    # 5. A remaining=None, B fresh 40% -> selects B
+    def test_unknown_a_fresh_b_selects_b(self):
+        doc = self.make_fresh_doc(a_rem=None, b_rem=40.0, a_conf="unknown", b_conf="official")
+        res = dispatch(self.store, object(), request(title="Unknown test", preferred_provider="claude"), doc, [])
+        self.assertEqual("claude-b", res["account_id"])
+        self.assertIn("claude-b", res["quota_summary"])
+
+    # 6. A forecast insufficient history, but current fresh/reliable -> normal fallback to A (80% vs 20%)
+    def test_insufficient_history_fallback_to_current_quota(self):
+        doc = self.make_fresh_doc(a_rem=80.0, b_rem=20.0)
+        # Empty execution history
+        res = dispatch(self.store, object(), request(title="No history test", preferred_provider="claude"), doc, [])
+        self.assertEqual("claude-a", res["account_id"])
+
+    # 7. A auth unavailable (disabled) -> cannot be selected
+    def test_auth_unavailable_not_selected(self):
+        from manager.claude_account_selector import resolve_claude_account
+        registry = [
+            {"account_id": "claude-a", "enabled": False, "config_dir": None},
+            {"account_id": "claude-b", "enabled": True, "config_dir": r"C:\accounts\b\.claude"},
+        ]
+        doc = self.make_fresh_doc(a_rem=100.0, b_rem=30.0)
+        res = resolve_claude_account(registry, doc)
+        self.assertEqual("claude-b", res["account_id"])
+
+    # 8. Capability mismatch -> quota cannot force selection of incompatible provider
+    def test_capability_mismatch_prevents_quota_override(self):
+        # Implementation task with repo editing -> Codex capability score is high
+        doc = self.make_fresh_doc(a_rem=100.0, b_rem=100.0)
+        req = request(title="Repo edit task", task_type="implementation", needs_repo_edit=True)
+        res = dispatch(self.store, object(), req, doc, [])
+        self.assertEqual("codex", res["recommended_provider"])
+
+    # 9. five_hour suggests consume, but weekly clearly conserve -> weekly protection takes effect
+    def test_five_hour_suggest_consume_weekly_conserve_weekly_protection(self):
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        reset_5h = now + timedelta(hours=1)
+        reset_week = now + timedelta(days=2)
+
+        # Account A: 5h has 80% (resets 1h -> suggest consume), weekly has 20% (burning fast -> conserve)
+        a_extra = [{"name": "seven_day", "remaining_percent": 20.0, "used_percent": 80.0, "resets_at": reset_week.isoformat()}]
+        # Account B: 5h has 50% (normal use), weekly has 60% (healthy)
+        b_extra = [{"name": "seven_day", "remaining_percent": 60.0, "used_percent": 40.0, "resets_at": reset_week.isoformat()}]
+
+        doc = self.make_fresh_doc(a_rem=80.0, b_rem=50.0, a_resets=reset_5h, b_resets=now + timedelta(hours=4),
+                                   a_extra_windows=a_extra, b_extra_windows=b_extra)
+
+        h_a = {
+            "provider": "claude", "account_id": "claude-a", "last_updated": (now - timedelta(hours=1)).isoformat(),
+            "windows": [
+                {"name": "five_hour", "remaining_percent": 90.0, "resets_at": reset_5h.isoformat()},
+                {"name": "seven_day", "remaining_percent": 22.0, "resets_at": reset_week.isoformat()},
+            ],
+        }
+        h_b = {
+            "provider": "claude", "account_id": "claude-b", "last_updated": (now - timedelta(hours=1)).isoformat(),
+            "windows": [
+                {"name": "five_hour", "remaining_percent": 55.0, "resets_at": (now + timedelta(hours=4)).isoformat()},
+                {"name": "seven_day", "remaining_percent": 61.0, "resets_at": reset_week.isoformat()},
+            ],
+        }
+        res = dispatch(self.store, object(), request(title="Multi-window test", preferred_provider="claude"), doc, [h_a, h_b])
+        self.assertEqual("claude-b", res["account_id"])
+
+    # 10. Selected account's quota_evidence cannot reference another account
+    def test_selected_account_quota_evidence_isolated(self):
+        doc = self.make_fresh_doc(a_rem=85.0, b_rem=15.0)
+        res = dispatch(self.store, object(), request(title="Isolation test", preferred_provider="claude"), doc, [])
+        self.assertEqual("claude-a", res["account_id"])
+        evidence = res["quota_evidence"]["claude"]
+        self.assertEqual("claude-a", evidence.get("account_id"))
+        self.assertEqual(85.0, evidence["windows"][0]["remaining_percent"])
+        self.assertNotIn("claude-b", str(evidence))
+
+    # 11. account-a / account-b history completely isolated
+    def test_account_history_isolation(self):
+        from datetime import datetime, timezone, timedelta
+        from manager.quota_forecast import forecast_account
+        now = datetime.now(timezone.utc)
+        reset_time = now + timedelta(hours=4)
+
+        cur_a = {"provider": "claude", "account_id": "claude-a", "confidence": "official", "source_type": "official",
+                 "source": "claude_code_statusline_rate_limits", "last_updated": now.isoformat(),
+                 "windows": [{"name": "five_hour", "remaining_percent": 70.0, "resets_at": reset_time.isoformat()}]}
+        cur_b = {"provider": "claude", "account_id": "claude-b", "confidence": "official", "source_type": "official",
+                 "source": "claude_code_statusline_rate_limits", "last_updated": now.isoformat(),
+                 "windows": [{"name": "five_hour", "remaining_percent": 30.0, "resets_at": reset_time.isoformat()}]}
+
+        # History only has samples for claude-a
+        h_a = {"provider": "claude", "account_id": "claude-a", "last_updated": (now - timedelta(hours=1)).isoformat(),
+               "windows": [{"name": "five_hour", "remaining_percent": 90.0, "resets_at": reset_time.isoformat()}]}
+
+        fc_a = forecast_account(cur_a, history=[h_a], now=now)
+        fc_b = forecast_account(cur_b, history=[h_a], now=now)
+
+        self.assertEqual(2, fc_a.windows[0].burn_rate_samples)
+        self.assertEqual(20.0, fc_a.windows[0].burn_rate_pct_per_hour)
+        # Account B should have 0 history samples used because history was for claude-a!
+        self.assertEqual(1, fc_b.windows[0].burn_rate_samples)
+        self.assertIsNone(fc_b.windows[0].burn_rate_pct_per_hour)
+
+    # 12. Forecast module unavailable / exception -> Dispatcher maintains safe fallback
+    def test_forecast_module_exception_safe_fallback(self):
+        from unittest.mock import patch
+        doc = self.make_fresh_doc(a_rem=80.0, b_rem=20.0)
+        with patch("manager.quota_forecast.forecast_account", side_effect=RuntimeError("forecast math failure")):
+            res = dispatch(self.store, object(), request(title="Exception fallback test", preferred_provider="claude"), doc, [])
+            self.assertIn(res["recommended_provider"], ("claude", "codex"))
+            self.assertIn("quota_evidence", res)
+
+    # 13. P2 regression: ATTENTION + suggest consume must not output RiskStatus.CONSERVE
+    def test_p2_regression_attention_suggest_consume_not_conserve(self):
+        from datetime import datetime, timezone, timedelta
+        from manager.quota_forecast import RiskStatus, ActionRecommendation
+        now = datetime.now(timezone.utc)
+        reset_time = now + timedelta(hours=4)
+        doc = self.make_fresh_doc(a_rem=55.0, b_rem=10.0, a_resets=reset_time)
+        h_a = {
+            "provider": "claude", "account_id": "claude-a", "last_updated": (now - timedelta(hours=1)).isoformat(),
+            "windows": [{"name": "five_hour", "remaining_percent": 65.0, "resets_at": reset_time.isoformat()}],
+        }
+        res = dispatch(self.store, object(), request(title="P2 test", preferred_provider="claude"), doc, [h_a])
+        fc_info = res["quota_evidence"]["claude"].get("forecast", {})
+        self.assertEqual(ActionRecommendation.SUGGEST_CONSUME.value, fc_info.get("overall_action_recommendation"))
+        self.assertEqual(RiskStatus.CONSUME_FASTER.value, fc_info.get("overall_risk_status"))
+        self.assertNotEqual(RiskStatus.CONSERVE.value, fc_info.get("overall_risk_status"))
+
+
 if __name__ == "__main__": unittest.main()

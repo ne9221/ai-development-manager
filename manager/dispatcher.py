@@ -163,25 +163,62 @@ def dispatch(store, service, request, quota_document=None, executions=None):
             # later, against this exact account's config_dir) decides whether
             # the launch can actually proceed.
             selected_quota = unknown_account_summary("claude", EXPECTED_PROVIDERS["claude"], account_id)
+    elif selected == "claude":
+        # Check if multiple named accounts exist in quota["accounts"]
+        named_claude_accounts = [
+            item for item in quota.get("accounts", [])
+            if item.get("provider") == "claude" and item.get("account_id") is not None
+        ]
+        if named_claude_accounts:
+            try:
+                from manager.quota_forecast import forecast_account, score_account_forecast
+                scored = []
+                for acc_item in named_claude_accounts:
+                    fc = forecast_account(acc_item, history=history, now=None)
+                    score = score_account_forecast(fc)
+                    scored.append((score, acc_item, fc))
+                eligible = [c for c in scored if c[0][0]]
+                if eligible:
+                    eligible.sort(key=lambda x: x[0], reverse=True)
+                    best_score, best_item, best_fc = eligible[0]
+                    selected_quota = best_item
+                    account_id = best_item.get("account_id")
+                else:
+                    selected_quota = next((item for item in quota["providers"] if item["provider"] == "claude"), named_claude_accounts[0])
+            except Exception:
+                selected_quota = next((item for item in quota["providers"] if item["provider"] == "claude"), named_claude_accounts[0])
+        else:
+            selected_quota = next(item for item in quota["providers"] if item["provider"] == selected)
     else:
         selected_quota = next(item for item in quota["providers"] if item["provider"] == selected)
-    if selected == "claude" and account_id:
-        # decision["quota_evidence"]["claude"] was computed by decide() from
-        # quota["providers"] (the provider-level legacy representative) --
-        # a different real account's numbers, or stale/None data, depending
-        # on what happens to be the representative. That is exactly the
-        # "borrowed evidence" this account-scoped dispatch must never carry:
-        # replace it with evidence built from the account-scoped
-        # selected_quota resolved above, so the persisted audit trail
-        # (Task/Execution/Command quota_evidence) matches quota_summary and
-        # the warnings, not a different account entirely. historical_estimate
-        # is provider-level (not account-specific quota data), so it is kept.
-        decision["quota_evidence"]["claude"] = {
-            "freshness": selected_quota["freshness"], "source_type": selected_quota["source_type"],
-            "confidence": selected_quota["confidence"], "windows": selected_quota["windows"],
-            "nearest_reset_at": selected_quota["nearest_reset_at"],
-            "historical_estimate": decision["quota_evidence"]["claude"].get("historical_estimate"),
+
+    # Scoped quota and forecast evidence for selected provider/account
+    selected_evidence = {
+        "freshness": selected_quota["freshness"],
+        "source_type": selected_quota["source_type"],
+        "confidence": selected_quota["confidence"],
+        "windows": selected_quota["windows"],
+        "nearest_reset_at": selected_quota["nearest_reset_at"],
+        "historical_estimate": decision["quota_evidence"].get(selected, {}).get("historical_estimate"),
+    }
+    if selected_quota.get("account_id"):
+        selected_evidence["account_id"] = selected_quota["account_id"]
+    try:
+        from manager.quota_forecast import forecast_account, forecast_to_dict
+        fc = forecast_account(selected_quota, history=history, now=None)
+        fc_dict = forecast_to_dict(fc)
+        selected_evidence["forecast"] = {
+            "overall_warning_level": fc_dict.get("overall_warning_level"),
+            "overall_risk_status": fc_dict.get("overall_risk_status"),
+            "overall_action_recommendation": fc_dict.get("overall_action_recommendation"),
+            "overall_warning_reason": fc_dict.get("overall_warning_reason"),
+            "primary_window": fc_dict.get("primary_window"),
+            "dispatchable": fc_dict.get("dispatchable"),
         }
+    except Exception:
+        pass
+    decision["quota_evidence"][selected] = selected_evidence
+
     warnings = [item for item in [decision.get("warning")] if item]
     if request.get("preferred_provider"):
         warnings.append(f"Preferred provider override selected: {selected}")
