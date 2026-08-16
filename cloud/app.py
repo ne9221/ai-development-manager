@@ -11,12 +11,20 @@ import uuid
 from datetime import datetime, timezone
 from wsgiref.simple_server import make_server
 
+from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
+from manager.dispatch_requests import dispatch_request_registry
 from manager.runtime_bridge import redact, runtime_bridge
 from manager.tasks import DriveRecords, TaskError
 
 
 CONTRACT_VERSION = "1.0"
 ALLOWED_INPUTS = {"project_id", "user_request", "task_id", "task_type", "complexity", "preferred_provider", "excluded_provider", "multi_task"}
+DISPATCH_INGRESS_PATH = "/api/v1/tasks/dispatch"
+DISPATCH_INGRESS_ERROR_STATUS = {
+    "malformed_request": "400 Bad Request",
+    "unknown_project": "404 Not Found",
+    "idempotency_backend_unavailable": "503 Service Unavailable",
+}
 logger = logging.getLogger("runtime_bridge_cloud")
 logger.addHandler(logging.StreamHandler())
 logger.setLevel(logging.INFO)
@@ -34,6 +42,17 @@ def default_service_factory():
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
+def default_write_service_factory():
+    import google.auth
+    from googleapiclient.discovery import build
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/drive"])
+    return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def default_lock_registry_factory(project_id, request_id):
+    return dispatch_request_registry(os.environ.get("ADM_LOCK_GCS_BUCKET"), project_id, request_id)
+
+
 def json_response(start_response, status, document, request_id=None):
     raw = json.dumps(redact(document), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     headers = [("Content-Type", "application/json; charset=utf-8"), ("Content-Length", str(len(raw)))]
@@ -47,7 +66,10 @@ def error(code, message, request_id):
     return {"error": {"code": code, "message": message, "request_id": request_id}}
 
 
-def create_app(service_factory=default_service_factory, bridge_func=runtime_bridge):
+def create_app(service_factory=default_service_factory, bridge_func=runtime_bridge,
+                write_service_factory=default_write_service_factory,
+                lock_registry_factory=default_lock_registry_factory,
+                dispatch_ingress_func=handle_dispatch):
     def app(environ, start_response):
         started = time.perf_counter()
         request_id = environ.get("HTTP_X_REQUEST_ID") or uuid.uuid4().hex
@@ -56,7 +78,7 @@ def create_app(service_factory=default_service_factory, bridge_func=runtime_brid
         try:
             if method == "GET" and path == "/health":
                 return json_response(start_response, status, {"status": "ok", "contract_version": CONTRACT_VERSION, "timestamp": iso_now()}, request_id)
-            if method != "POST" or path != "/dispatch":
+            if method != "POST" or path not in ("/dispatch", DISPATCH_INGRESS_PATH):
                 status, category = "404 Not Found", "not_found"
                 return json_response(start_response, status, error(category, "endpoint not found", request_id), request_id)
             expected = os.environ.get("ADM_API_KEY")
@@ -67,6 +89,31 @@ def create_app(service_factory=default_service_factory, bridge_func=runtime_brid
             if not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:], expected):
                 status, category = "401 Unauthorized", "auth_failure"
                 return json_response(start_response, status, error(category, "invalid bearer credential", request_id), request_id)
+            if path == DISPATCH_INGRESS_PATH:
+                try:
+                    length = int(environ.get("CONTENT_LENGTH") or 0)
+                    payload = json.loads(environ["wsgi.input"].read(length).decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    status, category = "400 Bad Request", "malformed_request"
+                    return json_response(start_response, status, error(category, "request body must be valid JSON", request_id), request_id)
+                project_id = payload.get("project_id") if isinstance(payload, dict) else None
+                try:
+                    write_service = write_service_factory()
+                except Exception:
+                    status, category = "503 Service Unavailable", "drive_unavailable"
+                    return json_response(start_response, status, error(category, "runtime data is unavailable", request_id), request_id)
+                try:
+                    result = dispatch_ingress_func(DriveRecords(write_service), write_service, lock_registry_factory, payload)
+                except DispatchIngressError as exc:
+                    status, category = DISPATCH_INGRESS_ERROR_STATUS.get(exc.code, "422 Unprocessable Entity"), exc.code
+                    return json_response(start_response, status, error(exc.code, str(exc), request_id), request_id)
+                except TaskError as exc:
+                    status, category = "422 Unprocessable Entity", "dispatch_ingress_error"
+                    return json_response(start_response, status, error(category, str(exc), request_id), request_id)
+                except Exception:
+                    status, category = "500 Internal Server Error", "dispatch_ingress_exception"
+                    return json_response(start_response, status, error(category, "dispatch ingress failed", request_id), request_id)
+                return json_response(start_response, status, result, request_id)
             try:
                 length = int(environ.get("CONTENT_LENGTH") or 0)
                 payload = json.loads(environ["wsgi.input"].read(length).decode("utf-8"))
