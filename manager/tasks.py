@@ -85,7 +85,7 @@ class DriveRecords:
             query += f" and name='{name}'"
         items, token, seen = [], None, set()
         while True:
-            options = {"q": query, "spaces": "drive", "fields": "nextPageToken,files(id,name,mimeType,parents,modifiedTime)", "pageSize": 100}
+            options = {"q": query, "spaces": "drive", "fields": "nextPageToken,files(id,name,mimeType,parents,modifiedTime,createdTime)", "pageSize": 100}
             if token:
                 options["pageToken"] = token
             response = self.files.list(**options).execute()
@@ -108,7 +108,34 @@ class DriveRecords:
             return matches[0]["id"]
         if not create:
             raise TaskError(f"Drive folder not found: {name}")
-        return self.files.create(body={"name": name, "parents": [parent], "mimeType": MIME_FOLDER}, fields="id").execute()["id"]
+        created_id = self.files.create(body={"name": name, "parents": [parent], "mimeType": MIME_FOLDER}, fields="id").execute()["id"]
+        return self._reconcile_created_folder(parent, name, created_id)
+
+    def _reconcile_created_folder(self, parent, name, created_id):
+        """Resolve a concurrent first-create race for the same (parent, name) folder.
+
+        Two processes can both observe "folder missing" and both create it,
+        leaving two same-named folders. Re-read siblings right after our own
+        create: if we're still the only match, we're done. If a concurrent
+        writer raced us, every racer deterministically picks the same
+        canonical winner (earliest createdTime, id as tiebreak). Whichever
+        racer did not win deletes the empty folder it just created (safe,
+        since only that racer holds its id) and adopts the winner's id, so
+        the race self-heals to one canonical folder without ever touching a
+        folder it doesn't own.
+        """
+        matches = [item for item in self.children(parent, name) if item.get("mimeType") == MIME_FOLDER]
+        if len(matches) == 1:
+            return created_id
+        if not matches or created_id not in {item["id"] for item in matches}:
+            raise TaskError(f"Drive folder vanished during creation: {name}")
+        winner = min(matches, key=lambda item: (item.get("createdTime") or "", item["id"]))
+        if winner["id"] == created_id:
+            return created_id
+        if self.children(created_id):
+            raise TaskError(f"duplicate Drive folder: {name}")
+        self.files.delete(fileId=created_id).execute()
+        return winner["id"]
 
     def project_folder(self, area, project_id, create=True):
         root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS[area], create)

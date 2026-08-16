@@ -1,9 +1,10 @@
 import re
+import threading
 import unittest
 from copy import deepcopy
 from unittest.mock import patch
 
-from manager.tasks import DriveRecords, TaskError, complete_task, create_handoff, create_project, create_task, logical_record_id, record_storage_id, update_task, validate
+from manager.tasks import MIME_FOLDER, ROOT_FOLDER_ID, ROOT_FOLDERS, DriveRecords, TaskError, complete_task, create_handoff, create_project, create_task, logical_record_id, record_storage_id, update_task, validate
 
 
 class MemoryStore:
@@ -22,35 +23,53 @@ class Request:
 
 
 class FakeDriveFiles:
-    def __init__(self): self.items = {}; self.next_id = 1
+    """In-memory fake Drive backend. `on_list`, if set, is invoked with the raw
+    query string right after a list() call has snapshotted its result but
+    before that result is handed back -- used by concurrency tests to pause a
+    caller *after* it has observed "missing" so a second caller can observe
+    the same stale "missing" snapshot, forcing a real TOCTOU interleaving
+    (pausing before the snapshot would let CPython's GIL scheduling resolve
+    the two callers sequentially by luck instead of racing them)."""
+    def __init__(self, on_list=None): self.items = {}; self.next_id = 1; self.lock = threading.Lock(); self.on_list = on_list
     def list(self, q, **_kwargs):
         parent = re.search(r"'([^']+)' in parents", q).group(1)
         name_match = re.search(r" and name='([^']*)'", q)
         name = name_match.group(1) if name_match else None
         def result():
-            values = [deepcopy(item["meta"]) for item in self.items.values() if parent in item["meta"].get("parents", []) and (name is None or item["meta"]["name"] == name)]
+            with self.lock:
+                values = [deepcopy(item["meta"]) for item in self.items.values() if parent in item["meta"].get("parents", []) and (name is None or item["meta"]["name"] == name)]
+            if self.on_list:
+                self.on_list(q)
             return {"files": values}
         return Request(result)
     def create(self, body, media_body=None, **_kwargs):
         def result():
-            file_id = f"file-{self.next_id}"; self.next_id += 1
-            meta = dict(body, id=file_id)
-            raw = media_body.getbytes(0, media_body.size()) if media_body else b""
-            self.items[file_id] = {"meta": meta, "raw": raw}
+            with self.lock:
+                created_seq = self.next_id; self.next_id += 1
+                file_id = f"file-{created_seq:06d}"
+                meta = dict(body, id=file_id, createdTime=f"{created_seq:012d}")
+                raw = media_body.getbytes(0, media_body.size()) if media_body else b""
+                self.items[file_id] = {"meta": meta, "raw": raw}
             return {"id": file_id}
         return Request(result)
     def update(self, fileId, body, media_body, **_kwargs):
         def result():
-            self.items[fileId]["meta"].update(body)
-            self.items[fileId]["raw"] = media_body.getbytes(0, media_body.size())
+            with self.lock:
+                self.items[fileId]["meta"].update(body)
+                self.items[fileId]["raw"] = media_body.getbytes(0, media_body.size())
             return {"id": fileId}
         return Request(result)
     def get_media(self, fileId): return Request(lambda: self.items[fileId]["raw"])
-    def delete(self, fileId): return Request(lambda: self.items.pop(fileId) and {})
+    def delete(self, fileId):
+        def result():
+            with self.lock:
+                self.items.pop(fileId)
+            return {}
+        return Request(result)
 
 
 class FakeDriveService:
-    def __init__(self): self.transport = FakeDriveFiles()
+    def __init__(self, on_list=None): self.transport = FakeDriveFiles(on_list=on_list)
     def files(self): return self.transport
 
 
@@ -183,6 +202,126 @@ class TaskTests(unittest.TestCase):
         store.put("sessions", "project-a", logical_id, {"version": 3})
         self.assertFalse(store.delete("sessions", "project-a", logical_id, expected=token))
         self.assertEqual({"version": 3}, store.get("sessions", "project-a", logical_id))
+
+
+class DriveFolderRaceTests(unittest.TestCase):
+    """Regression coverage for the first-write TOCTOU race on Drive folder
+    creation: two processes both see "folder missing" and both create it,
+    leaving two same-named folders. folder()/project_folder() must resolve
+    every racer to one canonical folder instead."""
+
+    def test_single_writer_first_create_is_normal_path(self):
+        store = DriveRecords(FakeDriveService())
+        folder_id = store.project_folder("sessions", "project-a")
+        self.assertEqual(folder_id, store.project_folder("sessions", "project-a", create=False))
+        root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["sessions"], create=False)
+        self.assertEqual(1, len(store.children(root, "project-a")))
+
+    def test_folder_already_exists_is_reused_not_duplicated(self):
+        store = DriveRecords(FakeDriveService())
+        first = store.project_folder("commands", "project-a")
+        second = store.project_folder("commands", "project-a")
+        self.assertEqual(first, second)
+        root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["commands"], create=False)
+        self.assertEqual(1, len(store.children(root, "project-a")))
+
+    def test_pre_existing_duplicate_folders_still_fail_closed(self):
+        store = DriveRecords(FakeDriveService())
+        root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["sessions"])
+        store.files.create(body={"name": "project-a", "parents": [root], "mimeType": MIME_FOLDER}, fields="id").execute()
+        store.files.create(body={"name": "project-a", "parents": [root], "mimeType": MIME_FOLDER}, fields="id").execute()
+        with self.assertRaisesRegex(TaskError, "duplicate Drive folder"):
+            store.project_folder("sessions", "project-a")
+        with self.assertRaisesRegex(TaskError, "duplicate Drive folder"):
+            store.project_folder("sessions", "project-a", create=False)
+
+    def _race_two_first_creates(self, area, project_id):
+        """Hand-orchestrate the exact TOCTOU interleaving: both racers observe
+        "no folder" before either creates, then both create. Deterministic and
+        reproducible without relying on real thread scheduling."""
+        store = DriveRecords(FakeDriveService())
+        root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS[area])
+        self.assertEqual([], store.children(root, project_id))
+        id_a = store.files.create(body={"name": project_id, "parents": [root], "mimeType": MIME_FOLDER}, fields="id").execute()["id"]
+        id_b = store.files.create(body={"name": project_id, "parents": [root], "mimeType": MIME_FOLDER}, fields="id").execute()["id"]
+        resolved_a = store._reconcile_created_folder(root, project_id, id_a)
+        resolved_b = store._reconcile_created_folder(root, project_id, id_b)
+        return store, root, resolved_a, resolved_b
+
+    def test_two_concurrent_writers_same_project_and_area_resolve_to_one_canonical_folder(self):
+        store, root, resolved_a, resolved_b = self._race_two_first_creates("sessions", "project-a")
+        self.assertEqual(resolved_a, resolved_b)
+        remaining = store.children(root, "project-a")
+        self.assertEqual(1, len(remaining))
+        self.assertEqual(resolved_a, remaining[0]["id"])
+        self.assertEqual(resolved_a, store.project_folder("sessions", "project-a", create=False))
+
+    def test_concurrent_commands_area_resolves_to_one_canonical_folder(self):
+        store, root, resolved_a, resolved_b = self._race_two_first_creates("commands", "project-a")
+        self.assertEqual(resolved_a, resolved_b)
+        self.assertEqual(1, len(store.children(root, "project-a")))
+
+    def test_concurrent_sessions_area_resolves_to_one_canonical_folder(self):
+        store, root, resolved_a, resolved_b = self._race_two_first_creates("sessions", "project-a")
+        self.assertEqual(resolved_a, resolved_b)
+        self.assertEqual(1, len(store.children(root, "project-a")))
+
+    def test_two_concurrent_writers_different_areas_do_not_interfere(self):
+        store = DriveRecords(FakeDriveService())
+        commands_id = store.project_folder("commands", "project-a")
+        sessions_id = store.project_folder("sessions", "project-a")
+        self.assertNotEqual(commands_id, sessions_id)
+        commands_root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["commands"], create=False)
+        sessions_root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["sessions"], create=False)
+        self.assertEqual(1, len(store.children(commands_root, "project-a")))
+        self.assertEqual(1, len(store.children(sessions_root, "project-a")))
+
+    def test_two_concurrent_writers_different_projects_do_not_interfere(self):
+        store = DriveRecords(FakeDriveService())
+        a_id = store.project_folder("sessions", "project-a")
+        b_id = store.project_folder("sessions", "project-b")
+        self.assertNotEqual(a_id, b_id)
+        root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["sessions"], create=False)
+        self.assertEqual(1, len(store.children(root, "project-a")))
+        self.assertEqual(1, len(store.children(root, "project-b")))
+
+    def test_real_threaded_concurrent_first_create_does_not_duplicate_or_fail(self):
+        """Same race as above, but driven by actual OS threads paused at a
+        barrier inside list(), so both really do observe "missing" at the
+        same time -- not just a hand-sequenced simulation."""
+        barrier = threading.Barrier(2, timeout=5)
+        seen = {"n": 0}
+        seen_lock = threading.Lock()
+
+        def on_list(query):
+            if "name='project-a'" not in query:
+                return
+            with seen_lock:
+                seen["n"] += 1
+                should_wait = seen["n"] <= 2
+            if should_wait:
+                barrier.wait()
+
+        store = DriveRecords(FakeDriveService(on_list=on_list))
+        root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["sessions"])
+
+        results, errors = {}, []
+
+        def racer(key):
+            try:
+                results[key] = store.folder(root, "project-a")
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=racer, args=(key,)) for key in ("a", "b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertEqual([], errors)
+        self.assertEqual(results["a"], results["b"])
+        self.assertEqual(1, len(store.children(root, "project-a")))
 
 
 if __name__ == "__main__": unittest.main()
