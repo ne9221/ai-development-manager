@@ -108,6 +108,19 @@ def _summarize_item(provider_id, display_name, item, now, max_age_minutes):
     }
 
 
+def _dedupe_last_wins(candidates):
+    """Collapse duplicate entries that share the same account_id within a
+    single provider's candidate list. Keeps the last (highest document-order)
+    entry per account_id whole -- never blends fields from two records --
+    matching the pre-P0.1 `{item["provider"]: item for item in ...}` dict
+    comprehension's last-wins semantics, extended from one implicit
+    account_id=None key per provider to one key per account_id."""
+    deduped = {}
+    for item in candidates:
+        deduped[item.get("account_id")] = item
+    return list(deduped.values())
+
+
 def _legacy_representative(candidates):
     """Pick the (provider, account_id) entry that stands in for the
     provider-level legacy summary. account_id=None (the pre-P0.1
@@ -137,7 +150,7 @@ def summarize(document, max_age_minutes=60, now=None):
     providers_output = []
     accounts_output = []
     for provider_id, display_name in EXPECTED_PROVIDERS.items():
-        candidates = by_provider.get(provider_id, [])
+        candidates = _dedupe_last_wins(by_provider.get(provider_id, []))
         for item in candidates:
             account_summary = _summarize_item(provider_id, display_name, item, now, max_age_minutes)
             account_summary["account_id"] = item.get("account_id")

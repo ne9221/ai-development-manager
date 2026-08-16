@@ -165,5 +165,121 @@ class MalformedAccountIdDoesNotCrash(unittest.TestCase):
         self.assertEqual(len([a for a in result["accounts"] if a["provider"] == "claude"]), 2)
 
 
+class DuplicateLegacyNoneAccountIsLastWins(unittest.TestCase):
+    """Two account_id=None entries for the same provider (a duplicated
+    legacy record) must resolve exactly like the pre-P0.1
+    `{item["provider"]: item for item in ...}` dict comprehension: the
+    entry that appears LAST in document order wins. This is a deliberate,
+    documented rule -- not a claim of input-order independence."""
+
+    def test_last_document_entry_wins_forward_order(self):
+        result = summarize(doc(claude_item(None, remaining=11), claude_item(None, remaining=99)), now=NOW)
+        claude = next(p for p in result["providers"] if p["provider"] == "claude")
+        self.assertEqual(claude["windows"][0]["remaining_percent"], 99)
+        accounts = [a for a in result["accounts"] if a["provider"] == "claude"]
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0]["windows"][0]["remaining_percent"], 99)
+
+    def test_last_document_entry_wins_reversed_order(self):
+        result = summarize(doc(claude_item(None, remaining=99), claude_item(None, remaining=11)), now=NOW)
+        claude = next(p for p in result["providers"] if p["provider"] == "claude")
+        self.assertEqual(claude["windows"][0]["remaining_percent"], 11)
+        accounts = [a for a in result["accounts"] if a["provider"] == "claude"]
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0]["windows"][0]["remaining_percent"], 11)
+
+
+class DuplicateNamedAccountCollapsesToOne(unittest.TestCase):
+    """Two entries sharing the same named account_id must collapse to a
+    single accounts[] entry -- no duplicate key -- and the surviving
+    entry must be the last one in document order, explicitly (not an
+    input-order-independent merge)."""
+
+    def test_duplicate_named_account_produces_single_entry(self):
+        result = summarize(
+            doc(claude_item("claude-a", remaining=5), claude_item("claude-a", remaining=95)), now=NOW,
+        )
+        matches = [a for a in result["accounts"] if a["provider"] == "claude" and a["account_id"] == "claude-a"]
+        self.assertEqual(len(matches), 1, "duplicate (provider, account_id) key must not appear twice")
+        self.assertEqual(matches[0]["windows"][0]["remaining_percent"], 95)
+
+    def test_duplicate_named_account_last_wins_is_order_sensitive_by_design(self):
+        forward = summarize(doc(claude_item("claude-a", remaining=5), claude_item("claude-a", remaining=95)), now=NOW)
+        backward = summarize(doc(claude_item("claude-a", remaining=95), claude_item("claude-a", remaining=5)), now=NOW)
+        forward_match = find_account(forward, "claude", "claude-a")
+        backward_match = find_account(backward, "claude", "claude-a")
+        # This is intentionally NOT equal: last-wins means the last document
+        # entry is authoritative, so swapping order swaps the winner.
+        self.assertEqual(forward_match["windows"][0]["remaining_percent"], 95)
+        self.assertEqual(backward_match["windows"][0]["remaining_percent"], 5)
+
+
+class DistinctAccountsUnaffectedByDedup(unittest.TestCase):
+    """Two different named accounts (no shared key) must both survive and
+    the resulting account map must be order-independent, since there is
+    no duplicate key to resolve."""
+
+    def test_two_distinct_accounts_both_retained_regardless_of_order(self):
+        forward = summarize(doc(claude_item("A", remaining=70), claude_item("B", remaining=20)), now=NOW)
+        backward = summarize(doc(claude_item("B", remaining=20), claude_item("A", remaining=70)), now=NOW)
+        key = lambda a: (a["provider"], a["account_id"])
+        self.assertEqual(sorted(forward["accounts"], key=key), sorted(backward["accounts"], key=key))
+
+
+class DuplicateDoesNotBlendFields(unittest.TestCase):
+    """A duplicate pair must resolve to exactly one whole source record --
+    never a Frankenstein record with fields mixed from both entries."""
+
+    def test_official_and_unknown_duplicate_does_not_fabricate_quota(self):
+        result = summarize(
+            doc(
+                claude_item("claude-a", remaining=60, confidence="official", source_type="official"),
+                claude_item("claude-a", remaining=None, confidence="unknown", source_type="manual", status="unknown"),
+            ),
+            now=NOW,
+        )
+        matches = [a for a in result["accounts"] if a["provider"] == "claude" and a["account_id"] == "claude-a"]
+        self.assertEqual(len(matches), 1)
+        winner = matches[0]
+        # The last entry (unknown/manual) must win wholesale -- not a mix
+        # of the first entry's "official" confidence with the second's
+        # missing quota, and not the reverse.
+        self.assertEqual(winner["confidence"], "unknown")
+        self.assertEqual(winner["source_type"], "manual")
+        self.assertFalse(winner["source_reliable"])
+        self.assertFalse(winner["has_reliable_quota"])
+
+    def test_stale_and_fresh_duplicate_does_not_concatenate_fields(self):
+        stale_time = NOW.replace(hour=0)
+        result = summarize(
+            doc(
+                claude_item("claude-a", remaining=60, updated=stale_time),
+                claude_item("claude-a", remaining=80, updated=NOW),
+            ),
+            now=NOW,
+        )
+        matches = [a for a in result["accounts"] if a["provider"] == "claude" and a["account_id"] == "claude-a"]
+        self.assertEqual(len(matches), 1)
+        winner = matches[0]
+        self.assertFalse(winner["stale"])
+        self.assertEqual(winner["windows"][0]["remaining_percent"], 80)
+        self.assertEqual(winner["last_updated"], NOW.isoformat())
+
+
+class MissingAccountIdKeyDedupesWithExplicitNone(unittest.TestCase):
+    """An entry with the account_id key entirely absent must be treated as
+    the same logical key as an explicit account_id=None entry, including
+    for duplicate resolution."""
+
+    def test_missing_key_and_explicit_none_collapse_to_one_last_wins(self):
+        with_key = claude_item(None, remaining=11)
+        missing_key = claude_item(None, remaining=99)
+        del missing_key["account_id"]
+        result = summarize(doc(with_key, missing_key), now=NOW)
+        accounts = [a for a in result["accounts"] if a["provider"] == "claude"]
+        self.assertEqual(len(accounts), 1, "missing account_id must dedupe with explicit None, not add a second entry")
+        self.assertEqual(accounts[0]["windows"][0]["remaining_percent"], 99)
+
+
 if __name__ == "__main__":
     unittest.main()
