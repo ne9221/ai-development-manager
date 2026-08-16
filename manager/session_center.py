@@ -70,7 +70,7 @@ dl{display:grid;grid-template-columns:190px 1fr;gap:10px 18px}dt{color:#8fa2b8}d
 const labels={provider:'Provider / AI',project_id:'Project',task_id:'Task ID',execution_id:'Execution ID',provider_session_id:'Provider session ID',cwd:'cwd',branch:'Branch',started_at:'Started at',current_state:'Current state',latest_activity:'Latest activity'};
 async function refresh(){const r=await fetch('/api/session',{cache:'no-store'});const s=await r.json();
  document.querySelector('#summary').innerHTML=`<span class="badge ${s.correlated?'':'bad'}">${s.correlated?'CORRELATED':'UNLINKED'}</span> &nbsp; ${s.current_state}`;
- const root=document.querySelector('#fields');root.replaceChildren();for(const [k,label] of Object.entries(labels)){const dt=document.createElement('dt');dt.textContent=label;const dd=document.createElement('dd');dd.textContent=s[k]??'—';root.append(dt,dd)}}
+ const root=document.querySelector('#fields');root.replaceChildren();for(const [k,label] of Object.entries(labels)){const dt=document.createElement('dt');dt.textContent=label;const dd=document.createElement('dd');dd.textContent=(k==='provider'&&s.account_id)?`${s.provider} · ${s.account_id}`:(s[k]??'—');root.append(dt,dd)}}
 refresh();setInterval(refresh,1000);
 </script></main></body></html>"""
 
@@ -251,6 +251,12 @@ class LiveSession:
     status_source: Callable[[], str | None] | None = field(default=None, repr=False)
     pid: int | None = None
     mode: str | None = None
+    # Threaded straight from the authoritative Execution record's own
+    # account_id (manager/executions.py session_link_fields) -- never
+    # guessed from config_dir, PID, or session title. None for legacy
+    # Executions and for the raw provider-session-id mode, which has no
+    # Execution record to read it from.
+    account_id: str | None = None
     _size: int = field(init=False)
     _latest: float = field(default_factory=time.time, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -292,6 +298,7 @@ class LiveSession:
             "current_state": current_state,
             "latest_activity": utc_iso(latest),
             "correlated": self.correlated,
+            "account_id": self.account_id,
         }
 
 
@@ -321,6 +328,7 @@ class PendingCorrelation:
             "current_state": "correlation_failed" if self.error else "correlating",
             "latest_activity": None,
             "correlated": False,
+            "account_id": None,
         }
 
 
@@ -448,7 +456,7 @@ def _resolve_execution_mode(args: argparse.Namespace, deadline: float) -> LiveSe
                 provider_session_id, meta["session_file"], meta["cwd"], meta["started_at"], execution["project_id"],
                 execution["task_id"], execution["execution_id"], execution["branch"], execution["provider"], args.idle_seconds, True,
                 status_source=drive_status_source(store, execution["project_id"], execution["execution_id"]),
-                pid=meta.get("pid"), mode=execution.get("mode"),
+                pid=meta.get("pid"), mode=execution.get("mode"), account_id=execution.get("account_id"),
             )
         except SessionCenterError as exc:
             last_error = exc
@@ -469,7 +477,7 @@ def _resolve_provider_session_mode(args: argparse.Namespace, deadline: float) ->
                     provider_session_id, meta["session_file"], meta["cwd"], meta["started_at"], execution["project_id"],
                     execution["task_id"], execution["execution_id"], execution["branch"], execution["provider"], args.idle_seconds, True,
                     status_source=file_status_source(args.execution_file, provider_session_id, meta["cwd"]),
-                    pid=meta.get("pid"), mode=execution.get("mode"),
+                    pid=meta.get("pid"), mode=execution.get("mode"), account_id=execution.get("account_id"),
                 )
             return LiveSession(
                 provider_session_id, meta["session_file"], meta["cwd"], meta["started_at"], args.project_id, args.task_id,
