@@ -223,11 +223,13 @@ def acquire_claude_config_lock(config_dir, *, account_id=None, project_id=None, 
     """Acquire exclusive local-machine ownership of one canonicalized Claude
     config directory, or raise :class:`ConfigLockBusyError`.
 
-    Idempotent for the exact same live owning process: a second acquire call
-    from the same (pid, creation_identity) for the same config directory
-    succeeds and returns the existing record unchanged -- this covers a
-    retry inside the same process after a partial failure whose release did
-    not run, without weakening exclusion against any other process.
+    Idempotent for the exact same live owning execution: a second acquire
+    call for the same config directory succeeds and returns the existing
+    record unchanged only when (pid, creation_identity, execution_id) all
+    match the existing record -- this covers a retry of the same execution
+    after a partial failure whose release did not run, without weakening
+    exclusion against a different execution in the same process (e.g. two
+    executions racing inside one long-lived ADM process).
     """
     canonical = canonical_config_dir(config_dir)
     lock_id = config_lock_id(canonical)
@@ -241,7 +243,8 @@ def acquire_claude_config_lock(config_dir, *, account_id=None, project_id=None, 
         if existing is not None:
             status = process_identity_state(existing["pid"], existing["creation_identity"])
             if status == "live":
-                if existing["pid"] == owner_pid and existing["creation_identity"] == owner_identity:
+                if (existing["pid"] == owner_pid and existing["creation_identity"] == owner_identity
+                        and existing.get("execution_id") == execution_id):
                     return dict(existing)
                 raise ConfigLockBusyError(
                     f"Claude config directory is already in use by execution "

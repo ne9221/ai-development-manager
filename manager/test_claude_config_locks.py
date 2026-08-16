@@ -124,6 +124,32 @@ class AcquireReleaseTests(ConfigLockTestCase):
         second = self.acquire()
         self.assertEqual(first, second)
 
+    def test_same_process_different_execution_id_is_busy_not_idempotent(self):
+        # P0.2: same (pid, creation_identity) but a *different* execution_id
+        # must never be treated as the same owner reacquiring -- that would
+        # let a second, unrelated execution inside the same long-lived ADM
+        # process silently reuse the first execution's lock record and go on
+        # to spawn a second Claude child against the same config directory.
+        self.acquire(pid=999920, creation_identity="same-process", execution_id="exec-1")
+        with patch("manager.claude_config_locks.process_identity_state", return_value="live"):
+            with self.assertRaises(ConfigLockBusyError):
+                self.acquire(pid=999920, creation_identity="same-process", execution_id="exec-2")
+
+    def test_same_execution_id_different_creation_identity_is_not_same_owner(self):
+        # A reused pid with a *different* creation_identity (a genuinely
+        # different OS process) must not be mistaken for the same owner just
+        # because a caller happened to pass a matching execution_id.
+        self.acquire(pid=999921, creation_identity="owner-x", execution_id="exec-shared")
+        with patch("manager.claude_config_locks.process_identity_state", return_value="live"):
+            with self.assertRaises(ConfigLockBusyError):
+                self.acquire(pid=999921, creation_identity="owner-y", execution_id="exec-shared")
+
+    def test_different_pid_is_busy(self):
+        self.acquire(pid=999922, creation_identity="owner-a", execution_id="exec-1")
+        with patch("manager.claude_config_locks.process_identity_state", return_value="live"):
+            with self.assertRaises(ConfigLockBusyError):
+                self.acquire(pid=999923, creation_identity="owner-a", execution_id="exec-1")
+
     def test_different_config_dirs_never_contend(self):
         a = self.acquire(config_dir=r"C:\accounts\a\.claude")
         b = self.acquire(config_dir=r"C:\accounts\b\.claude", account_id="account-b", execution_id="exec-b")
@@ -271,6 +297,46 @@ class ConcurrencyRaceTests(ConfigLockTestCase):
 
         self.assertEqual([], errors)
         self.assertEqual(1, len(winners), f"expected exactly one winner, got {winners}")
+        self.assertEqual(7, len(busy))
+
+    def test_same_process_distinct_executions_never_both_win_the_same_config_dir(self):
+        # P0.2 regression at the execution layer: same (pid, creation_identity)
+        # -- i.e. the same ADM manager process -- racing several distinct
+        # execution_ids for the *same* config directory. Before the fix, any
+        # later execution_id would hit the idempotent (pid, creation_identity)
+        # match and be handed the first execution's lock record as if it had
+        # won too, so a second Claude child could be spawned against the same
+        # config directory from within one process. Only the very first
+        # execution_id to land may ever hold the lock; every other
+        # execution_id from the same process must be refused BUSY, never
+        # silently handed the existing record.
+        winners, busy, errors = [], [], []
+        lock = threading.Lock()
+        barrier = threading.Barrier(8)
+        same_pid, same_identity = 999810, "same-manager-process"
+
+        def attempt(i):
+            try:
+                barrier.wait(timeout=5)
+                record = self.acquire(pid=same_pid, creation_identity=same_identity, execution_id=f"exec-{i}")
+                with lock:
+                    winners.append(record["execution_id"])
+            except ConfigLockBusyError:
+                with lock:
+                    busy.append(i)
+            except Exception as exc:  # pragma: no cover - would fail the test below anyway
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(8)]
+        with patch("manager.claude_config_locks.process_identity_state", return_value="live"):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(winners), f"expected exactly one execution_id to win, got {winners}")
         self.assertEqual(7, len(busy))
 
     def test_different_config_dirs_do_not_block_each_other_under_concurrency(self):
