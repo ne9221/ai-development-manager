@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from wsgiref.simple_server import make_server
 
 from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
+from cloud.drive_credentials import user_oauth_write_credentials
 from manager.dispatch_requests import dispatch_request_registry
 from manager.runtime_bridge import redact, runtime_bridge
 from manager.tasks import DriveRecords, TaskError
@@ -44,9 +45,9 @@ def default_service_factory():
 
 
 def default_write_service_factory():
-    import google.auth
     from googleapiclient.discovery import build
-    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/drive"])
+    credentials, source = user_oauth_write_credentials()
+    logger.info(json.dumps({"event": "drive_write_credential", "source": source}, separators=(",", ":")))
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
