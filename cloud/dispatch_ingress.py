@@ -21,6 +21,7 @@ into the created record.
 """
 
 import re
+import time
 
 from manager.dispatch_requests import claim_dispatch_request
 from manager.dispatcher import dispatch as dispatcher_dispatch
@@ -34,6 +35,16 @@ ALLOWED_PRIORITIES = {"low", "normal", "high", "urgent"}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 MAX_TITLE_LENGTH = 300
 MAX_GOAL_LENGTH = 4000
+
+# A claim record alone is never sufficient proof a retry can report success:
+# the original claimant may have died between winning the CAS and finishing
+# the Task/Command write. Before trusting a claim, bounded-retry-verify the
+# canonical Task/Command it points at actually exists -- long enough to
+# tolerate a still-in-flight concurrent winner (its writes are ordinary,
+# non-CAS Drive puts, so a retrying caller must never attempt them itself)
+# without waiting so long the ingress call blocks indefinitely.
+CLAIM_VERIFICATION_ATTEMPTS = 5
+CLAIM_VERIFICATION_DELAY_SECONDS = 0.02
 
 
 class DispatchIngressError(TaskError):
@@ -82,6 +93,57 @@ def validate_dispatch_payload(payload):
     }
 
 
+def _fetch_if_exists(store, area, project_id, name):
+    """None means the record legitimately does not exist yet; any other
+    backend failure still propagates instead of being mistaken for that."""
+    try:
+        return store.get(area, project_id, name)
+    except TaskError as exc:
+        message = str(exc)
+        if "found 0" in message or "not found" in message:
+            return None
+        raise
+
+
+def _resolve_existing_claim(store, project_id, request_id, claim):
+    """The retry path for an already-claimed request_id (`claim["claimed"]
+    is False`). Cases:
+
+    - claim + Task/Command both present and consistent: idempotent replay,
+      return the existing result.
+    - Command not (yet) found after bounded retries: the original claimant
+      may have died before finishing the write, or -- if it is instead a
+      concurrent in-flight winner -- it did not finish within the retry
+      budget. Either way this must not report `accepted: true` for state
+      that cannot be confirmed; fail closed instead. The caller is free to
+      retry the same request_id later: once the real write lands (or is
+      confirmed permanently lost), this resolves deterministically.
+    - Command found but its own identity does not match the claim it was
+      created under (task_id/request_id linkage): fail closed rather than
+      trust a record that could belong to a different, colliding claim.
+    """
+    task_id, command_id = claim["task_id"], claim["command_id"]
+    for attempt in range(CLAIM_VERIFICATION_ATTEMPTS):
+        command = _fetch_if_exists(store, "commands", project_id, command_id)
+        if command is not None:
+            task = _fetch_if_exists(store, "tasks", project_id, task_id)
+            if (task is None or command.get("task_id") != task_id or command.get("request_id") != request_id
+                    or task.get("source_context", {}).get("external_request_id") != request_id):
+                raise DispatchIngressError(
+                    "dispatch_state_inconsistent",
+                    f"claimed request {request_id} resolves to a Task/Command whose identity does not match the claim",
+                )
+            return {"accepted": True, "request_id": request_id, "task_id": task_id,
+                    "command_id": command_id, "status": command.get("status", "queued")}
+        if attempt + 1 < CLAIM_VERIFICATION_ATTEMPTS:
+            time.sleep(CLAIM_VERIFICATION_DELAY_SECONDS)
+    raise DispatchIngressError(
+        "dispatch_incomplete",
+        f"request {request_id} was claimed but its Task/Command was never confirmed created; "
+        "not retryable as success -- retry the same request_id later or investigate the idempotency record",
+    )
+
+
 def handle_dispatch(store, service, lock_registry_factory, payload):
     """Idempotently create a queued Task+Command for one external request and
     return its identity. Never launches a provider.
@@ -106,13 +168,7 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
         raise DispatchIngressError("idempotency_backend_unavailable", "could not establish request idempotency") from exc
 
     if not claim["claimed"]:
-        status = "queued"
-        try:
-            status = store.get("commands", project_id, claim["command_id"]).get("status", status)
-        except TaskError:
-            pass
-        return {"accepted": True, "request_id": request_id, "task_id": claim["task_id"],
-                "command_id": claim["command_id"], "status": status}
+        return _resolve_existing_claim(store, project_id, request_id, claim)
 
     internal_request = {
         "project_id": project_id, "task_id": task_id, "title": clean["title"],
