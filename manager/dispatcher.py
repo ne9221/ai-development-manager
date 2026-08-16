@@ -109,11 +109,25 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
     return clean("\n".join(lines))
 
 
-def dispatch(store, service, request, quota_document=None, executions=None):
+def dispatch(store, service, request, quota_document=None, executions=None, history_store=None):
     request_ok(request)
     project = store.get("projects", request["project_id"], request["project_id"]); validate("project", project)
     quota = summarize(quota_document or read_drive_status(service=service), 60)
     history = executions if executions is not None else list_executions(store, request["project_id"])
+
+    # Resolve quota telemetry history for quota forecasting
+    quota_history = []
+    if executions and any(isinstance(item, dict) and ("windows" in item or "remaining_percent" in item or "observed_at" in item) for item in executions):
+        quota_history = [item for item in executions if isinstance(item, dict)]
+    else:
+        try:
+            if history_store is not None:
+                quota_history = history_store.get_history()
+            else:
+                from manager.quota_history import get_default_quota_history_store
+                quota_history = get_default_quota_history_store().get_history()
+        except Exception:
+            quota_history = []
 
     task = None
     if request.get("task_id"):
@@ -174,7 +188,7 @@ def dispatch(store, service, request, quota_document=None, executions=None):
                 from manager.quota_forecast import forecast_account, score_account_forecast
                 scored = []
                 for acc_item in named_claude_accounts:
-                    fc = forecast_account(acc_item, history=history, now=None)
+                    fc = forecast_account(acc_item, history=quota_history, now=None)
                     score = score_account_forecast(fc)
                     scored.append((score, acc_item, fc))
                 eligible = [c for c in scored if c[0][0]]
@@ -205,7 +219,7 @@ def dispatch(store, service, request, quota_document=None, executions=None):
         selected_evidence["account_id"] = selected_quota["account_id"]
     try:
         from manager.quota_forecast import forecast_account, forecast_to_dict
-        fc = forecast_account(selected_quota, history=history, now=None)
+        fc = forecast_account(selected_quota, history=quota_history, now=None)
         fc_dict = forecast_to_dict(fc)
         selected_evidence["forecast"] = {
             "overall_warning_level": fc_dict.get("overall_warning_level"),

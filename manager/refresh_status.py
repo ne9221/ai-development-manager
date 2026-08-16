@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Refresh automatic quota providers and publish one validated Drive SSOT."""
+"""Single-writer refresh worker that updates runtime and Drive status."""
 
+import argparse
 import json
 import os
 import sys
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,8 +16,7 @@ from collectors.publish_drive import build_service, sync_drive
 from manager.quota_reader import read_drive_status, validate_status
 
 
-ROOT = Path(__file__).parents[1]
-SCHEMA = ROOT / "schema" / "status.schema.json"
+SCHEMA = Path(__file__).parents[1] / "schema" / "status.schema.json"
 
 
 class RefreshError(RuntimeError):
@@ -98,7 +99,7 @@ def write_atomic(path, document):
 
 def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_accounts=None,
             reader=read_drive_status, codex_collector=collect_codex,
-            publisher=sync_drive, validator=validate_status):
+            publisher=sync_drive, validator=validate_status, history_store=None):
     """`claude_path` remains the single/legacy-account payload path (account_id=None),
     unchanged from before. `claude_accounts`, if given, is an additional
     {account_id: path} mapping for extra Claude accounts; each is captured,
@@ -114,6 +115,18 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_a
             log_line(log_path, f"Drive read failure: {type(exc).__name__}")
             raise RefreshError("could not read Drive runtime SSOT") from exc
 
+        # Initialize history store if not explicitly disabled (history_store=False)
+        resolved_history_store = None
+        if history_store is not False:
+            if history_store is not None:
+                resolved_history_store = history_store
+            else:
+                try:
+                    from manager.quota_history import QuotaHistoryStore
+                    resolved_history_store = QuotaHistoryStore(runtime_path.parent / "quota_history.json")
+                except Exception as exc:
+                    log_line(log_path, f"history store init warning: {type(exc).__name__}")
+
         outcomes = {}
         try:
             _, codex_document = codex_collector(timeout=20)
@@ -121,6 +134,12 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_a
             replace_provider(document, codex)
             outcomes["codex"] = "success"
             log_line(log_path, "provider codex success")
+            if resolved_history_store is not None and codex.get("windows"):
+                try:
+                    resolved_history_store.append_snapshot(codex)
+                    log_line(log_path, "quota history codex recorded")
+                except Exception as exc:
+                    log_line(log_path, f"quota history codex warning: {type(exc).__name__}")
         except Exception as exc:
             outcomes["codex"] = "unavailable"
             log_line(log_path, f"provider codex unavailable: {type(exc).__name__}")
@@ -139,6 +158,12 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_a
                     if not existing or claude["last_updated"] > existing.get("last_updated", ""):
                         replace_provider(document, claude)
                         outcomes[outcome_key] = "success"
+                        if resolved_history_store is not None:
+                            try:
+                                resolved_history_store.append_snapshot(claude)
+                                log_line(log_path, f"quota history {outcome_key} recorded")
+                            except Exception as exc:
+                                log_line(log_path, f"quota history {outcome_key} warning: {type(exc).__name__}")
                     else:
                         outcomes[outcome_key] = "unchanged"
                 else:
