@@ -8,9 +8,13 @@ from unittest.mock import patch
 
 from mcp import Client
 
-from manager.mcp_adapter import MAX_REQUEST_LENGTH, MAX_RESPONSE_BYTES, invoke_bridge, server
+from cloud.dispatch_ingress import DispatchIngressError
+from manager.mcp_adapter import MAX_REQUEST_LENGTH, MAX_RESPONSE_BYTES, invoke_bridge, invoke_dispatch, invoke_task_status, server
 from manager.runtime_quota_tool import read_runtime_status
-from manager.tasks import TaskError
+from manager.tasks import DriveRecords, TaskError, create_project, validate
+from manager.test_dispatcher import quota as quota_fixture
+from manager.test_task_claims import MemoryClaimRegistry
+from manager.test_tasks import FakeDriveService
 
 
 def contract(**changes):
@@ -53,8 +57,15 @@ class MCPAdapterTests(unittest.TestCase):
         async def check():
             async with Client(server) as client:
                 tools = (await client.list_tools()).tools
-                self.assertEqual({"adm_dispatch", "adm_status", "adm_runtime_quota_status", "adm_health"}, {item.name for item in tools})
-                self.assertTrue(all(item.annotations.read_only_hint and item.annotations.destructive_hint is False for item in tools))
+                self.assertEqual(
+                    {"adm_dispatch", "adm_status", "adm_runtime_quota_status", "adm_health",
+                     "adm_create_task", "adm_task_status"},
+                    {item.name for item in tools},
+                )
+                self.assertTrue(all(item.annotations.destructive_hint is False for item in tools))
+                write_tools = {"adm_create_task"}
+                for item in tools:
+                    self.assertEqual(item.name not in write_tools, item.annotations.read_only_hint)
                 quota_tool = next(item for item in tools if item.name == "adm_runtime_quota_status")
                 self.assertEqual({"max_age_minutes"}, set(quota_tool.input_schema["properties"]))
                 self.assertEqual(
@@ -196,6 +207,174 @@ class MCPAdapterTests(unittest.TestCase):
             capture_output=True, text=True, check=False,
         )
         self.assertEqual(0, source.returncode, source.stderr)
+
+    def test_no_direct_provider_spawn_from_mcp_adapter(self):
+        """adm_create_task must only ever reach the provider pipeline through
+        the existing Direct Dispatch ingress -- never launch/execution
+        machinery directly, and never accept a caller-chosen provider,
+        account, or execution control."""
+        import manager.mcp_adapter as module
+        with open(module.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        for forbidden in ("execution_runner", "claude_launcher", "codex_launcher", "subprocess.Popen", "os.system"):
+            self.assertNotIn(forbidden, source)
+
+
+class SharedMemoryRegistries:
+    """Mirrors cloud/test_dispatch_ingress.py's double: a fresh wrapper per
+    call, state shared per (project_id, request_id) key."""
+    def __init__(self):
+        self.registries = {}
+
+    def factory(self, project_id, request_id):
+        key = (project_id, request_id)
+        if key not in self.registries:
+            self.registries[key] = MemoryClaimRegistry()
+        return self.registries[key]
+
+
+def project(project_id="p1"):
+    return {"project_id": project_id, "name": "Project One", "repo": "https://github.com/example/project",
+            "default_branch": "main", "runtime_ssot": "Drive", "project_rules": [], "active_tasks": [],
+            "current_phase": "Phase 1", "important_constraints": []}
+
+
+class MCPCreateTaskToolTests(unittest.TestCase):
+    """adm_create_task: the one write surface, restricted to exactly
+    project_id/title/goal/request_id and wired only through
+    cloud.dispatch_ingress.handle_dispatch (Safe Auto-Admission v1)."""
+
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+        create_project(self.store, project())
+        self.registries = SharedMemoryRegistries()
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=quota_fixture())
+        self.quota_patch.start()
+
+    def tearDown(self):
+        self.quota_patch.stop()
+
+    def test_invoke_dispatch_creates_disposable_read_only_task_and_command(self):
+        result = invoke_dispatch(
+            {"project_id": "p1", "title": "Investigate flaky test", "goal": "Read logs, report findings", "request_id": "req-1"},
+            write_service_factory=lambda: self.service, lock_registry_factory=self.registries.factory,
+        )
+        self.assertEqual({"accepted": True, "request_id": "req-1", "task_id": "dispatch-req-1",
+                           "command_id": "dispatch-req-1", "status": "queued"}, result)
+        task = self.store.get("tasks", "p1", "dispatch-req-1")
+        validate("task", task)
+        self.assertTrue(task["read_only"])
+        command = self.store.get("commands", "p1", "dispatch-req-1")
+        validate("command", command)
+        self.assertEqual("direct_dispatch_ingress", command["created_via"])
+
+    def test_invoke_dispatch_is_idempotent_on_replay(self):
+        first = invoke_dispatch({"project_id": "p1", "title": "t", "goal": "g", "request_id": "req-dup"},
+                                write_service_factory=lambda: self.service, lock_registry_factory=self.registries.factory)
+        second = invoke_dispatch({"project_id": "p1", "title": "t", "goal": "g", "request_id": "req-dup"},
+                                 write_service_factory=lambda: self.service, lock_registry_factory=self.registries.factory)
+        self.assertEqual(first["task_id"], second["task_id"])
+
+    def test_dispatch_ingress_error_propagates_with_safe_message(self):
+        with self.assertRaises(DispatchIngressError) as ctx:
+            invoke_dispatch({"project_id": "does-not-exist", "title": "t", "goal": "g", "request_id": "req-2"},
+                            write_service_factory=lambda: self.service, lock_registry_factory=self.registries.factory)
+        self.assertEqual("unknown_project", ctx.exception.code)
+
+    def test_write_service_unavailable_is_sanitized(self):
+        def broken():
+            raise RuntimeError("credential=super-secret")
+        with self.assertRaises(TaskError) as ctx:
+            invoke_dispatch({"project_id": "p1", "title": "t", "goal": "g", "request_id": "req-3"},
+                            write_service_factory=broken, lock_registry_factory=self.registries.factory)
+        self.assertNotIn("super-secret", str(ctx.exception))
+
+    def test_unexpected_dispatch_exception_is_sanitized(self):
+        def broken_dispatch(*_args, **_kwargs):
+            raise RuntimeError("token=hunter2")
+        with self.assertRaises(TaskError) as ctx:
+            invoke_dispatch({"project_id": "p1", "title": "t", "goal": "g", "request_id": "req-4"},
+                            write_service_factory=lambda: self.service, lock_registry_factory=self.registries.factory,
+                            dispatch_func=broken_dispatch)
+        self.assertNotIn("hunter2", str(ctx.exception))
+
+    def test_tool_only_accepts_the_four_narrow_fields(self):
+        """The tool's own function signature is the enforcement point: an
+        MCP client cannot pass provider/account_id/executable/env/etc.
+        through it at all -- extra properties are dropped before they ever
+        reach invoke_dispatch, exactly like adm_runtime_quota_status's
+        unmodeled-property behavior documented in docs/MCP-INTEGRATION.md."""
+        captured = []
+        def fake(payload, **_kwargs):
+            captured.append(payload)
+            return {"accepted": True, "request_id": payload["request_id"], "task_id": "t", "command_id": "c", "status": "queued"}
+        with patch("manager.mcp_adapter.invoke_dispatch", side_effect=fake):
+            result = asyncio.run(tool("adm_create_task", {
+                "project_id": "p1", "title": "t", "goal": "g", "request_id": "req-5",
+                "provider": "claude", "account_id": "acct-1", "executable": "/bin/sh",
+                "env": {"X": "1"}, "config_dir": "/tmp", "working_directory": "/tmp",
+            }))
+        self.assertFalse(result.is_error)
+        self.assertEqual({"project_id", "title", "goal", "request_id"}, set(captured[0]))
+
+    def test_create_task_tool_missing_field_is_error(self):
+        result = asyncio.run(tool("adm_create_task", {"project_id": "p1", "title": "t", "goal": "g"}))
+        self.assertTrue(result.is_error)
+
+
+class MCPTaskStatusToolTests(unittest.TestCase):
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+        create_project(self.store, project())
+        self.registries = SharedMemoryRegistries()
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=quota_fixture())
+        self.quota_patch.start()
+        invoke_dispatch({"project_id": "p1", "title": "t", "goal": "g", "request_id": "req-1"},
+                        write_service_factory=lambda: self.service, lock_registry_factory=self.registries.factory)
+
+    def tearDown(self):
+        self.quota_patch.stop()
+
+    def test_invoke_task_status_resolves_task_and_command_with_bounded_fields(self):
+        result = invoke_task_status("p1", "dispatch-req-1", "dispatch-req-1", service_factory=lambda: self.service)
+        self.assertEqual("queued", result["command"]["status"])
+        self.assertIn("status", result["task"])
+        # No raw source_context (goal/origin/idempotency evidence) leaks through the status surface.
+        self.assertNotIn("source_context", result["task"])
+        self.assertNotIn("quota_evidence", result["task"])
+
+    def test_invoke_task_status_raises_when_neither_found(self):
+        with self.assertRaises(TaskError):
+            invoke_task_status("p1", "no-such-task", "no-such-command", service_factory=lambda: self.service)
+
+    def test_status_tool_resolves_via_request_id_convention(self):
+        captured = []
+        def fake(project_id, task_id, command_id, **_kwargs):
+            captured.append((project_id, task_id, command_id))
+            return {"project_id": project_id, "task_id": task_id, "command_id": command_id, "task": {}, "command": {}}
+        with patch("manager.mcp_adapter.invoke_task_status", side_effect=fake):
+            result = asyncio.run(tool("adm_task_status", {"project_id": "p1", "request_id": "req-1"}))
+        self.assertFalse(result.is_error)
+        self.assertEqual(("p1", "dispatch-req-1", "dispatch-req-1"), captured[0])
+
+    def test_status_tool_explicit_ids_override_request_id_convention(self):
+        captured = []
+        def fake(project_id, task_id, command_id, **_kwargs):
+            captured.append((project_id, task_id, command_id))
+            return {"project_id": project_id, "task_id": task_id, "command_id": command_id, "task": {}, "command": {}}
+        with patch("manager.mcp_adapter.invoke_task_status", side_effect=fake):
+            asyncio.run(tool("adm_task_status", {"project_id": "p1", "request_id": "req-1", "task_id": "manual-t1", "command_id": "manual-c1"}))
+        self.assertEqual(("p1", "manual-t1", "manual-c1"), captured[0])
+
+    def test_status_tool_requires_at_least_one_identity(self):
+        result = asyncio.run(tool("adm_task_status", {"project_id": "p1"}))
+        self.assertTrue(result.is_error)
+
+    def test_status_tool_unknown_identity_is_error_not_empty_success(self):
+        result = asyncio.run(tool("adm_task_status", {"project_id": "p1", "request_id": "never-created"}))
+        self.assertTrue(result.is_error)
 
 
 if __name__ == "__main__": unittest.main()
