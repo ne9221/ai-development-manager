@@ -149,10 +149,39 @@ class DispatcherTests(unittest.TestCase):
         self.assertNotIn("40% remaining", result_a["quota_summary"])
         self.assertTrue(any("stale" in item or "unknown" in item for item in result_a["warnings"]))
 
-    def test_account_id_unknown_fails_closed(self):
-        doc = two_claude_accounts()
-        with self.assertRaises(TaskError):
-            self.dispatch_case(request(title="Missing account", preferred_provider="claude", account_id="claude-does-not-exist"), doc)
+    def test_account_id_unknown_defers_to_auth_preflight(self):
+        """An explicit account_id with no captured per-account quota data must
+        not fail closed at dispatch() -- dispatch() has no way to know whether
+        that account is actually launchable; only ClaudeLauncher's real auth
+        preflight can decide that. The explicit account_id is preserved
+        verbatim (never substituted/dropped), and its quota evidence is a
+        distinct unknown/unavailable entry -- never another account's or the
+        legacy representative's real numbers laundered onto it."""
+        doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
+        result = self.dispatch_case(request(title="Missing account", preferred_provider="claude", account_id="claude-does-not-exist"), doc)
+        self.assertEqual("claude-does-not-exist", result["account_id"])
+        self.assertIn("claude-does-not-exist", result["quota_summary"])
+        self.assertIn("quota unknown", result["quota_summary"])
+        self.assertNotIn("90% remaining", result["quota_summary"])
+        self.assertNotIn("40% remaining", result["quota_summary"])
+        self.assertTrue(any("unknown" in item or "stale" in item for item in result["warnings"]))
+        # quota_evidence is persisted onto the Task/Execution/Command records
+        # (execution_runner.reserve_execution, dispatcher.create_task) as the
+        # durable audit trail -- it must never show another account's real
+        # numbers for an account dispatch() could not itself find data for.
+        claude_evidence = result["quota_evidence"]["claude"]
+        self.assertEqual("unknown", claude_evidence["confidence"])
+        self.assertEqual([], claude_evidence["windows"])
+
+    def test_account_id_matched_quota_evidence_reflects_that_account_not_legacy_representative(self):
+        """Same evidence-integrity property, for the already-matched-account
+        case: quota_evidence must reflect the specific requested account_id's
+        own data, never the provider-level legacy representative's (which can
+        be a different real account's numbers)."""
+        doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
+        result_b = self.dispatch_case(request(title="Account B evidence", preferred_provider="claude", account_id="claude-b"), doc)
+        claude_evidence = result_b["quota_evidence"]["claude"]
+        self.assertEqual(40, claude_evidence["windows"][0]["remaining_percent"])
 
     def test_account_id_lookup_deterministic_when_source_has_duplicate_records(self):
         """Regression for the duplicate-key bug: if two source records
