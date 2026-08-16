@@ -8,6 +8,7 @@ from manager.tasks import DriveRecords, TaskError, create_project, validate
 from manager.test_dispatcher import quota as quota_fixture
 from manager.test_task_claims import MemoryClaimRegistry
 from manager.test_tasks import FakeDriveService
+from manager.trusted_ingress import ADMISSION_VERSION, REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN
 
 
 def project(project_id="p1"):
@@ -18,7 +19,7 @@ def project(project_id="p1"):
 
 def payload(**changes):
     value = {"request_id": "req-1", "project_id": "p1", "title": "Fix the parser", "goal": "Fix the regression in the parser",
-              "priority": "normal", "constraints": {"read_only": False}}
+              "priority": "normal", "constraints": {"read_only": True}}
     value.update(changes)
     return value
 
@@ -61,17 +62,34 @@ class DispatchIngressTests(unittest.TestCase):
         validate("task", task)
         self.assertEqual("Fix the parser", task["title"])
         self.assertEqual("normal", task["priority"])
-        self.assertFalse(task["read_only"])
+        # v1 Safe Auto-Admission: read_only and execution_policies are always
+        # forced server-side, and source_context carries the trusted-ingress
+        # evidence the Command Watcher independently re-verifies.
+        self.assertTrue(task["read_only"])
+        self.assertEqual(sorted(REQUIRED_TASK_POLICIES), sorted(task["execution_policies"]))
         self.assertEqual("Fix the regression in the parser", task["source_context"]["goal"])
+        self.assertEqual(TRUSTED_INGRESS_ORIGIN, task["source_context"]["origin"])
+        self.assertEqual("req-1", task["source_context"]["external_request_id"])
+        self.assertEqual(ADMISSION_VERSION, task["source_context"]["admission_version"])
         command = self.store.get("commands", "p1", "dispatch-req-1")
         validate("command", command)
         self.assertEqual("queued", command["status"])
         self.assertIn(command["provider"], ("codex", "claude", "antigravity", "gemini_app"))
+        self.assertEqual(TRUSTED_INGRESS_ORIGIN, command["created_via"])
+        self.assertEqual(ADMISSION_VERSION, command["admission_version"])
+        self.assertEqual("req-1", command["request_id"])
 
-    def test_read_only_constraint_defaults_false_and_can_be_set_true(self):
-        result = self.call(payload(request_id="req-ro", constraints={"read_only": True}))
+    def test_read_only_constraint_defaults_true_when_omitted(self):
+        result = self.call(payload(request_id="req-ro", constraints={}))
         task = self.store.get("tasks", "p1", result["task_id"])
         self.assertTrue(task["read_only"])
+
+    def test_read_only_false_is_rejected_outright(self):
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-write", constraints={"read_only": False}))
+        self.assertEqual("read_only_required", ctx.exception.code)
+        with self.assertRaises(TaskError):
+            self.store.get("tasks", "p1", "dispatch-req-write")
 
     def test_priority_is_honored(self):
         result = self.call(payload(request_id="req-pri", priority="urgent"))
@@ -167,11 +185,15 @@ class DispatchIngressTests(unittest.TestCase):
         self.assertEqual("idempotency_backend_unavailable", ctx.exception.code)
 
     def test_queued_command_is_recognized_by_command_watcher_and_left_alone(self):
-        """The Command Watcher must recognize the record contract this ingress
-        writes, and -- because no allowlist entry or execution-policy tagging
-        exists for it -- must reject it as not_allowlisted rather than
-        launching anything. This proves the ingress cannot bypass the
-        watcher's existing safety gates."""
+        """The Command Watcher must recognize the record contract this
+        ingress writes, and -- with no static allowlist entry and no
+        ADM_LOCK_GCS_BUCKET configured to corroborate the trusted-ingress
+        evidence (manager.trusted_ingress) -- must reject it as
+        not_allowlisted rather than launching anything. This proves the
+        ingress alone, without the separate idempotency-record cross-check
+        wired up, can never grant itself launch authority. The positive
+        case (evidence + corroborating record both present) is covered in
+        manager/test_command_watcher.py's trusted-ingress admission tests."""
         self.call()
         results = poll_once(self.store, self.service, allowlist=frozenset())
         self.assertEqual(1, len(results))

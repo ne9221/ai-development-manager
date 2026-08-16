@@ -24,6 +24,7 @@ DISPATCH_INGRESS_ERROR_STATUS = {
     "malformed_request": "400 Bad Request",
     "unknown_project": "404 Not Found",
     "idempotency_backend_unavailable": "503 Service Unavailable",
+    "read_only_required": "422 Unprocessable Entity",
 }
 logger = logging.getLogger("runtime_bridge_cloud")
 logger.addHandler(logging.StreamHandler())

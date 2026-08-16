@@ -20,19 +20,14 @@ from manager.quota_reader import read_drive_status, summarize
 from manager.runtime_bridge import all_projects
 from manager.task_claims import check_task_execution_claim, task_claim_registry
 from manager.tasks import DriveRecords, TaskError, now_iso, validate
+from manager.trusted_ingress import REQUIRED_TASK_POLICIES, task_policy_satisfied, verify_trusted_ingress_admission
+from manager.dispatch_requests import dispatch_request_registry
 
 
 POLL_SECONDS = 60
 MAX_POLL_SECONDS = 900
 CLAIM_TIMEOUT_SECONDS = 20 * 60
 MAX_COMMANDS_PER_POLL = 4
-
-# A queued command may only be launched if its (project_id, task_id) is an
-# exact entry in this allowlist AND the live Task still satisfies every one
-# of these policies. Absence of a config (unset env var, missing/unreadable/
-# malformed file) means an empty allowlist -- zero launches -- never "assume
-# permissive because nothing else is queued."
-REQUIRED_TASK_POLICIES = frozenset({"disposable", "read_only", "no_repo_writes", "no_external_writes"})
 
 
 def execution_id(command):
@@ -62,12 +57,7 @@ def load_allowlist(path=None):
     return frozenset(allowed)
 
 
-def _policy_satisfied(task):
-    """Even an allowlisted task must independently prove it is still disposable/read-only."""
-    if task.get("read_only") is not True:
-        return False
-    policies = task.get("execution_policies")
-    return isinstance(policies, list) and REQUIRED_TASK_POLICIES.issubset(set(policies))
+_policy_satisfied = task_policy_satisfied
 
 
 def session_center_healthy(url=None, timeout=2.0):
@@ -324,7 +314,7 @@ def _existing_terminal(store, command):
 
 def process_command(store, service, command, launcher_factory=None, writer_factory=GCSLockRegistry.from_environment,
                     claim_factory=task_claim_registry, allowlist=frozenset(), health_check=session_center_healthy,
-                    quota_check=None):
+                    quota_check=None, ingress_registry_factory=dispatch_request_registry):
     """Claim/reconcile one command; a claimed command is never automatically relaunched.
 
     launcher_factory/quota_check are explicit-override escape hatches (tests
@@ -349,12 +339,21 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         return {"status": "rejected", "reason": "unsupported_provider"}
     launcher_factory = launcher_factory or runtime["launcher_factory"]
     quota_check = quota_check or runtime["quota_check"]
+    admitted_task = None
     if (command["project_id"], command["task_id"]) not in allowlist:
-        # Out of scope, not an anomaly: leave the command untouched (no write)
-        # so unrelated projects/tasks are never mutated by this watcher.
-        return {"status": "rejected", "reason": "not_allowlisted"}
+        # Off the static allowlist is not automatically out of scope: a
+        # command stamped by the authenticated Direct Dispatch ingress can
+        # still be safely auto-admitted under the narrow v1 trusted-ingress
+        # contract (disposable read-only only, evidence cross-checked
+        # against the ingress-only-writable idempotency record -- see
+        # manager.trusted_ingress). Anything that satisfies neither path is
+        # left untouched (no write), same as before.
+        admitted_task = verify_trusted_ingress_admission(
+            store, command, os.environ.get("ADM_LOCK_GCS_BUCKET"), ingress_registry_factory)
+        if admitted_task is None:
+            return {"status": "rejected", "reason": "not_allowlisted"}
     try:
-        candidate_task = store.get("tasks", command["project_id"], command["task_id"])
+        candidate_task = admitted_task or store.get("tasks", command["project_id"], command["task_id"])
         validate("task", candidate_task)
     except TaskError:
         return _attention(store, command, None, "allowlisted_task_missing_or_invalid")

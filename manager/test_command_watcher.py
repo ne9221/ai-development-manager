@@ -674,6 +674,208 @@ class CommandWatcherTests(unittest.TestCase):
         sentinel_launcher.assert_called_once()
 
 
+class TrustedIngressAdmissionTests(unittest.TestCase):
+    """Adversarial coverage for v1 Safe Auto-Admission
+    (manager.trusted_ingress): a disposable read-only Task/Command stamped
+    by the authenticated Direct Dispatch ingress can be launched without a
+    static ADM_WATCHER_ALLOWLIST_PATH entry -- but only when its
+    self-declared evidence is corroborated by the separate,
+    ingress-only-writable dispatch-request idempotency record. Every
+    negative case here must fail exactly the same way an ordinary
+    never-allowlisted command does: {"status": "rejected", "reason":
+    "not_allowlisted"}, no write, no launch."""
+
+    def setUp(self):
+        self.store = Store()
+        create_project(self.store, project())
+        self.registry = MemoryClaimRegistry()
+        self.registry.document = {
+            "schema_version": "0.1.0", "project_id": "p1", "request_id": "req-1",
+            "task_id": "t1", "command_id": "cmd-1", "created_at": now_iso(),
+        }
+        self.registry.generation = 1
+
+    def registry_factory(self, bucket, project_id, request_id):
+        return self.registry
+
+    def admitted_task(self, **overrides):
+        built = create_task(self.store, task(read_only=True), assign=False, persist=False)
+        built["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)
+        built["source_context"] = {
+            "origin": "direct_dispatch_ingress", "external_request_id": "req-1", "admission_version": "v1",
+        }
+        built.update(overrides)
+        self.store.put("tasks", "p1", "t1", built)
+        return built
+
+    @staticmethod
+    def admitted_command(**overrides):
+        value = command(created_via="direct_dispatch_ingress", admission_version="v1", request_id="req-1")
+        value.update(overrides)
+        return value
+
+    def test_trusted_ingress_admitted_task_launches_without_static_allowlist(self):
+        self.admitted_task()
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", runner):
+            result = process_command(
+                self.store, object(), self.admitted_command(), claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), health_check=lambda: True, quota_check=lambda service: True,
+                ingress_registry_factory=self.registry_factory,
+            )
+        runner.assert_called_once()
+        self.assertEqual("completed", result["status"])
+
+    def test_ordinary_untrusted_command_off_allowlist_still_rejected(self):
+        self.admitted_task()  # task itself is fully compliant
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), command(),  # no created_via/admission_version/request_id at all
+                claim_factory=lambda *_: MemoryClaimRegistry(), allowlist=frozenset(),
+                ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
+    def test_caller_read_only_false_task_never_admitted(self):
+        self.admitted_task(read_only=False)
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), self.admitted_command(), claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
+    def test_injected_write_policy_never_admitted(self):
+        self.admitted_task(execution_policies=["disposable", "read_only"])  # missing no_repo_writes/no_external_writes
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), self.admitted_command(), claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
+    def test_forged_created_via_without_any_idempotency_record_never_admitted(self):
+        """A Task/Command manually stamped with the ingress's own evidence
+        fields -- but naming a request_id nobody ever actually claimed
+        through the authenticated ingress -- must not be admitted on the
+        self-declared fields alone."""
+        self.admitted_task()
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), self.admitted_command(request_id="never-claimed"),
+                claim_factory=lambda *_: MemoryClaimRegistry(), allowlist=frozenset(),
+                ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
+    def test_forged_created_via_with_mismatched_idempotency_record_never_admitted(self):
+        """The idempotency record exists (a real, distinct request_id was
+        claimed) but for a different command_id than this Command claims --
+        proving the check cross-references identity, not just presence."""
+        self.admitted_task()
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), self.admitted_command(command_id="cmd-not-the-claimed-one"),
+                claim_factory=lambda *_: MemoryClaimRegistry(), allowlist=frozenset(),
+                ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
+    def test_no_gcs_bucket_configured_fails_closed_even_with_full_evidence(self):
+        self.admitted_task()
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": ""}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), self.admitted_command(), claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
+    def test_wrong_admission_version_never_admitted(self):
+        self.admitted_task()
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), self.admitted_command(admission_version="v2-not-yet-supported"),
+                claim_factory=lambda *_: MemoryClaimRegistry(), allowlist=frozenset(),
+                ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
+    def test_idempotency_backend_error_fails_closed(self):
+        self.admitted_task()
+        self.registry.read_unavailable = True
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), self.admitted_command(), claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
+    def test_static_allowlist_still_bypasses_ingress_check_for_manual_tasks(self):
+        """The trusted-ingress path is additive, not a replacement: a
+        normal, non-ingress task/command on the static allowlist keeps
+        launching exactly as before, with zero ingress evidence and zero
+        idempotency-record lookups."""
+        built = create_task(self.store, task(read_only=True), assign=False, persist=False)
+        built["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)
+        self.store.put("tasks", "p1", "t1", built)
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        with patch("manager.command_watcher.launch_task", runner):
+            result = process_command(
+                self.store, object(), command(), claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset({("p1", "t1")}), health_check=lambda: True, quota_check=lambda service: True,
+            )
+        runner.assert_called_once()
+        self.assertEqual("completed", result["status"])
+
+    def test_duplicate_admitted_command_only_launches_once(self):
+        """The trusted-ingress check only ever runs for a freshly `queued`
+        command; replaying the same admitted command after it has already
+        gone terminal must be reconciled (skipped), never relaunched."""
+        self.admitted_task()
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", runner):
+            first = process_command(
+                self.store, object(), self.admitted_command(), claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), health_check=lambda: True, quota_check=lambda service: True,
+                ingress_registry_factory=self.registry_factory,
+            )
+            stored = self.store.get("commands", "p1", "cmd-1")
+            second = process_command(
+                self.store, object(), stored, claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), health_check=lambda: True, quota_check=lambda service: True,
+                ingress_registry_factory=self.registry_factory,
+            )
+        runner.assert_called_once()
+        self.assertEqual("completed", first["status"])
+        self.assertEqual({"status": "completed", "skipped": True}, second)
+
+
 class WatcherSessionCenterBootstrapIntegrationTests(unittest.TestCase):
     """Reproduces the exact deadlock the reviewer found and proves the fix:
     Session Center used to block its own HTTP bind on wait_for_execution(),

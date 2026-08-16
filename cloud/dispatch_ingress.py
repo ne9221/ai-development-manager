@@ -4,10 +4,20 @@ ADM's existing Task + Command contract.
 This module only ever writes through manager.dispatcher.dispatch() (the
 existing provider/quota decision) and manager.tasks (the existing Drive
 persistence). It never launches a provider process, never calls
-execution_runner/claude_launcher/codex_launcher, and never touches the
-Command Watcher's allowlist or execution-policy gates -- a Command created
-here sits `queued` for that existing, unmodified pipeline to pick up (or
-correctly leave alone) under its own rules.
+execution_runner/claude_launcher/codex_launcher, and never directly grants
+Command Watcher launch authority -- a Command created here sits `queued`
+for that existing, unmodified pipeline to pick up under its own rules.
+
+v1 scope: every request accepted here becomes a disposable, read-only Task
+(REQUIRED_TASK_POLICIES, forced server-side and never taken from the
+caller's payload), stamped with trusted-ingress evidence
+(manager.trusted_ingress) that the Command Watcher independently verifies
+-- including cross-checking against this module's own idempotency record
+-- before it will auto-admit the command without a static allowlist entry.
+A caller cannot request anything else: `constraints.read_only: false` is
+rejected outright, and ALLOWED_FIELDS/ALLOWED_CONSTRAINT_FIELDS make it
+impossible to smuggle execution_policies, account_id, or any other field
+into the created record.
 """
 
 import re
@@ -15,6 +25,7 @@ import re
 from manager.dispatch_requests import claim_dispatch_request
 from manager.dispatcher import dispatch as dispatcher_dispatch
 from manager.tasks import TaskError, now_iso, update_task, validate
+from manager.trusted_ingress import ADMISSION_VERSION, REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN
 
 
 ALLOWED_FIELDS = {"request_id", "project_id", "title", "goal", "priority", "constraints"}
@@ -52,9 +63,19 @@ def validate_dispatch_payload(payload):
     constraints = payload.get("constraints", {})
     if not isinstance(constraints, dict) or set(constraints) - ALLOWED_CONSTRAINT_FIELDS:
         raise DispatchIngressError("malformed_request", "constraints must be an object containing only read_only")
-    read_only = constraints.get("read_only", False)
+    read_only = constraints.get("read_only", True)
     if not isinstance(read_only, bool):
         raise DispatchIngressError("malformed_request", "constraints.read_only must be a boolean")
+    if read_only is not True:
+        # v1 Safe Auto-Admission only ever creates disposable read-only
+        # tasks -- the caller cannot opt out of read_only, not even
+        # explicitly. There is deliberately no server-side override to
+        # true here: a caller that actually wants write access is rejected
+        # outright, not silently downgraded.
+        raise DispatchIngressError(
+            "read_only_required",
+            "direct dispatch ingress v1 only accepts disposable read-only tasks; constraints.read_only must be true or omitted",
+        )
     return {
         "request_id": request_id, "project_id": project_id, "title": title.strip(),
         "goal": goal.strip(), "priority": priority, "read_only": read_only,
@@ -96,10 +117,19 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
     internal_request = {
         "project_id": project_id, "task_id": task_id, "title": clean["title"],
         "task_type": "general", "complexity": "medium",
-        "source_context": {"origin": "direct_dispatch_ingress", "external_request_id": request_id, "goal": clean["goal"]},
+        "source_context": {
+            "origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": request_id,
+            "goal": clean["goal"], "admission_version": ADMISSION_VERSION,
+        },
     }
     result = dispatcher_dispatch(store, service, internal_request)
-    update_task(store, project_id, task_id, priority=clean["priority"], read_only=clean["read_only"])
+    # read_only and execution_policies are forced here, server-side, from
+    # the fixed REQUIRED_TASK_POLICIES set -- never from clean/payload --
+    # so this Task always satisfies the Safe Auto-Admission policy gate
+    # (manager.trusted_ingress.task_policy_satisfied) the Command Watcher
+    # re-checks independently before ever launching it.
+    update_task(store, project_id, task_id, priority=clean["priority"],
+                read_only=True, execution_policies=sorted(REQUIRED_TASK_POLICIES))
 
     command = {
         "command_id": command_id, "project_id": project_id, "task_id": task_id,
@@ -107,6 +137,7 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
         "mode": result["mode"], "effort": result["effort"], "selection_reason": result["selection_reason"],
         "quota_evidence": result["quota_evidence"], "created_at": now_iso(), "status": "queued",
         "execution_id": None, "claimed_at": None, "completed_at": None, "result": None,
+        "created_via": TRUSTED_INGRESS_ORIGIN, "admission_version": ADMISSION_VERSION, "request_id": request_id,
     }
     validate("command", command)
     store.put("commands", project_id, command_id, command)
