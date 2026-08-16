@@ -767,5 +767,152 @@ class LauncherToSessionCenterIntegrationTest(unittest.TestCase):
             self.assertEqual(prepared.pid, live_session.pid)
 
 
+class AccountIdentityTests(unittest.TestCase):
+    """P0.1 Phase 3: Session Center must carry account_id through from the
+    authoritative Execution record instead of dropping it -- the Execution
+    already has it (manager/executions.py session_link_fields), it just
+    never reached LiveSession/snapshot()."""
+
+    def start_server(self, view):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(view))
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, port
+
+    def get(self, port, path):
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as response:
+            return response.status, json.loads(response.read())
+
+    def _resolve_with_record(self, record, provider="claude", agents_response=None):
+        args = bootstrap_args(
+            execution_project_id="adm", execution_id=record["execution_id"], wait_seconds=5.0, provider=provider,
+        )
+
+        class Store:
+            def get(self, *_a):
+                return record
+
+        if provider == "claude":
+            with patch("manager.session_center.shutil.which", return_value="claude.exe"), \
+                 patch("manager.session_center.subprocess.run",
+                       return_value=SimpleNamespace(returncode=0, stdout=json.dumps(agents_response), stderr="")), \
+                 patch("manager.tasks.build_service", return_value=object()), \
+                 patch("manager.tasks.DriveRecords", return_value=Store()):
+                return resolve_session(args, time.monotonic() + 5.0)
+        with patch("manager.tasks.build_service", return_value=object()), \
+             patch("manager.tasks.DriveRecords", return_value=Store()):
+            return resolve_session(args, time.monotonic() + 5.0)
+
+    def test_execution_account_id_claude_a_is_carried_into_session_view(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            uuid_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            record = {
+                "provider": "claude", "project_id": "adm", "task_id": "task-1", "execution_id": "run-acct-a",
+                "provider_session_id": uuid_a, "account_id": "claude-a",
+                "task_snapshot": {"working_directory": cwd, "branch": "main"},
+            }
+            agents = [{"pid": 1, "cwd": cwd, "sessionId": uuid_a, "startedAt": 1000000, "kind": "background", "name": "n"}]
+            live_session = self._resolve_with_record(record, agents_response=agents)
+            self.assertEqual("claude-a", live_session.account_id)
+            self.assertEqual("claude-a", live_session.snapshot()["account_id"])
+
+    def test_execution_account_id_claude_b_is_independent_and_correct(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            uuid_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            record = {
+                "provider": "claude", "project_id": "adm", "task_id": "task-1", "execution_id": "run-acct-b",
+                "provider_session_id": uuid_b, "account_id": "claude-b",
+                "task_snapshot": {"working_directory": cwd, "branch": "main"},
+            }
+            agents = [{"pid": 2, "cwd": cwd, "sessionId": uuid_b, "startedAt": 1000000, "kind": "background", "name": "n"}]
+            live_session = self._resolve_with_record(record, agents_response=agents)
+            self.assertEqual("claude-b", live_session.account_id)
+            self.assertNotEqual("claude-a", live_session.account_id)
+            self.assertTrue(live_session.correlated)
+            self.assertEqual(uuid_b, live_session.provider_session_id)
+
+    def test_legacy_execution_without_account_id_field_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as codex_home, tempfile.TemporaryDirectory() as cwd:
+            sessions_dir = Path(codex_home) / "sessions"
+            sessions_dir.mkdir()
+            session_path = sessions_dir / "rollout-provider-legacy.jsonl"
+            session_path.write_text(json.dumps({
+                "timestamp": "2026-08-14T09:31:49.290Z", "type": "session_meta",
+                "payload": {"id": "provider-legacy", "cwd": cwd},
+            }) + "\n", encoding="utf-8")
+            # No "account_id" key at all -- pre-P0.1 legacy Execution shape.
+            record = {
+                "provider": "codex", "project_id": "adm", "task_id": "task-1", "execution_id": "run-legacy",
+                "provider_session_id": "provider-legacy", "task_snapshot": {"working_directory": cwd, "branch": "main"},
+            }
+            with patch.dict("os.environ", {"CODEX_HOME": codex_home}):
+                live_session = self._resolve_with_record(record, provider="codex")
+            self.assertIsNone(live_session.account_id)
+            snapshot = live_session.snapshot()
+            self.assertIsNone(snapshot["account_id"])
+            self.assertTrue(live_session.correlated)
+
+    def test_codex_provider_without_account_id_behavior_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as codex_home, tempfile.TemporaryDirectory() as cwd:
+            sessions_dir = Path(codex_home) / "sessions"
+            sessions_dir.mkdir()
+            session_path = sessions_dir / "rollout-provider-codex.jsonl"
+            session_path.write_text(json.dumps({
+                "timestamp": "2026-08-14T09:31:49.290Z", "type": "session_meta",
+                "payload": {"id": "provider-codex", "cwd": cwd},
+            }) + "\n", encoding="utf-8")
+            record = {
+                "provider": "codex", "project_id": "adm", "task_id": "task-1", "execution_id": "run-codex-acct",
+                "provider_session_id": "provider-codex", "account_id": None,
+                "task_snapshot": {"working_directory": cwd, "branch": "main"},
+            }
+            with patch.dict("os.environ", {"CODEX_HOME": codex_home}):
+                live_session = self._resolve_with_record(record, provider="codex")
+            self.assertIsNone(live_session.account_id)
+            self.assertEqual("codex", live_session.provider)
+            self.assertTrue(live_session.correlated)
+
+    def test_account_id_does_not_participate_in_execution_correlation_matching(self):
+        """Two distinct executions with different account_id but otherwise
+        colliding provider_session_id/cwd/branch must still correlate purely
+        on (project_id, execution_id, provider_session_id) -- account_id is
+        carried, never consulted, by the matching logic."""
+        with tempfile.TemporaryDirectory() as cwd:
+            uuid_x = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+            record = {
+                "provider": "claude", "project_id": "adm", "task_id": "task-1", "execution_id": "run-acct-c",
+                "provider_session_id": uuid_x, "account_id": "claude-c",
+                "task_snapshot": {"working_directory": cwd, "branch": "main"},
+            }
+            agents = [{"pid": 3, "cwd": cwd, "sessionId": uuid_x, "startedAt": 1000000, "kind": "background", "name": "n"}]
+            live_session = self._resolve_with_record(record, agents_response=agents)
+            self.assertEqual(uuid_x, live_session.provider_session_id)
+            self.assertEqual("run-acct-c", live_session.execution_id)
+            self.assertTrue(live_session.correlated)
+            self.assertEqual("claude-c", live_session.account_id)
+
+    def test_api_session_endpoint_exposes_account_id(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            uuid_a = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+            record = {
+                "provider": "claude", "project_id": "adm", "task_id": "task-1", "execution_id": "run-acct-http",
+                "provider_session_id": uuid_a, "account_id": "claude-a",
+                "task_snapshot": {"working_directory": cwd, "branch": "main"},
+            }
+            agents = [{"pid": 5, "cwd": cwd, "sessionId": uuid_a, "startedAt": 1000000, "kind": "background", "name": "n"}]
+            live_session = self._resolve_with_record(record, agents_response=agents)
+            args = bootstrap_args(execution_project_id="adm", execution_id="run-acct-http", provider="claude")
+            view = SessionView(build_pending(args))
+            view.resolve(live_session)
+            server, port = self.start_server(view)
+            try:
+                status, body = self.get(port, "/api/session")
+                self.assertEqual(200, status)
+                self.assertEqual("claude-a", body["account_id"])
+            finally:
+                server.shutdown(); server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()
