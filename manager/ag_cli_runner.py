@@ -370,9 +370,18 @@ class AgCliProcess:
         if not stdout:
             self._closed = True
             return
-        for line in iter(stdout.readline, ""):
-            if not line:
+        while True:
+            try:
+                line = stdout.readline()
+            except Exception:
                 break
+            if not line or not isinstance(line, (str, bytes)):
+                break
+            if isinstance(line, bytes):
+                try:
+                    line = line.decode("utf-8", errors="replace")
+                except Exception:
+                    break
             line_str = line.strip()
             if not line_str:
                 continue
@@ -398,9 +407,18 @@ class AgCliProcess:
         stderr = self.process.stderr
         if not stderr:
             return
-        for line in iter(stderr.readline, ""):
-            if not line:
+        while True:
+            try:
+                line = stderr.readline()
+            except Exception:
                 break
+            if not line or not isinstance(line, (str, bytes)):
+                break
+            if isinstance(line, bytes):
+                try:
+                    line = line.decode("utf-8", errors="replace")
+                except Exception:
+                    break
             line_str = line.strip()
             if line_str:
                 self._stderr_lines.append(line_str)
