@@ -3,7 +3,8 @@
 import json
 import subprocess
 import unittest
-from unittest.mock import MagicMock, patch
+from pathlib import Path
+from unittest.mock import MagicMock, mock_open, patch
 
 from manager.ag_headless_runner import (
     AgHeadlessProcess,
@@ -16,32 +17,29 @@ from manager.ag_runner import AgLaunchError, LaunchRequest
 
 
 class TestAgHeadlessRunner(unittest.TestCase):
-    @patch("pathlib.Path.is_dir")
-    @patch("pathlib.Path.is_file")
-    def test_verify_auth_identity_success_with_local_profile(self, mock_is_file, mock_is_dir):
-        mock_is_dir.return_value = True
-        mock_is_file.return_value = False
+    @patch("manager.ag_cli_runner._cli_auth_status_check", return_value=False)
+    @patch("pathlib.Path.is_file", return_value=True)
+    @patch("pathlib.Path.open", new_callable=mock_open, read_data=json.dumps({"access_token": "ya29.fake-token"}))
+    def test_verify_auth_identity_success_with_parsed_credential_token(self, mock_file_open, mock_is_file, mock_cli_check):
         identity = verify_auth_identity()
         self.assertEqual(identity, "local_google_account_profile")
 
     @patch.dict("os.environ", {}, clear=True)
-    @patch("pathlib.Path.is_dir")
-    @patch("pathlib.Path.is_file")
-    def test_verify_auth_identity_fail_closed_when_unproven(self, mock_is_file, mock_is_dir):
-        mock_is_dir.return_value = False
-        mock_is_file.return_value = False
+    @patch("manager.ag_cli_runner._cli_auth_status_check", return_value=False)
+    @patch("pathlib.Path.is_dir", return_value=False)
+    @patch("pathlib.Path.is_file", return_value=False)
+    def test_verify_auth_identity_fail_closed_when_unproven(self, mock_is_file, mock_is_dir, mock_cli_check):
         with self.assertRaises(AgLaunchError) as ctx:
             verify_auth_identity()
         self.assertEqual(ctx.exception.classification, "unverified_identity")
         self.assertIn("Fail closed", ctx.exception.detail)
 
     @patch.dict("os.environ", {"GOOGLE_API_KEY": "AIzaSyFakeKeyThirdParty"}, clear=True)
-    @patch("pathlib.Path.is_dir")
-    @patch("pathlib.Path.is_file")
-    def test_verify_auth_identity_fails_closed_when_api_key_provided_without_profile(self, mock_is_file, mock_is_dir):
+    @patch("manager.ag_cli_runner._cli_auth_status_check", return_value=False)
+    @patch("pathlib.Path.is_dir", return_value=False)
+    @patch("pathlib.Path.is_file", return_value=False)
+    def test_verify_auth_identity_fails_closed_when_api_key_provided_without_profile(self, mock_is_file, mock_is_dir, mock_cli_check):
         # GOOGLE_API_KEY is not proof of local profile; without local config it must fail closed
-        mock_is_dir.return_value = False
-        mock_is_file.return_value = False
         with self.assertRaises(AgLaunchError) as ctx:
             verify_auth_identity()
         self.assertEqual(ctx.exception.classification, "unverified_identity")
@@ -54,9 +52,15 @@ class TestAgHeadlessRunner(unittest.TestCase):
             "GEMINI_API_KEY": "secret-gemini-key",
             "VERTEX_PROJECT": "my-vertex-proj",
             "GOOGLE_CLOUD_PROJECT": "gcp-proj",
+            "GCLOUD_PROJECT": "gcp-proj-legacy",
             "GCP_PROJECT": "gcp-proj-2",
+            "GOOGLE_CLOUD_LOCATION": "us-central1",
             "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/sa.json",
             "GOOGLE_GENAI_USE_VERTEXAI": "1",
+            "VERTEXAI_PROJECT": "vertex-proj",
+            "VERTEXAI_LOCATION": "us-central1",
+            "CLOUDSDK_CORE_PROJECT": "cloudsdk-proj",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": "fake-access-token",
             "CUSTOM_VAR": "keep-me",
         }
         clean_env = sanitize_ag_environment(dirty_env)
@@ -64,9 +68,16 @@ class TestAgHeadlessRunner(unittest.TestCase):
         self.assertNotIn("GEMINI_API_KEY", clean_env)
         self.assertNotIn("VERTEX_PROJECT", clean_env)
         self.assertNotIn("GOOGLE_CLOUD_PROJECT", clean_env)
+        self.assertNotIn("GCLOUD_PROJECT", clean_env)
         self.assertNotIn("GCP_PROJECT", clean_env)
-        self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", clean_env)
+        self.assertNotIn("GOOGLE_CLOUD_LOCATION", clean_env)
         self.assertNotIn("GOOGLE_GENAI_USE_VERTEXAI", clean_env)
+        self.assertNotIn("VERTEXAI_PROJECT", clean_env)
+        self.assertNotIn("VERTEXAI_LOCATION", clean_env)
+        self.assertNotIn("CLOUDSDK_CORE_PROJECT", clean_env)
+        self.assertNotIn("CLOUDSDK_AUTH_ACCESS_TOKEN", clean_env)
+        self.assertNotEqual(clean_env["GOOGLE_APPLICATION_CREDENTIALS"], "/path/to/sa.json")
+        self.assertFalse(Path(clean_env["GOOGLE_APPLICATION_CREDENTIALS"]).exists())
         self.assertEqual(clean_env["CUSTOM_VAR"], "keep-me")
         self.assertEqual(clean_env["PATH"], "/bin:/usr/bin")
 

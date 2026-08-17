@@ -25,6 +25,7 @@ from manager.ag_runner import (
     LaunchOutcome,
     LaunchRequest,
     PreparedLaunch,
+    ROUTE_LIVE_IDE_IPC,
     RunningLaunch,
     normalize_event,
     utc_now,
@@ -174,6 +175,8 @@ class AgIdeBridge:
             process_creation_identity=f"live-pid-{pid}",
             prepared_at=now,
             mode="live_ide",
+            route_used=ROUTE_LIVE_IDE_IPC,
+            actual_runner="AgIdeBridge",
             _target=client,
             _request=request,
         )

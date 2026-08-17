@@ -17,6 +17,23 @@ MAX_TIMEOUT_SECONDS = 300.0
 MAX_TURN_TIMEOUT_SECONDS = 7200.0
 MAX_ERROR_CHARS = 1000
 
+# Route identity constants (execution evidence attribution). These are
+# distinct concepts and must never be collapsed into one another:
+#  - AG_OFFICIAL_CLI: a verified standalone `agy` executable only.
+#  - AG_LIVE_IDE_IPC: the live Antigravity IDE / Language Server IPC bridge.
+#  - GEMINI_CLI_FALLBACK: agentapi, the bundled language_server+agentapi
+#    combo, or the generic `gemini` CLI -- legitimate fallback tooling, but
+#    never the verified official CLI.
+ROUTE_OFFICIAL_CLI = "AG_OFFICIAL_CLI"
+ROUTE_LIVE_IDE_IPC = "AG_LIVE_IDE_IPC"
+ROUTE_GEMINI_CLI_FALLBACK = "GEMINI_CLI_FALLBACK"
+
+MODE_TO_ROUTE = {
+    "cli": ROUTE_OFFICIAL_CLI,
+    "headless": ROUTE_GEMINI_CLI_FALLBACK,
+    "live_ide": ROUTE_LIVE_IDE_IPC,
+}
+
 
 class AgLaunchError(RuntimeError):
     """Bounded Antigravity provider launch failure."""
@@ -54,6 +71,14 @@ class PreparedLaunch:
     _target: Any = field(repr=False)
     _request: LaunchRequest = field(repr=False)
     _started: bool = field(default=False, repr=False)
+    # Execution evidence: which route/runner actually served this launch, and
+    # whether a fallback transition occurred getting here. Never left
+    # defaulted-but-misleading -- callers that build PreparedLaunch directly
+    # are expected to set route_used/actual_runner explicitly.
+    route_used: str = ""
+    actual_runner: str = ""
+    fallback_occurred: bool = False
+    fallback_reason: str | None = None
 
 
 @dataclass
@@ -193,9 +218,15 @@ class AgRunner:
             return self._cli_runner
         if self._headless_runner is not None:
             return self._headless_runner
-        return self._get_cli_runner()
+        # Default auto-mode fallback after Live IDE is the permissive
+        # GEMINI_CLI_FALLBACK route (headless), never the strict
+        # AG_OFFICIAL_CLI-only resolver -- explicit force_mode="cli" is the
+        # only way to require a verified standalone `agy`.
+        return self._get_headless_runner()
 
     def prepare(self, request: LaunchRequest) -> PreparedLaunch:
+        self.last_fallback_reason = None
+
         if request.force_mode == "cli":
             return self._get_cli_runner().prepare(request)
         if request.force_mode == "headless":
@@ -220,7 +251,14 @@ class AgRunner:
         else:
             self.last_fallback_reason = "live_ide_not_found"
 
-        return self._get_fallback_runner().prepare(request)
+        prepared = self._get_fallback_runner().prepare(request)
+        if self.last_fallback_reason:
+            # A fallback transition happened getting here -- record it so
+            # evidence never shows AG_OFFICIAL_CLI/AG_LIVE_IDE_IPC for a
+            # launch that actually fell back.
+            prepared.fallback_occurred = True
+            prepared.fallback_reason = self.last_fallback_reason
+        return prepared
 
     def start(self, prepared: PreparedLaunch, prompt: str) -> RunningLaunch:
         if prepared.mode == "live_ide":
