@@ -367,12 +367,103 @@ class ClaudeSessionAdapter(SessionAdapter):
         )
 
 
+def default_antigravity_sessions_root():
+    return Path.home() / ".gemini" / "antigravity-ide" / "brain"
+
+
+class AntigravitySessionAdapter(SessionAdapter):
+    """Read Antigravity IDE brain transcript JSONL sessions without altering files."""
+
+    provider = "antigravity"
+
+    def discover_raw_sessions(self, source_root=None):
+        root = Path(source_root or default_antigravity_sessions_root())
+        if not root.is_dir():
+            return ()
+        return ({"path": path, "source_root": root} for path in sorted(root.rglob("*.jsonl")))
+
+    def parse_raw_session(self, raw_session):
+        path, root = Path(raw_session["path"]), raw_session["source_root"]
+        # Extract session_id from parent or grandparent dir
+        session_id = path.parent.name
+        if session_id == "logs" and path.parent.parent.name == ".system_generated":
+            session_id = path.parent.parent.parent.name
+        elif session_id == ".system_generated":
+            session_id = path.parent.parent.name
+
+        cwd = model = title = summary = parent_session_id = first_prompt = identity_header = None
+        timestamps, messages, repository_urls = [], 0, []
+        for item in _json_lines(path):
+            timestamp = _safe_timestamp(item.get("timestamp") or item.get("created_at") or item.get("time"))
+            if timestamp:
+                timestamps.append(timestamp)
+            if item.get("type") in ("USER_INPUT", "PLANNER_RESPONSE", "user", "assistant", "message"):
+                messages += 1
+                content = item.get("content")
+                text = _text_content(content) if isinstance(content, (str, list)) else None
+                if text and first_prompt is None and item.get("type") in ("USER_INPUT", "user"):
+                    first_prompt = text
+                if text and identity_header is None and item.get("type") in ("USER_INPUT", "user"):
+                    identity_header = parse_identity_header(text)
+                if text:
+                    repository_urls.extend(extract_repository_urls(text))
+            if model is None and isinstance(item.get("model"), str):
+                model = item["model"]
+
+        if not session_id or session_id.startswith("."):
+            return None
+        try:
+            source_identifier = path.relative_to(root).as_posix()
+        except ValueError:
+            source_identifier = str(path)
+        return {
+            "provider_session_id": session_id, "source_identifier": source_identifier,
+            "source_path": str(path), "working_directory": cwd,
+            "started_at": min(timestamps) if timestamps else None,
+            "updated_at": max(timestamps) if timestamps else None,
+            "model": model, "status": "unknown", "parent_session_id": parent_session_id,
+            "title": title or session_id, "summary": summary, "message_count": messages,
+            "first_user_prompt": first_prompt[:SHORT_PROMPT_LIMIT] if first_prompt else None,
+            "_identity_header": identity_header,
+            "_repository_urls": list(dict.fromkeys(repository_urls)),
+            "content_hash": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    def normalize(self, parsed_session):
+        provider_session_id = parsed_session["provider_session_id"]
+        return CanonicalSession(
+            session_id=manager_session_key(self.provider, provider_session_id),
+            provider=self.provider, provider_session_id=provider_session_id,
+            project_id=None, task_id=None,
+            source_identifier=parsed_session.get("source_identifier"), source_path=parsed_session.get("source_path"),
+            working_directory=parsed_session.get("working_directory"),
+            started_at=parsed_session.get("started_at"), updated_at=parsed_session.get("updated_at"),
+            model=parsed_session.get("model"), status=parsed_session.get("status"),
+            parent_session_id=parsed_session.get("parent_session_id"), title=parsed_session.get("title"),
+            summary=parsed_session.get("summary"), usage_ref=None, resume_ref=None,
+            classification_method="unclassified", mapping_source=None, classification_confidence=None,
+            classification_status="needs_review", content_hash=parsed_session.get("content_hash"),
+            conversation_label=parsed_session.get("title"), repository=None,
+            message_count=parsed_session.get("message_count"), first_user_prompt=parsed_session.get("first_user_prompt"),
+            identity_header=parsed_session.get("_identity_header"), repository_urls=parsed_session.get("_repository_urls"),
+        )
+
+
 def discover_claude_sessions(sessions_root=None):
     return ClaudeSessionAdapter().discover(sessions_root)
 
 
+def discover_antigravity_sessions(sessions_root=None):
+    return AntigravitySessionAdapter().discover(sessions_root)
+
+
 def session_adapter(provider):
-    adapters = {"codex": CodexSessionAdapter, "claude": ClaudeSessionAdapter}
+    adapters = {
+        "codex": CodexSessionAdapter,
+        "claude": ClaudeSessionAdapter,
+        "antigravity": AntigravitySessionAdapter,
+        "gemini": AntigravitySessionAdapter,
+    }
     try:
         return adapters[provider]()
     except KeyError as exc:
