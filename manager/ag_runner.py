@@ -1,7 +1,7 @@
-"""Unified Antigravity Runner facade and event normalizer.
+"""Antigravity direct dispatch execution facade and event models.
 
-This module provides the shared interface, normalized event models, and high-level router
-for Antigravity execution (dispatching between Live IDE Bridge and Headless Runner).
+This module provides normalized event translation, outcome dataclasses, and the AgRunner
+facade which automatically negotiates between Live IDE, Official CLI, and Headless execution.
 It does not contain IDE-specific IPC or low-level subprocess transport implementations.
 """
 
@@ -40,7 +40,7 @@ class LaunchRequest:
     approval_policy: str | None = "plan"
     timeout_seconds: float = 30.0
     turn_timeout_seconds: float = 30.0
-    force_mode: str | None = None  # None (auto hybrid), "live_ide", or "headless"
+    force_mode: str | None = None  # None (auto hybrid), "live_ide", "cli", or "headless"
 
 
 @dataclass
@@ -50,7 +50,7 @@ class PreparedLaunch:
     pid: int
     process_creation_identity: str
     prepared_at: str
-    mode: str  # "live_ide" or "headless"
+    mode: str  # "live_ide", "cli", or "headless"
     _target: Any = field(repr=False)
     _request: LaunchRequest = field(repr=False)
     _started: bool = field(default=False, repr=False)
@@ -140,16 +140,34 @@ def normalize_event(raw_event: dict[str, Any]) -> AgNormalizedEvent:
                 "code": raw_event.get("code"),
             },
         )
+    # Check for structured dictionary output: {"error": "..."} or {"response": "..."}
+    if "error" in raw_event and raw_event["error"]:
+        return AgNormalizedEvent(
+            event_type="error",
+            payload={
+                "error": raw_event["error"],
+                "code": raw_event.get("code") or "provider_error",
+            },
+        )
+    if "response" in raw_event:
+        return AgNormalizedEvent(
+            event_type="result",
+            payload={
+                "response": raw_event["response"],
+                "stats": raw_event.get("stats") or {},
+            },
+        )
     # Default fallback
     return AgNormalizedEvent(event_type="message", payload={"content": str(raw_event)})
 
 
 class AgRunner:
-    """Facade and router for Antigravity live and headless execution."""
+    """Facade and router for Antigravity live, CLI, and headless execution."""
 
-    def __init__(self, ide_bridge: Any = None, headless_runner: Any = None):
+    def __init__(self, ide_bridge: Any = None, headless_runner: Any = None, cli_runner: Any = None):
         self._ide_bridge = ide_bridge
         self._headless_runner = headless_runner
+        self._cli_runner = cli_runner
         self.last_fallback_reason: str | None = None
 
     def _get_ide_bridge(self):
@@ -158,13 +176,28 @@ class AgRunner:
             self._ide_bridge = AgIdeBridge()
         return self._ide_bridge
 
+    def _get_cli_runner(self):
+        if self._cli_runner is None:
+            from manager.ag_cli_runner import OfficialAgCliRunner
+            self._cli_runner = OfficialAgCliRunner()
+        return self._cli_runner
+
     def _get_headless_runner(self):
         if self._headless_runner is None:
             from manager.ag_headless_runner import AgHeadlessRunner
             self._headless_runner = AgHeadlessRunner()
         return self._headless_runner
 
+    def _get_fallback_runner(self):
+        if self._cli_runner is not None:
+            return self._cli_runner
+        if self._headless_runner is not None:
+            return self._headless_runner
+        return self._get_cli_runner()
+
     def prepare(self, request: LaunchRequest) -> PreparedLaunch:
+        if request.force_mode == "cli":
+            return self._get_cli_runner().prepare(request)
         if request.force_mode == "headless":
             return self._get_headless_runner().prepare(request)
         if request.force_mode == "live_ide":
@@ -181,35 +214,44 @@ class AgRunner:
             except AgLaunchError as exc:
                 if exc.classification in ("live_ide_transport_unavailable", "live_ide_not_found"):
                     self.last_fallback_reason = exc.classification
-                    # Observable fallback to headless
+                    # Observable fallback to CLI / headless runner
                 else:
-                    # Non-transport errors (auth, critical failure) must NOT be swallowed
                     raise
         else:
             self.last_fallback_reason = "live_ide_not_found"
 
-        # Fallback to headless runner (which enforces strict fail-closed auth verification)
-        return self._get_headless_runner().prepare(request)
+        return self._get_fallback_runner().prepare(request)
 
     def start(self, prepared: PreparedLaunch, prompt: str) -> RunningLaunch:
         if prepared.mode == "live_ide":
             return self._get_ide_bridge().start(prepared, prompt)
+        if prepared.mode == "cli":
+            return self._get_cli_runner().start(prepared, prompt)
         return self._get_headless_runner().start(prepared, prompt)
 
     def set_heartbeat(self, running: RunningLaunch, callback: Callable[[str], Any]) -> None:
         running._heartbeat = callback
-        target = self._get_ide_bridge() if running.prepared.mode == "live_ide" else self._get_headless_runner()
+        if running.prepared.mode == "live_ide":
+            target = self._get_ide_bridge()
+        elif running.prepared.mode == "cli":
+            target = self._get_cli_runner()
+        else:
+            target = self._get_headless_runner()
         if hasattr(target, "set_heartbeat"):
             target.set_heartbeat(running, callback)
 
     def wait(self, running: RunningLaunch) -> LaunchOutcome:
         if running.prepared.mode == "live_ide":
             return self._get_ide_bridge().wait(running)
+        if running.prepared.mode == "cli":
+            return self._get_cli_runner().wait(running)
         return self._get_headless_runner().wait(running)
 
     def close(self, target: Any) -> None:
         prepared = getattr(target, "prepared", target)
         if prepared and getattr(prepared, "mode", None) == "live_ide":
             self._get_ide_bridge().close(prepared)
+        elif prepared and getattr(prepared, "mode", None) == "cli":
+            self._get_cli_runner().close(prepared)
         elif prepared:
             self._get_headless_runner().close(prepared)
