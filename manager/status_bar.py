@@ -24,20 +24,70 @@ from manager.tasks import DriveRecords
 
 UNKNOWN = "UNKNOWN"
 
+# Matches the staleness threshold executions.py (STALE_AFTER_SECONDS) and
+# dashboard_core.py already use for the identical "is this execution still
+# actually alive" question -- not a new, independently-invented constant.
+# Always pass explicitly where the caller cares; this is only the default.
+DEFAULT_ACTIVE_EVIDENCE_MAX_AGE_SECONDS = 15 * 60
+
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def _authoritative_status(execution):
-    """UNKNOWN with no execution evidence at all; otherwise reuses Session
-    Center's fail-closed terminal/cleanup rule so a terminal execution whose
+def _parse_timestamp(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _active_evidence_at(execution):
+    """The most recent timestamp that actually names live/current activity,
+    or None if there isn't one. Deliberately narrower than
+    _last_trustworthy_evidence(): reserved_at/started_at/completed_at, a
+    record merely existing, and process/PID liveness are all excluded on
+    purpose -- none of them prove the run is still doing anything *now*,
+    only that it once began, once ended, or that some process is alive
+    (which is not the same claim). Only heartbeat_at and
+    progress_updated_at qualify. A malformed timestamp is treated the same
+    as a missing one -- it is not evidence."""
+    parsed = [_parse_timestamp(execution.get("heartbeat_at")), _parse_timestamp(execution.get("progress_updated_at"))]
+    valid = [value for value in parsed if value is not None]
+    return max(valid) if valid else None
+
+
+def _authoritative_status(execution, now=None, active_evidence_max_age_seconds=DEFAULT_ACTIVE_EVIDENCE_MAX_AGE_SECONDS):
+    """UNKNOWN with no execution evidence at all; reuses Session Center's
+    fail-closed terminal/cleanup rule so a terminal execution whose
     cleanup_evidence still shows a retained task claim or writer lease never
-    displays as fully completed -- it degrades to "finishing" instead."""
+    displays as fully completed -- it degrades to "finishing" instead.
+
+    A "running" record additionally requires trustworthy active evidence
+    (see _active_evidence_at): a status field alone -- however old the
+    record, however fresh its reserved_at/started_at, however alive its
+    process -- is never sufficient proof the run is still active. No
+    evidence, stale evidence, or unparseable evidence all fail closed to
+    UNKNOWN rather than defaulting to a guessed "running"."""
     if not isinstance(execution, dict):
         return UNKNOWN
     state = _authoritative_state(execution)
-    return state if isinstance(state, str) else UNKNOWN
+    if not isinstance(state, str):
+        return UNKNOWN
+    if state != "running":
+        return state
+    evidence_at = _active_evidence_at(execution)
+    if evidence_at is None:
+        return UNKNOWN
+    age_seconds = ((now or datetime.now(timezone.utc)) - evidence_at).total_seconds()
+    if age_seconds < 0 or age_seconds > active_evidence_max_age_seconds:
+        return UNKNOWN
+    return "running"
 
 
 def _last_trustworthy_evidence(execution):
@@ -154,7 +204,8 @@ def _drive_sync_status(read_error):
 
 
 def build_snapshot(execution=None, task=None, quota_document=None, github_repo_dir=None,
-                    drive_error=None, quota_max_age_minutes=60, now=None, git_runner=subprocess.run):
+                    drive_error=None, quota_max_age_minutes=60, now=None, git_runner=subprocess.run,
+                    active_evidence_max_age_seconds=DEFAULT_ACTIVE_EVIDENCE_MAX_AGE_SECONDS):
     """Pure aside from the injected git_runner call: assembles a display
     snapshot from already-fetched evidence and never mutates anything it is
     given."""
@@ -172,7 +223,7 @@ def build_snapshot(execution=None, task=None, quota_document=None, github_repo_d
         "task_id": task_id or UNKNOWN,
         "session_id": session_id or UNKNOWN,
         "execution_id": execution_id or UNKNOWN,
-        "status": _authoritative_status(execution),
+        "status": _authoritative_status(execution, now, active_evidence_max_age_seconds),
         "last_trustworthy_evidence": _last_trustworthy_evidence(execution),
         "quota": _quota_projection(quota_document, provider, now, quota_max_age_minutes),
         "blocker": _blocker(task),
@@ -210,7 +261,8 @@ def fetch_quota_document(service):
 
 
 def fetch_snapshot(store, service, project_id=None, execution_id=None, task_id=None,
-                    github_repo_dir=None, quota_max_age_minutes=60, git_runner=subprocess.run):
+                    github_repo_dir=None, quota_max_age_minutes=60, git_runner=subprocess.run,
+                    active_evidence_max_age_seconds=DEFAULT_ACTIVE_EVIDENCE_MAX_AGE_SECONDS, now=None):
     """Read-only end-to-end build: reads Drive live, never writes, and never
     raises -- any read failure surfaces as drive_sync.state=='unreachable'
     plus the affected fields falling back to UNKNOWN/null."""
@@ -222,6 +274,7 @@ def fetch_snapshot(store, service, project_id=None, execution_id=None, task_id=N
         execution=execution, task=task, quota_document=quota_document,
         github_repo_dir=github_repo_dir, drive_error=drive_error,
         quota_max_age_minutes=quota_max_age_minutes, git_runner=git_runner,
+        active_evidence_max_age_seconds=active_evidence_max_age_seconds, now=now,
     )
 
 
@@ -232,6 +285,7 @@ def parser():
     result.add_argument("--task-id")
     result.add_argument("--repo-dir", help="Local git working tree to report GitHub sync state for")
     result.add_argument("--quota-max-age-minutes", type=float, default=60)
+    result.add_argument("--active-evidence-max-age-seconds", type=float, default=DEFAULT_ACTIVE_EVIDENCE_MAX_AGE_SECONDS)
     return result
 
 
@@ -247,6 +301,7 @@ def main():
     snapshot = fetch_snapshot(
         store, service, args.project_id, args.execution_id, args.task_id,
         args.repo_dir, args.quota_max_age_minutes,
+        active_evidence_max_age_seconds=args.active_evidence_max_age_seconds,
     )
     print(json.dumps(snapshot, indent=2))
     return 0

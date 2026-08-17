@@ -123,6 +123,57 @@ class StatusFieldTests(unittest.TestCase):
         self.assertEqual({"source": None, "at": None}, build_snapshot(execution=None, now=NOW)["last_trustworthy_evidence"])
 
 
+class RunningRequiresActiveEvidenceTests(unittest.TestCase):
+    """AG SB-1.1: status='running' alone must never surface as RUNNING.
+    Only a fresh heartbeat_at/progress_updated_at counts as active evidence;
+    reserved_at/started_at/completed_at, record existence, and PID liveness
+    do not. The freshness threshold is passed explicitly and fixed here --
+    never the code's only allowed value (see test_threshold_is_injectable)."""
+
+    MAX_AGE = 900  # arbitrary fixed value for these tests, not a hardcoded architectural constant
+
+    def test_running_with_stale_heartbeat_is_unknown(self):
+        record = execution("running", heartbeat_at="2026-08-17T11:00:00.000000Z", progress_updated_at=None)
+        self.assertEqual(UNKNOWN, build_snapshot(execution=record, now=NOW, active_evidence_max_age_seconds=self.MAX_AGE)["status"])
+
+    def test_running_with_no_heartbeat_or_progress_is_unknown(self):
+        record = execution("running", heartbeat_at=None, progress_updated_at=None)
+        self.assertEqual(UNKNOWN, build_snapshot(execution=record, now=NOW, active_evidence_max_age_seconds=self.MAX_AGE)["status"])
+
+    def test_running_with_only_fresh_started_at_is_unknown(self):
+        record = execution("running", started_at="2026-08-17T11:59:00.000000Z", heartbeat_at=None, progress_updated_at=None)
+        self.assertEqual(UNKNOWN, build_snapshot(execution=record, now=NOW, active_evidence_max_age_seconds=self.MAX_AGE)["status"])
+
+    def test_running_with_only_fresh_reserved_at_is_unknown(self):
+        record = execution("running", heartbeat_at=None, progress_updated_at=None, reserved_at="2026-08-17T11:59:30.000000Z")
+        self.assertEqual(UNKNOWN, build_snapshot(execution=record, now=NOW, active_evidence_max_age_seconds=self.MAX_AGE)["status"])
+
+    def test_running_with_fresh_heartbeat_is_running(self):
+        record = execution("running", heartbeat_at="2026-08-17T11:59:00.000000Z", progress_updated_at=None)
+        self.assertEqual("running", build_snapshot(execution=record, now=NOW, active_evidence_max_age_seconds=self.MAX_AGE)["status"])
+
+    def test_running_with_fresh_progress_updated_at_is_running(self):
+        record = execution("running", heartbeat_at=None, progress_updated_at="2026-08-17T11:58:00.000000Z")
+        self.assertEqual("running", build_snapshot(execution=record, now=NOW, active_evidence_max_age_seconds=self.MAX_AGE)["status"])
+
+    def test_running_with_malformed_timestamps_is_unknown(self):
+        record = execution("running", heartbeat_at="not-a-timestamp", progress_updated_at="2026/08/17")
+        self.assertEqual(UNKNOWN, build_snapshot(execution=record, now=NOW, active_evidence_max_age_seconds=self.MAX_AGE)["status"])
+
+    def test_running_with_future_dated_evidence_is_unknown(self):
+        record = execution("running", heartbeat_at="2026-08-17T13:00:00.000000Z", progress_updated_at=None)
+        self.assertEqual(UNKNOWN, build_snapshot(execution=record, now=NOW, active_evidence_max_age_seconds=self.MAX_AGE)["status"])
+
+    def test_terminal_with_retained_cleanup_is_still_finishing_not_gated_by_active_evidence(self):
+        record = execution("completed", cleanup_evidence={"task_claim_release": "retained", "writer_release": "released"}, heartbeat_at=None, progress_updated_at=None)
+        self.assertEqual("finishing", build_snapshot(execution=record, now=NOW, active_evidence_max_age_seconds=self.MAX_AGE)["status"])
+
+    def test_threshold_is_injectable_not_hardcoded(self):
+        record = execution("running", heartbeat_at="2026-08-17T11:55:00.000000Z", progress_updated_at=None)  # 5 minutes old
+        self.assertEqual(UNKNOWN, build_snapshot(execution=record, now=NOW, active_evidence_max_age_seconds=240)["status"])
+        self.assertEqual("running", build_snapshot(execution=record, now=NOW, active_evidence_max_age_seconds=360)["status"])
+
+
 class QuotaProjectionTests(unittest.TestCase):
     def test_no_quota_document_returns_null_remaining(self):
         snapshot = build_snapshot(execution=execution(), quota_document=None, now=NOW)
@@ -216,7 +267,7 @@ class ReadOnlyContractTests(unittest.TestCase):
             ("executions", "p1", "e1"): execution(),
             ("tasks", "p1", "t1"): {"status": "ready", "blocked_reason": None},
         })
-        snapshot = fetch_snapshot(store, FakeService(error=RuntimeError("no quota configured")), "p1", "e1", "t1")
+        snapshot = fetch_snapshot(store, FakeService(error=RuntimeError("no quota configured")), "p1", "e1", "t1", now=NOW)
         self.assertEqual("running", snapshot["status"])  # would raise via FakeStore.put/delete if ever called
 
     def test_fetch_snapshot_never_calls_a_write_method_on_failure_paths(self):
