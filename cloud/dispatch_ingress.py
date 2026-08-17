@@ -1,4 +1,4 @@
-"""Thin authenticated ingress: turn an external high-level task request into
+﻿"""Thin authenticated ingress: turn an external high-level task request into
 ADM's existing Task + Command contract.
 
 This module only ever writes through manager.dispatcher.dispatch() (the
@@ -189,7 +189,8 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
 
     command = {
         "command_id": command_id, "project_id": project_id, "task_id": task_id,
-        "provider": result["provider"], "model": result["model"], "fallback_model": result["fallback_model"],
+        "provider": result["provider"], "account_id": result.get("account_id"),
+        "model": result["model"], "fallback_model": result["fallback_model"],
         "mode": result["mode"], "effort": result["effort"], "selection_reason": result["selection_reason"],
         "quota_evidence": result["quota_evidence"], "created_at": now_iso(), "status": "queued",
         "execution_id": None, "claimed_at": None, "completed_at": None, "result": None,
@@ -198,3 +199,4 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
     validate("command", command)
     store.put("commands", project_id, command_id, command)
     return {"accepted": True, "request_id": request_id, "task_id": task_id, "command_id": command_id, "status": "queued"}
+

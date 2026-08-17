@@ -1,12 +1,15 @@
+import os
 import threading
 import unittest
-from unittest.mock import patch
+from datetime import datetime, timedelta, timezone
+from unittest.mock import Mock, patch
 
 from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
-from manager.command_watcher import poll_once
+from manager.command_watcher import poll_once, process_command
 from manager.dispatch_requests import claim_dispatch_request
 from manager.dispatcher import dispatch as dispatcher_dispatch
 from manager.tasks import DriveRecords, TaskError, create_project, now_iso, update_task, validate
+from manager.test_command_watcher import CommandWatcherTests
 from manager.test_dispatcher import quota as quota_fixture
 from manager.test_task_claims import MemoryClaimRegistry
 from manager.test_tasks import FakeDriveService
@@ -277,6 +280,88 @@ class DispatchIngressTests(unittest.TestCase):
         self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, results[0])
         command = self.store.get("commands", "p1", "dispatch-req-1")
         self.assertEqual("queued", command["status"])
+
+
+class DirectDispatchClaudeAccountIdentityTests(unittest.TestCase):
+    """M0: manager.dispatcher.dispatch() already resolves a specific
+    account_id when it auto-selects among named Claude accounts by quota
+    forecast, and manager.command_watcher already treats a command's own
+    account_id as launch authority (bypassing the fail-closed automatic-quota
+    gate for Claude, per P0.0). The only missing wire was this ingress
+    dropping that resolved account_id on the floor when it persisted the
+    Command record -- silently forcing every Direct Dispatch Claude command
+    onto the auto-selection path, which is unconditionally rejected as
+    quota_unreliable. Without this, provider=claude could never actually
+    launch through Direct Dispatch."""
+
+    REGISTRY = [
+        {"account_id": "claude-a", "enabled": True, "config_dir": r"C:\accounts\a\.claude"},
+        {"account_id": "claude-b", "enabled": True, "config_dir": r"C:\accounts\b\.claude"},
+    ]
+
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+        create_project(self.store, project())
+        self.registries = SharedMemoryRegistries()
+        fresh = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        reset_soon = (datetime.now(timezone.utc) + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def claude_account(account_id, remaining):
+            return {"provider": "claude", "account_id": account_id, "display_name": "claude",
+                     "collection_mode": "automatic", "source": "test", "source_type": "official",
+                     "confidence": "official", "last_updated": fresh, "status": "ok",
+                     "windows": [{"name": "primary", "remaining_percent": remaining, "used_percent": 100 - remaining, "resets_at": reset_soon}]}
+
+        doc = {
+            "schema_version": "0.1.0", "generated_at": fresh,
+            "providers": [
+                claude_account("claude-a", 90), claude_account("claude-b", 40),
+                {"provider": "codex", "display_name": "codex", "collection_mode": "automatic",
+                 "source": "test", "source_type": "official", "confidence": "official", "last_updated": fresh,
+                 "status": "ok", "windows": [{"name": "primary", "remaining_percent": 5, "used_percent": 95, "resets_at": None}]},
+            ],
+        }
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=doc)
+        self.quota_patch.start()
+
+    def tearDown(self):
+        self.quota_patch.stop()
+
+    def call(self, body=None):
+        return handle_dispatch(self.store, self.service, self.registries.factory, body if body is not None else payload())
+
+    def test_dispatcher_selected_claude_account_id_survives_onto_command(self):
+        result = self.call(payload(request_id="req-acct"))
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual("claude", command["provider"])
+        self.assertEqual("claude-a", command["account_id"])
+
+    def test_command_account_id_lets_command_watcher_bypass_auto_quota_gate(self):
+        """Proves the account_id isn't just stored but actually usable: the
+        Command Watcher must route this command through the explicit-account
+        launch path (which requires no reliable aggregate quota signal) and
+        must launch it with the exact account_id the dispatcher chose --
+        never falling back to the auto-selection quota gate that would
+        otherwise reject every Claude command from this ingress."""
+        result = self.call(payload(request_id="req-acct2"))
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual("claude-a", command["account_id"])
+        runner = Mock(return_value=CommandWatcherTests.complete("exec-1"))
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher._claude_account_registry", return_value=self.REGISTRY), \
+             patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}):
+            outcome = process_command(
+                self.store, self.service, command, claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), health_check=lambda: True,
+                quota_check=lambda service: False,  # auto-selection gate would reject; must never be consulted
+                ingress_registry_factory=lambda bucket, project_id, request_id: self.registries.factory(project_id, request_id),
+            )
+        runner.assert_called_once()
+        _, kwargs = runner.call_args
+        self.assertEqual("claude-a", kwargs.get("account_id"))
+        self.assertEqual("completed", outcome["status"])
 
 
 if __name__ == "__main__":
