@@ -1,0 +1,339 @@
+"""Adversarial regression tests for the AG official CLI remediation
+(session ag-official-cli-remediation-r1-20260817): billing isolation,
+auth false-positive, route authenticity, silent fallback, Windows
+invocation/lifecycle, and false-COMPLETED normalization.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, mock_open, patch
+
+from manager.ag_cli_runner import (
+    AgCliProcess,
+    OfficialAgCliRunner,
+    resolve_ag_cli_executable,
+    resolve_ag_official_cli_executable,
+    sanitize_ag_environment,
+    verify_auth_identity,
+)
+from manager.ag_headless_runner import AgHeadlessRunner
+from manager.ag_ide_bridge import AgIdeBridge
+from manager.ag_runner import (
+    AgLaunchError,
+    AgRunner,
+    LaunchRequest,
+    ROUTE_GEMINI_CLI_FALLBACK,
+    ROUTE_LIVE_IDE_IPC,
+    ROUTE_OFFICIAL_CLI,
+)
+
+
+class TestAdvAuthEmptyDirectoryFailsClosed(unittest.TestCase):
+    @patch("manager.ag_cli_runner._cli_auth_status_check", return_value=False)
+    @patch("pathlib.Path.is_dir", return_value=True)
+    @patch("pathlib.Path.is_file", return_value=False)
+    def test_adv_auth_empty_directory_fails_closed(self, mock_is_file, mock_is_dir, mock_cli_check):
+        """~/.gemini/config, antigravity-ide, etc. existing as bare (empty)
+        directories -- with no parseable credential file and no verified CLI
+        auth-status -- must not be accepted as identity proof."""
+        with self.assertRaises(AgLaunchError) as ctx:
+            verify_auth_identity()
+        self.assertEqual(ctx.exception.classification, "unverified_identity")
+
+    @patch("manager.ag_cli_runner._cli_auth_status_check", return_value=False)
+    @patch("pathlib.Path.is_file", return_value=True)
+    @patch("pathlib.Path.open", new_callable=mock_open, read_data="{}")
+    def test_adv_auth_credential_file_without_token_fields_fails_closed(self, mock_open_call, mock_is_file, mock_cli_check):
+        """A credential file that exists but has no real token field is not
+        proof either -- only presence, not content, would be the old bug."""
+        with self.assertRaises(AgLaunchError) as ctx:
+            verify_auth_identity()
+        self.assertEqual(ctx.exception.classification, "unverified_identity")
+
+
+class TestAdvBillingAdcOverrideAndGcpVars(unittest.TestCase):
+    def test_adv_billing_adc_override_and_gcp_vars(self):
+        dirty_env = {
+            "GOOGLE_CLOUD_PROJECT": "leak-proj",
+            "GCLOUD_PROJECT": "leak-proj-legacy",
+            "CLOUDSDK_CORE_PROJECT": "leak-cloudsdk-proj",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": "leak-token",
+            "VERTEXAI_PROJECT": "leak-vertex-proj",
+            "VERTEXAI_LOCATION": "us-central1",
+            "GOOGLE_GENAI_USE_VERTEXAI": "true",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/real/service-account.json",
+        }
+        clean_env = sanitize_ag_environment(dirty_env)
+        for var in (
+            "GOOGLE_CLOUD_PROJECT",
+            "GCLOUD_PROJECT",
+            "CLOUDSDK_CORE_PROJECT",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
+            "VERTEXAI_PROJECT",
+            "VERTEXAI_LOCATION",
+            "GOOGLE_GENAI_USE_VERTEXAI",
+        ):
+            self.assertNotIn(var, clean_env, f"{var} must be stripped from the child environment")
+
+        # GOOGLE_APPLICATION_CREDENTIALS must be overridden to a
+        # provably-nonexistent path (verified against the installed
+        # google-auth library: an explicit env var pointing at a missing
+        # file raises DefaultCredentialsError immediately in
+        # google.auth.default(), rather than falling through to gcloud SDK
+        # cached credentials or the GCE metadata server).
+        self.assertIn("GOOGLE_APPLICATION_CREDENTIALS", clean_env)
+        self.assertNotEqual(clean_env["GOOGLE_APPLICATION_CREDENTIALS"], "/real/service-account.json")
+        adc_path = clean_env["GOOGLE_APPLICATION_CREDENTIALS"]
+        self.assertFalse(os.path.exists(adc_path))
+
+        import google.auth
+        import google.auth.exceptions
+
+        with patch.dict(os.environ, clean_env, clear=True):
+            with self.assertRaises(google.auth.exceptions.DefaultCredentialsError):
+                google.auth.default()
+
+
+class TestAdvRouteNoSilentFallbackOnAuthFail(unittest.TestCase):
+    def test_adv_route_no_silent_fallback_on_auth_fail_forced_official(self):
+        """force_mode='cli' (AG_OFFICIAL_CLI): an auth failure must propagate,
+        never silently fall back to another runner."""
+        runner = AgRunner()
+        req = LaunchRequest(working_directory=".", force_mode="cli")
+        with patch(
+            "manager.ag_cli_runner.verify_auth_identity",
+            side_effect=AgLaunchError("unverified_identity", "no proof"),
+        ):
+            with self.assertRaises(AgLaunchError) as ctx:
+                runner.prepare(req)
+        self.assertEqual(ctx.exception.classification, "unverified_identity")
+
+    def test_adv_route_no_silent_fallback_on_auth_fail_auto_mode(self):
+        """auto mode: binary resolves fine but auth fails -- must stop, not
+        silently fall back to a different runner/route."""
+        mock_bridge = MagicMock()
+        mock_bridge.is_alive.return_value = False
+        mock_headless = MagicMock()
+        mock_headless.prepare.side_effect = AgLaunchError("unverified_identity", "no proof")
+        runner = AgRunner(ide_bridge=mock_bridge, headless_runner=mock_headless)
+        req = LaunchRequest(working_directory=".")
+        with self.assertRaises(AgLaunchError) as ctx:
+            runner.prepare(req)
+        self.assertEqual(ctx.exception.classification, "unverified_identity")
+        # Evidence: fallback_reason was set to route-not-found (live IDE
+        # offline caused the hop to the fallback runner), but that fallback
+        # runner's OWN auth failure must not trigger yet another fallback.
+        self.assertEqual(runner.last_fallback_reason, "live_ide_not_found")
+
+
+class TestAdvRouteDistinctFromLiveIde(unittest.TestCase):
+    def test_adv_route_distinct_from_live_ide(self):
+        official_runner = OfficialAgCliRunner(
+            executable_resolver=lambda: ("/opt/bin/agy", []),
+            auth_verifier=lambda: "verified",
+        )
+        official_prep = official_runner.prepare(LaunchRequest(working_directory="."))
+        self.assertEqual(official_prep.route_used, ROUTE_OFFICIAL_CLI)
+
+        headless_runner = AgHeadlessRunner(
+            executable_resolver=lambda: ("/opt/bin/agentapi", []),
+            auth_verifier=lambda: "verified",
+        )
+        headless_prep = headless_runner.prepare(LaunchRequest(working_directory="."))
+        self.assertEqual(headless_prep.route_used, ROUTE_GEMINI_CLI_FALLBACK)
+
+        self.assertNotEqual(official_prep.route_used, headless_prep.route_used)
+        self.assertNotEqual(official_prep.route_used, ROUTE_LIVE_IDE_IPC)
+        self.assertNotEqual(headless_prep.route_used, ROUTE_LIVE_IDE_IPC)
+
+    def test_adv_official_cli_default_resolver_never_accepts_agentapi_or_gemini(self):
+        """OfficialAgCliRunner() with no injected resolver (the real default
+        wiring for AG_OFFICIAL_CLI) must use the strict standalone-agy-only
+        resolver, not the permissive agentapi/gemini fallback resolver."""
+        runner = OfficialAgCliRunner(auth_verifier=lambda: "verified")
+        with patch("shutil.which", return_value=None), patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(AgLaunchError) as ctx:
+                runner.prepare(LaunchRequest(working_directory="."))
+        self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+    def test_adv_fallback_never_reports_official_cli_after_transition(self):
+        """After a Live-IDE -> fallback transition in auto mode, evidence
+        must never claim AG_OFFICIAL_CLI -- the fallback runner must be the
+        permissive GEMINI_CLI_FALLBACK resolver, not the strict
+        official-only resolver silently substituted in."""
+        mock_bridge = MagicMock()
+        mock_bridge.is_alive.return_value = False
+        runner = AgRunner(ide_bridge=mock_bridge)
+        req = LaunchRequest(working_directory=".")
+        with patch("manager.ag_cli_runner.verify_auth_identity", return_value="verified"), \
+             patch("shutil.which", return_value=None), patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(AgLaunchError) as ctx:
+                runner.prepare(req)
+        # The broad/fallback resolver raises "executable_not_found"; the
+        # strict AG_OFFICIAL_CLI-only resolver would instead raise
+        # "route_unavailable". Getting this specific classification proves
+        # the fallback runner (headless) resolved via the permissive path.
+        self.assertEqual(ctx.exception.classification, "executable_not_found")
+        self.assertEqual(runner.last_fallback_reason, "live_ide_not_found")
+
+
+class TestAdvWindowsCmdResolutionAndOrphanCleanup(unittest.TestCase):
+    def test_adv_windows_cmd_resolution_wraps_bat_through_comspec(self):
+        mock_resolver = lambda: ("C:/fake/antigravity-ide/bin/agentapi.bat", [])
+        mock_auth = lambda: "verified"
+        runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
+        req = LaunchRequest(working_directory=".")
+        prepared = runner.prepare(req)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 5555
+        mock_proc.stdout.readline.side_effect = [""]
+        mock_proc.stderr.readline.side_effect = [""]
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+            runner.start(prepared, "some prompt with & | metacharacters")
+            called_args = mock_popen.call_args[0][0]
+            comspec = os.environ.get("COMSPEC", "cmd.exe")
+            self.assertEqual(called_args[0], comspec)
+            self.assertEqual(called_args[1], "/c")
+            self.assertEqual(called_args[2], "C:/fake/antigravity-ide/bin/agentapi.bat")
+            # The prompt remains one single argv element, never concatenated
+            # into a shell string -- this is why shell=True is avoided.
+            self.assertIn("some prompt with & | metacharacters", called_args)
+            self.assertFalse(mock_popen.call_args[1].get("shell", False))
+
+    def test_adv_windows_cmd_resolution_leaves_exe_untouched(self):
+        mock_resolver = lambda: ("C:/fake/bin/agy.exe", [])
+        runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=lambda: "verified")
+        req = LaunchRequest(working_directory=".")
+        prepared = runner.prepare(req)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 5556
+        mock_proc.stdout.readline.side_effect = [""]
+        mock_proc.stderr.readline.side_effect = [""]
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+            runner.start(prepared, "prompt")
+            called_args = mock_popen.call_args[0][0]
+            self.assertEqual(called_args[0], "C:/fake/bin/agy.exe")
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only real process-tree cleanup check")
+    def test_adv_windows_orphan_cleanup_real_process_tree(self):
+        """Spawn a real parent process that itself spawns a real grandchild
+        (simulating a .bat wrapper spawning node.exe), call terminate(), and
+        verify BOTH are actually gone -- not just the immediate pid."""
+        marker = Path(os.environ["TEMP"]) / f"adm_ag_adv_grandchild_pid_{os.getpid()}.txt"
+        if marker.exists():
+            marker.unlink()
+
+        parent_script = (
+            "import subprocess, sys, time, os;"
+            f"gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']);"
+            f"open(r'{marker}', 'w').write(str(gc.pid));"
+            "time.sleep(60)"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", parent_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        cli_proc = AgCliProcess.__new__(AgCliProcess)
+        cli_proc.process = proc
+
+        try:
+            deadline = time.time() + 10
+            grandchild_pid = None
+            while time.time() < deadline and grandchild_pid is None:
+                if marker.exists():
+                    content = marker.read_text().strip()
+                    if content:
+                        grandchild_pid = int(content)
+                time.sleep(0.2)
+            self.assertIsNotNone(grandchild_pid, "grandchild pid marker was never written")
+
+            cli_proc.terminate()
+
+            def _pid_alive(pid: int) -> bool:
+                out = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                    capture_output=True,
+                    text=True,
+                )
+                return str(pid) in out.stdout
+
+            deadline = time.time() + 10
+            while time.time() < deadline and (_pid_alive(proc.pid) or _pid_alive(grandchild_pid)):
+                time.sleep(0.3)
+
+            self.assertFalse(_pid_alive(proc.pid), "parent process was not cleaned up")
+            self.assertFalse(_pid_alive(grandchild_pid), "grandchild process was orphaned")
+        finally:
+            if marker.exists():
+                marker.unlink()
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+
+
+class TestAdvNormalizerDetectsExit0JsonError(unittest.TestCase):
+    def _run_with_stdout_lines(self, lines):
+        mock_resolver = lambda: ("/opt/bin/agentapi", [])
+        runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=lambda: "verified")
+        req = LaunchRequest(working_directory=".")
+        prepared = runner.prepare(req)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 7777
+        mock_proc.stdout.readline.side_effect = [*lines, ""]
+        mock_proc.stderr.readline.side_effect = [""]
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            running = runner.start(prepared, "do the task")
+            return runner.wait(running)
+
+    def test_adv_normalizer_detects_exit0_json_error_via_status_field(self):
+        line = json.dumps({"type": "result", "status": "error", "message": "quota exceeded for project"}) + "\n"
+        outcome = self._run_with_stdout_lines([line])
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("quota", outcome.failure_detail.lower())
+
+    def test_adv_normalizer_detects_exit0_json_error_via_response_text(self):
+        line = json.dumps({"type": "result", "response": "Error: unauthorized -- please re-authenticate"}) + "\n"
+        outcome = self._run_with_stdout_lines([line])
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.failure_classification, "unauthorized")
+
+    def test_adv_normalizer_detects_exit0_unstructured_text_error(self):
+        outcome = self._run_with_stdout_lines(["Fatal: quota exceeded, aborting\n"])
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("quota_exceeded", outcome.failure_classification)
+
+    def test_adv_normalizer_leaves_genuine_success_completed(self):
+        line = json.dumps({"type": "result", "response": "Task finished with no issues", "stats": {}}) + "\n"
+        outcome = self._run_with_stdout_lines([line])
+        self.assertEqual(outcome.status, "completed")
+
+
+if __name__ == "__main__":
+    unittest.main()
