@@ -23,9 +23,19 @@ not available on `PATH`.
 single raw `application/json` file named `status.json` in the configured Drive
 folder and verifies its metadata and bytes after upload.
 
-Authentication uses Google Application Default Credentials, an existing token
-at `GOOGLE_DRIVE_TOKEN`, or an official Desktop OAuth client JSON selected with
-`GOOGLE_OAUTH_CLIENT_SECRETS`. Credentials remain outside the repository.
+Authentication uses, in order: Google Application Default Credentials, an
+existing token at `GOOGLE_DRIVE_TOKEN`, an official Desktop OAuth client JSON
+selected with `GOOGLE_OAUTH_CLIENT_SECRETS` (if set), or otherwise the ADM
+bundled default Desktop OAuth client (`manager/default_oauth_config.py`).
+Credentials remain outside the repository.
+
+The repository does not currently ship a real ADM Desktop OAuth `client_id`;
+`manager/default_oauth_config.py` holds an explicit `UNPROVISIONED` sentinel.
+Fresh-machine `python -m manager.drive_auth authorize` fails closed with
+`ADM Desktop OAuth client configuration not provisioned` until an ADM
+maintainer provisions a real Google Cloud "Desktop app" OAuth client and
+replaces those sentinel values (or a user sets `GOOGLE_OAUTH_CLIENT_SECRETS`
+to their own Desktop OAuth client JSON).
 
 ```powershell
 python collectors/publish_drive.py

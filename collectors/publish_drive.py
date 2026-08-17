@@ -19,6 +19,45 @@ class PublisherError(RuntimeError):
     pass
 
 
+REQUIRED_INSTALLED_FIELDS = ("client_id", "client_secret", "auth_uri", "token_uri", "redirect_uris")
+
+
+def _validate_installed_client_config(config, source):
+    """Validate a Google OAuth client config is a well-formed Desktop (installed) client.
+
+    Fails closed (raises PublisherError) on anything malformed, empty, or of the
+    wrong client type (e.g. a Web client). Never accepts a config silently.
+    """
+    if not isinstance(config, dict) or not config:
+        raise PublisherError(f"{source} OAuth client configuration is malformed or empty")
+    if "installed" not in config:
+        if "web" in config:
+            raise PublisherError(
+                f"{source} OAuth client is a Web application client; "
+                "a Desktop (installed) OAuth client is required"
+            )
+        raise PublisherError(f"{source} OAuth client configuration is malformed: missing 'installed' section")
+    installed = config["installed"]
+    if not isinstance(installed, dict):
+        raise PublisherError(f"{source} OAuth client configuration is malformed: 'installed' is not an object")
+    missing = [field for field in REQUIRED_INSTALLED_FIELDS if not installed.get(field)]
+    if missing:
+        raise PublisherError(
+            f"{source} OAuth client configuration is malformed: missing {', '.join(missing)}"
+        )
+    return installed
+
+
+def _load_bundled_oauth_config():
+    from manager.default_oauth_config import UNPROVISIONED_SENTINEL, load_default_oauth_config
+
+    config = load_default_oauth_config()
+    installed = _validate_installed_client_config(config, source="ADM bundled default")
+    if installed.get("client_id") == UNPROVISIONED_SENTINEL or installed.get("client_secret") == UNPROVISIONED_SENTINEL:
+        raise PublisherError("ADM Desktop OAuth client configuration not provisioned")
+    return config
+
+
 def load_status(path, schema_path):
     if not path.is_file():
         raise PublisherError(f"local status JSON not found: {path}")
@@ -101,13 +140,27 @@ def credentials_with_source(allow_interactive=False, oauth=None):
     except oauth["DefaultCredentialsError"]:
         pass
 
-    client_secrets = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRETS")
-    if not allow_interactive or not client_secrets:
+    if not allow_interactive:
         detail = f" ({token_problem})" if token_problem else ""
-        suffix = " Set GOOGLE_OAUTH_CLIENT_SECRETS, then run python -m manager.drive_auth authorize." if not client_secrets else " Run python -m manager.drive_auth authorize."
-        raise PublisherError(f"Google OAuth reauthorization required{detail}.{suffix}")
+        raise PublisherError(f"Google OAuth reauthorization required{detail}. Run python -m manager.drive_auth authorize.")
+
+    client_secrets = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRETS")
+    if client_secrets:
+        secrets_path = Path(client_secrets)
+        if not secrets_path.is_file():
+            raise PublisherError(f"GOOGLE_OAUTH_CLIENT_SECRETS file not found: {client_secrets}")
+        try:
+            env_config = json.loads(secrets_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise PublisherError(f"GOOGLE_OAUTH_CLIENT_SECRETS file is malformed: {exc}") from exc
+        _validate_installed_client_config(env_config, source="GOOGLE_OAUTH_CLIENT_SECRETS")
+        flow = oauth["InstalledAppFlow"].from_client_secrets_file(str(secrets_path), SCOPES)
+    else:
+        bundled_config = _load_bundled_oauth_config()
+        flow = oauth["InstalledAppFlow"].from_client_config(bundled_config, SCOPES)
+
     try:
-        creds = oauth["InstalledAppFlow"].from_client_secrets_file(client_secrets, SCOPES).run_local_server(port=0)
+        creds = flow.run_local_server(port=0)
     except Exception as exc:
         raise PublisherError(f"Google Desktop OAuth authorization failed: {exc}") from exc
     if not creds or not creds.valid:
