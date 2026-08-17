@@ -139,9 +139,10 @@ class TestOfficialAgCliRunner(unittest.TestCase):
                 resolve_ag_official_cli_executable()
             self.assertEqual(ctx.exception.classification, "route_unavailable")
 
+    @patch("pathlib.Path.is_file", return_value=True)
     @patch("shutil.which")
-    def test_resolve_ag_official_cli_executable_finds_standalone_agy(self, mock_which):
-        mock_which.side_effect = lambda name: "/usr/local/bin/agy" if name == "agy" else None
+    def test_resolve_ag_official_cli_executable_finds_standalone_agy(self, mock_which, mock_is_file):
+        mock_which.side_effect = lambda name: "/usr/local/bin/agy" if name in ("agy", "agy.exe", "agy.cmd", "agy.bat") else None
         with patch.dict("os.environ", {}, clear=True):
             path, prefix = resolve_ag_official_cli_executable()
             self.assertIn("agy", path)

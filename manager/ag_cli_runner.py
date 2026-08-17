@@ -14,6 +14,7 @@ import queue
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -54,6 +55,12 @@ SECONDARY_BILLING_ENV_VARS = (
     "VERTEXAI_LOCATION",
     "CLOUDSDK_CORE_PROJECT",
     "CLOUDSDK_AUTH_ACCESS_TOKEN",
+    "CLOUDSDK_CORE_ACCOUNT",
+    "CLOUDSDK_CONFIG",
+    "CLOUDSDK_BILLING_QUOTA_PROJECT",
+    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+    "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+    "GOOGLE_CLOUD_QUOTA_PROJECT",
 )
 
 # GOOGLE_APPLICATION_CREDENTIALS is handled separately from the strip list
@@ -346,40 +353,171 @@ def verify_auth_identity(timeout: float = 5.0) -> str:
     )
 
 
-def resolve_ag_official_cli_executable(explicit: str | None = None) -> tuple[str, list[str]]:
-    """Locate ONLY a verified standalone `agy` Antigravity CLI executable.
+def is_trusted_ag_executable_path(
+    path: Path | str,
+    extra_trusted_roots: list[Path] | None = None,
+) -> bool:
+    """Verify that an Antigravity official executable resides within a known,
+    trusted vendor installation directory (or explicit trusted test roots).
 
-    This is the AG_OFFICIAL_CLI route. It deliberately does NOT accept
-    `agentapi`, the bundled `language_server` + `agentapi` combo, or the
-    generic `gemini` CLI -- those are the GEMINI_CLI_FALLBACK route (see
-    resolve_ag_cli_executable) and must never be reported back as the
-    verified official CLI. If no real standalone `agy` binary can be found,
-    this fails closed with `route_unavailable` rather than silently
-    substituting a different tool or faking readiness.
+    Rejects temp directories, arbitrary user folders, git workspaces, and
+    unknown PATH prepends to prevent route spoofing and preserve audit authenticity.
+    """
+    try:
+        resolved = Path(path).resolve()
+    except Exception:
+        return False
+
+    if not resolved.is_file():
+        return False
+
+    resolved_str = os.path.normcase(os.path.normpath(str(resolved)))
+
+    # If explicit extra trusted roots are passed (e.g. for testing), verify them first
+    if extra_trusted_roots:
+        for r in extra_trusted_roots:
+            try:
+                norm_r = os.path.normcase(os.path.normpath(str(Path(r).resolve())))
+                if resolved_str == norm_r or resolved_str.startswith(norm_r + os.sep):
+                    return True
+            except Exception:
+                continue
+
+    # Reject any path residing in temporary directories
+    temp_dirs = [tempfile.gettempdir(), "/tmp", "/var/tmp"]
+    for temp_env in ("TEMP", "TMP", "TMPDIR"):
+        val = os.environ.get(temp_env)
+        if val:
+            temp_dirs.append(val)
+    for td in temp_dirs:
+        try:
+            norm_td = os.path.normcase(os.path.normpath(str(Path(td).resolve())))
+            if resolved_str == norm_td or resolved_str.startswith(norm_td + os.sep):
+                return False
+        except Exception:
+            continue
+
+    trusted_roots: list[Path] = []
+    # 1. Canonical user .gemini root
+    try:
+        trusted_roots.append(resolve_canonical_gemini_home())
+    except Exception:
+        pass
+
+    # 2. LocalAppData / AppData npm / ProgramFiles on Windows
+    for env_var, sub_path in (
+        ("LOCALAPPDATA", "Programs"),
+        ("APPDATA", "npm"),
+        ("ProgramFiles", ""),
+        ("ProgramFiles(x86)", ""),
+    ):
+        base = os.environ.get(env_var)
+        if base:
+            try:
+                cand_root = (Path(base) / sub_path).resolve() if sub_path else Path(base).resolve()
+                trusted_roots.append(cand_root)
+            except Exception:
+                pass
+
+    # 3. Standard POSIX vendor / system paths
+    for posix_path in ("/usr/local", "/usr", "/opt", "/Applications"):
+        try:
+            p = Path(posix_path).resolve()
+            trusted_roots.append(p)
+        except Exception:
+            pass
+
+    try:
+        home_local = (_safe_home() / ".local" / "bin").resolve()
+        trusted_roots.append(home_local)
+        home_npm = (_safe_home() / ".npm-global").resolve()
+        trusted_roots.append(home_npm)
+    except Exception:
+        pass
+
+    if extra_trusted_roots:
+        for r in extra_trusted_roots:
+            try:
+                trusted_roots.append(Path(r).resolve())
+            except Exception:
+                pass
+
+    for root in trusted_roots:
+        try:
+            norm_root = os.path.normcase(os.path.normpath(str(root.resolve())))
+            if resolved_str == norm_root or resolved_str.startswith(norm_root + os.sep):
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
+def resolve_ag_official_cli_executable(
+    explicit: str | None = None,
+    extra_trusted_roots: list[Path] | None = None,
+) -> tuple[str, list[str]]:
+    """Locate ONLY a verified standalone `agy` Antigravity CLI executable from
+    a canonical trusted installation root.
+
+    This is the AG_OFFICIAL_CLI route. It strictly rejects unverified binaries
+    from temp or arbitrary PATH folders, and does NOT accept `agentapi`, the
+    bundled `language_server` + `agentapi` combo, or the generic `gemini` CLI.
+    If no verified standalone `agy` in a trusted root is found, fails closed
+    with `route_unavailable`.
     """
     if explicit:
         path = shutil.which(explicit) or (explicit if Path(explicit).is_file() else None)
-        if path:
+        if path and is_trusted_ag_executable_path(path, extra_trusted_roots=extra_trusted_roots):
             return str(Path(path).resolve()), []
-        raise AgLaunchError("route_unavailable", f"Explicit Antigravity official CLI executable not found: {explicit}")
+        raise AgLaunchError("route_unavailable", f"Explicit Antigravity official CLI executable is not trusted or not found: {explicit}")
 
     env_bin = os.environ.get("AGY_BIN")
     if env_bin:
         path = shutil.which(env_bin) or (env_bin if Path(env_bin).is_file() else None)
-        if path:
+        if path and is_trusted_ag_executable_path(path, extra_trusted_roots=extra_trusted_roots):
             return str(Path(path).resolve()), []
 
+    # 1. Search canonical .gemini and known installation locations first
+    gemini_home = resolve_canonical_gemini_home()
+    for sub in (
+        "antigravity-ide/bin/agy.cmd",
+        "antigravity-ide/bin/agy.bat",
+        "antigravity-ide/bin/agy.exe",
+        "antigravity-ide/bin/agy",
+        "antigravity/bin/agy.cmd",
+        "antigravity/bin/agy.bat",
+        "antigravity/bin/agy.exe",
+        "antigravity/bin/agy",
+        "bin/agy.cmd",
+        "bin/agy.bat",
+        "bin/agy.exe",
+        "bin/agy",
+    ):
+        cand = gemini_home / sub
+        if cand.is_file() and is_trusted_ag_executable_path(cand, extra_trusted_roots=extra_trusted_roots):
+            return str(cand.resolve()), []
+
+    # 2. Check npm global installation in AppData
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        for npm_name in ("agy.cmd", "agy.bat", "agy.exe", "agy"):
+            npm_cand = Path(appdata) / "npm" / npm_name
+            if npm_cand.is_file() and is_trusted_ag_executable_path(npm_cand, extra_trusted_roots=extra_trusted_roots):
+                return str(npm_cand.resolve()), []
+
+    # 3. Check system PATH only if resolved binary is in a verified trusted root
     names = ("agy.exe", "agy.cmd", "agy.bat", "agy") if os.name == "nt" else ("agy",)
     for name in names:
         found = shutil.which(name)
-        if found:
+        if found and is_trusted_ag_executable_path(found, extra_trusted_roots=extra_trusted_roots):
             return str(Path(found).resolve()), []
 
     raise AgLaunchError(
         "route_unavailable",
-        "Verified standalone Antigravity official CLI executable (agy) was not found on this "
-        "machine. AG_OFFICIAL_CLI route is unavailable -- refusing to substitute agentapi, the "
-        "bundled language server, or the generic gemini CLI. Fail closed.",
+        "Verified standalone Antigravity official CLI executable (agy) from a trusted "
+        "installation root was not found on this machine. AG_OFFICIAL_CLI route is unavailable "
+        "-- refusing unverified PATH binaries, agentapi, or generic gemini CLI. Fail closed.",
     )
 
 
@@ -490,11 +628,13 @@ def _detect_masked_failure(raw_event: dict[str, Any] | None, text: str = "") -> 
             return (str(raw_event.get("code") or "provider_error"), str(raw_event["error"]))
         if raw_event.get("unauthorized") is True:
             return ("unauthorized", str(raw_event.get("message") or "Unauthorized"))
-        candidate_texts.extend(str(v) for v in raw_event.values() if isinstance(v, str))
+        candidate_texts.extend(str(v) for v in raw_event.values() if isinstance(v, (str, int, float)))
 
-    lowered = "\n".join(candidate_texts).lower()
+    lowered_newline = "\n".join(candidate_texts).lower()
+    lowered_single_space = " ".join(" ".join(candidate_texts).split()).lower()
+
     for phrase in _MASKED_FAILURE_PHRASES:
-        if phrase in lowered:
+        if phrase in lowered_newline or phrase in lowered_single_space:
             return (
                 phrase.replace(" ", "_"),
                 f"Detected '{phrase}' in provider output despite exit_code 0 / success-shaped payload",

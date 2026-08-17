@@ -522,5 +522,157 @@ class TestAdvFinding3CliAuthStatusPositiveProof(unittest.TestCase):
             self.assertTrue(_cli_auth_status_check())
 
 
+class TestAdvR3GcloudAccountAndConfigIsolation(unittest.TestCase):
+    """Adversarial regression suite for R3 Finding 1 (P1: gcloud account / config isolation)."""
+
+    def test_r3_cloudsdk_core_account_and_config_stripped(self):
+        dirty_env = {
+            "CLOUDSDK_CORE_ACCOUNT": "attacker-account@example.com",
+            "CLOUDSDK_CONFIG": "/untrusted/gcloud/config/dir",
+            "CLOUDSDK_BILLING_QUOTA_PROJECT": "leak-quota-proj",
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE": "/untrusted/creds.json",
+            "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT": "sa@attacker.iam.gserviceaccount.com",
+            "GOOGLE_CLOUD_QUOTA_PROJECT": "leak-gcp-quota-proj",
+            "CLOUDSDK_CORE_PROJECT": "leak-cloudsdk-proj",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": "leak-token",
+            "GCLOUD_PROJECT": "leak-legacy-proj",
+            "SAFE_VAR": "keep-me",
+        }
+        clean_env = sanitize_ag_environment(dirty_env)
+        for var in (
+            "CLOUDSDK_CORE_ACCOUNT",
+            "CLOUDSDK_CONFIG",
+            "CLOUDSDK_BILLING_QUOTA_PROJECT",
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+            "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+            "GOOGLE_CLOUD_QUOTA_PROJECT",
+            "CLOUDSDK_CORE_PROJECT",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
+            "GCLOUD_PROJECT",
+        ):
+            self.assertNotIn(var, clean_env, f"{var} must be stripped from sanitized child env")
+        self.assertEqual(clean_env.get("SAFE_VAR"), "keep-me")
+
+    def test_r3_spawn_env_never_reintroduces_cloudsdk_account(self):
+        mock_resolver = lambda: ("/opt/bin/agy", [])
+        mock_auth = lambda: "verified"
+        runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
+        req = LaunchRequest(working_directory=".")
+        prepared = runner.prepare(req)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 2345
+        mock_proc.stdout.readline.side_effect = [""]
+        mock_proc.stderr.readline.side_effect = [""]
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        with patch.dict(os.environ, {"CLOUDSDK_CORE_ACCOUNT": "other@example.com", "CLOUDSDK_CONFIG": "/other/config"}):
+            with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+                runner.start(prepared, "test prompt")
+                called_env = mock_popen.call_args[1].get("env", {})
+                self.assertNotIn("CLOUDSDK_CORE_ACCOUNT", called_env)
+                self.assertNotIn("CLOUDSDK_CONFIG", called_env)
+
+
+class TestAdvR3OfficialCliRouteAuthenticity(unittest.TestCase):
+    """Adversarial regression suite for R3 Finding 2 (P1: Official CLI route authenticity)."""
+
+    def test_r3_temp_dir_fake_agy_rejected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            fake_agy = Path(td) / ("agy.bat" if os.name == "nt" else "agy")
+            fake_agy.write_text("@echo fake", encoding="utf-8")
+
+            with patch("shutil.which", return_value=str(fake_agy)), \
+                 patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(AgLaunchError) as ctx:
+                    resolve_ag_official_cli_executable()
+                self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+    def test_r3_arbitrary_path_prepended_fake_agy_rejected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            fake_bin_dir = Path(td) / "custom_bin"
+            fake_bin_dir.mkdir()
+            fake_agy = fake_bin_dir / ("agy.exe" if os.name == "nt" else "agy")
+            fake_agy.write_text("fake binary", encoding="utf-8")
+
+            with patch("shutil.which", return_value=str(fake_agy)), \
+                 patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(AgLaunchError) as ctx:
+                    resolve_ag_official_cli_executable()
+                self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+    def test_r3_unknown_explicit_install_root_rejected(self):
+        with self.assertRaises(AgLaunchError) as ctx:
+            resolve_ag_official_cli_executable(explicit="/untrusted/custom/path/to/agy")
+        self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+    def test_r3_trusted_canonical_install_root_accepted(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            trusted_root = Path(td) / "trusted_vendor"
+            trusted_root.mkdir()
+            valid_agy = trusted_root / ("agy.exe" if os.name == "nt" else "agy")
+            valid_agy.write_text("valid binary", encoding="utf-8")
+
+            path, prefix = resolve_ag_official_cli_executable(
+                explicit=str(valid_agy),
+                extra_trusted_roots=[trusted_root],
+            )
+            self.assertEqual(path, str(valid_agy.resolve()))
+            self.assertEqual(prefix, [])
+
+    def test_r3_unverified_binary_never_tagged_official_cli(self):
+        """OfficialAgCliRunner default resolver must fail closed when binary is unverified,
+        never proceeding to claim AG_OFFICIAL_CLI."""
+        runner = OfficialAgCliRunner(auth_verifier=lambda: "verified")
+        with patch("shutil.which", return_value="/tmp/untrusted/agy"), \
+             patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(AgLaunchError) as ctx:
+                runner.prepare(LaunchRequest(working_directory="."))
+            self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+
+class TestAdvR3MaskedFailureSplitFields(unittest.TestCase):
+    """Adversarial regression suite for R3 Finding 3 (P2: Masked failure split-field detection)."""
+
+    def _run_with_stdout_lines(self, lines):
+        mock_resolver = lambda: ("/opt/bin/agentapi", [])
+        runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=lambda: "verified")
+        req = LaunchRequest(working_directory=".")
+        prepared = runner.prepare(req)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 8888
+        mock_proc.stdout.readline.side_effect = [*lines, ""]
+        mock_proc.stderr.readline.side_effect = [""]
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            running = runner.start(prepared, "run task")
+            return runner.wait(running)
+
+    def test_r3_split_quota_exceeded_detected(self):
+        line = json.dumps({"part_a": "quota", "part_b": "exceeded"}) + "\n"
+        outcome = self._run_with_stdout_lines([line])
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.failure_classification, "quota_exceeded")
+
+    def test_r3_split_unauthorized_detected(self):
+        line = json.dumps({"status_code": 403, "header": "Auth", "body": "unauthorized access denied"}) + "\n"
+        outcome = self._run_with_stdout_lines([line])
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.failure_classification, "unauthorized")
+
+    def test_r3_normal_success_payload_not_misidentified(self):
+        line = json.dumps({"status": "ok", "part_a": "Analysis complete", "part_b": "All checks passed"}) + "\n"
+        outcome = self._run_with_stdout_lines([line])
+        self.assertEqual(outcome.status, "completed")
+        self.assertIsNone(outcome.failure_classification)
+
+
 if __name__ == "__main__":
     unittest.main()
