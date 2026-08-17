@@ -17,7 +17,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Generator
 
 from manager.ag_runner import (
     AgLaunchError,
@@ -31,6 +31,17 @@ from manager.ag_runner import (
 )
 
 
+SECONDARY_BILLING_ENV_VARS = (
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "VERTEX_PROJECT",
+    "GOOGLE_CLOUD_PROJECT",
+    "GCP_PROJECT",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+)
+
+
 def _safe_home() -> Path:
     try:
         return Path.home()
@@ -38,14 +49,20 @@ def _safe_home() -> Path:
         return Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or "/tmp")
 
 
-def verify_auth_identity() -> str:
-    """Verify that headless execution uses the same local Google identity as the IDE.
+def sanitize_ag_environment(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Strip secondary billing/API keys to ensure child process strictly uses local Google account profile."""
+    env = dict(os.environ if base_env is None else base_env)
+    for var in SECONDARY_BILLING_ENV_VARS:
+        env.pop(var, None)
+    return env
 
-    Fails closed if the identity cannot be proven or if an unverified API key / second
-    billing channel is detected.
+
+def verify_auth_identity() -> str:
+    """Verify that headless execution uses a verified local Google account profile.
+
+    Strictly fails closed if local IDE configuration or credential profile cannot be proven.
+    GOOGLE_API_KEY is not accepted as evidence of local Google AI Pro account identity.
     """
-    # 1. Prohibit unverified third-party API key injection without matching local credentials
-    api_key = os.environ.get("GOOGLE_API_KEY")
     gemini_home = Path(os.environ.get("GEMINI_HOME", _safe_home() / ".gemini"))
 
     # Local credentials directory / config check
@@ -55,10 +72,10 @@ def verify_auth_identity() -> str:
 
     has_local_profile = config_dir.is_dir() or ide_dir.is_dir() or oauth_file.is_file()
 
-    if not has_local_profile and not api_key:
+    if not has_local_profile:
         raise AgLaunchError(
             "unverified_identity",
-            "Cannot prove Antigravity local identity: no IDE configuration or local credential profile found. Fail closed.",
+            "Cannot prove Antigravity local identity: no local configuration directory (~/.gemini/config, ~/.gemini/antigravity-ide) or OAuth credential profile found. Fail closed.",
         )
 
     # Return validated identity indicator
@@ -195,7 +212,9 @@ class AgHeadlessRunner:
         if req.model:
             args.extend(["--model", req.model])
 
-        env = dict(os.environ)
+        # Sanitize environment to prevent secondary billing / external API key injection
+        env = sanitize_ag_environment(os.environ)
+
         # Enforce sandbox and working directory
         cwd = req.working_directory if Path(req.working_directory).is_dir() else None
 

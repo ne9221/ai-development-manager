@@ -28,6 +28,9 @@ class MockAgBridge:
     def is_alive(self):
         return self.is_alive_val
 
+    def is_transport_available(self):
+        return True
+
     def prepare(self, request):
         self.events.append("prepare")
         prep = PreparedLaunch(

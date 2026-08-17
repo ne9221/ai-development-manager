@@ -150,6 +150,7 @@ class AgRunner:
     def __init__(self, ide_bridge: Any = None, headless_runner: Any = None):
         self._ide_bridge = ide_bridge
         self._headless_runner = headless_runner
+        self.last_fallback_reason: str | None = None
 
     def _get_ide_bridge(self):
         if self._ide_bridge is None:
@@ -172,14 +173,20 @@ class AgRunner:
                 raise AgLaunchError("live_ide_not_found", "Antigravity Live IDE/runtime is not running")
             return bridge.prepare(request)
 
-        # Hybrid auto-discovery: Live IDE prioritized
+        # Hybrid auto-discovery: Live IDE prioritized only if transport is actually available
         bridge = self._get_ide_bridge()
         if bridge.is_alive():
             try:
                 return bridge.prepare(request)
-            except Exception as exc:
-                # If bridge preparation fails, fallback to headless
-                pass
+            except AgLaunchError as exc:
+                if exc.classification in ("live_ide_transport_unavailable", "live_ide_not_found"):
+                    self.last_fallback_reason = exc.classification
+                    # Observable fallback to headless
+                else:
+                    # Non-transport errors (auth, critical failure) must NOT be swallowed
+                    raise
+        else:
+            self.last_fallback_reason = "live_ide_not_found"
 
         # Fallback to headless runner (which enforces strict fail-closed auth verification)
         return self._get_headless_runner().prepare(request)

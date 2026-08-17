@@ -9,6 +9,7 @@ from manager.ag_headless_runner import (
     AgHeadlessProcess,
     AgHeadlessRunner,
     resolve_ag_executable,
+    sanitize_ag_environment,
     verify_auth_identity,
 )
 from manager.ag_runner import AgLaunchError, LaunchRequest
@@ -33,6 +34,41 @@ class TestAgHeadlessRunner(unittest.TestCase):
             verify_auth_identity()
         self.assertEqual(ctx.exception.classification, "unverified_identity")
         self.assertIn("Fail closed", ctx.exception.detail)
+
+    @patch.dict("os.environ", {"GOOGLE_API_KEY": "AIzaSyFakeKeyThirdParty"}, clear=True)
+    @patch("pathlib.Path.is_dir")
+    @patch("pathlib.Path.is_file")
+    def test_verify_auth_identity_fails_closed_when_api_key_provided_without_profile(self, mock_is_file, mock_is_dir):
+        # GOOGLE_API_KEY is not proof of local profile; without local config it must fail closed
+        mock_is_dir.return_value = False
+        mock_is_file.return_value = False
+        with self.assertRaises(AgLaunchError) as ctx:
+            verify_auth_identity()
+        self.assertEqual(ctx.exception.classification, "unverified_identity")
+
+    def test_sanitize_ag_environment_strips_secondary_billing(self):
+        dirty_env = {
+            "PATH": "/bin:/usr/bin",
+            "HOME": "/home/user",
+            "GOOGLE_API_KEY": "secret-api-key",
+            "GEMINI_API_KEY": "secret-gemini-key",
+            "VERTEX_PROJECT": "my-vertex-proj",
+            "GOOGLE_CLOUD_PROJECT": "gcp-proj",
+            "GCP_PROJECT": "gcp-proj-2",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/sa.json",
+            "GOOGLE_GENAI_USE_VERTEXAI": "1",
+            "CUSTOM_VAR": "keep-me",
+        }
+        clean_env = sanitize_ag_environment(dirty_env)
+        self.assertNotIn("GOOGLE_API_KEY", clean_env)
+        self.assertNotIn("GEMINI_API_KEY", clean_env)
+        self.assertNotIn("VERTEX_PROJECT", clean_env)
+        self.assertNotIn("GOOGLE_CLOUD_PROJECT", clean_env)
+        self.assertNotIn("GCP_PROJECT", clean_env)
+        self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", clean_env)
+        self.assertNotIn("GOOGLE_GENAI_USE_VERTEXAI", clean_env)
+        self.assertEqual(clean_env["CUSTOM_VAR"], "keep-me")
+        self.assertEqual(clean_env["PATH"], "/bin:/usr/bin")
 
     @patch("shutil.which")
     def test_resolve_ag_executable_raises_when_missing(self, mock_which):
@@ -62,9 +98,14 @@ class TestAgHeadlessRunner(unittest.TestCase):
         ]
         mock_proc.poll.return_value = 0
 
-        with patch("subprocess.Popen", return_value=mock_proc):
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
             running = runner.start(prepared, "Prompt text")
             self.assertEqual(prepared.pid, 4321)
+
+            # Ensure subprocess environment was sanitized
+            called_env = mock_popen.call_args[1].get("env")
+            self.assertIsNotNone(called_env)
+            self.assertNotIn("GOOGLE_API_KEY", called_env)
 
             events = []
             running._heartbeat = lambda ev: events.append(ev)

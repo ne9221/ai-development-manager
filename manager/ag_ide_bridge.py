@@ -17,7 +17,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Generator
 
 from manager.ag_runner import (
     AgLaunchError,
@@ -64,7 +64,10 @@ def _detect_live_processes() -> list[dict[str, Any]]:
 
 
 class AgIdeClient:
-    """Mockable JSON-RPC / IPC transport for Live Antigravity Language Server."""
+    """IPC transport interface for Live Antigravity Language Server / IDE.
+
+    Note: Default client fails closed as no verified local IPC transport is currently implemented.
+    """
 
     def __init__(self, endpoint: str | None = None, timeout: float = 30.0):
         self.endpoint = endpoint
@@ -72,14 +75,23 @@ class AgIdeClient:
         self._closed = False
         self._queue: queue.Queue[AgNormalizedEvent] = queue.Queue()
 
+    def is_available(self) -> bool:
+        return False
+
     def send_prompt(self, session_id: str, prompt: str, sandbox: str | None = "read-only") -> None:
         if self._closed:
             raise AgLaunchError("bridge_closed", "Cannot send prompt to closed bridge")
-        # Base client provides default response stream
-        self._queue.put(AgNormalizedEvent("message", {"content": f"Processing read-only request: {prompt}"}))
-        self._queue.put(AgNormalizedEvent("result", {"response": "# AI Development Manager\nVerified read-only dispatch.", "stats": {"tokens": 25}}))
+        raise AgLaunchError(
+            "live_ide_transport_unavailable",
+            "Antigravity Live IDE IPC transport is not available. Real Language Server / IDE transport is not implemented.",
+        )
 
     def read_events(self, timeout: float = 1.0) -> Generator[AgNormalizedEvent, None, None]:
+        if not self.is_available():
+            raise AgLaunchError(
+                "live_ide_transport_unavailable",
+                "Antigravity Live IDE IPC transport is not available. Real Language Server / IDE transport is not implemented.",
+            )
         while not self._closed:
             try:
                 event = self._queue.get(timeout=timeout)
@@ -112,9 +124,21 @@ class AgIdeBridge:
         self._client_factory = client_factory or AgIdeClient
 
     def is_alive(self) -> bool:
-        """Check if any Antigravity IDE / agent runtime process is active."""
+        """Check if any Antigravity IDE / agent runtime process is active (discovery/telemetry only)."""
         procs = _detect_live_processes()
         return len(procs) > 0
+
+    def is_transport_available(self) -> bool:
+        """Check if a functional IPC transport is configured and available."""
+        if not self.is_alive():
+            return False
+        try:
+            client = self._client_factory()
+            if hasattr(client, "is_available"):
+                return client.is_available()
+            return True
+        except Exception:
+            return False
 
     def get_live_pid(self) -> int:
         procs = _detect_live_processes()
@@ -127,6 +151,12 @@ class AgIdeBridge:
     def prepare(self, request: LaunchRequest) -> PreparedLaunch:
         if not self.is_alive():
             raise AgLaunchError("live_ide_not_found", "Antigravity Live IDE is not currently running")
+
+        if not self.is_transport_available():
+            raise AgLaunchError(
+                "live_ide_transport_unavailable",
+                "Antigravity Live IDE process is running but direct IPC transport is unavailable (no verified Language Server transport).",
+            )
 
         pid = self.get_live_pid()
         thread_id = f"ag-live-{uuid.uuid4().hex[:12]}"
@@ -216,7 +246,7 @@ class AgIdeBridge:
                 failure_msg = f"Antigravity turn exceeded timeout of {timeout} seconds"
         except Exception as exc:
             status = "failed"
-            failure_kind = "bridge_exception"
+            failure_kind = getattr(exc, "classification", "bridge_exception")
             failure_msg = str(exc)
 
         return LaunchOutcome(

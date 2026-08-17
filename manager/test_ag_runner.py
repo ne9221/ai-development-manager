@@ -94,7 +94,15 @@ class TestAgRunnerRouter(unittest.TestCase):
             self.runner.prepare(req)
         self.assertEqual(ctx.exception.classification, "live_ide_not_found")
 
-    def test_hybrid_auto_selects_live_ide_when_alive(self):
+    def test_forced_live_ide_mode_when_transport_unavailable_raises(self):
+        self.mock_bridge.is_alive.return_value = True
+        self.mock_bridge.prepare.side_effect = AgLaunchError("live_ide_transport_unavailable", "no IPC transport")
+        req = LaunchRequest(working_directory="/test", force_mode="live_ide")
+        with self.assertRaises(AgLaunchError) as ctx:
+            self.runner.prepare(req)
+        self.assertEqual(ctx.exception.classification, "live_ide_transport_unavailable")
+
+    def test_hybrid_auto_selects_live_ide_when_transport_ready(self):
         self.mock_bridge.is_alive.return_value = True
         req = LaunchRequest(working_directory="/test")
         self.mock_bridge.prepare.return_value = PreparedLaunch(
@@ -115,7 +123,30 @@ class TestAgRunnerRouter(unittest.TestCase):
         )
         prep = self.runner.prepare(req)
         self.assertEqual(prep.mode, "headless")
+        self.assertEqual(self.runner.last_fallback_reason, "live_ide_not_found")
         self.mock_headless.prepare.assert_called_once_with(req)
+
+    def test_hybrid_auto_fallbacks_to_headless_when_transport_unavailable(self):
+        self.mock_bridge.is_alive.return_value = True
+        self.mock_bridge.prepare.side_effect = AgLaunchError("live_ide_transport_unavailable", "no IPC transport")
+        req = LaunchRequest(working_directory="/test")
+        self.mock_headless.prepare.return_value = PreparedLaunch(
+            thread_id="ag-h3", session_path=None, pid=401, process_creation_identity="h3",
+            prepared_at="2026-08-17T00:00:00Z", mode="headless", _target=None, _request=req,
+        )
+        prep = self.runner.prepare(req)
+        self.assertEqual(prep.mode, "headless")
+        self.assertEqual(self.runner.last_fallback_reason, "live_ide_transport_unavailable")
+        self.mock_headless.prepare.assert_called_once_with(req)
+
+    def test_hybrid_auto_does_not_swallow_unexpected_critical_errors(self):
+        self.mock_bridge.is_alive.return_value = True
+        self.mock_bridge.prepare.side_effect = AgLaunchError("security_denied", "Unauthorized token")
+        req = LaunchRequest(working_directory="/test")
+        with self.assertRaises(AgLaunchError) as ctx:
+            self.runner.prepare(req)
+        self.assertEqual(ctx.exception.classification, "security_denied")
+        self.mock_headless.prepare.assert_not_called()
 
     def test_start_and_wait_delegates_by_mode(self):
         req = LaunchRequest(working_directory="/test")
