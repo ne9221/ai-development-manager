@@ -55,6 +55,7 @@ SECONDARY_BILLING_ENV_VARS = (
     "VERTEXAI_LOCATION",
     "CLOUDSDK_CORE_PROJECT",
     "CLOUDSDK_AUTH_ACCESS_TOKEN",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
     "CLOUDSDK_CORE_ACCOUNT",
     "CLOUDSDK_CONFIG",
     "CLOUDSDK_BILLING_QUOTA_PROJECT",
@@ -358,10 +359,13 @@ def is_trusted_ag_executable_path(
     extra_trusted_roots: list[Path] | None = None,
 ) -> bool:
     """Verify that an Antigravity official executable resides within a known,
-    trusted vendor installation directory (or explicit trusted test roots).
+    trusted elevation-gated / system-managed vendor installation directory (or
+    explicit trusted test roots).
 
-    Rejects temp directories, arbitrary user folders, git workspaces, and
-    unknown PATH prepends to prevent route spoofing and preserve audit authenticity.
+    Strictly rejects user-writable directories (such as ~/.gemini, %APPDATA%/npm,
+    %LOCALAPPDATA%/Programs, ~/.local/bin, ~/.npm-global), temp directories,
+    arbitrary user profile folders, and unknown PATH prepends to prevent route
+    spoofing and preserve audit authenticity.
     """
     try:
         resolved = Path(path).resolve()
@@ -397,52 +401,59 @@ def is_trusted_ag_executable_path(
         except Exception:
             continue
 
-    trusted_roots: list[Path] = []
-    # 1. Canonical user .gemini root
+    # Reject user-writable directories (user home, APPDATA, LOCALAPPDATA, .gemini, .local, etc.)
+    user_writable_dirs: list[Path] = []
     try:
-        trusted_roots.append(resolve_canonical_gemini_home())
+        user_writable_dirs.append(_safe_home())
+    except Exception:
+        pass
+    for env_k in ("APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOME"):
+        v = os.environ.get(env_k)
+        if v:
+            try:
+                user_writable_dirs.append(Path(v).resolve())
+            except Exception:
+                pass
+    try:
+        user_writable_dirs.append(resolve_canonical_gemini_home())
     except Exception:
         pass
 
-    # 2. LocalAppData / AppData npm / ProgramFiles on Windows
-    for env_var, sub_path in (
-        ("LOCALAPPDATA", "Programs"),
-        ("APPDATA", "npm"),
-        ("ProgramFiles", ""),
-        ("ProgramFiles(x86)", ""),
+    for udir in user_writable_dirs:
+        try:
+            norm_u = os.path.normcase(os.path.normpath(str(Path(udir).resolve())))
+            if resolved_str == norm_u or resolved_str.startswith(norm_u + os.sep):
+                return False
+        except Exception:
+            continue
+
+    trusted_system_roots: list[Path] = []
+
+    # 1. System / ProgramFiles on Windows (elevation-gated)
+    for env_var in (
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "SystemRoot",
+        "WINDIR",
     ):
         base = os.environ.get(env_var)
         if base:
             try:
-                cand_root = (Path(base) / sub_path).resolve() if sub_path else Path(base).resolve()
-                trusted_roots.append(cand_root)
+                cand_root = Path(base).resolve()
+                trusted_system_roots.append(cand_root)
             except Exception:
                 pass
 
-    # 3. Standard POSIX vendor / system paths
-    for posix_path in ("/usr/local", "/usr", "/opt", "/Applications"):
+    # 2. Standard POSIX vendor / system paths (elevation-gated)
+    for posix_path in ("/usr/local", "/usr", "/opt", "/Applications", "/Library"):
         try:
             p = Path(posix_path).resolve()
-            trusted_roots.append(p)
+            trusted_system_roots.append(p)
         except Exception:
             pass
 
-    try:
-        home_local = (_safe_home() / ".local" / "bin").resolve()
-        trusted_roots.append(home_local)
-        home_npm = (_safe_home() / ".npm-global").resolve()
-        trusted_roots.append(home_npm)
-    except Exception:
-        pass
-
-    if extra_trusted_roots:
-        for r in extra_trusted_roots:
-            try:
-                trusted_roots.append(Path(r).resolve())
-            except Exception:
-                pass
-
-    for root in trusted_roots:
+    for root in trusted_system_roots:
         try:
             norm_root = os.path.normcase(os.path.normpath(str(root.resolve())))
             if resolved_str == norm_root or resolved_str.startswith(norm_root + os.sep):
@@ -457,56 +468,60 @@ def resolve_ag_official_cli_executable(
     explicit: str | None = None,
     extra_trusted_roots: list[Path] | None = None,
 ) -> tuple[str, list[str]]:
-    """Locate ONLY a verified standalone `agy` Antigravity CLI executable from
-    a canonical trusted installation root.
+    r"""Locate ONLY a verified standalone `agy` Antigravity CLI executable from
+    a canonical trusted elevation-gated system/vendor installation root.
 
-    This is the AG_OFFICIAL_CLI route. It strictly rejects unverified binaries
-    from temp or arbitrary PATH folders, and does NOT accept `agentapi`, the
-    bundled `language_server` + `agentapi` combo, or the generic `gemini` CLI.
-    If no verified standalone `agy` in a trusted root is found, fails closed
+    This is the AG_OFFICIAL_CLI route. It strictly rejects user-writable directories
+    (%APPDATA%
+pm, %LOCALAPPDATA%\Programs, ~/.gemini, ~/.local/bin), temp folders,
+    arbitrary user directories, and unverified PATH folders. Does NOT accept `agentapi`,
+    the bundled `language_server` + `agentapi` combo, or generic `gemini` CLI.
+    If no verified standalone `agy` in a trusted system root is found, fails closed
     with `route_unavailable`.
     """
     if explicit:
         path = shutil.which(explicit) or (explicit if Path(explicit).is_file() else None)
         if path and is_trusted_ag_executable_path(path, extra_trusted_roots=extra_trusted_roots):
             return str(Path(path).resolve()), []
-        raise AgLaunchError("route_unavailable", f"Explicit Antigravity official CLI executable is not trusted or not found: {explicit}")
+        raise AgLaunchError(
+            "route_unavailable",
+            f"Explicit Antigravity official CLI executable is not trusted or not found: {explicit}",
+        )
 
-    env_bin = os.environ.get("AGY_BIN")
+    env_bin = os.environ.get("AGY_OFFICIAL_BIN") or os.environ.get("ANTIGRAVITY_OFFICIAL_BIN") or os.environ.get("AGY_BIN")
     if env_bin:
         path = shutil.which(env_bin) or (env_bin if Path(env_bin).is_file() else None)
         if path and is_trusted_ag_executable_path(path, extra_trusted_roots=extra_trusted_roots):
             return str(Path(path).resolve()), []
 
-    # 1. Search canonical .gemini and known installation locations first
-    gemini_home = resolve_canonical_gemini_home()
-    for sub in (
-        "antigravity-ide/bin/agy.cmd",
-        "antigravity-ide/bin/agy.bat",
-        "antigravity-ide/bin/agy.exe",
-        "antigravity-ide/bin/agy",
-        "antigravity/bin/agy.cmd",
-        "antigravity/bin/agy.bat",
-        "antigravity/bin/agy.exe",
-        "antigravity/bin/agy",
-        "bin/agy.cmd",
-        "bin/agy.bat",
-        "bin/agy.exe",
-        "bin/agy",
+    # 1. Search known trusted system vendor installation locations
+    system_candidates: list[Path] = []
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        base = os.environ.get(env_var)
+        if base:
+            for sub in (
+                "Google/Antigravity/bin/agy.exe",
+                "Google/Antigravity/bin/agy.cmd",
+                "Google/Antigravity/bin/agy.bat",
+                "Antigravity/bin/agy.exe",
+                "Antigravity/bin/agy.cmd",
+                "Antigravity/bin/agy.bat",
+            ):
+                system_candidates.append(Path(base) / sub)
+
+    for posix_sub in (
+        "/usr/local/bin/agy",
+        "/usr/bin/agy",
+        "/opt/google/antigravity/bin/agy",
+        "/opt/antigravity/bin/agy",
     ):
-        cand = gemini_home / sub
+        system_candidates.append(Path(posix_sub))
+
+    for cand in system_candidates:
         if cand.is_file() and is_trusted_ag_executable_path(cand, extra_trusted_roots=extra_trusted_roots):
             return str(cand.resolve()), []
 
-    # 2. Check npm global installation in AppData
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        for npm_name in ("agy.cmd", "agy.bat", "agy.exe", "agy"):
-            npm_cand = Path(appdata) / "npm" / npm_name
-            if npm_cand.is_file() and is_trusted_ag_executable_path(npm_cand, extra_trusted_roots=extra_trusted_roots):
-                return str(npm_cand.resolve()), []
-
-    # 3. Check system PATH only if resolved binary is in a verified trusted root
+    # 2. Check system PATH only if resolved binary is in a verified trusted system root
     names = ("agy.exe", "agy.cmd", "agy.bat", "agy") if os.name == "nt" else ("agy",)
     for name in names:
         found = shutil.which(name)
@@ -605,12 +620,25 @@ def resolve_ag_cli_executable(explicit: str | None = None) -> tuple[str, list[st
     raise AgLaunchError("executable_not_found", "Official Antigravity CLI executable (agentapi/agy) was not found")
 
 
-# exit_code == 0 is not sufficient proof of success: a "result"-shaped event
-# or plain accumulated output can still carry an auth/quota failure. These
-# markers catch that masked-failure case so it normalizes to FAILED instead
-# of a false COMPLETED.
+def _extract_all_strings(obj: Any) -> list[str]:
+    """Recursively extract all string / scalar representations from nested dicts/lists."""
+    results: list[str] = []
+    if isinstance(obj, str):
+        results.append(obj)
+    elif isinstance(obj, (int, float, bool)):
+        results.append(str(obj))
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            results.extend(_extract_all_strings(v))
+        for k in obj.keys():
+            results.append(str(k))
+    elif isinstance(obj, (list, tuple, set)):
+        for item in obj:
+            results.extend(_extract_all_strings(item))
+    return results
+
+
 _MASKED_FAILURE_STATUS_VALUES = {"error", "failed", "failure"}
-_MASKED_FAILURE_PHRASES = ("quota exceeded", "unauthorized")
 
 
 def _detect_masked_failure(raw_event: dict[str, Any] | None, text: str = "") -> tuple[str, str] | None:
@@ -624,21 +652,34 @@ def _detect_masked_failure(raw_event: dict[str, Any] | None, text: str = "") -> 
         if status in _MASKED_FAILURE_STATUS_VALUES:
             detail = raw_event.get("message") or raw_event.get("response") or status
             return (str(raw_event.get("code") or f"status_{status}"), str(detail))
-        if raw_event.get("error"):
-            return (str(raw_event.get("code") or "provider_error"), str(raw_event["error"]))
         if raw_event.get("unauthorized") is True:
             return ("unauthorized", str(raw_event.get("message") or "Unauthorized"))
-        candidate_texts.extend(str(v) for v in raw_event.values() if isinstance(v, (str, int, float)))
+        candidate_texts.extend(_extract_all_strings(raw_event))
 
-    lowered_newline = "\n".join(candidate_texts).lower()
-    lowered_single_space = " ".join(" ".join(candidate_texts).split()).lower()
+    all_raw_text = "\n".join(candidate_texts)
+    lowered_newline = all_raw_text.lower()
 
-    for phrase in _MASKED_FAILURE_PHRASES:
-        if phrase in lowered_newline or phrase in lowered_single_space:
-            return (
-                phrase.replace(" ", "_"),
-                f"Detected '{phrase}' in provider output despite exit_code 0 / success-shaped payload",
-            )
+    # Normalize punctuation and whitespace (e.g. "quota: exceeded", "quota-exceeded", "quota_exceeded")
+    normalized_spaced = re.sub(r"[\W_]+", " ", lowered_newline)
+    lowered_single_space = " ".join(normalized_spaced.split())
+
+    # Check for quota exceeded patterns (including 2-way, 3-way, split)
+    if re.search(r"\bquota\s+(?:has\s+been\s+|is\s+|limit\s+)?exceeded\b", lowered_single_space):
+        return (
+            "quota_exceeded",
+            "Detected 'quota exceeded' in provider output despite exit_code 0 / success-shaped payload",
+        )
+
+    # Check for unauthorized / unauthenticated patterns
+    if re.search(r"\b(?:unauthorized|unauthenticated)\b", lowered_single_space):
+        return (
+            "unauthorized",
+            "Detected 'unauthorized' in provider output despite exit_code 0 / success-shaped payload",
+        )
+
+    if isinstance(raw_event, dict) and raw_event.get("error"):
+        return (str(raw_event.get("code") or "provider_error"), str(raw_event["error"]))
+
     return None
 
 

@@ -674,5 +674,202 @@ class TestAdvR3MaskedFailureSplitFields(unittest.TestCase):
         self.assertIsNone(outcome.failure_classification)
 
 
+
+class TestAdvR4TrustedRootEnforcement(unittest.TestCase):
+    """Adversarial regression suite for R4 P1-A: Trusted-root allowlist enforcement."""
+
+    def test_r4_fake_agy_in_appdata_npm_rejected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            appdata_dir = Path(td) / "AppData" / "Roaming"
+            npm_dir = appdata_dir / "npm"
+            npm_dir.mkdir(parents=True)
+            fake_agy = npm_dir / ("agy.cmd" if os.name == "nt" else "agy")
+            fake_agy.write_text("@echo fake agy in npm", encoding="utf-8")
+
+            with patch.dict(os.environ, {"APPDATA": str(appdata_dir)}, clear=False), \
+                 patch("shutil.which", return_value=str(fake_agy)):
+                with self.assertRaises(AgLaunchError) as ctx:
+                    resolve_ag_official_cli_executable()
+                self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+    def test_r4_fake_agy_in_localappdata_programs_rejected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            local_appdata = Path(td) / "AppData" / "Local"
+            programs_dir = local_appdata / "Programs"
+            programs_dir.mkdir(parents=True)
+            fake_agy = programs_dir / ("agy.exe" if os.name == "nt" else "agy")
+            fake_agy.write_text("fake binary in localappdata", encoding="utf-8")
+
+            with patch.dict(os.environ, {"LOCALAPPDATA": str(local_appdata)}, clear=False), \
+                 patch("shutil.which", return_value=str(fake_agy)):
+                with self.assertRaises(AgLaunchError) as ctx:
+                    resolve_ag_official_cli_executable()
+                self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+    def test_r4_fake_agy_in_gemini_home_rejected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            gemini_home = Path(td) / ".gemini"
+            bin_dir = gemini_home / "antigravity-ide" / "bin"
+            bin_dir.mkdir(parents=True)
+            fake_agy = bin_dir / ("agy.cmd" if os.name == "nt" else "agy")
+            fake_agy.write_text("@echo fake agy in gemini home", encoding="utf-8")
+
+            with patch("manager.ag_cli_runner.resolve_canonical_gemini_home", return_value=gemini_home), \
+                 patch("shutil.which", return_value=str(fake_agy)):
+                with self.assertRaises(AgLaunchError) as ctx:
+                    resolve_ag_official_cli_executable()
+                self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+    def test_r4_arbitrary_path_fake_rejected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            fake_dir = Path(td) / "user_custom_bin"
+            fake_dir.mkdir(parents=True)
+            fake_agy = fake_dir / ("agy.exe" if os.name == "nt" else "agy")
+            fake_agy.write_text("fake binary", encoding="utf-8")
+
+            with patch("shutil.which", return_value=str(fake_agy)), \
+                 patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(AgLaunchError) as ctx:
+                    resolve_ag_official_cli_executable()
+                self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+    def test_r4_remaining_trusted_system_root_mock_accepted(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sys_root = Path(td) / "ProgramFiles"
+            sys_root.mkdir(parents=True)
+            valid_agy = sys_root / ("agy.exe" if os.name == "nt" else "agy")
+            valid_agy.write_text("valid system binary", encoding="utf-8")
+
+            path, prefix = resolve_ag_official_cli_executable(
+                explicit=str(valid_agy),
+                extra_trusted_roots=[sys_root],
+            )
+            self.assertEqual(path, str(valid_agy.resolve()))
+            self.assertEqual(prefix, [])
+
+    def test_r4_unverified_executable_never_tagged_official_cli(self):
+        runner = OfficialAgCliRunner(auth_verifier=lambda: "verified")
+        with patch("shutil.which", return_value="/untrusted/user/bin/agy"), \
+             patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(AgLaunchError) as ctx:
+                runner.prepare(LaunchRequest(working_directory="."))
+            self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+
+class TestAdvR4CloudsdkAccessTokenFileSanitization(unittest.TestCase):
+    """Adversarial regression suite for R4 P1-B: CLOUDSDK_AUTH_ACCESS_TOKEN_FILE sanitization."""
+
+    def test_r4_cloudsdk_auth_access_token_file_stripped(self):
+        dirty_env = {
+            "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE": "/path/to/untrusted/token.json",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": "untrusted-token-value",
+            "CLOUDSDK_CORE_ACCOUNT": "untrusted@attacker.com",
+            "CLOUDSDK_CONFIG": "/path/to/untrusted/gcloud/config",
+            "SAFE_SYSTEM_VAR": "preserved",
+        }
+        clean_env = sanitize_ag_environment(dirty_env)
+        self.assertNotIn("CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", clean_env)
+        self.assertNotIn("CLOUDSDK_AUTH_ACCESS_TOKEN", clean_env)
+        self.assertNotIn("CLOUDSDK_CORE_ACCOUNT", clean_env)
+        self.assertNotIn("CLOUDSDK_CONFIG", clean_env)
+        self.assertEqual(clean_env.get("SAFE_SYSTEM_VAR"), "preserved")
+
+    def test_r4_cloudsdk_auth_access_token_file_not_reintroduced_in_spawn(self):
+        mock_resolver = lambda: ("/opt/bin/agy", [])
+        mock_auth = lambda: "verified"
+        runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
+        req = LaunchRequest(working_directory=".")
+        prepared = runner.prepare(req)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 4321
+        mock_proc.stdout.readline.side_effect = [""]
+        mock_proc.stderr.readline.side_effect = [""]
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        with patch.dict(os.environ, {"CLOUDSDK_AUTH_ACCESS_TOKEN_FILE": "/tmp/secret_token.json"}):
+            with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+                runner.start(prepared, "run prompt")
+                called_env = mock_popen.call_args[1].get("env", {})
+                self.assertNotIn("CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", called_env)
+
+    def test_r4_all_secondary_billing_vars_stripped_without_regression(self):
+        from manager.ag_cli_runner import SECONDARY_BILLING_ENV_VARS
+
+        self.assertIn("CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", SECONDARY_BILLING_ENV_VARS)
+        self.assertIn("CLOUDSDK_AUTH_ACCESS_TOKEN", SECONDARY_BILLING_ENV_VARS)
+        self.assertIn("CLOUDSDK_CORE_ACCOUNT", SECONDARY_BILLING_ENV_VARS)
+        self.assertIn("CLOUDSDK_CONFIG", SECONDARY_BILLING_ENV_VARS)
+        self.assertIn("CLOUDSDK_BILLING_QUOTA_PROJECT", SECONDARY_BILLING_ENV_VARS)
+        self.assertIn("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", SECONDARY_BILLING_ENV_VARS)
+        self.assertIn("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", SECONDARY_BILLING_ENV_VARS)
+        self.assertIn("GOOGLE_CLOUD_QUOTA_PROJECT", SECONDARY_BILLING_ENV_VARS)
+
+
+class TestAdvR4MaskedFailureParser(unittest.TestCase):
+    """Adversarial regression suite for R4 P2: Enhanced Masked Failure Parser."""
+
+    def _run_with_stdout_lines(self, lines):
+        mock_resolver = lambda: ("/opt/bin/agentapi", [])
+        runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=lambda: "verified")
+        req = LaunchRequest(working_directory=".")
+        prepared = runner.prepare(req)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 9999
+        mock_proc.stdout.readline.side_effect = [*lines, ""]
+        mock_proc.stderr.readline.side_effect = [""]
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            running = runner.start(prepared, "run task")
+            return runner.wait(running)
+
+    def test_r4_nested_dict_and_list_quota_exceeded_detected(self):
+        payload = {
+            "level1": {
+                "details": [
+                    {"code": 429, "type": "quota", "message": "exceeded by caller"}
+                ]
+            }
+        }
+        outcome = self._run_with_stdout_lines([json.dumps(payload) + "\n"])
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.failure_classification, "quota_exceeded")
+
+    def test_r4_punctuation_split_quota_exceeded_detected(self):
+        for val in ["quota:exceeded", "quota-exceeded", "quota_exceeded", "quota / exceeded"]:
+            payload = {"error_reason": val}
+            outcome = self._run_with_stdout_lines([json.dumps(payload) + "\n"])
+            self.assertEqual(outcome.status, "failed", f"Failed to detect {val}")
+            self.assertEqual(outcome.failure_classification, "quota_exceeded", f"Failed classification on {val}")
+
+    def test_r4_three_way_split_quota_exceeded_detected(self):
+        for phrase in ["quota limit exceeded", "quota has been exceeded", "quota is exceeded"]:
+            payload = {"message": phrase}
+            outcome = self._run_with_stdout_lines([json.dumps(payload) + "\n"])
+            self.assertEqual(outcome.status, "failed", f"Failed to detect {phrase}")
+            self.assertEqual(outcome.failure_classification, "quota_exceeded")
+
+    def test_r4_unauthorized_detected_without_substring_false_positive(self):
+        # Detected unauthorized
+        unauth_payload = {"error": "unauthorized access attempt"}
+        outcome = self._run_with_stdout_lines([json.dumps(unauth_payload) + "\n"])
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.failure_classification, "unauthorized")
+
+        # Benign word containing 'author' should NOT fail
+        benign_payload = {"status": "ok", "author": "John Doe", "authority": "standard"}
+        outcome2 = self._run_with_stdout_lines([json.dumps(benign_payload) + "\n"])
+        self.assertEqual(outcome2.status, "completed")
+        self.assertIsNone(outcome2.failure_classification)
+
 if __name__ == "__main__":
     unittest.main()
