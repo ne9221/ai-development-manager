@@ -3,12 +3,14 @@
 import json
 import subprocess
 import unittest
-from unittest.mock import MagicMock, patch
+from pathlib import Path
+from unittest.mock import MagicMock, mock_open, patch
 
 from manager.ag_cli_runner import (
     AgCliProcess,
     OfficialAgCliRunner,
     resolve_ag_cli_executable,
+    resolve_ag_official_cli_executable,
     sanitize_ag_environment,
     verify_auth_identity,
 )
@@ -16,31 +18,45 @@ from manager.ag_runner import AgLaunchError, LaunchRequest, normalize_event
 
 
 class TestOfficialAgCliRunner(unittest.TestCase):
-    @patch("pathlib.Path.is_dir")
-    @patch("pathlib.Path.is_file")
-    def test_verify_auth_identity_success_with_local_profile(self, mock_is_file, mock_is_dir):
-        mock_is_dir.return_value = True
-        mock_is_file.return_value = False
+    @patch("manager.ag_cli_runner._cli_auth_status_check", return_value=False)
+    @patch("pathlib.Path.is_file", return_value=True)
+    @patch("pathlib.Path.open", new_callable=mock_open, read_data=json.dumps({"access_token": "ya29.fake-token"}))
+    def test_verify_auth_identity_success_with_parsed_credential_token(self, mock_file_open, mock_is_file, mock_cli_check):
         identity = verify_auth_identity()
         self.assertEqual(identity, "local_google_account_profile")
 
+    @patch("manager.ag_cli_runner._cli_auth_status_check", return_value=True)
+    @patch("pathlib.Path.is_file", return_value=False)
+    def test_verify_auth_identity_success_via_cli_auth_status(self, mock_is_file, mock_cli_check):
+        identity = verify_auth_identity()
+        self.assertEqual(identity, "official_cli_auth_status")
+
+    @patch("manager.ag_cli_runner._cli_auth_status_check", return_value=False)
+    @patch("pathlib.Path.is_dir", return_value=True)
+    @patch("pathlib.Path.is_file", return_value=False)
+    def test_verify_auth_identity_fails_closed_on_empty_directory(self, mock_is_file, mock_is_dir, mock_cli_check):
+        # A config/profile *directory* existing (but no parseable token file,
+        # and no verified CLI auth-status) must NOT be accepted as proof.
+        with self.assertRaises(AgLaunchError) as ctx:
+            verify_auth_identity()
+        self.assertEqual(ctx.exception.classification, "unverified_identity")
+        self.assertIn("Fail closed", ctx.exception.detail)
+
     @patch.dict("os.environ", {}, clear=True)
-    @patch("pathlib.Path.is_dir")
-    @patch("pathlib.Path.is_file")
-    def test_verify_auth_identity_fail_closed_when_unproven(self, mock_is_file, mock_is_dir):
-        mock_is_dir.return_value = False
-        mock_is_file.return_value = False
+    @patch("manager.ag_cli_runner._cli_auth_status_check", return_value=False)
+    @patch("pathlib.Path.is_dir", return_value=False)
+    @patch("pathlib.Path.is_file", return_value=False)
+    def test_verify_auth_identity_fail_closed_when_unproven(self, mock_is_file, mock_is_dir, mock_cli_check):
         with self.assertRaises(AgLaunchError) as ctx:
             verify_auth_identity()
         self.assertEqual(ctx.exception.classification, "unverified_identity")
         self.assertIn("Fail closed", ctx.exception.detail)
 
     @patch.dict("os.environ", {"GOOGLE_API_KEY": "AIzaSyFakeKeyThirdParty"}, clear=True)
-    @patch("pathlib.Path.is_dir")
-    @patch("pathlib.Path.is_file")
-    def test_verify_auth_identity_fails_closed_when_api_key_without_profile(self, mock_is_file, mock_is_dir):
-        mock_is_dir.return_value = False
-        mock_is_file.return_value = False
+    @patch("manager.ag_cli_runner._cli_auth_status_check", return_value=False)
+    @patch("pathlib.Path.is_dir", return_value=False)
+    @patch("pathlib.Path.is_file", return_value=False)
+    def test_verify_auth_identity_fails_closed_when_api_key_without_profile(self, mock_is_file, mock_is_dir, mock_cli_check):
         with self.assertRaises(AgLaunchError) as ctx:
             verify_auth_identity()
         self.assertEqual(ctx.exception.classification, "unverified_identity")
@@ -53,9 +69,15 @@ class TestOfficialAgCliRunner(unittest.TestCase):
             "GEMINI_API_KEY": "secret-gemini-key",
             "VERTEX_PROJECT": "my-vertex-proj",
             "GOOGLE_CLOUD_PROJECT": "gcp-proj",
+            "GCLOUD_PROJECT": "gcp-proj-legacy",
             "GCP_PROJECT": "gcp-proj-2",
+            "GOOGLE_CLOUD_LOCATION": "us-central1",
             "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/sa.json",
             "GOOGLE_GENAI_USE_VERTEXAI": "1",
+            "VERTEXAI_PROJECT": "vertex-proj",
+            "VERTEXAI_LOCATION": "us-central1",
+            "CLOUDSDK_CORE_PROJECT": "cloudsdk-proj",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": "fake-access-token",
             "SAFE_ENV_VAR": "keep-me",
         }
         clean_env = sanitize_ag_environment(dirty_env)
@@ -63,11 +85,31 @@ class TestOfficialAgCliRunner(unittest.TestCase):
         self.assertNotIn("GEMINI_API_KEY", clean_env)
         self.assertNotIn("VERTEX_PROJECT", clean_env)
         self.assertNotIn("GOOGLE_CLOUD_PROJECT", clean_env)
+        self.assertNotIn("GCLOUD_PROJECT", clean_env)
         self.assertNotIn("GCP_PROJECT", clean_env)
-        self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", clean_env)
+        self.assertNotIn("GOOGLE_CLOUD_LOCATION", clean_env)
         self.assertNotIn("GOOGLE_GENAI_USE_VERTEXAI", clean_env)
+        self.assertNotIn("VERTEXAI_PROJECT", clean_env)
+        self.assertNotIn("VERTEXAI_LOCATION", clean_env)
+        self.assertNotIn("CLOUDSDK_CORE_PROJECT", clean_env)
+        self.assertNotIn("CLOUDSDK_AUTH_ACCESS_TOKEN", clean_env)
+        # GOOGLE_APPLICATION_CREDENTIALS is overridden (not merely removed)
+        # to a guaranteed-nonexistent sentinel path, so ADC discovery fails
+        # closed instead of silently falling through to gcloud SDK / GCE
+        # metadata credentials.
+        self.assertNotEqual(clean_env["GOOGLE_APPLICATION_CREDENTIALS"], "/path/to/sa.json")
+        self.assertFalse(Path(clean_env["GOOGLE_APPLICATION_CREDENTIALS"]).exists())
         self.assertEqual(clean_env["SAFE_ENV_VAR"], "keep-me")
         self.assertEqual(clean_env["PATH"], "/bin:/usr/bin")
+
+    def test_sanitize_ag_environment_does_not_strip_unrelated_provider_keys(self):
+        # OPENAI_API_KEY / ANTHROPIC_API_KEY do not participate in
+        # Google/Vertex billing-route selection, so they are out of scope
+        # for this billing-isolation gate.
+        dirty_env = {"OPENAI_API_KEY": "sk-fake", "ANTHROPIC_API_KEY": "sk-ant-fake"}
+        clean_env = sanitize_ag_environment(dirty_env)
+        self.assertEqual(clean_env["OPENAI_API_KEY"], "sk-fake")
+        self.assertEqual(clean_env["ANTHROPIC_API_KEY"], "sk-ant-fake")
 
     @patch("shutil.which")
     def test_resolve_ag_cli_executable_raises_when_missing(self, mock_which):
@@ -76,6 +118,34 @@ class TestOfficialAgCliRunner(unittest.TestCase):
             with self.assertRaises(AgLaunchError) as ctx:
                 resolve_ag_cli_executable()
             self.assertEqual(ctx.exception.classification, "executable_not_found")
+
+    @patch("shutil.which")
+    def test_resolve_ag_official_cli_executable_raises_route_unavailable_when_missing(self, mock_which):
+        mock_which.return_value = None
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(AgLaunchError) as ctx:
+                resolve_ag_official_cli_executable()
+            self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+    @patch("shutil.which")
+    def test_resolve_ag_official_cli_executable_ignores_agentapi_and_gemini(self, mock_which):
+        # Only a standalone `agy` counts -- agentapi/gemini being on PATH
+        # must not make AG_OFFICIAL_CLI look available.
+        mock_which.side_effect = lambda name: (
+            "/usr/local/bin/agentapi" if name == "agentapi" else ("/usr/local/bin/gemini" if name == "gemini" else None)
+        )
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(AgLaunchError) as ctx:
+                resolve_ag_official_cli_executable()
+            self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+    @patch("shutil.which")
+    def test_resolve_ag_official_cli_executable_finds_standalone_agy(self, mock_which):
+        mock_which.side_effect = lambda name: "/usr/local/bin/agy" if name == "agy" else None
+        with patch.dict("os.environ", {}, clear=True):
+            path, prefix = resolve_ag_official_cli_executable()
+            self.assertIn("agy", path)
+            self.assertEqual(prefix, [])
 
     @patch("shutil.which")
     def test_resolve_ag_cli_executable_finds_in_path(self, mock_which):
