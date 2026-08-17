@@ -9,6 +9,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 from collectors.publish_drive import build_service
+from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_identity_state
 from manager.execution_lifecycle import terminalize_execution
 from manager.execution_runner import launch_task
@@ -87,19 +88,43 @@ def session_center_healthy(url=None, timeout=2.0):
     return isinstance(body, dict) and body.get("status") == "ok"
 
 
-def codex_quota_reliable(service):
+def provider_quota_reliable(service, provider):
     """Fail-closed: stale/unknown/unreachable quota is never treated as
-    "enough to launch". This reuses quota_reader.summarize()'s own
-    reliability computation unchanged -- no scoring/routing rework, just a
-    pre-launch gate on the same has_reliable_quota signal dispatch() already
-    computes but does not itself hard-block on.
+    "enough to launch", for any provider. Reuses quota_reader.summarize()'s
+    own reliability computation unchanged -- no scoring/routing rework, just
+    a pre-launch gate on the same has_reliable_quota signal dispatch()
+    already computes but does not itself hard-block on. A provider's
+    has_reliable_quota is read from that provider's own quota_reader entry
+    only; one provider's fresh quota can never satisfy another's gate.
     """
     try:
         quota = summarize(read_drive_status(service=service), max_age_minutes=60)
     except Exception:
         return False
-    codex = next((provider for provider in quota["providers"] if provider["provider"] == "codex"), None)
-    return bool(codex and codex.get("has_reliable_quota"))
+    entry = next((item for item in quota["providers"] if item["provider"] == provider), None)
+    return bool(entry and entry.get("has_reliable_quota"))
+
+
+def codex_quota_reliable(service):
+    return provider_quota_reliable(service, "codex")
+
+
+def claude_quota_reliable(service):
+    return provider_quota_reliable(service, "claude")
+
+
+# provider -> {launcher_factory, quota_check}. An unrecognized provider must
+# never fall back to Codex's (or any other provider's) launcher or quota
+# gate -- resolve_provider_runtime() returns None for it, which callers treat
+# as an unconditional reject.
+PROVIDER_RUNTIMES = {
+    "codex": {"launcher_factory": CodexLauncher, "quota_check": codex_quota_reliable},
+    "claude": {"launcher_factory": ClaudeLauncher, "quota_check": claude_quota_reliable},
+}
+
+
+def resolve_provider_runtime(provider):
+    return PROVIDER_RUNTIMES.get(provider)
 
 
 def _result(status, execution_id_value, session_id=None, error_kind=None):
@@ -266,10 +291,16 @@ def _existing_terminal(store, command):
                      _result(execution["status"], command["execution_id"], execution.get("session_id")))
 
 
-def process_command(store, service, command, launcher_factory=CodexLauncher, writer_factory=GCSLockRegistry.from_environment,
+def process_command(store, service, command, launcher_factory=None, writer_factory=GCSLockRegistry.from_environment,
                     claim_factory=task_claim_registry, allowlist=frozenset(), health_check=session_center_healthy,
-                    quota_check=codex_quota_reliable):
-    """Claim/reconcile one command; a claimed command is never automatically relaunched."""
+                    quota_check=None):
+    """Claim/reconcile one command; a claimed command is never automatically relaunched.
+
+    launcher_factory/quota_check are explicit-override escape hatches (tests
+    use them directly); when not given, both resolve from PROVIDER_RUNTIMES
+    by the command's own provider. An unrecognized provider is rejected here
+    -- it never silently falls back to Codex's launcher or quota gate.
+    """
     try:
         validate("command", command)
     except TaskError:
@@ -280,8 +311,13 @@ def process_command(store, service, command, launcher_factory=CodexLauncher, wri
         # Already-running authority is governed entirely by existing
         # recovery/lifecycle; Session Center health never factors in here.
         return _reconcile_active(store, service, command, claim_factory)
-    if command["status"] != "queued" or command["provider"] != "codex":
+    if command["status"] != "queued":
         return {"status": "rejected"}
+    runtime = resolve_provider_runtime(command["provider"])
+    if runtime is None:
+        return {"status": "rejected", "reason": "unsupported_provider"}
+    launcher_factory = launcher_factory or runtime["launcher_factory"]
+    quota_check = quota_check or runtime["quota_check"]
     if (command["project_id"], command["task_id"]) not in allowlist:
         # Out of scope, not an anomaly: leave the command untouched (no write)
         # so unrelated projects/tasks are never mutated by this watcher.
@@ -324,7 +360,7 @@ def process_command(store, service, command, launcher_factory=CodexLauncher, wri
         retry = ({"retry_count": retry_count, "retry_of_execution_id": retry_of} if retry_count else {})
         outcome = launch_task(store, service, writer_registry, claim_registry, launcher_factory(),
                               claimed["project_id"], claimed["task_id"], claimed["execution_id"], claimed["model"],
-                              on_running=lambda _execution: _write(store, running), **retry)
+                              on_running=lambda _execution: _write(store, running), provider=claimed["provider"], **retry)
         terminal = outcome["terminal"]["execution"]
         dispatch = outcome["dispatch"]
         selected = {**running, "provider": dispatch["provider"], "model": dispatch["model"] or claimed["model"],

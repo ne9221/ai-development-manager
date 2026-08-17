@@ -114,7 +114,8 @@ def decide(state, target):
         return {"action": "noop"}
 
     kill_pid = state_pid if (state_execution_id is not None and verified_alive) else None
-    return {"action": "respawn", "execution_id": wanted, "project_id": target["project_id"], "kill_pid": kill_pid}
+    return {"action": "respawn", "execution_id": wanted, "project_id": target["project_id"],
+            "provider": target.get("provider", "codex"), "kill_pid": kill_pid}
 
 
 def port_available(host, port):
@@ -144,16 +145,21 @@ def kill(pid):
             pass
 
 
-def spawn_session_center(python_exe, repo, project_id, execution_id, port, wait_seconds):
+def spawn_session_center(python_exe, repo, project_id, execution_id, port, wait_seconds, provider="codex"):
     """Start Session Center detached from this (short-lived) process so it
-    survives after this invocation exits."""
+    survives after this invocation exits.
+
+    provider is deterministically known from the target Command already --
+    no Drive/filesystem read needed -- so it can be shown in the
+    PendingCorrelation view immediately, before the Execution's
+    provider_session_id is ever observed."""
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     return subprocess.Popen(
         [python_exe, "-m", "manager.session_center",
          "--execution-project-id", project_id, "--execution-id", execution_id,
-         "--wait-seconds", str(wait_seconds), "--port", str(port)],
+         "--wait-seconds", str(wait_seconds), "--port", str(port), "--provider", provider],
         cwd=repo, creationflags=creationflags, close_fds=True,
     )
 
@@ -188,7 +194,8 @@ def run_once(store, allowlist, state_path, python_exe, repo, port, wait_seconds,
         # as its own. Never spawn a second listener, never guess who it is.
         return {"status": "attention", "reason": "port_occupied_unverified"}
 
-    process = spawn_session_center(python_exe, repo, decision["project_id"], decision["execution_id"], port, wait_seconds)
+    process = spawn_session_center(python_exe, repo, decision["project_id"], decision["execution_id"], port, wait_seconds,
+                                   provider=decision.get("provider", "codex"))
     identity = process_creation_identity(process.pid)
     write_state(state_path, process.pid, decision["execution_id"], identity)
     return {"status": "spawned", "execution_id": decision["execution_id"], "pid": process.pid}

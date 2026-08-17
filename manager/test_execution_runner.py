@@ -4,8 +4,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from manager.claude_launcher import ClaudeLaunchError
 from manager.codex_launcher import CodexLaunchError, LaunchOutcome, LaunchRequest
-from manager.execution_runner import launch_task, run_execution
+from manager.execution_runner import _stopped, launch_task, run_execution
 from manager.task_claims import check_task_execution_claim
 from manager.tasks import TaskError
 from manager.test_execution_lifecycle import build_store, quota_document
@@ -61,6 +62,44 @@ class Launcher:
         if self.close_stops: self.process.live = False
 
 
+class ClaudeStyleLauncher:
+    """A launcher double shaped like ClaudeLauncher: prepare() returns
+    provider_session_id/session_path (not Codex's thread_id/session_path
+    naming), proving run_execution/_session() genuinely accept both via duck
+    typing rather than one launcher's field names happening to work by luck."""
+
+    def __init__(self, outcome="completed", prepare_failure=None):
+        self.outcome, self.prepare_failure = outcome, prepare_failure
+        self.events, self.process, self.prepared = [], Process(), None
+
+    def prepare(self, request):
+        self.events.append("prepare")
+        self.request = request
+        if self.prepare_failure:
+            self.process.live = False
+            raise ClaudeLaunchError("spawn_failed", "raw secret from claude prepare")
+        client = SimpleNamespace(process=self.process)
+        self.prepared = SimpleNamespace(provider_session_id="claude-session-1", session_path="/tmp/claude.jsonl",
+                                        pid=4343, process_creation_identity="test-process:4343",
+                                        prepared_at="2026-08-13T13:00:00Z", _client=client)
+        return self.prepared
+
+    def start(self, prepared, prompt):
+        self.events.append("start")
+        return SimpleNamespace(prepared=prepared, started_at="2026-08-13T13:00:01Z")
+
+    def set_heartbeat(self, running, callback):
+        running.heartbeat = callback
+
+    def wait(self, running):
+        self.events.append("wait")
+        return LaunchOutcome(self.outcome, "claude-session-1", "turn-1", "2026-08-13T13:01:00Z", None, None)
+
+    def close(self, handle):
+        self.events.append("close")
+        self.process.live = False
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -68,8 +107,8 @@ class RunnerTests(unittest.TestCase):
 
     def tearDown(self): self.temp.cleanup()
 
-    def execute(self, read_only=False, launcher=None, store=None):
-        store = store or build_store(read_only=read_only, working_directory=self.request.working_directory)
+    def execute(self, read_only=False, launcher=None, store=None, provider="codex"):
+        store = store or build_store(read_only=read_only, working_directory=self.request.working_directory, provider=provider)
         writer = None if read_only else MemoryRegistry()
         claim = MemoryClaimRegistry()
         launcher = launcher or Launcher()
@@ -78,7 +117,7 @@ class RunnerTests(unittest.TestCase):
              patch("manager.executions.read_drive_status", return_value=quota_document()):
             result = run_execution(store, object(), writer, claim, launcher, "p1", "t1", "exec-a", "secret prompt", self.request,
                                    access="read_only" if read_only else "production_write",
-                                   baseline_head=None if read_only else "a" * 40)
+                                   baseline_head=None if read_only else "a" * 40, provider=provider)
         return store, writer, claim, launcher, result
 
     def test_prepare_link_start_wait_close_order_and_session_readback(self):
@@ -184,6 +223,62 @@ class RunnerTests(unittest.TestCase):
         persisted = repr(store.records)
         for secret in ("secret prompt", "raw secret", "provider detail", "stderr"):
             self.assertNotIn(secret, persisted)
+
+    # -- Claude provider-neutrality proofs (item 11: provider evidence remains "claude") --
+
+    def test_claude_provider_evidence_flows_through_execution_and_session(self):
+        store, _, _, _, result = self.execute(
+            read_only=True, launcher=ClaudeStyleLauncher(), provider="claude",
+            store=build_store(read_only=True, working_directory=self.request.working_directory, provider="claude"),
+        )
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+        execution = store.get("executions", "p1", "exec-a")
+        self.assertEqual("claude", execution["provider"])
+        self.assertEqual("claude-session-1", execution["provider_session_id"])
+        session = result["session"]
+        self.assertEqual("claude:claude-session-1", session["session_id"])
+        self.assertEqual("claude", session["provider"])
+        self.assertEqual("claude-session-1", session["provider_session_id"])
+
+    def test_provider_session_id_accepts_both_thread_id_and_provider_session_id_naming(self):
+        # Codex's PreparedLaunch names this field thread_id; Claude's names it
+        # provider_session_id. Both must resolve to the same downstream identity.
+        codex_store = build_store(read_only=True, working_directory=self.request.working_directory, provider="codex")
+        _, _, _, _, codex_result = self.execute(read_only=True, launcher=Launcher(), store=codex_store, provider="codex")
+        self.assertEqual("codex:thread-1", codex_result["session"]["session_id"])
+
+        claude_store = build_store(read_only=True, working_directory=self.request.working_directory, provider="claude")
+        _, _, _, _, claude_result = self.execute(read_only=True, launcher=ClaudeStyleLauncher(), store=claude_store, provider="claude")
+        self.assertEqual("claude:claude-session-1", claude_result["session"]["session_id"])
+
+    # -- item 9: launcher exception does not create a fake running Execution --
+
+    def test_claude_launcher_prepare_failure_never_leaves_a_fake_running_execution(self):
+        store = build_store(read_only=True, working_directory=self.request.working_directory, provider="claude")
+        launcher = ClaudeStyleLauncher(prepare_failure=True)
+        with self.assertRaises(ClaudeLaunchError):
+            self.execute(read_only=True, launcher=launcher, store=store, provider="claude")
+        execution = store.get("executions", "p1", "exec-a")
+        self.assertNotEqual("running", execution["status"])
+        self.assertEqual("interrupted", execution["status"])
+        self.assertIsNone(launcher.prepared)
+
+    # -- regression coverage for 5d86fcd: _stopped() must duck-type Claude's
+    # PreparedLaunch shape too, not only Codex's _client.process --
+
+    def test_stopped_falls_back_to_process_attribute_when_no_client_is_present(self):
+        # ClaudeLauncher's real PreparedLaunch holds the subprocess directly as
+        # `_process` and has no `_client` field at all (unlike Codex's
+        # app-server-wrapped `_client.process`). Before 5d86fcd, _stopped()
+        # only ever read _client.process and silently returned False forever
+        # for a real Claude execution even after a clean exit, so
+        # terminalize_execution() could never be reached.
+        process = Process()
+        prepared = SimpleNamespace(_process=process)
+        self.assertFalse(hasattr(prepared, "_client"))
+        self.assertFalse(_stopped(prepared))
+        process.live = False
+        self.assertTrue(_stopped(prepared))
 
 
 if __name__ == "__main__":

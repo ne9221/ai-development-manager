@@ -1,10 +1,11 @@
-"""Minimal localhost UI for one live Windows Codex session."""
+"""Minimal localhost UI for one live Windows Codex or Claude session."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -104,6 +105,78 @@ def read_codex_meta(path: Path, provider_session_id: str) -> dict:
     return {"cwd": payload["cwd"], "started_at": record["timestamp"]}
 
 
+def _run_claude_agents_json(executable: str | None = None, timeout: float = 5.0) -> list:
+    """Invoke `claude agents --json` and parse its structured session list.
+    Any failure -- missing executable, nonzero exit, malformed JSON, a
+    non-list result -- raises SessionCenterError so the caller's own bounded
+    polling loop (identical to Codex's) retries rather than treating one
+    failed probe as final.
+    """
+    exe = executable or shutil.which("claude") or shutil.which("claude.exe") or shutil.which("claude.cmd")
+    if not exe:
+        raise SessionCenterError("Claude CLI was not found")
+    try:
+        result = subprocess.run([exe, "agents", "--json"], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SessionCenterError(f"claude agents --json failed to run: {exc}") from exc
+    if result.returncode != 0:
+        raise SessionCenterError(f"claude agents --json exited with code {result.returncode}")
+    try:
+        agents = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise SessionCenterError("claude agents --json returned malformed JSON") from exc
+    if not isinstance(agents, list):
+        raise SessionCenterError("claude agents --json did not return a list")
+    return agents
+
+
+def find_claude_session(provider_session_id: str, executable: str | None = None) -> dict:
+    """Exact-match provider_session_id (the UUID ADM assigned before spawn,
+    via --session-id) against claude agents --json's sessionId field -- the
+    sole identity authority. PID/cwd/startedAt are read back only as
+    corroborating evidence attached to the confirmed match; they are never
+    used to pick among candidates, so a decoy entry sharing this host's cwd
+    or an unrelated agent reusing a PID can never be mistaken for the target."""
+    agents = _run_claude_agents_json(executable)
+    matches = [agent for agent in agents if isinstance(agent, dict) and agent.get("sessionId") == provider_session_id]
+    if len(matches) != 1:
+        raise SessionCenterError(
+            f"expected exactly one Claude agent session for {provider_session_id!r}, found {len(matches)}"
+        )
+    agent = matches[0]
+    for key in ("pid", "cwd", "startedAt"):
+        if key not in agent:
+            raise SessionCenterError(f"claude agents --json entry is missing {key!r}")
+    return agent
+
+
+def read_claude_meta(agent: dict) -> dict:
+    cwd, started_at_ms, pid = agent.get("cwd"), agent.get("startedAt"), agent.get("pid")
+    if not isinstance(cwd, str) or not cwd:
+        raise SessionCenterError("Claude agent entry is missing cwd")
+    if not isinstance(started_at_ms, (int, float)) or isinstance(started_at_ms, bool):
+        raise SessionCenterError("Claude agent entry is missing startedAt")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        raise SessionCenterError("Claude agent entry is missing pid")
+    return {"cwd": cwd, "started_at": utc_iso(started_at_ms / 1000), "pid": pid}
+
+
+def resolve_provider_meta(provider: str, provider_session_id: str) -> dict:
+    """Provider dispatch for locating and reading live provider session
+    evidence: {"cwd", "started_at", "session_file" (Path|None), "pid" (int|None)}.
+    An unrecognized provider fails closed -- it never falls back to Codex's
+    (or any other provider's) resolver."""
+    if provider == "codex":
+        session_file = find_codex_session(provider_session_id)
+        meta = read_codex_meta(session_file, provider_session_id)
+        return {**meta, "session_file": session_file, "pid": None}
+    if provider == "claude":
+        agent = find_claude_session(provider_session_id)
+        meta = read_claude_meta(agent)
+        return {**meta, "session_file": None}
+    raise SessionCenterError(f"unsupported provider for session correlation: {provider!r}")
+
+
 def load_execution(path: Path, provider_session_id: str, provider_cwd: str) -> dict:
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
@@ -161,7 +234,11 @@ def current_branch(cwd: str) -> str | None:
 @dataclass
 class LiveSession:
     provider_session_id: str
-    session_file: Path
+    # None for providers (e.g. Claude) whose transcript path is only
+    # optional advisory corroboration, never the identity authority --
+    # exact provider_session_id match (via find_claude_session) already
+    # confirmed correlation before a LiveSession is ever constructed.
+    session_file: Path | None
     cwd: str
     started_at: str
     project_id: str
@@ -172,16 +249,18 @@ class LiveSession:
     idle_seconds: float = 15.0
     correlated: bool = False
     status_source: Callable[[], str | None] | None = field(default=None, repr=False)
+    pid: int | None = None
+    mode: str | None = None
     _size: int = field(init=False)
     _latest: float = field(default_factory=time.time, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self):
-        self._size = self.session_file.stat().st_size
+        self._size = self.session_file.stat().st_size if self.session_file is not None else 0
 
     def snapshot(self) -> dict:
         now = time.time()
-        size = self.session_file.stat().st_size
+        size = self.session_file.stat().st_size if self.session_file is not None else self._size
         with self._lock:
             if size != self._size:
                 self._size = size
@@ -190,6 +269,10 @@ class LiveSession:
         # Authoritative ADM lifecycle status always wins over transcript
         # activity: an execution can only be "completed"/"failed"/etc. on
         # explicit SSOT evidence, never inferred from transcript inactivity.
+        # Without a transcript file at all (no activity signal to observe),
+        # this authoritative-status path is the *only* source of truth --
+        # the idle/running fallback below degrades to "no observed
+        # activity yet" rather than a meaningful running/waiting distinction.
         authoritative_status = self.status_source() if self.status_source else None
         if authoritative_status in TERMINAL_EXECUTION_STATUSES or authoritative_status == FINISHING:
             current_state = authoritative_status
@@ -201,6 +284,8 @@ class LiveSession:
             "task_id": self.task_id,
             "execution_id": self.execution_id or "UNLINKED",
             "provider_session_id": self.provider_session_id,
+            "pid": self.pid,
+            "mode": self.mode,
             "cwd": self.cwd,
             "branch": self.branch or "—",
             "started_at": self.started_at,
@@ -337,11 +422,16 @@ def _validate_identity_args(args: argparse.Namespace) -> None:
 
 def build_pending(args: argparse.Namespace) -> PendingCorrelation:
     """Fast: figures out the deterministic identity to display while
-    correlating, without touching Drive or the filesystem."""
+    correlating, without touching Drive or the filesystem. provider is
+    already deterministically known from the target Command at spawn time
+    (see session_center_supervisor.spawn_session_center) -- no Drive/
+    filesystem read needed to show it here, same as project_id/task_id/
+    execution_id."""
     _validate_identity_args(args)
+    provider = getattr(args, "provider", None) or "codex"
     if args.execution_project_id:
-        return PendingCorrelation(args.execution_project_id, None, args.execution_id)
-    return PendingCorrelation(args.project_id, args.task_id, None)
+        return PendingCorrelation(args.execution_project_id, None, args.execution_id, provider)
+    return PendingCorrelation(args.project_id, args.task_id, None, provider)
 
 
 def _resolve_execution_mode(args: argparse.Namespace, deadline: float) -> LiveSession:
@@ -352,42 +442,44 @@ def _resolve_execution_mode(args: argparse.Namespace, deadline: float) -> LiveSe
     last_error: SessionCenterError | None = None
     while time.monotonic() < deadline:
         try:
-            session_file = find_codex_session(provider_session_id)
-            meta = read_codex_meta(session_file, provider_session_id)
+            meta = resolve_provider_meta(execution["provider"], provider_session_id)
             execution = validate_execution(execution, provider_session_id, meta["cwd"])
             return LiveSession(
-                provider_session_id, session_file, meta["cwd"], meta["started_at"], execution["project_id"],
+                provider_session_id, meta["session_file"], meta["cwd"], meta["started_at"], execution["project_id"],
                 execution["task_id"], execution["execution_id"], execution["branch"], execution["provider"], args.idle_seconds, True,
                 status_source=drive_status_source(store, execution["project_id"], execution["execution_id"]),
+                pid=meta.get("pid"), mode=execution.get("mode"),
             )
         except SessionCenterError as exc:
             last_error = exc
             time.sleep(.25)
-    raise last_error or SessionCenterError("timed out waiting for the Codex session file")
+    raise last_error or SessionCenterError("timed out waiting for the provider session")
 
 
 def _resolve_provider_session_mode(args: argparse.Namespace, deadline: float) -> LiveSession:
     provider_session_id = args.provider_session_id
+    provider = getattr(args, "provider", None) or "codex"
     last_error: SessionCenterError | None = None
     while time.monotonic() < deadline:
         try:
-            session_file = find_codex_session(provider_session_id)
-            meta = read_codex_meta(session_file, provider_session_id)
+            meta = resolve_provider_meta(provider, provider_session_id)
             if args.execution_file:
                 execution = load_execution(args.execution_file, provider_session_id, meta["cwd"])
                 return LiveSession(
-                    provider_session_id, session_file, meta["cwd"], meta["started_at"], execution["project_id"],
+                    provider_session_id, meta["session_file"], meta["cwd"], meta["started_at"], execution["project_id"],
                     execution["task_id"], execution["execution_id"], execution["branch"], execution["provider"], args.idle_seconds, True,
                     status_source=file_status_source(args.execution_file, provider_session_id, meta["cwd"]),
+                    pid=meta.get("pid"), mode=execution.get("mode"),
                 )
             return LiveSession(
-                provider_session_id, session_file, meta["cwd"], meta["started_at"], args.project_id, args.task_id,
-                None, args.branch or current_branch(meta["cwd"]), "codex", args.idle_seconds, False,
+                provider_session_id, meta["session_file"], meta["cwd"], meta["started_at"], args.project_id, args.task_id,
+                None, args.branch or current_branch(meta["cwd"]), provider, args.idle_seconds, False,
+                pid=meta.get("pid"),
             )
         except SessionCenterError as exc:
             last_error = exc
             time.sleep(.25)
-    raise last_error or SessionCenterError("timed out waiting for the Codex session file")
+    raise last_error or SessionCenterError("timed out waiting for the provider session")
 
 
 def resolve_session(args: argparse.Namespace, deadline: float) -> LiveSession:
@@ -419,6 +511,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--branch")
     result.add_argument("--port", type=int, default=8765)
     result.add_argument("--idle-seconds", type=float, default=15.0)
+    result.add_argument("--provider", default="codex")
     return result
 
 
