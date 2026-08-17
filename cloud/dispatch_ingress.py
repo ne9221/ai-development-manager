@@ -16,22 +16,48 @@ caller's payload), stamped with trusted-ingress evidence
 -- before it will auto-admit the command without a static allowlist entry.
 A caller cannot request anything else: `constraints.read_only: false` is
 rejected outright, and ALLOWED_FIELDS/ALLOWED_CONSTRAINT_FIELDS make it
-impossible to smuggle execution_policies, account_id, or any other field
-into the created record.
+impossible to smuggle execution_policies or any other field into the
+created record.
+
+`provider`/`account_id` are the one deliberate exception: a trusted caller
+may explicitly request a specific provider (and, for Claude, a specific
+named account) instead of letting manager.dispatcher's quota-aware
+auto-selector choose. This is routing evidence, not launch authority --
+launch-time enforcement still lives entirely in manager.command_watcher
+(trusted-ingress admission, the local Claude account registry, the
+launcher's own permission profile). Here the contract is narrower and
+purely about not silently discarding or overriding an explicit request:
+- An explicit provider is passed straight to manager.dispatcher.dispatch()
+  as preferred_provider, which already short-circuits its quota-based
+  recommendation -- it is never downgraded to auto-selection.
+- An explicit account_id is only accepted alongside provider="claude" (the
+  only provider with multiple named accounts in this system) and is
+  rejected up front unless it names a real, enabled entry in the local
+  Claude account registry (CLAUDE_ACCOUNTS_CONFIG) -- fail closed rather
+  than queuing a Command that could only be rejected later at launch time.
+- After dispatch, the resolved provider/account_id are compared back
+  against what was requested; any mismatch fails closed instead of
+  silently substituting a different provider/account. Both the requested
+  and the actually-assigned identity are persisted on the Command record.
 """
 
+import os
 import re
 import time
 
+from manager.claude_account_selector import load_claude_accounts
 from manager.dispatch_requests import claim_dispatch_request
 from manager.dispatcher import dispatch as dispatcher_dispatch
 from manager.tasks import TaskError, now_iso, update_task, validate
 from manager.trusted_ingress import ADMISSION_VERSION, REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN
 
 
-ALLOWED_FIELDS = {"request_id", "project_id", "title", "goal", "priority", "constraints"}
+ALLOWED_FIELDS = {"request_id", "project_id", "title", "goal", "priority", "constraints", "provider", "account_id"}
 ALLOWED_CONSTRAINT_FIELDS = {"read_only"}
 ALLOWED_PRIORITIES = {"low", "normal", "high", "urgent"}
+# Matches schema/command.schema.json's provider enum -- the only providers
+# the Command Watcher can actually launch today.
+ALLOWED_PROVIDERS = {"codex", "claude"}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 MAX_TITLE_LENGTH = 300
 MAX_GOAL_LENGTH = 4000
@@ -87,10 +113,43 @@ def validate_dispatch_payload(payload):
             "read_only_required",
             "direct dispatch ingress v1 only accepts disposable read-only tasks; constraints.read_only must be true or omitted",
         )
+    provider = payload.get("provider")
+    if provider is not None and (not isinstance(provider, str) or provider not in ALLOWED_PROVIDERS):
+        raise DispatchIngressError("malformed_request", f"provider must be one of {sorted(ALLOWED_PROVIDERS)} or omitted")
+    account_id = payload.get("account_id")
+    if account_id is not None:
+        if not isinstance(account_id, str) or not account_id.strip() or len(account_id) > 200:
+            raise DispatchIngressError("malformed_request", "account_id must be a non-empty string (max 200 chars)")
+        if provider != "claude":
+            raise DispatchIngressError(
+                "malformed_request",
+                "account_id requires provider=\"claude\" explicitly (only Claude has multiple named accounts)",
+            )
     return {
         "request_id": request_id, "project_id": project_id, "title": title.strip(),
         "goal": goal.strip(), "priority": priority, "read_only": read_only,
+        "provider": provider, "account_id": account_id,
     }
+
+
+def _claude_account_registry():
+    """Load the Claude account registry from CLAUDE_ACCOUNTS_CONFIG if set,
+    else None -- mirrors manager.command_watcher's own loader exactly (same
+    env var, same "no registry configured" semantics) so an explicit
+    account_id is validated here against the identical source of truth the
+    Command Watcher will independently re-check at launch time."""
+    path = os.environ.get("CLAUDE_ACCOUNTS_CONFIG")
+    return load_claude_accounts(path) if path else None
+
+
+def _account_is_registered_and_enabled(registry, account_id):
+    """True only if a local registry is actually configured and the id
+    names one of its enabled accounts. No registry configured (None) can
+    never validate an explicit id -- fail closed rather than trusting a
+    bare id with nothing to resolve it against."""
+    if registry is None:
+        return False
+    return any(account["account_id"] == account_id and account["enabled"] for account in registry)
 
 
 def _fetch_if_exists(store, area, project_id, name):
@@ -158,6 +217,15 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
     except TaskError as exc:
         raise DispatchIngressError("unknown_project", f"unknown project: {project_id}") from exc
 
+    requested_provider, requested_account_id = clean["provider"], clean["account_id"]
+    if requested_account_id is not None:
+        registry = _claude_account_registry()
+        if not _account_is_registered_and_enabled(registry, requested_account_id):
+            raise DispatchIngressError(
+                "unknown_account",
+                f"unknown or disabled Claude account_id: {requested_account_id}",
+            )
+
     task_id = command_id = f"dispatch-{request_id}"
     try:
         registry = lock_registry_factory(project_id, request_id)
@@ -178,7 +246,31 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
             "goal": clean["goal"], "admission_version": ADMISSION_VERSION,
         },
     }
+    if requested_provider is not None:
+        # preferred_provider short-circuits manager.dispatcher's quota-based
+        # recommendation outright (`selected = request.get("preferred_provider")
+        # or decision["recommended_provider"] or ...`) -- an explicit request
+        # here is never subject to auto-selection.
+        internal_request["preferred_provider"] = requested_provider
+    if requested_account_id is not None:
+        internal_request["account_id"] = requested_account_id
     result = dispatcher_dispatch(store, service, internal_request)
+
+    # Defense in depth: the explicit request was already validated above,
+    # but never trust that dispatcher_dispatch() actually honored it --
+    # fail closed on any mismatch instead of silently persisting a Command
+    # for a different provider/account than what was requested.
+    if requested_provider is not None and result["provider"] != requested_provider:
+        raise DispatchIngressError(
+            "dispatch_state_inconsistent",
+            f"requested provider {requested_provider!r} but dispatcher resolved {result['provider']!r}",
+        )
+    if requested_account_id is not None and result.get("account_id") != requested_account_id:
+        raise DispatchIngressError(
+            "dispatch_state_inconsistent",
+            f"requested account_id {requested_account_id!r} but dispatcher resolved {result.get('account_id')!r}",
+        )
+
     # read_only and execution_policies are forced here, server-side, from
     # the fixed REQUIRED_TASK_POLICIES set -- never from clean/payload --
     # so this Task always satisfies the Safe Auto-Admission policy gate
@@ -190,6 +282,7 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
     command = {
         "command_id": command_id, "project_id": project_id, "task_id": task_id,
         "provider": result["provider"], "account_id": result.get("account_id"),
+        "requested_provider": requested_provider, "requested_account_id": requested_account_id,
         "model": result["model"], "fallback_model": result["fallback_model"],
         "mode": result["mode"], "effort": result["effort"], "selection_reason": result["selection_reason"],
         "quota_evidence": result["quota_evidence"], "created_at": now_iso(), "status": "queued",
