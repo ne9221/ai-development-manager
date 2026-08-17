@@ -19,7 +19,7 @@ from manager.ag_runner import AgLaunchError, LaunchRequest
 class TestAgHeadlessRunner(unittest.TestCase):
     @patch("manager.ag_cli_runner._cli_auth_status_check", return_value=False)
     @patch("pathlib.Path.is_file", return_value=True)
-    @patch("pathlib.Path.open", new_callable=mock_open, read_data=json.dumps({"access_token": "ya29.fake-token"}))
+    @patch("pathlib.Path.open", new_callable=mock_open, read_data=json.dumps({"access_token": "ya29.fake-token", "expiry": "2099-01-01T00:00:00Z"}))
     def test_verify_auth_identity_success_with_parsed_credential_token(self, mock_file_open, mock_is_file, mock_cli_check):
         identity = verify_auth_identity()
         self.assertEqual(identity, "local_google_account_profile")

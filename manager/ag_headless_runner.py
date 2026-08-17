@@ -12,6 +12,7 @@ from manager.ag_cli_runner import (
     AgCliProcess as AgHeadlessProcess,
     OfficialAgCliRunner,
     resolve_ag_cli_executable,
+    resolve_canonical_gemini_home,
     sanitize_ag_environment,
     verify_auth_identity,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "AgHeadlessProcess",
     "AgHeadlessRunner",
     "resolve_ag_executable",
+    "resolve_canonical_gemini_home",
     "sanitize_ag_environment",
     "verify_auth_identity",
 ]

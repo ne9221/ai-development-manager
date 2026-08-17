@@ -20,7 +20,7 @@ from manager.ag_runner import AgLaunchError, LaunchRequest, normalize_event
 class TestOfficialAgCliRunner(unittest.TestCase):
     @patch("manager.ag_cli_runner._cli_auth_status_check", return_value=False)
     @patch("pathlib.Path.is_file", return_value=True)
-    @patch("pathlib.Path.open", new_callable=mock_open, read_data=json.dumps({"access_token": "ya29.fake-token"}))
+    @patch("pathlib.Path.open", new_callable=mock_open, read_data=json.dumps({"access_token": "ya29.fake-token", "expiry": "2099-01-01T00:00:00Z"}))
     def test_verify_auth_identity_success_with_parsed_credential_token(self, mock_file_open, mock_is_file, mock_cli_check):
         identity = verify_auth_identity()
         self.assertEqual(identity, "local_google_account_profile")
@@ -312,6 +312,101 @@ class TestOfficialAgCliRunner(unittest.TestCase):
             self.assertEqual(outcome.status, "completed")
             self.assertIn("Line 1: starting", outcome.response_text)
             self.assertIn("Line 3: done", outcome.response_text)
+
+
+class TestAgAuthAndCredentialHardening(unittest.TestCase):
+    """Direct unit tests for hardened token expiry parsing, CLI positive auth proof, and canonical path resolution."""
+
+    def test_parse_timestamp_formats(self):
+        from manager.ag_cli_runner import _parse_timestamp
+        self.assertIsNone(_parse_timestamp(None))
+        self.assertIsNone(_parse_timestamp(True))
+        self.assertIsNone(_parse_timestamp(False))
+        self.assertIsNone(_parse_timestamp("invalid-date"))
+        self.assertIsNone(_parse_timestamp(""))
+
+        # Epoch seconds
+        self.assertEqual(_parse_timestamp(1700000000), 1700000000.0)
+        self.assertEqual(_parse_timestamp("1700000000"), 1700000000.0)
+
+        # Epoch milliseconds
+        self.assertEqual(_parse_timestamp(1700000000000), 1700000000.0)
+        self.assertEqual(_parse_timestamp("1700000000000"), 1700000000.0)
+
+        # ISO format
+        ts = _parse_timestamp("2030-01-01T00:00:00Z")
+        self.assertIsNotNone(ts)
+        self.assertGreater(ts, 1800000000)
+
+    def test_parse_local_credential_token_expiry_checks(self):
+        from manager.ag_cli_runner import _parse_local_credential_token
+
+        # Valid future expiry with token
+        valid_json = json.dumps({"access_token": "ya29.valid", "expiry": "2099-01-01T00:00:00Z"})
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.open", new_callable=mock_open, read_data=valid_json):
+            self.assertTrue(_parse_local_credential_token(Path("/fake/oauth.json")))
+
+        # Expired token
+        expired_json = json.dumps({"access_token": "ya29.valid", "expiry": "2020-01-01T00:00:00Z"})
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.open", new_callable=mock_open, read_data=expired_json):
+            self.assertFalse(_parse_local_credential_token(Path("/fake/oauth.json")))
+
+        # Malformed expiry
+        malformed_json = json.dumps({"access_token": "ya29.valid", "expiry": "malformed"})
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.open", new_callable=mock_open, read_data=malformed_json):
+            self.assertFalse(_parse_local_credential_token(Path("/fake/oauth.json")))
+
+        # Missing expiry metadata
+        no_expiry_json = json.dumps({"access_token": "ya29.valid"})
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.open", new_callable=mock_open, read_data=no_expiry_json):
+            self.assertFalse(_parse_local_credential_token(Path("/fake/oauth.json")))
+
+        # Empty token string
+        empty_token_json = json.dumps({"access_token": "  ", "expiry": "2099-01-01T00:00:00Z"})
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.open", new_callable=mock_open, read_data=empty_token_json):
+            self.assertFalse(_parse_local_credential_token(Path("/fake/oauth.json")))
+
+    def test_cli_auth_status_check_positive_proof(self):
+        from manager.ag_cli_runner import _cli_auth_status_check
+
+        def _run_with_stdout(stdout: str, rc: int = 0):
+            mock_proc = MagicMock()
+            mock_proc.returncode = rc
+            mock_proc.stdout = stdout
+            mock_proc.stderr = ""
+            with patch("manager.ag_cli_runner.resolve_ag_cli_executable", return_value=("/bin/agy", [])), \
+                 patch("subprocess.run", return_value=mock_proc):
+                return _cli_auth_status_check()
+
+        # Reject blank
+        self.assertFalse(_run_with_stdout(""))
+        self.assertFalse(_run_with_stdout("   \n  "))
+
+        # Reject exit code != 0
+        self.assertFalse(_run_with_stdout("Logged in as user@example.com", rc=1))
+
+        # Reject guest session
+        self.assertFalse(_run_with_stdout("Guest session active"))
+        self.assertFalse(_run_with_stdout(json.dumps({"status": "guest", "authenticated": True})))
+
+        # Reject Chinese unauthenticated
+        self.assertFalse(_run_with_stdout("未登入"))
+        self.assertFalse(_run_with_stdout("請先登入帳號"))
+
+        # Reject generic unknown success text
+        self.assertFalse(_run_with_stdout("Success! Process finished."))
+        self.assertFalse(_run_with_stdout("OK 200"))
+
+        # Accept positive patterns
+        self.assertTrue(_run_with_stdout("Logged in as test_user@google.com"))
+        self.assertTrue(_run_with_stdout("Authenticated as alice"))
+        self.assertTrue(_run_with_stdout("Auth status: Authenticated"))
+        self.assertTrue(_run_with_stdout(json.dumps({"authenticated": True, "user": "alice@gmail.com"})))
 
 
 if __name__ == "__main__":

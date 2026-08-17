@@ -20,6 +20,7 @@ from manager.ag_cli_runner import (
     OfficialAgCliRunner,
     resolve_ag_cli_executable,
     resolve_ag_official_cli_executable,
+    resolve_canonical_gemini_home,
     sanitize_ag_environment,
     verify_auth_identity,
 )
@@ -333,6 +334,192 @@ class TestAdvNormalizerDetectsExit0JsonError(unittest.TestCase):
         line = json.dumps({"type": "result", "response": "Task finished with no issues", "stats": {}}) + "\n"
         outcome = self._run_with_stdout_lines([line])
         self.assertEqual(outcome.status, "completed")
+
+
+class TestAdvFinding1GeminiHomeBypass(unittest.TestCase):
+    """Adversarial regression suite for Finding 1 (P0: GEMINI_HOME billing/account bypass)."""
+
+    def test_arbitrary_external_gemini_home_rejected(self):
+        with patch.dict(os.environ, {"GEMINI_HOME": "/external/attacker/gemini_home"}, clear=False):
+            with self.assertRaises(AgLaunchError) as ctx:
+                resolve_canonical_gemini_home()
+            self.assertEqual(ctx.exception.classification, "unverified_identity")
+            self.assertIn("Untrusted GEMINI_HOME", ctx.exception.detail)
+
+            with self.assertRaises(AgLaunchError) as ctx:
+                verify_auth_identity()
+            self.assertEqual(ctx.exception.classification, "unverified_identity")
+
+    def test_another_user_profile_path_rejected(self):
+        other_user = "C:\\Users\\AnotherUser\\.gemini" if os.name == "nt" else "/home/anotheruser/.gemini"
+        with patch.dict(os.environ, {"GEMINI_HOME": other_user}, clear=False):
+            with self.assertRaises(AgLaunchError) as ctx:
+                resolve_canonical_gemini_home()
+            self.assertEqual(ctx.exception.classification, "unverified_identity")
+            self.assertIn("Untrusted GEMINI_HOME", ctx.exception.detail)
+
+    def test_valid_canonical_expected_profile_accepted(self):
+        expected = (Path.home().resolve() / ".gemini").resolve()
+        with patch.dict(os.environ, {"GEMINI_HOME": str(expected)}, clear=False):
+            resolved = resolve_canonical_gemini_home()
+            self.assertEqual(resolved, expected)
+
+    def test_equivalent_non_canonical_path_canonicalized(self):
+        expected = (Path.home().resolve() / ".gemini").resolve()
+        # Equivalent path using traversal / relative parts
+        equivalent = str(Path.home().resolve() / "Documents" / ".." / ".gemini")
+        with patch.dict(os.environ, {"GEMINI_HOME": equivalent}, clear=False):
+            resolved = resolve_canonical_gemini_home()
+            self.assertEqual(resolved, expected)
+
+    def test_spawn_env_gemini_home_equals_verified_canonical_path(self):
+        expected = (Path.home().resolve() / ".gemini").resolve()
+        dirty_env = {"GEMINI_HOME": "/untrusted/inherited/path"}
+        # sanitize_ag_environment strips/overrides untrusted GEMINI_HOME with canonical path
+        sanitized = sanitize_ag_environment(dirty_env)
+        self.assertEqual(sanitized["GEMINI_HOME"], str(expected))
+
+    def test_start_spawn_passes_canonical_gemini_home(self):
+        expected = (Path.home().resolve() / ".gemini").resolve()
+        mock_resolver = lambda: ("/opt/bin/agy", [])
+        mock_auth = lambda: "verified"
+        runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
+        req = LaunchRequest(working_directory=".")
+        prepared = runner.prepare(req)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 1234
+        mock_proc.stdout.readline.side_effect = [""]
+        mock_proc.stderr.readline.side_effect = [""]
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+            runner.start(prepared, "test prompt")
+            called_env = mock_popen.call_args[1].get("env", {})
+            self.assertEqual(called_env.get("GEMINI_HOME"), str(expected))
+
+
+class TestAdvFinding2ExpiredLocalCredential(unittest.TestCase):
+    """Adversarial regression suite for Finding 2 (P1: Expired local credential accepted)."""
+
+    def test_expired_iso_timestamp_credential_rejected(self):
+        fake_path = Path("/mock/oauth_credentials.json")
+        expired_data = json.dumps({"access_token": "ya29.old_token", "expiry": "2020-01-01T00:00:00Z"})
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.open", new_callable=mock_open, read_data=expired_data):
+            from manager.ag_cli_runner import _parse_local_credential_token
+            self.assertFalse(_parse_local_credential_token(fake_path))
+
+    def test_expired_epoch_seconds_credential_rejected(self):
+        fake_path = Path("/mock/oauth_credentials.json")
+        expired_data = json.dumps({"access_token": "ya29.old_token", "expires_at": 1577836800})
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.open", new_callable=mock_open, read_data=expired_data):
+            from manager.ag_cli_runner import _parse_local_credential_token
+            self.assertFalse(_parse_local_credential_token(fake_path))
+
+    def test_malformed_expiry_string_fails_closed(self):
+        fake_path = Path("/mock/oauth_credentials.json")
+        malformed_data = json.dumps({"access_token": "ya29.token", "expiry": "not-a-valid-date-or-epoch"})
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.open", new_callable=mock_open, read_data=malformed_data):
+            from manager.ag_cli_runner import _parse_local_credential_token
+            self.assertFalse(_parse_local_credential_token(fake_path))
+
+    def test_malformed_expiry_type_fails_closed(self):
+        fake_path = Path("/mock/oauth_credentials.json")
+        malformed_data = json.dumps({"access_token": "ya29.token", "expiry": ["invalid", "list"]})
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.open", new_callable=mock_open, read_data=malformed_data):
+            from manager.ag_cli_runner import _parse_local_credential_token
+            self.assertFalse(_parse_local_credential_token(fake_path))
+
+    def test_missing_expiry_metadata_downgrades_and_returns_false(self):
+        """Token existence alone without verifiable expiry metadata cannot be
+        elevated to strong proof -- must downgrade to CLI check or fail closed."""
+        fake_path = Path("/mock/oauth_credentials.json")
+        no_expiry_data = json.dumps({"access_token": "ya29.token_without_expiry"})
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.open", new_callable=mock_open, read_data=no_expiry_data):
+            from manager.ag_cli_runner import _parse_local_credential_token
+            self.assertFalse(_parse_local_credential_token(fake_path))
+
+    def test_future_iso_timestamp_credential_allowed(self):
+        fake_path = Path("/mock/oauth_credentials.json")
+        valid_data = json.dumps({"access_token": "ya29.valid_token", "expiry": "2099-01-01T00:00:00Z"})
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.open", new_callable=mock_open, read_data=valid_data):
+            from manager.ag_cli_runner import _parse_local_credential_token
+            self.assertTrue(_parse_local_credential_token(fake_path))
+
+    def test_future_epoch_milliseconds_credential_allowed(self):
+        fake_path = Path("/mock/oauth_credentials.json")
+        valid_data = json.dumps({"access_token": "ya29.valid_token", "expires_at": 4102444800000})
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.open", new_callable=mock_open, read_data=valid_data):
+            from manager.ag_cli_runner import _parse_local_credential_token
+            self.assertTrue(_parse_local_credential_token(fake_path))
+
+
+class TestAdvFinding3CliAuthStatusPositiveProof(unittest.TestCase):
+    """Adversarial regression suite for Finding 3 (P1: CLI auth status false-positive)."""
+
+    def _mock_cli_run(self, stdout: str, stderr: str = "", returncode: int = 0):
+        mock_proc = MagicMock()
+        mock_proc.returncode = returncode
+        mock_proc.stdout = stdout
+        mock_proc.stderr = stderr
+        return mock_proc
+
+    def test_blank_output_exit_0_rejected(self):
+        mock_res = self._mock_cli_run(stdout="", stderr="", returncode=0)
+        with patch("manager.ag_cli_runner.resolve_ag_cli_executable", return_value=("/opt/bin/agy", [])), \
+             patch("subprocess.run", return_value=mock_res):
+            from manager.ag_cli_runner import _cli_auth_status_check
+            self.assertFalse(_cli_auth_status_check())
+
+    def test_guest_session_text_rejected(self):
+        mock_res = self._mock_cli_run(stdout="Guest session active\nSession ID: 12345", returncode=0)
+        with patch("manager.ag_cli_runner.resolve_ag_cli_executable", return_value=("/opt/bin/agy", [])), \
+             patch("subprocess.run", return_value=mock_res):
+            from manager.ag_cli_runner import _cli_auth_status_check
+            self.assertFalse(_cli_auth_status_check())
+
+    def test_guest_session_json_rejected(self):
+        mock_res = self._mock_cli_run(stdout=json.dumps({"status": "guest", "authenticated": False}), returncode=0)
+        with patch("manager.ag_cli_runner.resolve_ag_cli_executable", return_value=("/opt/bin/agy", [])), \
+             patch("subprocess.run", return_value=mock_res):
+            from manager.ag_cli_runner import _cli_auth_status_check
+            self.assertFalse(_cli_auth_status_check())
+
+    def test_chinese_unauthenticated_text_rejected(self):
+        mock_res = self._mock_cli_run(stdout="目前未登入，請先使用 agy auth login 進行認證", returncode=0)
+        with patch("manager.ag_cli_runner.resolve_ag_cli_executable", return_value=("/opt/bin/agy", [])), \
+             patch("subprocess.run", return_value=mock_res):
+            from manager.ag_cli_runner import _cli_auth_status_check
+            self.assertFalse(_cli_auth_status_check())
+
+    def test_unknown_success_text_rejected(self):
+        mock_res = self._mock_cli_run(stdout="Operation completed successfully. Status code 200.", returncode=0)
+        with patch("manager.ag_cli_runner.resolve_ag_cli_executable", return_value=("/opt/bin/agy", [])), \
+             patch("subprocess.run", return_value=mock_res):
+            from manager.ag_cli_runner import _cli_auth_status_check
+            self.assertFalse(_cli_auth_status_check())
+
+    def test_known_authenticated_positive_text_accepted(self):
+        mock_res = self._mock_cli_run(stdout="Logged in as developer@gmail.com\nProfile: Default", returncode=0)
+        with patch("manager.ag_cli_runner.resolve_ag_cli_executable", return_value=("/opt/bin/agy", [])), \
+             patch("subprocess.run", return_value=mock_res):
+            from manager.ag_cli_runner import _cli_auth_status_check
+            self.assertTrue(_cli_auth_status_check())
+
+    def test_known_authenticated_positive_json_accepted(self):
+        mock_res = self._mock_cli_run(stdout=json.dumps({"authenticated": True, "account": "developer@google.com"}), returncode=0)
+        with patch("manager.ag_cli_runner.resolve_ag_cli_executable", return_value=("/opt/bin/agy", [])), \
+             patch("subprocess.run", return_value=mock_res):
+            from manager.ag_cli_runner import _cli_auth_status_check
+            self.assertTrue(_cli_auth_status_check())
 
 
 if __name__ == "__main__":

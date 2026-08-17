@@ -11,12 +11,14 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Generator
 
@@ -69,28 +71,117 @@ _ADC_FAIL_CLOSED_SENTINEL_NAME = ".adm-ag-adc-fail-closed-sentinel-does-not-exis
 
 
 def _safe_home() -> Path:
+    """Return the canonical real user home directory."""
     try:
-        return Path.home()
+        return Path.home().resolve()
     except Exception:
-        return Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or "/tmp")
+        fallback = os.environ.get("USERPROFILE") or os.environ.get("HOME") or "/tmp"
+        return Path(fallback).resolve()
+
+
+def resolve_canonical_gemini_home(
+    raw_path: str | Path | None = None,
+    base_env: dict[str, str] | None = None,
+) -> Path:
+    """Resolve and strictly validate the canonical Antigravity/Gemini home directory.
+
+    Enforces that the path resolves to the canonical `.gemini` directory under the
+    current user's home profile, defending against directory traversal (..),
+    symlink/junction redirection outside the user profile, alternate drive aliases,
+    inherited poison from HOME/USERPROFILE/GEMINI_HOME, and other-user profile
+    takeovers. Fails closed with AgLaunchError if an invalid or external path
+    is specified.
+    """
+    expected_home = _safe_home()
+    expected_gemini = (expected_home / ".gemini").resolve()
+
+    cand_str: str | None = None
+    if raw_path is not None:
+        cand_str = str(raw_path)
+    else:
+        env = os.environ if base_env is None else base_env
+        cand_str = env.get("GEMINI_HOME")
+
+    if not cand_str:
+        return expected_gemini
+
+    cand_path = Path(cand_str)
+    try:
+        resolved_cand = cand_path.resolve()
+    except Exception as exc:
+        raise AgLaunchError(
+            "unverified_identity",
+            f"Failed to resolve GEMINI_HOME '{cand_str}': {exc}. Fail closed.",
+        )
+
+    norm_cand = os.path.normcase(os.path.normpath(str(resolved_cand)))
+    norm_expected = os.path.normcase(os.path.normpath(str(expected_gemini)))
+
+    if norm_cand != norm_expected:
+        raise AgLaunchError(
+            "unverified_identity",
+            f"Untrusted GEMINI_HOME '{cand_str}' resolved to '{resolved_cand}', which does "
+            f"not match canonical expected profile path '{expected_gemini}'. Fail closed.",
+        )
+
+    return expected_gemini
 
 
 def sanitize_ag_environment(base_env: dict[str, str] | None = None) -> dict[str, str]:
     """Strip/override env vars that could switch the child process onto a
-    secondary GCP/Vertex/API billing route, so the official AG CLI route
-    strictly stays on the local Google AI Pro account profile.
+    secondary GCP/Vertex/API billing route or external GEMINI_HOME profile,
+    so the official AG CLI route strictly stays on the verified local Google
+    AI Pro account profile.
     """
     env = dict(os.environ if base_env is None else base_env)
     for var in SECONDARY_BILLING_ENV_VARS:
         env.pop(var, None)
     env["GOOGLE_APPLICATION_CREDENTIALS"] = str(_safe_home() / _ADC_FAIL_CLOSED_SENTINEL_NAME)
+    env["GEMINI_HOME"] = str(resolve_canonical_gemini_home())
     return env
+
+
+def _parse_timestamp(val: Any) -> float | None:
+    """Parse integer, float, numeric string, or ISO-8601 string into UTC epoch seconds.
+    Returns None if malformed.
+    """
+    if isinstance(val, bool) or val is None:
+        return None
+    if isinstance(val, (int, float)):
+        # Milliseconds timestamp (> 1e11) vs seconds
+        return float(val) / 1000.0 if val > 1e11 else float(val)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        # Numeric string (e.g. "1723900000" or "1723900000000")
+        try:
+            num = float(s)
+            return num / 1000.0 if num > 1e11 else num
+        except ValueError:
+            pass
+        # ISO-8601 timestamp string
+        try:
+            s_iso = s.replace("Z", "+00:00") if s.endswith("Z") else s
+            dt = datetime.fromisoformat(s_iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            return None
+    return None
 
 
 def _parse_local_credential_token(path: Path) -> bool:
     """True only if `path` is a real, parseable credential file containing a
-    non-empty token/session field -- file/directory *existence* is never
-    accepted as proof by itself.
+    non-empty token/session field AND valid future expiry metadata.
+
+    If expiry metadata is present:
+      - expired -> reject (False)
+      - malformed expiry -> fail closed (False)
+      - future expiry -> allow (True)
+    If credential schema has NO verifiable expiry, we do not upgrade static token
+    existence to strong identity proof (returns False, downgrading to CLI positive proof).
     """
     try:
         if not path.is_file():
@@ -101,15 +192,71 @@ def _parse_local_credential_token(path: Path) -> bool:
         return False
     if not isinstance(data, dict):
         return False
-    token_fields = ("access_token", "refresh_token", "id_token", "session_token")
-    return any(isinstance(data.get(field), str) and data.get(field).strip() for field in token_fields)
+
+    token_fields = ("access_token", "refresh_token", "id_token", "session_token", "token")
+    has_token = any(isinstance(data.get(field), str) and data.get(field).strip() for field in token_fields)
+    if not has_token:
+        return False
+
+    expiry_fields = ("expiry", "expires_at", "expiration", "expires", "exp", "valid_until")
+    expiry_val = None
+    for field in expiry_fields:
+        if field in data:
+            expiry_val = data[field]
+            break
+
+    if expiry_val is None:
+        # No verifiable expiry metadata in schema: cannot treat static token as strong proof
+        return False
+
+    expiry_epoch = _parse_timestamp(expiry_val)
+    if expiry_epoch is None:
+        # Malformed expiry metadata -> fail closed
+        return False
+
+    if expiry_epoch <= time.time():
+        # Expired credential -> reject
+        return False
+
+    return True
+
+
+_EXPLICIT_UNAUTHENTICATED_PATTERNS = (
+    r"\bguest\b",
+    r"\bnot\s+authenticated\b",
+    r"\bunauthenticated\b",
+    r"\bunauthorized\b",
+    r"\blogin\s+required\b",
+    r"\bnot\s+logged\s+in\b",
+    r"\bplease\s+log\s*in\b",
+    r"\bplease\s+run\b",
+    r"未登入",
+    r"未登录",
+    r"請登入",
+    r"请登录",
+    r"訪客",
+    r"访客",
+)
+
+_POSITIVE_AUTH_TEXT_PATTERNS = (
+    r"logged\s+in\s+as\s+[^\s@]+@[^\s]+",
+    r"authenticated\s+as\s+[^\s@]+@[^\s]+",
+    r"logged\s+in\s+as\s+[\w\.\-]+",
+    r"authenticated\s+as\s+[\w\.\-]+",
+    r"active\s+account\s*:\s*[^\s]+",
+    r"auth\s+status\s*:\s*(?:authenticated|logged_in|active)",
+    r"status\s*:\s*(?:authenticated|logged_in|active)",
+    r"account\s*:\s*[^\s@]+@[^\s]+",
+)
 
 
 def _cli_auth_status_check(timeout: float = 5.0) -> bool:
-    """Best-effort secondary identity check: ask the resolved AG CLI for its
-    own auth status, bounded by `timeout`. Any failure -- not found, non-zero
-    exit, timeout, unexpected output -- is treated as "not verified", never
-    as proof of identity.
+    """Secondary identity check: verify positive proof of authentication from
+    the resolved AG CLI auth status, bounded by `timeout`.
+
+    Strictly requires positive evidence of an active, authenticated account.
+    Blank output, guest session, Chinese/foreign unauthenticated indicators,
+    or unknown success text are rejected (fail closed).
     """
     try:
         executable, prefix_args = resolve_ag_cli_executable()
@@ -126,23 +273,62 @@ def _cli_auth_status_check(timeout: float = 5.0) -> bool:
         return False
     if result.returncode != 0:
         return False
-    combined = f"{result.stdout}\n{result.stderr}".lower()
-    if any(marker in combined for marker in ("not authenticated", "unauthorized", "login required", "please run")):
+
+    stdout_raw = result.stdout or ""
+    stderr_raw = result.stderr or ""
+    combined = f"{stdout_raw}\n{stderr_raw}".strip()
+    if not combined:
         return False
-    return True
+
+    # Check explicit unauthenticated / guest markers
+    for unauth_pat in _EXPLICIT_UNAUTHENTICATED_PATTERNS:
+        if re.search(unauth_pat, combined, re.IGNORECASE):
+            return False
+
+    # 1. Try structured JSON parsing
+    for line in combined.splitlines():
+        line_str = line.strip()
+        if not (line_str.startswith("{") and line_str.endswith("}")):
+            continue
+        try:
+            data = json.loads(line_str)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            status = str(data.get("status", "")).strip().lower()
+            if status in ("unauthenticated", "guest", "logged_out", "none", "error"):
+                return False
+            if data.get("authenticated") is True or data.get("logged_in") is True:
+                acct = str(data.get("account") or data.get("email") or data.get("user") or "").strip().lower()
+                if acct == "guest":
+                    return False
+                return True
+            if status in ("authenticated", "logged_in", "active"):
+                return True
+            acct = str(data.get("account") or data.get("email") or "").strip()
+            if acct and acct.lower() != "guest":
+                return True
+
+    # 2. Plain text positive pattern matching
+    for pos_pat in _POSITIVE_AUTH_TEXT_PATTERNS:
+        if re.search(pos_pat, combined, re.IGNORECASE):
+            return True
+
+    # Unknown output without positive proof -> fail closed
+    return False
 
 
 def verify_auth_identity(timeout: float = 5.0) -> str:
     """Verify that Antigravity execution uses a verified local Google account profile.
 
-    Accepts only a verifiable credential/token file (real parsed token
-    content, not mere presence) or a bounded-timeout official CLI auth-status
-    check. Directory existence (~/.gemini/config, ~/.gemini/antigravity-ide,
-    etc.) is never accepted as proof. Strictly fails closed if neither check
-    can positively verify identity. GOOGLE_API_KEY is not accepted as
-    evidence of local Google AI Pro account identity.
+    Accepts only a verifiable credential/token file (real parsed token content
+    with valid future expiry, not mere presence) or a bounded-timeout official
+    CLI auth-status check with positive proof. Directory existence (~/.gemini/config,
+    ~/.gemini/antigravity-ide, etc.) is never accepted as proof. Strictly fails
+    closed if neither check can positively verify identity. GOOGLE_API_KEY is not
+    accepted as evidence of local Google AI Pro account identity.
     """
-    gemini_home = Path(os.environ.get("GEMINI_HOME", _safe_home() / ".gemini"))
+    gemini_home = resolve_canonical_gemini_home()
     oauth_file = gemini_home / "oauth_credentials.json"
 
     if _parse_local_credential_token(oauth_file):
@@ -153,9 +339,10 @@ def verify_auth_identity(timeout: float = 5.0) -> str:
 
     raise AgLaunchError(
         "unverified_identity",
-        "Cannot prove Antigravity local identity: no parseable credential/token file "
-        "(~/.gemini/oauth_credentials.json) and official CLI auth-status check did not "
-        "verify an active session. Directory existence is not accepted as proof. Fail closed.",
+        "Cannot prove Antigravity local identity: no parseable valid-credential file "
+        "(~/.gemini/oauth_credentials.json) with active expiry and official CLI "
+        "auth-status check did not verify positive authenticated proof. Directory "
+        "existence is not accepted as proof. Fail closed.",
     )
 
 
@@ -231,8 +418,8 @@ def resolve_ag_cli_executable(explicit: str | None = None) -> tuple[str, list[st
         if found:
             return str(Path(found).resolve()), []
 
-    # 2. Known default installation locations under ~/.gemini
-    gemini_home = Path(os.environ.get("GEMINI_HOME", _safe_home() / ".gemini"))
+    # 2. Known default installation locations under verified canonical ~/.gemini
+    gemini_home = resolve_canonical_gemini_home()
     for sub in (
         "antigravity-ide/bin/agentapi.bat",
         "antigravity-ide/bin/agentapi.cmd",
@@ -491,8 +678,8 @@ class OfficialAgCliRunner:
         thread_id = f"ag-{mode}-{uuid.uuid4().hex[:12]}"
         now = utc_now()
 
-        home = _safe_home()
-        session_path = str(home / ".gemini" / "antigravity-ide" / "brain" / thread_id / "transcript.jsonl")
+        gemini_home = resolve_canonical_gemini_home()
+        session_path = str(gemini_home / "antigravity-ide" / "brain" / thread_id / "transcript.jsonl")
 
         return PreparedLaunch(
             thread_id=thread_id,
