@@ -6,13 +6,26 @@ import pandas as pd
 from collectors.publish_drive import build_service
 from manager.tasks import DriveRecords
 from manager.quota_reader import read_drive_status, summarize
+from manager.status_bar import build_snapshot
 from manager.dashboard_core import (
     parse_time,
     determine_execution_state,
     is_execution_stale,
+    is_cleanup_confirmed,
     get_global_summary,
-    map_task_board
+    map_task_board,
+    format_unknown_field,
+    format_status_bar_status,
+    format_quota_remaining,
+    format_quota_freshness,
+    format_blocker,
+    format_needs_user_action,
+    format_github_state,
+    format_drive_reachability,
+    format_last_trustworthy_evidence,
 )
+
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Page Configuration
 st.set_page_config(
@@ -111,7 +124,8 @@ def load_all_data():
         service = build_service()
         store = DriveRecords(service)
         
-        # Load Quota Document
+        # Load Quota Document (raw document kept for status_bar.build_snapshot,
+        # which does its own summarize() call internally)
         quota_doc = read_drive_status(service=service)
         quota_summary = summarize(quota_doc, max_age_minutes=60)
         
@@ -160,6 +174,7 @@ def load_all_data():
                 
         return {
             "success": True,
+            "quota_doc": quota_doc,
             "quota_summary": quota_summary,
             "projects": projects,
             "all_tasks": all_tasks,
@@ -172,6 +187,7 @@ def load_all_data():
     except Exception as e:
         return {
             "success": False,
+            "quota_doc": None,
             "quota_summary": None,
             "projects": [],
             "all_tasks": [],
@@ -209,6 +225,7 @@ if not data["success"]:
     st.stop()
 
 # Prepare Data Variables
+quota_doc = data.get("quota_doc")
 quota_summary = data["quota_summary"]
 projects = data["projects"]
 all_tasks = data["all_tasks"]
@@ -256,6 +273,56 @@ with m4:
         <div class="metric-value">{summary_metrics['reliable_providers_count']} / 4</div>
     </div>
     """, unsafe_allow_html=True)
+
+# Layout: 0. Status Bar -- one read-only truth-projection snapshot per
+# execution still worth reporting on (active, or terminal but not yet
+# provably cleaned up). See manager/status_bar.py for the fail-closed
+# UNKNOWN/None rules this section must never override.
+st.header("🧭 Status Bar")
+status_bar_executions = [
+    e for e in all_executions
+    if e.get("status") not in {"completed", "failed", "interrupted", "cancelled"} or not is_cleanup_confirmed(e)
+]
+if not status_bar_executions:
+    st.info("No execution to report on right now.")
+else:
+    for exe in status_bar_executions:
+        p_id = exe.get("project_id")
+        t_id = exe.get("task_id")
+        task = next((t for t in all_tasks if t.get("project_id") == p_id and t.get("task_id") == t_id), None)
+        snapshot = build_snapshot(
+            execution=exe, task=task, quota_document=quota_doc,
+            github_repo_dir=REPO_DIR, drive_error=None, now=now,
+        )
+        quota = snapshot["quota"]
+        st.markdown(f"""
+        <div class="glass-card">
+            <p>
+                <b>AI / Provider:</b> {format_unknown_field(snapshot['provider'])} &nbsp;|&nbsp;
+                <b>Account alias:</b> {format_unknown_field(snapshot['account_alias'])} &nbsp;|&nbsp;
+                <b>Project:</b> {format_unknown_field(snapshot['project_id'])} &nbsp;|&nbsp;
+                <b>Task:</b> {format_unknown_field(snapshot['task_id'])}
+            </p>
+            <p>
+                <b>Status:</b> {format_status_bar_status(snapshot['status'])} &nbsp;|&nbsp;
+                <b>Last trustworthy evidence:</b> {format_last_trustworthy_evidence(snapshot['last_trustworthy_evidence'])}
+            </p>
+            <p>
+                <b>Quota remaining:</b> {format_quota_remaining(quota['remaining_percent'])} &nbsp;|&nbsp;
+                <b>Quota freshness:</b> {format_quota_freshness(quota['freshness'])}
+            </p>
+            <p>
+                <b>Blocker:</b> {format_blocker(snapshot['blocker'])} &nbsp;|&nbsp;
+                <b>Needs user action:</b> {format_needs_user_action(snapshot['needs_user_action'])}
+            </p>
+            <p>
+                <b>GitHub state:</b> {format_github_state(snapshot['github_sync'])} &nbsp;|&nbsp;
+                <b>Drive reachability:</b> {format_drive_reachability(snapshot['drive_sync'])}
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+st.markdown("---")
 
 # Layout: 1. Quota Columns
 st.header("⚡ Provider / Quota Center")

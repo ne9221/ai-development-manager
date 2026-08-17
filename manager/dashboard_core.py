@@ -115,6 +115,65 @@ def get_global_summary(
         "reliable_providers_count": reliable_providers
     }
 
+UNKNOWN = "UNKNOWN"
+
+def format_unknown_field(value) -> str:
+    """UNKNOWN/None renders literally as 'Unknown' -- never a guess."""
+    if value is None or value == UNKNOWN:
+        return "Unknown"
+    return str(value)
+
+def format_status_bar_status(value) -> str:
+    """Same UNKNOWN handling as format_unknown_field, plus readable casing
+    for the real state strings status_bar.build_snapshot returns (running,
+    finishing, blocked, ...)."""
+    if value is None or value == UNKNOWN:
+        return "Unknown"
+    return str(value).replace("_", " ").title()
+
+def format_quota_remaining(remaining_percent) -> str:
+    """None must render as '—', never '0%' -- no remaining evidence is not
+    the same claim as zero quota remaining."""
+    if remaining_percent is None:
+        return "—"
+    return f"{remaining_percent}%"
+
+def format_quota_freshness(freshness) -> str:
+    if not freshness or freshness == "unknown":
+        return "Unknown"
+    return str(freshness).title()
+
+def format_blocker(blocker) -> str:
+    return blocker if isinstance(blocker, str) and blocker else "—"
+
+def format_needs_user_action(value) -> str:
+    """None means no authoritative signal exists yet and must render as
+    '—' -- never 'No', which would claim evidence that doesn't exist."""
+    if value is None:
+        return "—"
+    return "Yes" if value else "No"
+
+def format_github_state(github_sync: dict | None) -> str:
+    state = (github_sync or {}).get("state")
+    if not state:
+        return "Unknown"
+    return str(state).title()
+
+def format_drive_reachability(drive_sync: dict | None) -> str:
+    """'reachable' must render as 'Reachable', never 'Synced' -- this is a
+    live-read-succeeded signal, not a sync-state claim."""
+    state = (drive_sync or {}).get("state")
+    if state == "reachable":
+        return "Reachable"
+    if state == "unreachable":
+        return "Unreachable"
+    return "Unknown"
+
+def format_last_trustworthy_evidence(evidence: dict | None) -> str:
+    if not evidence or not evidence.get("at"):
+        return "—"
+    return evidence["at"]
+
 def map_task_board(all_tasks: list, active_executions_dict: dict, now: datetime) -> dict:
     """Group tasks into Ready, In progress, Blocked / Attention, Completed."""
     board = {

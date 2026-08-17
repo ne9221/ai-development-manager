@@ -211,5 +211,107 @@ class TestDashboardAppRender(unittest.TestCase):
         self.assertEqual(df.iloc[0]["State"], "RUNNING")
         self.assertEqual(df.iloc[0]["Health"], "✅ OK")
 
+class TestStatusBarSection(unittest.TestCase):
+    """SB-2: UI Truth Contract for the new Status Bar section. Each test
+    pins one required rendering rule from the task instructions."""
+
+    def setUp(self):
+        st.cache_data.clear()
+
+    def _single_execution_dashboard(self, mock_build_service, mock_read_drive_status, mock_drive_records,
+                                      execution_overrides, providers=None):
+        mock_read_drive_status.return_value = {"providers": providers or []}
+        mock_store = mock_drive_records.return_value
+        mock_store.list_projects.return_value = [{"project_id": "p1", "title": "P1"}]
+
+        def mock_children(parent, name=None):
+            if "executions" in parent:
+                return [{"name": "exec-1.json", "mimeType": "application/json"}]
+            return []
+        mock_store.project_folder.side_effect = lambda area, project_id, create=False: f"folder-{area}"
+        mock_store.children.side_effect = mock_children
+
+        base = {"project_id": "p1", "task_id": "t1", "execution_id": "e1", "provider": "codex", "status": "running"}
+        base.update(execution_overrides)
+
+        def mock_get(area, project_id, name):
+            return base if area == "executions" else {}
+        mock_store.get.side_effect = mock_get
+
+        at = AppTest.from_file("../dashboard.py")
+        at.run(timeout=30)
+        self.assertFalse(at.exception, f"App crashed: {at.exception}")
+        return " ".join(el.value for el in at.markdown)
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_stale_execution_renders_unknown_not_running(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+        rendered = self._single_execution_dashboard(
+            mock_build_service, mock_read_drive_status, mock_drive_records,
+            {"provider_session_id": "sess-1", "heartbeat_at": "2020-01-01T00:00:00.000000Z"},
+        )
+        self.assertIn("<b>Status:</b> Unknown", rendered)
+        self.assertNotIn("<b>Status:</b> Running", rendered)
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_unknown_quota_renders_dash_not_zero_percent(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+        fresh_now = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        rendered = self._single_execution_dashboard(
+            mock_build_service, mock_read_drive_status, mock_drive_records,
+            {"provider_session_id": "sess-1", "heartbeat_at": fresh_now},
+            providers=[],  # no quota data reported for "codex" at all
+        )
+        self.assertIn("<b>Quota remaining:</b> —", rendered)
+        self.assertNotIn("<b>Quota remaining:</b> 0%", rendered)
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_unknown_account_never_guesses_claude_a_or_b(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+        rendered = self._single_execution_dashboard(
+            mock_build_service, mock_read_drive_status, mock_drive_records, {},
+        )
+        self.assertIn("<b>Account alias:</b> Unknown", rendered)
+        self.assertNotIn("Claude A", rendered)
+        self.assertNotIn("Claude B", rendered)
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_drive_reachable_renders_reachable_not_synced(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+        rendered = self._single_execution_dashboard(
+            mock_build_service, mock_read_drive_status, mock_drive_records, {},
+        )
+        self.assertIn("<b>Drive reachability:</b> Reachable", rendered)
+        self.assertNotIn("<b>Drive reachability:</b> Synced", rendered)
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_needs_user_action_null_renders_dash_not_no(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+        rendered = self._single_execution_dashboard(
+            mock_build_service, mock_read_drive_status, mock_drive_records, {},
+        )
+        self.assertIn("<b>Needs user action:</b> —", rendered)
+        self.assertNotIn("<b>Needs user action:</b> No", rendered)
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_terminal_retained_cleanup_renders_finishing(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+        rendered = self._single_execution_dashboard(
+            mock_build_service, mock_read_drive_status, mock_drive_records,
+            {
+                "status": "completed",
+                "cleanup_evidence": {"task_claim_release": "retained", "writer_release": "released"},
+            },
+        )
+        self.assertIn("<b>Status:</b> Finishing", rendered)
+        self.assertNotIn("<b>Status:</b> Completed", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()
