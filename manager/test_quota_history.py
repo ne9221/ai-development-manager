@@ -80,7 +80,7 @@ class QuotaHistoryTests(unittest.TestCase):
         s_b1 = make_snapshot("claude", "B", remaining=30.0, last_updated=t1, resets_at=reset_time)
         s_b2 = make_snapshot("claude", "B", remaining=20.0, last_updated=t2, resets_at=reset_time)
 
-        self.store.append_snapshots([s_a1, s_b1, s_a2, s_b2])
+        self.store.append_snapshots([s_a1, s_b1, s_a2, s_b2], now=NOW)
 
         hist_a = self.store.get_account_history("claude", "A")
         hist_b = self.store.get_account_history("claude", "B")
@@ -116,7 +116,7 @@ class QuotaHistoryTests(unittest.TestCase):
         s2 = make_snapshot("claude", "A", remaining=70.0, last_updated=t2, resets_at=reset_5h, extra_windows=[w_7d_2])
         cur = make_snapshot("claude", "A", remaining=50.0, last_updated=NOW, resets_at=reset_5h, extra_windows=[w_7d_cur])
 
-        self.store.append_snapshots([s1, s2])
+        self.store.append_snapshots([s1, s2], now=NOW)
         fc = forecast_account(cur, history=self.store.get_account_history("claude", "A"), now=NOW)
 
         fc_5h = next(w for w in fc.windows if w.window_name == "five_hour")
@@ -133,8 +133,8 @@ class QuotaHistoryTests(unittest.TestCase):
         s1 = make_snapshot("claude", "A", remaining=80.0, last_updated=t1)
         s1_dup = make_snapshot("claude", "A", remaining=80.0, last_updated=t1)
 
-        self.store.append_snapshot(s1)
-        self.store.append_snapshot(s1_dup)
+        self.store.append_snapshot(s1, now=NOW)
+        self.store.append_snapshot(s1_dup, now=NOW)
 
         hist = self.store.get_account_history("claude", "A")
         self.assertEqual(len(hist), 1)
@@ -150,9 +150,9 @@ class QuotaHistoryTests(unittest.TestCase):
         s3 = make_snapshot("claude", "A", remaining=70.0, last_updated=t3)
 
         # Append in reversed order: t3, t1, t2
-        self.store.append_snapshot(s3)
-        self.store.append_snapshot(s1)
-        self.store.append_snapshot(s2)
+        self.store.append_snapshot(s3, now=NOW)
+        self.store.append_snapshot(s1, now=NOW)
+        self.store.append_snapshot(s2, now=NOW)
 
         hist = self.store.get_account_history("claude", "A")
         timestamps = [s["observed_at"] for s in hist]
@@ -216,7 +216,7 @@ class QuotaHistoryTests(unittest.TestCase):
         s3 = make_snapshot("claude", "A", remaining=100.0, last_updated=NOW - timedelta(minutes=20), resets_at=reset_new)
         cur = make_snapshot("claude", "A", remaining=90.0, last_updated=NOW, resets_at=reset_new)
 
-        self.store.append_snapshots([s1, s2, s3])
+        self.store.append_snapshots([s1, s2, s3], now=NOW)
         fc = forecast_account(cur, history=self.store.get_account_history("claude", "A"), now=NOW)
 
         # Burn rate must be calculated ONLY between s3 (100%) and cur (90%) over 20 min = 30%/h
@@ -239,12 +239,12 @@ class QuotaHistoryTests(unittest.TestCase):
         self.assertEqual(hist, [])
         # Append should still work and repair the file
         s = make_snapshot("claude", "A", remaining=80.0)
-        self.assertTrue(store.append_snapshot(s))
+        self.assertTrue(store.append_snapshot(s, now=NOW))
         self.assertEqual(len(store.get_history()), 1)
 
     def test_invalid_document_save_fails_safe_without_overwriting(self):
         s = make_snapshot("claude", "A", remaining=80.0)
-        self.store.append_snapshot(s)
+        self.store.append_snapshot(s, now=NOW)
         self.assertEqual(len(self.store.get_history()), 1)
 
         # Attempt to save schema-invalid document with fail_safe=True
@@ -271,7 +271,7 @@ class QuotaHistoryTests(unittest.TestCase):
         s1 = make_snapshot("claude", "A", remaining=90.0, last_updated=t1, resets_at=reset_time)
         cur = make_snapshot("claude", "A", remaining=80.0, last_updated=NOW, resets_at=reset_time)
 
-        self.store.append_snapshot(s1)
+        self.store.append_snapshot(s1, now=NOW)
         fc = forecast_account(cur, history=self.store.get_history(), now=NOW)
 
         self.assertEqual(fc.windows[0].burn_rate_samples, 2)
