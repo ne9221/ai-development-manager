@@ -1,12 +1,12 @@
-"""Regression coverage for run_command_watcher.ps1 / run_session_center_supervisor.ps1:
-neither wrapper may override GOOGLE_DRIVE_TOKEN with a ManagerHome-derived path.
-That path is not guaranteed to hold a real token (the canonical, already-working
-credential lives at collectors.publish_drive.token_path()'s own default), and an
-unconditional override here silently shadows it -- collectors.publish_drive itself
-already fully covers correct resolution/refresh/reauth behavior (see
-collectors/test_drive_auth.py); these tests only guard the wrapper scripts' own
-environment setup, by actually executing them with a stub Python module standing
-in for the real manager module they invoke."""
+"""Regression coverage for run_command_watcher.ps1 / run_session_center_supervisor.ps1 /
+run_refresh.ps1: none of these wrappers may override GOOGLE_DRIVE_TOKEN with a
+ManagerHome-derived path. That path is not guaranteed to hold a real token (the
+canonical, already-working credential lives at collectors.publish_drive.token_path()'s
+own default), and an unconditional override here silently shadows it --
+collectors.publish_drive itself already fully covers correct resolution/refresh/reauth
+behavior (see collectors/test_drive_auth.py); these tests only guard the wrapper
+scripts' own environment setup, by actually executing them with a stub Python module
+standing in for the real manager module they invoke."""
 
 import json
 import os
@@ -62,6 +62,12 @@ class LauncherEnvironmentTests(unittest.TestCase):
     def test_session_center_supervisor_wrapper_never_overrides_google_drive_token(self):
         self._write_env_dump_stub("session_center_supervisor")
         env = self._run("run_session_center_supervisor.ps1", ["-StateFile", str(self.root / "state.json")])
+        self.assertIsNone(env["GOOGLE_DRIVE_TOKEN"], "wrapper must not shadow the canonical Drive token resolver")
+        self.assertEqual(str(self.manager_home), env["AI_MANAGER_HOME"], "unrelated AI_MANAGER_HOME wiring must be unaffected")
+
+    def test_refresh_wrapper_never_overrides_google_drive_token(self):
+        self._write_env_dump_stub("refresh_status")
+        env = self._run("run_refresh.ps1", [])
         self.assertIsNone(env["GOOGLE_DRIVE_TOKEN"], "wrapper must not shadow the canonical Drive token resolver")
         self.assertEqual(str(self.manager_home), env["AI_MANAGER_HOME"], "unrelated AI_MANAGER_HOME wiring must be unaffected")
 
