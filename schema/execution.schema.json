@@ -131,6 +131,26 @@
       "type": ["object", "null"],
       "description": "Bounded terminal cleanup audit; never contains a lease token."
     },
+    "recovery_attestation": {
+      "description": "Operator break-glass attestation evidence when manager.execution_recovery.recover_stale_running_execution() force-terminalizes a stuck running execution whose provider liveness could not be automatically proven. Absent/null for every execution that never went through that path.",
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["actor", "attested_at", "reason", "break_glass_recovery", "break_glass", "prior_status", "provider_liveness"],
+          "properties": {
+            "actor": {"type": "string", "minLength": 1, "maxLength": 200},
+            "attested_at": {"type": "string", "format": "date-time"},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 500},
+            "break_glass_recovery": {"const": true},
+            "break_glass": {"type": "boolean"},
+            "prior_status": {"enum": ["running", "interrupted"]},
+            "provider_liveness": {"enum": ["stopped", "replaced", "unknown"]},
+            "provider_liveness_detail": {"type": ["string", "null"], "maxLength": 200}
+          }
+        }
+      ]
+    },
     "notes": {"type": "array", "items": {"type": "string"}},
     "task_snapshot": {"type": "object"}
   }
