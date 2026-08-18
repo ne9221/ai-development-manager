@@ -227,6 +227,55 @@ class DispatcherTests(unittest.TestCase):
         with self.assertRaises(TaskError): request_ok({"project_id": "p1"})
         with self.assertRaises(TaskError): request_ok(request(preferred_provider="codex", excluded_provider="codex"))
 
+    # -- P0: working_directory contract (dispatch-time resolved Task snapshot) --
+
+    def test_new_task_persists_working_directory_snapshot_from_project(self):
+        """A brand-new Task (the Direct Dispatch shape: no task_id supplied,
+        no working_directory field in the request either -- Direct Dispatch's
+        own ALLOWED_FIELDS doesn't even accept one) must have its
+        working_directory resolved from the already-loaded, trusted Project
+        record and persisted onto the Task at creation time, so
+        execution_runner.launch_task() never hits a bare KeyError later."""
+        result = self.dispatch_case(request(task_id="wd-snapshot-task"))
+        task = self.store.get("tasks", "p1", "wd-snapshot-task")
+        self.assertIn("working_directory", task)
+        self.assertEqual(project()["working_directory"], task["working_directory"])
+
+    def test_new_task_working_directory_never_taken_from_request_payload(self):
+        """Security boundary: even if a caller's request dict somehow carried
+        a working_directory-shaped key, dispatch() must never read it -- the
+        Project record (server-loaded, not client-supplied) is the only
+        source. Direct Dispatch's own payload validator already strips this
+        field before it reaches here; this proves dispatch() itself does not
+        create a second injection path if that upstream allowlist ever
+        changes."""
+        malicious = request(task_id="wd-injection-task")
+        malicious["working_directory"] = "/tmp/attacker-controlled-path"
+        result = self.dispatch_case(malicious)
+        task = self.store.get("tasks", "p1", "wd-injection-task")
+        self.assertEqual(project()["working_directory"], task["working_directory"])
+        self.assertNotEqual("/tmp/attacker-controlled-path", task["working_directory"])
+
+    def test_new_task_with_no_project_working_directory_leaves_it_null(self):
+        store = MemoryStore()
+        proj = project(); proj["working_directory"] = None
+        create_project(store, proj)
+        dispatch(store, object(), request(task_id="no-wd-task"), quota(), [])
+        task = store.get("tasks", "p1", "no-wd-task")
+        self.assertIsNone(task.get("working_directory"))
+
+    def test_existing_task_working_directory_is_never_overwritten_by_dispatch(self):
+        """Retry/re-dispatch of an *existing* task_id must not silently
+        re-derive working_directory from the Project's current value -- the
+        Task's own dispatch-time snapshot is immutable once set, so a later
+        Project edit can never drift an in-flight/retried Task."""
+        create_task(self.store, request(task_id="t1", working_directory="C:/already/resolved"), assign=False)
+        self.store.records[("projects", "p1", "p1")]["active_tasks"] = ["t1"]
+        self.store.records[("projects", "p1", "p1")]["working_directory"] = "C:/work/project/renamed"
+        self.dispatch_case(request())
+        task = self.store.get("tasks", "p1", "t1")
+        self.assertEqual("C:/already/resolved", task["working_directory"])
+
 
 class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
     """Regression test suite for M1 Slice 2: Forecast Evidence -> Account-aware Quota Routing."""

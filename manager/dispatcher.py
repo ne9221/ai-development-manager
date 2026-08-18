@@ -148,6 +148,15 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
         "task_id": safe_id(request.get("task_id") or re.sub(r"[^a-z0-9]+", "-", request["title"].lower()).strip("-")),
         "project_id": request["project_id"], "title": request["title"], "task_type": request["task_type"], "complexity": request["complexity"],
         "expected_minutes": request.get("expected_minutes") or 20, "needs_repo_edit": request.get("needs_repo_edit", True), "needs_research": request.get("needs_research", False), "needs_browser": request.get("needs_browser", False), "parallelizable": request.get("parallelizable", False),
+        # Resolved from the already-loaded, server-side Project record only --
+        # never from `request` (Direct Dispatch's own payload allowlist has no
+        # working_directory field, and this must stay true even if that ever
+        # changes). This is a one-time, dispatch-time snapshot: once a Task
+        # exists, this branch never runs again for it, so a later edit to
+        # Project.working_directory cannot silently drift an already-dispatched
+        # or retried Task (manager.execution_runner.launch_task() relies on
+        # this immutability for its own legacy-fallback backfill).
+        "working_directory": project.get("working_directory"),
         "scope": request.get("scope", []), "constraints": request.get("constraints", []), "acceptance_criteria": request.get("acceptance_criteria", []), "source_context": request.get("source_context", {}),
         "current_progress": "Not started", "next_action": "Confirm dispatch recommendation",
     }

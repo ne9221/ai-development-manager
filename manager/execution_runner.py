@@ -22,7 +22,7 @@ from manager.gcs_lock_registry import GCSLockRegistry
 from manager.quota_reader import read_drive_status
 from manager.session_identity import manager_session_key
 from manager.task_claims import task_claim_registry
-from manager.tasks import DriveRecords, TaskError, validate
+from manager.tasks import DriveRecords, TaskError, update_task, validate
 from manager.worktree_locks import link_session as link_writer_session
 
 
@@ -158,6 +158,38 @@ def _dispatch_request(task, provider, account_id=None):
     }
 
 
+def _resolve_working_directory(store, task):
+    """Resolve the launch-time working_directory, backfilling a legacy Task.
+
+    manager.dispatcher.dispatch() snapshots working_directory onto every Task
+    it creates going forward, so this is normally a pass-through read of the
+    Task's own value. A Task persisted before that contract existed has no
+    such field; only then does this fall back to reading the Task's Project
+    (never any caller-supplied value -- there is none available here). The
+    resolved value is validated (string, absolute, existing directory) before
+    it is trusted, and only *then* backfilled onto the Task record itself, so
+    a bad Project value is never persisted, and every later launch/retry of
+    this same Task reuses this Task's own snapshot instead of re-reading
+    Project again (matching the immutable-snapshot guarantee dispatch()
+    already provides for a Task that had the field from creation).
+    """
+    value = task.get("working_directory")
+    from_project = False
+    if value is None:
+        project = store.get("projects", task["project_id"], task["project_id"])
+        value = project.get("working_directory")
+        from_project = True
+    if not isinstance(value, str) or not value.strip():
+        raise TaskError(f"no working_directory is configured for task {task['task_id']!r} or its project")
+    if not os.path.isabs(value):
+        raise TaskError(f"working_directory must be an absolute path: {value!r}")
+    if not os.path.isdir(value):
+        raise TaskError(f"working_directory does not exist or is not a directory: {value!r}")
+    if from_project:
+        update_task(store, task["project_id"], task["task_id"], working_directory=value)
+    return value
+
+
 def launch_task(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                 execution_id=None, model=None, timeout_seconds=None, quota_document=None, executions=None,
                 retry_count=0, retry_of_execution_id=None, on_running=None, provider="codex",
@@ -200,6 +232,7 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     """
     task = store.get("tasks", project_id, task_id)
     validate("task", task)
+    working_directory = _resolve_working_directory(store, task)
     turn_timeout = task_turn_timeout(task["expected_minutes"], timeout_seconds)
     if provider == "claude" and claude_accounts is not None:
         quota_document = quota_document or read_drive_status(service=service)
@@ -218,7 +251,7 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     reserve_execution(store, project_id, task_id, execution_id, provider, dispatched["quota_evidence"],
                       dispatched["mode"], dispatched["effort"], retry_count=retry_count,
                       retry_of_execution_id=retry_of_execution_id)
-    request = LaunchRequest(task["working_directory"], model=model, reasoning_effort=dispatched["effort"],
+    request = LaunchRequest(working_directory, model=model, reasoning_effort=dispatched["effort"],
                             sandbox="read-only" if task["read_only"] else None,
                             approval_policy="never" if task["read_only"] else None,
                             timeout_seconds=RPC_TIMEOUT_SECONDS, turn_timeout_seconds=turn_timeout)

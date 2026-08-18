@@ -11,10 +11,10 @@ from manager.claude_launcher import ClaudeLaunchError
 from manager.codex_launcher import CodexLaunchError, LaunchOutcome, LaunchRequest
 from manager.execution_runner import _stopped, launch_task, run_execution
 from manager.task_claims import check_task_execution_claim
-from manager.tasks import TaskError
-from manager.test_execution_lifecycle import build_store, quota_document
+from manager.tasks import TaskError, create_project, create_task
+from manager.test_execution_lifecycle import MemoryStore, build_store, quota_document
 from manager.test_task_claims import MemoryClaimRegistry
-from manager.test_worktree_locks import MemoryRegistry
+from manager.test_worktree_locks import HEAD, REPO, MemoryRegistry
 from manager.worktree_locks import link_session
 
 
@@ -668,6 +668,209 @@ class ClaudeConfigLockWiringTests(unittest.TestCase):
         # account_id is attribution only. Two accounts (mis)configured to the
         # same real directory must canonicalize identically.
         self.assertEqual(canonical_config_dir(r"C:\accounts\a\.claude"), canonical_config_dir(r"c:\ACCOUNTS\a\.CLAUDE"))
+
+
+class WorkingDirectoryContractTests(unittest.TestCase):
+    """P0 regression: manager.execution_runner.launch_task() must never do a
+    bare task["working_directory"] dict access (KeyError on any Task created
+    before/without this field -- exactly what Direct Dispatch's Task shape
+    was doing). It must resolve the Task's own snapshot first, fall back to
+    the Task's Project only for a legacy Task missing the field, validate
+    the resolved value (string, absolute, existing directory) before any
+    provider spawn or execution-reservation side effect, and never fall
+    back to the launching process's own ambient cwd."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.valid_dir = str(Path(self.temp.name).resolve())
+        self.lock_home = tempfile.TemporaryDirectory()
+        self._lock_home_patch = patch.dict(os.environ, {"AI_MANAGER_HOME": self.lock_home.name})
+        self._lock_home_patch.start()
+
+    def tearDown(self):
+        self._lock_home_patch.stop()
+        self.lock_home.cleanup()
+        self.temp.cleanup()
+
+    def _project(self, working_directory="unset"):
+        document = {
+            "project_id": "p1", "name": "Project", "repo": REPO, "default_branch": "main",
+            "runtime_ssot": "Drive", "project_rules": [], "active_tasks": ["t1"],
+            "current_phase": "Phase 3C", "important_constraints": [],
+        }
+        if working_directory != "unset":
+            document["working_directory"] = working_directory
+        return document
+
+    def _legacy_task(self, **overrides):
+        # Deliberately shaped like a pre-fix Task: no working_directory key
+        # at all unless a test explicitly adds one via overrides -- this is
+        # what every Task persisted by manager.dispatcher.dispatch() before
+        # this P0 fix (and every Direct-Dispatch-created Task before it)
+        # actually looks like on disk.
+        document = {
+            "task_id": "t1", "project_id": "p1", "title": "Legacy task", "task_type": "implementation",
+            "complexity": "medium", "expected_minutes": 20, "needs_repo_edit": True,
+            "needs_research": False, "needs_browser": False, "parallelizable": False,
+            "read_only": False, "scope": ["manager/executions.py"], "constraints": [],
+            "acceptance_criteria": ["gate"], "branch": "refs/heads/main", "baseline_head": HEAD,
+            "allowed_paths": ["manager/executions.py"], "execution_policies": [],
+        }
+        document.update(overrides)
+        return document
+
+    def _store(self, project_working_directory="unset", task_overrides=None):
+        store = MemoryStore()
+        create_project(store, self._project(project_working_directory))
+        create_task(store, self._legacy_task(**(task_overrides or {})), assign=False)
+        return store
+
+    def _launch(self, store, launcher=None, retry_count=0, retry_of_execution_id=None,
+               execution_id="exec-a", provider="codex"):
+        launcher = launcher or Launcher()
+        with patch("manager.execution_runner.dispatch", return_value={
+            "recommended_provider": provider, "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
+            "generated_prompt": "bounded task",
+        }), patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            result = launch_task(store, object(), MemoryRegistry(), MemoryClaimRegistry(), launcher,
+                                 "p1", "t1", execution_id, retry_count=retry_count,
+                                 retry_of_execution_id=retry_of_execution_id, provider=provider)
+        return result, launcher
+
+    # -- B2: legacy Task missing working_directory falls back to its Project --
+
+    def test_legacy_task_falls_back_to_project_working_directory(self):
+        store = self._store(project_working_directory=self.valid_dir)
+        result, launcher = self._launch(store)
+        self.assertEqual(self.valid_dir, launcher.request.working_directory)
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+
+    def test_legacy_fallback_is_backfilled_onto_the_task_as_its_own_snapshot(self):
+        # So this Task behaves exactly like a post-fix, dispatch-time
+        # resolved Task from now on -- see the Retry test below, which
+        # relies on this to avoid re-deriving from Project on every attempt.
+        store = self._store(project_working_directory=self.valid_dir)
+        self._launch(store)
+        self.assertEqual(self.valid_dir, store.get("tasks", "p1", "t1")["working_directory"])
+
+    def test_task_snapshot_working_directory_takes_priority_over_project(self):
+        store = self._store(
+            project_working_directory=self.valid_dir,
+            task_overrides={"working_directory": self.valid_dir},
+        )
+        # A second, different Project directory must never override an
+        # already-resolved Task snapshot.
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        store.records[("projects", "p1", "p1")]["working_directory"] = str(Path(other.name).resolve())
+        result, launcher = self._launch(store)
+        self.assertEqual(self.valid_dir, launcher.request.working_directory)
+
+    # -- B3: missing everywhere fails closed --
+
+    def test_missing_task_and_project_working_directory_fails_closed(self):
+        store = self._store(project_working_directory="unset")
+        with self.assertRaises(TaskError):
+            self._launch(store)
+
+    def test_null_project_working_directory_fails_closed(self):
+        store = self._store(project_working_directory=None)
+        with self.assertRaises(TaskError):
+            self._launch(store)
+
+    # -- B4: invalid path shapes fail closed --
+
+    def test_relative_working_directory_fails_closed(self):
+        store = self._store(task_overrides={"working_directory": "relative/path"})
+        with self.assertRaisesRegex(TaskError, "absolute"):
+            self._launch(store)
+
+    def test_nonexistent_working_directory_fails_closed(self):
+        missing = os.path.join(self.valid_dir, "does-not-exist")
+        store = self._store(task_overrides={"working_directory": missing})
+        with self.assertRaisesRegex(TaskError, "does not exist|not a directory"):
+            self._launch(store)
+
+    def test_working_directory_pointing_to_a_file_fails_closed(self):
+        file_path = os.path.join(self.valid_dir, "not-a-dir.txt")
+        Path(file_path).write_text("x")
+        store = self._store(task_overrides={"working_directory": file_path})
+        with self.assertRaisesRegex(TaskError, "not a directory"):
+            self._launch(store)
+
+    # -- B5: invalid working_directory fails before reservation or spawn side effects --
+
+    def test_invalid_working_directory_fails_before_reservation_and_spawn(self):
+        store = self._store(project_working_directory="unset")
+        launcher = Launcher()
+        with self.assertRaises(TaskError):
+            self._launch(store, launcher=launcher)
+        self.assertEqual([], launcher.events)  # prepare() (the only thing that can spawn) never ran
+        with self.assertRaises((TaskError, KeyError)):
+            store.get("executions", "p1", "exec-a")  # no Execution reservation was ever persisted
+
+    # -- B6: trusted retry of a legacy task resolves working_directory on the second attempt --
+
+    def test_retry_of_legacy_task_resolves_working_directory(self):
+        store = self._store(project_working_directory=self.valid_dir)
+        result, launcher = self._launch(
+            store, retry_count=1, retry_of_execution_id="exec-a-prior", execution_id="exec-a-retry",
+        )
+        self.assertEqual(self.valid_dir, launcher.request.working_directory)
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+
+    def test_retry_reuses_backfilled_snapshot_without_redriving_from_a_changed_project(self):
+        # First (failed) attempt backfills the Task's own snapshot from
+        # Project. If Project.working_directory is edited afterward (e.g. by
+        # an unrelated later dispatch), a genuine second attempt of this same
+        # Task -- taken through the real prepare_task_retry() blocked->ready
+        # transition, not a fresh Task -- must keep using the value already
+        # resolved onto it, never silently re-derive from the changed Project.
+        from manager.executions import prepare_task_retry
+        store = self._store(project_working_directory=self.valid_dir, task_overrides={
+            "read_only": True, "needs_repo_edit": False,
+        })
+        claim = MemoryClaimRegistry()
+        failing_launcher = Launcher(failure="prepare")
+        with patch("manager.execution_runner.dispatch", return_value={
+            "recommended_provider": "codex", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
+            "generated_prompt": "bounded task",
+        }), patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()), \
+             self.assertRaises(CodexLaunchError):
+            launch_task(store, object(), None, claim, failing_launcher, "p1", "t1", "exec-a")
+        self.assertEqual("interrupted", store.get("executions", "p1", "exec-a")["status"])
+        # Backfilled onto the Task by the first attempt.
+        self.assertEqual(self.valid_dir, store.get("tasks", "p1", "t1")["working_directory"])
+
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        store.records[("projects", "p1", "p1")]["working_directory"] = str(Path(other.name).resolve())
+        prepare_task_retry(store, claim, "p1", "t1", "exec-a", retry_count=1)
+        self.assertEqual("ready", store.get("tasks", "p1", "t1")["status"])
+
+        retry_launcher = Launcher()
+        with patch("manager.execution_runner.dispatch", return_value={
+            "recommended_provider": "codex", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
+            "generated_prompt": "bounded task",
+        }), patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            launch_task(store, object(), None, claim, retry_launcher, "p1", "t1", "exec-a-retry",
+                       retry_count=1, retry_of_execution_id="exec-a")
+        self.assertEqual(self.valid_dir, retry_launcher.request.working_directory)
+
+    # -- B7: Claude and Codex both receive the identical resolved absolute directory --
+
+    def test_claude_and_codex_launch_requests_receive_the_same_resolved_directory(self):
+        for provider, launcher in (("codex", Launcher()), ("claude", ClaudeStyleLauncher())):
+            with self.subTest(provider=provider):
+                store = self._store(project_working_directory=self.valid_dir)
+                self._launch(store, launcher=launcher, provider=provider)
+                self.assertEqual(self.valid_dir, launcher.request.working_directory)
 
 
 if __name__ == "__main__":
