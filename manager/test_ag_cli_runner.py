@@ -2,7 +2,9 @@
 
 import json
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from manager.ag_cli_runner import (
@@ -16,6 +18,13 @@ from manager.ag_runner import AgLaunchError, LaunchRequest, normalize_event
 
 
 class TestOfficialAgCliRunner(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.valid_cwd = self._tmpdir.name
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
     @patch("pathlib.Path.is_dir")
     @patch("pathlib.Path.is_file")
     def test_verify_auth_identity_success_with_local_profile(self, mock_is_file, mock_is_dir):
@@ -89,7 +98,7 @@ class TestOfficialAgCliRunner(unittest.TestCase):
         mock_auth = lambda: "local_profile"
         runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
 
-        req = LaunchRequest(working_directory="/test", model="flash")
+        req = LaunchRequest(working_directory=self.valid_cwd, model="flash")
         prepared = runner.prepare(req)
         self.assertEqual(prepared.mode, "cli")
         self.assertTrue(prepared.thread_id.startswith("ag-cli-"))
@@ -114,6 +123,7 @@ class TestOfficialAgCliRunner(unittest.TestCase):
             self.assertIn("--model", called_args)
             self.assertIn("flash", called_args)
             self.assertIn("Read README header", called_args)
+            self.assertEqual(mock_popen.call_args.kwargs["cwd"], self.valid_cwd)
 
             outcome = runner.wait(running)
             self.assertEqual(outcome.status, "completed")
@@ -128,7 +138,7 @@ class TestOfficialAgCliRunner(unittest.TestCase):
         mock_auth = lambda: "local_profile"
         runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
 
-        req = LaunchRequest(working_directory="/test")
+        req = LaunchRequest(working_directory=self.valid_cwd)
         prepared = runner.prepare(req)
 
         mock_proc = MagicMock()
@@ -154,7 +164,7 @@ class TestOfficialAgCliRunner(unittest.TestCase):
         mock_auth = lambda: "local_profile"
         runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
 
-        req = LaunchRequest(working_directory="/test")
+        req = LaunchRequest(working_directory=self.valid_cwd)
         prepared = runner.prepare(req)
 
         mock_proc = MagicMock()
@@ -177,7 +187,7 @@ class TestOfficialAgCliRunner(unittest.TestCase):
         mock_auth = lambda: "local_profile"
         runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
 
-        req = LaunchRequest(working_directory="/test", turn_timeout_seconds=0.1)
+        req = LaunchRequest(working_directory=self.valid_cwd, turn_timeout_seconds=0.1)
         prepared = runner.prepare(req)
 
         mock_proc = MagicMock()
@@ -199,7 +209,7 @@ class TestOfficialAgCliRunner(unittest.TestCase):
         mock_auth = lambda: "local_profile"
         runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
 
-        req = LaunchRequest(working_directory="/test")
+        req = LaunchRequest(working_directory=self.valid_cwd)
         prepared = runner.prepare(req)
 
         mock_proc = MagicMock()
@@ -221,7 +231,7 @@ class TestOfficialAgCliRunner(unittest.TestCase):
         mock_auth = lambda: "local_profile"
         runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
 
-        req = LaunchRequest(working_directory="/test")
+        req = LaunchRequest(working_directory=self.valid_cwd)
         prepared = runner.prepare(req)
 
         mock_proc = MagicMock()
@@ -242,6 +252,108 @@ class TestOfficialAgCliRunner(unittest.TestCase):
             self.assertEqual(outcome.status, "completed")
             self.assertIn("Line 1: starting", outcome.response_text)
             self.assertIn("Line 3: done", outcome.response_text)
+
+
+class TestAgCliRunnerWorkingDirectoryFailClosed(unittest.TestCase):
+    """Regression coverage: OfficialAgCliRunner.start() must never spawn the
+    CLI subprocess with a missing/invalid working_directory, and must never
+    fall back to the ambient process cwd (cwd=None) to do so."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.valid_cwd = self._tmpdir.name
+        self.mock_resolver = lambda: ("/opt/bin/agentapi", [])
+        self.mock_auth = lambda: "local_profile"
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _prepared(self, working_directory):
+        runner = OfficialAgCliRunner(executable_resolver=self.mock_resolver, auth_verifier=self.mock_auth)
+        req = LaunchRequest(working_directory=working_directory)
+        prepared = runner.prepare(req)
+        return runner, prepared
+
+    def test_none_working_directory_fails_closed_no_spawn(self):
+        runner, prepared = self._prepared(None)
+        with patch("subprocess.Popen") as mock_popen:
+            with self.assertRaises(AgLaunchError) as ctx:
+                runner.start(prepared, "prompt")
+            self.assertEqual(ctx.exception.classification, "invalid_request")
+            mock_popen.assert_not_called()
+
+    def test_empty_string_working_directory_fails_closed_no_spawn(self):
+        runner, prepared = self._prepared("")
+        with patch("subprocess.Popen") as mock_popen:
+            with self.assertRaises(AgLaunchError) as ctx:
+                runner.start(prepared, "prompt")
+            self.assertEqual(ctx.exception.classification, "invalid_request")
+            mock_popen.assert_not_called()
+
+    def test_relative_working_directory_fails_closed_no_spawn(self):
+        runner, prepared = self._prepared("relative/path")
+        with patch("subprocess.Popen") as mock_popen:
+            with self.assertRaises(AgLaunchError) as ctx:
+                runner.start(prepared, "prompt")
+            self.assertEqual(ctx.exception.classification, "invalid_request")
+            mock_popen.assert_not_called()
+
+    def test_nonexistent_absolute_working_directory_fails_closed_no_spawn(self):
+        nonexistent = str(Path(self.valid_cwd) / "does-not-exist-xyz")
+        runner, prepared = self._prepared(nonexistent)
+        with patch("subprocess.Popen") as mock_popen:
+            with self.assertRaises(AgLaunchError) as ctx:
+                runner.start(prepared, "prompt")
+            self.assertEqual(ctx.exception.classification, "invalid_request")
+            mock_popen.assert_not_called()
+
+    def test_file_path_instead_of_directory_fails_closed_no_spawn(self):
+        file_path = str(Path(self.valid_cwd) / "some_file.txt")
+        Path(file_path).write_text("not a directory")
+        runner, prepared = self._prepared(file_path)
+        with patch("subprocess.Popen") as mock_popen:
+            with self.assertRaises(AgLaunchError) as ctx:
+                runner.start(prepared, "prompt")
+            self.assertEqual(ctx.exception.classification, "invalid_request")
+            mock_popen.assert_not_called()
+
+    def test_valid_absolute_existing_directory_launches_with_exact_cwd(self):
+        runner, prepared = self._prepared(self.valid_cwd)
+        mock_proc = MagicMock()
+        mock_proc.pid = 4242
+        mock_proc.stdout.readline.side_effect = [""]
+        mock_proc.stderr.readline.side_effect = [""]
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+            runner.start(prepared, "prompt")
+            mock_popen.assert_called_once()
+            self.assertEqual(mock_popen.call_args.kwargs["cwd"], self.valid_cwd)
+            self.assertIsNotNone(mock_popen.call_args.kwargs["cwd"])
+
+    def test_path_with_spaces_launches_with_exact_cwd(self):
+        spaced = tempfile.mkdtemp(suffix=" with spaces", dir=self.valid_cwd)
+        runner, prepared = self._prepared(spaced)
+        mock_proc = MagicMock()
+        mock_proc.pid = 4243
+        mock_proc.stdout.readline.side_effect = [""]
+        mock_proc.stderr.readline.side_effect = [""]
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+            runner.start(prepared, "prompt")
+            self.assertEqual(mock_popen.call_args.kwargs["cwd"], spaced)
+
+    def test_invalid_working_directory_does_not_mark_prepared_as_started(self):
+        # Since a LaunchRequest is frozen/immutable, an invalid working_directory
+        # can never be retried on the same PreparedLaunch anyway, but this still
+        # confirms the failure happens before the _started side effect, not after.
+        runner, prepared = self._prepared(None)
+        self.assertFalse(prepared._started)
+        with patch("subprocess.Popen"):
+            with self.assertRaises(AgLaunchError):
+                runner.start(prepared, "prompt")
+        self.assertFalse(prepared._started)
 
 
 if __name__ == "__main__":

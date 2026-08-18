@@ -298,10 +298,27 @@ class OfficialAgCliRunner:
     def start(self, prepared: PreparedLaunch, prompt: str) -> RunningLaunch:
         if prepared._started:
             raise AgLaunchError("already_started", "Prepared Antigravity launch was already started")
+
+        req = prepared._request
+
+        # Fail closed on missing/invalid working_directory rather than ever
+        # falling back to the ambient process cwd (matches the contract
+        # ClaudeLauncher/CodexLauncher enforce for the same field).
+        wd = req.working_directory
+        if not isinstance(wd, str) or not wd.strip():
+            raise AgLaunchError("invalid_request", "working_directory must be a non-empty string")
+        cwd_path = Path(wd)
+        if not cwd_path.is_absolute():
+            raise AgLaunchError("invalid_request", f"working_directory must be an absolute path: {wd!r}")
+        if not cwd_path.is_dir():
+            raise AgLaunchError(
+                "invalid_request", f"working_directory does not exist or is not a directory: {wd!r}"
+            )
+        cwd = str(cwd_path)
+
         prepared._started = True
 
         executable, prefix_args = self._get_resolved_executable()
-        req = prepared._request
 
         args = [executable]
         args.extend(prefix_args)
@@ -322,9 +339,6 @@ class OfficialAgCliRunner:
 
         # Sanitize environment to prevent secondary billing / external API key injection
         env = sanitize_ag_environment(os.environ)
-
-        # Enforce sandbox and working directory
-        cwd = req.working_directory if Path(req.working_directory).is_dir() else None
 
         try:
             proc = subprocess.Popen(
