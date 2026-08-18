@@ -36,17 +36,35 @@ from pathlib import Path
 
 from manager.codex_launcher import process_creation_identity, process_identity_state
 from manager.command_watcher import load_allowlist
+from manager.dispatch_requests import dispatch_request_registry
 from manager.refresh_status import RefreshError, runtime_lock, write_atomic
+from manager.runtime_bridge import all_projects
 from manager.tasks import DriveRecords, TaskError
+from manager.trusted_ingress import verify_trusted_ingress_admission
 
 ACTIVE_STATUSES = ("queued", "claimed", "running")
 PORT_RECHECK_ATTEMPTS = 10
 PORT_RECHECK_INTERVAL_SECONDS = 0.2
 
 
-def find_active_command(store, allowlist):
+def find_active_command(store, allowlist, bucket=None, ingress_registry_factory=dispatch_request_registry):
     """Deterministic: the most-recently-created in-scope, non-terminal
-    command. An empty allowlist means nothing is ever followed."""
+    command. An empty allowlist and no bucket means nothing is ever
+    followed.
+
+    In-scope has two independent routes, matching manager.command_watcher's
+    own admission model exactly so a command that Command Watcher will
+    launch is never invisible to the Session Center UI:
+
+    1. The existing static ADM_WATCHER_ALLOWLIST_PATH allowlist -- entirely
+       unchanged from before this parameter existed.
+    2. A command admitted under the v1 trusted-ingress contract (see
+       manager.trusted_ingress.verify_trusted_ingress_admission, the exact
+       same fail-closed check Command Watcher itself uses -- never
+       duplicated or re-implemented here). Only evaluated when `bucket` is
+       given; a command is never assumed in-scope just for being
+       queued/claimed/running.
+    """
     candidates = []
     for project_id, task_id in sorted(allowlist):
         try:
@@ -56,6 +74,20 @@ def find_active_command(store, allowlist):
         for record in commands:
             if record.get("task_id") == task_id and record.get("status") in ACTIVE_STATUSES:
                 candidates.append(record)
+    if bucket:
+        for project in all_projects(store):
+            project_id = project["project_id"]
+            try:
+                commands = store.list_records("commands", project_id)
+            except TaskError:
+                continue
+            for record in commands:
+                if record.get("status") not in ACTIVE_STATUSES:
+                    continue
+                if (project_id, record.get("task_id")) in allowlist:
+                    continue  # already a candidate via the static path above
+                if verify_trusted_ingress_admission(store, record, bucket, ingress_registry_factory) is not None:
+                    candidates.append(record)
     if not candidates:
         return None
     candidates.sort(key=lambda c: c.get("created_at") or "")
@@ -164,12 +196,13 @@ def spawn_session_center(python_exe, repo, project_id, execution_id, port, wait_
     )
 
 
-def run_once(store, allowlist, state_path, python_exe, repo, port, wait_seconds, host="127.0.0.1"):
+def run_once(store, allowlist, state_path, python_exe, repo, port, wait_seconds, host="127.0.0.1",
+            bucket=None, ingress_registry_factory=dispatch_request_registry):
     """The entire read-decide-kill/spawn-write cycle for one invocation.
     Callers must hold the exclusive lock for the whole duration -- see main().
     """
     state = read_state(state_path)
-    target = find_active_command(store, allowlist)
+    target = find_active_command(store, allowlist, bucket=bucket, ingress_registry_factory=ingress_registry_factory)
     decision = decide(state, target)
 
     if decision["action"] == "noop":
@@ -221,7 +254,8 @@ def main(argv=None):
     try:
         with runtime_lock(lock_path_for(args.state_file)):
             result = run_once(store, allowlist, args.state_file, args.python_path,
-                              args.repository_path, args.port, args.wait_seconds)
+                              args.repository_path, args.port, args.wait_seconds,
+                              bucket=os.environ.get("ADM_LOCK_GCS_BUCKET"))
     except RefreshError:
         # Another invocation is already mid-cycle: no-op, spawn/kill/write
         # nothing. This is not a failure -- it is mutual exclusion working.
