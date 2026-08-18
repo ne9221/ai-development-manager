@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -18,6 +19,7 @@ from unittest.mock import MagicMock, mock_open, patch
 from manager.ag_cli_runner import (
     AgCliProcess,
     OfficialAgCliRunner,
+    is_trusted_ag_executable_path,
     resolve_ag_cli_executable,
     resolve_ag_official_cli_executable,
     resolve_canonical_gemini_home,
@@ -235,14 +237,16 @@ class TestAdvWindowsCmdResolutionAndOrphanCleanup(unittest.TestCase):
         """Spawn a real parent process that itself spawns a real grandchild
         (simulating a .bat wrapper spawning node.exe), call terminate(), and
         verify BOTH are actually gone -- not just the immediate pid."""
-        marker = Path(os.environ["TEMP"]) / f"adm_ag_adv_grandchild_pid_{os.getpid()}.txt"
+        marker = Path(tempfile.gettempdir()) / f"adm_ag_adv_grandchild_pid_{os.getpid()}.txt"
         if marker.exists():
             marker.unlink()
 
+        marker_repr = repr(str(marker))
+        exe_repr = repr(sys.executable)
         parent_script = (
-            "import subprocess, sys, time, os;"
-            f"gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']);"
-            f"open(r'{marker}', 'w').write(str(gc.pid));"
+            "import subprocess, sys, time, os; "
+            f"gc = subprocess.Popen([{exe_repr}, '-c', 'import time; time.sleep(60)']); "
+            f"open({marker_repr}, 'w').write(str(gc.pid)); "
             "time.sleep(60)"
         )
         proc = subprocess.Popen(
@@ -870,6 +874,104 @@ class TestAdvR4MaskedFailureParser(unittest.TestCase):
         outcome2 = self._run_with_stdout_lines([json.dumps(benign_payload) + "\n"])
         self.assertEqual(outcome2.status, "completed")
         self.assertIsNone(outcome2.failure_classification)
+
+class TestAdvR5WindowsTempTrustedRootHardening(unittest.TestCase):
+    """Adversarial regression suite for R5: Windows Temp and SystemRoot/WINDIR exclusion."""
+
+    def test_r5_windows_temp_fake_agy_rejected_directly(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            win_dir = Path(td) / "Windows"
+            temp_dir = win_dir / "Temp"
+            temp_dir.mkdir(parents=True)
+            fake_agy = temp_dir / ("agy.exe" if os.name == "nt" else "agy")
+            fake_agy.write_text("fake binary in windows temp", encoding="utf-8")
+
+            with patch.dict(os.environ, {"SystemRoot": str(win_dir), "WINDIR": str(win_dir)}, clear=False):
+                self.assertFalse(is_trusted_ag_executable_path(fake_agy))
+
+    def test_r5_windows_systemroot_not_in_trusted_roots(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            win_dir = Path(td) / "Windows"
+            system32_dir = win_dir / "System32"
+            system32_dir.mkdir(parents=True)
+            fake_agy = system32_dir / ("agy.exe" if os.name == "nt" else "agy")
+            fake_agy.write_text("fake binary in system32", encoding="utf-8")
+
+            with patch.dict(os.environ, {"SystemRoot": str(win_dir), "WINDIR": str(win_dir)}, clear=False):
+                # SystemRoot/WINDIR is strictly excluded as a trusted root
+                self.assertFalse(is_trusted_ag_executable_path(fake_agy))
+
+    def test_r5_windows_temp_fake_agy_path_prepended_rejected_end_to_end(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            win_dir = Path(td) / "Windows"
+            temp_dir = win_dir / "Temp"
+            temp_dir.mkdir(parents=True)
+            fake_agy = temp_dir / ("agy.exe" if os.name == "nt" else "agy")
+            fake_agy.write_text("fake binary in windows temp", encoding="utf-8")
+
+            with patch.dict(os.environ, {"SystemRoot": str(win_dir), "WINDIR": str(win_dir)}, clear=False),                  patch("shutil.which", return_value=str(fake_agy)):
+                with self.assertRaises(AgLaunchError) as ctx:
+                    resolve_ag_official_cli_executable()
+                self.assertEqual(ctx.exception.classification, "route_unavailable")
+
+    def test_r5_program_files_installation_path_still_accepted_with_extra_roots(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            pf_dir = Path(td) / "Program Files"
+            bin_dir = pf_dir / "Google" / "Antigravity" / "bin"
+            bin_dir.mkdir(parents=True)
+            valid_agy = bin_dir / ("agy.exe" if os.name == "nt" else "agy")
+            valid_agy.write_text("valid vendor binary", encoding="utf-8")
+
+            path, prefix = resolve_ag_official_cli_executable(
+                explicit=str(valid_agy),
+                extra_trusted_roots=[pf_dir],
+            )
+            self.assertEqual(path, str(valid_agy.resolve()))
+            self.assertEqual(prefix, [])
+
+    def test_r5_program_files_discovery_still_accepted_from_system_candidates(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            fake_user = Path(td) / "user"
+            pf_dir = Path(td) / "Program Files"
+            bin_dir = pf_dir / "Google" / "Antigravity" / "bin"
+            bin_dir.mkdir(parents=True)
+            valid_agy = bin_dir / ("agy.exe" if os.name == "nt" else "agy")
+            valid_agy.write_text("valid vendor binary", encoding="utf-8")
+
+            clean_env = {
+                "ProgramFiles": str(pf_dir),
+                "LOCALAPPDATA": str(fake_user / "local"),
+                "APPDATA": str(fake_user / "roaming"),
+                "USERPROFILE": str(fake_user),
+                "HOME": str(fake_user),
+                "TEMP": str(fake_user / "temp"),
+                "TMP": str(fake_user / "temp"),
+            }
+            with patch.dict(os.environ, clean_env, clear=True),                  patch("tempfile.gettempdir", return_value=str(fake_user / "temp")):
+                path, prefix = resolve_ag_official_cli_executable()
+                self.assertEqual(path, str(valid_agy.resolve()))
+                self.assertEqual(prefix, [])
+
+    def test_r5_unverified_windows_temp_never_tagged_official_cli(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            win_dir = Path(td) / "Windows"
+            temp_dir = win_dir / "Temp"
+            temp_dir.mkdir(parents=True)
+            fake_agy = temp_dir / ("agy.exe" if os.name == "nt" else "agy")
+            fake_agy.write_text("fake binary", encoding="utf-8")
+
+            runner = OfficialAgCliRunner(auth_verifier=lambda: "verified")
+            with patch.dict(os.environ, {"SystemRoot": str(win_dir), "WINDIR": str(win_dir)}, clear=False),                  patch("shutil.which", return_value=str(fake_agy)):
+                with self.assertRaises(AgLaunchError) as ctx:
+                    runner.prepare(LaunchRequest(working_directory="."))
+                self.assertEqual(ctx.exception.classification, "route_unavailable")
+
 
 if __name__ == "__main__":
     unittest.main()

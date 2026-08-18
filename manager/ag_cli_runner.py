@@ -427,15 +427,30 @@ def is_trusted_ag_executable_path(
         except Exception:
             continue
 
+    # Additional defense-in-depth: reject Windows system temp directories
+    for sys_env in ("SystemRoot", "WINDIR", "SYSTEMROOT"):
+        sval = os.environ.get(sys_env)
+        if sval:
+            temp_dirs.append(os.path.join(sval, "Temp"))
+            temp_dirs.append(os.path.join(sval, "temp"))
+    temp_dirs.extend(["C:\\Windows\\Temp", "C:\\Windows\\temp", "C:\\temp", "C:\\Temp"])
+    for td in temp_dirs:
+        try:
+            norm_td = os.path.normcase(os.path.normpath(str(Path(td).resolve())))
+            if resolved_str == norm_td or resolved_str.startswith(norm_td + os.sep):
+                return False
+        except Exception:
+            continue
+
     trusted_system_roots: list[Path] = []
 
     # 1. System / ProgramFiles on Windows (elevation-gated)
+    # Note: %SystemRoot% and %WINDIR% are strictly excluded as trust roots because
+    # they contain unprivileged user-writable locations such as %SystemRoot%\Temp.
     for env_var in (
         "ProgramFiles",
         "ProgramFiles(x86)",
         "ProgramW6432",
-        "SystemRoot",
-        "WINDIR",
     ):
         base = os.environ.get(env_var)
         if base:
