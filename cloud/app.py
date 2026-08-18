@@ -25,6 +25,8 @@ DISPATCH_INGRESS_ERROR_STATUS = {
     "malformed_request": "400 Bad Request",
     "unknown_project": "404 Not Found",
     "unknown_account": "404 Not Found",
+    "unknown_execution": "404 Not Found",
+    "retry_not_eligible": "409 Conflict",
     "idempotency_backend_unavailable": "503 Service Unavailable",
     "read_only_required": "422 Unprocessable Entity",
     "dispatch_state_inconsistent": "409 Conflict",

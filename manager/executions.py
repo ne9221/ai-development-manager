@@ -285,8 +285,57 @@ def cancel_reserved_execution(store, claim_registry, project_id, execution_id, r
     return cancelled
 
 
+def linked_command_for_execution(store, project_id, task_id, execution_id):
+    """The unique Command (if any) whose own execution_id links back to
+    `execution_id`, scoped to this exact project_id/task_id. None if zero or
+    more than one match -- ambiguous linkage is never trusted as evidence of
+    anything."""
+    linked = [c for c in store.list_records("commands", project_id)
+              if c.get("execution_id") == execution_id and c.get("task_id") == task_id]
+    return linked[0] if len(linked) == 1 else None
+
+
+def _prelaunch_failure_linked_command(store, project_id, task_id, execution_id):
+    """The linked Command (if any) that structurally proves `execution_id`
+    was cancelled by manager.command_watcher._reconcile_active's prelaunch-
+    cleanup path, not some other (ordinary or future) cancellation reason.
+
+    Matched purely on stored, schema-validated fields the caller cannot
+    forge from outside that one code path: its own terminal result is
+    error_kind=prelaunch_failed. Never trusts free-text notes on the
+    execution itself.
+    """
+    command = linked_command_for_execution(store, project_id, task_id, execution_id)
+    if command is None:
+        return None
+    result = command.get("result") or {}
+    if command.get("status") != "failed" or result.get("error_kind") != "prelaunch_failed":
+        return None
+    return command
+
+
+def retry_eligible(store, project_id, task_id, prior):
+    """True if the already-fetched, already-validated `prior` execution
+    (belonging to project_id/task_id) may be retried.
+
+    failed/interrupted are always eligible -- the original, unchanged
+    contract. A cancelled execution is eligible only when
+    _prelaunch_failure_linked_command proves it was cancelled by the
+    trusted prelaunch-failure cleanup path; every other cancellation
+    (ordinary user cancellation, superseded, authority-inconsistent, or any
+    future reason) is deliberately not recognized and stays terminal.
+    """
+    status = prior.get("status")
+    if status in ("failed", "interrupted"):
+        return True
+    if status == "cancelled":
+        return _prelaunch_failure_linked_command(store, project_id, task_id, prior.get("execution_id")) is not None
+    return False
+
+
 def prepare_task_retry(store, claim_registry, project_id, task_id, prior_execution_id, retry_count=1):
-    """Return one safely cleaned-up failed/interrupted task to ready."""
+    """Return one safely cleaned-up failed/interrupted (or prelaunch-failure-
+    cancelled) task to ready."""
     task = store.get("tasks", project_id, task_id)
     validate("task", task)
     prior = store.get("executions", project_id, prior_execution_id)
@@ -295,13 +344,20 @@ def prepare_task_retry(store, claim_registry, project_id, task_id, prior_executi
         raise TaskError(f"retry_count must be from 1 to {MAX_RETRY_COUNT}")
     if retry_count != int(prior.get("retry_count", 0)) + 1:
         raise TaskError("retry_count must increment the prior execution exactly once")
-    if prior.get("task_id") != task_id or prior.get("status") not in ("failed", "interrupted"):
+    if prior.get("task_id") != task_id or not retry_eligible(store, project_id, task_id, prior):
         raise TaskError("retry requires the task's failed or interrupted prior execution")
-    cleanup = prior.get("cleanup_evidence") or {}
-    if cleanup.get("persistence") != "complete" or cleanup.get("task_claim_release") != "released":
-        raise TaskError("retry requires complete persistence and released task claim")
-    if prior.get("access") == "production_write" and cleanup.get("writer_release") != "released":
-        raise TaskError("retry requires released writer authority")
+    # A prelaunch-failure-cancelled reservation never acquired running
+    # authority in the first place (cancel_reserved_execution enforces that
+    # before it will even cancel one) -- there is no writer/claim cleanup to
+    # verify, and cleanup_evidence is always None for it by construction.
+    # The failed/interrupted cleanup contract below is therefore unchanged
+    # and only ever applies to executions that actually ran.
+    if prior.get("status") in ("failed", "interrupted"):
+        cleanup = prior.get("cleanup_evidence") or {}
+        if cleanup.get("persistence") != "complete" or cleanup.get("task_claim_release") != "released":
+            raise TaskError("retry requires complete persistence and released task claim")
+        if prior.get("access") == "production_write" and cleanup.get("writer_release") != "released":
+            raise TaskError("retry requires released writer authority")
     if check_task_execution_claim(claim_registry, project_id, task_id) is not None:
         raise TaskError("retry requires no active task claim")
     executions = store.list_records("executions", project_id)

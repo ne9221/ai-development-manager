@@ -56,6 +56,28 @@ def session(provider="codex", provider_session_id="s1", project_id="p1"):
     return {"session_id": manager_session_key(provider, provider_session_id), "provider": provider, "provider_session_id": provider_session_id, "project_id": project_id}
 
 
+def command(command_id="cmd1", project_id="p1", task_id="t1", execution_id="prior", status="failed", error_kind="prelaunch_failed"):
+    return {
+        "command_id": command_id, "project_id": project_id, "task_id": task_id,
+        "provider": "codex", "account_id": None, "model": None, "fallback_model": None,
+        "mode": "code", "effort": "medium", "selection_reason": [], "quota_evidence": {},
+        "created_at": "2026-08-09T00:00:00Z", "status": status, "execution_id": execution_id,
+        "claimed_at": "2026-08-09T00:00:01Z", "completed_at": "2026-08-09T00:00:05Z",
+        "result": ({"status": "error", "execution_id": execution_id, "session_id": None, "error_kind": error_kind}
+                   if status == "failed" else None),
+        "created_via": "direct_dispatch_ingress", "admission_version": "v1", "request_id": "req-1",
+    }
+
+
+def prelaunch_cancelled_execution(reserved, cancelled_at="2026-08-09T00:01:00Z"):
+    """Shape produced by manager.command_watcher._reconcile_active's real
+    prelaunch-cleanup call to cancel_reserved_execution() -- never started,
+    no running authority, no cleanup_evidence (nothing to clean up)."""
+    return {**reserved, "status": "cancelled", "finished_at": cancelled_at, "elapsed_minutes": 0,
+            "access": None, "lease_evidence": None, "cleanup_evidence": None,
+            "notes": [*reserved.get("notes", []), "prelaunch failure left a reservation without provider authority"]}
+
+
 def put_legacy_running(store, service, project_id, task_id, execution_id, provider, mode=None, effort=None, started_at=None, notes=None, session=None):
     """Create a legacy running fixture without exposing a production bypass."""
     task_document = store.get("tasks", project_id, task_id)
@@ -145,6 +167,71 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(1, ready["source_context"]["retry_count"])
         self.assertEqual("prior", ready["source_context"]["retry_of_execution_id"])
         self.assertEqual(ready, prepare_task_retry(self.store, MemoryClaimRegistry(), "p1", "t1", "prior"))
+
+    def test_retry_eligible_for_cancelled_execution_caused_by_prelaunch_failure(self):
+        # Reproduces the live golden-E2E bug: a Command that failed with
+        # error_kind=prelaunch_failed before the running gate ever granted
+        # authority leaves its execution "cancelled", not "failed" --
+        # structurally proven via the linked failed Command, this must be
+        # retryable, not permanently stuck.
+        reserved = reserve_execution(self.store, "p1", "t1", "prior", "codex", decision())
+        prior = prelaunch_cancelled_execution(reserved)
+        self.store.put("executions", "p1", "prior", prior)
+        self.store.put("commands", "p1", "cmd1", command())
+        task_record = self.store.get("tasks", "p1", "t1")
+        task_record.update(status="blocked", blocked_reason="Execution failed before provider authority: prelaunch_contract_or_gate_failure",
+                            source_context={"active_execution_id": "prior"})
+        self.store.put("tasks", "p1", "t1", task_record)
+        ready = prepare_task_retry(self.store, MemoryClaimRegistry(), "p1", "t1", "prior")
+        self.assertEqual("ready", ready["status"])
+        self.assertIsNone(ready["blocked_reason"])
+        self.assertEqual(1, ready["source_context"]["retry_count"])
+        self.assertEqual("prior", ready["source_context"]["retry_of_execution_id"])
+        # Idempotent replay, matching the failed/interrupted contract.
+        self.assertEqual(ready, prepare_task_retry(self.store, MemoryClaimRegistry(), "p1", "t1", "prior"))
+
+    def test_retry_rejects_ordinary_cancelled_execution_without_linked_prelaunch_failure(self):
+        reserved = reserve_execution(self.store, "p1", "t1", "prior", "codex", decision())
+        prior = prelaunch_cancelled_execution(reserved)
+        self.store.put("executions", "p1", "prior", prior)
+        task_record = self.store.get("tasks", "p1", "t1")
+        task_record.update(status="blocked", blocked_reason="x", source_context={"active_execution_id": "prior"})
+        self.store.put("tasks", "p1", "t1", task_record)
+        # No linked Command at all -- an ordinary/future cancellation reason
+        # must never be mistaken for the trusted prelaunch-failure shape.
+        with self.assertRaisesRegex(TaskError, "failed or interrupted"):
+            prepare_task_retry(self.store, MemoryClaimRegistry(), "p1", "t1", "prior")
+        # A linked Command exists but never actually failed (e.g. still queued)
+        # -- still not eligible.
+        self.store.put("commands", "p1", "cmd1", command(status="queued", error_kind=None))
+        with self.assertRaisesRegex(TaskError, "failed or interrupted"):
+            prepare_task_retry(self.store, MemoryClaimRegistry(), "p1", "t1", "prior")
+        # A linked Command failed, but for an unrelated reason (never prelaunch_failed).
+        self.store.put("commands", "p1", "cmd1", command(status="failed", error_kind="provider_error"))
+        with self.assertRaisesRegex(TaskError, "failed or interrupted"):
+            prepare_task_retry(self.store, MemoryClaimRegistry(), "p1", "t1", "prior")
+
+    def test_retry_rejects_cancelled_execution_linked_to_a_different_tasks_command(self):
+        reserved = reserve_execution(self.store, "p1", "t1", "prior", "codex", decision())
+        prior = prelaunch_cancelled_execution(reserved)
+        self.store.put("executions", "p1", "prior", prior)
+        # A prelaunch_failed Command exists, but for a *different* task --
+        # must not let one task's genuine failure vouch for another's retry.
+        self.store.put("commands", "p1", "cmd1", command(task_id="other-task"))
+        task_record = self.store.get("tasks", "p1", "t1")
+        task_record.update(status="blocked", blocked_reason="x", source_context={"active_execution_id": "prior"})
+        self.store.put("tasks", "p1", "t1", task_record)
+        with self.assertRaisesRegex(TaskError, "failed or interrupted"):
+            prepare_task_retry(self.store, MemoryClaimRegistry(), "p1", "t1", "prior")
+
+    def test_retry_rejects_cross_task_execution_id(self):
+        create_task(self.store, {**task(), "task_id": "t2"}, assign=False)
+        reserved = reserve_execution(self.store, "p1", "t2", "prior-t2", "codex", decision())
+        prior = prelaunch_cancelled_execution(reserved)
+        self.store.put("executions", "p1", "prior-t2", prior)
+        self.store.put("commands", "p1", "cmd1", command(task_id="t2", execution_id="prior-t2"))
+        with self.assertRaisesRegex(TaskError, "failed or interrupted"):
+            prepare_task_retry(self.store, MemoryClaimRegistry(), "p1", "t1", "prior-t2")
 
     def test_retry_reservation_is_bounded_and_linked_to_prior_execution(self):
         retry = reserve_execution(self.store, "p1", "t1", "retry-1", "codex", decision(),

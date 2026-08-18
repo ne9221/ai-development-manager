@@ -621,5 +621,199 @@ class ReadOnlyNeedsRepoEditContractTests(unittest.TestCase):
             )
 
 
+class TrustedRetryLinkageTests(unittest.TestCase):
+    """P0: a trusted caller may ask handle_dispatch() to retry a specific
+    prior execution of an *existing* task instead of creating a brand-new
+    one -- but only under strict, server-side-established linkage. Nothing
+    here is taken on the caller's word: task_id is derived from the
+    validated prior execution record, eligibility is re-derived from
+    manager.executions.retry_eligible(), retry_count is always computed
+    server-side, and provider/account_id are inherited verbatim from the
+    prior attempt's own Command."""
+
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+        create_project(self.store, project())
+        create_project(self.store, project(project_id="p2"))
+        self.registries = SharedMemoryRegistries()
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=quota_fixture())
+        self.quota_patch.start()
+
+    def tearDown(self):
+        self.quota_patch.stop()
+
+    def call(self, body=None):
+        return handle_dispatch(self.store, self.service, self.registries.factory, body if body is not None else payload())
+
+    def _original_dispatch(self, request_id="orig-1", project_id="p1"):
+        return self.call(payload(request_id=request_id, project_id=project_id))
+
+    def _reserve_and_terminalize(self, task_id, execution_id, project_id="p1", status="failed"):
+        """Real reserve_execution(), then a real terminal transition,
+        matching an execution that actually ran and finished."""
+        from manager.executions import reserve_execution
+        reserved = reserve_execution(self.store, project_id, task_id, execution_id, "codex", {"decision": "fresh"})
+        terminal = {**reserved, "status": status, "started_at": now_iso(), "completed_at": now_iso(),
+                    "finished_at": now_iso(), "elapsed_minutes": 1, "quota_before": {}, "quota_after": {},
+                    "quota_delta": {}, "source_confidence": "official", "access": "read_only", "lease_evidence": None,
+                    "cleanup_evidence": {"persistence": "complete", "task_claim_release": "released", "writer_release": "not_required"}}
+        validate("execution", terminal)
+        self.store.put("executions", project_id, execution_id, terminal)
+        return terminal
+
+    def _reserve_and_cancel_via_prelaunch(self, task_id, execution_id, project_id="p1"):
+        """Real reserve_execution(), then the exact shape
+        manager.command_watcher._reconcile_active's real prelaunch-cleanup
+        call to cancel_reserved_execution() produces."""
+        from manager.executions import cancel_reserved_execution, reserve_execution
+        reserve_execution(self.store, project_id, task_id, execution_id, "codex", {"decision": "fresh"})
+        return cancel_reserved_execution(self.store, MemoryClaimRegistry(), project_id, execution_id,
+                                          "prelaunch failure left a reservation without provider authority")
+
+    def _mark_command_prelaunch_failed(self, command_id, execution_id, project_id="p1"):
+        command = self.store.get("commands", project_id, command_id)
+        command.update(status="failed", execution_id=execution_id, completed_at=now_iso(),
+                        result={"status": "error", "execution_id": execution_id, "session_id": None, "error_kind": "prelaunch_failed"})
+        validate("command", command)
+        self.store.put("commands", project_id, command_id, command)
+        return command
+
+    def _mark_command_failed(self, command_id, execution_id, project_id="p1", error_kind="provider_error"):
+        command = self.store.get("commands", project_id, command_id)
+        command.update(status="failed", execution_id=execution_id, completed_at=now_iso(),
+                        result={"status": "error", "execution_id": execution_id, "session_id": None, "error_kind": error_kind})
+        validate("command", command)
+        self.store.put("commands", project_id, command_id, command)
+        return command
+
+    def test_failed_execution_is_retryable_and_inherits_prior_provider(self):
+        original = self._original_dispatch()
+        task_id = original["task_id"]
+        self._reserve_and_terminalize(task_id, task_id, status="failed")
+        prior_command = self._mark_command_failed(task_id, task_id)
+        result = self.call(payload(request_id="retry-1", retry_of_execution_id=task_id))
+        self.assertTrue(result["accepted"])
+        self.assertEqual(task_id, result["task_id"])  # same existing task, not a new one
+        retry_command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual(1, retry_command["retry_count"])
+        self.assertEqual(task_id, retry_command["retry_of_execution_id"])
+        self.assertEqual(prior_command["provider"], retry_command["provider"])
+        self.assertEqual("queued", retry_command["status"])
+        self.assertEqual(TRUSTED_INGRESS_ORIGIN, retry_command["created_via"])
+        self.assertEqual(ADMISSION_VERSION, retry_command["admission_version"])
+        # No new Task was created -- the original one is untouched.
+        with self.assertRaises(TaskError):
+            self.store.get("tasks", "p1", "dispatch-retry-1")
+
+    def test_prelaunch_cancelled_execution_is_retryable(self):
+        original = self._original_dispatch(request_id="orig-2")
+        task_id = original["task_id"]
+        self._reserve_and_cancel_via_prelaunch(task_id, task_id)
+        self._mark_command_prelaunch_failed(task_id, task_id)
+        result = self.call(payload(request_id="retry-2", retry_of_execution_id=task_id))
+        self.assertTrue(result["accepted"])
+        retry_command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual(1, retry_command["retry_count"])
+
+    def test_ordinary_cancelled_execution_is_rejected(self):
+        original = self._original_dispatch(request_id="orig-3")
+        task_id = original["task_id"]
+        self._reserve_and_cancel_via_prelaunch(task_id, task_id)
+        # No linked failed/prelaunch_failed Command at all -- the Command
+        # is still queued, so this cancellation is not structurally proven.
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="retry-3", retry_of_execution_id=task_id))
+        self.assertEqual("retry_not_eligible", ctx.exception.code)
+
+    def test_unknown_execution_id_rejected(self):
+        self._original_dispatch(request_id="orig-4")
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="retry-4", retry_of_execution_id="does-not-exist"))
+        self.assertEqual("unknown_execution", ctx.exception.code)
+
+    def test_cross_project_execution_id_rejected(self):
+        # An execution genuinely created under p2 must never be usable to
+        # retry a task in p1 -- store.get is scoped by project_id, so this
+        # is structurally impossible, not just policy-rejected.
+        other = self.call(payload(request_id="orig-p2", project_id="p2"))
+        other_task_id = other["task_id"]
+        self._reserve_and_terminalize(other_task_id, other_task_id, project_id="p2", status="failed")
+        self._mark_command_failed(other_task_id, other_task_id, project_id="p2")
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="retry-cross-project", project_id="p1", retry_of_execution_id=other_task_id))
+        self.assertEqual("unknown_execution", ctx.exception.code)
+
+    def test_forged_retry_count_field_rejected(self):
+        original = self._original_dispatch(request_id="orig-5")
+        task_id = original["task_id"]
+        self._reserve_and_terminalize(task_id, task_id, status="failed")
+        self._mark_command_failed(task_id, task_id)
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="retry-5", retry_of_execution_id=task_id, retry_count=5))
+        self.assertEqual("malformed_request", ctx.exception.code)
+
+    def test_provider_and_account_id_cannot_be_combined_with_retry(self):
+        original = self._original_dispatch(request_id="orig-6")
+        task_id = original["task_id"]
+        self._reserve_and_terminalize(task_id, task_id, status="failed")
+        self._mark_command_failed(task_id, task_id)
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="retry-6", retry_of_execution_id=task_id, provider="claude"))
+        self.assertEqual("malformed_request", ctx.exception.code)
+
+    def test_retry_count_exceeding_maximum_rejected(self):
+        original = self._original_dispatch(request_id="orig-7")
+        task_id = original["task_id"]
+        terminal = self._reserve_and_terminalize(task_id, task_id, status="failed")
+        terminal["retry_count"] = 2  # already at MAX_RETRY_COUNT
+        validate("execution", terminal)
+        self.store.put("executions", "p1", task_id, terminal)
+        self._mark_command_failed(task_id, task_id)
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="retry-7", retry_of_execution_id=task_id))
+        self.assertEqual("retry_not_eligible", ctx.exception.code)
+
+    def test_duplicate_retry_request_id_is_idempotent(self):
+        original = self._original_dispatch(request_id="orig-8")
+        task_id = original["task_id"]
+        self._reserve_and_terminalize(task_id, task_id, status="failed")
+        self._mark_command_failed(task_id, task_id)
+        first = self.call(payload(request_id="retry-8", retry_of_execution_id=task_id))
+        second = self.call(payload(request_id="retry-8", retry_of_execution_id=task_id))
+        self.assertEqual(first, second)
+        # Only one retry Command was ever persisted.
+        self.store.get("commands", "p1", first["command_id"])
+
+    def test_no_unique_linked_command_rejected(self):
+        # The prior execution is genuinely failed/interrupted, but no
+        # Command links back to it (e.g. a hand-crafted execution) -- there
+        # is no provider/account_id evidence to inherit from, so this must
+        # fail closed rather than fabricate a routing decision.
+        original = self._original_dispatch(request_id="orig-9")
+        task_id = original["task_id"]
+        self._reserve_and_terminalize(task_id, task_id, status="failed")
+        # Command stays "queued" -- never marked failed/linked.
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="retry-9", retry_of_execution_id=task_id))
+        self.assertEqual("retry_not_eligible", ctx.exception.code)
+
+    def test_trusted_ingress_provenance_preserved_on_original_task(self):
+        original = self._original_dispatch(request_id="orig-10")
+        task_id = original["task_id"]
+        self._reserve_and_terminalize(task_id, task_id, status="failed")
+        self._mark_command_failed(task_id, task_id)
+        task_before = self.store.get("tasks", "p1", task_id)
+        self.call(payload(request_id="retry-10", retry_of_execution_id=task_id))
+        task_after = self.store.get("tasks", "p1", task_id)
+        # The retry ingress never touches the Task record at all -- its
+        # original trusted-ingress source_context is untouched, byte for
+        # byte, and the actual blocked->ready transition remains the sole
+        # responsibility of manager.executions.prepare_task_retry(), called
+        # later by manager.command_watcher at claim time.
+        self.assertEqual(task_before, task_after)
+        self.assertEqual(TRUSTED_INGRESS_ORIGIN, task_after["source_context"]["origin"])
+
+
 if __name__ == "__main__":
     unittest.main()

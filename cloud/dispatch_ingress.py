@@ -39,6 +39,34 @@ purely about not silently discarding or overriding an explicit request:
   against what was requested; any mismatch fails closed instead of
   silently substituting a different provider/account. Both the requested
   and the actually-assigned identity are persisted on the Command record.
+
+`retry_of_execution_id` is the other deliberate exception: a trusted caller
+may ask to retry a specific prior execution of an *existing* task instead
+of this ingress's normal brand-new-task-per-request_id shape. The linkage
+is never taken on faith -- a bare client-supplied id is not launch
+authority:
+- The prior execution is looked up strictly within the caller's own
+  project_id; its task_id is read from that record, never taken from (or
+  cross-checked against anything in) the caller's payload, so there is no
+  field for a client to smuggle a foreign task_id through even in
+  principle.
+- manager.executions.retry_eligible() (the same authoritative check
+  manager.executions.prepare_task_retry() itself re-verifies) decides
+  whether the prior execution may be retried at all -- failed/interrupted,
+  or cancelled only when structurally proven to have been cancelled by the
+  trusted prelaunch-failure cleanup path. An ordinary or future
+  cancellation reason is never retryable.
+- retry_count is always computed server-side as one more than the prior
+  execution's own retry_count; there is no field for a caller to supply or
+  override it.
+- provider/account_id are not accepted alongside retry_of_execution_id: a
+  retry reuses the exact provider/account_id of the prior attempt's own
+  Command, inherited verbatim, never re-selected or re-routed.
+- No Task is created or mutated here -- the existing task_id's actual
+  blocked -> ready transition is manager.executions.prepare_task_retry(),
+  which already runs, unmodified, inside manager.command_watcher's normal
+  claim flow once this Command is admitted. This ingress only ever writes
+  the new, trusted-ingress-stamped Command that carries the linkage.
 """
 
 import os
@@ -48,17 +76,22 @@ import time
 from manager.claude_account_selector import load_claude_accounts
 from manager.dispatch_requests import claim_dispatch_request
 from manager.dispatcher import dispatch as dispatcher_dispatch
+from manager.executions import MAX_RETRY_COUNT, linked_command_for_execution, retry_eligible
 from manager.tasks import TaskError, now_iso, update_task, validate
 from manager.trusted_ingress import ADMISSION_VERSION, REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN
 
 
-ALLOWED_FIELDS = {"request_id", "project_id", "title", "goal", "priority", "constraints", "provider", "account_id"}
+ALLOWED_FIELDS = {"request_id", "project_id", "title", "goal", "priority", "constraints",
+                   "provider", "account_id", "retry_of_execution_id"}
 ALLOWED_CONSTRAINT_FIELDS = {"read_only"}
 ALLOWED_PRIORITIES = {"low", "normal", "high", "urgent"}
 # Matches schema/command.schema.json's provider enum -- the only providers
 # the Command Watcher can actually launch today.
 ALLOWED_PROVIDERS = {"codex", "claude"}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# Matches schema/command.schema.json's execution_id pattern exactly (longer
+# max length than the other ingress ids).
+EXECUTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 MAX_TITLE_LENGTH = 300
 MAX_GOAL_LENGTH = 4000
 
@@ -125,10 +158,25 @@ def validate_dispatch_payload(payload):
                 "malformed_request",
                 "account_id requires provider=\"claude\" explicitly (only Claude has multiple named accounts)",
             )
+    retry_of_execution_id = payload.get("retry_of_execution_id")
+    if retry_of_execution_id is not None:
+        if not isinstance(retry_of_execution_id, str) or not EXECUTION_ID_PATTERN.match(retry_of_execution_id):
+            raise DispatchIngressError(
+                "malformed_request", "retry_of_execution_id must match ^[A-Za-z0-9._-]{1,200}$")
+        if provider is not None or account_id is not None:
+            # A retry reuses the prior attempt's own provider/account_id
+            # verbatim (see linked_command_for_execution below) -- it is
+            # never a fresh routing request, so combining the two would be
+            # ambiguous about which one wins. Reject outright rather than
+            # silently picking one.
+            raise DispatchIngressError(
+                "malformed_request",
+                "retry_of_execution_id cannot be combined with provider/account_id",
+            )
     return {
         "request_id": request_id, "project_id": project_id, "title": title.strip(),
         "goal": goal.strip(), "priority": priority, "read_only": read_only,
-        "provider": provider, "account_id": account_id,
+        "provider": provider, "account_id": account_id, "retry_of_execution_id": retry_of_execution_id,
     }
 
 
@@ -180,14 +228,23 @@ def _resolve_existing_claim(store, project_id, request_id, claim):
     - Command found but its own identity does not match the claim it was
       created under (task_id/request_id linkage): fail closed rather than
       trust a record that could belong to a different, colliding claim.
+
+    A retry-linked Command (retry_of_execution_id is not None) targets a
+    pre-existing task, so its Task's source_context.external_request_id
+    legitimately still names that task's *original* creation request, never
+    this retry's request_id -- that specific cross-check is skipped only
+    for retries; the task_id/request_id linkage on the Command itself is
+    still fully verified either way.
     """
     task_id, command_id = claim["task_id"], claim["command_id"]
     for attempt in range(CLAIM_VERIFICATION_ATTEMPTS):
         command = _fetch_if_exists(store, "commands", project_id, command_id)
         if command is not None:
             task = _fetch_if_exists(store, "tasks", project_id, task_id)
+            is_retry = command.get("retry_of_execution_id") is not None
+            task_linkage_ok = is_retry or (task is not None and task.get("source_context", {}).get("external_request_id") == request_id)
             if (task is None or command.get("task_id") != task_id or command.get("request_id") != request_id
-                    or task.get("source_context", {}).get("external_request_id") != request_id):
+                    or not task_linkage_ok):
                 raise DispatchIngressError(
                     "dispatch_state_inconsistent",
                     f"claimed request {request_id} resolves to a Task/Command whose identity does not match the claim",
@@ -203,6 +260,82 @@ def _resolve_existing_claim(store, project_id, request_id, claim):
     )
 
 
+def _handle_retry_dispatch(store, lock_registry_factory, project_id, request_id, retry_of_execution_id):
+    """The retry-linkage branch of handle_dispatch(): server-side-validate
+    the requested linkage, then create a new, trusted-ingress-stamped
+    Command for the *existing* task (never a new task), carrying
+    retry_count/retry_of_execution_id for manager.command_watcher's
+    existing claim-time manager.executions.prepare_task_retry() call to act
+    on -- this function never touches the Task record itself and never
+    launches anything.
+    """
+    try:
+        prior = store.get("executions", project_id, retry_of_execution_id)
+        validate("execution", prior)
+    except TaskError as exc:
+        raise DispatchIngressError(
+            "unknown_execution", f"unknown execution in project {project_id}: {retry_of_execution_id}") from exc
+
+    # task_id is read from the validated execution record, never from the
+    # caller's payload -- there is no field here for a client to smuggle a
+    # foreign task_id through even in principle.
+    task_id = prior.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        raise DispatchIngressError("unknown_execution", f"execution {retry_of_execution_id} has no valid task_id")
+    try:
+        store.get("tasks", project_id, task_id)
+    except TaskError as exc:
+        raise DispatchIngressError(
+            "unknown_execution", f"execution {retry_of_execution_id}'s task no longer exists") from exc
+
+    if not retry_eligible(store, project_id, task_id, prior):
+        raise DispatchIngressError(
+            "retry_not_eligible",
+            f"execution {retry_of_execution_id} is not eligible for retry "
+            "(requires failed/interrupted, or cancelled by a proven prelaunch failure)",
+        )
+    # Always server-computed from the prior execution's own retry_count --
+    # there is no field for a caller to supply or override this.
+    retry_count = int(prior.get("retry_count", 0)) + 1
+    if retry_count > MAX_RETRY_COUNT:
+        raise DispatchIngressError("retry_not_eligible", f"maximum retry count ({MAX_RETRY_COUNT}) already reached")
+
+    linked = linked_command_for_execution(store, project_id, task_id, retry_of_execution_id)
+    if linked is None:
+        raise DispatchIngressError(
+            "retry_not_eligible", f"no unique prior Command evidence to retry execution {retry_of_execution_id} from")
+
+    command_id = f"dispatch-{request_id}"
+    try:
+        registry = lock_registry_factory(project_id, request_id)
+        claim = claim_dispatch_request(registry, project_id, request_id, task_id, command_id, now_iso())
+    except DispatchIngressError:
+        raise
+    except Exception as exc:
+        raise DispatchIngressError("idempotency_backend_unavailable", "could not establish request idempotency") from exc
+
+    if not claim["claimed"]:
+        return _resolve_existing_claim(store, project_id, request_id, claim)
+
+    # provider/account_id are inherited verbatim from the prior attempt's
+    # own Command -- a retry is never a fresh routing decision.
+    command = {
+        "command_id": command_id, "project_id": project_id, "task_id": task_id,
+        "provider": linked["provider"], "account_id": linked.get("account_id"),
+        "requested_provider": None, "requested_account_id": None,
+        "model": linked.get("model"), "fallback_model": linked.get("fallback_model"),
+        "mode": linked.get("mode"), "effort": linked.get("effort"),
+        "selection_reason": linked.get("selection_reason", []),
+        "quota_evidence": linked.get("quota_evidence"), "created_at": now_iso(), "status": "queued",
+        "execution_id": None, "claimed_at": None, "completed_at": None, "result": None,
+        "created_via": TRUSTED_INGRESS_ORIGIN, "admission_version": ADMISSION_VERSION, "request_id": request_id,
+        "retry_count": retry_count, "retry_of_execution_id": retry_of_execution_id,
+    }
+    validate("command", command)
+    store.put("commands", project_id, command_id, command)
+    return {"accepted": True, "request_id": request_id, "task_id": task_id, "command_id": command_id, "status": "queued"}
+
+
 def handle_dispatch(store, service, lock_registry_factory, payload):
     """Idempotently create a queued Task+Command for one external request and
     return its identity. Never launches a provider.
@@ -216,6 +349,9 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
         store.get("projects", project_id, project_id)
     except TaskError as exc:
         raise DispatchIngressError("unknown_project", f"unknown project: {project_id}") from exc
+
+    if clean["retry_of_execution_id"] is not None:
+        return _handle_retry_dispatch(store, lock_registry_factory, project_id, request_id, clean["retry_of_execution_id"])
 
     requested_provider, requested_account_id = clean["provider"], clean["account_id"]
     if requested_account_id is not None:

@@ -727,6 +727,70 @@ class TrustedIngressAdmissionTests(unittest.TestCase):
         runner.assert_called_once()
         self.assertEqual("completed", result["status"])
 
+    def test_retry_linked_command_admitted_despite_external_request_id_mismatch(self):
+        # A retry targets a pre-existing task, so its own request_id ("req-2")
+        # necessarily differs from the task's *original* creation request
+        # ("req-1") -- that specific mismatch must not block admission for a
+        # retry, only the idempotency-record cross-check (below, for req-2)
+        # actually matters.
+        self.admitted_task()  # source_context.external_request_id == "req-1"
+        self.registry.document = {
+            "schema_version": "0.1.0", "project_id": "p1", "request_id": "req-2",
+            "task_id": "t1", "command_id": "cmd-1", "created_at": now_iso(),
+        }
+        retry_command = self.admitted_command(request_id="req-2", retry_count=1, retry_of_execution_id="prior-exec")
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher.prepare_task_retry", return_value=None):
+            result = process_command(
+                self.store, object(), retry_command, claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), health_check=lambda: True, quota_check=lambda service: True,
+                ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual("completed", result["status"])
+
+    def test_retry_linked_command_still_fails_closed_on_bad_idempotency_record(self):
+        # Same retry-shaped command, but the idempotency record's own
+        # task_id doesn't actually match -- the relaxed external_request_id
+        # check must never become a free pass; every other cross-check
+        # still fully applies.
+        self.admitted_task()
+        self.registry.document = {
+            "schema_version": "0.1.0", "project_id": "p1", "request_id": "req-2",
+            "task_id": "some-other-task", "command_id": "cmd-1", "created_at": now_iso(),
+        }
+        retry_command = self.admitted_command(request_id="req-2", retry_count=1, retry_of_execution_id="prior-exec")
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), retry_command, claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
+    def test_non_retry_command_still_requires_exact_external_request_id_match(self):
+        # Regression: a plain (non-retry) command must still be rejected on
+        # a mismatched external_request_id exactly as before -- the relaxed
+        # check is retry_of_execution_id-gated only.
+        self.admitted_task()  # external_request_id == "req-1"
+        mismatched = self.admitted_command(request_id="req-2")  # no retry_of_execution_id
+        self.registry.document = {
+            "schema_version": "0.1.0", "project_id": "p1", "request_id": "req-2",
+            "task_id": "t1", "command_id": "cmd-1", "created_at": now_iso(),
+        }
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), mismatched, claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
     def test_ordinary_untrusted_command_off_allowlist_still_rejected(self):
         self.admitted_task()  # task itself is fully compliant
         launch = Mock()

@@ -49,6 +49,16 @@ def verify_trusted_ingress_admission(store, command, bucket, registry_factory=di
     Fails closed -- never raises -- on any missing GCS bucket config, any
     backend error, or any mismatch between the command's self-declared
     evidence and the corroborating idempotency record.
+
+    A retry-linked command (retry_of_execution_id is not None) targets a
+    pre-existing task, so source_context.external_request_id on that task
+    legitimately still names its *original* creation request, never this
+    retry's own request_id -- that one cross-check is skipped only for
+    retries. Every other check, including the idempotency-record
+    cross-check below (which for a retry independently proves this exact
+    request_id legitimately targets this exact task_id/command_id, via a
+    store only the authenticated ingress can write), still applies
+    unchanged and is what actually establishes trust for a retry.
     """
     if command.get("created_via") != TRUSTED_INGRESS_ORIGIN:
         return None
@@ -68,7 +78,8 @@ def verify_trusted_ingress_admission(store, command, bucket, registry_factory=di
         return None
     if source_context.get("origin") != TRUSTED_INGRESS_ORIGIN:
         return None
-    if source_context.get("external_request_id") != request_id:
+    is_retry = command.get("retry_of_execution_id") is not None
+    if not is_retry and source_context.get("external_request_id") != request_id:
         return None
     if source_context.get("admission_version") != ADMISSION_VERSION:
         return None
