@@ -11,10 +11,18 @@ service account) are therefore acceptable for read-only Drive access only.
 
 This module does not implement a new OAuth mechanism: it reuses
 collectors.publish_drive.credentials_with_source() (the same credential
-loader the desktop Command Watcher already uses) and adds one policy layer
-on top -- reject any source that is not a genuine user-derived OAuth token,
-so a write-required caller fails closed instead of silently falling back to
-ADC and only discovering the quota error at files.create() time.
+loader the desktop Command Watcher already uses) and adds two policy layers
+on top:
+
+1. Reject any source that is not a genuine user-derived OAuth token, so a
+   write-required caller fails closed instead of silently falling back to
+   ADC and only discovering the quota error at files.create() time.
+2. Never persist a refreshed token back to disk. The Cloud Run token store
+   is a read-only Secret Manager volume; a refreshed access token is valid
+   in memory for the life of the request, but attempting to write it back
+   raises OSError [Errno 30] on that mount. A cold instance whose token has
+   expired since the secret was created must still be able to refresh and
+   proceed -- it just can't (and doesn't need to) save the new token.
 """
 
 from collectors.publish_drive import PublisherError, credentials_with_source
@@ -30,12 +38,14 @@ def user_oauth_write_credentials(credentials_source=credentials_with_source):
     """Return (creds, source) for a write-required Drive path, or fail closed.
 
     Always requests non-interactive credential resolution (Cloud Run has no
-    browser to complete an interactive consent flow). Only existing_token and
-    refreshed_token -- both genuine user OAuth tokens -- are accepted;
-    application_default (service account ADC) and desktop_oauth (unreachable
-    here) are rejected rather than silently used.
+    browser to complete an interactive consent flow) and disables refreshed-
+    token persistence (the token store is a read-only Secret Manager mount;
+    a refresh must succeed in memory without a doomed write-back). Only
+    existing_token and refreshed_token -- both genuine user OAuth tokens --
+    are accepted; application_default (service account ADC) and
+    desktop_oauth (unreachable here) are rejected rather than silently used.
     """
-    creds, source = credentials_source(allow_interactive=False)
+    creds, source = credentials_source(allow_interactive=False, persist_refreshed_token=False)
     if source not in USER_OAUTH_SOURCES:
         raise DriveWriteCredentialError(
             f"write-required Drive path requires user OAuth credentials, got source={source}"

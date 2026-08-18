@@ -106,7 +106,15 @@ def _write_token(path, creds):
             Path(temporary).unlink()
 
 
-def credentials_with_source(allow_interactive=False, oauth=None):
+def credentials_with_source(allow_interactive=False, oauth=None, persist_refreshed_token=True):
+    """Resolve Drive OAuth credentials.
+
+    persist_refreshed_token controls whether a successful in-memory token
+    refresh is written back to disk. Desktop/normal callers keep the
+    original write-back behavior (default True); a caller whose token store
+    is a read-only mount (e.g. a Cloud Run Secret Manager volume) must pass
+    False so a refresh still succeeds without attempting a doomed disk write.
+    """
     oauth = oauth or _oauth_imports()
     path = token_path()
     creds = None
@@ -124,7 +132,8 @@ def credentials_with_source(allow_interactive=False, oauth=None):
         else:
             try:
                 creds.refresh(oauth["Request"]())
-                _write_token(path, creds)
+                if persist_refreshed_token:
+                    _write_token(path, creds)
                 source = "refreshed_token"
             except oauth["RefreshError"]:
                 token_problem = "invalid_refresh_token"; creds = None

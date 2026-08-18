@@ -95,6 +95,46 @@ class DriveAuthTests(unittest.TestCase):
             with self.assertRaisesRegex(PublisherError, "invalid_refresh_token"):
                 credentials_with_source(oauth=oauth(FakeCredential(valid=False, expired=True, refresh_error=RefreshError())))
 
+    # -- persist_refreshed_token contract (Cloud Run read-only mount vs desktop) --
+
+    def test_persist_refreshed_token_true_writes_back_by_default(self):
+        # Desktop / normal callers (e.g. the Command Watcher) don't pass
+        # persist_refreshed_token at all -- the default (True) must keep
+        # writing the refreshed token back to disk, exactly as before this
+        # parameter existed.
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"GOOGLE_DRIVE_TOKEN": str(self.token(directory, "old"))}, clear=False):
+            creds, source = credentials_with_source(oauth=oauth(FakeCredential(valid=False, expired=True)))
+            self.assertEqual("refreshed_token", source)
+            self.assertTrue(creds.valid)
+            self.assertNotEqual("old", Path(os.environ["GOOGLE_DRIVE_TOKEN"]).read_text(encoding="utf-8"))
+
+    def test_persist_refreshed_token_false_skips_write_back(self):
+        # A Cloud Run caller with a read-only Secret Manager token mount must
+        # pass persist_refreshed_token=False: the refresh still succeeds and
+        # returns valid, usable credentials, but the on-disk token is left
+        # untouched (a write there would OSError on a read-only mount).
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"GOOGLE_DRIVE_TOKEN": str(self.token(directory, "old"))}, clear=False):
+            creds, source = credentials_with_source(
+                oauth=oauth(FakeCredential(valid=False, expired=True)), persist_refreshed_token=False)
+            self.assertEqual("refreshed_token", source)
+            self.assertTrue(creds.valid)
+            self.assertEqual("old", Path(os.environ["GOOGLE_DRIVE_TOKEN"]).read_text(encoding="utf-8"))
+
+    def test_persist_refreshed_token_false_survives_readonly_directory(self):
+        # Direct reproduction of the P0: even when the token's parent
+        # directory genuinely cannot be written to (simulating the
+        # Secret Manager mount), persist_refreshed_token=False must not
+        # attempt the write and so must not raise OSError.
+        with tempfile.TemporaryDirectory() as directory:
+            token = self.token(directory, "old")
+            with patch.dict(os.environ, {"GOOGLE_DRIVE_TOKEN": str(token)}, clear=False), \
+                 patch("collectors.publish_drive._write_token", side_effect=OSError(30, "Read-only file system")) as write_token:
+                creds, source = credentials_with_source(
+                    oauth=oauth(FakeCredential(valid=False, expired=True)), persist_refreshed_token=False)
+            write_token.assert_not_called()
+            self.assertEqual("refreshed_token", source)
+            self.assertTrue(creds.valid)
+
     # -- fallback precedence: env override vs bundled default ---------------
 
     def test_env_override_uses_client_secrets_file(self):

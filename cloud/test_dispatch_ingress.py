@@ -1,7 +1,11 @@
+import contextlib
+import json
 import os
+import tempfile
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
@@ -362,6 +366,162 @@ class DirectDispatchClaudeAccountIdentityTests(unittest.TestCase):
         _, kwargs = runner.call_args
         self.assertEqual("claude-a", kwargs.get("account_id"))
         self.assertEqual("completed", outcome["status"])
+
+
+@contextlib.contextmanager
+def _registry_env(entries):
+    """Point CLAUDE_ACCOUNTS_CONFIG at a temp registry file for the duration
+    of the block; restores the previous environment on exit."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "accounts.json"
+        path.write_text(json.dumps({"accounts": entries}), encoding="utf-8")
+        with patch.dict(os.environ, {"CLAUDE_ACCOUNTS_CONFIG": str(path)}, clear=False):
+            yield
+
+
+class ExplicitProviderAccountRoutingTests(unittest.TestCase):
+    """P0-2: a trusted caller (the ChatGPT-facing Direct Dispatch ingress)
+    must be able to request a specific provider and, for Claude, a specific
+    named account -- and have that request actually respected end to end,
+    never silently overridden by the quota-aware auto-selector and never
+    silently substituted for a different provider/account."""
+
+    REGISTRY = [
+        {"account_id": "claude-a", "enabled": True, "config_dir": r"C:\accounts\a\.claude"},
+        {"account_id": "claude-b", "enabled": True, "config_dir": r"C:\accounts\b\.claude"},
+        {"account_id": "claude-disabled", "enabled": False, "config_dir": r"C:\accounts\d\.claude"},
+    ]
+
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+        create_project(self.store, project())
+        self.registries = SharedMemoryRegistries()
+        fresh = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Deliberately no Claude quota entries at all, and Codex quota very
+        # healthy -- this is the real production shape the handoff reported
+        # (Codex trait score wins, Claude evidence stale/unknown), so any
+        # test here that still lands on the exact requested Claude account
+        # proves the explicit route, not a coincidence of quota scoring.
+        doc = {
+            "schema_version": "0.1.0", "generated_at": fresh,
+            "providers": [
+                {"provider": "codex", "display_name": "codex", "collection_mode": "automatic",
+                 "source": "test", "source_type": "official", "confidence": "official", "last_updated": fresh,
+                 "status": "ok", "windows": [{"name": "primary", "remaining_percent": 95, "used_percent": 5, "resets_at": None}]},
+            ],
+        }
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=doc)
+        self.quota_patch.start()
+
+    def tearDown(self):
+        self.quota_patch.stop()
+
+    def call(self, body=None):
+        return handle_dispatch(self.store, self.service, self.registries.factory, body if body is not None else payload())
+
+    def test_explicit_claude_a_gets_exact_account(self):
+        with _registry_env(self.REGISTRY):
+            result = self.call(payload(request_id="req-a", provider="claude", account_id="claude-a"))
+        command = self.store.get("commands", "p1", result["command_id"])
+        validate("command", command)
+        self.assertEqual("claude", command["provider"])
+        self.assertEqual("claude-a", command["account_id"])
+        self.assertEqual("claude", command["requested_provider"])
+        self.assertEqual("claude-a", command["requested_account_id"])
+
+    def test_explicit_claude_b_gets_exact_account(self):
+        with _registry_env(self.REGISTRY):
+            result = self.call(payload(request_id="req-b", provider="claude", account_id="claude-b"))
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual("claude", command["provider"])
+        self.assertEqual("claude-b", command["account_id"])
+        self.assertEqual("claude-b", command["requested_account_id"])
+
+    def test_explicit_provider_is_never_overridden_by_auto_selector(self):
+        # Quota fixture strongly favors codex; without the explicit route
+        # auto-selection would pick codex (proven by the sibling no-provider
+        # request below). The explicit request must still win.
+        with _registry_env(self.REGISTRY):
+            result = self.call(payload(request_id="req-explicit", provider="claude", account_id="claude-a"))
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual("claude", command["provider"])
+
+        auto_result = self.call(payload(request_id="req-auto"))
+        auto_command = self.store.get("commands", "p1", auto_result["command_id"])
+        self.assertEqual("codex", auto_command["provider"])
+        self.assertIsNone(auto_command["requested_provider"])
+        self.assertIsNone(auto_command["requested_account_id"])
+
+    def test_invalid_provider_rejected(self):
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-badprov", provider="antigravity"))
+        self.assertEqual("malformed_request", ctx.exception.code)
+
+    def test_account_id_requires_explicit_claude_provider(self):
+        # provider omitted entirely (would otherwise auto-select) -- account_id
+        # alone is not enough to imply provider=claude.
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-noprov", account_id="claude-a"))
+        self.assertEqual("malformed_request", ctx.exception.code)
+
+    def test_account_id_with_mismatched_provider_rejected(self):
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-mismatch2", provider="codex", account_id="claude-a"))
+        self.assertEqual("malformed_request", ctx.exception.code)
+
+    def test_unknown_claude_account_id_fails_closed(self):
+        with _registry_env(self.REGISTRY):
+            with self.assertRaises(DispatchIngressError) as ctx:
+                self.call(payload(request_id="req-unknown", provider="claude", account_id="claude-nonexistent"))
+        self.assertEqual("unknown_account", ctx.exception.code)
+        with self.assertRaises(TaskError):
+            self.store.get("tasks", "p1", "dispatch-req-unknown")
+        with self.assertRaises(TaskError):
+            self.store.get("commands", "p1", "dispatch-req-unknown")
+
+    def test_disabled_claude_account_id_fails_closed(self):
+        with _registry_env(self.REGISTRY):
+            with self.assertRaises(DispatchIngressError) as ctx:
+                self.call(payload(request_id="req-disabled", provider="claude", account_id="claude-disabled"))
+        self.assertEqual("unknown_account", ctx.exception.code)
+
+    def test_no_registry_configured_fails_closed_for_explicit_account(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_ACCOUNTS_CONFIG", None)
+            with self.assertRaises(DispatchIngressError) as ctx:
+                self.call(payload(request_id="req-noreg", provider="claude", account_id="claude-a"))
+            self.assertEqual("unknown_account", ctx.exception.code)
+
+    def test_explicit_provider_without_account_id_does_not_require_registry(self):
+        # provider=claude alone (no account_id) must still work via
+        # dispatcher's own auto-account-selection-among-named-accounts path
+        # (or the legacy single-account path); it must not be rejected just
+        # because no CLAUDE_ACCOUNTS_CONFIG registry is configured -- that
+        # registry is only consulted when an explicit account_id is given.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_ACCOUNTS_CONFIG", None)
+            result = self.call(payload(request_id="req-provonly", provider="claude"))
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual("claude", command["provider"])
+        self.assertEqual("claude", command["requested_provider"])
+        self.assertIsNone(command["requested_account_id"])
+
+    def test_dispatch_mismatch_fails_closed_without_persisting_command(self):
+        # Defense in depth: even if dispatcher_dispatch() somehow resolved a
+        # different provider than requested, the ingress must fail closed
+        # rather than persist a Command that silently substitutes it.
+        with _registry_env(self.REGISTRY), \
+             patch("cloud.dispatch_ingress.dispatcher_dispatch") as fake_dispatch:
+            fake_dispatch.return_value = {
+                "provider": "codex", "account_id": None, "model": None, "fallback_model": None,
+                "mode": "code", "effort": "medium", "selection_reason": [], "quota_evidence": {},
+            }
+            with self.assertRaises(DispatchIngressError) as ctx:
+                self.call(payload(request_id="req-swapped", provider="claude", account_id="claude-a"))
+        self.assertEqual("dispatch_state_inconsistent", ctx.exception.code)
+        with self.assertRaises(TaskError):
+            self.store.get("commands", "p1", "dispatch-req-swapped")
 
 
 if __name__ == "__main__":

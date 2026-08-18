@@ -11,33 +11,41 @@ from cloud.drive_credentials import DriveWriteCredentialError, user_oauth_write_
 SECRET_MARKER = "refresh-token-secret-value"
 
 
+def _source(oauth_doubles, **credentials_with_source_kwargs):
+    """Build a credentials_source callable matching user_oauth_write_credentials'
+    real call signature: credentials_source(allow_interactive, persist_refreshed_token)."""
+    def _call(allow_interactive, persist_refreshed_token):
+        return credentials_with_source(
+            allow_interactive=allow_interactive,
+            persist_refreshed_token=persist_refreshed_token,
+            oauth=oauth_doubles,
+            **credentials_with_source_kwargs,
+        )
+    return _call
+
+
 class UserOauthWriteCredentialsTests(unittest.TestCase):
     def test_valid_existing_token_is_write_capable(self):
         creds, source = user_oauth_write_credentials(
-            credentials_source=lambda allow_interactive: credentials_with_source(
-                allow_interactive=allow_interactive, oauth=oauth(FakeCredential())))
+            credentials_source=_source(oauth(FakeCredential())))
         self.assertEqual("existing_token", source)
         self.assertTrue(creds.valid)
 
     def test_expired_token_with_valid_refresh_succeeds(self):
         creds, source = user_oauth_write_credentials(
-            credentials_source=lambda allow_interactive: credentials_with_source(
-                allow_interactive=allow_interactive,
-                oauth=oauth(FakeCredential(valid=False, expired=True))))
+            credentials_source=_source(oauth(FakeCredential(valid=False, expired=True))))
         self.assertEqual("refreshed_token", source)
         self.assertTrue(creds.valid)
 
     def test_missing_token_fails_closed(self):
         with self.assertRaises(PublisherError):
             user_oauth_write_credentials(
-                credentials_source=lambda allow_interactive: credentials_with_source(
-                    allow_interactive=allow_interactive, oauth=oauth(credential=None, default_error=True)))
+                credentials_source=_source(oauth(credential=None, default_error=True)))
 
     def test_adc_service_account_only_fails_closed(self):
         with self.assertRaises(DriveWriteCredentialError):
             user_oauth_write_credentials(
-                credentials_source=lambda allow_interactive: credentials_with_source(
-                    allow_interactive=allow_interactive, oauth=oauth(credential=None, default_error=False)))
+                credentials_source=_source(oauth(credential=None, default_error=False)))
 
     def test_malformed_token_fails_closed_without_leaking_credential(self):
         class BrokenCredentials:
@@ -48,9 +56,7 @@ class UserOauthWriteCredentialsTests(unittest.TestCase):
         broken_oauth = oauth(credential=None, default_error=True)
         broken_oauth["Credentials"] = BrokenCredentials
         with self.assertRaises(PublisherError) as ctx:
-            user_oauth_write_credentials(
-                credentials_source=lambda allow_interactive: credentials_with_source(
-                    allow_interactive=allow_interactive, oauth=broken_oauth))
+            user_oauth_write_credentials(credentials_source=_source(broken_oauth))
         self.assertNotIn(SECRET_MARKER, str(ctx.exception))
 
     def test_never_calls_interactive_flow(self):
@@ -62,9 +68,7 @@ class UserOauthWriteCredentialsTests(unittest.TestCase):
         broken_oauth = oauth(credential=None, default_error=True)
         broken_oauth["InstalledAppFlow"] = ExplodingFlow
         with self.assertRaises(PublisherError):
-            user_oauth_write_credentials(
-                credentials_source=lambda allow_interactive: credentials_with_source(
-                    allow_interactive=allow_interactive, oauth=broken_oauth))
+            user_oauth_write_credentials(credentials_source=_source(broken_oauth))
 
     def test_wrapper_reuses_shared_credentials_with_source_by_default(self):
         # Proves this module adds a policy layer only, not a second OAuth
@@ -77,9 +81,7 @@ class UserOauthWriteCredentialsTests(unittest.TestCase):
             (FakeCredential(), "existing_token"),
             (FakeCredential(valid=False, expired=True), "refreshed_token"),
         ]:
-            _, source = user_oauth_write_credentials(
-                credentials_source=lambda allow_interactive, d=double: credentials_with_source(
-                    allow_interactive=allow_interactive, oauth=oauth(d)))
+            _, source = user_oauth_write_credentials(credentials_source=_source(oauth(double)))
             self.assertEqual(expected, source)
 
     def test_invalid_refresh_token_fails_closed_without_leaking_secret(self):
@@ -90,9 +92,7 @@ class UserOauthWriteCredentialsTests(unittest.TestCase):
         from collectors.test_drive_auth import RefreshError
         broken_oauth = oauth(FakeCredential(valid=False, expired=True, refresh_error=RefreshError(SECRET_MARKER)))
         with self.assertRaises(PublisherError) as ctx:
-            user_oauth_write_credentials(
-                credentials_source=lambda allow_interactive: credentials_with_source(
-                    allow_interactive=allow_interactive, oauth=broken_oauth))
+            user_oauth_write_credentials(credentials_source=_source(broken_oauth))
         self.assertNotIn(SECRET_MARKER, str(ctx.exception))
         self.assertIn("invalid_refresh_token", str(ctx.exception))
 
@@ -101,13 +101,44 @@ class UserOauthWriteCredentialsTests(unittest.TestCase):
         # built only from the safe `source` enum string, never from creds.
         try:
             user_oauth_write_credentials(
-                credentials_source=lambda allow_interactive: credentials_with_source(
-                    allow_interactive=allow_interactive, oauth=oauth(credential=None, default_error=False)))
+                credentials_source=_source(oauth(credential=None, default_error=False)))
         except DriveWriteCredentialError as exc:
             self.assertNotIn(SECRET_MARKER, str(exc))
             self.assertIn("application_default", str(exc))
         else:
             self.fail("expected DriveWriteCredentialError")
+
+    def test_default_wrapper_disables_refreshed_token_persistence(self):
+        # The real (unpatched) call user_oauth_write_credentials makes to
+        # credentials_source must request persist_refreshed_token=False --
+        # the Cloud Run token store is a read-only Secret Manager mount, so
+        # a refresh must never attempt a write-back.
+        captured = {}
+
+        def spy_source(allow_interactive, persist_refreshed_token):
+            captured["allow_interactive"] = allow_interactive
+            captured["persist_refreshed_token"] = persist_refreshed_token
+            return credentials_with_source(
+                allow_interactive=allow_interactive,
+                persist_refreshed_token=persist_refreshed_token,
+                oauth=oauth(FakeCredential(valid=False, expired=True)),
+            )
+
+        user_oauth_write_credentials(credentials_source=spy_source)
+        self.assertEqual(False, captured["allow_interactive"])
+        self.assertEqual(False, captured["persist_refreshed_token"])
+
+    def test_cold_start_refresh_never_writes_back_to_readonly_mount(self):
+        # Reproduces the real P0: an expired access token on a Cloud Run
+        # instance must refresh successfully in memory without calling
+        # _write_token (which would OSError [Errno 30] on the read-only
+        # Secret Manager volume).
+        with patch("collectors.publish_drive._write_token") as write_token:
+            creds, source = user_oauth_write_credentials(
+                credentials_source=_source(oauth(FakeCredential(valid=False, expired=True))))
+        write_token.assert_not_called()
+        self.assertEqual("refreshed_token", source)
+        self.assertTrue(creds.valid)
 
 
 class DefaultWriteServiceFactoryTests(unittest.TestCase):
@@ -145,6 +176,34 @@ class DefaultWriteServiceFactoryTests(unittest.TestCase):
              patch("googleapiclient.discovery.build", never_build):
             with self.assertRaises(DriveWriteCredentialError):
                 app_module.default_write_service_factory()
+
+    def test_refreshed_token_credential_logs_safe_source_only(self):
+        # Same guarantee as the existing_token case, but for the cold-start
+        # refresh path specifically: the log line must carry only the safe
+        # "refreshed_token" enum string, never token/secret material.
+        import cloud.app as app_module
+
+        class LeakyRefreshedCredential:
+            valid = True
+            token = "ACCESS-TOKEN-SECRET-VALUE"
+            refresh_token = "REFRESH-TOKEN-SECRET-VALUE"
+
+        built = {}
+
+        def fake_build(*_args, **kwargs):
+            built.update(kwargs)
+            return object()
+
+        with patch("cloud.app.user_oauth_write_credentials",
+                   return_value=(LeakyRefreshedCredential(), "refreshed_token")), \
+             patch("googleapiclient.discovery.build", fake_build), \
+             self.assertLogs("runtime_bridge_cloud", logging.INFO) as logs:
+            service = app_module.default_write_service_factory()
+        self.assertIsNotNone(service)
+        logged = "".join(logs.output)
+        self.assertIn("refreshed_token", logged)
+        self.assertNotIn("ACCESS-TOKEN-SECRET-VALUE", logged)
+        self.assertNotIn("REFRESH-TOKEN-SECRET-VALUE", logged)
 
     def test_readonly_factory_is_unaffected_and_stays_on_adc(self):
         import cloud.app as app_module
