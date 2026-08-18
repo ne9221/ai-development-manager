@@ -524,5 +524,102 @@ class ExplicitProviderAccountRoutingTests(unittest.TestCase):
             self.store.get("commands", "p1", "dispatch-req-swapped")
 
 
+class ReadOnlyNeedsRepoEditContractTests(unittest.TestCase):
+    """A brand-new Direct Dispatch Task is always read_only=True (forced,
+    server-side, unconditionally -- see handle_dispatch's read_only_required
+    rejection above). manager.dispatcher.dispatch() has no read_only concept
+    of its own and defaults needs_repo_edit=True for any new task that
+    doesn't specify it, which used to leave every such Task self-
+    contradictory (read_only=True, needs_repo_edit=True) -- a contract
+    manager.execution_lifecycle.enter_running_gate() correctly refuses to
+    ever launch. These tests prove the ingress now produces an internally
+    consistent, launchable contract, and that the authoritative gate itself
+    still rejects a genuinely contradictory snapshot unchanged."""
+
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+        create_project(self.store, project())
+        self.registries = SharedMemoryRegistries()
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=quota_fixture())
+        self.quota_patch.start()
+
+    def tearDown(self):
+        self.quota_patch.stop()
+
+    def call(self, body=None):
+        return handle_dispatch(self.store, self.service, self.registries.factory, body if body is not None else payload())
+
+    def test_brand_new_direct_dispatch_task_gets_needs_repo_edit_false(self):
+        result = self.call(payload(request_id="req-contract"))
+        task = self.store.get("tasks", "p1", result["task_id"])
+        self.assertTrue(task["read_only"])
+        self.assertFalse(task["needs_repo_edit"])
+
+    def test_direct_dispatch_task_snapshot_passes_the_read_only_running_gate(self):
+        from manager.execution_lifecycle import enter_running_gate
+        from manager.executions import reserve_execution
+        from manager.test_task_claims import MemoryClaimRegistry
+
+        result = self.call(payload(request_id="req-gate"))
+        task_id = result["task_id"]
+        command = self.store.get("commands", "p1", task_id)
+        reserve_execution(self.store, "p1", task_id, task_id, command["provider"], {"decision": "fresh"})
+        # Must not raise: the persisted Task contract is internally
+        # consistent (read_only=True, needs_repo_edit=False), so the
+        # authoritative gate actually admits it for a read-only launch.
+        with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_fixture()):
+            outcome = enter_running_gate(
+                self.store, object(), None, "p1", task_id, task_id, command["provider"], "read_only",
+                started_at=now_iso(), task_claim_registry=MemoryClaimRegistry(),
+            )
+        self.assertEqual("running", outcome["execution"]["status"])
+
+    def test_dispatcher_default_for_other_callers_is_unchanged(self):
+        # Scope check: the fix lives in the ingress's own internal_request
+        # construction, not in manager.dispatcher.dispatch()'s general
+        # default -- a direct dispatcher.dispatch() call (the shape every
+        # other caller, e.g. the CLI/runtime_bridge, still uses) keeps
+        # defaulting needs_repo_edit=True exactly as before.
+        store = DriveRecords(FakeDriveService())
+        create_project(store, project())
+        dispatcher_dispatch(store, self.service, {
+            "project_id": "p1", "task_id": "unrelated-task", "title": "Unrelated direct dispatcher call",
+            "task_type": "implementation", "complexity": "medium",
+        })
+        task = store.get("tasks", "p1", "unrelated-task")
+        self.assertTrue(task["needs_repo_edit"])
+
+    def test_needs_repo_edit_cannot_be_smuggled_through_the_payload(self):
+        # Adversarial: needs_repo_edit is forced server-side (False, to match
+        # the also-forced read_only=True) -- a caller must not be able to
+        # override it, in either direction, via the request payload.
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-smuggle", needs_repo_edit=True))
+        self.assertEqual("malformed_request", ctx.exception.code)
+
+    def test_authoritative_gate_still_rejects_a_genuinely_contradictory_snapshot(self):
+        # The gate itself is untouched: if some other path ever again
+        # produces read_only=True with needs_repo_edit=True, it must still
+        # fail closed exactly as before.
+        from manager.execution_lifecycle import enter_running_gate
+        from manager.executions import reserve_execution
+        from manager.test_task_claims import MemoryClaimRegistry
+
+        result = self.call(payload(request_id="req-corrupt"))
+        task_id = result["task_id"]
+        command = self.store.get("commands", "p1", task_id)
+        corrupted = self.store.get("tasks", "p1", task_id)
+        corrupted["needs_repo_edit"] = True
+        validate("task", corrupted)
+        self.store.put("tasks", "p1", task_id, corrupted)
+        reserve_execution(self.store, "p1", task_id, task_id, command["provider"], {"decision": "fresh"})
+        with self.assertRaises(TaskError):
+            enter_running_gate(
+                self.store, object(), None, "p1", task_id, task_id, command["provider"], "read_only",
+                started_at=now_iso(), task_claim_registry=MemoryClaimRegistry(),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

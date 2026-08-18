@@ -241,6 +241,17 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
     internal_request = {
         "project_id": project_id, "task_id": task_id, "title": clean["title"],
         "task_type": "general", "complexity": "medium",
+        # This ingress is unconditionally read-only (read_only=True is forced
+        # below, server-side, with no caller override -- see the read_only
+        # rejection above). manager.dispatcher.dispatch() has no read_only
+        # concept of its own and defaults needs_repo_edit=True for any new
+        # task that doesn't specify it, which would create a self-contradictory
+        # Task (read_only=True, needs_repo_edit=True) that
+        # manager.execution_lifecycle.enter_running_gate() correctly refuses
+        # to ever launch (read-only access requires needs_repo_edit is not
+        # True). Setting it False here keeps the Task's own contract
+        # internally consistent from the moment it is first persisted.
+        "needs_repo_edit": False,
         "source_context": {
             "origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": request_id,
             "goal": clean["goal"], "admission_version": ADMISSION_VERSION,
