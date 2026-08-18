@@ -10,7 +10,6 @@ param(
 )
 
 $env:AI_MANAGER_HOME = $ManagerHome
-$env:GOOGLE_DRIVE_TOKEN = Join-Path $ManagerHome "google-drive-token.json"
 if ($CodexBin) { $env:CODEX_BIN = $CodexBin }
 if ($CodexHome) { $env:CODEX_HOME = $CodexHome }
 if ($PythonDeps) { $env:PYTHONPATH = $PythonDeps }

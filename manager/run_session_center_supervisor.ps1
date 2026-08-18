@@ -9,7 +9,6 @@ param(
 )
 
 $env:AI_MANAGER_HOME = $ManagerHome
-$env:GOOGLE_DRIVE_TOKEN = Join-Path $ManagerHome "google-drive-token.json"
 if ($PythonDeps) { $env:PYTHONPATH = $PythonDeps }
 if ($AllowlistPath) { $env:ADM_WATCHER_ALLOWLIST_PATH = $AllowlistPath }
 Set-Location -LiteralPath $RepositoryPath
