@@ -105,6 +105,12 @@ def _summarize_item(provider_id, display_name, item, now, max_age_minutes):
         "source_verified": source_verified,
         "has_reliable_quota": reliable,
         "nearest_reset_at": nearest_reset,
+        # Passed through unmodified (e.g. Codex's metadata.credits) so
+        # downstream forecasting (manager.quota_forecast.forecast_account)
+        # can distinguish "subscription quota exhausted" from "provider
+        # unavailable" -- extra credits are a separate pool from the quota
+        # windows above and must not be silently dropped here.
+        "metadata": item.get("metadata", {}),
     }
 
 

@@ -416,6 +416,24 @@ action_badge_class = {
 
 action_label = daily_brief_vm.recommended_action.upper()
 
+recommended_card = next(
+    (
+        c for c in daily_brief_vm.accounts
+        if c.provider == daily_brief_vm.recommended_provider and c.account_id == daily_brief_vm.recommended_account
+    ),
+    None,
+)
+
+truth_line_html = ""
+if recommended_card is not None:
+    truth_line_html = f"""
+    <div style="font-size: 0.85rem; color: #8b949e; margin-bottom: 10px;">
+        Primary quota: <b>{recommended_card.formatted_five_hour_remaining}</b> &nbsp;|&nbsp;
+        Extra credits: <b>{recommended_card.formatted_extra_credits}</b> &nbsp;|&nbsp;
+        Effective availability: <b>{recommended_card.formatted_effective_availability}</b>
+    </div>
+    """
+
 st.markdown(f"""
 <div class="recommendation-card">
     <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
@@ -429,6 +447,7 @@ st.markdown(f"""
     <div style="font-size: 0.95rem; line-height: 1.5; color: #e6edf3; margin-bottom: 10px;">
         <b>Reason:</b> {daily_brief_vm.reason}
     </div>
+    {truth_line_html}
     <div style="font-size: 0.85rem; color: #8b949e;">
         ⏳ <b>Nearest Cycle Reset:</b> {daily_brief_vm.nearest_reset_countdown} &nbsp;|&nbsp;
         Generated at: <code>{daily_brief_vm.generated_at}</code>
@@ -522,6 +541,14 @@ else:
                     st.write(f"• **Reset**: `{card.formatted_weekly_countdown}`")
                     if card.weekly_action_recommendation in ("conserve", "hold"):
                         st.caption(f"⚠️ Weekly status: {card.weekly_action_recommendation.upper()}")
+
+                # Truthful availability: primary subscription quota, extra credits,
+                # and the effective (actually dispatchable) availability, kept distinct
+                # so "primary quota exhausted" is never displayed as "unavailable" when
+                # usable extra credits exist.
+                if card.extra_credits_available is not None:
+                    st.write(f"• **Extra Credits**: `{card.formatted_extra_credits}`")
+                st.write(f"• **Effective Availability**: `{card.formatted_effective_availability}`")
 
                 # Metadata / Telemetry
                 st.caption(f"Source: `{card.source}` ({card.source_type}) | Confidence: `{card.confidence}`")

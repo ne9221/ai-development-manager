@@ -313,6 +313,15 @@ class AccountQuotaCardViewModel:
     action_recommendation: str = "hold"
     warning_reason: str = ""
 
+    # Extra credits (e.g. Codex pay-as-you-go balance) -- a pool distinct from
+    # the subscription quota windows above.
+    extra_credits_available: Optional[bool] = None
+    extra_credits_balance: Optional[str] = None
+
+    # Truthful summary of whether the provider can actually be dispatched to
+    # right now: "available" | "available_via_credits" | "unavailable" | "unknown"
+    effective_availability: str = "unknown"
+
     # Formatted display strings
     formatted_five_hour_remaining: str = "Unknown"
     formatted_weekly_remaining: str = "—"
@@ -320,6 +329,8 @@ class AccountQuotaCardViewModel:
     formatted_weekly_countdown: str = "—"
     formatted_five_hour_burn_rate: str = "—"
     formatted_five_hour_projected: str = "—"
+    formatted_extra_credits: str = "—"
+    formatted_effective_availability: str = "Unknown"
 
 
 @dataclass
@@ -398,6 +409,34 @@ def build_account_quota_card_vm(fc: AccountQuotaForecast) -> AccountQuotaCardVie
     overall_risk_str = fc.overall_risk_status.value if hasattr(fc.overall_risk_status, "value") else str(fc.overall_risk_status)
     overall_act_str = fc.overall_action_recommendation.value if hasattr(fc.overall_action_recommendation, "value") else str(fc.overall_action_recommendation)
 
+    # Truthful effective availability: never collapse "primary quota exhausted"
+    # into "unavailable" when extra credits make the provider still usable,
+    # and never invent an answer when telemetry is stale/unknown.
+    if fc.stale:
+        effective_availability = "unknown"
+    elif overall_risk_str == "available_via_credits":
+        effective_availability = "available_via_credits"
+    elif fc.dispatchable:
+        effective_availability = "available"
+    else:
+        effective_availability = "unavailable"
+
+    formatted_effective_availability = {
+        "unknown": "Unknown / Stale",
+        "available_via_credits": "Available via credits",
+        "available": "Available",
+        "unavailable": "Unavailable",
+    }[effective_availability]
+
+    if fc.extra_credits_available is True:
+        formatted_extra_credits = (
+            f"Available (balance: {fc.extra_credits_balance})" if fc.extra_credits_balance else "Available"
+        )
+    elif fc.extra_credits_available is False:
+        formatted_extra_credits = "Not available"
+    else:
+        formatted_extra_credits = "—"
+
     return AccountQuotaCardViewModel(
         provider=fc.provider,
         account_id=fc.account_id,
@@ -440,12 +479,17 @@ def build_account_quota_card_vm(fc: AccountQuotaForecast) -> AccountQuotaCardVie
         overall_risk=overall_risk_str,
         action_recommendation=overall_act_str,
         warning_reason=fc.overall_warning_reason,
+        extra_credits_available=fc.extra_credits_available,
+        extra_credits_balance=fc.extra_credits_balance,
+        effective_availability=effective_availability,
         formatted_five_hour_remaining=format_percent(f5_rem),
         formatted_weekly_remaining=format_percent(w_rem) if has_week else "—",
         formatted_five_hour_countdown=format_countdown(f5_h_reset),
         formatted_weekly_countdown=format_countdown(w_h_reset) if has_week else "—",
         formatted_five_hour_burn_rate=format_burn_rate(f5_burn),
         formatted_five_hour_projected=format_percent(f5_proj) if f5_proj is not None else "—",
+        formatted_extra_credits=formatted_extra_credits,
+        formatted_effective_availability=formatted_effective_availability,
     )
 
 
@@ -560,6 +604,9 @@ def build_daily_brief_vm(
 
         if rec_action == "consume":
             reason_parts.append(f"fresh surplus quota ({rem_str} remaining, resets {reset_str})")
+        elif rec_action == "normal" and best_vm.effective_availability == "available_via_credits":
+            balance_note = f" (balance: {best_vm.extra_credits_balance})" if best_vm.extra_credits_balance else ""
+            reason_parts.append(f"primary quota exhausted (0% remaining) but extra credits available{balance_note}")
         elif rec_action == "normal":
             reason_parts.append(f"fresh quota ({rem_str} remaining, resets {reset_str})")
         elif rec_action == "conserve":

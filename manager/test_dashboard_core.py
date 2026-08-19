@@ -388,6 +388,113 @@ class TestDashboardCore(unittest.TestCase):
         self.assertTrue(any("stale" in w.lower() for w in brief.telemetry_warnings))
         self.assertTrue(brief.accounts[0].stale)
 
+    def test_daily_brief_codex_primary_exhausted_with_credits_via_real_dashboard_pipeline(self):
+        """End-to-end reproduction of the actual production dashboard.py data
+        flow: read_drive_status() -> manager.quota_reader.summarize() ->
+        build_daily_brief_vm() -- NOT build_daily_brief_vm(raw_doc) directly.
+        This is the exact path that was still showing 'No AI Available' live
+        after only manager.quota_forecast was fixed, because summarize()
+        silently dropped metadata.credits before the forecast ever saw it."""
+        from manager.quota_reader import summarize
+
+        now = datetime(2026, 8, 19, 15, 49, 25, tzinfo=timezone.utc)
+        raw_doc = {
+            "generated_at": now.isoformat(),
+            "providers": [
+                {
+                    "provider": "claude",
+                    "display_name": "Claude Code",
+                    "source": "claude_code_statusline_rate_limits",
+                    "source_type": "official",
+                    "confidence": "unknown",
+                    "status": "unknown",
+                    "last_updated": "2026-08-09T04:14:40Z",
+                    "windows": [],
+                },
+                {
+                    "provider": "codex",
+                    "display_name": "Codex",
+                    "source": "codex_app_server",
+                    "source_type": "official",
+                    "confidence": "official",
+                    "status": "ok",
+                    "last_updated": now.isoformat(),
+                    "windows": [
+                        {"name": "primary", "duration_minutes": 10080, "used_percent": 100, "remaining_percent": 0, "resets_at": (now + timedelta(hours=12)).isoformat()}
+                    ],
+                    "metadata": {
+                        "credits": {"hasCredits": True, "unlimited": False, "balance": "768.2067540000"},
+                    },
+                },
+            ],
+        }
+        quota_summary = summarize(raw_doc, max_age_minutes=60, now=now)
+        brief = build_daily_brief_vm(quota_summary, now=now)
+
+        self.assertNotEqual(brief.recommended_display_name, "No AI Available")
+        self.assertNotEqual(brief.recommended_action, "hold")
+        self.assertEqual(brief.recommended_provider, "codex")
+        codex_vm = next(a for a in brief.accounts if a.provider == "codex")
+        self.assertEqual(codex_vm.effective_availability, "available_via_credits")
+
+    def test_daily_brief_codex_primary_exhausted_with_credits_is_not_no_ai_available(self):
+        """Reproduces the real production status.json shape (2026-08-19): Codex
+        primary quota at 0% with a usable credits balance, Claude stale from a
+        much older snapshot. The Dashboard must NOT say 'No AI Available' /
+        HOLD -- Codex is truthfully available via its extra credits."""
+        now = datetime(2026, 8, 19, 15, 34, 25, tzinfo=timezone.utc)
+        doc = {
+            "providers": [
+                {
+                    "provider": "claude",
+                    "account_id": None,
+                    "display_name": "Claude Code",
+                    "source": "claude_code_statusline_rate_limits",
+                    "source_type": "official",
+                    "confidence": "unknown",
+                    "status": "unknown",
+                    "last_updated": "2026-08-09T04:14:40Z",
+                    "windows": [],
+                },
+                {
+                    "provider": "codex",
+                    "account_id": None,
+                    "display_name": "Codex",
+                    "source": "codex_app_server",
+                    "source_type": "official",
+                    "confidence": "official",
+                    "status": "ok",
+                    "last_updated": now.isoformat(),
+                    "windows": [
+                        {"name": "primary", "duration_minutes": 10080, "used_percent": 100, "remaining_percent": 0, "resets_at": (now + timedelta(hours=12)).isoformat()}
+                    ],
+                    "metadata": {
+                        "credits": {"hasCredits": True, "unlimited": False, "balance": "813.5882690000"},
+                    },
+                },
+            ]
+        }
+        brief = build_daily_brief_vm(doc, now=now)
+
+        self.assertNotEqual(brief.recommended_display_name, "No AI Available")
+        self.assertNotEqual(brief.recommended_action, "hold")
+        self.assertEqual(brief.recommended_provider, "codex")
+
+        codex_vm = next(a for a in brief.accounts if a.provider == "codex")
+        claude_vm = next(a for a in brief.accounts if a.provider == "claude")
+
+        # Primary quota and extra credits are separately visible and truthful.
+        self.assertEqual(codex_vm.formatted_five_hour_remaining, "0.0%")
+        self.assertEqual(codex_vm.extra_credits_available, True)
+        self.assertIn("813.5882690000", codex_vm.formatted_extra_credits)
+        self.assertEqual(codex_vm.effective_availability, "available_via_credits")
+        self.assertEqual(codex_vm.formatted_effective_availability, "Available via credits")
+
+        # Claude stays Unknown/Stale -- never converted to a fabricated 0%.
+        self.assertTrue(claude_vm.stale)
+        self.assertEqual(claude_vm.effective_availability, "unknown")
+        self.assertEqual(claude_vm.formatted_effective_availability, "Unknown / Stale")
+
     def test_insufficient_history_does_not_fabricate_burn_rate(self):
         now = datetime(2026, 8, 16, 12, 0, 0, tzinfo=timezone.utc)
         doc = {

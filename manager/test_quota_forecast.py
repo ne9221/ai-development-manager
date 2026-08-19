@@ -15,6 +15,7 @@ from manager.quota_forecast import (
     forecast_to_dict,
     forecast_window,
     parse_iso_time,
+    score_account_forecast,
 )
 
 
@@ -42,10 +43,11 @@ def make_account_item(
     confidence="official",
     status="ok",
     stale=False,
+    metadata=None,
 ):
     if windows is None:
         windows = [make_window("five_hour", 80.0, 20.0, resets_at=NOW + timedelta(hours=3))]
-    return {
+    item = {
         "provider": provider,
         "account_id": account_id,
         "display_name": display_name,
@@ -58,6 +60,9 @@ def make_account_item(
         "last_updated": last_updated.isoformat() if isinstance(last_updated, datetime) else last_updated,
         "windows": windows,
     }
+    if metadata is not None:
+        item["metadata"] = metadata
+    return item
 
 
 class QuotaForecastCoreTests(unittest.TestCase):
@@ -388,6 +393,88 @@ class QuotaForecastCoreTests(unittest.TestCase):
         self.assertEqual(fc.overall_risk_status, RiskStatus.EXHAUSTED)
         self.assertEqual(fc.overall_action_recommendation, ActionRecommendation.HOLD)
         self.assertFalse(fc.dispatchable)
+
+    # =====================================================================
+    # Codex effective-availability truth: primary subscription quota exhausted
+    # (0% remaining) is NOT the same fact as "provider unavailable" when the
+    # provider itself reports a usable extra-credits balance.
+    # =====================================================================
+
+    def test_primary_zero_with_credits_available_is_dispatchable_via_credits(self):
+        reset_time = NOW + timedelta(hours=6)
+        current = make_account_item(
+            "codex", "codex-1",
+            windows=[make_window("primary", remaining=0.0, resets_at=reset_time, duration=10080)],
+            last_updated=NOW,
+            source="codex_app_server",
+            metadata={"credits": {"hasCredits": True, "unlimited": False, "balance": "813.5882690000"}},
+        )
+        fc = forecast_account(current, now=NOW)
+
+        self.assertEqual(fc.primary_window.remaining_percent, 0.0)
+        self.assertEqual(fc.extra_credits_available, True)
+        self.assertEqual(fc.extra_credits_balance, "813.5882690000")
+        self.assertEqual(fc.overall_risk_status, RiskStatus.AVAILABLE_VIA_CREDITS)
+        self.assertEqual(fc.overall_action_recommendation, ActionRecommendation.NORMAL_USE)
+        self.assertTrue(fc.dispatchable, "account must be dispatchable via credits, not held")
+
+        # And the shared dispatch-scoring function must treat it as eligible.
+        is_eligible, action_tier, *_ = score_account_forecast(fc)
+        self.assertTrue(is_eligible)
+        self.assertGreater(action_tier, 0.0)
+
+    def test_primary_zero_with_no_credits_is_unavailable(self):
+        reset_time = NOW + timedelta(hours=6)
+        current = make_account_item(
+            "codex", "codex-1",
+            windows=[make_window("primary", remaining=0.0, resets_at=reset_time, duration=10080)],
+            last_updated=NOW,
+            source="codex_app_server",
+            metadata={"credits": {"hasCredits": False, "unlimited": False, "balance": "0"}},
+        )
+        fc = forecast_account(current, now=NOW)
+
+        self.assertEqual(fc.extra_credits_available, False)
+        self.assertEqual(fc.overall_risk_status, RiskStatus.EXHAUSTED)
+        self.assertEqual(fc.overall_action_recommendation, ActionRecommendation.HOLD)
+        self.assertFalse(fc.dispatchable)
+
+        is_eligible, *_ = score_account_forecast(fc)
+        self.assertFalse(is_eligible)
+
+    def test_primary_zero_with_credits_metadata_absent_does_not_invent_availability(self):
+        reset_time = NOW + timedelta(hours=6)
+        current = make_account_item(
+            "codex", "codex-1",
+            windows=[make_window("primary", remaining=0.0, resets_at=reset_time, duration=10080)],
+            last_updated=NOW,
+            source="codex_app_server",
+            # No metadata.credits at all -- must not fabricate availability.
+        )
+        fc = forecast_account(current, now=NOW)
+
+        self.assertIsNone(fc.extra_credits_available)
+        self.assertEqual(fc.overall_risk_status, RiskStatus.EXHAUSTED)
+        self.assertEqual(fc.overall_action_recommendation, ActionRecommendation.HOLD)
+        self.assertFalse(fc.dispatchable)
+
+    def test_claude_stale_remains_unknown_not_zero(self):
+        """A provider with no quota telemetry (e.g. Claude with no statusline
+        data) must surface as stale/unknown, never silently treated as 0%."""
+        current = make_account_item(
+            "claude", "account-a",
+            windows=[],
+            last_updated=NOW - timedelta(hours=10),
+        )
+        fc = forecast_account(current, now=NOW)
+
+        self.assertTrue(fc.stale)
+        self.assertEqual(fc.overall_warning_level, WarningLevel.UNKNOWN)
+        self.assertFalse(fc.dispatchable)
+        self.assertIsNone(fc.extra_credits_available)
+
+        is_eligible, *_ = score_account_forecast(fc)
+        self.assertFalse(is_eligible)
 
 
 if __name__ == "__main__":

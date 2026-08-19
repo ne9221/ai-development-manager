@@ -145,6 +145,32 @@ class CodexSingleAccountBehaviorPreserved(unittest.TestCase):
         self.assertTrue(codex_provider["has_reliable_quota"])
 
 
+class MetadataCreditsSurviveSummarize(unittest.TestCase):
+    """summarize() must pass metadata (e.g. Codex's extra-credits balance)
+    through unmodified. Both the Dashboard and the real dispatcher
+    (manager.dispatcher) build their forecast_account() input from this
+    summarized shape -- silently dropping metadata here means the account-
+    level credits signal can never reach the shared truth source no matter
+    what manager.quota_forecast does with it."""
+
+    def test_codex_credits_metadata_present_in_provider_and_account_output(self):
+        item = codex_item(remaining=0)
+        item["metadata"] = {"credits": {"hasCredits": True, "unlimited": False, "balance": "813.5882690000"}}
+        result = summarize(doc(item), now=NOW)
+
+        codex_provider = next(p for p in result["providers"] if p["provider"] == "codex")
+        codex_account = find_account(result, "codex", None)
+        self.assertEqual(codex_provider["metadata"]["credits"]["hasCredits"], True)
+        self.assertEqual(codex_provider["metadata"]["credits"]["balance"], "813.5882690000")
+        self.assertEqual(codex_account["metadata"]["credits"]["hasCredits"], True)
+
+    def test_missing_metadata_summarizes_to_empty_dict_not_missing_key(self):
+        result = summarize(doc(codex_item(remaining=90)), now=NOW)
+        codex_account = find_account(result, "codex", None)
+        self.assertIn("metadata", codex_account)
+        self.assertEqual(codex_account["metadata"], {})
+
+
 class MalformedAccountIdDoesNotCrash(unittest.TestCase):
     """A pre-P0.1 document with account_id entirely absent, or a stray
     non-string account_id, must not raise."""

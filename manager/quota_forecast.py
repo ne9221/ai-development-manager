@@ -37,6 +37,7 @@ class RiskStatus(str, Enum):
     CONSUME_FASTER = "consume_faster"
     LIKELY_EXHAUST_BEFORE_RESET = "likely_exhaust_before_reset"
     EXHAUSTED = "exhausted"
+    AVAILABLE_VIA_CREDITS = "available_via_credits"
 
 
 class ActionRecommendation(str, Enum):
@@ -121,6 +122,13 @@ class AccountQuotaForecast:
     overall_warning_reason: str = ""
     dispatchable: bool = False
 
+    # Extra credits (e.g. Codex pay-as-you-go balance) are a distinct pool from
+    # the subscription quota windows above. None = provider reports no credits
+    # concept / unknown (never treated as "no credits available"); True/False
+    # is the provider's own hasCredits-or-unlimited signal.
+    extra_credits_available: Optional[bool] = None
+    extra_credits_balance: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return forecast_to_dict(self)
 
@@ -145,6 +153,31 @@ def _extract_window(snapshot: Dict[str, Any], window_name: str) -> Optional[Dict
         if isinstance(w, dict) and w.get("name") == window_name:
             return w
     return None
+
+
+def _extract_credits(current_account_item: Dict[str, Any]) -> Tuple[Optional[bool], Optional[str]]:
+    """Read the provider's own extra-credits signal from metadata.credits.
+
+    Trusts only an explicit boolean hasCredits/unlimited flag from the source
+    (e.g. Codex's account/rateLimits/read). Any other shape (missing metadata,
+    missing credits block, non-bool hasCredits) is reported as unknown (None)
+    rather than invented as unavailable -- primary quota exhaustion must never
+    be conflated with "no extra credits".
+    """
+    metadata = current_account_item.get("metadata")
+    if not isinstance(metadata, dict):
+        return (None, None)
+    credits = metadata.get("credits")
+    if not isinstance(credits, dict):
+        return (None, None)
+    has_credits = credits.get("hasCredits")
+    unlimited = credits.get("unlimited")
+    balance = credits.get("balance")
+    balance_str = balance if isinstance(balance, str) else None
+    if not isinstance(has_credits, bool) and not isinstance(unlimited, bool):
+        return (None, balance_str)
+    available = bool(has_credits) or bool(unlimited)
+    return (available, balance_str)
 
 
 def calculate_window_burn_rate(
@@ -651,9 +684,30 @@ def forecast_account(
     overall_risk = primary.risk_status if primary else RiskStatus.UNKNOWN
     overall_action = primary.action_recommendation if primary else ActionRecommendation.HOLD
 
+    # Extra credits (e.g. Codex pay-as-you-go balance) are a separate pool from
+    # the subscription quota windows -- primary quota exhausted != provider
+    # unavailable when the provider itself reports a usable credits balance.
+    extra_credits_available, extra_credits_balance = _extract_credits(current_account_item)
+    any_window_exhausted = any(
+        w.remaining_percent == 0.0 or w.risk_status == RiskStatus.EXHAUSTED for w in window_forecasts
+    )
+    available_via_credits = (
+        not stale
+        and has_reliable_quota
+        and any_window_exhausted
+        and extra_credits_available is True
+    )
+
     # Multi-window protection policy (Phase E):
-    # 1. If any window is exhausted (0% remaining), the account is exhausted
-    if any(w.remaining_percent == 0.0 or w.risk_status == RiskStatus.EXHAUSTED for w in window_forecasts):
+    # 1. If any window is exhausted (0% remaining), the account is exhausted --
+    #    unless the provider reports usable extra credits, in which case the
+    #    account is still dispatchable via those credits.
+    if available_via_credits:
+        overall_risk = RiskStatus.AVAILABLE_VIA_CREDITS
+        overall_action = ActionRecommendation.NORMAL_USE
+        balance_note = f" (balance: {extra_credits_balance})" if extra_credits_balance else ""
+        overall_reason = f"Subscription quota exhausted (0% remaining) but extra credits available{balance_note}"
+    elif any_window_exhausted:
         overall_risk = RiskStatus.EXHAUSTED
         overall_action = ActionRecommendation.HOLD
     # 2. If any secondary/longer window requires CONSERVE / LIKELY_EXHAUST_BEFORE_RESET,
@@ -684,7 +738,7 @@ def forecast_account(
     dispatchable = (
         not stale
         and has_reliable_quota
-        and has_positive_remaining
+        and (has_positive_remaining or available_via_credits)
     )
 
     return AccountQuotaForecast(
@@ -708,6 +762,8 @@ def forecast_account(
         overall_action_recommendation=overall_action,
         overall_warning_reason=overall_reason,
         dispatchable=dispatchable,
+        extra_credits_available=extra_credits_available,
+        extra_credits_balance=extra_credits_balance,
     )
 
 
@@ -841,6 +897,8 @@ def score_account_forecast(fc: AccountQuotaForecast) -> Tuple[bool, float, float
         action_tier = 4.0
     elif fc.overall_action_recommendation == ActionRecommendation.SUGGEST_CONSUME:
         action_tier = 3.0
+    elif fc.overall_risk_status == RiskStatus.AVAILABLE_VIA_CREDITS:
+        action_tier = 2.0
     elif (
         fc.overall_action_recommendation == ActionRecommendation.CONSERVE
         or fc.overall_risk_status == RiskStatus.LIKELY_EXHAUST_BEFORE_RESET
