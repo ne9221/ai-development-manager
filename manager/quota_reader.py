@@ -9,6 +9,8 @@ from pathlib import Path
 from collectors.publish_drive import FOLDER_ID, FILE_NAME, build_service
 from jsonschema import Draft202012Validator, FormatChecker
 
+from manager.quota_forecast import extract_extra_credits_available
+
 
 EXPECTED_PROVIDERS = {
     "codex": "Codex",
@@ -105,6 +107,7 @@ def _summarize_item(provider_id, display_name, item, now, max_age_minutes):
         "source_verified": source_verified,
         "has_reliable_quota": reliable,
         "nearest_reset_at": nearest_reset,
+        "extra_credits_available": extract_extra_credits_available(item),
     }
 
 

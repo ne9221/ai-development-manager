@@ -21,14 +21,17 @@ def claude_item(account_id, remaining=80, confidence="official", source_type="of
     }
 
 
-def codex_item(remaining=90, updated=NOW):
-    return {
+def codex_item(remaining=90, updated=NOW, metadata=None):
+    item = {
         "provider": "codex", "display_name": "Codex", "collection_mode": "automatic",
         "source": "codex_app_server", "source_type": "official", "confidence": "official",
         "last_updated": updated.isoformat(), "status": "ok",
         "windows": [{"name": "seven_day", "remaining_percent": remaining,
                      "used_percent": 100 - remaining, "resets_at": None}],
     }
+    if metadata is not None:
+        item["metadata"] = metadata
+    return item
 
 
 def doc(*providers):
@@ -96,6 +99,26 @@ class LegacyNoneAccountCompatPriority(unittest.TestCase):
         forward_claude = next(p for p in forward["providers"] if p["provider"] == "claude")
         backward_claude = next(p for p in backward["providers"] if p["provider"] == "claude")
         self.assertEqual(forward_claude, backward_claude)
+
+
+class ExtraCreditsAvailabilityPropagated(unittest.TestCase):
+    """summarize() must not silently drop metadata.credits.hasCredits -- it is the
+    shared truth source both the Dashboard and dispatch/quota selection consume."""
+
+    def test_credits_true_propagates_to_summary(self):
+        result = summarize(doc(codex_item(remaining=0, metadata={"credits": {"hasCredits": True}})), now=NOW)
+        codex = next(p for p in result["providers"] if p["provider"] == "codex")
+        self.assertIs(codex["extra_credits_available"], True)
+
+    def test_credits_false_propagates_to_summary(self):
+        result = summarize(doc(codex_item(remaining=0, metadata={"credits": {"hasCredits": False}})), now=NOW)
+        codex = next(p for p in result["providers"] if p["provider"] == "codex")
+        self.assertIs(codex["extra_credits_available"], False)
+
+    def test_missing_credits_metadata_is_unknown_not_fabricated(self):
+        result = summarize(doc(codex_item(remaining=0)), now=NOW)
+        codex = next(p for p in result["providers"] if p["provider"] == "codex")
+        self.assertIsNone(codex["extra_credits_available"])
 
 
 class ReliabilityNotConflatedAcrossAccounts(unittest.TestCase):

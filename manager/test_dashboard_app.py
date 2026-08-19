@@ -110,6 +110,87 @@ class TestDashboardAppRender(unittest.TestCase):
     @patch("manager.tasks.DriveRecords")
     @patch("manager.quota_reader.read_drive_status")
     @patch("collectors.publish_drive.build_service")
+    def test_app_render_zero_percent_quota_with_extra_credits_is_not_no_ai_available(
+        self, mock_build_service, mock_read_drive_status, mock_drive_records
+    ):
+        """Real end-to-end Streamlit render of the reported bug: Codex primary quota
+        is 0%, but real extra/bonus credits are available (metadata.credits.hasCredits
+        from the official Codex app-server response). Today's Recommendation must NOT
+        say 'No AI Available', and the account card must show effective availability."""
+        now = datetime.now(timezone.utc)
+        mock_read_drive_status.return_value = {
+            "providers": [
+                {
+                    "provider": "codex",
+                    "display_name": "Codex",
+                    "status": "ok",
+                    "collection_mode": "automatic",
+                    "source": "codex_app_server",
+                    "source_type": "official",
+                    "confidence": "official",
+                    "last_updated": now.isoformat().replace("+00:00", "Z"),
+                    "windows": [
+                        {"name": "primary", "remaining_percent": 0.0, "used_percent": 100.0, "resets_at": (now + timedelta(days=3)).isoformat()}
+                    ],
+                    "metadata": {"credits": {"hasCredits": True, "unlimited": False}},
+                }
+            ]
+        }
+        mock_store = mock_drive_records.return_value
+        mock_store.list_projects.return_value = []
+
+        at = AppTest.from_file("../dashboard.py")
+        at.run(timeout=30)
+
+        self.assertFalse(at.exception, f"App crashed on 0% primary + credits: {at.exception}")
+
+        markdown_texts = [el.value for el in at.markdown]
+        full_page_text = "\n".join(markdown_texts)
+        self.assertNotIn("No AI Available", full_page_text)
+        self.assertIn("Codex", full_page_text)
+        self.assertIn("AVAILABLE VIA CREDITS", full_page_text)
+        self.assertIn("Extra credits", full_page_text)
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_app_render_zero_percent_quota_without_credits_is_genuinely_no_ai_available(
+        self, mock_build_service, mock_read_drive_status, mock_drive_records
+    ):
+        """Same 0% primary window, but no extra credits: recommendation must
+        genuinely say No AI Available -- the fix must not fabricate availability."""
+        now = datetime.now(timezone.utc)
+        mock_read_drive_status.return_value = {
+            "providers": [
+                {
+                    "provider": "codex",
+                    "display_name": "Codex",
+                    "status": "ok",
+                    "collection_mode": "automatic",
+                    "source": "codex_app_server",
+                    "source_type": "official",
+                    "confidence": "official",
+                    "last_updated": now.isoformat().replace("+00:00", "Z"),
+                    "windows": [
+                        {"name": "primary", "remaining_percent": 0.0, "used_percent": 100.0, "resets_at": (now + timedelta(days=3)).isoformat()}
+                    ],
+                    "metadata": {"credits": {"hasCredits": False, "unlimited": False}},
+                }
+            ]
+        }
+        mock_store = mock_drive_records.return_value
+        mock_store.list_projects.return_value = []
+
+        at = AppTest.from_file("../dashboard.py")
+        at.run(timeout=30)
+
+        self.assertFalse(at.exception, f"App crashed on 0% primary, no credits: {at.exception}")
+        full_page_text = "\n".join(el.value for el in at.markdown)
+        self.assertIn("No AI Available", full_page_text)
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
     def test_app_render_claude_ab_multi_account(self, mock_build_service, mock_read_drive_status, mock_drive_records):
         now = datetime.now(timezone.utc)
         mock_read_drive_status.return_value = {

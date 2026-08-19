@@ -388,6 +388,66 @@ class TestDashboardCore(unittest.TestCase):
         self.assertTrue(any("stale" in w.lower() for w in brief.telemetry_warnings))
         self.assertTrue(brief.accounts[0].stale)
 
+    def test_daily_brief_recommends_codex_via_credits_not_no_ai_available(self):
+        """Codex quota-truth: primary 0% + real extra credits must NOT surface
+        'No AI Available'/HOLD when Codex is genuinely still usable via credits."""
+        now = datetime(2026, 8, 16, 12, 0, 0, tzinfo=timezone.utc)
+        doc = {
+            "providers": [
+                {
+                    "provider": "codex",
+                    "account_id": None,
+                    "display_name": "Codex",
+                    "source": "codex_app_server",
+                    "source_type": "official",
+                    "confidence": "official",
+                    "status": "ok",
+                    "last_updated": now.isoformat(),
+                    "windows": [
+                        {"name": "primary", "remaining_percent": 0.0, "used_percent": 100.0, "resets_at": (now + timedelta(days=3)).isoformat()}
+                    ],
+                    "metadata": {"credits": {"hasCredits": True, "unlimited": False}},
+                }
+            ]
+        }
+        brief = build_daily_brief_vm(doc, now=now)
+        self.assertEqual(brief.recommended_provider, "codex")
+        self.assertNotEqual(brief.recommended_display_name, "No AI Available")
+        self.assertNotEqual(brief.recommended_action, "hold")
+        self.assertIn("credits", brief.reason.lower())
+        codex_vm = brief.accounts[0]
+        self.assertTrue(codex_vm.dispatchable)
+        self.assertTrue(codex_vm.available_via_credits)
+        self.assertEqual(codex_vm.formatted_effective_availability, "AVAILABLE VIA CREDITS")
+        self.assertNotIn(codex_vm, brief.unsafe_accounts)
+
+    def test_daily_brief_says_no_ai_available_when_no_credits_and_no_quota(self):
+        """Same 0% primary window, but no extra credits: must genuinely say unavailable."""
+        now = datetime(2026, 8, 16, 12, 0, 0, tzinfo=timezone.utc)
+        doc = {
+            "providers": [
+                {
+                    "provider": "codex",
+                    "account_id": None,
+                    "display_name": "Codex",
+                    "source": "codex_app_server",
+                    "source_type": "official",
+                    "confidence": "official",
+                    "status": "ok",
+                    "last_updated": now.isoformat(),
+                    "windows": [
+                        {"name": "primary", "remaining_percent": 0.0, "used_percent": 100.0, "resets_at": (now + timedelta(days=3)).isoformat()}
+                    ],
+                    "metadata": {"credits": {"hasCredits": False, "unlimited": False}},
+                }
+            ]
+        }
+        brief = build_daily_brief_vm(doc, now=now)
+        self.assertEqual(brief.recommended_display_name, "No AI Available")
+        self.assertEqual(brief.recommended_action, "hold")
+        self.assertFalse(brief.accounts[0].dispatchable)
+        self.assertFalse(brief.accounts[0].available_via_credits)
+
     def test_insufficient_history_does_not_fabricate_burn_rate(self):
         now = datetime(2026, 8, 16, 12, 0, 0, tzinfo=timezone.utc)
         doc = {

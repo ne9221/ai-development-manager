@@ -493,6 +493,23 @@ else:
                 </div>
                 """, unsafe_allow_html=True)
 
+                # Effective availability: primary quota alone does not tell the whole
+                # story when extra/bonus credits exist (queued != running; 0% primary
+                # must not by itself mean "unavailable").
+                if card.extra_credits_available is True:
+                    credits_text = "available"
+                elif card.extra_credits_available is False:
+                    credits_text = "none"
+                else:
+                    credits_text = "unknown"
+                availability_bg = "badge-action-normal" if card.available_via_credits else "badge-unknown"
+                st.markdown(f"""
+                <div style="margin-top:6px;">
+                    <span class="badge {availability_bg}">EFFECTIVE AVAILABILITY: {card.formatted_effective_availability}</span>
+                </div>
+                """, unsafe_allow_html=True)
+                st.write(f"• **Primary quota**: `{card.formatted_five_hour_remaining}` &nbsp;|&nbsp; **Extra credits**: `{credits_text}`")
+
                 # 5-Hour Quota Display
                 st.markdown("#### 5-Hour Window")
                 if card.stale:

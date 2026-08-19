@@ -281,6 +281,12 @@ class AccountQuotaCardViewModel:
     dispatchable: bool
     last_updated: Optional[str]
 
+    # Extra/bonus credits and effective availability (queued != running: 0% primary
+    # quota does not by itself mean unusable when real extra credits exist)
+    extra_credits_available: Optional[bool] = None
+    available_via_credits: bool = False
+    formatted_effective_availability: str = "UNKNOWN"
+
     # Primary / 5-hour window
     five_hour_remaining_pct: Optional[float] = None
     five_hour_used_pct: Optional[float] = None
@@ -398,6 +404,15 @@ def build_account_quota_card_vm(fc: AccountQuotaForecast) -> AccountQuotaCardVie
     overall_risk_str = fc.overall_risk_status.value if hasattr(fc.overall_risk_status, "value") else str(fc.overall_risk_status)
     overall_act_str = fc.overall_action_recommendation.value if hasattr(fc.overall_action_recommendation, "value") else str(fc.overall_action_recommendation)
 
+    if fc.available_via_credits:
+        formatted_effective_availability = "AVAILABLE VIA CREDITS"
+    elif fc.dispatchable:
+        formatted_effective_availability = "AVAILABLE"
+    elif fc.stale or not fc.has_reliable_quota:
+        formatted_effective_availability = "UNKNOWN"
+    else:
+        formatted_effective_availability = "UNAVAILABLE"
+
     return AccountQuotaCardViewModel(
         provider=fc.provider,
         account_id=fc.account_id,
@@ -414,6 +429,9 @@ def build_account_quota_card_vm(fc: AccountQuotaForecast) -> AccountQuotaCardVie
         source_verified=fc.source_verified,
         dispatchable=fc.dispatchable,
         last_updated=fc.last_updated,
+        extra_credits_available=fc.extra_credits_available,
+        available_via_credits=fc.available_via_credits,
+        formatted_effective_availability=formatted_effective_availability,
         five_hour_remaining_pct=f5_rem,
         five_hour_used_pct=f5_used,
         five_hour_resets_at=f5_resets,
@@ -558,7 +576,9 @@ def build_daily_brief_vm(
         rem_str = f"{best_vm.five_hour_remaining_pct:.0f}%" if best_vm.five_hour_remaining_pct is not None else "healthy"
         reset_str = best_vm.formatted_five_hour_countdown
 
-        if rec_action == "consume":
+        if best_vm.available_via_credits:
+            reason_parts.append("primary quota exhausted (0%) but extra/bonus credits are available; effective availability: AVAILABLE VIA CREDITS")
+        elif rec_action == "consume":
             reason_parts.append(f"fresh surplus quota ({rem_str} remaining, resets {reset_str})")
         elif rec_action == "normal":
             reason_parts.append(f"fresh quota ({rem_str} remaining, resets {reset_str})")

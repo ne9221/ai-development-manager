@@ -42,10 +42,11 @@ def make_account_item(
     confidence="official",
     status="ok",
     stale=False,
+    metadata=None,
 ):
     if windows is None:
         windows = [make_window("five_hour", 80.0, 20.0, resets_at=NOW + timedelta(hours=3))]
-    return {
+    item = {
         "provider": provider,
         "account_id": account_id,
         "display_name": display_name,
@@ -58,6 +59,9 @@ def make_account_item(
         "last_updated": last_updated.isoformat() if isinstance(last_updated, datetime) else last_updated,
         "windows": windows,
     }
+    if metadata is not None:
+        item["metadata"] = metadata
+    return item
 
 
 class QuotaForecastCoreTests(unittest.TestCase):
@@ -388,6 +392,45 @@ class QuotaForecastCoreTests(unittest.TestCase):
         self.assertEqual(fc.overall_risk_status, RiskStatus.EXHAUSTED)
         self.assertEqual(fc.overall_action_recommendation, ActionRecommendation.HOLD)
         self.assertFalse(fc.dispatchable)
+
+    # Codex quota-truth: primary 0% + extra credits available => still dispatchable
+    def test_primary_zero_with_extra_credits_remains_dispatchable(self):
+        w0 = make_window("primary", remaining=0.0, resets_at=NOW + timedelta(days=3), duration=10080)
+        item = make_account_item(
+            "codex", None, "Codex", windows=[w0], source="codex_app_server",
+            metadata={"credits": {"hasCredits": True, "unlimited": False}},
+        )
+        fc = forecast_account(item, now=NOW)
+        self.assertTrue(fc.dispatchable, "Codex with real extra credits must remain dispatchable when primary is 0%")
+        self.assertTrue(fc.available_via_credits)
+        self.assertIs(fc.extra_credits_available, True)
+        self.assertEqual(fc.overall_risk_status, RiskStatus.AVAILABLE_VIA_CREDITS)
+        self.assertEqual(fc.overall_action_recommendation, ActionRecommendation.NORMAL_USE)
+
+    # Codex quota-truth: primary 0% + no credits => genuinely exhausted/unavailable
+    def test_primary_zero_without_credits_is_unavailable(self):
+        w0 = make_window("primary", remaining=0.0, resets_at=NOW + timedelta(days=3), duration=10080)
+        item = make_account_item(
+            "codex", None, "Codex", windows=[w0], source="codex_app_server",
+            metadata={"credits": {"hasCredits": False, "unlimited": False}},
+        )
+        fc = forecast_account(item, now=NOW)
+        self.assertFalse(fc.dispatchable)
+        self.assertFalse(fc.available_via_credits)
+        self.assertIs(fc.extra_credits_available, False)
+        self.assertEqual(fc.overall_risk_status, RiskStatus.EXHAUSTED)
+        self.assertEqual(fc.overall_action_recommendation, ActionRecommendation.HOLD)
+
+    # Codex quota-truth: primary 0% + unknown credits => must NOT invent availability
+    def test_primary_zero_with_unknown_credits_does_not_invent_availability(self):
+        w0 = make_window("primary", remaining=0.0, resets_at=NOW + timedelta(days=3), duration=10080)
+        item = make_account_item("codex", None, "Codex", windows=[w0], source="codex_app_server")  # no metadata at all
+        fc = forecast_account(item, now=NOW)
+        self.assertFalse(fc.dispatchable)
+        self.assertFalse(fc.available_via_credits)
+        self.assertIsNone(fc.extra_credits_available)
+        self.assertEqual(fc.overall_risk_status, RiskStatus.EXHAUSTED)
+        self.assertEqual(fc.overall_action_recommendation, ActionRecommendation.HOLD)
 
 
 if __name__ == "__main__":
