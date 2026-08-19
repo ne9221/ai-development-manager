@@ -418,6 +418,18 @@ class CommandWatcherTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(frozenset(), load_allowlist())
 
+    def test_production_allowlist_admits_zero_state_bootstrap_smoke(self):
+        allowlist = Path(__file__).parents[1] / "templates" / "watcher_allowlist.json"
+        self.assertIn(("ai-development-manager", "phase3-zero-state-bootstrap-final-smoke"),
+                      load_allowlist(str(allowlist)))
+
+    def test_windows_watcher_task_wires_allowlist_path_to_runtime(self):
+        manager = Path(__file__).parent
+        installer = (manager / "install_command_watcher.ps1").read_text(encoding="utf-8")
+        runner = (manager / "run_command_watcher.ps1").read_text(encoding="utf-8")
+        self.assertIn('-AllowlistPath `"$AllowlistPath`"', installer)
+        self.assertIn('$env:ADM_WATCHER_ALLOWLIST_PATH = $AllowlistPath', runner)
+
     # -- Phase 4C: provider routing + Claude quota fail-closed wiring --
 
     # 1 & 2: provider resolves the correct launcher/quota-gate pairing

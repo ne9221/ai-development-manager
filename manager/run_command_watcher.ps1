@@ -5,6 +5,7 @@ param(
     [string]$CodexBin,
     [string]$CodexHome,
     [string]$PythonDeps,
+    [Parameter(Mandatory=$true)][string]$AllowlistPath,
     [Parameter(Mandatory=$true)][string]$GcsBucket,
     [Parameter(Mandatory=$true)][string]$GcsObject
 )
@@ -14,6 +15,7 @@ $env:GOOGLE_DRIVE_TOKEN = Join-Path $ManagerHome "google-drive-token.json"
 if ($CodexBin) { $env:CODEX_BIN = $CodexBin }
 if ($CodexHome) { $env:CODEX_HOME = $CodexHome }
 if ($PythonDeps) { $env:PYTHONPATH = $PythonDeps }
+$env:ADM_WATCHER_ALLOWLIST_PATH = $AllowlistPath
 $env:ADM_LOCK_GCS_BUCKET = $GcsBucket
 $env:ADM_LOCK_GCS_OBJECT = $GcsObject
 Set-Location -LiteralPath $RepositoryPath

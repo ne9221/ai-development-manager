@@ -78,6 +78,7 @@ instances ignored:
 ./manager/install_command_watcher.ps1 -PythonPath C:\path\python.exe `
   -RepositoryPath C:\path\ai-development-manager -ManagerHome $env:LOCALAPPDATA\AI-Development-Manager `
   -CodexBin C:\path\codex.exe -CodexHome $env:USERPROFILE\.codex -PythonDeps C:\path\site-packages `
+  -AllowlistPath C:\path\ai-development-manager\templates\watcher_allowlist.json `
   -GcsBucket your-authority-bucket -GcsObject worktree-locks/global-registry.json
 ```
 
