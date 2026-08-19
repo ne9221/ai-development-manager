@@ -140,6 +140,19 @@ class CommandWatcherTests(unittest.TestCase):
         result = process_command(self.store, object(), {"command_id": "bad"}, launcher_factory=runner)
         self.assertEqual({"status": "rejected"}, result); runner.assert_not_called()
 
+    def test_missing_governance_inheritance_hard_rejects_before_launch(self):
+        task_record = self.store.get("tasks", "p1", "t1")
+        del task_record["governance"]
+        self.store.put("tasks", "p1", "t1", task_record)
+        runner = Mock()
+        result = process_command(
+            self.store, object(), command(), launcher_factory=runner,
+            allowlist=self.ALLOWLIST, health_check=lambda: True,
+            quota_check=lambda _service: True,
+        )
+        self.assertEqual({"status": "rejected", "reason": "mandatory_governance_missing_or_stale"}, result)
+        runner.assert_not_called()
+
     def test_task_claim_collision_and_missing_writer_authority_do_not_launch(self):
         collision = Mock(side_effect=TaskClaimConflict("already claimed"))
         with patch("manager.command_watcher.launch_task", collision):

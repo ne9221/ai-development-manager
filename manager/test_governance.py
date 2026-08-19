@@ -79,6 +79,11 @@ class GovernanceTests(unittest.TestCase):
 
     def test_mandatory_rules_are_injected_and_rendered_for_all_dispatch_providers(self):
         task = create_task(self.store, task_input(), assign=False)
+        self.assertEqual({
+            "parallel_first", "research_before_build", "copy_ready_dispatch",
+            "real_running_truth", "visibility_first", "mandatory_status_report",
+            "cloud_first", "task_identity",
+        }, set(MANDATORY_RULE_IDS))
         self.assertEqual(list(MANDATORY_RULE_IDS), task["governance"]["mandatory_rule_ids"])
         for provider in ("codex", "claude", "antigravity"):
             with self.subTest(provider=provider):
@@ -89,6 +94,8 @@ class GovernanceTests(unittest.TestCase):
                 }, quota_document=quota(), executions=[])
                 for rule_id in MANDATORY_RULE_IDS:
                     self.assertIn(rule_id, result["generated_prompt"])
+                for identity in ("Conversation:", "Session:", "Priority:", "Mode:"):
+                    self.assertIn(identity, result["generated_prompt"].split("\n\n", 1)[0])
                 self.assertIn("Overall project progress:", result["generated_prompt"])
 
     def test_missing_injection_blocks_dispatch(self):

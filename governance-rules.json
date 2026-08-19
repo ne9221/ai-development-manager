@@ -2,11 +2,15 @@
   "schema_version": "1.0.0",
   "mandatory_rules": [
     {
-      "id": "research_before_build",
-      "instruction": "Borrow first: when research is required, inspect mature reusable solutions before building and record either PoC evidence or explicit rejection evidence."
+      "id": "parallel_first",
+      "instruction": "When accelerating delivery, schedule independent non-conflicting tasks in the same execution batch; serialize only dependencies, provider limits, or conflicting write scope."
     },
     {
-      "id": "copy_ready_ai_dispatch",
+      "id": "research_before_build",
+      "instruction": "For foundational capabilities, research GitHub and mature reusable solutions first, prefer Direct Use then Wrap/Adapt then Build, produce a runnable PoC when reasonably possible, and give explicit rejection evidence before a custom build."
+    },
+    {
+      "id": "copy_ready_dispatch",
       "instruction": "Treat this brief as the copy-ready execution contract; do not rely on README memory or unstated rules."
     },
     {
@@ -15,7 +19,7 @@
     },
     {
       "id": "visibility_first",
-      "instruction": "Keep current progress, blockers, next action, and provider state visible in the required ADM report."
+      "instruction": "Prioritize user-visible usable progress over generalized infrastructure; never present internal READY/PASS as user-facing completion."
     },
     {
       "id": "mandatory_status_report",
