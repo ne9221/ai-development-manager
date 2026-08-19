@@ -237,7 +237,22 @@ def reserve_execution(store, project_id, task_id, execution_id, provider, quota_
         validate("execution", existing)
         if existing.get("status") == "reserved" and all(existing.get(key) == value for key, value in expected.items()):
             return existing
-        raise TaskError(f"execution_id already exists with a different reservation: {execution_id}")
+        # Retries reuse the same execution_id as the attempt they retry (the
+        # watcher derives it deterministically from the command, not the
+        # attempt) -- a terminal existing record at that id is therefore the
+        # expected shape of a genuine retry, not a conflict, but only when the
+        # caller's retry linkage actually proves it: this exact id is both the
+        # target being reserved and the prior execution being retried, and the
+        # retry_count increments the terminal record's own by exactly one.
+        # Any other terminal reuse (retry_count=0, mismatched linkage, wrong
+        # task_id) still falls through to the conflict error unchanged.
+        retryable_terminal = existing.get("status") in ("completed", "failed", "interrupted")
+        if (retryable_terminal and retry_count > 0 and retry_of_execution_id == execution_id
+                and existing.get("task_id") == task_id
+                and retry_count == int(existing.get("retry_count", 0)) + 1):
+            pass
+        else:
+            raise TaskError(f"execution_id already exists with a different reservation: {execution_id}")
 
     reserved_at = reserved_at or now_iso()
     execution = {

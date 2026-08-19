@@ -304,6 +304,39 @@ class ExecutionTests(unittest.TestCase):
             reserve_execution(self.store, "p1", "t1", "malformed", "codex", decision())
         self.assertEqual(malformed, self.store.get("executions", "p1", "malformed"))
 
+    def test_reserve_allows_retry_over_a_terminal_execution_at_the_same_id(self):
+        """Regression: the watcher derives execution_id deterministically from
+        the command, so every retry targets the exact same execution_id as the
+        attempt it retries. reserve_execution must therefore allow overwriting
+        a terminal (not just 'reserved') record at that id when the caller's
+        retry linkage proves it -- otherwise every retry is structurally
+        impossible (confirmed live: a real retry immediately re-raised
+        'different reservation' before ever spawning a process)."""
+        with patch("manager.executions.read_drive_status", side_effect=[quota([]), quota([])]):
+            put_legacy_running(self.store, object(), "p1", "t1", "same-id", "codex", started_at="2026-08-09T00:00:00Z")
+            terminal = finish_execution(self.store, object(), "p1", "same-id", status="interrupted", completed_at="2026-08-09T00:01:00Z")
+        self.assertEqual(0, terminal.get("retry_count", 0))
+
+        # Unlinked/mismatched retries onto the same terminal id still conflict.
+        with self.assertRaisesRegex(TaskError, "different reservation"):
+            reserve_execution(self.store, "p1", "t1", "same-id", "codex", decision())
+        with self.assertRaisesRegex(TaskError, "different reservation"):
+            reserve_execution(self.store, "p1", "t1", "same-id", "codex", decision(),
+                              retry_count=1, retry_of_execution_id="some-other-id")
+        with self.assertRaisesRegex(TaskError, "different reservation"):
+            reserve_execution(self.store, "p1", "t1", "same-id", "codex", decision(),
+                              retry_count=2, retry_of_execution_id="same-id")
+        self.assertEqual(terminal, self.store.get("executions", "p1", "same-id"))
+
+        retried = reserve_execution(self.store, "p1", "t1", "same-id", "codex", decision(),
+                                    retry_count=1, retry_of_execution_id="same-id")
+        self.assertEqual("reserved", retried["status"])
+        self.assertEqual(1, retried["retry_count"])
+        self.assertEqual("same-id", retried["retry_of_execution_id"])
+        self.assertIsNone(retried["started_at"])
+        self.assertIsNone(retried["provider_evidence"])
+        self.assertEqual(retried, self.store.get("executions", "p1", "same-id"))
+
     def test_reserve_rejects_invalid_quota_evidence(self):
         for evidence in (None, {}, [], "fresh"):
             with self.subTest(evidence=evidence), self.assertRaisesRegex(TaskError, "non-empty object"):
