@@ -1,7 +1,9 @@
 import unittest
 from copy import deepcopy
+from unittest import mock
 
 from manager.dispatcher import dispatch, request_ok
+from manager.rules_manifest import mandatory_rules
 from manager.sessions import parse_identity_header
 from manager.tasks import TaskError, create_handoff, create_project, create_task
 
@@ -310,6 +312,30 @@ class DispatcherTests(unittest.TestCase):
         self.dispatch_case(request())
         task = self.store.get("tasks", "p1", "t1")
         self.assertEqual("C:/already/resolved", task["working_directory"])
+
+    def test_mandatory_rules_are_injected_into_generated_task(self):
+        """The caller passed no shared_rules at all: injection must still happen automatically."""
+        result = self.dispatch_case(request(title="No manual rules passed"))
+        prompt = result["generated_prompt"]
+        for rule in mandatory_rules("dispatch"):
+            self.assertIn(rule["instruction"], prompt, f"mandatory rule {rule['rule_id']} was not auto-injected")
+
+    def test_dispatch_rejected_when_mandatory_rule_injection_missing(self):
+        """Any generated prompt lacking a mandatory rule (bug, drift, bypass) must block dispatch, not warn."""
+        with mock.patch("manager.dispatcher.prompt_for", return_value="AI: Codex\nProject: p1\nTask: t1\n\nno mandatory rules present here"):
+            with self.assertRaises(TaskError) as ctx:
+                self.dispatch_case(request(title="Bypassed injection"))
+        self.assertIn("mandatory rule injection missing", str(ctx.exception))
+
+    def test_research_before_build_requires_poc_or_rejection_evidence(self):
+        with self.assertRaises(TaskError) as ctx:
+            self.dispatch_case(request(title="New architecture spike", research_gate_required=True))
+        self.assertIn("research gate", str(ctx.exception))
+        ok = self.dispatch_case(request(
+            title="New architecture spike with evidence", research_gate_required=True,
+            research_evidence={"candidates": [{"name": "libfoo", "rejection_reason": "unmaintained since 2023"}], "poc_attempted": False},
+        ))
+        self.assertIn("generated_prompt", ok)
 
 
 class QuotaAwareRoutingDispatcherTests(unittest.TestCase):

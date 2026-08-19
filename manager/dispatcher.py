@@ -12,8 +12,11 @@ from manager.assignment import CAPABILITIES, decide
 from manager.estimator import estimate
 from manager.executions import list_executions
 from manager.quota_reader import EXPECTED_PROVIDERS, read_drive_status, summarize, unknown_account_summary
+from manager.rules_manifest import injection_lines, mandatory_rules, validate_prompt_injection, validate_research_gate
 from manager.tasks import DriveRecords, TaskError, create_task, safe_id, validate
 
+
+MANDATORY_RULES = mandatory_rules("dispatch")
 
 ADAPTATION = {
     "codex": "Work directly in the named repo and scope. Run required tests and git status. Commit/push only when explicitly requested.",
@@ -98,6 +101,8 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
         *[f"- Project business / acceptance: {item}" for item in task.get("acceptance_criteria", [])],
         *[f"- AI Development Manager scope / protection: {item}" for item in (shared_rules or [])],
         *[f"- AI Development Manager scope / protection: {item}" for item in task.get("constraints", [])],
+        "Mandatory ADM rules (auto-injected; do not remove, paraphrase, or omit):",
+        *injection_lines(MANDATORY_RULES),
         "Allowed scope:", *[f"- {item}" for item in task.get("scope", [])],
         "Forbidden scope / do not touch:", *[f"- {item}" for item in dict.fromkeys(forbidden)],
         "Acceptance criteria:", *[f"- {item}" for item in task.get("acceptance_criteria", [])],
@@ -119,6 +124,8 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
 
 def dispatch(store, service, request, quota_document=None, executions=None, history_store=None):
     request_ok(request)
+    if request.get("research_gate_required"):
+        validate_research_gate(request.get("research_evidence"))
     project = store.get("projects", request["project_id"], request["project_id"]); validate("project", project)
     quota = summarize(quota_document or read_drive_status(service=service), 60)
     history = executions if executions is not None else list_executions(store, request["project_id"])
@@ -269,6 +276,7 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
             project["active_tasks"].append(task["task_id"]); store.put("projects", project["project_id"], project["project_id"], project)
     summary = quota_line(selected_quota)
     generated = prompt_for(project, task, handoff, selected, selected_estimate, summary, warnings, request.get("shared_rules"), request.get("ponytail_available"))
+    validate_prompt_injection(generated, MANDATORY_RULES)
     return {
         "recommended_provider": selected, "provider": selected,
         "account_id": selected_quota.get("account_id"),

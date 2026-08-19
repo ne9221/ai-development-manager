@@ -177,6 +177,43 @@ and at most five recent session metadata records. It deliberately excludes full
 provider transcripts and directs the next AI to resume current progress and
 the handoff before exploring completed work.
 
+## Mandatory rule inheritance (Documented vs Enforced)
+
+`AI-DEVELOPMENT-RULES.md` is the prose SSOT for all cross-project rules.
+Seven of those rules also have a canonical machine-readable form in
+`manager/rules_manifest.json` (`rule_id`, `scope`, `severity`,
+`injection_required`, `completion_check_required`, `instruction`).
+`manager/dispatcher.py::dispatch()` loads this manifest at import time and:
+
+1. **Auto-injects** every mandatory rule's instruction into the generated
+   task prompt, unconditionally - the caller does not pass or remember
+   `shared_rules` for these seven.
+2. **Rejects dispatch** (raises `TaskError`, never just a warning) if the
+   generated prompt is missing a mandatory rule's instruction text, so a
+   future code change that breaks injection fails loudly instead of shipping
+   a silently non-compliant task. See `manager/test_dispatcher.py::
+   test_dispatch_rejected_when_mandatory_rule_injection_missing`.
+
+A rule being **Enforced** below means: code path + automated regression test
+exist proving a violation is rejected, not merely written down. A rule can be
+Documented in `AI-DEVELOPMENT-RULES.md` without being Enforced here.
+
+| rule_id | Documented | Enforced | How |
+|---|---|---|---|
+| `cloud_first` | Yes (rule 1) | Yes | Auto-injected into every dispatch prompt; `DriveRecords` is already the runtime SSOT. |
+| `task_identity` | Yes (rule 12) | Yes | Auto-injected; prompt header format checked by `sessions.parse_identity_header` (existing). |
+| `research_before_build` | Yes (rule 14) | Yes | Auto-injected; `dispatch()` calls `rules_manifest.validate_research_gate()` and rejects a `research_gate_required` task lacking PoC/rejection evidence (`manager/test_dispatcher.py::test_research_before_build_requires_poc_or_rejection_evidence`). |
+| `copy_ready_ai_dispatch` | New | Yes | Auto-injected; `dispatch()` already returns one `generated_prompt` string, never a scattered set. |
+| `real_running_truth` | New | Yes | Auto-injected; `execution.schema.json` + `execution_lifecycle.py` already require real evidence before `status: running` persists; `rules_manifest.validate_running_claim()` adds a reusable report-level check (`manager/test_rules_manifest.py::test_running_claim_requires_execution_evidence`). |
+| `visibility_first` | New | Documented only | Auto-injected into every prompt as a stated priority; no automated check exists for this judgment call, and none is planned without a concrete false-positive to test against. |
+| `mandatory_status_report` | New | Yes | Auto-injected; `rules_manifest.validate_status_report()` is wired into `tasks.complete_task(..., status_report=...)` and rejects completion when a supplied report is missing a required field (`manager/test_tasks.py::test_status_report_requires_mandatory_fields`). |
+
+Run just the enforcement regression suite:
+
+```powershell
+python -m pytest manager/test_rules_manifest.py manager/test_dispatcher.py manager/test_tasks.py -q
+```
+
 ## Development Overview
 
 The Drive-backed Development Overview is a compact project management view; it

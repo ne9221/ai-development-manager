@@ -125,6 +125,17 @@ class TaskTests(unittest.TestCase):
         self.assertTrue(any(key[0] == "history" for key in self.store.records))
         self.assertEqual("completed", handoff["reason"])
 
+    def test_status_report_requires_mandatory_fields(self):
+        self.create()
+        with self.assertRaises(TaskError) as ctx:
+            complete_task(self.store, "ai-development-manager", "phase-5", "Done", "codex", "session-b", status_report={"current_progress": "done"})
+        self.assertIn("status report missing mandatory fields", str(ctx.exception))
+        task, _ = complete_task(self.store, "ai-development-manager", "phase-5", "Done", "codex", "session-b", status_report={
+            "current_progress": "done", "overall_project_progress": "80%", "milestone_progress": "M3 complete",
+            "estimated_remaining": "none", "waiting_blocker": "none", "actual_ai_provider_running": "codex",
+        })
+        self.assertEqual("completed", task["status"])
+
     def test_malformed_records_rejected(self):
         with self.assertRaises(TaskError): validate("task", {"task_id": "broken"})
         broken = handoff_input(); broken["minimal_context"] = "x" * 4001

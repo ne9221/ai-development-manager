@@ -1,7 +1,7 @@
 # AI Development Rules
 
-version: 0.1.3
-last_updated: 2026-08-10
+version: 0.1.4
+last_updated: 2026-08-19
 
 Single source of truth for cross-project AI-development rules. This document
 governs how AI coding tools (ChatGPT, Claude Code, Codex, Antigravity,
@@ -69,6 +69,18 @@ individual project's own `TASKS` or business rules - it sits above them.
     Project business/acceptance requirements win within their scope; Global
     Rules govern coordination and execution. Claude, Codex, and Antigravity
     must not maintain drifting copies of these common rules.
+17. Seven of the rules above are additionally machine-enforced, not just
+    documented here: `manager/rules_manifest.json` is the canonical
+    machine-readable form (`rule_id`, `scope`, `severity`,
+    `injection_required`, `completion_check_required`, `instruction`) of
+    `research_before_build`, `copy_ready_ai_dispatch`, `real_running_truth`,
+    `visibility_first`, `mandatory_status_report`, `cloud_first`, and
+    `task_identity`. `manager/dispatcher.py::dispatch()` auto-injects all
+    seven into every generated task prompt without the caller needing to
+    request it, and rejects (`TaskError`, not a warning) any generated task
+    whose prompt is missing one. See the Rule Enforcement Matrix in
+    `README.md` for exactly which rules are Enforced (code + test) versus
+    Documented-only.
 
 ## Changelog
 
@@ -81,3 +93,8 @@ individual project's own `TASKS` or business rules - it sits above them.
 - 0.1.3 (2026-08-10): Added Development Overview, GitHub Research Gate,
   Weekly GitHub Discovery, cloud/local exception approval, and Global Rules
   SSOT enforcement.
+- 0.1.4 (2026-08-19): Added rule 17: seven rules now have a canonical
+  machine-readable manifest (`manager/rules_manifest.json`) that
+  `manager/dispatcher.py` auto-injects into every generated task and
+  validates before returning a dispatchable prompt, closing the gap where a
+  documented rule could silently fail to reach a dispatched task.
