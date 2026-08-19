@@ -442,6 +442,9 @@ class CommandWatcherTests(unittest.TestCase):
         runner = (manager / "run_command_watcher.ps1").read_text(encoding="utf-8")
         self.assertIn('-AllowlistPath `"$AllowlistPath`"', installer)
         self.assertIn('$env:ADM_WATCHER_ALLOWLIST_PATH = $AllowlistPath', runner)
+        self.assertIn('-IngressFolderId `"$IngressFolderId`"', installer)
+        self.assertIn('$env:ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID = $IngressFolderId', runner)
+        self.assertIn('$env:ADM_DRIVE_DISPATCH_INGRESS_OWNER = $IngressOwner', runner)
 
     # -- Phase 4C: provider routing + Claude quota fail-closed wiring --
 

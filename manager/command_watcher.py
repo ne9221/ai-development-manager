@@ -467,8 +467,14 @@ def main(argv=None):
     while True:
         try:
             service = build_service()
-            result = poll_once(DriveRecords(service), service)
-            print(json.dumps({"status": "ok", "host": socket.gethostname()[:100], "commands": result}, separators=(",", ":")))
+            store = DriveRecords(service)
+            ingress = []
+            if os.environ.get("ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID"):
+                from manager.drive_dispatch_ingress import poll_drive_dispatch_requests
+                ingress = poll_drive_dispatch_requests(store, service, os.environ.get("ADM_LOCK_GCS_BUCKET"))
+            result = poll_once(store, service)
+            print(json.dumps({"status": "ok", "host": socket.gethostname()[:100], "ingress": ingress,
+                              "commands": result}, separators=(",", ":")))
         except Exception:
             print(json.dumps({"status": "unavailable"}, separators=(",", ":")))
         if args.once:

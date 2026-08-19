@@ -7,7 +7,9 @@ param(
     [string]$PythonDeps,
     [Parameter(Mandatory=$true)][string]$AllowlistPath,
     [Parameter(Mandatory=$true)][string]$GcsBucket,
-    [Parameter(Mandatory=$true)][string]$GcsObject
+    [Parameter(Mandatory=$true)][string]$GcsObject,
+    [string]$IngressFolderId,
+    [string]$IngressOwner
 )
 
 $env:AI_MANAGER_HOME = $ManagerHome
@@ -18,6 +20,8 @@ if ($PythonDeps) { $env:PYTHONPATH = $PythonDeps }
 $env:ADM_WATCHER_ALLOWLIST_PATH = $AllowlistPath
 $env:ADM_LOCK_GCS_BUCKET = $GcsBucket
 $env:ADM_LOCK_GCS_OBJECT = $GcsObject
+if ($IngressFolderId) { $env:ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID = $IngressFolderId }
+if ($IngressOwner) { $env:ADM_DRIVE_DISPATCH_INGRESS_OWNER = $IngressOwner }
 Set-Location -LiteralPath $RepositoryPath
 & $PythonPath -m manager.command_watcher --once
 exit $LASTEXITCODE

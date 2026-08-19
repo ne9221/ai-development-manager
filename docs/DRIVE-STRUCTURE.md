@@ -43,3 +43,18 @@ and every creation/update uses GCS `ifGenerationMatch=0/N`. Lease owner tokens
 are returned only by acquire; the registry stores their hashes. Released and
 expired generations remain auditable but do not block a new owner.
 `COMMANDS/<project_id>/<command_id>.json` is the bounded ChatGPT-to-Windows command queue. A ChatGPT client writes a schema-valid `queued` command that references an existing Drive `TASKS` record. The Windows watcher moves it through `claimed`, healthy `running`, nonterminal `attention`, and terminal `completed`/`failed`, writing only compact lifecycle, execution/session, and error-category evidence. `attention` never grants retry or releases authority. It never stores raw prompts, transcripts, credentials, OAuth data, or provider responses.
+
+`DISPATCH-REQUESTS` is a separate private folder in the configured owner's My
+Drive root, not below the service-account-shared ADM folder. ChatGPT may upload
+only strict `schema/dispatch_request.schema.json` records named
+`<request_id>.json`. The Windows watcher admits a record only when its local
+OAuth identity, folder, file parent, sole owner, sole permission, MIME type,
+size, timestamp, filename, and schema all verify. It then calls the existing
+trusted Direct Dispatch ingress, which generates governance metadata, claims
+`request_id` through the existing GCS CAS registry, writes the normal governed
+Task and queued Command, and leaves launch authority with the Watcher.
+
+Configure the scheduled watcher with `-IngressFolderId` and `-IngressOwner`.
+The runner exposes these only as `ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID` and
+`ADM_DRIVE_DISPATCH_INGRESS_OWNER`; omitting either disables/fails the ingress
+without changing the original COMMANDS path.

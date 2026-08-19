@@ -8,11 +8,13 @@ param(
     [Parameter(Mandatory=$true)][string]$PythonDeps,
     [Parameter(Mandatory=$true)][string]$AllowlistPath,
     [Parameter(Mandatory=$true)][string]$GcsBucket,
-    [Parameter(Mandatory=$true)][string]$GcsObject
+    [Parameter(Mandatory=$true)][string]$GcsObject,
+    [string]$IngressFolderId,
+    [string]$IngressOwner
 )
 
 $runner = Join-Path $RepositoryPath "manager\run_command_watcher.ps1"
-$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -CodexBin `"$CodexBin`" -CodexHome `"$CodexHome`" -PythonDeps `"$PythonDeps`" -AllowlistPath `"$AllowlistPath`" -GcsBucket `"$GcsBucket`" -GcsObject `"$GcsObject`""
+$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -CodexBin `"$CodexBin`" -CodexHome `"$CodexHome`" -PythonDeps `"$PythonDeps`" -AllowlistPath `"$AllowlistPath`" -GcsBucket `"$GcsBucket`" -GcsObject `"$GcsObject`" -IngressFolderId `"$IngressFolderId`" -IngressOwner `"$IngressOwner`""
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
