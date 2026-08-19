@@ -83,7 +83,15 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
         f"Project name: {project['name']}", f"Repo: {project['repo']}",
         f"Working directory: {project.get('working_directory') or 'resolve from repo'}",
         f"Branch: {project['default_branch']}", f"Baseline commit: {baseline}",
-        f"Task goal: {task['title']}", f"Current state: {task.get('current_progress', 'Not started')}",
+        f"Task title: {task['title']}",
+        # source_context.goal (set by cloud/dispatch_ingress.py's Direct
+        # Dispatch path) is the actual caller-supplied instruction -- title
+        # alone is too short to act on and must never stand in for it when a
+        # real goal exists. Falls back to title only for a task with no goal
+        # recorded at all (every pre-Direct-Dispatch task), preserving the
+        # prior single-line behavior for that case unchanged.
+        f"Task goal: {task.get('source_context', {}).get('goal') or task['title']}",
+        f"Current state: {task.get('current_progress', 'Not started')}",
         f"Next action: {task.get('next_action', '')}", f"Latest handoff: {handoff_text}",
         "Rule priority (highest first):",
         *[f"- Project business / acceptance: {item}" for item in project.get("project_rules", [])],

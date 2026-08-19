@@ -227,6 +227,41 @@ class DispatcherTests(unittest.TestCase):
         with self.assertRaises(TaskError): request_ok({"project_id": "p1"})
         with self.assertRaises(TaskError): request_ok(request(preferred_provider="codex", excluded_provider="codex"))
 
+    # -- P0: Direct Dispatch source_context.goal must reach the generated prompt --
+
+    def test_source_context_goal_reaches_generated_prompt(self):
+        """A Direct Dispatch task's real instruction lives in
+        source_context.goal (see cloud/dispatch_ingress.py's internal_request)
+        -- prompt_for() must surface that actual goal text, not silently drop
+        it in favor of the short title. Reproduces the real failure: a
+        Golden E2E dispatched with goal="...reply with
+        GOLDEN_E2E_VERIFIED_SUCCESS and exit immediately." only ever showed
+        the title "Golden E2E Verification" to the provider."""
+        task = create_task(self.store, request(
+            task_id="t1", title="Golden E2E Verification",
+            source_context={"origin": "direct_dispatch_ingress", "goal": "reply with GOLDEN_E2E_VERIFIED_SUCCESS and exit immediately."},
+        ), assign=False)
+        self.store.records[("projects", "p1", "p1")]["active_tasks"] = ["t1"]
+        result = self.dispatch_case(request(title="Golden E2E Verification"))
+        self.assertIn("reply with GOLDEN_E2E_VERIFIED_SUCCESS and exit immediately.", result["generated_prompt"])
+
+    def test_title_remains_present_alongside_a_real_goal(self):
+        """Title must not be replaced/dropped when a real goal is also shown."""
+        create_task(self.store, request(
+            task_id="t1", title="Golden E2E Verification",
+            source_context={"origin": "direct_dispatch_ingress", "goal": "reply with GOLDEN_E2E_VERIFIED_SUCCESS and exit immediately."},
+        ), assign=False)
+        self.store.records[("projects", "p1", "p1")]["active_tasks"] = ["t1"]
+        result = self.dispatch_case(request(title="Golden E2E Verification"))
+        self.assertIn("Golden E2E Verification", result["generated_prompt"])
+
+    def test_legacy_task_with_no_goal_falls_back_to_title_without_crashing(self):
+        """A task with no source_context.goal at all (every pre-Direct-Dispatch
+        task, and any task created without one) must keep working exactly as
+        before -- no crash, no blank instruction line."""
+        result = self.dispatch_case(request(task_id="legacy-task", title="Fix the parser"))
+        self.assertIn("Fix the parser", result["generated_prompt"])
+
     # -- P0: working_directory contract (dispatch-time resolved Task snapshot) --
 
     def test_new_task_persists_working_directory_snapshot_from_project(self):
