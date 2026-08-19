@@ -30,9 +30,11 @@ from manager.autopilot_continuations import (
     mark_continuation_dispatching,
     mark_continuation_failed_safe,
 )
+from manager.dispatch_requests import claim_dispatch_request, dispatch_request_registry
 from manager.dispatcher import dispatch as dispatcher_dispatch
 from manager.quota_reader import read_drive_status, summarize
-from manager.tasks import DriveRecords, TaskError, now_iso, update_task, validate
+from manager.task_claims import check_task_execution_claim, task_claim_registry
+from manager.tasks import DriveRecords, TaskError, now_iso, safe_id, update_task, validate
 from manager.trusted_ingress import (
     ADMISSION_VERSION,
     REQUIRED_TASK_POLICIES,
@@ -111,6 +113,14 @@ def evaluate_dependencies(store: DriveRecords, project_id: str, task: dict[str, 
     for dep_task_id in depends_on:
         if not isinstance(dep_task_id, str) or not dep_task_id.strip():
             return {"satisfied": False, "state": STATE_BLOCKED, "reason": "invalid_dependency_id"}
+
+        # AG AC-DEP-02 (P2): a task cannot depend on itself. In the common
+        # case this is already caught below by the status check (a task
+        # cannot be "completed" while it is still the one being evaluated),
+        # but that relies on incidental state rather than an explicit
+        # invariant -- check it directly so it fails closed unconditionally.
+        if dep_task_id == task.get("task_id"):
+            return {"satisfied": False, "state": STATE_BLOCKED, "reason": f"self_dependency:{dep_task_id}"}
 
         try:
             dep_task = store.get("tasks", project_id, dep_task_id)
@@ -454,18 +464,63 @@ def evaluate_circuit_breaker(
     return {"allowed": True, "state": STATE_ELIGIBLE, "reason": None}
 
 
-def _task_active_evidence(store: DriveRecords, project_id: str, task_id: str) -> str | None:
-    """Codex P1-1: is there already an execution or Command in flight for
-    this task? Any non-terminal record — reserved/running execution, or a
-    queued/claimed/running/attention Command — makes the task ineligible for
-    a fresh Autopilot dispatch. Returns a short evidence string, or None if
-    the task has no active work."""
+def build_default_task_claim_reader(bucket: str, project_id: str) -> Callable[[str], bool]:
+    """AG AC-SELECT-01: construct the real GCS-backed task_claim_reader for
+    callers that want manager.task_claims consulted during candidate
+    selection. Not wired in automatically by step_autopilot (see the comment
+    at its call site) -- pass this explicitly when the caller's deployment
+    already treats task_claims as authoritative. A backend error is treated
+    as "unknown, assume active" (fail closed): excludes the candidate rather
+    than risking a double-dispatch onto a task some other authority may
+    still be holding.
+    """
+    def _reader(task_id: str) -> bool:
+        try:
+            registry = task_claim_registry(bucket, project_id, task_id)
+            return check_task_execution_claim(registry, project_id, task_id) is not None
+        except Exception:
+            return True
+    return _reader
+
+
+def _task_active_evidence(
+    store: DriveRecords,
+    project_id: str,
+    task: dict[str, Any],
+    task_claim_reader: Callable[[str], bool] | None = None,
+) -> str | None:
+    """Codex P1-1 / AG AC-SELECT-01: is there already an execution, Command,
+    or task claim in flight for this task? Any non-terminal record —
+    reserved/running execution, a queued/claimed/running/attention Command,
+    an authoritative nonterminal source_context.active_execution_id, or an
+    active manager.task_claims lease — makes the task ineligible for a fresh
+    Autopilot dispatch. Returns a short evidence string, or None if the task
+    has no active work."""
+    task_id = task.get("task_id")
     for execution in store.list_records("executions", project_id):
         if execution.get("task_id") == task_id and execution.get("status") in _NONTERMINAL_EXECUTION_STATUSES:
             return f"active_execution:{execution.get('execution_id')}:{execution.get('status')}"
     for command in store.list_records("commands", project_id):
         if command.get("task_id") == task_id and command.get("status") in _NONTERMINAL_COMMAND_STATUSES:
             return f"active_command:{command.get('command_id')}:{command.get('status')}"
+
+    active_exec_id = (task.get("source_context") or {}).get("active_execution_id")
+    if active_exec_id:
+        try:
+            named_execution = store.get("executions", project_id, active_exec_id)
+        except TaskError:
+            named_execution = None
+        if named_execution is not None and named_execution.get("status") in _NONTERMINAL_EXECUTION_STATUSES:
+            return f"active_execution_id:{active_exec_id}:{named_execution.get('status')}"
+
+    if task_claim_reader is not None:
+        try:
+            has_claim = task_claim_reader(task_id)
+        except Exception:
+            has_claim = True  # unknown -> treat as active, fail closed
+        if has_claim:
+            return f"active_task_claim:{task_id}"
+
     return None
 
 
@@ -477,12 +532,15 @@ def find_next_candidate_task(
     git_checker: Callable[[str], tuple[bool, str]] | None = None,
     writer_registry_reader: Callable[[], dict[str, Any] | None] | None = None,
     head_reader: Callable[[str], str] | None = None,
+    task_claim_reader: Callable[[str], bool] | None = None,
 ) -> dict[str, Any]:
     """Find the next eligible, unexecuted task in the project backlog.
 
-    Codex P1-1 / P1-3: eligibility is evaluated BEFORE ranking, not after.
+    Codex P1-1 / P1-3, AG AC-SELECT-01: eligibility is evaluated BEFORE
+    ranking, not after.
     1. Enumerate ready/queued candidate tasks.
-    2. Exclude any candidate with an existing non-terminal execution/Command.
+    2. Exclude any candidate with an existing non-terminal execution,
+       Command, authoritative active_execution_id, or active task claim.
     3. Evaluate dependency + (when `project` is given) repository-transition
        eligibility for each remaining candidate.
     4. Collect eligible candidates, rank by priority, return the highest.
@@ -509,7 +567,7 @@ def find_next_candidate_task(
         status = t.get("status")
         if status not in ("ready", "queued"):
             continue
-        active_evidence = _task_active_evidence(store, project_id, task_id)
+        active_evidence = _task_active_evidence(store, project_id, t, task_claim_reader=task_claim_reader)
         if active_evidence is not None:
             blocked.append({"task_id": task_id, "reason": f"already_active:{active_evidence}"})
             continue
@@ -559,6 +617,8 @@ def step_autopilot(
     git_checker: Callable[[str], tuple[bool, str]] | None = None,
     writer_registry_reader: Callable[[], dict[str, Any] | None] | None = None,
     head_reader: Callable[[str], str] | None = None,
+    task_claim_reader: Callable[[str], bool] | None = None,
+    dispatch_request_registry_factory: Callable[..., Any] = dispatch_request_registry,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Execute one bounded, fail-closed Autopilot continuation step.
@@ -567,12 +627,15 @@ def step_autopilot(
     1. Verify predecessor completion & barrier (AG Finding 3 / Codex P1-2).
     2. Derive a restart-safe continuation depth/session-start floor from
        durable Task evidence (Codex P0-5), then check circuit breaker & budget.
-    3. Find next eligible candidate task (Codex P1-1 / P1-3).
+    3. Find next eligible candidate task (Codex P1-1 / P1-3 / AG AC-SELECT-01).
     4. Enforce Slice 1 read-only scope constraint.
-    5. Re-verify dependency progression (AG Finding 1 / Codex P0-2).
+    5. Re-verify dependency progression (AG Finding 1 / Codex P0-2 / AG AC-DEP-01).
     6. Re-verify dirty-tree / baseline transition (AG Finding 2 / Codex P0-1).
-    7. Atomically claim continuation idempotency via GCS CAS (Codex P0-4).
-    8. Dispatch next Task + Command, advancing the CAS state machine.
+    7. Atomically claim continuation idempotency via GCS CAS (Codex P0-4 /
+       AG AC-CAS-01: deterministic identity, durable-evidence-based recovery).
+    8. Dispatch next Task + Command under the existing Direct Dispatch
+       trusted-ingress contract (AG AC-INGRESS-01) so Command Watcher's Safe
+       Auto-Admission actually accepts it, advancing the CAS state machine.
     """
     current_time = now or datetime.now(timezone.utc)
 
@@ -614,6 +677,16 @@ def step_autopilot(
         except (ValueError, AttributeError):
             pass
 
+    # AG AC-CHAIN-01: thread the durable chain root through unchanged once
+    # established, rather than re-rooting at every hop, so the full lineage
+    # can be reconstructed from any single link after a restart.
+    durable_root_execution_id = None
+    if source_context.get("origin") == TRUSTED_INGRESS_ORIGIN:
+        candidate_root = source_context.get("root_execution_id")
+        if isinstance(candidate_root, str) and candidate_root.strip():
+            durable_root_execution_id = candidate_root
+    root_execution_id = durable_root_execution_id or source_execution_id
+
     # 2. Circuit breaker & Quota
     quota_doc = quota_document
     if quota_doc is None and service is not None:
@@ -649,9 +722,21 @@ def step_autopilot(
         if t.get("status") == "completed":
             completed_ids.add(t.get("task_id"))
 
+    # AG AC-SELECT-01: exclude candidates already covered by an active
+    # manager.task_claims lease, in addition to executions/Commands. This is
+    # deliberately opt-in (via the `task_claim_reader` parameter) rather than
+    # auto-constructed from `bucket`: manager.task_claims is explicitly not
+    # yet wired into execution_lifecycle.enter_running_gate() as an
+    # authoritative gate elsewhere in this codebase (Slice 3A primitive), so
+    # silently making every bucket-configured Autopilot call depend on that
+    # backend being reachable would be a new hard dependency, not a
+    # narrowly-scoped safety fix. A caller that already treats task_claims as
+    # authoritative can pass its own reader; build_default_task_claim_reader()
+    # below is provided for that purpose.
     selection = find_next_candidate_task(
         store, project_id, completed_ids, project=project,
         git_checker=git_checker, writer_registry_reader=writer_registry_reader, head_reader=head_reader,
+        task_claim_reader=task_claim_reader,
     )
     next_task = selection["task"]
     if next_task is None:
@@ -710,9 +795,19 @@ def step_autopilot(
         }
 
     # 7. Persistent Idempotency Claim via GCS CAS (recoverable state machine)
-    next_command_id = f"autopilot-{next_task_id}-{now_iso()[:10]}"
+    #
+    # AG AC-CAS-01: the Command/request identity is derived purely from
+    # stable chain inputs (project_id is implicit in the registry scope;
+    # source_execution_id + next_task_id are the stable identifiers) -- NOT
+    # from wall-clock time -- so the exact same continuation always resolves
+    # to the exact same command_id/request_id after a restart, and that
+    # identity is what recovery logic below re-derives and looks up rather
+    # than trusting a stored value.
+    next_command_id = f"autopilot-{safe_id(source_execution_id)}-{safe_id(next_task_id)}"
+    request_id = f"ap-{safe_id(source_execution_id)}-{safe_id(next_task_id)}"
     decided_at = now_iso()
     new_continuation_count = effective_continuation_count + 1
+    autopilot_session_id = f"{project_id}:{root_execution_id}"
 
     reg = None
     claim = None
@@ -734,9 +829,35 @@ def step_autopilot(
         if not claim["claimed"]:
             existing_state = claim.get("state")
             if existing_state in (CONT_STATE_DISPATCHED, CONT_STATE_COMPLETED):
+                # AG AC-CAS-01: the CAS record alone is not proof of
+                # dispatch -- re-derive the deterministic Command identity
+                # and inspect durable Command evidence before trusting it.
+                expected_command_id = f"autopilot-{safe_id(source_execution_id)}-{safe_id(claim['next_task_id'])}"
+                existing_command = None
+                try:
+                    existing_command = store.get("commands", project_id, expected_command_id)
+                    validate("command", existing_command)
+                except TaskError:
+                    existing_command = None
+                if (existing_command is not None
+                        and existing_command.get("project_id") == project_id
+                        and existing_command.get("task_id") == claim.get("next_task_id")):
+                    return {
+                        "status": "already_claimed",
+                        "state": STATE_DISPATCHED,
+                        "existing_claim": claim,
+                        "existing_command_id": expected_command_id,
+                        "continuation_count": effective_continuation_count,
+                    }
+                # The claim record says DISPATCHED/COMPLETED but no matching
+                # Command exists. A single missing read is not durable proof
+                # of absence (could race an eventually-consistent store), so
+                # this is never silently reclassified as either dispatched
+                # or safe-to-retry -- surface for recovery instead.
                 return {
-                    "status": "already_claimed",
-                    "state": STATE_DISPATCHED,
+                    "status": "halted",
+                    "state": STATE_ATTENTION_REQUIRED,
+                    "reason": "continuation_claimed_dispatched_but_command_missing",
                     "existing_claim": claim,
                     "continuation_count": effective_continuation_count,
                 }
@@ -761,7 +882,33 @@ def step_autopilot(
                 "continuation_count": effective_continuation_count,
             }
 
-    # 8. Dispatch next task under trusted-ingress contract
+    # 8. Dispatch next task under the EXISTING Direct Dispatch trusted-ingress
+    # contract (AG AC-INGRESS-01). Creating a Drive Command alone is not
+    # sufficient: manager.command_watcher.process_command only auto-admits a
+    # non-allowlisted Command when manager.trusted_ingress.
+    # verify_trusted_ingress_admission proves BOTH (a) the Task's own
+    # source_context carries matching origin/admission_version/
+    # external_request_id evidence, AND (b) a dispatch-requests idempotency
+    # record (manager.dispatch_requests, the same store Direct Dispatch's
+    # cloud.dispatch_ingress writes to) corroborates that exact
+    # project/task/command/request identity. This reuses that existing,
+    # already-proven authority rather than inventing a second one, and
+    # rather than letting the Autopilot origin string alone grant trust.
+    task_source_context = {
+        "origin": TRUSTED_INGRESS_ORIGIN,
+        "admission_version": ADMISSION_VERSION,
+        "external_request_id": request_id,
+        "source_execution_id": source_execution_id,
+        "source_task_id": source_task_id,
+        "continuation_count": new_continuation_count,
+        "continuation_depth": new_continuation_count,
+        "root_execution_id": root_execution_id,
+        "parent_execution_id": source_execution_id,
+        "autopilot_session_id": autopilot_session_id,
+        "decided_at": decided_at,
+        "goal": next_task.get("source_context", {}).get("goal") or next_task["title"],
+    }
+
     dispatch_request = {
         "project_id": project_id,
         "task_id": next_task_id,
@@ -771,15 +918,7 @@ def step_autopilot(
         "expected_minutes": next_task.get("expected_minutes", 20),
         "needs_repo_edit": False,
         "read_only": True,
-        "source_context": {
-            "origin": TRUSTED_INGRESS_ORIGIN,
-            "admission_version": ADMISSION_VERSION,
-            "source_execution_id": source_execution_id,
-            "source_task_id": source_task_id,
-            "continuation_count": new_continuation_count,
-            "decided_at": decided_at,
-            "goal": next_task.get("source_context", {}).get("goal") or next_task["title"],
-        },
+        "source_context": task_source_context,
     }
 
     try:
@@ -801,8 +940,19 @@ def step_autopilot(
         }
 
     try:
+        # Reuse the existing Direct Dispatch trusted-ingress idempotency
+        # authority instead of inventing a second one -- this is exactly
+        # what Command Watcher's verify_trusted_ingress_admission
+        # cross-checks the Task/Command evidence against. Deterministic
+        # (project_id, request_id, next_task_id, next_command_id) makes this
+        # safe to call again on any retry of the same continuation.
+        if bucket:
+            dispatch_reg = dispatch_request_registry_factory(bucket, project_id, request_id)
+            claim_dispatch_request(dispatch_reg, project_id, request_id, next_task_id, next_command_id, decided_at)
+
         update_task(store, project_id, next_task_id, priority=next_task.get("priority", "normal"),
-                    read_only=True, execution_policies=sorted(REQUIRED_TASK_POLICIES))
+                    read_only=True, execution_policies=sorted(REQUIRED_TASK_POLICIES),
+                    source_context=task_source_context)
 
         command = {
             "command_id": next_command_id,
@@ -826,7 +976,7 @@ def step_autopilot(
             "result": None,
             "created_via": TRUSTED_INGRESS_ORIGIN,
             "admission_version": ADMISSION_VERSION,
-            "request_id": f"ap-{next_task_id}",
+            "request_id": request_id,
         }
         validate("command", command)
         store.put("commands", project_id, next_command_id, command)

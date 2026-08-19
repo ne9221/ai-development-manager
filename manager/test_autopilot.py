@@ -416,6 +416,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
             self.store, None, "p1", "exec-1", session_start,
             continuation_count=0, bucket="test-bucket",
             continuation_registry_factory=lambda *_: claim_reg,
+            dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
             quota_document=self.quota_doc,
             git_checker=lambda _: (True, ""),
         )
@@ -447,6 +448,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
         # First run
         first = step_autopilot(self.store, None, "p1", "exec-1", session_start, continuation_count=0,
                                bucket="test-bucket", continuation_registry_factory=lambda *_: claim_reg,
+ dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
                                quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("dispatched", first["status"])
 
@@ -458,6 +460,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
         # created for the same predecessor execution.
         second = step_autopilot(self.store, None, "p1", "exec-1", session_start, continuation_count=0,
                                 bucket="test-bucket", continuation_registry_factory=lambda *_: claim_reg,
+ dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
                                 quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("halted", second["status"])
         self.assertEqual(STATE_BLOCKED, second["state"])
@@ -485,6 +488,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
 
         res = step_autopilot(self.store, None, "p1", "exec-1", session_start, continuation_count=0,
                              bucket="test-bucket", continuation_registry_factory=lambda *_: claim_reg,
+ dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
 
         self.assertEqual("halted", res["status"])
@@ -502,6 +506,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
 
         res = step_autopilot(self.store, None, "p1", "exec-1", session_start, continuation_count=0,
                              bucket="test-bucket", continuation_registry_factory=lambda *_: claim_reg,
+ dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
 
         self.assertEqual("done", res["status"])
@@ -528,6 +533,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
 
         first = step_autopilot(self.store, None, "p1", "exec-1", session_start, continuation_count=0,
                                bucket="test-bucket", continuation_registry_factory=lambda *_: claim_reg,
+ dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
                                quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("dispatched", first["status"])
 
@@ -540,6 +546,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
 
         second = step_autopilot(self.store, None, "p1", "exec-1", session_start, continuation_count=0,
                                 bucket="test-bucket", continuation_registry_factory=lambda *_: claim_reg,
+ dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
                                 quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("already_claimed", second["status"])
         self.assertEqual(STATE_DISPATCHED, second["state"])
@@ -844,6 +851,7 @@ class ContinuationDispatchRecoveryIntegrationTests(unittest.TestCase):
             return step_autopilot(self.store, None, "p1", "exec-1", datetime.now(timezone.utc),
                                   continuation_count=0, bucket="test-bucket",
                                   continuation_registry_factory=lambda *_: claim_reg,
+                                  dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
                                   quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         finally:
             autopilot_module.dispatcher_dispatch = original
@@ -945,6 +953,7 @@ class RestartSafeContinuationDepthTests(unittest.TestCase):
         res = step_autopilot(self.store, None, "p1", "exec-child-1", datetime.now(timezone.utc),
                              continuation_count=0, bucket="test-bucket",
                              continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
+                             dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("halted", res["status"])
         self.assertEqual(STATE_DONE, res["state"])
@@ -965,6 +974,7 @@ class RestartSafeContinuationDepthTests(unittest.TestCase):
         res = step_autopilot(self.store, None, "p1", "exec-1", datetime.now(timezone.utc),
                              continuation_count=0, bucket="test-bucket",
                              continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
+                             dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("dispatched", res["status"])
 
@@ -1061,6 +1071,7 @@ class CandidateEligibilityBeforeRankingTests(unittest.TestCase):
         res = step_autopilot(store, None, "p1", "exec-1", datetime.now(timezone.utc),
                              continuation_count=0, bucket="test-bucket",
                              continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
+                             dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=sample_quota_document(), git_checker=lambda _: (True, ""))
         self.assertEqual("halted", res["status"])
         self.assertEqual(STATE_BLOCKED, res["state"])
@@ -1142,6 +1153,7 @@ class RetryInvariantRegressionTests(unittest.TestCase):
         res = step_autopilot(self.store, None, "p1", "exec-1", datetime.now(timezone.utc),
                              continuation_count=0, bucket="test-bucket",
                              continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
+                             dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("halted", res["status"])
         self.assertEqual(STATE_RETRY_ELIGIBLE, res["state"])
@@ -1186,6 +1198,408 @@ class RetryInvariantRegressionTests(unittest.TestCase):
         res = verify_predecessor_barrier(self.store, "p1", "exec-1")
         self.assertFalse(res["passed"])
         self.assertIn(res["state"], (STATE_BLOCKED, STATE_ATTENTION_REQUIRED))
+
+
+class TrustedWatcherAdmissionIntegrationTests(unittest.TestCase):
+    """AG AC-INGRESS-01: an Autopilot-generated Command must actually pass
+    manager.command_watcher's real trusted-ingress admission path -- proven
+    here by calling manager.trusted_ingress.verify_trusted_ingress_admission
+    (the exact function command_watcher.process_command calls) against the
+    Task/Command that step_autopilot produced, without modifying
+    command_watcher.py or trusted_ingress.py at all."""
+
+    def setUp(self):
+        self.store = MemoryStore()
+        self.project = sample_project("p1", working_directory=os.getcwd())
+        self.store.put("projects", "p1", "p1", self.project)
+        self.quota_doc = sample_quota_document()
+        task1 = sample_task("p1", "t1", status="completed", read_only=True, needs_repo_edit=False)
+        self.store.put("tasks", "p1", "t1", task1)
+        exec1 = sample_execution("p1", "t1", "exec-1", status="completed")
+        self.store.put("executions", "p1", "exec-1", exec1)
+        task2 = sample_task("p1", "t2", title="Task 2", status="ready", depends_on=["t1"], read_only=True, needs_repo_edit=False)
+        self.store.put("tasks", "p1", "t2", task2)
+        self.dispatch_reg = MemoryClaimRegistry()
+
+    def _dispatch(self):
+        return step_autopilot(self.store, None, "p1", "exec-1", datetime.now(timezone.utc),
+                              continuation_count=0, bucket="test-bucket",
+                              continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
+                              dispatch_request_registry_factory=lambda *_: self.dispatch_reg,
+                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
+
+    def test_valid_autopilot_continuation_passes_watcher_trusted_admission(self):
+        from manager.trusted_ingress import verify_trusted_ingress_admission
+
+        res = self._dispatch()
+        self.assertEqual("dispatched", res["status"])
+        command = self.store.get("commands", "p1", res["next_command_id"])
+
+        admitted_task = verify_trusted_ingress_admission(
+            self.store, command, "test-bucket", registry_factory=lambda *_: self.dispatch_reg)
+        self.assertIsNotNone(admitted_task)
+        self.assertEqual("t2", admitted_task["task_id"])
+
+    def test_missing_trusted_evidence_is_rejected(self):
+        """A Command that never went through step_autopilot's Task-stamping
+        (e.g. hand-crafted, or written before this fix) carries no
+        source_context evidence and must be rejected, not accidentally
+        admitted."""
+        from manager.trusted_ingress import verify_trusted_ingress_admission
+
+        task2 = self.store.get("tasks", "p1", "t2")  # untouched: source_context == {}
+        command = {
+            "command_id": "cmd-bare", "project_id": "p1", "task_id": "t2",
+            "provider": "codex", "model": None, "fallback_model": None, "mode": "standard",
+            "effort": "medium", "selection_reason": [], "quota_evidence": None,
+            "created_at": now_iso_for_tests(), "status": "queued", "execution_id": None,
+            "claimed_at": None, "completed_at": None, "result": None,
+            "created_via": "direct_dispatch_ingress", "admission_version": "v1",
+            "request_id": "ap-bare",
+        }
+        self.store.put("commands", "p1", "cmd-bare", command)
+
+        admitted_task = verify_trusted_ingress_admission(
+            self.store, command, "test-bucket", registry_factory=lambda *_: self.dispatch_reg)
+        self.assertIsNone(admitted_task)
+
+    def test_forged_autopilot_origin_alone_is_rejected(self):
+        """An origin string on the Task alone, with no corroborating
+        dispatch-requests idempotency record, must not grant admission --
+        proves the origin string alone never grants authority."""
+        from manager.trusted_ingress import verify_trusted_ingress_admission
+
+        task2 = self.store.get("tasks", "p1", "t2")
+        task2["source_context"] = {
+            "origin": "direct_dispatch_ingress", "admission_version": "v1",
+            "external_request_id": "ap-forged", "read_only": True,
+        }
+        task2["read_only"] = True
+        task2["execution_policies"] = ["disposable", "no_external_writes", "no_repo_writes", "read_only"]
+        self.store.put("tasks", "p1", "t2", task2)
+        command = {
+            "command_id": "cmd-forged", "project_id": "p1", "task_id": "t2",
+            "provider": "codex", "model": None, "fallback_model": None, "mode": "standard",
+            "effort": "medium", "selection_reason": [], "quota_evidence": None,
+            "created_at": now_iso_for_tests(), "status": "queued", "execution_id": None,
+            "claimed_at": None, "completed_at": None, "result": None,
+            "created_via": "direct_dispatch_ingress", "admission_version": "v1",
+            "request_id": "ap-forged",
+        }
+        self.store.put("commands", "p1", "cmd-forged", command)
+
+        # No dispatch-requests record exists for "ap-forged" -- the fake
+        # registry is empty.
+        admitted_task = verify_trusted_ingress_admission(
+            self.store, command, "test-bucket", registry_factory=lambda *_: self.dispatch_reg)
+        self.assertIsNone(admitted_task)
+
+    def test_mismatched_identity_is_rejected(self):
+        from manager.trusted_ingress import verify_trusted_ingress_admission
+
+        res = self._dispatch()
+        command = self.store.get("commands", "p1", res["next_command_id"])
+        tampered = dict(command)
+        tampered["task_id"] = "some-other-task-id"
+
+        admitted_task = verify_trusted_ingress_admission(
+            self.store, tampered, "test-bucket", registry_factory=lambda *_: self.dispatch_reg)
+        self.assertIsNone(admitted_task)
+
+    def test_duplicate_trusted_request_remains_idempotent(self):
+        from manager.dispatch_requests import claim_dispatch_request
+
+        first = claim_dispatch_request(self.dispatch_reg, "p1", "ap-x-y", "t2", "cmd-1", now_iso_for_tests())
+        second = claim_dispatch_request(self.dispatch_reg, "p1", "ap-x-y", "t2", "cmd-1", now_iso_for_tests())
+        self.assertTrue(first["claimed"])
+        self.assertFalse(second["claimed"])
+        self.assertEqual(first["command_id"], second["command_id"])
+        self.assertEqual(first["task_id"], second["task_id"])
+
+    def test_existing_direct_dispatch_behavior_unchanged(self):
+        """A genuine Direct Dispatch (not Autopilot) Task/Command, stamped
+        exactly as cloud.dispatch_ingress would, must still be admitted --
+        proves the Autopilot integration didn't alter or narrow the existing
+        trusted-ingress contract."""
+        from manager.trusted_ingress import verify_trusted_ingress_admission
+        from manager.dispatch_requests import claim_dispatch_request
+
+        dd_task = sample_task("p1", "dd-task", status="ready", read_only=True, needs_repo_edit=False)
+        dd_task["source_context"] = {
+            "origin": "direct_dispatch_ingress", "admission_version": "v1",
+            "external_request_id": "dd-req-1",
+        }
+        self.store.put("tasks", "p1", "dd-task", dd_task)
+        dd_command = {
+            "command_id": "dd-cmd-1", "project_id": "p1", "task_id": "dd-task",
+            "provider": "codex", "model": None, "fallback_model": None, "mode": "standard",
+            "effort": "medium", "selection_reason": [], "quota_evidence": None,
+            "created_at": now_iso_for_tests(), "status": "queued", "execution_id": None,
+            "claimed_at": None, "completed_at": None, "result": None,
+            "created_via": "direct_dispatch_ingress", "admission_version": "v1",
+            "request_id": "dd-req-1",
+        }
+        self.store.put("commands", "p1", "dd-cmd-1", dd_command)
+        claim_dispatch_request(self.dispatch_reg, "p1", "dd-req-1", "dd-task", "dd-cmd-1", now_iso_for_tests())
+
+        admitted_task = verify_trusted_ingress_admission(
+            self.store, dd_command, "test-bucket", registry_factory=lambda *_: self.dispatch_reg)
+        self.assertIsNotNone(admitted_task)
+        self.assertEqual("dd-task", admitted_task["task_id"])
+
+
+class DeterministicCommandIdentityTests(unittest.TestCase):
+    """AG AC-CAS-01: Command/request identity must be a deterministic
+    function of stable chain inputs (project_id, source_execution_id,
+    next_task_id), never wall-clock time -- the same continuation observed
+    after a restart must resolve to the same command_id."""
+
+    def setUp(self):
+        self.store = MemoryStore()
+        self.project = sample_project("p1", working_directory=os.getcwd())
+        self.store.put("projects", "p1", "p1", self.project)
+        self.quota_doc = sample_quota_document()
+        task1 = sample_task("p1", "t1", status="completed", read_only=True, needs_repo_edit=False)
+        self.store.put("tasks", "p1", "t1", task1)
+        exec1 = sample_execution("p1", "t1", "exec-1", status="completed")
+        self.store.put("executions", "p1", "exec-1", exec1)
+        task2 = sample_task("p1", "t2", title="Task 2", status="ready", depends_on=["t1"], read_only=True, needs_repo_edit=False)
+        self.store.put("tasks", "p1", "t2", task2)
+
+    def test_same_source_execution_and_next_task_yields_same_command_id_after_restart(self):
+        claim_reg = MemoryClaimRegistryWithCAS()
+        dispatch_reg = MemoryClaimRegistry()
+
+        first = step_autopilot(self.store, None, "p1", "exec-1", datetime.now(timezone.utc),
+                               continuation_count=0, bucket="test-bucket",
+                               continuation_registry_factory=lambda *_: claim_reg,
+                               dispatch_request_registry_factory=lambda *_: dispatch_reg,
+                               quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
+        self.assertEqual("dispatched", first["status"])
+        first_command_id = first["next_command_id"]
+
+        # Advance the Command past P1-1's non-terminal exclusion window (as
+        # command_watcher would once the provider run finishes) so this
+        # second poll actually reaches the CAS claim / identity-recovery
+        # path being tested here, rather than being short-circuited earlier
+        # by "already active" candidate exclusion (a different, already
+        # separately-tested safety path).
+        cmd = self.store.get("commands", "p1", first_command_id)
+        cmd["status"] = "completed"
+        self.store.put("commands", "p1", first_command_id, cmd)
+
+        # "Restart": brand-new claim registry instances would be a crash
+        # scenario, not a normal replay -- what matters here is that
+        # nothing about the identity computation depends on wall-clock
+        # time, so re-running with the SAME (still-persisted) claim
+        # registry after time has passed resolves to the identical id.
+        second = step_autopilot(self.store, None, "p1", "exec-1", datetime.now(timezone.utc) + timedelta(hours=3),
+                                continuation_count=0, bucket="test-bucket",
+                                continuation_registry_factory=lambda *_: claim_reg,
+                                dispatch_request_registry_factory=lambda *_: dispatch_reg,
+                                quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
+        self.assertEqual("already_claimed", second["status"])
+        self.assertEqual(first_command_id, second["existing_command_id"])
+
+    def test_command_id_does_not_embed_a_date_string(self):
+        claim_reg = MemoryClaimRegistryWithCAS()
+        dispatch_reg = MemoryClaimRegistry()
+        res = step_autopilot(self.store, None, "p1", "exec-1", datetime.now(timezone.utc),
+                             continuation_count=0, bucket="test-bucket",
+                             continuation_registry_factory=lambda *_: claim_reg,
+                             dispatch_request_registry_factory=lambda *_: dispatch_reg,
+                             quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
+        today = datetime.now(timezone.utc).date().isoformat()
+        self.assertNotIn(today, res["next_command_id"])
+        self.assertEqual("autopilot-exec-1-t2", res["next_command_id"])
+
+
+class CasNotProofOfDispatchRecoveryTests(unittest.TestCase):
+    """AG AC-CAS-01 refinement: an existing CAS claim record in DISPATCHED
+    state is not, by itself, proof that a Command was actually created --
+    durable Command evidence must be inspected before trusting it."""
+
+    def setUp(self):
+        self.store = MemoryStore()
+        self.project = sample_project("p1", working_directory=os.getcwd())
+        self.store.put("projects", "p1", "p1", self.project)
+        self.quota_doc = sample_quota_document()
+        task1 = sample_task("p1", "t1", status="completed", read_only=True, needs_repo_edit=False)
+        self.store.put("tasks", "p1", "t1", task1)
+        exec1 = sample_execution("p1", "t1", "exec-1", status="completed")
+        self.store.put("executions", "p1", "exec-1", exec1)
+        task2 = sample_task("p1", "t2", title="Task 2", status="ready", depends_on=["t1"], read_only=True, needs_repo_edit=False)
+        self.store.put("tasks", "p1", "t2", task2)
+
+    def test_dispatched_claim_with_matching_command_is_idempotent(self):
+        claim_reg = MemoryClaimRegistryWithCAS()
+        dispatch_reg = MemoryClaimRegistry()
+        first = step_autopilot(self.store, None, "p1", "exec-1", datetime.now(timezone.utc),
+                               continuation_count=0, bucket="test-bucket",
+                               continuation_registry_factory=lambda *_: claim_reg,
+                               dispatch_request_registry_factory=lambda *_: dispatch_reg,
+                               quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
+        self.assertEqual("dispatched", first["status"])
+
+        cmd = self.store.get("commands", "p1", first["next_command_id"])
+        cmd["status"] = "completed"  # out of P1-1's non-terminal exclusion set
+        self.store.put("commands", "p1", first["next_command_id"], cmd)
+
+        second = step_autopilot(self.store, None, "p1", "exec-1", datetime.now(timezone.utc),
+                                continuation_count=0, bucket="test-bucket",
+                                continuation_registry_factory=lambda *_: claim_reg,
+                                dispatch_request_registry_factory=lambda *_: dispatch_reg,
+                                quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
+        self.assertEqual("already_claimed", second["status"])
+        self.assertEqual(STATE_DISPATCHED, second["state"])
+
+    def test_dispatched_claim_with_missing_command_is_attention_required_not_dispatched(self):
+        """Simulates a claim record that reached DISPATCHED (e.g. via a
+        direct/manual write, or a Command later deleted) without a
+        corresponding Command actually existing in the store."""
+        from manager.autopilot_continuations import claim_autopilot_continuation, mark_continuation_dispatched, mark_continuation_dispatching
+
+        claim_reg = MemoryClaimRegistryWithCAS()
+        claim = claim_autopilot_continuation(claim_reg, "p1", "exec-1", "t1", "t2", "autopilot-exec-1-t2", 1, now_iso_for_tests())
+        dispatching = mark_continuation_dispatching(claim_reg, claim)
+        mark_continuation_dispatched(claim_reg, dispatching)
+        # Deliberately no Command written to self.store for "autopilot-exec-1-t2".
+
+        res = step_autopilot(self.store, None, "p1", "exec-1", datetime.now(timezone.utc),
+                             continuation_count=0, bucket="test-bucket",
+                             continuation_registry_factory=lambda *_: claim_reg,
+                             dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+                             quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
+        self.assertEqual("halted", res["status"])
+        self.assertEqual(STATE_ATTENTION_REQUIRED, res["state"])
+        self.assertEqual("continuation_claimed_dispatched_but_command_missing", res["reason"])
+        self.assertNotEqual("dispatched", res["status"])
+        self.assertNotEqual("already_claimed", res["status"])
+
+
+class DurableLineageFieldsTests(unittest.TestCase):
+    """AG AC-CHAIN-01: durable lineage (root_execution_id,
+    parent_execution_id, continuation_depth, autopilot_session_id) must be
+    persisted onto the dispatched Task's source_context, not just passed as
+    in-memory caller arguments, so it survives a Task/Execution reload."""
+
+    def setUp(self):
+        self.store = MemoryStore()
+        self.project = sample_project("p1", working_directory=os.getcwd())
+        self.store.put("projects", "p1", "p1", self.project)
+        self.quota_doc = sample_quota_document()
+
+    def test_lineage_fields_persisted_on_dispatched_task(self):
+        task1 = sample_task("p1", "t1", status="completed", read_only=True, needs_repo_edit=False)
+        self.store.put("tasks", "p1", "t1", task1)
+        exec1 = sample_execution("p1", "t1", "exec-1", status="completed")
+        self.store.put("executions", "p1", "exec-1", exec1)
+        task2 = sample_task("p1", "t2", title="Task 2", status="ready", depends_on=["t1"], read_only=True, needs_repo_edit=False)
+        self.store.put("tasks", "p1", "t2", task2)
+
+        res = step_autopilot(self.store, None, "p1", "exec-1", datetime.now(timezone.utc),
+                             continuation_count=0, bucket="test-bucket",
+                             continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
+                             dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+                             quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
+        self.assertEqual("dispatched", res["status"])
+
+        # Simulate a fresh process reloading the Task fresh from the store
+        # (not reusing anything held in memory from the dispatch above).
+        reloaded_task = self.store.get("tasks", "p1", "t2")
+        sc = reloaded_task["source_context"]
+        self.assertEqual("exec-1", sc["root_execution_id"])
+        self.assertEqual("exec-1", sc["parent_execution_id"])
+        self.assertEqual(1, sc["continuation_depth"])
+        self.assertEqual("p1:exec-1", sc["autopilot_session_id"])
+        self.assertEqual("exec-1", sc["source_execution_id"])
+
+    def test_root_execution_id_threads_through_a_second_hop_unchanged(self):
+        """Even though Slice 1 blocks a second automatic continuation
+        (MAX_AUTOMATIC_CONTINUATION_DEPTH=1), the root-threading logic
+        itself must correctly preserve the ORIGINAL root rather than
+        re-rooting at each hop, so a future multi-hop slice can rely on it."""
+        root_task = sample_task("p1", "root-1", status="completed", read_only=True, needs_repo_edit=False)
+        self.store.put("tasks", "p1", "root-1", root_task)
+        root_exec = sample_execution("p1", "root-1", "exec-root", status="completed")
+        self.store.put("executions", "p1", "exec-root", root_exec)
+
+        child_task = sample_task("p1", "child-1", status="ready", depends_on=["root-1"], read_only=True, needs_repo_edit=False)
+        self.store.put("tasks", "p1", "child-1", child_task)
+
+        claim_reg = MemoryClaimRegistryWithCAS()
+        dispatch_reg = MemoryClaimRegistry()
+        res = step_autopilot(self.store, None, "p1", "exec-root", datetime.now(timezone.utc),
+                             continuation_count=0, bucket="test-bucket",
+                             continuation_registry_factory=lambda *_: claim_reg,
+                             dispatch_request_registry_factory=lambda *_: dispatch_reg,
+                             quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
+        self.assertEqual("dispatched", res["status"])
+        child_sc = self.store.get("tasks", "p1", "child-1")["source_context"]
+        self.assertEqual("exec-root", child_sc["root_execution_id"])
+        self.assertEqual("p1:exec-root", child_sc["autopilot_session_id"])
+
+
+class SelfDependencyTests(unittest.TestCase):
+    """AG AC-DEP-02 (P2): a task listing its own task_id in depends_on must
+    fail closed with zero dispatch."""
+
+    def setUp(self):
+        self.store = MemoryStore()
+
+    def test_self_dependency_blocks(self):
+        task = sample_task("p1", "t1", depends_on=["t1"])
+        self.store.put("tasks", "p1", "t1", task)
+        res = evaluate_dependencies(self.store, "p1", task)
+        self.assertFalse(res["satisfied"])
+        self.assertEqual(STATE_BLOCKED, res["state"])
+        self.assertEqual("self_dependency:t1", res["reason"])
+
+
+class OptInTaskClaimExclusionTests(unittest.TestCase):
+    """AG AC-SELECT-01 refinement: candidate selection can additionally
+    exclude tasks covered by an active manager.task_claims lease, when the
+    caller opts in with a task_claim_reader (never auto-activated merely
+    because a bucket is configured -- see build_default_task_claim_reader's
+    docstring in manager/autopilot.py for why)."""
+
+    def setUp(self):
+        self.store = MemoryStore()
+        self.project = sample_project("p1", working_directory=os.getcwd())
+
+    def test_task_with_active_claim_is_excluded_when_reader_provided(self):
+        task = sample_task("p1", "t1", title="Task", status="ready")
+        self.store.put("tasks", "p1", "t1", task)
+
+        selection = find_next_candidate_task(self.store, "p1", set(), project=self.project,
+                                             git_checker=lambda _: (True, ""),
+                                             task_claim_reader=lambda task_id: task_id == "t1")
+        self.assertIsNone(selection["task"])
+        self.assertIn("active_task_claim", selection["blocked"][0]["reason"])
+
+    def test_task_claim_reader_error_excludes_candidate_fail_closed(self):
+        task = sample_task("p1", "t1", title="Task", status="ready")
+        self.store.put("tasks", "p1", "t1", task)
+
+        def _raising_reader(task_id):
+            raise RuntimeError("simulated backend unavailable")
+
+        selection = find_next_candidate_task(self.store, "p1", set(), project=self.project,
+                                             git_checker=lambda _: (True, ""),
+                                             task_claim_reader=_raising_reader)
+        self.assertIsNone(selection["task"])
+
+    def test_no_task_claim_reader_does_not_exclude_anything(self):
+        task = sample_task("p1", "t1", title="Task", status="ready")
+        self.store.put("tasks", "p1", "t1", task)
+        selection = find_next_candidate_task(self.store, "p1", set(), project=self.project,
+                                             git_checker=lambda _: (True, ""))
+        self.assertIsNotNone(selection["task"])
+
+
+def now_iso_for_tests():
+    from manager.tasks import now_iso
+    return now_iso()
 
 
 if __name__ == "__main__":
