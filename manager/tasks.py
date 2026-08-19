@@ -270,7 +270,12 @@ def create_handoff(store, document):
     return store.put("handoffs", document["project_id"], document["handoff_id"], document)
 
 
-def complete_task(store, project_id, task_id, summary, provider=None, session=None):
+def complete_task(store, project_id, task_id, summary, provider=None, session=None, status_report=None):
+    """`status_report`, when supplied, must satisfy the mandatory_status_report rule
+    (manager/rules_manifest.json) before completion is allowed to proceed."""
+    if status_report is not None:
+        from manager.rules_manifest import validate_status_report
+        validate_status_report(status_report)
     task = store.get("tasks", project_id, task_id)
     timestamp = now_iso()
     task.update(status="completed", completed_at=timestamp, updated_at=timestamp, blocked_reason=None, current_progress=summary, next_action="")

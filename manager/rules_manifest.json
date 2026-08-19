@@ -1,0 +1,65 @@
+{
+  "manifest_version": "1.0.0",
+  "source": "AI-DEVELOPMENT-RULES.md",
+  "rules": [
+    {
+      "rule_id": "cloud_first",
+      "scope": ["dispatch"],
+      "severity": "blocking",
+      "injection_required": true,
+      "completion_check_required": false,
+      "instruction": "Cloud-first: GitHub/Drive remain the canonical SSOT; the local machine is runtime/checkout only, never the sole source of truth."
+    },
+    {
+      "rule_id": "task_identity",
+      "scope": ["dispatch"],
+      "severity": "blocking",
+      "injection_required": true,
+      "completion_check_required": true,
+      "required_fields": ["ai", "project", "task"],
+      "instruction": "Every dispatched task must state AI, Project, Task, and Conversation/Session identifiers when applicable."
+    },
+    {
+      "rule_id": "research_before_build",
+      "scope": ["dispatch", "task_creation"],
+      "severity": "blocking",
+      "injection_required": true,
+      "completion_check_required": true,
+      "instruction": "Research mature existing solutions first (Direct Use, then Wrap/Adapt, then Build); a comparison/report alone does not satisfy this gate, attempt a runnable PoC where reasonable, and record concrete rejection evidence before building from scratch."
+    },
+    {
+      "rule_id": "copy_ready_ai_dispatch",
+      "scope": ["dispatch"],
+      "severity": "blocking",
+      "injection_required": true,
+      "completion_check_required": false,
+      "instruction": "Deliver any user-facing dispatch prompt as one complete copy-ready block; critical instructions may not be scattered outside it."
+    },
+    {
+      "rule_id": "real_running_truth",
+      "scope": ["dispatch", "execution", "status_report"],
+      "severity": "blocking",
+      "injection_required": true,
+      "completion_check_required": true,
+      "required_evidence_fields": ["execution_id", "provider", "session_id", "started_at"],
+      "instruction": "queued != running: never report an AI as running without real execution/provider evidence (execution_id and provider/session evidence)."
+    },
+    {
+      "rule_id": "visibility_first",
+      "scope": ["dispatch", "status_report"],
+      "severity": "advisory",
+      "injection_required": true,
+      "completion_check_required": false,
+      "instruction": "User-visible usable progress outranks additional generalized infrastructure; internal component READY/PASS must not be reported as user-facing product completion."
+    },
+    {
+      "rule_id": "mandatory_status_report",
+      "scope": ["dispatch", "status_report"],
+      "severity": "blocking",
+      "injection_required": true,
+      "completion_check_required": true,
+      "required_fields": ["current_progress", "overall_project_progress", "milestone_progress", "estimated_remaining", "waiting_blocker", "actual_ai_provider_running"],
+      "instruction": "Every ADM work report must include current progress, overall project progress, milestone progress, estimated remaining work/time, waiting/blocker, and the actual AI/provider currently running."
+    }
+  ]
+}
