@@ -9,7 +9,9 @@ developable.
 
 ## What lives here
 
-- `AI-DEVELOPMENT-RULES.md` - the cross-project rules SSOT (versioned).
+- `AI-DEVELOPMENT-RULES.md` - the human-readable cross-project policy SSOT.
+- `governance-rules.json` - the canonical machine-readable mandatory-rule
+  source used for automatic task inheritance and fail-closed dispatch.
 - `schema/status.schema.json` - provider-neutral quota/usage status schema
   (v0.1), plus `schema/status.example.json` showing real PoC-derived values
   for Codex / Claude Code / Antigravity / Gemini App.
@@ -106,11 +108,16 @@ python -m manager.tasks task-read example-project example-task
 python -m manager.tasks task-update example-project example-task --status in_progress --progress "Started"
 python -m manager.tasks handoff-create templates/handoff.json
 python -m manager.tasks handoff-latest example-project example-task
-python -m manager.tasks task-complete example-project example-task --summary "Acceptance criteria passed"
+python -m manager.tasks task-complete example-project example-task --summary "Acceptance criteria passed" --report templates/completion-report.json
 ```
 
 Task creation records the current assignment recommendation and quota evidence,
-but never starts an AI provider.
+but never starts an AI provider. It also overwrites caller-supplied governance
+metadata with the current canonical version/digest/rule IDs/status fields.
+Dispatch fails if that metadata is missing or stale. Completed reports supplied
+through `task-complete` must contain every canonical ADM status field; research
+tasks require PoC or explicit rejection evidence, and any running claim requires
+real execution evidence.
 
 ## Drive authentication health
 
@@ -337,6 +344,10 @@ The estimator uses medians from similar completed executions. Estimates over
 The dispatcher reads the Drive project/task/latest handoff, current quota, and
 execution estimates, then creates a short recommendation and paste-ready prompt.
 It never starts or sends work to an AI provider.
+
+The generated prompt is copy-ready: it includes the canonical mandatory rules,
+task identity, scope, acceptance criteria, and required ADM completion fields.
+No caller must manually copy rules from the README or policy document.
 
 ```powershell
 python -m manager.dispatcher --project-id ai-development-manager --title "Phase 7 dispatcher" --task-type implementation --complexity medium --scope "Implement dispatcher" --acceptance "Tests pass"

@@ -40,6 +40,17 @@
     "depends_on": {"type": "array", "items": {"type": "string"}},
     "blocked_reason": {"type": ["string", "null"]},
     "source_context": {"type": "object"},
+    "governance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rules_version", "rules_digest", "mandatory_rule_ids", "mandatory_status_fields"],
+      "properties": {
+        "rules_version": {"type": "string", "minLength": 1},
+        "rules_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "mandatory_rule_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "mandatory_status_fields": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      }
+    },
     "quota_evidence": {"type": ["object", "null"]},
     "current_progress": {"type": "string"},
     "next_action": {"type": "string"}

@@ -1,0 +1,14 @@
+{
+  "ai": "Codex",
+  "project": "example-project",
+  "task": "example-task",
+  "conversation": "example-conversation",
+  "session": "example-session",
+  "current_progress": "Acceptance criteria passed",
+  "overall_project_progress": "Task completed; project total not independently measured",
+  "milestone_progress": "Task milestone completed",
+  "estimated_remaining": "0 minutes for this task",
+  "waiting_blocker": "None",
+  "actual_ai_provider_running_now": "None",
+  "rule_evidence": {}
+}

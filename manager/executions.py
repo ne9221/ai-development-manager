@@ -411,10 +411,15 @@ def persist_terminal(store, service, project_id, execution_id, status="completed
     return execution
 
 
-def finish_execution(store, service, project_id, execution_id, status="completed", completed_at=None, note=None):
+def finish_execution(store, service, project_id, execution_id, status="completed", completed_at=None, note=None, completion_report=None):
     execution = persist_terminal(store, service, project_id, execution_id, status, completed_at, note)
     if status == "completed":
-        complete_task(store, project_id, execution["task_id"], note or f"Execution {execution_id} completed", execution["provider"], execution.get("session_id"))
+        from manager.governance import execution_completion_report
+
+        task = store.get("tasks", project_id, execution["task_id"])
+        summary = note or f"Execution {execution_id} completed"
+        report = completion_report or execution_completion_report(task, execution, summary)
+        complete_task(store, project_id, execution["task_id"], summary, execution["provider"], execution.get("session_id"), report)
     else:
         update_task(store, project_id, execution["task_id"], status="blocked", blocked_reason=f"Execution {status}: {note or 'no details'}", current_progress=f"Execution {execution_id} {status}", next_action="Review failure and decide whether to resume")
     return execution

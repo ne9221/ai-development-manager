@@ -1,0 +1,59 @@
+{
+  "schema_version": "1.0.0",
+  "mandatory_rules": [
+    {
+      "id": "research_before_build",
+      "instruction": "Borrow first: when research is required, inspect mature reusable solutions before building and record either PoC evidence or explicit rejection evidence."
+    },
+    {
+      "id": "copy_ready_ai_dispatch",
+      "instruction": "Treat this brief as the copy-ready execution contract; do not rely on README memory or unstated rules."
+    },
+    {
+      "id": "real_running_truth",
+      "instruction": "Claim an AI/provider is running only with current real execution evidence; otherwise report that none is proven running."
+    },
+    {
+      "id": "visibility_first",
+      "instruction": "Keep current progress, blockers, next action, and provider state visible in the required ADM report."
+    },
+    {
+      "id": "mandatory_status_report",
+      "instruction": "Finish with every mandatory ADM status field exactly as listed in this brief."
+    },
+    {
+      "id": "cloud_first",
+      "instruction": "Use the configured cloud/GitHub runtime SSOT for persistent project state; local state is only for approved runtime, scratch, cache, login, or session needs."
+    },
+    {
+      "id": "task_identity",
+      "instruction": "Preserve the canonical AI, Project, Task, Conversation, and Session identity in reports and handoffs."
+    }
+  ],
+  "mandatory_status_fields": [
+    "ai",
+    "project",
+    "task",
+    "conversation",
+    "session",
+    "current_progress",
+    "overall_project_progress",
+    "milestone_progress",
+    "estimated_remaining",
+    "waiting_blocker",
+    "actual_ai_provider_running_now"
+  ],
+  "status_field_labels": {
+    "ai": "AI",
+    "project": "Project",
+    "task": "Task",
+    "conversation": "Conversation",
+    "session": "Session",
+    "current_progress": "Current progress",
+    "overall_project_progress": "Overall project progress",
+    "milestone_progress": "Milestone progress",
+    "estimated_remaining": "Estimated remaining",
+    "waiting_blocker": "Waiting/blocker",
+    "actual_ai_provider_running_now": "Actual AI/provider running now"
+  }
+}

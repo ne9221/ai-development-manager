@@ -11,6 +11,7 @@ from collectors.publish_drive import build_service
 from manager.assignment import CAPABILITIES, decide
 from manager.estimator import estimate
 from manager.executions import list_executions
+from manager.governance import MANDATORY_STATUS_FIELDS, STATUS_FIELD_LABELS, rendered_rules, validate_task_enforcement
 from manager.quota_reader import EXPECTED_PROVIDERS, read_drive_status, summarize, unknown_account_summary
 from manager.rules_manifest import injection_lines, mandatory_rules, validate_prompt_injection, validate_research_gate
 from manager.tasks import DriveRecords, TaskError, create_task, safe_id, validate
@@ -64,6 +65,9 @@ def phase_goals(scope, count):
 
 
 def prompt_for(project, task, handoff, provider, estimate_result, quota_summary, warnings, shared_rules=None, ponytail_available=None):
+    validate_task_enforcement(task)
+    mandatory_rules = rendered_rules()
+    additional_shared_rules = [rule for rule in (shared_rules or []) if rule not in mandatory_rules]
     forbidden = list(project.get("important_constraints", [])) + list(task.get("constraints", []))
     if handoff:
         forbidden += handoff.get("do_not_touch", [])
@@ -99,7 +103,8 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
         "Rule priority (highest first):",
         *[f"- Project business / acceptance: {item}" for item in project.get("project_rules", [])],
         *[f"- Project business / acceptance: {item}" for item in task.get("acceptance_criteria", [])],
-        *[f"- AI Development Manager scope / protection: {item}" for item in (shared_rules or [])],
+        *[f"- Mandatory ADM governance: {item}" for item in mandatory_rules],
+        *[f"- AI Development Manager scope / protection: {item}" for item in additional_shared_rules],
         *[f"- AI Development Manager scope / protection: {item}" for item in task.get("constraints", [])],
         "Mandatory ADM rules (auto-injected; do not remove, paraphrase, or omit):",
         *injection_lines(MANDATORY_RULES),
@@ -117,7 +122,12 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
         f"Quota summary: {quota_summary}",
         f"Warnings: {'; '.join(warnings) if warnings else 'none'}",
         "Required validation:", "- Run the tests/checks named by the acceptance criteria.", "- Run git diff --check and inspect git status when this is a repo-edit task.",
-        "Completion report format:", "- Work completed", "- Files changed", "- Tests/checks and results", "- Remaining issues or blockers", "- Commit hash/push status if requested", "Do not start another phase automatically.",
+        "Completion report format:",
+        *[f"{STATUS_FIELD_LABELS[field]}:" for field in MANDATORY_STATUS_FIELDS],
+        "Rule evidence: research_before_build must include outcome=poc or outcome=rejected plus concrete evidence when research is required.",
+        "Running evidence: any running claim must include provider, execution_id, status=running, and observed_at.",
+        "Files changed:", "Tests:", "FAIL-before evidence:", "PASS-after evidence:",
+        "Commit SHA:", "GitHub push status:", "Do not start another phase automatically.",
     ]
     return clean("\n".join(lines))
 
@@ -274,6 +284,7 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
         task = create_task(store, task_input, service, assign=False, persist=persist_task)
         if persist_task and task["task_id"] not in project["active_tasks"]:
             project["active_tasks"].append(task["task_id"]); store.put("projects", project["project_id"], project["project_id"], project)
+    validate_task_enforcement(task)
     summary = quota_line(selected_quota)
     generated = prompt_for(project, task, handoff, selected, selected_estimate, summary, warnings, request.get("shared_rules"), request.get("ponytail_available"))
     validate_prompt_injection(generated, MANDATORY_RULES)

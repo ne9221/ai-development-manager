@@ -225,6 +225,8 @@ def create_project(store, document):
 
 
 def create_task(store, document, service=None, assign=True, persist=True):
+    from manager.governance import inject_task_enforcement
+
     timestamp = now_iso()
     document = dict(document)
     document.setdefault("status", "ready")
@@ -238,6 +240,7 @@ def create_task(store, document, service=None, assign=True, persist=True):
     document.setdefault("source_context", {})
     document.setdefault("current_progress", "Not started")
     document.setdefault("next_action", "Confirm assignment and begin")
+    inject_task_enforcement(document)
     if assign:
         quota = summarize(read_drive_status(service=service), max_age_minutes=60)
         decision = decide(document, quota)
@@ -262,21 +265,24 @@ def update_task(store, project_id, task_id, **changes):
 
 
 def create_handoff(store, document):
+    from manager.governance import validate_completion_report
+
     document = dict(document)
     document.setdefault("created_at", now_iso())
     for key in ("completed_work", "files_changed", "commits", "tests", "known_issues", "do_not_touch", "acceptance_criteria"):
         document.setdefault(key, [])
+    if document.get("reason") == "completed" and "completion_report" in document:
+        task = store.get("tasks", document["project_id"], document["task_id"])
+        validate_completion_report(document["completion_report"], task, store, document.get("from_provider"), document.get("from_session"))
     validate("handoff", document)
     return store.put("handoffs", document["project_id"], document["handoff_id"], document)
 
 
-def complete_task(store, project_id, task_id, summary, provider=None, session=None, status_report=None):
-    """`status_report`, when supplied, must satisfy the mandatory_status_report rule
-    (manager/rules_manifest.json) before completion is allowed to proceed."""
-    if status_report is not None:
-        from manager.rules_manifest import validate_status_report
-        validate_status_report(status_report)
+def complete_task(store, project_id, task_id, summary, provider=None, session=None, report=None):
+    from manager.governance import validate_completion_report
+
     task = store.get("tasks", project_id, task_id)
+    validate_completion_report(report, task, store, provider, session)
     timestamp = now_iso()
     task.update(status="completed", completed_at=timestamp, updated_at=timestamp, blocked_reason=None, current_progress=summary, next_action="")
     validate("task", task)
@@ -289,6 +295,7 @@ def complete_task(store, project_id, task_id, summary, provider=None, session=No
         "from_session": session, "reason": "completed", "completed_work": [summary],
         "current_state": "completed", "next_action": "", "minimal_context": summary,
         "acceptance_criteria": task["acceptance_criteria"],
+        "completion_report": report,
     })
     return task, handoff
 
@@ -305,7 +312,7 @@ def main():
     read = sub.add_parser("task-read"); read.add_argument("project_id"); read.add_argument("task_id")
     update = sub.add_parser("task-update"); update.add_argument("project_id"); update.add_argument("task_id"); update.add_argument("--status"); update.add_argument("--progress"); update.add_argument("--next-action"); update.add_argument("--blocked-reason"); update.add_argument("--assigned-provider")
     latest = sub.add_parser("handoff-latest"); latest.add_argument("project_id"); latest.add_argument("task_id")
-    complete = sub.add_parser("task-complete"); complete.add_argument("project_id"); complete.add_argument("task_id"); complete.add_argument("--summary", required=True); complete.add_argument("--provider"); complete.add_argument("--session")
+    complete = sub.add_parser("task-complete"); complete.add_argument("project_id"); complete.add_argument("task_id"); complete.add_argument("--summary", required=True); complete.add_argument("--provider"); complete.add_argument("--session"); complete.add_argument("--report", required=True)
     args = parser.parse_args()
     try:
         service = build_service(); store = DriveRecords(service)
@@ -315,7 +322,7 @@ def main():
         elif args.command == "task-update": result = update_task(store, args.project_id, args.task_id, status=args.status, current_progress=args.progress, next_action=args.next_action, blocked_reason=args.blocked_reason, assigned_provider=args.assigned_provider)
         elif args.command == "handoff-create": result = create_handoff(store, load_json(args.input))
         elif args.command == "handoff-latest": result = store.latest("handoffs", args.project_id, args.task_id); validate("handoff", result)
-        else: result = complete_task(store, args.project_id, args.task_id, args.summary, args.provider, args.session)[0]
+        else: result = complete_task(store, args.project_id, args.task_id, args.summary, args.provider, args.session, load_json(args.report))[0]
         print(json.dumps(result, indent=2))
         return 0
     except (TaskError, OSError, json.JSONDecodeError) as exc:
