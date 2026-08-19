@@ -271,9 +271,9 @@ def create_handoff(store, document):
     document.setdefault("created_at", now_iso())
     for key in ("completed_work", "files_changed", "commits", "tests", "known_issues", "do_not_touch", "acceptance_criteria"):
         document.setdefault(key, [])
-    if document.get("reason") == "completed" and "completion_report" in document:
+    if document.get("reason") == "completed":
         task = store.get("tasks", document["project_id"], document["task_id"])
-        validate_completion_report(document["completion_report"], task, store, document.get("from_provider"), document.get("from_session"))
+        validate_completion_report(document.get("completion_report"), task, store, document.get("from_provider"), document.get("from_session"))
     validate("handoff", document)
     return store.put("handoffs", document["project_id"], document["handoff_id"], document)
 

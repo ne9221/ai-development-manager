@@ -16,6 +16,7 @@ from manager.execution_lifecycle import terminalize_execution
 from manager.execution_runner import launch_task
 from manager.executions import cancel_reserved_execution, execution_health, prepare_task_retry
 from manager.gcs_lock_registry import GCSLockRegistry
+from manager.governance import validate_task_enforcement
 from manager.quota_reader import read_drive_status, summarize
 from manager.runtime_bridge import all_projects
 from manager.task_claims import check_task_execution_claim, task_claim_registry
@@ -357,6 +358,10 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         validate("task", candidate_task)
     except TaskError:
         return _attention(store, command, None, "allowlisted_task_missing_or_invalid")
+    try:
+        validate_task_enforcement(candidate_task)
+    except TaskError:
+        return {"status": "rejected", "reason": "mandatory_governance_missing_or_stale"}
     if not _policy_satisfied(candidate_task):
         return _attention(store, command, None, "allowlisted_task_policy_not_satisfied")
     if not health_check():
