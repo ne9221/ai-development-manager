@@ -66,6 +66,56 @@ one-time human approval -- see the end of this document.
 
 ## Exact commands (NOT executed -- for the one-time approval this plan is asking for)
 
+**Read this before running any of the commands below.** `--set-env-vars` and
+`--set-secrets` are **full-replacement** flags: they replace the *entire*
+env-var set (respectively secret mapping) on the new revision with exactly
+what you list, discarding anything already configured that you didn't
+repeat -- they do not merge with, or preserve, whatever the live service
+currently has. This is exactly how a real production incident happened on
+2026-08-19: a redeploy used `--set-env-vars`/`--set-secrets` from a stale
+copy of the command below (this same file, from before
+`GOOGLE_DRIVE_TOKEN`/`CLAUDE_ACCOUNTS_CONFIG` existed), which silently
+dropped both -- the new revision passed `/health` (no Drive dependency) but
+failed every real write-capable request with `503 drive_unavailable`. The
+regression was caught by a candidate dispatch smoke test before any
+production traffic was cut, and rolled back within minutes with zero
+production impact.
+
+**Never assume this document's env/secret list is complete or current.**
+Before any redeploy, inventory the *live* revision currently serving
+traffic as the source of truth:
+
+```bash
+gcloud run revisions describe <live-revision-name> \
+  --region asia-east1 --project ai-development-manager \
+  --format="yaml(spec.containers[0].env, spec.containers[0].volumeMounts, spec.volumes, spec.serviceAccountName)"
+```
+
+As of 2026-08-19, production requires at minimum these env vars:
+`MCP_ALLOWED_HOST`, `ADM_LOCK_GCS_BUCKET`, `GOOGLE_DRIVE_TOKEN`,
+`CLAUDE_ACCOUNTS_CONFIG` -- and these secrets: `ADM_API_KEY` (env-style) plus
+two file-mount secrets, `adm-cloudrun-drive-oauth-token` at
+`/secrets/gdrive-oauth/token.json` and `adm-claude-account-registry` at
+`/secrets/claude-accounts/accounts.json`. This list itself can go stale the
+same way the old one did -- the `gcloud run revisions describe` command
+above is the only thing that can't lie.
+
+Use `--update-env-vars`/`--update-secrets` (merge: adds or updates only the
+keys you list, never removes an unlisted one), never `--set-env-vars`/
+`--set-secrets`, for any redeploy of an already-configured service. Note
+that "update" only protects you from dropping keys that are *already* in
+the Configuration's current template -- if a previous deploy already used
+`--set-*` and dropped something, that gap persists until you explicitly
+re-add it once. That is why the command below still lists every currently-
+required var/secret explicitly, rather than relying on merge semantics
+alone to carry them forward.
+
+Non-env/secret settings (`--service-account`, container concurrency,
+CPU/memory, timeout, max instances) are ordinary Cloud Run Configuration
+scalars and are **not** affected by this gap -- `gcloud run deploy` already
+carries them forward from the previous revision unless you explicitly pass
+a flag to change one, confirmed by inspecting the actual incident revision.
+
 ```bash
 # 1) Redeploy from the integration branch (from a fresh clone checked out at
 #    integration/p0-direct-dispatch-activation-20260817)
@@ -74,8 +124,8 @@ gcloud run deploy adm-runtime-bridge \
   --region asia-east1 \
   --project ai-development-manager \
   --service-account ai-development-manager-runtime@ai-development-manager.iam.gserviceaccount.com \
-  --set-secrets ADM_API_KEY=ADM_API_KEY:latest \
-  --set-env-vars MCP_ALLOWED_HOST=adm-runtime-bridge-551449082603.asia-east1.run.app,ADM_LOCK_GCS_BUCKET=adm-lock-smoke-551449082603-20260813-0147,ADM_GIT_SHA=$(git rev-parse HEAD) \
+  --update-secrets ADM_API_KEY=ADM_API_KEY:latest,/secrets/gdrive-oauth/token.json=adm-cloudrun-drive-oauth-token:latest,/secrets/claude-accounts/accounts.json=adm-claude-account-registry:latest \
+  --update-env-vars MCP_ALLOWED_HOST=adm-runtime-bridge-551449082603.asia-east1.run.app,ADM_LOCK_GCS_BUCKET=adm-lock-smoke-551449082603-20260813-0147,GOOGLE_DRIVE_TOKEN=/secrets/gdrive-oauth/token.json,CLAUDE_ACCOUNTS_CONFIG=/secrets/claude-accounts/accounts.json,ADM_GIT_SHA=$(git rev-parse HEAD) \
   --allow-unauthenticated
 
 # ADM_GIT_SHA above is computed from the exact clone/commit being deployed
@@ -85,6 +135,17 @@ gcloud run deploy adm-runtime-bridge \
 # K_SERVICE/K_REVISION/K_CONFIGURATION runtime env, so a request can always
 # be traced to the exact deployed commit without cross-referencing deploy
 # logs after the fact. See cloud/app.py:health_document().
+
+# Post-deploy validation MUST include a real write-capable Direct Dispatch
+# request against the new revision's own tagged URL, not just /health --
+# /health has no Drive dependency and cannot detect a dropped
+# GOOGLE_DRIVE_TOKEN/CLAUDE_ACCOUNTS_CONFIG/secret-mount regression like the
+# one above. Minimal disposable, read-only, no-repo-edit example:
+#   curl -X POST -H "Authorization: Bearer $ADM_API_KEY" -H "Content-Type: application/json" \
+#     -d '{"request_id":"<unique>","project_id":"ai-development-manager","title":"deploy verify","goal":"Reply OK. Read only. Touch nothing."}' \
+#     <candidate-tagged-url>/api/v1/tasks/dispatch
+# A 503 drive_unavailable here means the write path is broken even if
+# /health returned 200 -- do not proceed to a traffic cutover.
 
 # 2a) If reusing the existing smoke bucket: no IAM command needed (already granted).
 # 2b) If instead creating a fresh bucket:
