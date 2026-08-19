@@ -49,7 +49,47 @@ class CloudAppTests(unittest.TestCase):
         self.assertEqual(logging.INFO, logger.getEffectiveLevel())
         self.assertTrue(logger.handlers)
         status, body, _ = invoke(self.app, "GET", "/health", auth=None)
-        self.assertEqual(200, status); self.assertEqual({"status", "contract_version", "timestamp"}, set(body)); self.assertEqual("1.0", body["contract_version"])
+        self.assertEqual(200, status)
+        self.assertEqual({"status", "contract_version", "timestamp", "service", "revision", "configuration", "git_sha"}, set(body))
+        self.assertEqual("1.0", body["contract_version"])
+
+    def test_health_reports_revision_provenance_when_env_is_set(self):
+        with patch.dict(os.environ, {"K_SERVICE": "adm-runtime-bridge", "K_REVISION": "adm-runtime-bridge-00016-rek",
+                                     "K_CONFIGURATION": "adm-runtime-bridge", "ADM_GIT_SHA": "c0b5d8a"}):
+            status, body, _ = invoke(self.app, "GET", "/health", auth=None)
+        self.assertEqual(200, status)
+        self.assertEqual("adm-runtime-bridge", body["service"])
+        self.assertEqual("adm-runtime-bridge-00016-rek", body["revision"])
+        self.assertEqual("adm-runtime-bridge", body["configuration"])
+        self.assertEqual("c0b5d8a", body["git_sha"])
+
+    def test_health_falls_back_to_null_when_provenance_env_is_missing_and_stays_200(self):
+        with patch.dict(os.environ, {}, clear=True):
+            status, body, _ = invoke(self.app, "GET", "/health", auth=None)
+        self.assertEqual(200, status)
+        self.assertIsNone(body["service"]); self.assertIsNone(body["revision"])
+        self.assertIsNone(body["configuration"]); self.assertIsNone(body["git_sha"])
+        self.assertEqual("ok", body["status"])
+
+    def test_health_falls_back_to_null_when_provenance_env_is_empty_string(self):
+        with patch.dict(os.environ, {"K_SERVICE": "", "K_REVISION": "", "K_CONFIGURATION": "", "ADM_GIT_SHA": ""}):
+            status, body, _ = invoke(self.app, "GET", "/health", auth=None)
+        self.assertEqual(200, status)
+        self.assertIsNone(body["service"]); self.assertIsNone(body["revision"])
+        self.assertIsNone(body["configuration"]); self.assertIsNone(body["git_sha"])
+
+    def test_health_provenance_never_leaks_secret_looking_values(self):
+        with patch.dict(os.environ, {"ADM_GIT_SHA": "token=hunter2"}):
+            status, body, _ = invoke(self.app, "GET", "/health", auth=None)
+        self.assertEqual(200, status)
+        self.assertNotIn("hunter2", json.dumps(body))
+        self.assertIn("[REDACTED]", body["git_sha"])
+
+    def test_health_does_not_require_auth_or_change_dispatch_contract(self):
+        status, _, _ = invoke(self.app, "GET", "/health", auth=None)
+        self.assertEqual(200, status)
+        status, body, _ = invoke(self.app, "POST", "/dispatch", {"user_request": "work"}, auth=None)
+        self.assertEqual(401, status); self.assertEqual("auth_failure", body["error"]["code"])
 
     def test_valid_alias_continuation_and_multitask_dispatch(self):
         for payload, kind in [

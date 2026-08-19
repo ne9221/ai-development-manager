@@ -75,8 +75,16 @@ gcloud run deploy adm-runtime-bridge \
   --project ai-development-manager \
   --service-account ai-development-manager-runtime@ai-development-manager.iam.gserviceaccount.com \
   --set-secrets ADM_API_KEY=ADM_API_KEY:latest \
-  --set-env-vars MCP_ALLOWED_HOST=adm-runtime-bridge-551449082603.asia-east1.run.app,ADM_LOCK_GCS_BUCKET=adm-lock-smoke-551449082603-20260813-0147 \
+  --set-env-vars MCP_ALLOWED_HOST=adm-runtime-bridge-551449082603.asia-east1.run.app,ADM_LOCK_GCS_BUCKET=adm-lock-smoke-551449082603-20260813-0147,ADM_GIT_SHA=$(git rev-parse HEAD) \
   --allow-unauthenticated
+
+# ADM_GIT_SHA above is computed from the exact clone/commit being deployed
+# (never hand-typed/hardcoded) -- run this from a clean checkout of the
+# commit you intend to deploy, same as --source . itself already requires.
+# /health then reports it back verbatim alongside Cloud Run's own
+# K_SERVICE/K_REVISION/K_CONFIGURATION runtime env, so a request can always
+# be traced to the exact deployed commit without cross-referencing deploy
+# logs after the fact. See cloud/app.py:health_document().
 
 # 2a) If reusing the existing smoke bucket: no IAM command needed (already granted).
 # 2b) If instead creating a fresh bucket:
