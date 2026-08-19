@@ -278,10 +278,29 @@ def create_handoff(store, document):
     return store.put("handoffs", document["project_id"], document["handoff_id"], document)
 
 
-def complete_task(store, project_id, task_id, summary, provider=None, session=None, report=None):
+def complete_task(store, project_id, task_id, summary, provider=None, session=None, report=None, status_report=None):
     from manager.governance import validate_completion_report
 
     task = store.get("tasks", project_id, task_id)
+    if status_report is not None:
+        from manager.rules_manifest import validate_status_report
+        validate_status_report(status_report)
+        if report is not None:
+            raise TaskError("use report or status_report, not both")
+        source_context = task.get("source_context", {})
+        report = {
+            "ai": (provider or task.get("assigned_provider") or "unknown").replace("_", " ").title(),
+            "project": project_id, "task": task_id,
+            "conversation": source_context.get("conversation") or session or "not supplied",
+            "session": session or source_context.get("session") or source_context.get("run_id") or "not supplied",
+            "current_progress": status_report["current_progress"],
+            "overall_project_progress": status_report["overall_project_progress"],
+            "milestone_progress": status_report["milestone_progress"],
+            "estimated_remaining": status_report["estimated_remaining"],
+            "waiting_blocker": status_report["waiting_blocker"],
+            "actual_ai_provider_running_now": "None",
+            "rule_evidence": status_report.get("rule_evidence", {}),
+        }
     validate_completion_report(report, task, store, provider, session)
     timestamp = now_iso()
     task.update(status="completed", completed_at=timestamp, updated_at=timestamp, blocked_reason=None, current_progress=summary, next_action="")
