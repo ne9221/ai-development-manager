@@ -93,7 +93,8 @@ class DispatcherTests(unittest.TestCase):
                 self.assertTrue(prompt.startswith(f"AI: {provider.title()}\nProject: p1\nTask: {task_id}\n\n"))
                 self.assertIn("Project name: Project One", prompt)
                 self.assertIn("Task goal: Conversation label differs", prompt)
-                self.assertNotIn("Conversation:", prompt)
+                self.assertIn("Conversation:", prompt)
+                self.assertIn("Session:", prompt)
 
     def test_existing_continuation_with_and_without_handoff(self):
         task = create_task(self.store, request(task_id="t1", current_progress="Parser fixed", next_action="Run tests"), assign=False)

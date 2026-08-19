@@ -120,7 +120,14 @@ class TaskTests(unittest.TestCase):
 
     def test_complete_preserves_task_history_and_final_handoff(self):
         self.create()
-        task, handoff = complete_task(self.store, "ai-development-manager", "phase-5", "All acceptance criteria passed", "codex", "session-b")
+        report = {
+            "ai": "Codex", "project": "ai-development-manager", "task": "phase-5",
+            "conversation": "test", "session": "session-b", "current_progress": "Complete",
+            "overall_project_progress": "Phase 5 complete", "milestone_progress": "Complete",
+            "estimated_remaining": "0 minutes", "waiting_blocker": "None",
+            "actual_ai_provider_running_now": "None", "rule_evidence": {},
+        }
+        task, handoff = complete_task(self.store, "ai-development-manager", "phase-5", "All acceptance criteria passed", "codex", "session-b", report)
         self.assertEqual("completed", task["status"])
         self.assertTrue(any(key[0] == "history" for key in self.store.records))
         self.assertEqual("completed", handoff["reason"])
