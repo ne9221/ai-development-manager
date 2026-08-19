@@ -84,7 +84,7 @@ instances ignored:
   -GcsBucket your-authority-bucket -GcsObject worktree-locks/global-registry.json
 ```
 
-The watcher polls Drive at a bounded rate and supports `provider: "codex"` only.
+The watcher polls Drive at a bounded rate and supports `provider: "codex"` or `"claude"`.
 It claims a command with a deterministic execution ID, then delegates exactly to
 `manager.execution_runner`; reservation, quota/dispatch, GCS task claim, writer
 authority, Codex, and terminal execution/handoff/task persistence remain owned by
@@ -95,6 +95,14 @@ a new command ID after review.
 Command results include the future selection contract fields `provider`, `model`,
 `mode`, `effort`, `selection_reason`, `fallback_model`, and `quota_evidence`.
 Model values are optional and no model is hard-coded by the watcher.
+
+Hydra is an optional execution adapter; the native launcher remains the default.
+Set `ADM_EXECUTION_BACKEND=hydra` to opt in. The watcher dynamically discovers
+and health-checks Hydra's current loopback MCP port before claiming a command.
+If Hydra is unavailable, the command remains queued; set
+`ADM_HYDRA_FALLBACK=native` to explicitly allow the original launcher instead.
+Hydra agent/endpoint data is stored only as execution provider evidence; ADM
+continues to own task, execution, session, handoff, governance, and quota truth.
 
 ## Tasks and handoffs
 

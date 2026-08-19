@@ -17,6 +17,7 @@ from manager.execution_runner import launch_task
 from manager.executions import cancel_reserved_execution, execution_health, prepare_task_retry
 from manager.gcs_lock_registry import GCSLockRegistry
 from manager.governance import validate_task_enforcement
+from manager.hydra_adapter import HydraLauncher, HydraRuntime
 from manager.quota_reader import read_drive_status, summarize
 from manager.runtime_bridge import all_projects
 from manager.task_claims import check_task_execution_claim, task_claim_registry
@@ -315,7 +316,8 @@ def _existing_terminal(store, command):
 
 def process_command(store, service, command, launcher_factory=None, writer_factory=GCSLockRegistry.from_environment,
                     claim_factory=task_claim_registry, allowlist=frozenset(), health_check=session_center_healthy,
-                    quota_check=None, ingress_registry_factory=dispatch_request_registry):
+                    quota_check=None, ingress_registry_factory=dispatch_request_registry,
+                    hydra_runtime_factory=HydraRuntime):
     """Claim/reconcile one command; a claimed command is never automatically relaunched.
 
     launcher_factory/quota_check are explicit-override escape hatches (tests
@@ -338,6 +340,7 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     runtime = resolve_provider_runtime(command["provider"])
     if runtime is None:
         return {"status": "rejected", "reason": "unsupported_provider"}
+    launcher_overridden = launcher_factory is not None
     launcher_factory = launcher_factory or runtime["launcher_factory"]
     quota_check = quota_check or runtime["quota_check"]
     admitted_task = None
@@ -390,6 +393,21 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         # blocked until that changes).
         return {"status": "rejected", "reason": "quota_unreliable"}
 
+    execution_backend = "native"
+    if not launcher_overridden:
+        selected_backend = os.environ.get("ADM_EXECUTION_BACKEND", "native").strip().lower()
+        if selected_backend not in {"native", "hydra"}:
+            return {"status": "rejected", "reason": "unsupported_execution_backend"}
+        if selected_backend == "hydra":
+            hydra = hydra_runtime_factory()
+            health = hydra.health()
+            if not health.get("healthy"):
+                if os.environ.get("ADM_HYDRA_FALLBACK", "").strip().lower() != "native":
+                    return {"status": "rejected", "reason": "hydra_unavailable"}
+            else:
+                launcher_factory = lambda: HydraLauncher(command["provider"], runtime=hydra)
+                execution_backend = "hydra"
+
     retry_count = command.get("retry_count", 0)
     retry_of = command.get("retry_of_execution_id")
     if retry_count:
@@ -410,10 +428,11 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         writer_registry = None if task.get("read_only") else writer_factory()
         running = {**claimed, "status": "running"}
         retry = ({"retry_count": retry_count, "retry_of_execution_id": retry_of} if retry_count else {})
+        backend = {"execution_backend": "hydra"} if execution_backend == "hydra" else {}
         outcome = launch_task(store, service, writer_registry, claim_registry, launcher_factory(),
                               claimed["project_id"], claimed["task_id"], claimed["execution_id"], claimed["model"],
                               on_running=lambda _execution: _write(store, running), provider=claimed["provider"],
-                              claude_accounts=claude_accounts, account_id=explicit_account_id, **retry)
+                              claude_accounts=claude_accounts, account_id=explicit_account_id, **backend, **retry)
         terminal = outcome["terminal"]["execution"]
         dispatch = outcome["dispatch"]
         selected = {**running, "provider": dispatch["provider"], "model": dispatch["model"] or claimed["model"],

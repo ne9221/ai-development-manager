@@ -462,6 +462,51 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertIsNone(resolve_provider_runtime(""))
         self.assertIsNone(resolve_provider_runtime(None))
 
+    def test_hydra_backend_is_opt_in_and_threads_backend_evidence_to_runner(self):
+        hydra = Mock()
+        hydra.health.return_value = {"healthy": True}
+        runner = Mock(return_value=self.complete("command-cmd-1"))
+        with patch.dict(os.environ, {"ADM_EXECUTION_BACKEND": "hydra"}, clear=False), \
+             patch("manager.command_watcher.launch_task", runner):
+            result = process_command(
+                self.store, object(), command(), claim_factory=self.claim_factory,
+                allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda _service: True,
+                hydra_runtime_factory=lambda: hydra,
+            )
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("hydra", runner.call_args.kwargs["execution_backend"])
+        self.assertEqual("codex", runner.call_args.kwargs["provider"])
+
+    def test_unhealthy_hydra_leaves_command_queued_without_reservation(self):
+        hydra = Mock()
+        hydra.health.return_value = {"healthy": False}
+        with patch.dict(os.environ, {"ADM_EXECUTION_BACKEND": "hydra", "ADM_HYDRA_FALLBACK": ""}, clear=False), \
+             patch("manager.command_watcher.launch_task") as runner:
+            result = process_command(
+                self.store, object(), command(), claim_factory=self.claim_factory,
+                allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda _service: True,
+                hydra_runtime_factory=lambda: hydra,
+            )
+        self.assertEqual({"status": "rejected", "reason": "hydra_unavailable"}, result)
+        self.assertEqual("ready", self.store.get("tasks", "p1", "t1")["status"])
+        self.assertFalse(any(key[0] == "executions" for key in self.store.records))
+        runner.assert_not_called()
+
+    def test_explicit_native_fallback_uses_original_launcher(self):
+        hydra = Mock()
+        hydra.health.return_value = {"healthy": False}
+        runner = Mock(return_value=self.complete("command-cmd-1"))
+        with patch.dict(os.environ, {"ADM_EXECUTION_BACKEND": "hydra", "ADM_HYDRA_FALLBACK": "native"}, clear=False), \
+             patch("manager.command_watcher.launch_task", runner):
+            result = process_command(
+                self.store, object(), command(), claim_factory=self.claim_factory,
+                allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda _service: True,
+                hydra_runtime_factory=lambda: hydra,
+            )
+        self.assertEqual("completed", result["status"])
+        self.assertIsInstance(runner.call_args.args[4], CodexLauncher)
+        self.assertNotIn("execution_backend", runner.call_args.kwargs)
+
     def test_unknown_provider_command_is_rejected_without_touching_codex_defaults(self):
         # command.schema.json's provider enum (codex/claude only) already
         # rejects this at validate("command", ...) before dispatch resolution

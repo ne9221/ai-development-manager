@@ -193,7 +193,7 @@ def _resolve_working_directory(store, task):
 def launch_task(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                 execution_id=None, model=None, timeout_seconds=None, quota_document=None, executions=None,
                 retry_count=0, retry_of_execution_id=None, on_running=None, provider="codex",
-                account_id=None, config_dir=None, claude_accounts=None):
+                account_id=None, config_dir=None, claude_accounts=None, execution_backend="native"):
     """Dispatch, reserve, and run one ready task; callers supply real authorities.
 
     `provider` names which provider this launcher belongs to (the caller
@@ -259,14 +259,14 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
                            execution_id, dispatched["generated_prompt"], request,
                            access="read_only" if task["read_only"] else "production_write",
                            baseline_head=task.get("baseline_head"), on_running=on_running, provider=provider,
-                           account_id=account_id, config_dir=config_dir)
+                           account_id=account_id, config_dir=config_dir, execution_backend=execution_backend)
     return {"execution_id": execution_id, "dispatch": dispatched, **result}
 
 
 def run_execution(store, service, writer_registry, claim_registry, launcher,
                   project_id, task_id, execution_id, prompt, launch_request: LaunchRequest,
                   access="production_write", baseline_head=None, on_running=None, provider="codex",
-                  account_id=None, config_dir=None):
+                  account_id=None, config_dir=None, execution_backend="native"):
     """Run one reserved execution through the reviewed lifecycle gates.
 
     ``provider_stopped`` is derived only after prepare-owned cleanup or after
@@ -291,8 +291,6 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
     operation_error = close_error = None
     status, summary = "interrupted", f"{provider} runner interrupted"
     try:
-        if on_running:
-            on_running(execution)
         if launch_request.working_directory != execution["task_snapshot"].get("working_directory"):
             raise TaskError("launch working directory does not match the reserved execution")
         prepare_kwargs = {}
@@ -300,7 +298,7 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
             prepare_kwargs["account_id"] = account_id
         if config_dir is not None:
             prepare_kwargs["config_dir"] = config_dir
-        if provider == "claude":
+        if provider == "claude" and execution_backend == "native":
             # Acquired here (after account/config_dir are resolved, immediately
             # before the child Claude process is spawned) so ADM never runs two
             # of its own Claude launches against the same on-disk config
@@ -318,8 +316,13 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
             "creation_identity": prepared.process_creation_identity,
             "started_at": prepared.prepared_at,
         }
+        if execution_backend == "hydra":
+            provider_evidence.update(backend="hydra", hydra_agent_id=prepared.hydra_agent_id,
+                                     mcp_endpoint=prepared.hydra_endpoint)
         heartbeat_execution(store, project_id, execution_id, "provider_prepared",
                             at=prepared.prepared_at, provider_evidence=provider_evidence)
+        if on_running:
+            on_running(execution)
         session = _persist_session_link(store, writer_registry, execution, prepared, launch_request, lease_token, provider)
         running = launcher.start(prepared, prompt)
         heartbeat_execution(store, project_id, execution_id, "turn_started", at=running.started_at)
@@ -353,7 +356,8 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
     # prepare() owns and closes a spawned process until it returns a handle.
     provider_stopped = prepared is None and operation_error is not None
     if prepared is not None:
-        provider_stopped = _stopped(prepared)
+        stopped = getattr(launcher, "provider_stopped", None)
+        provider_stopped = bool(stopped(prepared)) if callable(stopped) else _stopped(prepared)
     if not provider_stopped:
         error = TaskError(f"{provider} provider stop could not be proven; terminal authority retained")
         if operation_error:
