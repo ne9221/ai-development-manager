@@ -41,6 +41,33 @@ def iso_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def health_document():
+    """Revision provenance for /health, so a request can always be traced to
+    the exact service/revision/build that handled it -- never guessed from
+    deploy-log timing after the fact.
+
+    service/revision/configuration come from Cloud Run's own runtime env
+    (K_SERVICE/K_REVISION/K_CONFIGURATION -- set automatically by the
+    platform, not something this app or its deploy step configures).
+    git_sha has no Cloud Run-native equivalent; it is only populated when a
+    deploy step explicitly sets ADM_GIT_SHA (e.g. `--set-env-vars
+    ADM_GIT_SHA=$(git rev-parse HEAD)`), which nothing currently does. None
+    of these are secrets -- they are already visible in the Cloud Run
+    console/logs and git history -- so it is safe for this to stay on the
+    public, unauthenticated /health path. Any field whose env var is unset
+    or empty is null; that never affects the 200 status.
+    """
+    return {
+        "status": "ok",
+        "contract_version": CONTRACT_VERSION,
+        "timestamp": iso_now(),
+        "service": os.environ.get("K_SERVICE") or None,
+        "revision": os.environ.get("K_REVISION") or None,
+        "configuration": os.environ.get("K_CONFIGURATION") or None,
+        "git_sha": os.environ.get("ADM_GIT_SHA") or None,
+    }
+
+
 def default_service_factory():
     import google.auth
     from googleapiclient.discovery import build
@@ -83,7 +110,7 @@ def create_app(service_factory=default_service_factory, bridge_func=runtime_brid
         status, category, project_id = "200 OK", None, None
         try:
             if method == "GET" and path == "/health":
-                return json_response(start_response, status, {"status": "ok", "contract_version": CONTRACT_VERSION, "timestamp": iso_now()}, request_id)
+                return json_response(start_response, status, health_document(), request_id)
             if method != "POST" or path not in ("/dispatch", DISPATCH_INGRESS_PATH):
                 status, category = "404 Not Found", "not_found"
                 return json_response(start_response, status, error(category, "endpoint not found", request_id), request_id)
