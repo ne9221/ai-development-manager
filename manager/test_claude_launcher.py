@@ -138,6 +138,20 @@ class ClaudeLauncherTests(unittest.TestCase):
         for element in args[0]:
             self.assertIsInstance(element, str)
 
+    # Regression: a Claude child spawned without job-breakaway can be killed
+    # by Task Scheduler's Job Object the moment the launching --once watcher
+    # cycle exits, before the provider ever produces output (observed live:
+    # real PID spawned, zero bytes written to stdout/stderr, process gone by
+    # the next reconciliation cycle). On Windows the child must be started
+    # with CREATE_BREAKAWAY_FROM_JOB so it survives its parent job closing.
+    def test_windows_spawn_breaks_away_from_parent_job_object(self):
+        self.prepare()
+        _, kwargs = self.calls[-1]
+        if os.name == "nt":
+            self.assertEqual(kwargs.get("creationflags"), subprocess.CREATE_BREAKAWAY_FROM_JOB)
+        else:
+            self.assertNotIn("creationflags", kwargs)
+
     # 7. read-only permission mapping
     def test_read_only_profile_maps_to_plan_mode_with_safe_tools(self):
         prepared = self.prepare(sandbox="read-only", approval_policy="never")

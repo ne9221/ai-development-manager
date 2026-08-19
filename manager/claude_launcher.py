@@ -361,11 +361,22 @@ class ClaudeLauncher:
         except OSError as exc:
             raise ClaudeLaunchError("spawn_failed", f"failed to open output log files: {exc}") from exc
 
+        # Break the child out of whatever Windows Job Object owns this process
+        # (e.g. Task Scheduler's per-instance job) so it keeps running past the
+        # launching --once watcher cycle's own exit -- the watcher's design
+        # relies on a later poll cycle reconciling an independently-surviving
+        # provider process, not on this call blocking for the full run. Without
+        # this flag a Task-Scheduler-owned job can kill the child the moment its
+        # spawning process exits, before Claude ever produces output.
+        popen_kwargs = {}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_BREAKAWAY_FROM_JOB
         try:
             try:
                 process = self._popen(
                     argv, cwd=str(cwd), stdin=subprocess.PIPE,
                     stdout=stdout_handle, stderr=stderr_handle, shell=False, env=env,
+                    **popen_kwargs,
                 )
             except OSError as exc:
                 raise ClaudeLaunchError("spawn_failed", f"failed to start Claude CLI: {exc}") from exc
