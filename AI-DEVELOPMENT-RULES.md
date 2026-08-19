@@ -1,12 +1,27 @@
 # AI Development Rules
 
-version: 0.1.3
-last_updated: 2026-08-10
+version: 0.1.4
+last_updated: 2026-08-19
 
 Single source of truth for cross-project AI-development rules. This document
 governs how AI coding tools (ChatGPT, Claude Code, Codex, Antigravity,
 Gemini, ...) are coordinated across projects. It does not replace any
 individual project's own `TASKS` or business rules - it sits above them.
+
+## Documented vs Enforced
+
+This file is the human-readable policy SSOT. `governance-rules.json` is the
+canonical machine-readable source for the mandatory enforced subset. ADM task
+creation stamps that source's version, digest, rule IDs, and status fields into
+every generated Task; dispatch rejects missing or stale stamps. The dispatcher
+also renders those rules into every Codex, Claude, and Antigravity execution
+brief, so agents do not need to remember to read this file.
+
+Mechanically enforced now: research-before-build/borrow-first evidence for
+research tasks, copy-ready AI dispatch, real-running truth, visibility-first,
+mandatory ADM status reports, cloud-first, and task identity. Rules not listed
+in `governance-rules.json` remain documented policy until an enforcement gate
+is implemented; documentation alone is not described as enforcement.
 
 ## Rules
 
@@ -64,8 +79,9 @@ individual project's own `TASKS` or business rules - it sits above them.
     accounting, and productivity. Keep only a small set worth direct adoption,
     integration/reference, or a new project; avoid popularity-only and
     unchanged repeat findings.
-16. This file is the cross-project Global Rules SSOT. Every AI task applies it
-    before project-specific rules, and rule changes require version + changelog.
+16. This file is the cross-project Global Rules policy SSOT. Rules designated
+    for mechanical enforcement are sourced from `governance-rules.json`; rule
+    changes require version + changelog.
     Project business/acceptance requirements win within their scope; Global
     Rules govern coordination and execution. Claude, Codex, and Antigravity
     must not maintain drifting copies of these common rules.
@@ -80,4 +96,7 @@ individual project's own `TASKS` or business rules - it sits above them.
 - 0.1.2 (2026-08-10): Added required cross-AI work-report identity fields.
 - 0.1.3 (2026-08-10): Added Development Overview, GitHub Research Gate,
   Weekly GitHub Discovery, cloud/local exception approval, and Global Rules
-  SSOT enforcement.
+  SSOT policy.
+- 0.1.4 (2026-08-19): Distinguished documented policy from mechanical
+  enforcement and linked the canonical mandatory-rule source and dispatch /
+  completion gates.

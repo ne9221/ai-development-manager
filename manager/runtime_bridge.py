@@ -13,6 +13,7 @@ from pathlib import Path
 from collectors.publish_drive import build_service
 from manager.dispatcher import clean, dispatch
 from manager.executions import list_executions
+from manager.governance import RULES_PATH, rendered_rules
 from manager.quota_reader import QuotaReaderError, parse_time, read_drive_status, summarize
 from manager.scheduler import schedule
 from manager.tasks import DriveRecords, MIME_FOLDER, ROOT_FOLDER_ID, ROOT_FOLDERS, TaskError, validate
@@ -20,7 +21,6 @@ from manager.tasks import DriveRecords, MIME_FOLDER, ROOT_FOLDER_ID, ROOT_FOLDER
 
 logger = logging.getLogger("runtime_bridge")
 
-RULES_PATH = Path(__file__).parents[1] / "AI-DEVELOPMENT-RULES.md"
 RUNTIME_STATUS_PROVIDERS = ("codex", "claude")
 RUNTIME_STATUS_WINDOW_FIELDS = ("name", "duration_minutes", "used_percent", "remaining_percent", "resets_at")
 RUNTIME_STATUS_CONTRACT_VERSION = "1.0"
@@ -44,13 +44,10 @@ def generated_task_id(value):
 
 
 def load_shared_rules(path=RULES_PATH):
-    selected = {2, 5, 6, 9, 10}
-    rules = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        match = re.match(r"(\d+)\.\s+(.+)", line)
-        if match and int(match.group(1)) in selected:
-            rules.append(match.group(2))
-    return rules
+    if Path(path) == RULES_PATH:
+        return rendered_rules()
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
+    return [f"{rule['id']}: {rule['instruction']}" for rule in document["mandatory_rules"]]
 
 
 def all_projects(store):
