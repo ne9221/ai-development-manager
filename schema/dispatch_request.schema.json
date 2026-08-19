@@ -3,7 +3,7 @@
   "title": "ChatGPT Drive Dispatch Request",
   "type": "object",
   "additionalProperties": false,
-  "required": ["request_id", "project_id", "title", "goal", "priority", "created_at"],
+  "required": ["request_id", "project_id", "title", "goal", "created_at"],
   "properties": {
     "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"},
     "project_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"},

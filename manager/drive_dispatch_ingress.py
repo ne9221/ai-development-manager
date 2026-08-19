@@ -98,7 +98,8 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
             request = read_request(service, folder_id, expected_owner, metadata, now=now)
             payload = {
                 "request_id": request["request_id"], "project_id": request["project_id"],
-                "title": request["title"], "goal": request["goal"], "priority": request["priority"],
+                "title": request["title"], "goal": request["goal"],
+                "priority": request.get("priority") or "normal",
                 "constraints": {"read_only": True},
             }
             if request.get("preferred_provider") is not None:
