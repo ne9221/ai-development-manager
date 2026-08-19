@@ -147,6 +147,19 @@ gcloud run deploy adm-runtime-bridge \
 # A 503 drive_unavailable here means the write path is broken even if
 # /health returned 200 -- do not proceed to a traffic cutover.
 
+# Running the above from Git Bash / MSYS on Windows: its automatic
+# POSIX-to-Windows path conversion can silently rewrite an absolute-path-
+# looking argument (e.g. GOOGLE_DRIVE_TOKEN=/secrets/...) into something
+# like C:/Program Files/Git/secrets/..., which deploys "successfully" but
+# breaks the write path exactly like the missing-var regression above --
+# confirmed happening in practice on 2026-08-19. `MSYS_NO_PATHCONV=1` does
+# not reliably fix this (it can break gcloud's own internal path handling
+# instead). Prefer running this command from PowerShell/cmd, or verify
+# afterward with `gcloud run revisions describe <new-revision>
+# --format="yaml(spec.containers[0].env)"` that GOOGLE_DRIVE_TOKEN/
+# CLAUDE_ACCOUNTS_CONFIG still read exactly `/secrets/...` before trusting
+# the deploy.
+
 # 2a) If reusing the existing smoke bucket: no IAM command needed (already granted).
 # 2b) If instead creating a fresh bucket:
 gcloud storage buckets create gs://adm-lock-registry-ai-development-manager-asia-east1 \
