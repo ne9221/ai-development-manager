@@ -464,19 +464,29 @@ def evaluate_circuit_breaker(
     return {"allowed": True, "state": STATE_ELIGIBLE, "reason": None}
 
 
-def build_default_task_claim_reader(bucket: str, project_id: str) -> Callable[[str], bool]:
-    """AG AC-SELECT-01: construct the real GCS-backed task_claim_reader for
-    callers that want manager.task_claims consulted during candidate
-    selection. Not wired in automatically by step_autopilot (see the comment
-    at its call site) -- pass this explicitly when the caller's deployment
-    already treats task_claims as authoritative. A backend error is treated
-    as "unknown, assume active" (fail closed): excludes the candidate rather
-    than risking a double-dispatch onto a task some other authority may
-    still be holding.
+def build_default_task_claim_reader(
+    bucket: str,
+    project_id: str,
+    registry_factory: Callable[..., Any] = task_claim_registry,
+) -> Callable[[str], bool]:
+    """AG AC-SELECT-01 / Codex P1-1 wiring fix: construct the real
+    task_claim_reader that step_autopilot wires in by default whenever
+    `bucket` (real backend authority) is available and the caller did not
+    already supply its own reader -- see the call site in step_autopilot.
+    A backend error is treated as "unknown, assume active" (fail closed):
+    excludes the candidate rather than risking a double-dispatch onto a task
+    some other authority may still be holding.
+
+    `registry_factory` defaults to the real manager.task_claims.task_claim_registry
+    (real GCS) but is a dedicated, narrow seam for tests: pass a factory that
+    returns an in-memory double (matching task_claim_registry's
+    `(bucket, project_id, task_id, session=None)` signature) to exercise this
+    exact code path without touching real GCS or special-casing any bucket
+    name/string in production logic.
     """
     def _reader(task_id: str) -> bool:
         try:
-            registry = task_claim_registry(bucket, project_id, task_id)
+            registry = registry_factory(bucket, project_id, task_id)
             return check_task_execution_claim(registry, project_id, task_id) is not None
         except Exception:
             return True
@@ -618,6 +628,7 @@ def step_autopilot(
     writer_registry_reader: Callable[[], dict[str, Any] | None] | None = None,
     head_reader: Callable[[str], str] | None = None,
     task_claim_reader: Callable[[str], bool] | None = None,
+    task_claim_registry_factory: Callable[..., Any] = task_claim_registry,
     dispatch_request_registry_factory: Callable[..., Any] = dispatch_request_registry,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -722,21 +733,29 @@ def step_autopilot(
         if t.get("status") == "completed":
             completed_ids.add(t.get("task_id"))
 
-    # AG AC-SELECT-01: exclude candidates already covered by an active
-    # manager.task_claims lease, in addition to executions/Commands. This is
-    # deliberately opt-in (via the `task_claim_reader` parameter) rather than
-    # auto-constructed from `bucket`: manager.task_claims is explicitly not
-    # yet wired into execution_lifecycle.enter_running_gate() as an
-    # authoritative gate elsewhere in this codebase (Slice 3A primitive), so
-    # silently making every bucket-configured Autopilot call depend on that
-    # backend being reachable would be a new hard dependency, not a
-    # narrowly-scoped safety fix. A caller that already treats task_claims as
-    # authoritative can pass its own reader; build_default_task_claim_reader()
-    # below is provided for that purpose.
+    # Codex P1-1 wiring fix / AG AC-SELECT-01: exclude candidates already
+    # covered by an active manager.task_claims lease, in addition to
+    # executions/Commands. An explicitly-injected `task_claim_reader` always
+    # wins; otherwise, whenever real backend authority is available (a
+    # `bucket` was supplied -- the same signal every other GCS-backed check
+    # in this function already gates on), the check is ON BY DEFAULT via
+    # build_default_task_claim_reader(), constructed through the
+    # `task_claim_registry_factory` seam so tests can supply an in-memory
+    # double instead of touching real GCS -- never by special-casing a
+    # bucket name/string. Without a bucket, there is no backend authority to
+    # verify claims against at all (the same precondition the CAS
+    # continuation claim and dispatch-request idempotency checks already
+    # require), so no new hard dependency is introduced beyond what this
+    # function already needs `bucket` for.
+    effective_task_claim_reader = task_claim_reader
+    if effective_task_claim_reader is None and bucket:
+        effective_task_claim_reader = build_default_task_claim_reader(
+            bucket, project_id, registry_factory=task_claim_registry_factory)
+
     selection = find_next_candidate_task(
         store, project_id, completed_ids, project=project,
         git_checker=git_checker, writer_registry_reader=writer_registry_reader, head_reader=head_reader,
-        task_claim_reader=task_claim_reader,
+        task_claim_reader=effective_task_claim_reader,
     )
     next_task = selection["task"]
     if next_task is None:

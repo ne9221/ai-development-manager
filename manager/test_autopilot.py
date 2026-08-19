@@ -417,6 +417,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
             continuation_count=0, bucket="test-bucket",
             continuation_registry_factory=lambda *_: claim_reg,
             dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+            task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
             quota_document=self.quota_doc,
             git_checker=lambda _: (True, ""),
         )
@@ -449,6 +450,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
         first = step_autopilot(self.store, None, "p1", "exec-1", session_start, continuation_count=0,
                                bucket="test-bucket", continuation_registry_factory=lambda *_: claim_reg,
  dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+ task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                                quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("dispatched", first["status"])
 
@@ -461,6 +463,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
         second = step_autopilot(self.store, None, "p1", "exec-1", session_start, continuation_count=0,
                                 bucket="test-bucket", continuation_registry_factory=lambda *_: claim_reg,
  dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+ task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                                 quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("halted", second["status"])
         self.assertEqual(STATE_BLOCKED, second["state"])
@@ -489,6 +492,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
         res = step_autopilot(self.store, None, "p1", "exec-1", session_start, continuation_count=0,
                              bucket="test-bucket", continuation_registry_factory=lambda *_: claim_reg,
  dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+ task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
 
         self.assertEqual("halted", res["status"])
@@ -507,6 +511,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
         res = step_autopilot(self.store, None, "p1", "exec-1", session_start, continuation_count=0,
                              bucket="test-bucket", continuation_registry_factory=lambda *_: claim_reg,
  dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+ task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
 
         self.assertEqual("done", res["status"])
@@ -534,6 +539,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
         first = step_autopilot(self.store, None, "p1", "exec-1", session_start, continuation_count=0,
                                bucket="test-bucket", continuation_registry_factory=lambda *_: claim_reg,
  dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+ task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                                quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("dispatched", first["status"])
 
@@ -547,6 +553,7 @@ class AutopilotStepIntegrationTests(unittest.TestCase):
         second = step_autopilot(self.store, None, "p1", "exec-1", session_start, continuation_count=0,
                                 bucket="test-bucket", continuation_registry_factory=lambda *_: claim_reg,
  dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+ task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                                 quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("already_claimed", second["status"])
         self.assertEqual(STATE_DISPATCHED, second["state"])
@@ -852,6 +859,7 @@ class ContinuationDispatchRecoveryIntegrationTests(unittest.TestCase):
                                   continuation_count=0, bucket="test-bucket",
                                   continuation_registry_factory=lambda *_: claim_reg,
                                   dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+                                  task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                                   quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         finally:
             autopilot_module.dispatcher_dispatch = original
@@ -954,6 +962,7 @@ class RestartSafeContinuationDepthTests(unittest.TestCase):
                              continuation_count=0, bucket="test-bucket",
                              continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
                              dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+                             task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("halted", res["status"])
         self.assertEqual(STATE_DONE, res["state"])
@@ -975,6 +984,7 @@ class RestartSafeContinuationDepthTests(unittest.TestCase):
                              continuation_count=0, bucket="test-bucket",
                              continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
                              dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+                             task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("dispatched", res["status"])
 
@@ -1072,6 +1082,7 @@ class CandidateEligibilityBeforeRankingTests(unittest.TestCase):
                              continuation_count=0, bucket="test-bucket",
                              continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
                              dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+                             task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=sample_quota_document(), git_checker=lambda _: (True, ""))
         self.assertEqual("halted", res["status"])
         self.assertEqual(STATE_BLOCKED, res["state"])
@@ -1154,6 +1165,7 @@ class RetryInvariantRegressionTests(unittest.TestCase):
                              continuation_count=0, bucket="test-bucket",
                              continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
                              dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+                             task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("halted", res["status"])
         self.assertEqual(STATE_RETRY_ELIGIBLE, res["state"])
@@ -1226,6 +1238,7 @@ class TrustedWatcherAdmissionIntegrationTests(unittest.TestCase):
                               continuation_count=0, bucket="test-bucket",
                               continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
                               dispatch_request_registry_factory=lambda *_: self.dispatch_reg,
+                              task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                               quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
 
     def test_valid_autopilot_continuation_passes_watcher_trusted_admission(self):
@@ -1374,6 +1387,7 @@ class DeterministicCommandIdentityTests(unittest.TestCase):
                                continuation_count=0, bucket="test-bucket",
                                continuation_registry_factory=lambda *_: claim_reg,
                                dispatch_request_registry_factory=lambda *_: dispatch_reg,
+                               task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                                quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("dispatched", first["status"])
         first_command_id = first["next_command_id"]
@@ -1397,6 +1411,7 @@ class DeterministicCommandIdentityTests(unittest.TestCase):
                                 continuation_count=0, bucket="test-bucket",
                                 continuation_registry_factory=lambda *_: claim_reg,
                                 dispatch_request_registry_factory=lambda *_: dispatch_reg,
+                                task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                                 quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("already_claimed", second["status"])
         self.assertEqual(first_command_id, second["existing_command_id"])
@@ -1408,6 +1423,7 @@ class DeterministicCommandIdentityTests(unittest.TestCase):
                              continuation_count=0, bucket="test-bucket",
                              continuation_registry_factory=lambda *_: claim_reg,
                              dispatch_request_registry_factory=lambda *_: dispatch_reg,
+                             task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         today = datetime.now(timezone.utc).date().isoformat()
         self.assertNotIn(today, res["next_command_id"])
@@ -1438,6 +1454,7 @@ class CasNotProofOfDispatchRecoveryTests(unittest.TestCase):
                                continuation_count=0, bucket="test-bucket",
                                continuation_registry_factory=lambda *_: claim_reg,
                                dispatch_request_registry_factory=lambda *_: dispatch_reg,
+                               task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                                quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("dispatched", first["status"])
 
@@ -1449,6 +1466,7 @@ class CasNotProofOfDispatchRecoveryTests(unittest.TestCase):
                                 continuation_count=0, bucket="test-bucket",
                                 continuation_registry_factory=lambda *_: claim_reg,
                                 dispatch_request_registry_factory=lambda *_: dispatch_reg,
+                                task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                                 quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("already_claimed", second["status"])
         self.assertEqual(STATE_DISPATCHED, second["state"])
@@ -1469,6 +1487,7 @@ class CasNotProofOfDispatchRecoveryTests(unittest.TestCase):
                              continuation_count=0, bucket="test-bucket",
                              continuation_registry_factory=lambda *_: claim_reg,
                              dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+                             task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("halted", res["status"])
         self.assertEqual(STATE_ATTENTION_REQUIRED, res["state"])
@@ -1501,6 +1520,7 @@ class DurableLineageFieldsTests(unittest.TestCase):
                              continuation_count=0, bucket="test-bucket",
                              continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
                              dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+                             task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("dispatched", res["status"])
 
@@ -1533,6 +1553,7 @@ class DurableLineageFieldsTests(unittest.TestCase):
                              continuation_count=0, bucket="test-bucket",
                              continuation_registry_factory=lambda *_: claim_reg,
                              dispatch_request_registry_factory=lambda *_: dispatch_reg,
+                             task_claim_registry_factory=lambda *_: MemoryClaimRegistry(),
                              quota_document=self.quota_doc, git_checker=lambda _: (True, ""))
         self.assertEqual("dispatched", res["status"])
         child_sc = self.store.get("tasks", "p1", "child-1")["source_context"]
@@ -1595,6 +1616,123 @@ class OptInTaskClaimExclusionTests(unittest.TestCase):
         selection = find_next_candidate_task(self.store, "p1", set(), project=self.project,
                                              git_checker=lambda _: (True, ""))
         self.assertIsNotNone(selection["task"])
+
+
+_UNSET = object()
+
+
+class DefaultPathTaskClaimWiringTests(unittest.TestCase):
+    """Codex P1-1 wiring fix: task-claim exclusion must be ON BY DEFAULT in
+    the real/default step_autopilot() invocation path -- bucket supplied,
+    task_claim_reader NOT explicitly passed -- whenever real backend
+    authority (bucket) is available, not only when a caller opts in with its
+    own reader. Uses `task_claim_registry_factory` (a narrow backend seam,
+    mirroring continuation_registry_factory / dispatch_request_registry_factory)
+    to inject an in-memory double instead of touching real GCS -- production
+    code never special-cases a bucket name/string."""
+
+    def setUp(self):
+        self.store = MemoryStore()
+        self.project = sample_project("p1", working_directory=os.getcwd())
+        self.store.put("projects", "p1", "p1", self.project)
+        self.quota_doc = sample_quota_document()
+        task1 = sample_task("p1", "t1", status="completed", read_only=True, needs_repo_edit=False)
+        self.store.put("tasks", "p1", "t1", task1)
+        exec1 = sample_execution("p1", "t1", "exec-1", status="completed")
+        self.store.put("executions", "p1", "exec-1", exec1)
+
+    def _claimed_registry(self, task_id):
+        reg = MemoryClaimRegistry()
+        reg.document = {
+            "schema_version": "0.1.0", "project_id": "p1", "task_id": task_id,
+            "execution_id": "exec-other-owner", "provider": "codex",
+            "claimed_at": now_iso_for_tests(),
+        }
+        reg.generation = 1
+        return reg
+
+    def _run(self, task_claim_registry_factory=None, task_claim_reader=_UNSET):
+        kwargs = {}
+        if task_claim_reader is not _UNSET:
+            kwargs["task_claim_reader"] = task_claim_reader
+        return step_autopilot(
+            self.store, None, "p1", "exec-1", datetime.now(timezone.utc),
+            continuation_count=0, bucket="test-bucket",
+            continuation_registry_factory=lambda *_: MemoryClaimRegistryWithCAS(),
+            dispatch_request_registry_factory=lambda *_: MemoryClaimRegistry(),
+            task_claim_registry_factory=task_claim_registry_factory or (lambda *_: MemoryClaimRegistry()),
+            quota_document=self.quota_doc, git_checker=lambda _: (True, ""),
+            **kwargs,
+        )
+
+    def test_default_real_path_skips_claimed_urgent_selects_lower_priority_eligible(self):
+        urgent = sample_task("p1", "urgent-1", title="Urgent", status="ready", depends_on=["t1"])
+        urgent["priority"] = "urgent"
+        self.store.put("tasks", "p1", "urgent-1", urgent)
+        normal = sample_task("p1", "normal-1", title="Normal", status="ready", depends_on=["t1"])
+        normal["priority"] = "normal"
+        self.store.put("tasks", "p1", "normal-1", normal)
+
+        claimed = {"urgent-1": self._claimed_registry("urgent-1")}
+
+        def registry_factory(bucket, project_id, task_id, session=None):
+            return claimed.get(task_id, MemoryClaimRegistry())
+
+        # task_claim_reader intentionally NOT passed -- this is the
+        # default/real invocation path Codex flagged as unsafe.
+        res = self._run(task_claim_registry_factory=registry_factory)
+        self.assertEqual("dispatched", res["status"])
+        self.assertEqual("normal-1", res["next_task_id"])
+
+    def test_default_real_path_with_no_active_claim_proceeds(self):
+        task2 = sample_task("p1", "t2", title="Task 2", status="ready", depends_on=["t1"])
+        self.store.put("tasks", "p1", "t2", task2)
+
+        res = self._run()  # empty registry everywhere -> no claim anywhere
+        self.assertEqual("dispatched", res["status"])
+        self.assertEqual("t2", res["next_task_id"])
+
+    def test_default_real_path_backend_error_fails_closed_zero_dispatch(self):
+        task2 = sample_task("p1", "t2", title="Task 2", status="ready", depends_on=["t1"])
+        self.store.put("tasks", "p1", "t2", task2)
+
+        def _raising_factory(bucket, project_id, task_id, session=None):
+            raise RuntimeError("simulated GCS outage")
+
+        res = self._run(task_claim_registry_factory=_raising_factory)
+        self.assertEqual("halted", res["status"])
+        self.assertNotEqual("dispatched", res["status"])
+        commands = [v for (area, project_id, _), v in self.store.data.items()
+                   if area == "commands" and project_id == "p1"]
+        self.assertEqual(0, len(commands), "backend failure must never result in an unsafe dispatch")
+
+    def test_explicit_task_claim_reader_still_overrides_default_wiring(self):
+        task2 = sample_task("p1", "t2", title="Task 2", status="ready", depends_on=["t1"])
+        self.store.put("tasks", "p1", "t2", task2)
+
+        # The default-constructed reader (via registry_factory) would report
+        # t2 as claimed; an explicitly-injected reader takes precedence.
+        res = self._run(
+            task_claim_registry_factory=lambda *_: self._claimed_registry("t2"),
+            task_claim_reader=lambda task_id: False,
+        )
+        self.assertEqual("dispatched", res["status"])
+        self.assertEqual("t2", res["next_task_id"])
+
+    def test_no_bucket_default_path_does_not_construct_a_reader(self):
+        """Without a bucket there is no backend authority to verify claims
+        against (the same precondition the CAS/dispatch-request checks
+        already require) -- this must not be treated as a NEW gap, just the
+        existing bucket-optional degraded mode."""
+        task2 = sample_task("p1", "t2", title="Task 2", status="ready", depends_on=["t1"])
+        self.store.put("tasks", "p1", "t2", task2)
+
+        res = step_autopilot(
+            self.store, None, "p1", "exec-1", datetime.now(timezone.utc),
+            continuation_count=0, bucket=None,
+            quota_document=self.quota_doc, git_checker=lambda _: (True, ""),
+        )
+        self.assertEqual("dispatched", res["status"])
 
 
 def now_iso_for_tests():
