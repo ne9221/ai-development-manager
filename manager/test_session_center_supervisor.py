@@ -13,6 +13,11 @@ from manager.session_center_supervisor import (
     decide, find_active_command, kill, lock_path_for, main, port_available,
     read_state, run_once, target_execution_id, write_state,
 )
+from manager.tasks import create_project, create_task
+from manager.test_command_watcher import Store as DriveStore, command as ingress_command
+from manager.test_execution_lifecycle import project, task
+from manager.test_task_claims import MemoryClaimRegistry
+from manager.trusted_ingress import REQUIRED_TASK_POLICIES
 
 
 class Store:
@@ -54,6 +59,100 @@ class FindActiveCommandTests(unittest.TestCase):
     def test_target_execution_id_falls_back_to_deterministic_command_prefix(self):
         self.assertEqual("command-c1", target_execution_id(cmd(execution_id=None)))
         self.assertEqual("real-exec-id", target_execution_id(cmd(execution_id="real-exec-id")))
+
+
+class FindActiveCommandTrustedIngressTests(unittest.TestCase):
+    """Session Center's active-command discovery must see the exact same set
+    of launchable commands manager.command_watcher does -- a command Command
+    Watcher will launch under the v1 trusted-ingress contract (see
+    manager.trusted_ingress) must never be invisible here just because it is
+    off the static ADM_WATCHER_ALLOWLIST_PATH allowlist. This reuses
+    verify_trusted_ingress_admission directly (no re-implementation), so
+    every adversarial case it already defends against is covered here too."""
+
+    def setUp(self):
+        self.store = DriveStore()
+        create_project(self.store, project())
+        self.registry = MemoryClaimRegistry()
+        self.registry.document = {
+            "schema_version": "0.1.0", "project_id": "p1", "request_id": "req-1",
+            "task_id": "t1", "command_id": "cmd-1", "created_at": "2026-08-14T00:00:00Z",
+        }
+        self.registry.generation = 1
+
+    def registry_factory(self, bucket, project_id, request_id):
+        return self.registry
+
+    def admitted_task(self, **overrides):
+        built = task(read_only=True)
+        built["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)
+        built["source_context"] = {
+            "origin": "direct_dispatch_ingress", "external_request_id": "req-1", "admission_version": "v1",
+        }
+        built.update(overrides)
+        create_task(self.store, built, assign=False)
+        return built
+
+    @staticmethod
+    def admitted_command(**overrides):
+        value = ingress_command(created_via="direct_dispatch_ingress", admission_version="v1", request_id="req-1")
+        value.update(overrides)
+        return value
+
+    def test_a_static_allowlist_path_still_works_unchanged_even_with_bucket_configured(self):
+        """Requirement A: an ordinary allowlisted command (no trusted-ingress
+        evidence at all) must still be discovered exactly as before, whether
+        or not a GCS bucket is now also configured."""
+        self.store.put("commands", "p1", "cmd-1", ingress_command())
+        result = find_active_command(self.store, frozenset({("p1", "t1")}), bucket="test-bucket",
+                                     ingress_registry_factory=self.registry_factory)
+        self.assertEqual("cmd-1", result["command_id"])
+
+    def test_b_valid_trusted_ingress_command_discovered_with_empty_static_allowlist(self):
+        """Requirement B: a fully-evidenced trusted-ingress command must be
+        found even though the static allowlist never names it."""
+        self.admitted_task()
+        self.store.put("commands", "p1", "cmd-1", self.admitted_command())
+        result = find_active_command(self.store, frozenset(), bucket="test-bucket",
+                                     ingress_registry_factory=self.registry_factory)
+        self.assertIsNotNone(result)
+        self.assertEqual("cmd-1", result["command_id"])
+
+    def test_c_forged_evidence_without_real_idempotency_record_never_discovered(self):
+        """Requirement C: created_via/admission_version/request_id alone --
+        with no corroborating GCS record ever actually claimed through the
+        authenticated ingress -- must not be enough."""
+        self.admitted_task()
+        self.registry.document = None  # nothing was ever really claimed through the ingress
+        self.store.put("commands", "p1", "cmd-1", self.admitted_command())
+        result = find_active_command(self.store, frozenset(), bucket="test-bucket",
+                                     ingress_registry_factory=self.registry_factory)
+        self.assertIsNone(result)
+
+    def test_d_unrelated_stale_codex_command_excluded(self):
+        """Requirement D: an ordinary queued command with no ingress evidence
+        and off the static allowlist stays invisible, exactly like today."""
+        self.store.put("commands", "p1", "cmd-1", ingress_command(provider="codex"))
+        result = find_active_command(self.store, frozenset(), bucket="test-bucket",
+                                     ingress_registry_factory=self.registry_factory)
+        self.assertIsNone(result)
+
+    def test_no_bucket_configured_never_evaluates_trusted_ingress_path(self):
+        """Fail closed the other direction too: without ADM_LOCK_GCS_BUCKET
+        configured, a trusted-ingress command is not discovered -- identical
+        to pre-fix behavior, never a silent new default-allow."""
+        self.admitted_task()
+        self.store.put("commands", "p1", "cmd-1", self.admitted_command())
+        result = find_active_command(self.store, frozenset(), bucket=None,
+                                     ingress_registry_factory=self.registry_factory)
+        self.assertIsNone(result)
+
+    def test_trusted_ingress_command_never_double_counted_when_also_allowlisted(self):
+        self.admitted_task()
+        self.store.put("commands", "p1", "cmd-1", self.admitted_command())
+        result = find_active_command(self.store, frozenset({("p1", "t1")}), bucket="test-bucket",
+                                     ingress_registry_factory=self.registry_factory)
+        self.assertEqual("cmd-1", result["command_id"])
 
 
 class StateTests(unittest.TestCase):
