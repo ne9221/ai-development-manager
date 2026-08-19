@@ -96,6 +96,7 @@ class TestAgHeadlessRunner(unittest.TestCase):
             json.dumps({"type": "result", "response": "Finished", "stats": {"tokens": 10}}) + "\n",
             "",
         ]
+        mock_proc.stderr.readline.side_effect = [""]
         mock_proc.poll.return_value = 0
 
         with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
