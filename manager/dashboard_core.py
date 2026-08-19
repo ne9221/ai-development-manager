@@ -22,6 +22,59 @@ from manager.quota_forecast import (
 TERMINAL_EXECUTION_STATUSES = {"completed", "failed", "interrupted", "cancelled"}
 
 
+@dataclass
+class ServiceHealthViewModel:
+    """UI ViewModel for a single infrastructure health check (Scheduled Task or HTTP service)."""
+    name: str
+    found: bool
+    detail: str
+    status_label: str  # "Online" | "Offline" | "Unknown"
+
+
+def parse_scheduled_task_health(task_name: str, raw_schtasks_output: str | None) -> ServiceHealthViewModel:
+    """Parse `schtasks /Query /TN <name> /FO LIST` stdout into a health viewmodel.
+
+    A missing/unparseable result (task query failed, schtasks unavailable) is
+    reported as Unknown rather than Offline -- we could not observe the real
+    state, so we must not claim a definite answer either way.
+    """
+    if not raw_schtasks_output:
+        return ServiceHealthViewModel(name=task_name, found=False, detail="query failed", status_label="Unknown")
+
+    status = None
+    task_state = None
+    for line in raw_schtasks_output.splitlines():
+        line = line.strip()
+        if line.startswith("Status:") and status is None:
+            status = line.split(":", 1)[1].strip()
+        elif line.startswith("Scheduled Task State:") and task_state is None:
+            task_state = line.split(":", 1)[1].strip()
+
+    if status is None:
+        return ServiceHealthViewModel(name=task_name, found=False, detail="not found", status_label="Unknown")
+
+    enabled = task_state != "Disabled" if task_state is not None else True
+    detail = f"{status}" + (f" / {task_state}" if task_state else "")
+    status_label = "Offline" if not enabled else "Online"
+    return ServiceHealthViewModel(name=task_name, found=True, detail=detail, status_label=status_label)
+
+
+def build_session_center_health(listening: bool, session: dict | None) -> ServiceHealthViewModel:
+    """Build a health viewmodel from a Session Center /health + /api/session probe result."""
+    if not listening:
+        return ServiceHealthViewModel(
+            name="Session Center (HTTP :8765)",
+            found=False,
+            detail="not listening -- normal when no AI execution is currently active",
+            status_label="Offline",
+        )
+    if session:
+        detail = f"provider={session.get('provider', '—')}, state={session.get('current_state', '—')}"
+    else:
+        detail = "listening, but /api/session did not respond"
+    return ServiceHealthViewModel(name="Session Center (HTTP :8765)", found=True, detail=detail, status_label="Online")
+
+
 def parse_time(value: str | None) -> datetime | None:
     if not value:
         return None

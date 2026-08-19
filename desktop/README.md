@@ -20,6 +20,11 @@ execution lifecycle, launchers, or credentials.
   up. Never kills an already-running AI execution or Session Center process.
 - `Restart-ADM.ps1` -- `Stop-ADM.ps1` then `Start-ADM.ps1`. Same "never kills
   in-progress work" guarantee.
+- `Start-Dashboard.ps1` -- opens the Streamlit Operations Dashboard
+  (`dashboard.py`) in the browser: quota, active executions, task board,
+  session/handoff inspector, and Watcher/Session Center health. Read-only,
+  keeps a visible console running the Streamlit server (unlike the other
+  scripts above, this one does not exit -- close the window to stop it).
 
 ## Desktop shortcut setup (one-time, per machine)
 

@@ -1,5 +1,9 @@
 import streamlit as st
 import os
+import json
+import subprocess
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 import pandas as pd
 
@@ -15,8 +19,57 @@ from manager.dashboard_core import (
     map_task_board,
     build_daily_brief_vm,
     DailyBriefViewModel,
-    AccountQuotaCardViewModel
+    AccountQuotaCardViewModel,
+    parse_scheduled_task_health,
+    build_session_center_health,
 )
+
+WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
+SUPERVISOR_TASK_NAME = "AI Development Manager - Session Center Supervisor"
+SESSION_CENTER_URL = "http://127.0.0.1:8765"
+
+
+def query_scheduled_task_raw(task_name):
+    """Shell out to schtasks for a task's live state. Returns None on any failure
+    (schtasks unavailable, non-Windows host, permission error) so the caller can
+    report Unknown rather than fabricating a state."""
+    try:
+        result = subprocess.run(
+            ["schtasks", "/Query", "/TN", task_name, "/FO", "LIST"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout
+    except Exception:
+        return None
+
+
+def query_session_center_raw():
+    """Probe the local Session Center HTTP endpoints. Returns (listening, session_dict)."""
+    try:
+        with urllib.request.urlopen(f"{SESSION_CENTER_URL}/health", timeout=2) as resp:
+            listening = resp.status == 200
+    except Exception:
+        listening = False
+
+    session = None
+    if listening:
+        try:
+            with urllib.request.urlopen(f"{SESSION_CENTER_URL}/api/session", timeout=2) as resp:
+                session = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            session = None
+    return listening, session
+
+
+@st.cache_data(ttl=15)
+def load_infra_health():
+    watcher_vm = parse_scheduled_task_health(WATCHER_TASK_NAME, query_scheduled_task_raw(WATCHER_TASK_NAME))
+    supervisor_vm = parse_scheduled_task_health(SUPERVISOR_TASK_NAME, query_scheduled_task_raw(SUPERVISOR_TASK_NAME))
+    listening, session = query_session_center_raw()
+    session_center_vm = build_session_center_health(listening, session)
+    return watcher_vm, supervisor_vm, session_center_vm
 
 # Page Configuration
 st.set_page_config(
@@ -128,8 +181,14 @@ def list_records_isolated(store, area, project_id):
     return records, warnings
 
 
-# Cache data loading to prevent unnecessary Drive API calls on interaction
-@st.cache_data(ttl=60)
+# Cache data loading to prevent unnecessary Drive API calls on interaction.
+# ttl is long (10 min) because a full reload does one sequential Drive API
+# call per task/execution/handoff/session record across every project --
+# measured at several minutes wall-clock on this account's current data
+# volume. A 60s ttl would force that full reload on almost every rerun
+# (e.g. clicking a tab), making the UI unusable. The sidebar "Sync with
+# Google Drive" button still forces an immediate refresh on demand.
+@st.cache_data(ttl=600)
 def load_all_data():
     now = datetime.now(timezone.utc)
     all_warnings = []
@@ -315,6 +374,33 @@ with m4:
         <div class="metric-value">{reliable_count} / {total_accounts_count}</div>
     </div>
     """, unsafe_allow_html=True)
+
+# =====================================================================
+# Section: Watcher & Session Center Health
+# =====================================================================
+st.header("🩺 Watcher & Session Center Health")
+health_status_badge = {
+    "Online": "badge-fresh",
+    "Offline": "badge-danger",
+    "Unknown": "badge-unknown",
+}
+try:
+    watcher_health, supervisor_health, session_center_health = load_infra_health()
+    h1, h2, h3 = st.columns(3)
+    for col, vm in zip((h1, h2, h3), (watcher_health, supervisor_health, session_center_health)):
+        with col:
+            badge_class = health_status_badge.get(vm.status_label, "badge-unknown")
+            st.markdown(f"""
+            <div class="glass-card">
+                <div class="metric-label">{vm.name}</div>
+                <span class="badge {badge_class}" style="font-size:0.9rem;padding:6px 14px;">{vm.status_label.upper()}</span>
+                <p style="margin-top:10px;color:#8b949e;font-size:0.85rem;">{vm.detail}</p>
+            </div>
+            """, unsafe_allow_html=True)
+except Exception as health_exc:
+    st.warning(f"Could not evaluate Watcher/Session Center health: {health_exc}")
+
+st.markdown("---")
 
 # =====================================================================
 # Section A: Today's AI Recommendation (Daily Brief)

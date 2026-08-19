@@ -16,7 +16,9 @@ from manager.dashboard_core import (
     build_account_quota_card_vm,
     build_daily_brief_vm,
     AccountQuotaCardViewModel,
-    DailyBriefViewModel
+    DailyBriefViewModel,
+    parse_scheduled_task_health,
+    build_session_center_health,
 )
 from manager.quota_forecast import (
     AccountQuotaForecast,
@@ -495,6 +497,46 @@ class DirectDispatchDashboardVisibilityTests(unittest.TestCase):
         self.assertEqual(1, len(board["Completed"]))
         summary = get_global_summary([], [task], active_executions)
         self.assertEqual(0, summary["active_sessions_count"])
+
+
+class WatcherSessionCenterHealthTests(unittest.TestCase):
+    def test_enabled_running_task_is_online(self):
+        raw = "TaskName:  \\Foo\nStatus:  Running\nScheduled Task State:  Enabled\n"
+        vm = parse_scheduled_task_health("Foo", raw)
+        self.assertTrue(vm.found)
+        self.assertEqual("Online", vm.status_label)
+
+    def test_enabled_ready_idle_task_is_online(self):
+        raw = "TaskName:  \\Foo\nStatus:  Ready\nScheduled Task State:  Enabled\n"
+        vm = parse_scheduled_task_health("Foo", raw)
+        self.assertEqual("Online", vm.status_label)
+
+    def test_disabled_task_is_offline(self):
+        raw = "TaskName:  \\Foo\nStatus:  Ready\nScheduled Task State:  Disabled\n"
+        vm = parse_scheduled_task_health("Foo", raw)
+        self.assertEqual("Offline", vm.status_label)
+
+    def test_missing_query_output_is_unknown_not_offline(self):
+        vm = parse_scheduled_task_health("Foo", None)
+        self.assertFalse(vm.found)
+        self.assertEqual("Unknown", vm.status_label)
+
+    def test_unparseable_output_is_unknown(self):
+        vm = parse_scheduled_task_health("Foo", "ERROR: The system cannot find the file specified.\n")
+        self.assertEqual("Unknown", vm.status_label)
+
+    def test_session_center_not_listening_is_offline(self):
+        vm = build_session_center_health(listening=False, session=None)
+        self.assertEqual("Offline", vm.status_label)
+
+    def test_session_center_listening_with_session_is_online(self):
+        vm = build_session_center_health(listening=True, session={"provider": "codex", "current_state": "running"})
+        self.assertEqual("Online", vm.status_label)
+        self.assertIn("codex", vm.detail)
+
+    def test_session_center_listening_without_session_payload_is_online(self):
+        vm = build_session_center_health(listening=True, session=None)
+        self.assertEqual("Online", vm.status_label)
 
 
 if __name__ == "__main__":
