@@ -17,11 +17,13 @@ every generated Task; dispatch rejects missing or stale stamps. The dispatcher
 also renders those rules into every Codex, Claude, and Antigravity execution
 brief, so agents do not need to remember to read this file.
 
-Mechanically enforced now: research-before-build/borrow-first evidence for
-research tasks, copy-ready AI dispatch, real-running truth, visibility-first,
-mandatory ADM status reports, cloud-first, and task identity. Rules not listed
-in `governance-rules.json` remain documented policy until an enforcement gate
-is implemented; documentation alone is not described as enforcement.
+Mechanically enforced now: parallel-first inheritance through the existing
+parallel scheduler, research-before-build/borrow-first completion evidence,
+copy-ready dispatch, real-running truth, visibility-first, mandatory ADM status
+reports, cloud-first, and task identity. The command watcher rejects unstamped
+or stale Tasks before launch. Rules not listed in `governance-rules.json` remain
+documented policy until an enforcement gate is implemented; documentation alone
+is not described as enforcement.
 
 ## Rules
 

@@ -266,8 +266,8 @@ def cleanup_execution(writer_registry, claim_registry, execution, claim_generati
     return evidence
 
 
-def _terminal_handoff(execution, status, summary, timestamp):
-    return {
+def _terminal_handoff(execution, task, status, summary, timestamp):
+    handoff = {
         "handoff_id": f"{execution['task_id']}-{status}-{execution['execution_id']}",
         "task_id": execution["task_id"], "project_id": execution["project_id"],
         "created_at": timestamp, "from_provider": execution["provider"], "to_provider": None,
@@ -278,6 +278,11 @@ def _terminal_handoff(execution, status, summary, timestamp):
         "files_changed": [], "commits": [], "tests": [], "known_issues": [], "do_not_touch": [],
         "acceptance_criteria": execution["task_snapshot"].get("acceptance_criteria", []),
     }
+    if status == "completed":
+        from manager.governance import execution_completion_report
+
+        handoff["completion_report"] = execution_completion_report(task, execution, summary)
+    return handoff
 
 
 def _optional_record(store, area, project_id, record_id):
@@ -305,7 +310,7 @@ def _expected_terminal_task(task, execution_id, status, summary, timestamp):
 
 
 def _terminal_state(execution, task, handoff, status, summary, timestamp):
-    expected_handoff = _terminal_handoff(execution, status, summary, timestamp)
+    expected_handoff = _terminal_handoff(execution, task, status, summary, timestamp)
     expected_task = _expected_terminal_task(task, execution["execution_id"], status, summary, timestamp)
     return expected_handoff, expected_task, handoff == expected_handoff and task == expected_task
 
@@ -365,7 +370,8 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
         if execution.get("status") == "running":
             terminal = persist_terminal(store, service, project_id, execution_id, status, timestamp, summary)
         persisted.append("execution")
-        expected_handoff = _terminal_handoff(terminal, status, summary, timestamp)
+        task = store.get("tasks", project_id, task_id)
+        expected_handoff = _terminal_handoff(terminal, task, status, summary, timestamp)
         handoff = _optional_record(store, "handoffs", project_id, expected_handoff["handoff_id"])
         if handoff is None:
             create_handoff(store, expected_handoff)
@@ -374,7 +380,6 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
         elif handoff != expected_handoff:
             raise TaskError("deterministic terminal handoff conflicts with persisted content")
         persisted.append("handoff")
-        task = store.get("tasks", project_id, task_id)
         expected_task = _expected_terminal_task(task, execution_id, status, summary, timestamp)
         if task != expected_task:
             store.put("tasks", project_id, task_id, expected_task)

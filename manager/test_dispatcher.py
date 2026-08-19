@@ -90,9 +90,9 @@ class DispatcherTests(unittest.TestCase):
             with self.subTest(provider=provider):
                 result = self.dispatch_case(request(task_id=task_id, title="Conversation label differs", preferred_provider=provider), quota(80, 80))
                 prompt = result["generated_prompt"]
-                expected = {"ai": provider.title(), "project": "p1", "task": task_id}
+                expected = {"ai": provider.title(), "project": "p1", "task": task_id, "conversation": "not supplied"}
                 self.assertEqual(expected, parse_identity_header(prompt))
-                self.assertTrue(prompt.startswith(f"AI: {provider.title()}\nProject: p1\nTask: {task_id}\n\n"))
+                self.assertTrue(prompt.startswith(f"AI: {provider.title()}\nProject: p1\nTask: {task_id}\nConversation:"))
                 self.assertIn("Project name: Project One", prompt)
                 self.assertIn("Task goal: Conversation label differs", prompt)
                 self.assertIn("Conversation:", prompt)

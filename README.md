@@ -117,7 +117,9 @@ metadata with the current canonical version/digest/rule IDs/status fields.
 Dispatch fails if that metadata is missing or stale. Completed reports supplied
 through `task-complete` must contain every canonical ADM status field; research
 tasks require PoC or explicit rejection evidence, and any running claim requires
-real execution evidence.
+real execution evidence. The command watcher independently verifies the same
+governance stamp before launch, and the existing scheduler groups independent,
+non-conflicting work into parallel batches.
 
 ## Drive authentication health
 
