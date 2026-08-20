@@ -10,8 +10,8 @@ from unittest.mock import Mock, patch
 
 from manager.refresh_status import RefreshError, runtime_lock
 from manager.session_center_supervisor import (
-    decide, find_active_command, kill, lock_path_for, main, port_available,
-    read_state, run_once, target_execution_id, write_state,
+    decide, find_active_command, kill, lock_path_for, main, maintain_command_watcher,
+    port_available, read_state, run_once, target_execution_id, write_state,
 )
 from manager.tasks import create_project, create_task
 from manager.test_command_watcher import Store as DriveStore, command as ingress_command
@@ -27,6 +27,88 @@ class Store:
     def list_records(self, area, project_id):
         assert area == "commands"
         return list(self.records.get(project_id, []))
+
+
+class WatcherMaintenanceTests(unittest.TestCase):
+    TASK = "AI Development Manager - Command Watcher"
+
+    @staticmethod
+    def task(repo, state="Disabled", task_name=TASK, task_path="\\"):
+        runner = str(Path(repo) / "manager" / "run_command_watcher.ps1")
+        return {
+            "task_name": task_name, "task_path": task_path, "state": state,
+            "actions": [{"execute": "powershell.exe",
+                         "arguments": f"-File '{runner}' -RepositoryPath '{repo}'"}],
+        }
+
+    def run_case(self, task, sentinel=False, enable=None, prior=None):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        repo = root / "production"
+        repo.mkdir()
+        maintenance = root / "runtime" / "watcher-maintenance.json"
+        incident = root / "runtime" / "watcher-self-heal.json"
+        if sentinel:
+            maintenance.parent.mkdir()
+            maintenance.write_text('{"reason":"intentional"}', encoding="utf-8")
+        if prior:
+            incident.parent.mkdir(exist_ok=True)
+            incident.write_text(json.dumps(prior), encoding="utf-8")
+        query = Mock(side_effect=(lambda: task(repo))) if callable(task) else Mock(return_value=task)
+        enable = enable or Mock()
+        result = maintain_command_watcher(
+            repo, maintenance, incident, query_task=query, enable_task=enable,
+            now=lambda: "2026-08-20T00:00:00Z",
+        )
+        return result, query, enable, incident, repo
+
+    def test_healthy_watcher_is_a_true_noop(self):
+        result, query, enable, incident, _ = self.run_case(lambda repo: self.task(repo, "Ready"))
+        self.assertEqual("healthy", result["result"])
+        enable.assert_not_called()
+        self.assertFalse(incident.exists())
+
+    def test_unexpected_disabled_watcher_is_enabled_exactly_once(self):
+        states = []
+        def task(repo):
+            states.append(1)
+            return self.task(repo, "Disabled" if len(states) == 1 else "Ready")
+        result, query, enable, incident, _ = self.run_case(task)
+        enable.assert_called_once_with(self.TASK)
+        self.assertEqual("enabled", result["result"])
+        saved = json.loads(incident.read_text(encoding="utf-8"))
+        self.assertEqual({"detected_at", "previous_state", "sentinel", "attempted", "result"}, set(saved))
+        self.assertTrue(saved["attempted"])
+
+    def test_action_from_another_clone_is_never_enabled(self):
+        result, _, enable, incident, repo = self.run_case(
+            lambda _repo: self.task(str(Path(_repo).parent / "scratch")))
+        enable.assert_not_called()
+        self.assertEqual("identity_rejected", result["result"])
+        self.assertTrue(incident.exists())
+
+    def test_maintenance_sentinel_blocks_reenable(self):
+        result, _, enable, _, _ = self.run_case(lambda repo: self.task(repo), sentinel=True)
+        enable.assert_not_called()
+        self.assertEqual("intentional_maintenance", result["result"])
+        self.assertTrue(result["sentinel"])
+
+    def test_failed_enable_is_visible_and_fails_closed_without_retry_loop(self):
+        failed = Mock(side_effect=OSError("access denied"))
+        result, _, failed, incident, _ = self.run_case(lambda repo: self.task(repo), enable=failed)
+        self.assertEqual("enable_failed", result["result"])
+        failed.assert_called_once()
+        prior = json.loads(incident.read_text(encoding="utf-8"))
+        result, _, second, _, _ = self.run_case(lambda repo: self.task(repo), prior=prior)
+        second.assert_not_called()
+        self.assertEqual("failed_closed", result["result"])
+
+    def test_self_heal_never_manually_runs_the_watcher(self):
+        import inspect
+        source = inspect.getsource(maintain_command_watcher)
+        self.assertNotIn("Start-ScheduledTask", source)
+        self.assertNotIn("poll_once", source)
 
 
 def cmd(command_id="c1", project_id="p1", task_id="t1", status="queued", execution_id=None, created_at="2026-08-14T00:00:00Z"):
@@ -378,7 +460,8 @@ class LockTests(unittest.TestCase):
                      patch("manager.session_center_supervisor.DriveRecords", return_value=Store({})), \
                      patch("manager.session_center_supervisor.spawn_session_center", spawn), \
                      patch("builtins.print"):
-                    main(["--python-path", "python", "--repository-path", ".", "--state-file", state_path])
+                    main(["--python-path", "python", "--repository-path", ".", "--manager-home", directory,
+                          "--state-file", state_path])
             spawn.assert_not_called()
             self.assertFalse(Path(state_path).exists())
 

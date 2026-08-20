@@ -28,8 +28,10 @@ Concurrency/crash/PID-reuse safety (adversarial review findings):
 """
 
 import argparse
+import datetime
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -45,6 +47,105 @@ from manager.trusted_ingress import verify_trusted_ingress_admission
 ACTIVE_STATUSES = ("queued", "claimed", "running")
 PORT_RECHECK_ATTEMPTS = 10
 PORT_RECHECK_INTERVAL_SECONDS = 0.2
+WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
+
+
+def _powershell_json(script):
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def query_command_watcher_task():
+    """Read only the one approved root task; no wildcard task discovery."""
+    quoted = WATCHER_TASK_NAME.replace("'", "''")
+    script = (
+        f"$t=Get-ScheduledTask -TaskName '{quoted}' -ErrorAction Stop; "
+        "$a=@($t.Actions|ForEach-Object{[pscustomobject]@{execute=$_.Execute;arguments=$_.Arguments}}); "
+        "[pscustomobject]@{task_name=$t.TaskName;task_path=$t.TaskPath;state=[string]$t.State;actions=$a} "
+        "| ConvertTo-Json -Depth 5 -Compress"
+    )
+    return _powershell_json(script)
+
+
+def enable_command_watcher_task(task_name):
+    if task_name != WATCHER_TASK_NAME:
+        raise ValueError("refusing to enable any task except the approved Command Watcher")
+    quoted = task_name.replace("'", "''")
+    subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+         f"Enable-ScheduledTask -TaskName '{quoted}' -ErrorAction Stop | Out-Null"],
+        capture_output=True, text=True, check=True,
+    )
+
+
+def _same_path(left, right):
+    return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(os.path.abspath(str(right)))
+
+
+def _approved_watcher_identity(task, repository_path):
+    if task.get("task_name") != WATCHER_TASK_NAME or task.get("task_path") != "\\":
+        return False
+    actions = task.get("actions")
+    if not isinstance(actions, list) or len(actions) != 1:
+        return False
+    action = actions[0]
+    if os.path.basename(action.get("execute") or "").lower() != "powershell.exe":
+        return False
+    arguments = action.get("arguments") or ""
+    match = re.search(r"-RepositoryPath\s+(['\"])(.*?)\1", arguments, re.IGNORECASE)
+    if not match or not _same_path(match.group(2), repository_path):
+        return False
+    runner = str(Path(repository_path) / "manager" / "run_command_watcher.ps1")
+    return any(quoted in arguments for quoted in (f"'{runner}'", f'"{runner}"'))
+
+
+def _read_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def maintain_command_watcher(repository_path, maintenance_path, incident_path,
+                             query_task=query_command_watcher_task,
+                             enable_task=enable_command_watcher_task,
+                             now=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")):
+    """Self-heal one verified disabled watcher without ever executing it."""
+    sentinel = Path(maintenance_path).is_file()
+    try:
+        task = query_task()
+    except Exception:
+        task = None
+    previous_state = task.get("state") if isinstance(task, dict) else "Unavailable"
+    evidence = {
+        "detected_at": now(), "previous_state": previous_state,
+        "sentinel": sentinel, "attempted": False, "result": "healthy",
+    }
+    if not task or not _approved_watcher_identity(task, repository_path):
+        evidence["result"] = "identity_rejected"
+    elif previous_state.lower() != "disabled":
+        return evidence
+    elif sentinel:
+        evidence["result"] = "intentional_maintenance"
+    elif (_read_json(incident_path) or {}).get("result") in ("enable_failed", "enable_unconfirmed"):
+        evidence["result"] = "failed_closed"
+        return evidence  # preserve the failure latch; do not create a retry loop
+    else:
+        evidence["attempted"] = True
+        try:
+            enable_task(WATCHER_TASK_NAME)
+            restored = query_task()
+            evidence["result"] = "enabled" if (
+                _approved_watcher_identity(restored, repository_path)
+                and str(restored.get("state", "")).lower() != "disabled"
+            ) else "enable_unconfirmed"
+        except Exception:
+            evidence["result"] = "enable_failed"
+    write_atomic(Path(incident_path), evidence)
+    return evidence
 
 
 def find_active_command(store, allowlist, bucket=None, ingress_registry_factory=dispatch_request_registry):
@@ -238,24 +339,30 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python-path", required=True)
     parser.add_argument("--repository-path", required=True)
+    parser.add_argument("--manager-home", required=True)
     parser.add_argument("--state-file", required=True)
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--wait-seconds", type=float, default=1800.0)
     args = parser.parse_args(argv)
 
     try:
-        from collectors.publish_drive import build_service
-        store = DriveRecords(build_service())
-    except Exception:
-        print(json.dumps({"status": "unavailable"}))
-        return 0
-
-    allowlist = load_allowlist()
-    try:
         with runtime_lock(lock_path_for(args.state_file)):
-            result = run_once(store, allowlist, args.state_file, args.python_path,
-                              args.repository_path, args.port, args.wait_seconds,
-                              bucket=os.environ.get("ADM_LOCK_GCS_BUCKET"))
+            runtime = Path(args.manager_home) / "runtime"
+            watcher = maintain_command_watcher(
+                args.repository_path,
+                runtime / "watcher-maintenance.json",
+                runtime / "watcher-self-heal.json",
+            )
+            try:
+                from collectors.publish_drive import build_service
+                store = DriveRecords(build_service())
+            except Exception:
+                result = {"status": "unavailable"}
+            else:
+                result = run_once(store, load_allowlist(), args.state_file, args.python_path,
+                                  args.repository_path, args.port, args.wait_seconds,
+                                  bucket=os.environ.get("ADM_LOCK_GCS_BUCKET"))
+            result["watcher_maintenance"] = watcher
     except RefreshError:
         # Another invocation is already mid-cycle: no-op, spawn/kill/write
         # nothing. This is not a failure -- it is mutual exclusion working.

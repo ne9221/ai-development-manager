@@ -11,9 +11,15 @@
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "AdmCommon.ps1")
 
+$repository = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+
 try {
+    Confirm-AdmWatcherTaskIdentity -RepositoryPath $repository | Out-Null
     Confirm-AdmTaskEnabled -TaskName $AdmSupervisorTask
     Confirm-AdmTaskEnabled -TaskName $AdmWatcherTask
+    $restoredWatcher = Get-ScheduledTask -TaskName $AdmWatcherTask -ErrorAction Stop
+    if ($restoredWatcher.State -eq "Disabled") { throw "Command Watcher remained disabled after restore" }
+    Clear-AdmWatcherMaintenance
 } catch {
     Show-AdmError "ADM could not start: $($_.Exception.Message)`n`nCheck that the ADM Scheduled Tasks were installed on this machine."
     exit 1

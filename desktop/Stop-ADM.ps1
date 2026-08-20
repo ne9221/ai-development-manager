@@ -10,6 +10,10 @@
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "AdmCommon.ps1")
 
+$repository = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+Confirm-AdmWatcherTaskIdentity -RepositoryPath $repository | Out-Null
+Write-AdmWatcherMaintenance -Reason "Stop-ADM intentional maintenance" -SourceRepository $repository
+
 foreach ($name in @($AdmSupervisorTask, $AdmWatcherTask)) {
     $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
     if (-not $task) {

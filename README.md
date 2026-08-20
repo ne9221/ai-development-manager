@@ -313,6 +313,16 @@ stdout and local diagnostic record contain only bounded safe status. Raw
 prompts, transcripts, stderr, credentials, and provider errors are not
 persisted.
 
+The one-click `desktop\Stop-ADM.ps1` and `desktop\Start-ADM.ps1` scripts are
+production control surfaces only when their repository path exactly matches
+the installed root Command Watcher task action. A scratch or copied checkout
+is never a production control surface and is refused before any task state
+change. Intentional stops are recorded outside the repository at
+`%USERPROFILE%\.ai-development-manager\runtime\watcher-maintenance.json`;
+the Session Center Supervisor leaves a disabled watcher alone while that
+sentinel exists and otherwise re-enables the exact verified task without
+executing it.
+
 ## Retry lifecycle
 
 A reservation that provably never started may transition from `reserved` to

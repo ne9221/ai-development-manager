@@ -7,6 +7,9 @@
 $AdmSupervisorTask = "AI Development Manager - Session Center Supervisor"
 $AdmWatcherTask = "AI Development Manager - Command Watcher"
 $AdmSessionCenterUrl = "http://127.0.0.1:8765"
+$AdmManagerHome = if ($env:AI_MANAGER_HOME) { $env:AI_MANAGER_HOME } else { Join-Path $env:USERPROFILE ".ai-development-manager" }
+$AdmRuntimePath = Join-Path $AdmManagerHome "runtime"
+$AdmWatcherMaintenancePath = Join-Path $AdmRuntimePath "watcher-maintenance.json"
 
 function Get-AdmTaskStatus {
     param([Parameter(Mandatory = $true)][string]$TaskName)
@@ -56,6 +59,55 @@ function Confirm-AdmTaskEnabled {
     }
     if ($task.State -eq "Disabled") {
         Enable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
+    }
+}
+
+function Test-AdmWatcherTaskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]$Task,
+        [Parameter(Mandatory = $true)][string]$RepositoryPath
+    )
+    if ($Task.TaskName -ne $AdmWatcherTask -or $Task.TaskPath -ne "\" -or @($Task.Actions).Count -ne 1) { return $false }
+    $action = @($Task.Actions)[0]
+    if ([IO.Path]::GetFileName([string]$action.Execute) -ne "powershell.exe") { return $false }
+    $repository = [IO.Path]::GetFullPath($RepositoryPath).TrimEnd('\')
+    $runner = Join-Path $repository "manager\run_command_watcher.ps1"
+    $arguments = [string]$action.Arguments
+    $singleQuote = [char]39
+    $doubleQuote = [char]34
+    $runnerExact = $arguments.Contains($singleQuote + $runner + $singleQuote) -or $arguments.Contains($doubleQuote + $runner + $doubleQuote)
+    $repositoryFlag = "-RepositoryPath "
+    $repositoryExact = $arguments.Contains($repositoryFlag + $singleQuote + $repository + $singleQuote) -or $arguments.Contains($repositoryFlag + $doubleQuote + $repository + $doubleQuote)
+    return $runnerExact -and $repositoryExact
+}
+
+function Confirm-AdmWatcherTaskIdentity {
+    param([Parameter(Mandatory = $true)][string]$RepositoryPath)
+    $task = Get-ScheduledTask -TaskName $AdmWatcherTask -ErrorAction SilentlyContinue
+    if (-not $task -or -not (Test-AdmWatcherTaskIdentity -Task $task -RepositoryPath $RepositoryPath)) {
+        throw "Refusing to control Command Watcher: its exact root task action does not match this repository: $RepositoryPath"
+    }
+    return $task
+}
+
+function Write-AdmWatcherMaintenance {
+    param(
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [Parameter(Mandatory = $true)][string]$SourceRepository
+    )
+    New-Item -ItemType Directory -Force -Path $AdmRuntimePath | Out-Null
+    $temporary = "$AdmWatcherMaintenancePath.tmp"
+    [ordered]@{
+        timestamp = [DateTime]::UtcNow.ToString("o")
+        reason = $Reason
+        source = $SourceRepository
+    } | ConvertTo-Json | Set-Content -LiteralPath $temporary -Encoding UTF8
+    Move-Item -LiteralPath $temporary -Destination $AdmWatcherMaintenancePath -Force
+}
+
+function Clear-AdmWatcherMaintenance {
+    if (Test-Path -LiteralPath $AdmWatcherMaintenancePath) {
+        Remove-Item -LiteralPath $AdmWatcherMaintenancePath -Force
     }
 }
 

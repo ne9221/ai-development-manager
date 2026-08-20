@@ -17,5 +17,5 @@ if ($GcsBucket) { $env:ADM_LOCK_GCS_BUCKET = $GcsBucket }
 Set-Location -LiteralPath $RepositoryPath
 & $PythonPath -m manager.session_center_supervisor `
     --python-path $PythonPath --repository-path $RepositoryPath `
-    --state-file $StateFile --port $Port
+    --manager-home $ManagerHome --state-file $StateFile --port $Port
 exit $LASTEXITCODE
