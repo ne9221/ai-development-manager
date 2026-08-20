@@ -453,9 +453,15 @@ class ExplicitProviderAccountRoutingTests(unittest.TestCase):
         self.assertIsNone(auto_command["requested_provider"])
         self.assertIsNone(auto_command["requested_account_id"])
 
+    def test_explicit_antigravity_provider_is_accepted(self):
+        result = self.call(payload(request_id="req-ag", provider="antigravity"))
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual("antigravity", command["provider"])
+        self.assertEqual("antigravity", command["requested_provider"])
+
     def test_invalid_provider_rejected(self):
         with self.assertRaises(DispatchIngressError) as ctx:
-            self.call(payload(request_id="req-badprov", provider="antigravity"))
+            self.call(payload(request_id="req-badprov", provider="gemini"))
         self.assertEqual("malformed_request", ctx.exception.code)
 
     def test_account_id_requires_explicit_claude_provider(self):

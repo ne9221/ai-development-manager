@@ -87,7 +87,7 @@ ALLOWED_CONSTRAINT_FIELDS = {"read_only"}
 ALLOWED_PRIORITIES = {"low", "normal", "high", "urgent"}
 # Matches schema/command.schema.json's provider enum -- the only providers
 # the Command Watcher can actually launch today.
-ALLOWED_PROVIDERS = {"codex", "claude"}
+ALLOWED_PROVIDERS = {"codex", "claude", "antigravity"}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 # Matches schema/command.schema.json's execution_id pattern exactly (longer
 # max length than the other ingress ids).

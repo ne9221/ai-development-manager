@@ -148,6 +148,26 @@ class DriveDispatchIngressTests(unittest.TestCase):
         self.assertEqual({"read_only": True}, payload["constraints"])
         self.assertNotIn("created_at", payload)
 
+    def test_supported_providers_and_null_validate(self):
+        for provider in ("codex", "claude", "antigravity", None):
+            with self.subTest(provider=provider):
+                service = Service(request(preferred_provider=provider))
+                self.assertEqual(provider, read_request(
+                    service, FOLDER_ID, OWNER, service._files.file, NOW,
+                )["preferred_provider"])
+
+    def test_antigravity_request_reaches_trusted_read_only_ingress(self):
+        service = Service(request(preferred_provider="antigravity"))
+        handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1",
+                                     "task_id": "dispatch-drive-e2e-1",
+                                     "command_id": "dispatch-drive-e2e-1", "status": "queued"})
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            result = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                                  registry_factory=lambda *_args: object())
+        self.assertTrue(result[0]["accepted"])
+        self.assertEqual("antigravity", handler.call_args.args[3]["provider"])
+        self.assertEqual({"read_only": True}, handler.call_args.args[3]["constraints"])
+
     def test_missing_priority_defaults_to_normal(self):
         document = {k: v for k, v in request().items() if k != "priority"}
         service = Service(document)

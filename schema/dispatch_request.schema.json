@@ -9,7 +9,7 @@
     "project_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"},
     "title": {"type": "string", "minLength": 1, "maxLength": 300},
     "goal": {"type": "string", "minLength": 1, "maxLength": 4000},
-    "preferred_provider": {"type": ["string", "null"], "enum": ["codex", "claude", null]},
+    "preferred_provider": {"type": ["string", "null"], "enum": ["codex", "claude", "antigravity", null]},
     "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
     "created_at": {"type": "string", "format": "date-time"}
   }
