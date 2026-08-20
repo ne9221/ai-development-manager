@@ -253,7 +253,8 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
                       retry_of_execution_id=retry_of_execution_id)
     if provider == "antigravity":
         from manager.ag_runner import LaunchRequest as _AgLaunchRequest
-        request = _AgLaunchRequest(working_directory, model=model, reasoning_effort=dispatched["effort"],
+        request = _AgLaunchRequest(working_directory, project_id=project_id, model=model,
+                                   reasoning_effort=dispatched["effort"],
                                    sandbox="read-only" if task["read_only"] else None,
                                    approval_policy="never" if task["read_only"] else None,
                                    timeout_seconds=RPC_TIMEOUT_SECONDS, turn_timeout_seconds=turn_timeout)

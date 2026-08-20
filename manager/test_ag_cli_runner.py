@@ -89,7 +89,10 @@ class TestOfficialAgCliRunner(unittest.TestCase):
         mock_auth = lambda: "local_profile"
         runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
 
-        req = LaunchRequest(working_directory="/test", model="flash")
+        req = LaunchRequest(
+            working_directory="/test", project_id="ai-development-manager", model="flash",
+            sandbox="read-only", approval_policy="never",
+        )
         prepared = runner.prepare(req)
         self.assertEqual(prepared.mode, "cli")
         self.assertTrue(prepared.thread_id.startswith("ag-cli-"))
@@ -104,7 +107,8 @@ class TestOfficialAgCliRunner(unittest.TestCase):
         mock_proc.poll.return_value = 0
         mock_proc.returncode = 0
 
-        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+        with patch("pathlib.Path.is_dir", return_value=True), \
+             patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
             running = runner.start(prepared, "Read README header")
             self.assertEqual(prepared.pid, 9999)
 
@@ -114,6 +118,11 @@ class TestOfficialAgCliRunner(unittest.TestCase):
             self.assertIn("--model", called_args)
             self.assertIn("flash", called_args)
             self.assertIn("Read README header", called_args)
+            self.assertEqual(mock_popen.call_args.kwargs["env"]["ANTIGRAVITY_PROJECT_ID"],
+                             "ai-development-manager")
+            self.assertEqual(mock_popen.call_args.kwargs["cwd"], "/test")
+            self.assertEqual(prepared._request.sandbox, "read-only")
+            self.assertEqual(prepared._request.approval_policy, "never")
 
             outcome = runner.wait(running)
             self.assertEqual(outcome.status, "completed")
@@ -123,12 +132,25 @@ class TestOfficialAgCliRunner(unittest.TestCase):
 
             runner.close(prepared)
 
+    def test_agentapi_project_environment_requires_project_id(self):
+        runner = OfficialAgCliRunner(
+            executable_resolver=lambda: ("/opt/bin/agentapi", []),
+            auth_verifier=lambda: "local_profile",
+        )
+        prepared = runner.prepare(LaunchRequest(working_directory="/test"))
+
+        with patch("subprocess.Popen") as mock_popen, self.assertRaises(AgLaunchError) as ctx:
+            runner.start(prepared, "Run task")
+
+        self.assertEqual(ctx.exception.classification, "missing_project_id")
+        mock_popen.assert_not_called()
+
     def test_cli_lifecycle_agentapi_structured_error(self):
         mock_resolver = lambda: ("/opt/bin/agentapi", [])
         mock_auth = lambda: "local_profile"
         runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
 
-        req = LaunchRequest(working_directory="/test")
+        req = LaunchRequest(working_directory="/test", project_id="p1")
         prepared = runner.prepare(req)
 
         mock_proc = MagicMock()
@@ -177,7 +199,7 @@ class TestOfficialAgCliRunner(unittest.TestCase):
         mock_auth = lambda: "local_profile"
         runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
 
-        req = LaunchRequest(working_directory="/test", turn_timeout_seconds=0.1)
+        req = LaunchRequest(working_directory="/test", project_id="p1", turn_timeout_seconds=0.1)
         prepared = runner.prepare(req)
 
         mock_proc = MagicMock()
@@ -199,7 +221,7 @@ class TestOfficialAgCliRunner(unittest.TestCase):
         mock_auth = lambda: "local_profile"
         runner = OfficialAgCliRunner(executable_resolver=mock_resolver, auth_verifier=mock_auth)
 
-        req = LaunchRequest(working_directory="/test")
+        req = LaunchRequest(working_directory="/test", project_id="p1")
         prepared = runner.prepare(req)
 
         mock_proc = MagicMock()

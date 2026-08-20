@@ -308,7 +308,13 @@ class OfficialAgCliRunner:
 
         # Build CLI arguments based on target tool
         basename = Path(executable).name.lower()
-        if "agentapi" in basename or (prefix_args and "agentapi" in prefix_args):
+        is_agentapi = "agentapi" in basename or (prefix_args and "agentapi" in prefix_args)
+        if is_agentapi:
+            if not req.project_id:
+                raise AgLaunchError(
+                    "missing_project_id",
+                    "AgentAPI requires project_id when resolving the working-directory project environment",
+                )
             args.extend(["new-conversation"])
             if req.model:
                 args.extend(["--model", req.model])
@@ -322,6 +328,8 @@ class OfficialAgCliRunner:
 
         # Sanitize environment to prevent secondary billing / external API key injection
         env = sanitize_ag_environment(os.environ)
+        if is_agentapi:
+            env["ANTIGRAVITY_PROJECT_ID"] = req.project_id
 
         # Enforce sandbox and working directory
         cwd = req.working_directory if Path(req.working_directory).is_dir() else None

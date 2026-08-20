@@ -34,6 +34,7 @@ def utc_now() -> str:
 @dataclass(frozen=True)
 class LaunchRequest:
     working_directory: str
+    project_id: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
     sandbox: str | None = "read-only"

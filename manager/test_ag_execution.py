@@ -148,9 +148,11 @@ class MockCliRunner:
 
     def __init__(self):
         self.events = []
+        self.request = None
 
     def prepare(self, request):
         self.events.append("prepare")
+        self.request = request
         prep = PreparedLaunch(
             thread_id="ag-cli-abc99999",
             session_path=None,
@@ -268,6 +270,10 @@ class TestAgLaunchTaskPath(unittest.TestCase):
         )
         self.assertEqual(result["terminal"]["execution"]["status"], "completed")
         self.assertEqual(result["terminal"]["execution"]["provider"], "antigravity")
+        self.assertEqual(cli_runner.request.project_id, "p1")
+        self.assertEqual(cli_runner.request.working_directory, self.working_directory)
+        self.assertEqual(cli_runner.request.sandbox, "read-only")
+        self.assertEqual(cli_runner.request.approval_policy, "never")
 
     def test_launch_task_antigravity_read_only_preserved(self):
         """read_only task produces read_only execution with no lease_evidence."""
