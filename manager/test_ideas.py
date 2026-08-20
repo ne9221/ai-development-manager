@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 from manager.ideas import (
     STATUS_CONFIRMED,
+    STATUS_CONFLICTED,
     STATUS_CONVERTED,
     STATUS_DROPPED,
     STATUS_PENDING,
@@ -76,7 +77,6 @@ class IdeasModelAndStoreTests(unittest.TestCase):
         """When Drive SSOT is unavailable, local cache is viewable but all mutations are rejected."""
         with tempfile.TemporaryDirectory() as td:
             f = Path(td) / "test_ideas.json"
-            # Pre-seed local cache
             cached_item = IdeaItem(
                 idea_id="CACHED-1",
                 title="Existing Cached Idea",
@@ -85,85 +85,34 @@ class IdeasModelAndStoreTests(unittest.TestCase):
             )
             f.write_text(json.dumps([cached_item.to_dict()]), encoding="utf-8")
 
-            # Initialize with no drive service
             store = IdeasStore(drive_service=None, local_file_path=str(f))
             self.assertTrue(store.is_degraded)
-            # Viewable
             self.assertEqual(len(store.list_ideas()), 1)
             self.assertEqual(store.get_by_id("CACHED-1").title, "Existing Cached Idea")
 
-            # Mutation rejected: add_idea
             new_idea = IdeaItem(idea_id="NEW-1", title="New Mutation", description="")
             with self.assertRaises(RuntimeError) as ctx:
                 store.add_idea(new_idea)
             self.assertIn("read-only", str(ctx.exception))
 
-            # Mutation rejected: confirm_idea
             with self.assertRaises(RuntimeError) as ctx:
                 store.confirm_idea("CACHED-1")
             self.assertIn("read-only", str(ctx.exception))
 
-            # Mutation rejected: convert_idea
             with self.assertRaises(RuntimeError) as ctx:
                 store.convert_idea("CACHED-1", project_id="ai-development-manager")
             self.assertIn("read-only", str(ctx.exception))
 
-            # Mutation rejected: drop_idea
             with self.assertRaises(RuntimeError) as ctx:
                 store.drop_idea("CACHED-1", drop_reason="R", drop_problem="P")
             self.assertIn("read-only", str(ctx.exception))
 
-            # Mutation rejected: restore_idea
             with self.assertRaises(RuntimeError) as ctx:
                 store.restore_idea("CACHED-1")
             self.assertIn("read-only", str(ctx.exception))
 
-    def test_drive_project_migration_moves_file_without_duplicates(self):
-        """Converting an Idea from Unassigned to a project updates/moves the Drive file without orphan duplicates."""
-        mock_drive = MagicMock()
-        mock_files = MagicMock()
-        mock_drive.files.return_value = mock_files
-
-        # Mock folder resolution
-        def mock_list_side_effect(**kwargs):
-            q = kwargs.get("q", "")
-            m = MagicMock()
-            if "name='IDEAS'" in q:
-                m.execute.return_value = {"files": [{"id": "root-ideas"}]}
-            elif "name='Unassigned'" in q:
-                m.execute.return_value = {"files": [{"id": "folder-unassigned"}]}
-            elif "name='ai-development-manager'" in q:
-                m.execute.return_value = {"files": [{"id": "folder-adm"}]}
-            elif "name='IDEA-MIGRATE.json'" in q:
-                # File exists in Unassigned folder
-                m.execute.return_value = {"files": [{"id": "file-idea-migrate", "parents": ["folder-unassigned"]}]}
-            else:
-                m.execute.return_value = {"files": []}
-            return m
-
-        mock_files.list.side_effect = mock_list_side_effect
-
-        with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "ideas_cache.json"
-            store = IdeasStore(drive_service=mock_drive, local_file_path=str(f))
-            self.assertFalse(store.is_degraded)
-
-            idea = IdeaItem(idea_id="IDEA-MIGRATE", title="Migrating Idea", description="", status=STATUS_PENDING, project_id="Unassigned")
-            store._ideas = [idea]
-
-            # Convert to formal project
-            store.convert_idea("IDEA-MIGRATE", project_id="ai-development-manager", milestone_id="M1")
-
-            # Check files_client.update was called with addParents='folder-adm' and removeParents='folder-unassigned'
-            mock_files.update.assert_called()
-            update_calls = mock_files.update.call_args_list
-            latest_call_kwargs = update_calls[-1].kwargs
-            self.assertEqual(latest_call_kwargs.get("fileId"), "file-idea-migrate")
-            self.assertEqual(latest_call_kwargs.get("addParents"), "folder-adm")
-            self.assertEqual(latest_call_kwargs.get("removeParents"), "folder-unassigned")
-
-    def test_duplicate_records_detected_on_load_and_reported(self):
-        """When multiple folders in Drive contain the same idea_id, detect and report duplicate without crash."""
+    def test_duplicate_records_fail_closed_no_guessing_and_block_mutations(self):
+        """Duplicate records for same idea_id produce NO automatic winner, record error, and block mutations."""
         mock_drive = MagicMock()
         mock_files = MagicMock()
         mock_drive.files.return_value = mock_files
@@ -176,46 +125,22 @@ class IdeasModelAndStoreTests(unittest.TestCase):
             elif "'root-ideas' in parents" in q:
                 m.execute.return_value = {"files": [{"id": "f-unassigned", "name": "Unassigned"}, {"id": "f-adm", "name": "ai-development-manager"}]}
             elif "'f-unassigned' in parents" in q:
-                m.execute.return_value = {"files": [{"id": "file-1", "name": "IDEA-DUP.json"}]}
+                m.execute.return_value = {"files": [{"id": "file-1", "name": "IDEA-CONFLICT.json"}]}
             elif "'f-adm' in parents" in q:
-                m.execute.return_value = {"files": [{"id": "file-2", "name": "IDEA-DUP.json"}]}
+                m.execute.return_value = {"files": [{"id": "file-2", "name": "IDEA-CONFLICT.json"}]}
             else:
                 m.execute.return_value = {"files": []}
             return m
 
         mock_files.list.side_effect = mock_list_side_effect
 
-        doc_unassigned = json.dumps({
-            "idea_id": "IDEA-DUP",
-            "title": "Dup Title",
-            "description": "",
-            "status": "pending",
-            "priority": "medium",
-            "project_id": "Unassigned",
-            "created_at": "2026-08-21T00:00:00Z",
-            "source": "Chat",
-            "decision_note": "",
-        }).encode("utf-8")
-
-        doc_adm = json.dumps({
-            "idea_id": "IDEA-DUP",
-            "title": "Dup Title",
-            "description": "",
-            "status": "converted",
-            "priority": "medium",
-            "project_id": "ai-development-manager",
-            "created_at": "2026-08-21T00:00:00Z",
-            "source": "Chat",
-            "decision_note": "Converted",
-        }).encode("utf-8")
+        doc1 = json.dumps({"idea_id": "IDEA-CONFLICT", "title": "Copy 1 in Unassigned", "description": "", "status": "pending", "project_id": "Unassigned"}).encode("utf-8")
+        doc2 = json.dumps({"idea_id": "IDEA-CONFLICT", "title": "Copy 2 in ADM", "description": "", "status": "converted", "project_id": "ai-development-manager"}).encode("utf-8")
 
         def mock_get_media_side_effect(**kwargs):
             file_id = kwargs.get("fileId")
             m = MagicMock()
-            if file_id == "file-1":
-                m.execute.return_value = doc_unassigned
-            else:
-                m.execute.return_value = doc_adm
+            m.execute.return_value = doc1 if file_id == "file-1" else doc2
             return m
 
         mock_files.get_media.side_effect = mock_get_media_side_effect
@@ -224,15 +149,160 @@ class IdeasModelAndStoreTests(unittest.TestCase):
             f = Path(td) / "ideas_cache.json"
             store = IdeasStore(drive_service=mock_drive, local_file_path=str(f))
             self.assertFalse(store.is_degraded)
-            # Only one idea loaded
-            self.assertEqual(len(store.list_ideas()), 1)
-            # Resolved deterministically to the converted one
-            loaded = store.get_by_id("IDEA-DUP")
-            self.assertEqual(loaded.project_id, "ai-development-manager")
-            self.assertEqual(loaded.status, STATUS_CONVERTED)
-            # Consistency warning recorded
+
+            # Neither copy is picked as winner; item is marked CONFLICTED
+            conflicted_item = store.get_by_id("IDEA-CONFLICT")
+            self.assertIsNotNone(conflicted_item)
+            self.assertEqual(conflicted_item.status, STATUS_CONFLICTED)
+            self.assertTrue(conflicted_item.is_conflicted)
+            self.assertIn("IDEA-CONFLICT", store.conflicted_idea_ids)
+
+            # Explicit error message emitted
             self.assertIsNotNone(store.last_error)
-            self.assertIn("Duplicate idea records detected", store.last_error)
+            self.assertIn("SSOT Consistency Error", store.last_error)
+            self.assertIn("file-1", store.last_error)
+            self.assertIn("file-2", store.last_error)
+
+            # All mutations on this conflicted idea MUST be blocked
+            with self.assertRaises(RuntimeError) as ctx:
+                store.confirm_idea("IDEA-CONFLICT")
+            self.assertIn("conflicted state", str(ctx.exception))
+
+            with self.assertRaises(RuntimeError) as ctx:
+                store.convert_idea("IDEA-CONFLICT", project_id="ai-development-manager")
+            self.assertIn("conflicted state", str(ctx.exception))
+
+            with self.assertRaises(RuntimeError) as ctx:
+                store.drop_idea("IDEA-CONFLICT", drop_reason="R", drop_problem="P")
+            self.assertIn("conflicted state", str(ctx.exception))
+
+            with self.assertRaises(RuntimeError) as ctx:
+                store.restore_idea("IDEA-CONFLICT")
+            self.assertIn("conflicted state", str(ctx.exception))
+
+            with self.assertRaises(RuntimeError) as ctx:
+                store.update_idea(conflicted_item)
+            self.assertIn("conflicted state", str(ctx.exception))
+
+    def test_search_strictly_scoped_to_ideas_root_and_leaves_unrelated_files_alone(self):
+        """Search and write operations strictly scope within IDEAS root and never touch unrelated files elsewhere in Drive."""
+        mock_drive = MagicMock()
+        mock_files = MagicMock()
+        mock_drive.files.return_value = mock_files
+
+        # Unrelated file outside IDEAS hierarchy (e.g. in some other folder)
+        unrelated_file = {"id": "unrelated-file-id", "name": "IDEA-SCOPE.json", "parents": ["other-folder-root"]}
+
+        def mock_list_side_effect(**kwargs):
+            q = kwargs.get("q", "")
+            m = MagicMock()
+            if "name='IDEAS'" in q:
+                m.execute.return_value = {"files": [{"id": "root-ideas"}]}
+            elif "'root-ideas' in parents" in q:
+                m.execute.return_value = {"files": [{"id": "folder-unassigned", "name": "Unassigned"}]}
+            elif "'folder-unassigned' in parents" in q and "name='IDEA-SCOPE.json'" in q:
+                # Target file inside IDEAS/Unassigned
+                m.execute.return_value = {"files": [{"id": "file-inside-ideas", "name": "IDEA-SCOPE.json", "parents": ["folder-unassigned"]}]}
+            else:
+                m.execute.return_value = {"files": []}
+            return m
+
+        mock_files.list.side_effect = mock_list_side_effect
+
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "ideas_cache.json"
+            store = IdeasStore(drive_service=mock_drive, local_file_path=str(f))
+            self.assertFalse(store.is_degraded)
+
+            idea = IdeaItem(idea_id="IDEA-SCOPE", title="Scoped Idea", description="", status=STATUS_PENDING, project_id="Unassigned")
+            store._ideas = [idea]
+
+            # Convert within IDEAS
+            # Mock folder resolution for new project folder
+            def mock_list_side_effect2(**kwargs):
+                q = kwargs.get("q", "")
+                m = MagicMock()
+                if "name='IDEAS'" in q:
+                    m.execute.return_value = {"files": [{"id": "root-ideas"}]}
+                elif "'root-ideas' in parents" in q:
+                    m.execute.return_value = {"files": [{"id": "folder-unassigned", "name": "Unassigned"}, {"id": "folder-adm", "name": "ai-development-manager"}]}
+                elif "'folder-unassigned' in parents" in q and "name='IDEA-SCOPE.json'" in q:
+                    m.execute.return_value = {"files": [{"id": "file-inside-ideas", "name": "IDEA-SCOPE.json", "parents": ["folder-unassigned"]}]}
+                elif "'folder-adm' in parents" in q and "name='IDEA-SCOPE.json'" in q:
+                    m.execute.return_value = {"files": []}
+                elif "name='ai-development-manager'" in q:
+                    m.execute.return_value = {"files": [{"id": "folder-adm"}]}
+                else:
+                    m.execute.return_value = {"files": []}
+                return m
+
+            mock_files.list.side_effect = mock_list_side_effect2
+
+            store.convert_idea("IDEA-SCOPE", project_id="ai-development-manager")
+
+            # Verify update was called specifically on file-inside-ideas and NOT on unrelated-file-id
+            mock_files.update.assert_called()
+            for call in mock_files.update.call_args_list:
+                self.assertEqual(call.kwargs.get("fileId"), "file-inside-ideas")
+                self.assertNotEqual(call.kwargs.get("fileId"), "unrelated-file-id")
+
+            # Verify delete was never called on unrelated-file-id
+            for call in mock_files.delete.call_args_list:
+                self.assertNotEqual(call.kwargs.get("fileId"), "unrelated-file-id")
+
+    def test_duplicate_cleanup_failure_is_not_silent(self):
+        """If deleting an obsolete duplicate file inside IDEAS fails, raise RuntimeError and surface error."""
+        mock_drive = MagicMock()
+        mock_files = MagicMock()
+        mock_drive.files.return_value = mock_files
+
+        doc = json.dumps({
+            "idea_id": "IDEA-CLEANUP",
+            "title": "Cleanup Fail Idea",
+            "description": "",
+            "status": "pending",
+            "project_id": "Unassigned"
+        }).encode("utf-8")
+
+        def mock_list_side_effect(**kwargs):
+            q = kwargs.get("q", "")
+            m = MagicMock()
+            if "name='IDEAS'" in q:
+                m.execute.return_value = {"files": [{"id": "root-ideas"}]}
+            elif "'root-ideas' in parents" in q:
+                m.execute.return_value = {"files": [{"id": "folder-unassigned", "name": "Unassigned"}]}
+            elif "'folder-unassigned' in parents" in q and "name='IDEA-CLEANUP.json'" in q:
+                # Two duplicate files matching this idea_id inside IDEAS
+                m.execute.return_value = {
+                    "files": [
+                        {"id": "file-primary", "name": "IDEA-CLEANUP.json", "parents": ["folder-unassigned"]},
+                        {"id": "file-obsolete-dup", "name": "IDEA-CLEANUP.json", "parents": ["folder-unassigned"]}
+                    ]
+                }
+            elif "name='Unassigned'" in q:
+                m.execute.return_value = {"files": [{"id": "folder-unassigned"}]}
+            else:
+                m.execute.return_value = {"files": []}
+            return m
+
+        mock_files.list.side_effect = mock_list_side_effect
+        mock_files.get_media.return_value.execute.return_value = doc
+        mock_files.delete.side_effect = Exception("Google Drive 403 Insufficient Permission")
+
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "ideas_cache.json"
+            store = IdeasStore(drive_service=mock_drive, local_file_path=str(f))
+            self.assertFalse(store.is_degraded)
+
+            idea = IdeaItem(idea_id="IDEA-CLEANUP", title="Cleanup Fail Idea", description="", status=STATUS_PENDING)
+            store._ideas = [idea]
+            store.conflicted_idea_ids = set()
+
+            with self.assertRaises(RuntimeError) as ctx:
+                store.confirm_idea("IDEA-CLEANUP")
+            self.assertIn("Failed to clean up obsolete duplicate Idea file", str(ctx.exception))
+            self.assertIsNotNone(store.last_error)
+            self.assertIn("Failed to clean up obsolete duplicate", store.last_error)
 
 
 if __name__ == "__main__":

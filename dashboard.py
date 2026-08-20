@@ -13,6 +13,7 @@ from manager.quota_reader import read_drive_status, summarize
 from manager.quota_history import get_default_quota_history_store
 from manager.ideas import (
     STATUS_CONFIRMED,
+    STATUS_CONFLICTED,
     STATUS_CONVERTED,
     STATUS_DROPPED,
     STATUS_PENDING,
@@ -304,7 +305,8 @@ selected_nav = st.sidebar.radio("Navigation", NAV_PAGES, key="nav_selection")
 all_ideas = ideas_store.list_ideas()
 ideas_summary = get_ideas_summary(all_ideas)
 st.sidebar.markdown("---")
-st.sidebar.caption(f"💡 Ideas: {ideas_summary['pending']} 待立案 · {ideas_summary['confirmed']} 已确认")
+conflict_tag = f" · ⚠️ {ideas_summary['conflicted']} 冲突" if ideas_summary.get('conflicted', 0) > 0 else ""
+st.sidebar.caption(f"💡 Ideas: {ideas_summary['pending']} 待立案 · {ideas_summary['confirmed']} 已确认{conflict_tag}")
 st.sidebar.caption(f"⚡ Active Tasks: {len(active_executions)}")
 
 def render_overview_page():
@@ -547,7 +549,7 @@ def render_ideas_page():
         st.caption("✅ Ideas Store: Google Drive SSOT Connected")
 
     if ideas_store.last_error:
-        st.error(f"Ideas Store Notice: {ideas_store.last_error}")
+        st.error(f"{ideas_store.last_error}")
 
     # Quick Add Idea Expander
     with st.expander("➕ Capture New Idea (快速记录想法)", expanded=False):
@@ -584,6 +586,20 @@ def render_ideas_page():
                     st.error("Title cannot be empty.")
 
     grouped = group_ideas_by_status(ideas_store.list_ideas())
+
+    # Conflicted Ideas Warning Section (Fail Closed)
+    conflicted_list = grouped.get(STATUS_CONFLICTED, [])
+    if conflicted_list:
+        with st.expander(f"⚠️ 冲突锁定中的 Ideas ({len(conflicted_list)})", expanded=True):
+            st.error("检测到以下 Idea 在 Drive SSOT 中存在多份冲突记录。为确保真实性，禁止自动合并或选择胜出者，已锁定所有变更操作。请在云端排查修复后刷新。")
+            for c_item in conflicted_list:
+                st.markdown(f"""
+                <div class="glass-card" style="border: 1px solid #ff7b72;">
+                    <h4 style="margin:0; color:#ff7b72;">⚠️ {c_item.title} <small>({c_item.idea_id})</small></h4>
+                    <p style="margin:6px 0; font-size:13px;">{c_item.description}</p>
+                    <span class="badge-err">MUTATIONS LOCKED</span>
+                </div>
+                """, unsafe_allow_html=True)
 
     # Category 1: 待立案 (Default Expanded)
     pending_list = grouped[STATUS_PENDING]

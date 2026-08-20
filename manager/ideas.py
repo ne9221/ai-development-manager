@@ -7,18 +7,20 @@ import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 STATUS_PENDING = "pending"       # 待立案
 STATUS_CONFIRMED = "confirmed"   # 已确认
 STATUS_CONVERTED = "converted"   # 已立案
 STATUS_DROPPED = "dropped"       # 已放弃
+STATUS_CONFLICTED = "conflicted" # 冲突锁定
 
 STATUS_DISPLAY_NAMES = {
     STATUS_PENDING: "待立案",
     STATUS_CONFIRMED: "已确认",
     STATUS_CONVERTED: "已立案",
     STATUS_DROPPED: "已放弃",
+    STATUS_CONFLICTED: "冲突锁定",
 }
 
 STATUS_ICONS = {
@@ -26,6 +28,7 @@ STATUS_ICONS = {
     STATUS_CONFIRMED: "✨",
     STATUS_CONVERTED: "🚀",
     STATUS_DROPPED: "📦",
+    STATUS_CONFLICTED: "⚠️",
 }
 
 ROOT_FOLDER_ID = "1pXvl8BglU05ZrXMHIVIDyK-lOWNShXSO"
@@ -50,9 +53,15 @@ class IdeaItem:
     dropped_at: Optional[str] = None
     drop_reason: Optional[str] = None
     drop_problem: Optional[str] = None
+    is_conflicted: bool = False
+    conflict_details: Optional[List[Dict[str, Any]]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        # Exclude runtime-only conflict metadata from persistent payload
+        d.pop("is_conflicted", None)
+        d.pop("conflict_details", None)
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> IdeaItem:
@@ -88,6 +97,7 @@ class IdeasStore:
         self._ideas: List[IdeaItem] = []
         self.is_degraded: bool = drive_service is None
         self.last_error: Optional[str] = None
+        self.conflicted_idea_ids: Set[str] = set()
         self.load()
 
     def _get_drive_folder(self, parent_id: str, name: str, create: bool = True) -> Optional[str]:
@@ -107,10 +117,42 @@ class IdeasStore:
         ).execute()
         return created.get("id")
 
+    def _find_scoped_idea_files(self, idea_id: str) -> List[Dict[str, Any]]:
+        """Search strictly inside ADM IDEAS root hierarchy for files matching idea_id."""
+        if not self.drive_service:
+            return []
+        files_client = self.drive_service.files()
+        ideas_root_id = self._get_drive_folder(ROOT_FOLDER_ID, "IDEAS", create=False)
+        if not ideas_root_id:
+            return []
+
+        # List project folders under IDEAS root
+        q_folders = f"'{ideas_root_id}' in parents and mimeType='{MIME_FOLDER}' and trashed=false"
+        res_folders = files_client.list(q=q_folders, spaces="drive", fields="files(id, name)").execute()
+        proj_folders = res_folders.get("files", [])
+
+        filename = f"{idea_id}.json"
+        matching = []
+        for pf in proj_folders:
+            pf_id = pf["id"]
+            pf_name = pf.get("name", "Unassigned")
+            q_file = f"'{pf_id}' in parents and name='{filename}' and trashed=false"
+            res_file = files_client.list(q=q_file, spaces="drive", fields="files(id, name, parents)").execute()
+            for f in res_file.get("files", []):
+                matching.append({
+                    "id": f["id"],
+                    "name": f.get("name"),
+                    "parents": f.get("parents", [pf_id]),
+                    "folder_id": pf_id,
+                    "folder_name": pf_name,
+                })
+        return matching
+
     def load(self) -> List[IdeaItem]:
-        """Load ideas from Drive SSOT; fallback to local cache if unavailable."""
+        """Load ideas from Drive SSOT; fail closed on duplicate idea_ids without guessing."""
         self._ideas = []
         self.last_error = None
+        self.conflicted_idea_ids = set()
 
         if self.drive_service:
             try:
@@ -126,30 +168,52 @@ class IdeasStore:
                 res_folders = files_client.list(q=q_folders, spaces="drive", fields="files(id, name)").execute()
                 proj_folders = res_folders.get("files", [])
 
-                loaded_dict: Dict[str, IdeaItem] = {}
-                duplicates_found = []
+                raw_records_by_id: Dict[str, List[Tuple[IdeaItem, Dict[str, Any]]]] = {}
 
                 for pf in proj_folders:
                     pf_id = pf["id"]
+                    pf_name = pf.get("name", "Unassigned")
                     q_files = f"'{pf_id}' in parents and mimeType='{MIME_JSON}' and trashed=false"
                     res_files = files_client.list(q=q_files, spaces="drive", fields="files(id, name)").execute()
                     for f in res_files.get("files", []):
                         raw = files_client.get_media(fileId=f["id"]).execute()
                         doc = json.loads(raw.decode("utf-8"))
                         item = IdeaItem.from_dict(doc)
-                        if item.idea_id in loaded_dict:
-                            duplicates_found.append(item.idea_id)
-                            existing = loaded_dict[item.idea_id]
-                            # Deterministic resolution: if new one has assigned project_id, prefer it
-                            if item.project_id != "Unassigned" and existing.project_id == "Unassigned":
-                                loaded_dict[item.idea_id] = item
-                        else:
-                            loaded_dict[item.idea_id] = item
+                        file_meta = {"file_id": f["id"], "folder_id": pf_id, "folder_name": pf_name}
+                        raw_records_by_id.setdefault(item.idea_id, []).append((item, file_meta))
 
-                if duplicates_found:
-                    self.last_error = f"Consistency Notice: Duplicate idea records detected for IDs {list(set(duplicates_found))}. Resolved deterministically."
+                final_ideas = []
+                conflict_messages = []
 
-                self._ideas = list(loaded_dict.values())
+                for idea_id, records in raw_records_by_id.items():
+                    if len(records) > 1:
+                        # Conflict detected: do NOT choose a winner. Fail closed.
+                        self.conflicted_idea_ids.add(idea_id)
+                        conflict_info = [r[1] for r in records]
+                        conflict_desc = ", ".join([f"[Folder '{ci['folder_name']}', FileId '{ci['file_id']}']" for ci in conflict_info])
+                        conflict_messages.append(f"Idea '{idea_id}' ({conflict_desc})")
+
+                        # Create a conflicted placeholder representation
+                        conflicted_item = IdeaItem(
+                            idea_id=idea_id,
+                            title=f"[CONFLICTED] {records[0][0].title}",
+                            description=f"SSOT Conflict: {len(records)} conflicting copies exist in Drive across {conflict_desc}. Mutations locked.",
+                            status=STATUS_CONFLICTED,
+                            priority="high",
+                            project_id="Conflict-Locked",
+                            source="SSOT Truth Guard",
+                            decision_note=f"Conflicted copies in: {conflict_desc}",
+                            is_conflicted=True,
+                            conflict_details=conflict_info,
+                        )
+                        final_ideas.append(conflicted_item)
+                    else:
+                        final_ideas.append(records[0][0])
+
+                if conflict_messages:
+                    self.last_error = f"SSOT Consistency Error: Conflicting duplicate records detected for: {'; '.join(conflict_messages)}. Automatic winner selection disabled. Mutations blocked."
+
+                self._ideas = final_ideas
                 self.is_degraded = False
                 self._save_local_cache()
                 return self._ideas
@@ -177,7 +241,8 @@ class IdeasStore:
     def _save_local_cache(self) -> None:
         try:
             self.local_file_path.parent.mkdir(parents=True, exist_ok=True)
-            raw = [i.to_dict() for i in self._ideas]
+            # Persist only non-conflicted clean items to local cache
+            raw = [i.to_dict() for i in self._ideas if not i.is_conflicted]
             self.local_file_path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
             self.last_error = f"Local cache write failed: {exc}"
@@ -187,20 +252,22 @@ class IdeasStore:
         if not self.drive_service:
             raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
 
+        if idea.idea_id in self.conflicted_idea_ids or idea.is_conflicted:
+            raise RuntimeError(f"Idea '{idea.idea_id}' is in a conflicted state. Mutations are blocked until conflict is resolved.")
+
         files_client = self.drive_service.files()
         ideas_root_id = self._get_drive_folder(ROOT_FOLDER_ID, "IDEAS", create=True)
         target_proj = idea.project_id or "Unassigned"
         target_folder_id = self._get_drive_folder(ideas_root_id, target_proj, create=True)
 
-        filename = f"{idea.idea_id}.json"
-        query = f"name='{filename}' and trashed=false"
-        res = files_client.list(q=query, spaces="drive", fields="files(id, name, parents)").execute()
-        matching_files = res.get("files", [])
+        # Strictly scoped search inside IDEAS root hierarchy only
+        matching_files = self._find_scoped_idea_files(idea.idea_id)
 
         body_content = json.dumps(idea.to_dict(), indent=2, ensure_ascii=False).encode("utf-8")
-
         from googleapiclient.http import MediaInMemoryUpload
         media = MediaInMemoryUpload(body_content, mimetype=MIME_JSON, resumable=False)
+
+        filename = f"{idea.idea_id}.json"
 
         if matching_files:
             primary = matching_files[0]
@@ -220,12 +287,13 @@ class IdeasStore:
             else:
                 files_client.update(fileId=file_id, media_body=media).execute()
 
-            # Remove any orphan duplicates
+            # Clean up obsolete duplicate copies under IDEAS root and fail explicitly if cleanup errors
             for extra in matching_files[1:]:
                 try:
                     files_client.delete(fileId=extra["id"]).execute()
-                except Exception:
-                    pass
+                except Exception as del_exc:
+                    self.last_error = f"SSOT Cleanup Error: Failed to delete obsolete duplicate file '{extra['id']}' in folder '{extra.get('folder_name')}': {del_exc}"
+                    raise RuntimeError(f"Failed to clean up obsolete duplicate Idea file '{extra['id']}': {del_exc}") from del_exc
         else:
             files_client.create(
                 body={"name": filename, "parents": [target_folder_id], "mimeType": MIME_JSON},
@@ -265,6 +333,9 @@ class IdeasStore:
         if self.is_degraded or not self.drive_service:
             raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
 
+        if idea.idea_id in self.conflicted_idea_ids or idea.is_conflicted:
+            raise RuntimeError(f"Idea '{idea.idea_id}' is in a conflicted state. Mutations are blocked until conflict is resolved.")
+
         try:
             self._write_to_drive(idea)
             self.is_degraded = False
@@ -283,6 +354,8 @@ class IdeasStore:
     def confirm_idea(self, idea_id: str, note: str = "") -> None:
         if self.is_degraded or not self.drive_service:
             raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
+        if idea_id in self.conflicted_idea_ids:
+            raise RuntimeError(f"Idea '{idea_id}' is in a conflicted state. Confirm is blocked.")
         idea = self.get_by_id(idea_id)
         if not idea:
             raise KeyError(f"Idea not found: {idea_id}")
@@ -294,6 +367,8 @@ class IdeasStore:
     def convert_idea(self, idea_id: str, project_id: str, milestone_id: Optional[str] = None, task_id: Optional[str] = None, note: str = "") -> None:
         if self.is_degraded or not self.drive_service:
             raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
+        if idea_id in self.conflicted_idea_ids:
+            raise RuntimeError(f"Idea '{idea_id}' is in a conflicted state. Convert is blocked.")
         idea = self.get_by_id(idea_id)
         if not idea:
             raise KeyError(f"Idea not found: {idea_id}")
@@ -311,6 +386,8 @@ class IdeasStore:
     def drop_idea(self, idea_id: str, drop_reason: str, drop_problem: str, note: str = "") -> None:
         if self.is_degraded or not self.drive_service:
             raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
+        if idea_id in self.conflicted_idea_ids:
+            raise RuntimeError(f"Idea '{idea_id}' is in a conflicted state. Drop is blocked.")
         idea = self.get_by_id(idea_id)
         if not idea:
             raise KeyError(f"Idea not found: {idea_id}")
@@ -330,6 +407,8 @@ class IdeasStore:
     def restore_idea(self, idea_id: str, note: str = "") -> None:
         if self.is_degraded or not self.drive_service:
             raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
+        if idea_id in self.conflicted_idea_ids:
+            raise RuntimeError(f"Idea '{idea_id}' is in a conflicted state. Restore is blocked.")
         idea = self.get_by_id(idea_id)
         if not idea:
             raise KeyError(f"Idea not found: {idea_id}")
@@ -349,6 +428,7 @@ def group_ideas_by_status(ideas: List[IdeaItem]) -> Dict[str, List[IdeaItem]]:
         STATUS_CONFIRMED: [],
         STATUS_CONVERTED: [],
         STATUS_DROPPED: [],
+        STATUS_CONFLICTED: [],
     }
     for item in ideas:
         st = item.status if item.status in grouped else STATUS_PENDING
@@ -364,4 +444,5 @@ def get_ideas_summary(ideas: List[IdeaItem]) -> Dict[str, int]:
         "confirmed": len(grouped[STATUS_CONFIRMED]),
         "converted": len(grouped[STATUS_CONVERTED]),
         "dropped": len(grouped[STATUS_DROPPED]),
+        "conflicted": len(grouped[STATUS_CONFLICTED]),
     }
