@@ -7,7 +7,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 STATUS_PENDING = "pending"       # 待立案
 STATUS_CONFIRMED = "confirmed"   # 已确认
@@ -116,19 +116,19 @@ class IdeasStore:
             try:
                 ideas_root_id = self._get_drive_folder(ROOT_FOLDER_ID, "IDEAS", create=False)
                 if not ideas_root_id:
-                    # Root IDEAS folder does not exist yet; start clean
                     self._ideas = []
                     self.is_degraded = False
                     self._save_local_cache()
                     return self._ideas
 
                 files_client = self.drive_service.files()
-                # List project folders in IDEAS
                 q_folders = f"'{ideas_root_id}' in parents and mimeType='{MIME_FOLDER}' and trashed=false"
                 res_folders = files_client.list(q=q_folders, spaces="drive", fields="files(id, name)").execute()
                 proj_folders = res_folders.get("files", [])
 
-                loaded = []
+                loaded_dict: Dict[str, IdeaItem] = {}
+                duplicates_found = []
+
                 for pf in proj_folders:
                     pf_id = pf["id"]
                     q_files = f"'{pf_id}' in parents and mimeType='{MIME_JSON}' and trashed=false"
@@ -136,9 +136,20 @@ class IdeasStore:
                     for f in res_files.get("files", []):
                         raw = files_client.get_media(fileId=f["id"]).execute()
                         doc = json.loads(raw.decode("utf-8"))
-                        loaded.append(IdeaItem.from_dict(doc))
+                        item = IdeaItem.from_dict(doc)
+                        if item.idea_id in loaded_dict:
+                            duplicates_found.append(item.idea_id)
+                            existing = loaded_dict[item.idea_id]
+                            # Deterministic resolution: if new one has assigned project_id, prefer it
+                            if item.project_id != "Unassigned" and existing.project_id == "Unassigned":
+                                loaded_dict[item.idea_id] = item
+                        else:
+                            loaded_dict[item.idea_id] = item
 
-                self._ideas = loaded
+                if duplicates_found:
+                    self.last_error = f"Consistency Notice: Duplicate idea records detected for IDs {list(set(duplicates_found))}. Resolved deterministically."
+
+                self._ideas = list(loaded_dict.values())
                 self.is_degraded = False
                 self._save_local_cache()
                 return self._ideas
@@ -174,27 +185,50 @@ class IdeasStore:
 
     def _write_to_drive(self, idea: IdeaItem) -> None:
         if not self.drive_service:
-            return
+            raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
+
         files_client = self.drive_service.files()
         ideas_root_id = self._get_drive_folder(ROOT_FOLDER_ID, "IDEAS", create=True)
-        proj_folder_id = self._get_drive_folder(ideas_root_id, idea.project_id or "Unassigned", create=True)
+        target_proj = idea.project_id or "Unassigned"
+        target_folder_id = self._get_drive_folder(ideas_root_id, target_proj, create=True)
 
         filename = f"{idea.idea_id}.json"
-        query = f"'{proj_folder_id}' in parents and name='{filename}' and trashed=false"
-        res = files_client.list(q=query, spaces="drive", fields="files(id, name)").execute()
-        files = res.get("files", [])
+        query = f"name='{filename}' and trashed=false"
+        res = files_client.list(q=query, spaces="drive", fields="files(id, name, parents)").execute()
+        matching_files = res.get("files", [])
 
         body_content = json.dumps(idea.to_dict(), indent=2, ensure_ascii=False).encode("utf-8")
 
         from googleapiclient.http import MediaInMemoryUpload
         media = MediaInMemoryUpload(body_content, mimetype=MIME_JSON, resumable=False)
 
-        if files:
-            file_id = files[0]["id"]
-            files_client.update(fileId=file_id, media_body=media).execute()
+        if matching_files:
+            primary = matching_files[0]
+            file_id = primary["id"]
+            parents = primary.get("parents", [])
+
+            if target_folder_id not in parents:
+                remove_parents = ",".join(parents) if parents else None
+                update_kwargs = {
+                    "fileId": file_id,
+                    "media_body": media,
+                    "addParents": target_folder_id,
+                }
+                if remove_parents:
+                    update_kwargs["removeParents"] = remove_parents
+                files_client.update(**update_kwargs).execute()
+            else:
+                files_client.update(fileId=file_id, media_body=media).execute()
+
+            # Remove any orphan duplicates
+            for extra in matching_files[1:]:
+                try:
+                    files_client.delete(fileId=extra["id"]).execute()
+                except Exception:
+                    pass
         else:
             files_client.create(
-                body={"name": filename, "parents": [proj_folder_id], "mimeType": MIME_JSON},
+                body={"name": filename, "parents": [target_folder_id], "mimeType": MIME_JSON},
                 media_body=media,
                 fields="id"
             ).execute()
@@ -210,29 +244,33 @@ class IdeasStore:
 
     def add_idea(self, idea: IdeaItem) -> None:
         self.last_error = None
+        if self.is_degraded or not self.drive_service:
+            raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
+
         if not idea.title.strip():
             raise ValueError("Idea title cannot be empty.")
 
-        if self.drive_service:
-            try:
-                self._write_to_drive(idea)
-                self.is_degraded = False
-            except Exception as exc:
-                self.last_error = f"Drive SSOT write failed: {exc}"
-                raise RuntimeError(f"Failed to persist Idea to Drive SSOT: {exc}") from exc
+        try:
+            self._write_to_drive(idea)
+            self.is_degraded = False
+        except Exception as exc:
+            self.last_error = f"Drive SSOT write failed: {exc}"
+            raise RuntimeError(f"Failed to persist Idea to Drive SSOT: {exc}") from exc
 
         self._ideas.append(idea)
         self._save_local_cache()
 
     def update_idea(self, idea: IdeaItem) -> None:
         self.last_error = None
-        if self.drive_service:
-            try:
-                self._write_to_drive(idea)
-                self.is_degraded = False
-            except Exception as exc:
-                self.last_error = f"Drive SSOT write failed: {exc}"
-                raise RuntimeError(f"Failed to update Idea in Drive SSOT: {exc}") from exc
+        if self.is_degraded or not self.drive_service:
+            raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
+
+        try:
+            self._write_to_drive(idea)
+            self.is_degraded = False
+        except Exception as exc:
+            self.last_error = f"Drive SSOT write failed: {exc}"
+            raise RuntimeError(f"Failed to update Idea in Drive SSOT: {exc}") from exc
 
         for idx, existing in enumerate(self._ideas):
             if existing.idea_id == idea.idea_id:
@@ -243,6 +281,8 @@ class IdeasStore:
         self._save_local_cache()
 
     def confirm_idea(self, idea_id: str, note: str = "") -> None:
+        if self.is_degraded or not self.drive_service:
+            raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
         idea = self.get_by_id(idea_id)
         if not idea:
             raise KeyError(f"Idea not found: {idea_id}")
@@ -252,6 +292,8 @@ class IdeasStore:
         self.update_idea(idea)
 
     def convert_idea(self, idea_id: str, project_id: str, milestone_id: Optional[str] = None, task_id: Optional[str] = None, note: str = "") -> None:
+        if self.is_degraded or not self.drive_service:
+            raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
         idea = self.get_by_id(idea_id)
         if not idea:
             raise KeyError(f"Idea not found: {idea_id}")
@@ -267,6 +309,8 @@ class IdeasStore:
         self.update_idea(idea)
 
     def drop_idea(self, idea_id: str, drop_reason: str, drop_problem: str, note: str = "") -> None:
+        if self.is_degraded or not self.drive_service:
+            raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
         idea = self.get_by_id(idea_id)
         if not idea:
             raise KeyError(f"Idea not found: {idea_id}")
@@ -284,6 +328,8 @@ class IdeasStore:
         self.update_idea(idea)
 
     def restore_idea(self, idea_id: str, note: str = "") -> None:
+        if self.is_degraded or not self.drive_service:
+            raise RuntimeError("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
         idea = self.get_by_id(idea_id)
         if not idea:
             raise KeyError(f"Idea not found: {idea_id}")

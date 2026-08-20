@@ -542,7 +542,7 @@ def render_ideas_page():
     st.caption("保存平时零散提出的想法（‘以后要做 / 之后加 / 先记着’），在正式进入 Project 执行前完成确认与立案。")
 
     if ideas_store.is_degraded:
-        st.warning("⚠️ Ideas Store: Running in Local Cache / Degraded Mode (Google Drive SSOT disconnected)")
+        st.warning("⚠️ Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
     else:
         st.caption("✅ Ideas Store: Google Drive SSOT Connected")
 
