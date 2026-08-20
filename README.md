@@ -321,7 +321,8 @@ change. Intentional stops are recorded outside the repository at
 `%USERPROFILE%\.ai-development-manager\runtime\watcher-maintenance.json`;
 the Session Center Supervisor leaves a disabled watcher alone while that
 sentinel exists and otherwise re-enables the exact verified task without
-executing it.
+executing it. A successful Start clears the active sentinel by preserving it
+as `watcher-maintenance-last.json`.
 
 ## Retry lifecycle
 

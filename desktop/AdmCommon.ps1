@@ -10,6 +10,7 @@ $AdmSessionCenterUrl = "http://127.0.0.1:8765"
 $AdmManagerHome = if ($env:AI_MANAGER_HOME) { $env:AI_MANAGER_HOME } else { Join-Path $env:USERPROFILE ".ai-development-manager" }
 $AdmRuntimePath = Join-Path $AdmManagerHome "runtime"
 $AdmWatcherMaintenancePath = Join-Path $AdmRuntimePath "watcher-maintenance.json"
+$AdmWatcherMaintenanceLastPath = Join-Path $AdmRuntimePath "watcher-maintenance-last.json"
 
 function Get-AdmTaskStatus {
     param([Parameter(Mandatory = $true)][string]$TaskName)
@@ -107,7 +108,7 @@ function Write-AdmWatcherMaintenance {
 
 function Clear-AdmWatcherMaintenance {
     if (Test-Path -LiteralPath $AdmWatcherMaintenancePath) {
-        Remove-Item -LiteralPath $AdmWatcherMaintenancePath -Force
+        Move-Item -LiteralPath $AdmWatcherMaintenancePath -Destination $AdmWatcherMaintenanceLastPath -Force
     }
 }
 

@@ -56,6 +56,7 @@ Describe "ADM watcher maintenance sentinel" {
         & (Join-Path $here "Start-ADM.ps1") | Out-Null
         Assert-MockCalled Enable-ScheduledTask -ParameterFilter { $TaskName -eq $watcherName } -Times 1 -Exactly
         Test-Path -LiteralPath (Join-Path $global:admTestHome "runtime\watcher-maintenance.json") | Should Be $false
+        Test-Path -LiteralPath (Join-Path $global:admTestHome "runtime\watcher-maintenance-last.json") | Should Be $true
     }
 
     It "a scratch clone identity cannot disable the production watcher" {
