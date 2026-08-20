@@ -1,4 +1,4 @@
-﻿"""Minimal reserved-to-terminal execution runner.
+"""Minimal reserved-to-terminal execution runner.
 
 launch_task()/run_execution() are provider-parameterized (default "codex" for
 backward compatibility); main()'s CLI entry point remains Codex-only.
