@@ -268,7 +268,16 @@ def cleanup_execution(writer_registry, claim_registry, execution, claim_generati
 
 def _terminal_handoff(execution, task, status, summary, timestamp):
     handoff = {
-        "handoff_id": f"{execution['task_id']}-{status}-{execution['execution_id']}",
+        # A retry reuses the same execution_id as the attempt it retries (see
+        # reserve_execution), so retry_count must be part of this id or two
+        # different attempts that both terminalize with the same status
+        # collide on one deterministic handoff record -- confirmed live: a
+        # genuine retry's own termination raised "deterministic terminal
+        # handoff conflicts with persisted content" against the prior
+        # attempt's handoff, leaving cleanup partial and the task claim
+        # retained, which then made prepare_task_retry correctly refuse the
+        # *next* retry too.
+        "handoff_id": f"{execution['task_id']}-{status}-{execution['execution_id']}-{execution.get('retry_count', 0)}",
         "task_id": execution["task_id"], "project_id": execution["project_id"],
         "created_at": timestamp, "from_provider": execution["provider"], "to_provider": None,
         "from_session": execution.get("session_id"), "reason": status,
@@ -352,7 +361,7 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
         timestamp = existing["completed_at"]
         summary = existing["notes"][-1] if existing.get("notes") else f"Execution {execution_id} {status}"
         task = store.get("tasks", project_id, task_id)
-        handoff_id = f"{task_id}-{status}-{execution_id}"
+        handoff_id = f"{task_id}-{status}-{execution_id}-{existing.get('retry_count', 0)}"
         handoff = _optional_record(store, "handoffs", project_id, handoff_id)
         _, _, state_complete = _terminal_state(existing, task, handoff, status, summary, timestamp)
         audit = existing.get("cleanup_evidence") or {}
