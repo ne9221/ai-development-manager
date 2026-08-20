@@ -3,33 +3,228 @@
   "title": "AI Development Manager Drive Command",
   "type": "object",
   "additionalProperties": false,
-  "required": ["command_id", "project_id", "task_id", "provider", "model", "fallback_model", "mode", "effort", "selection_reason", "quota_evidence", "created_at", "status", "execution_id", "claimed_at", "completed_at", "result"],
+  "required": [
+    "command_id",
+    "project_id",
+    "task_id",
+    "provider",
+    "model",
+    "fallback_model",
+    "mode",
+    "effort",
+    "selection_reason",
+    "quota_evidence",
+    "created_at",
+    "status",
+    "execution_id",
+    "claimed_at",
+    "completed_at",
+    "result"
+  ],
   "properties": {
-    "command_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
-    "project_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
-    "task_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
-    "provider": {"enum": ["codex", "claude"]},
-    "account_id": {"type": ["string", "null"], "minLength": 1, "description": "Assigned provider account identity (e.g. which Claude account); non-secret, resolved against the local account registry only -- never a config_dir/credential. Null/absent means automatic selection."},
-    "requested_provider": {"type": ["string", "null"], "enum": ["codex", "claude", null], "description": "Provider a trusted caller explicitly requested (Direct Dispatch ingress), preserved verbatim for audit. Null means the caller left provider selection to automatic quota-aware assignment. Not launch authority by itself -- see `provider` for what was actually assigned."},
-    "requested_account_id": {"type": ["string", "null"], "minLength": 1, "description": "Claude account_id a trusted caller explicitly requested, preserved verbatim for audit. Null means automatic account selection. Not launch authority by itself -- see `account_id` for what was actually assigned."},
-    "model": {"type": ["string", "null"], "maxLength": 200},
-    "fallback_model": {"type": ["string", "null"], "maxLength": 200},
-    "mode": {"type": ["string", "null"], "maxLength": 80},
-    "effort": {"type": ["string", "null"], "maxLength": 80},
-    "selection_reason": {"type": "array", "items": {"type": "string", "maxLength": 500}, "maxItems": 8},
-    "quota_evidence": {"type": ["object", "null"]},
-    "created_at": {"type": "string", "format": "date-time"},
-    "status": {"enum": ["queued", "claimed", "running", "attention", "completed", "failed"]},
-    "execution_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9._-]{1,200}$"},
-    "claimed_at": {"type": ["string", "null"], "format": "date-time"},
-    "completed_at": {"type": ["string", "null"], "format": "date-time"},
-    "stale_at": {"type": ["string", "null"], "format": "date-time"},
-    "recovery_reason": {"type": ["string", "null"], "maxLength": 300},
-    "retry_count": {"type": "integer", "minimum": 0, "maximum": 2},
-    "retry_of_execution_id": {"type": ["string", "null"], "maxLength": 200},
-    "created_via": {"type": "string", "maxLength": 80, "description": "Server-stamped provenance, e.g. 'direct_dispatch_ingress'; never taken verbatim from an external caller's request payload."},
-    "admission_version": {"type": "string", "maxLength": 20, "description": "Safe Auto-Admission contract version this record was stamped under, for the Command Watcher's trusted-ingress verification."},
-    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$", "description": "External request identity, used to cross-check against the ingress idempotency record; not launch/account authority."},
-    "result": {"type": ["object", "null"], "additionalProperties": false, "properties": {"status": {"enum": ["completed", "failed", "interrupted", "error"]}, "execution_id": {"type": ["string", "null"], "maxLength": 200}, "session_id": {"type": ["string", "null"], "maxLength": 600}, "error_kind": {"type": ["string", "null"], "maxLength": 100}}}
+    "command_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,160}$"
+    },
+    "project_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,160}$"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,160}$"
+    },
+    "provider": {
+      "enum": [
+        "codex",
+        "claude",
+        "antigravity"
+      ]
+    },
+    "account_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "description": "Assigned provider account identity (e.g. which Claude account); non-secret, resolved against the local account registry only -- never a config_dir/credential. Null/absent means automatic selection."
+    },
+    "requested_provider": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "codex",
+        "claude",
+        "antigravity",
+        null
+      ],
+      "description": "Provider a trusted caller explicitly requested (Direct Dispatch ingress), preserved verbatim for audit. Null means the caller left provider selection to automatic quota-aware assignment. Not launch authority by itself -- see `provider` for what was actually assigned."
+    },
+    "requested_account_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "description": "Claude account_id a trusted caller explicitly requested, preserved verbatim for audit. Null means automatic account selection. Not launch authority by itself -- see `account_id` for what was actually assigned."
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 200
+    },
+    "fallback_model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 200
+    },
+    "mode": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 80
+    },
+    "effort": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 80
+    },
+    "selection_reason": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 500
+      },
+      "maxItems": 8
+    },
+    "quota_evidence": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "enum": [
+        "queued",
+        "claimed",
+        "running",
+        "attention",
+        "completed",
+        "failed"
+      ]
+    },
+    "execution_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[A-Za-z0-9._-]{1,200}$"
+    },
+    "claimed_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "completed_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "stale_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "recovery_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 300
+    },
+    "retry_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2
+    },
+    "retry_of_execution_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 200
+    },
+    "created_via": {
+      "type": "string",
+      "maxLength": 80,
+      "description": "Server-stamped provenance, e.g. 'direct_dispatch_ingress'; never taken verbatim from an external caller's request payload."
+    },
+    "admission_version": {
+      "type": "string",
+      "maxLength": 20,
+      "description": "Safe Auto-Admission contract version this record was stamped under, for the Command Watcher's trusted-ingress verification."
+    },
+    "request_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,128}$",
+      "description": "External request identity, used to cross-check against the ingress idempotency record; not launch/account authority."
+    },
+    "result": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "completed",
+            "failed",
+            "interrupted",
+            "error"
+          ]
+        },
+        "execution_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 200
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 600
+        },
+        "error_kind": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 100
+        }
+      }
+    }
   }
 }

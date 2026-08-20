@@ -1,4 +1,4 @@
-"""Bounded, Drive-backed command watcher that delegates every launch to execution_runner."""
+﻿"""Bounded, Drive-backed command watcher that delegates every launch to execution_runner."""
 
 import argparse
 import json
@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from collectors.publish_drive import build_service
 from manager.claude_account_selector import load_claude_accounts
+from manager.ag_runner import AgRunner
 from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_identity_state
 from manager.execution_lifecycle import terminalize_execution
@@ -109,9 +110,30 @@ def claude_quota_reliable(service):
 # never fall back to Codex's (or any other provider's) launcher or quota
 # gate -- resolve_provider_runtime() returns None for it, which callers treat
 # as an unconditional reject.
+def ag_availability_check(service):
+    """Fail-closed AG availability gate.
+
+    AG has no reliable headless quota source; this gate proves only what is
+    actually observable on the local machine: that a resolvable AG CLI binary
+    exists and that a verified local Google account identity can be confirmed.
+    Returns True only when both are satisfied; False in all other cases,
+    including any unexpected exception.  The `service` argument is accepted
+    for interface parity with the quota_check contract but is not used --
+    AG availability is a local host concern, not a Drive-readable signal.
+    """
+    try:
+        from manager.ag_cli_runner import resolve_ag_cli_executable, verify_auth_identity
+        verify_auth_identity()
+        resolve_ag_cli_executable()
+        return True
+    except Exception:
+        return False
+
+
 PROVIDER_RUNTIMES = {
     "codex": {"launcher_factory": CodexLauncher, "quota_check": codex_quota_reliable},
     "claude": {"launcher_factory": ClaudeLauncher, "quota_check": claude_quota_reliable},
+    "antigravity": {"launcher_factory": AgRunner, "quota_check": ag_availability_check},
 }
 
 
