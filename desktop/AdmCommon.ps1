@@ -66,6 +66,34 @@ function Get-AdmDashboardHealth {
     return [PSCustomObject]@{ Listening = $listening; Url = $Url }
 }
 
+function Start-AdmDashboardBackground {
+    param(
+        [string]$RepositoryPath = $(Split-Path -Parent $PSScriptRoot)
+    )
+    $dashHealth = Get-AdmDashboardHealth
+    if ($dashHealth.Listening) {
+        return $true
+    }
+
+    $startDashboardScript = Join-Path $PSScriptRoot "Start-Dashboard.ps1"
+    if (-not (Test-Path -LiteralPath $startDashboardScript)) {
+        return $false
+    }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "powershell.exe"
+    $psi.Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$startDashboardScript`" -RepositoryPath `"$RepositoryPath`""
+    $psi.WorkingDirectory = $RepositoryPath
+    $psi.CreateNoWindow = $true
+    $psi.UseShellExecute = $false
+    try {
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Get-AdmComprehensiveHealth {
     $supervisor = Get-AdmTaskStatus -TaskName $AdmSupervisorTask
     $watcher = Get-AdmTaskStatus -TaskName $AdmWatcherTask

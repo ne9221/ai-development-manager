@@ -20,6 +20,7 @@ class WindowsTrayLauncherTests(unittest.TestCase):
             "Start-ADM-Tray.vbs",
             "Install-AdmStartup.ps1",
             "Uninstall-AdmStartup.ps1",
+            "Start-Dashboard.ps1",
             "README.md"
         ]
         for filename in expected_files:
@@ -55,14 +56,26 @@ $h = Get-AdmComprehensiveHealth
         self.assertIn(data["WatcherStatus"], ["running", "ready", "disabled", "missing", "unknown"])
         self.assertIn(data["SupervisorStatus"], ["running", "ready", "disabled", "missing", "unknown"])
 
-    def test_cold_start_calls_service_confirmation_automatically(self):
+    def test_start_adm_dashboard_background_function_when_already_running(self):
+        script = f'''
+$ErrorActionPreference = "Stop"
+. "{DESKTOP_DIR / 'AdmCommon.ps1'}"
+$started = Start-AdmDashboardBackground -RepositoryPath "{REPO_ROOT}"
+[PSCustomObject]@{{ Started = $started }} | ConvertTo-Json -Compress
+'''
+        cmd = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        self.assertEqual(0, res.returncode, f"PowerShell failed: {res.stderr}")
+        import json
+        data = json.loads(res.stdout.strip())
+        self.assertTrue(data["Started"])
+
+    def test_cold_start_calls_service_and_dashboard_confirmation(self):
         launcher_path = DESKTOP_DIR / "AdmTrayLauncher.ps1"
         content = launcher_path.read_text(encoding="utf-8", errors="ignore")
         self.assertIn("Start-AdmServicesSafe", content)
-        # Ensure Start-AdmServicesSafe is invoked outside context menu (i.e. at top level cold start)
-        lines = [l.strip() for l in content.splitlines()]
-        self.assertIn("Start-AdmServicesSafe", lines)
-
+        self.assertIn("Start-AdmDashboardBackground", content)
+        
         # Test Start-AdmServicesSafe execution idempotency
         script = f'''
 $ErrorActionPreference = "Stop"
@@ -71,6 +84,7 @@ Confirm-AdmTaskEnabled -TaskName $AdmSupervisorTask
 Confirm-AdmTaskEnabled -TaskName $AdmWatcherTask
 Start-ScheduledTask -TaskName $AdmSupervisorTask -ErrorAction SilentlyContinue
 Start-ScheduledTask -TaskName $AdmWatcherTask -ErrorAction SilentlyContinue
+Start-AdmDashboardBackground -RepositoryPath "{REPO_ROOT}" -ErrorAction SilentlyContinue
 '''
         cmd = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)

@@ -30,24 +30,56 @@ function Start-AdmServicesSafe {
         Confirm-AdmTaskEnabled -TaskName $AdmWatcherTask
         Start-ScheduledTask -TaskName $AdmSupervisorTask -ErrorAction SilentlyContinue
         Start-ScheduledTask -TaskName $AdmWatcherTask -ErrorAction SilentlyContinue
+        Start-AdmDashboardBackground -RepositoryPath $RepositoryPath -ErrorAction SilentlyContinue
     } catch {
         # Non-fatal during background start
     }
 }
 
 function Open-AdmDashboardSafe {
+    param([int]$TimeoutSec = 8)
     try {
-        $health = Get-AdmComprehensiveHealth
-        if ($health.PreferredUrl) {
-            Start-Process $health.PreferredUrl
-        } else {
-            $statusPath = Join-Path $env:TEMP "adm-status.html"
-            $html = New-AdmStatusHtml -SupervisorStatus $health.SupervisorObject -WatcherStatus $health.WatcherObject -SessionCenter $health.SessionCenterObject -DashboardStatus $health.DashboardObject
-            $html | Out-File -FilePath $statusPath -Encoding utf8
-            Start-Process $statusPath
+        $dashHealth = Get-AdmDashboardHealth
+        if ($dashHealth.Listening) {
+            Start-Process "$AdmDashboardUrl/"
+            return
         }
+
+        # Cold start: trigger dashboard startup
+        Start-AdmDashboardBackground -RepositoryPath $RepositoryPath -ErrorAction SilentlyContinue
+
+        # Wait for health ready
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $ready = $false
+        while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+            Start-Sleep -Milliseconds 500
+            $dashCheck = Get-AdmDashboardHealth
+            if ($dashCheck.Listening) {
+                $ready = $true
+                break
+            }
+        }
+
+        if ($ready) {
+            Start-Process "$AdmDashboardUrl/"
+            return
+        }
+
+        # Fallback: check Session Center
+        $sc = Get-AdmSessionCenterHealth
+        if ($sc.Listening) {
+            Start-Process "$AdmSessionCenterUrl/"
+            return
+        }
+
+        # Fallback: diagnostic status html
+        $health = Get-AdmComprehensiveHealth
+        $statusPath = Join-Path $env:TEMP "adm-status.html"
+        $html = New-AdmStatusHtml -SupervisorStatus $health.SupervisorObject -WatcherStatus $health.WatcherObject -SessionCenter $health.SessionCenterObject -DashboardStatus $health.DashboardObject
+        $html | Out-File -FilePath $statusPath -Encoding utf8
+        Start-Process $statusPath
     } catch {
-        Start-Process "http://127.0.0.1:8501/"
+        Start-Process "$AdmDashboardUrl/"
     }
 }
 
@@ -57,7 +89,7 @@ if (-not $createdNew) {
     exit 0
 }
 
-# Cold start: idempotently ensure required ADM background tasks are enabled and triggered
+# Cold start: idempotently ensure required ADM background tasks and Dashboard are enabled and triggered
 Start-AdmServicesSafe
 
 # Add required .NET assemblies for WinForms NotifyIcon & System Icons
@@ -106,7 +138,7 @@ $menuRestart.Text = "Start / Restart Services"
 $menuRestart.add_Click({
     try {
         Start-AdmServicesSafe
-        $notifyIcon.ShowBalloonTip(3000, "ADM Services", "Scheduled tasks verified & triggered.", [System.Windows.Forms.ToolTipIcon]::Info)
+        $notifyIcon.ShowBalloonTip(3000, "ADM Services", "Scheduled tasks & Dashboard verified and triggered.", [System.Windows.Forms.ToolTipIcon]::Info)
     } catch {
         [System.Windows.Forms.MessageBox]::Show("Service start failed: $($_.Exception.Message)", "ADM Service Manager", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
     }
