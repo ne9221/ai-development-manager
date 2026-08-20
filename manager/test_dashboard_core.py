@@ -179,6 +179,9 @@ class TestDashboardCore(unittest.TestCase):
         self.assertEqual(summary["active_sessions_count"], 1)
         self.assertEqual(summary["reliable_providers_count"], 1)
 
+        stale_projection = get_global_summary(providers, [{"status": "in_progress"}], [])
+        self.assertEqual(stale_projection["running_tasks_count"], 0)
+
     def test_map_task_board(self):
         now = datetime(2026, 8, 15, 3, 0, 0, tzinfo=timezone.utc)
         tasks = [

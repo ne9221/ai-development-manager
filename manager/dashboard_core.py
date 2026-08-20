@@ -175,7 +175,9 @@ def get_global_summary(
     active_executions: list
 ) -> dict:
     """Compute dashboard global metrics."""
-    running_tasks = sum(1 for t in all_tasks if t.get("status") == "in_progress")
+    # An in_progress Task without an active Execution is stale projection, not
+    # proof that an AI is running now.
+    running_tasks = len({(e.get("project_id"), e.get("task_id")) for e in active_executions})
     blocked_tasks = sum(1 for t in all_tasks if t.get("status") == "blocked")
     active_sessions = len(active_executions)
 

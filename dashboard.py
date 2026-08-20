@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import json
 import subprocess
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -27,6 +28,8 @@ from manager.dashboard_core import (
 WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
 SUPERVISOR_TASK_NAME = "AI Development Manager - Session Center Supervisor"
 SESSION_CENTER_URL = "http://127.0.0.1:8765"
+DASHBOARD_PROJECT_ID = os.environ.get("ADM_DASHBOARD_PROJECT_ID", "ai-development-manager")
+RECENT_RECORD_LIMIT = 6
 
 
 def query_scheduled_task_raw(task_name):
@@ -159,37 +162,49 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-def list_records_isolated(store, area, project_id):
+def list_records_isolated(store, area, project_id, limit=RECENT_RECORD_LIMIT, include_ids=None):
     records = []
     warnings = []
     try:
         parent = store.project_folder(area, project_id, create=False)
-        items = store.children(parent)
-        for item in items:
+        items = sorted(
+            store.children(parent),
+            key=lambda item: item.get("modifiedTime") or "",
+            reverse=True,
+        )
+        json_items = [item for item in items if item.get("name", "").endswith(".json")]
+        selected_items = json_items[:limit]
+        if include_ids:
+            selected_names = {item.get("name") for item in selected_items}
+            selected_items.extend(
+                item for item in json_items[limit:]
+                if item.get("name") not in selected_names
+                and logical_record_id(item["name"][:-5]) in include_ids
+            )
+        for item in selected_items:
             name = item.get("name", "")
-            if name.endswith(".json"):
-                storage_id = name[:-5]
-                try:
+            storage_id = name[:-5]
+            try:
+                if item.get("id"):
+                    raw = store.files.get_media(fileId=item["id"]).execute()
+                    doc = json.loads(raw.decode("utf-8"))
+                else:  # Test doubles and legacy adapters may not expose Drive file IDs.
                     logical_id = logical_record_id(storage_id)
                     doc = store.get(area, project_id, logical_id)
-                    records.append(doc)
-                except Exception as exc:
-                    warnings.append(f"Malformed record '{name}' in '{area}' for project '{project_id}': {exc}")
+                records.append(doc)
+            except Exception as exc:
+                warnings.append(f"Malformed record '{name}' in '{area}' for project '{project_id}': {exc}")
     except Exception:
         # Ignore normal missing folder cases
         pass
     return records, warnings
 
 
-# Cache data loading to prevent unnecessary Drive API calls on interaction.
-# ttl is long (10 min) because a full reload does one sequential Drive API
-# call per task/execution/handoff/session record across every project --
-# measured at several minutes wall-clock on this account's current data
-# volume. A 60s ttl would force that full reload on almost every rerun
-# (e.g. clicking a tab), making the UI unusable. The sidebar "Sync with
-# Google Drive" button still forces an immediate refresh on demand.
-@st.cache_data(ttl=600)
+# Recent-first reads keep the HOME view bounded; the manual sync button clears
+# this short cache immediately when the user needs a fresh lifecycle state.
+@st.cache_data(ttl=60)
 def load_all_data():
+    load_started = time.perf_counter()
     now = datetime.now(timezone.utc)
     all_warnings = []
     try:
@@ -223,14 +238,20 @@ def load_all_data():
             max_age_minutes=60.0
         )
 
-        # Load Projects
+        # HOME is the live ai-development-manager operations view. Historical
+        # smoke projects stay in Drive but are not allowed to block first paint.
         projects = []
         try:
-            projects = store.list_projects()
+            project = store.get("projects", DASHBOARD_PROJECT_ID, DASHBOARD_PROJECT_ID)
+            projects = [project] if isinstance(project, dict) and project.get("project_id") else store.list_projects()
         except Exception as p_exc:
-            all_warnings.append(f"Drive projects list warning: {p_exc}")
+            try:
+                projects = store.list_projects()
+            except Exception:
+                all_warnings.append(f"Drive project read warning: {p_exc}")
 
         all_tasks = []
+        all_commands = []
         all_executions = []
         handoffs_dict = {}
         sessions_dict = {}
@@ -240,34 +261,27 @@ def load_all_data():
             if not p_id:
                 continue
 
-            # Read Tasks
-            tasks, t_warns = list_records_isolated(store, "tasks", p_id)
-            all_tasks.extend(tasks)
-            all_warnings.extend(t_warns)
+            # Read Commands
+            commands, c_warns = list_records_isolated(store, "commands", p_id)
+            all_commands.extend(commands)
+            all_warnings.extend(c_warns)
 
             # Read Executions
             executions, e_warns = list_records_isolated(store, "executions", p_id)
             all_executions.extend(executions)
             all_warnings.extend(e_warns)
 
-            # Read Handoffs
-            handoffs, h_warns = list_records_isolated(store, "handoffs", p_id)
-            all_warnings.extend(h_warns)
-            for ho in handoffs:
-                t_id = ho.get("task_id")
-                if t_id:
-                    key = (p_id, t_id)
-                    existing = handoffs_dict.get(key)
-                    if not existing or ho.get("created_at", "") > existing.get("created_at", ""):
-                        handoffs_dict[key] = ho
+            active_task_ids = {
+                record.get("task_id") for record in [*commands, *executions]
+                if record.get("task_id") and record.get("status") not in {"completed", "failed", "interrupted", "cancelled", "rejected"}
+            }
+            # Read recent Tasks plus any Task owning a current lifecycle record.
+            tasks, t_warns = list_records_isolated(store, "tasks", p_id, include_ids=active_task_ids)
+            all_tasks.extend(tasks)
+            all_warnings.extend(t_warns)
 
-            # Read Sessions
-            sessions, s_warns = list_records_isolated(store, "sessions", p_id)
-            all_warnings.extend(s_warns)
-            for s in sessions:
-                s_id = s.get("id") or s.get("provider_session_id")
-                if s_id:
-                    sessions_dict[(p_id, s_id)] = s
+            # Historical handoff/session detail is intentionally deferred from
+            # the P0 first paint. Session identity is authoritative on Execution.
 
         return {
             "success": True,
@@ -275,9 +289,11 @@ def load_all_data():
             "daily_brief_vm": daily_brief_vm,
             "projects": projects,
             "all_tasks": all_tasks,
+            "all_commands": all_commands,
             "all_executions": all_executions,
             "handoffs_dict": handoffs_dict,
             "sessions_dict": sessions_dict,
+            "load_duration_seconds": round(time.perf_counter() - load_started, 3),
             "warnings": all_warnings,
             "error": None
         }
@@ -290,9 +306,11 @@ def load_all_data():
             "daily_brief_vm": fallback_brief,
             "projects": [],
             "all_tasks": [],
+            "all_commands": [],
             "all_executions": [],
             "handoffs_dict": {},
             "sessions_dict": {},
+            "load_duration_seconds": round(time.perf_counter() - load_started, 3),
             "warnings": all_warnings + [str(e)],
             "error": str(e)
         }
@@ -314,7 +332,7 @@ with st.sidebar:
 
     # Auto-refresh check
     st.markdown("---")
-    st.caption("Data is cached locally for 60 seconds to respect API rate limits.")
+    st.caption("Recent HOME data is cached for 60 seconds. Sync clears the cache immediately.")
 
 # Load Data
 data = load_all_data()
@@ -328,12 +346,75 @@ quota_summary = data["quota_summary"]
 daily_brief_vm: DailyBriefViewModel = data["daily_brief_vm"]
 projects = data["projects"]
 all_tasks = data["all_tasks"]
+all_commands = data["all_commands"]
 all_executions = data["all_executions"]
 handoffs_dict = data["handoffs_dict"]
 sessions_dict = data["sessions_dict"]
 all_warnings = data.get("warnings", [])
+load_duration_seconds = data.get("load_duration_seconds")
 
 now = datetime.now(timezone.utc)
+
+# =====================================================================
+# P0: User-visible lifecycle truth (Task + Command + Execution)
+# =====================================================================
+st.header("📡 Current Execution Visibility")
+tasks_by_id = {task.get("task_id"): task for task in all_tasks if task.get("task_id")}
+commands_by_task = {}
+for command in all_commands:
+    task_id = command.get("task_id")
+    if task_id and (task_id not in commands_by_task or
+                    (command.get("updated_at") or command.get("created_at") or "") >
+                    (commands_by_task[task_id].get("updated_at") or commands_by_task[task_id].get("created_at") or "")):
+        commands_by_task[task_id] = command
+executions_by_task = {}
+for execution in all_executions:
+    task_id = execution.get("task_id")
+    if task_id and (task_id not in executions_by_task or
+                    (execution.get("heartbeat_at") or execution.get("completed_at") or execution.get("started_at") or execution.get("reserved_at") or "") >
+                    (executions_by_task[task_id].get("heartbeat_at") or executions_by_task[task_id].get("completed_at") or executions_by_task[task_id].get("started_at") or executions_by_task[task_id].get("reserved_at") or "")):
+        executions_by_task[task_id] = execution
+
+visibility_rows = []
+for task_id in dict.fromkeys([*tasks_by_id, *commands_by_task, *executions_by_task]):
+    task = tasks_by_id.get(task_id, {})
+    command = commands_by_task.get(task_id, {})
+    execution = executions_by_task.get(task_id, {})
+    execution_status = execution.get("status")
+    command_status = command.get("status")
+    if execution_status in {"failed", "interrupted", "cancelled"} or command_status in {"attention", "failed", "rejected"}:
+        category = "Attention"
+    elif execution_status == "completed" or task.get("status") == "completed":
+        category = "Completed"
+    elif command_status == "queued" or task.get("status") in {"ready", "queued"}:
+        category = "Queued"
+    elif execution and is_execution_stale(execution, now):
+        category = "Attention"
+    else:
+        category = "Active"
+    snapshot = execution.get("task_snapshot") or {}
+    visibility_rows.append({
+        "Class": category,
+        "AI": execution.get("provider") or command.get("provider") or task.get("assigned_provider") or task.get("recommended_provider") or "—",
+        "Task title": task.get("title") or snapshot.get("title") or "—",
+        "Task status": task.get("status") or "—",
+        "Command status": command_status or "—",
+        "Execution status": execution_status or "—",
+        "Session ID": execution.get("provider_session_id") or execution.get("session_id") or (command.get("result") or {}).get("session_id") or "—",
+        "Task ID": task_id or "—",
+        "Model / mode": f"{execution.get('model') or command.get('model') or snapshot.get('model') or '—'} / {execution.get('mode') or command.get('mode') or snapshot.get('mode') or task.get('mode') or '—'}",
+        "Working directory": task.get("working_directory") or snapshot.get("working_directory") or "—",
+        "Started at": execution.get("started_at") or execution.get("reserved_at") or command.get("claimed_at") or "—",
+        "Last updated": execution.get("heartbeat_at") or execution.get("completed_at") or task.get("updated_at") or command.get("completed_at") or command.get("created_at") or "—",
+    })
+
+visibility_rows.sort(key=lambda row: row["Last updated"], reverse=True)
+visibility_rows.sort(key=lambda row: {"Active": 0, "Queued": 1, "Attention": 2, "Completed": 3}[row["Class"]])
+if visibility_rows:
+    st.dataframe(pd.DataFrame(visibility_rows), use_container_width=True, hide_index=True)
+else:
+    st.info("No recent HOME Task / Command / Execution records found.")
+st.caption(f"Showing the {RECENT_RECORD_LIMIT} most recently modified records per lifecycle type for `{DASHBOARD_PROJECT_ID}`. Drive load: {load_duration_seconds}s. Use Sync with Google Drive for an immediate refresh.")
 
 # Active Executions mappings
 active_executions = [e for e in all_executions if e.get("status") not in {"completed", "failed", "interrupted", "cancelled"}]
@@ -622,7 +703,15 @@ st.markdown("---")
 # Section D: Task Board (Tabs for columns)
 # =====================================================================
 st.header("📋 Task Board")
-board = map_task_board(all_tasks, active_executions_dict, now)
+task_board_tasks = []
+for task in all_tasks:
+    board_task = dict(task)
+    command = commands_by_task.get(task.get("task_id"), {})
+    if (board_task.get("status") == "in_progress" and not active_executions_dict.get((task.get("project_id"), task.get("task_id")))
+            and command.get("status") in {"attention", "failed", "rejected"}):
+        board_task["status"] = "blocked"
+    task_board_tasks.append(board_task)
+board = map_task_board(task_board_tasks, active_executions_dict, now)
 
 tab_in_progress, tab_ready, tab_blocked, tab_completed = st.tabs([
     f"🚀 In Progress ({len(board['In progress'])})",
