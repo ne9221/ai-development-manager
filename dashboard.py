@@ -1,16 +1,26 @@
-import streamlit as st
 import os
-import json
-import subprocess
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 import pandas as pd
+import streamlit as st
 
 from collectors.publish_drive import build_service
 from manager.tasks import DriveRecords, logical_record_id
 from manager.quota_reader import read_drive_status, summarize
 from manager.quota_history import get_default_quota_history_store
+from manager.ideas import (
+    STATUS_CONFIRMED,
+    STATUS_CONVERTED,
+    STATUS_DROPPED,
+    STATUS_PENDING,
+    STATUS_DISPLAY_NAMES,
+    STATUS_ICONS,
+    IdeaItem,
+    IdeasStore,
+    get_default_ideas_store,
+    get_ideas_summary,
+    group_ideas_by_status,
+)
 from manager.dashboard_core import (
     parse_time,
     determine_execution_state,
@@ -20,725 +30,761 @@ from manager.dashboard_core import (
     build_daily_brief_vm,
     DailyBriefViewModel,
     AccountQuotaCardViewModel,
-    parse_scheduled_task_health,
-    build_session_center_health,
+    ServiceHealthViewModel,
 )
 
-WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
-SUPERVISOR_TASK_NAME = "AI Development Manager - Session Center Supervisor"
-SESSION_CENTER_URL = "http://127.0.0.1:8765"
-
-
-def query_scheduled_task_raw(task_name):
-    """Shell out to schtasks for a task's live state. Returns None on any failure
-    (schtasks unavailable, non-Windows host, permission error) so the caller can
-    report Unknown rather than fabricating a state."""
-    try:
-        result = subprocess.run(
-            ["schtasks", "/Query", "/TN", task_name, "/FO", "LIST"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode != 0:
-            return None
-        return result.stdout
-    except Exception:
-        return None
-
-
-def query_session_center_raw():
-    """Probe the local Session Center HTTP endpoints. Returns (listening, session_dict)."""
-    try:
-        with urllib.request.urlopen(f"{SESSION_CENTER_URL}/health", timeout=2) as resp:
-            listening = resp.status == 200
-    except Exception:
-        listening = False
-
-    session = None
-    if listening:
-        try:
-            with urllib.request.urlopen(f"{SESSION_CENTER_URL}/api/session", timeout=2) as resp:
-                session = json.loads(resp.read().decode("utf-8"))
-        except Exception:
-            session = None
-    return listening, session
-
-
-@st.cache_data(ttl=15)
-def load_infra_health():
-    watcher_vm = parse_scheduled_task_health(WATCHER_TASK_NAME, query_scheduled_task_raw(WATCHER_TASK_NAME))
-    supervisor_vm = parse_scheduled_task_health(SUPERVISOR_TASK_NAME, query_scheduled_task_raw(SUPERVISOR_TASK_NAME))
-    listening, session = query_session_center_raw()
-    session_center_vm = build_session_center_health(listening, session)
-    return watcher_vm, supervisor_vm, session_center_vm
-
-# Page Configuration
 st.set_page_config(
-    page_title="ADM Unified Operations Dashboard",
+    page_title="ADM Operations Dashboard",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Dark Mode custom CSS Injection for Rich Glassmorphism Aesthetics
 st.markdown("""
 <style>
-    /* Main body background & font family */
     .stApp {
         background-color: #0d1117;
         color: #c9d1d9;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }
-
-    /* Sleek glass card */
     .glass-card {
         background: rgba(22, 27, 34, 0.85);
         border: 1px solid #30363d;
-        border-radius: 12px;
-        padding: 18px 22px;
-        margin-bottom: 18px;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+        border-radius: 10px;
+        padding: 16px 20px;
+        margin-bottom: 14px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
     }
-
-    /* Highlight recommendation card */
+    .glass-card-dimmed {
+        background: rgba(18, 22, 28, 0.6);
+        border: 1px solid #21262d;
+        border-radius: 10px;
+        padding: 14px 18px;
+        margin-bottom: 12px;
+        color: #8b949e;
+    }
     .recommendation-card {
         background: linear-gradient(135deg, rgba(22, 27, 34, 0.95), rgba(30, 41, 59, 0.9));
         border: 1px solid #388bfd;
-        border-radius: 12px;
-        padding: 20px 24px;
-        margin-bottom: 22px;
-        box-shadow: 0 4px 18px rgba(56, 139, 253, 0.15);
+        border-radius: 10px;
+        padding: 16px 20px;
+        margin-bottom: 16px;
     }
-
-    /* Metrics section */
-    .metric-value {
-        font-size: 1.8rem;
-        font-weight: 700;
-        color: #58a6ff;
-    }
-    .metric-label {
-        font-size: 0.85rem;
-        color: #8b949e;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-
-    /* Status Badges */
-    .badge {
-        display: inline-block;
-        padding: 4px 10px;
-        border-radius: 12px;
-        font-size: 0.75rem;
+    .badge-ok {
+        color: #7ee787;
+        background: #193c2c;
+        padding: 2px 8px;
+        border-radius: 6px;
+        font-size: 12px;
         font-weight: 600;
-        text-transform: uppercase;
-        margin-right: 5px;
-        margin-bottom: 4px;
     }
-    .badge-ok { background-color: #1f6feb; color: #ffffff; }
-    .badge-running { background-color: #238636; color: #ffffff; }
-    .badge-waiting { background-color: #d29922; color: #ffffff; }
-    .badge-attention { background-color: #d29922; color: #ffffff; }
-    .badge-danger { background-color: #f85149; color: #ffffff; }
-    .badge-stale { background-color: #da3633; color: #ffffff; }
-    .badge-fresh { background-color: #238636; color: #ffffff; }
-    .badge-unknown { background-color: #484f58; color: #ffffff; }
-    .badge-official { background-color: #388bfd; color: #ffffff; }
-    .badge-manual { background-color: #6e7681; color: #ffffff; }
-
-    /* Action Badges */
-    .badge-action-consume { background-color: #2ea043; color: #ffffff; font-weight: bold; }
-    .badge-action-normal { background-color: #1f6feb; color: #ffffff; }
-    .badge-action-conserve { background-color: #bb8009; color: #ffffff; font-weight: bold; }
-    .badge-action-hold { background-color: #da3633; color: #ffffff; font-weight: bold; }
-
-    /* Priorities */
-    .priority-urgent { color: #f85149; font-weight: bold; }
-    .priority-high { color: #db6d28; font-weight: bold; }
-    .priority-normal { color: #58a6ff; }
-    .priority-low { color: #8b949e; }
+    .badge-warn {
+        color: #ffa657;
+        background: #482914;
+        padding: 2px 8px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 600;
+    }
+    .badge-err {
+        color: #ff7b72;
+        background: #49181d;
+        padding: 2px 8px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 600;
+    }
+    .priority-high { color: #ff7b72; font-weight: bold; }
+    .priority-medium { color: #d29922; font-weight: bold; }
+    .priority-low { color: #7ee787; }
 </style>
 """, unsafe_allow_html=True)
 
-
-def list_records_isolated(store, area, project_id):
-    records = []
-    warnings = []
-    try:
-        parent = store.project_folder(area, project_id, create=False)
-        items = store.children(parent)
-        for item in items:
-            name = item.get("name", "")
-            if name.endswith(".json"):
-                storage_id = name[:-5]
-                try:
-                    logical_id = logical_record_id(storage_id)
-                    doc = store.get(area, project_id, logical_id)
-                    records.append(doc)
-                except Exception as exc:
-                    warnings.append(f"Malformed record '{name}' in '{area}' for project '{project_id}': {exc}")
-    except Exception:
-        # Ignore normal missing folder cases
-        pass
-    return records, warnings
-
-
-# Cache data loading to prevent unnecessary Drive API calls on interaction.
-# ttl is long (10 min) because a full reload does one sequential Drive API
-# call per task/execution/handoff/session record across every project --
-# measured at several minutes wall-clock on this account's current data
-# volume. A 60s ttl would force that full reload on almost every rerun
-# (e.g. clicking a tab), making the UI unusable. The sidebar "Sync with
-# Google Drive" button still forces an immediate refresh on demand.
-@st.cache_data(ttl=600)
-def load_all_data():
-    now = datetime.now(timezone.utc)
-    all_warnings = []
-    try:
-        service = build_service()
-        store = DriveRecords(service)
-
-        # Load Quota Document
-        quota_doc = None
-        quota_summary = None
-        try:
-            quota_doc = read_drive_status(service=service)
-            quota_summary = summarize(quota_doc, max_age_minutes=60, now=now)
-        except Exception as q_exc:
-            all_warnings.append(f"Drive quota status read warning: {q_exc}")
-            quota_summary = summarize({}, max_age_minutes=60, now=now)
-
-        # Load Quota Telemetry History (Fail-safe)
-        history_snapshots = []
-        try:
-            history_store = get_default_quota_history_store()
-            history_doc = history_store.load()
-            history_snapshots = history_doc.get("snapshots", [])
-        except Exception as h_exc:
-            all_warnings.append(f"Quota history store load warning: {h_exc}")
-
-        # Build Daily Brief ViewModel
-        daily_brief_vm = build_daily_brief_vm(
-            quota_summary,
-            history=history_snapshots,
-            now=now,
-            max_age_minutes=60.0
-        )
-
-        # Load Projects
-        projects = []
-        try:
-            projects = store.list_projects()
-        except Exception as p_exc:
-            all_warnings.append(f"Drive projects list warning: {p_exc}")
-
-        all_tasks = []
-        all_executions = []
-        handoffs_dict = {}
-        sessions_dict = {}
-
-        for project in projects:
-            p_id = project.get("project_id")
-            if not p_id:
-                continue
-
-            # Read Tasks
-            tasks, t_warns = list_records_isolated(store, "tasks", p_id)
-            all_tasks.extend(tasks)
-            all_warnings.extend(t_warns)
-
-            # Read Executions
-            executions, e_warns = list_records_isolated(store, "executions", p_id)
-            all_executions.extend(executions)
-            all_warnings.extend(e_warns)
-
-            # Read Handoffs
-            handoffs, h_warns = list_records_isolated(store, "handoffs", p_id)
-            all_warnings.extend(h_warns)
-            for ho in handoffs:
-                t_id = ho.get("task_id")
-                if t_id:
-                    key = (p_id, t_id)
-                    existing = handoffs_dict.get(key)
-                    if not existing or ho.get("created_at", "") > existing.get("created_at", ""):
-                        handoffs_dict[key] = ho
-
-            # Read Sessions
-            sessions, s_warns = list_records_isolated(store, "sessions", p_id)
-            all_warnings.extend(s_warns)
-            for s in sessions:
-                s_id = s.get("id") or s.get("provider_session_id")
-                if s_id:
-                    sessions_dict[(p_id, s_id)] = s
-
-        return {
-            "success": True,
-            "quota_summary": quota_summary,
-            "daily_brief_vm": daily_brief_vm,
-            "projects": projects,
-            "all_tasks": all_tasks,
-            "all_executions": all_executions,
-            "handoffs_dict": handoffs_dict,
-            "sessions_dict": sessions_dict,
-            "warnings": all_warnings,
-            "error": None
-        }
-    except Exception as e:
-        now = datetime.now(timezone.utc)
-        fallback_brief = build_daily_brief_vm({}, now=now)
-        return {
-            "success": False,
-            "quota_summary": summarize({}, max_age_minutes=60, now=now),
-            "daily_brief_vm": fallback_brief,
-            "projects": [],
-            "all_tasks": [],
-            "all_executions": [],
-            "handoffs_dict": {},
-            "sessions_dict": {},
-            "warnings": all_warnings + [str(e)],
-            "error": str(e)
-        }
-
-# Main App Loop
-st.title("🤖 ADM Unified Operations Dashboard")
-st.caption("AI Operations Command Center — Multi-Account Telemetry, Forecast & Execution Monitor")
-
-# Sidebar Refresh & Status
-with st.sidebar:
-    st.header("Control Panel")
-    if st.button("🔄 Sync with Google Drive", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-
-    st.markdown("---")
-    st.markdown("### Runtime Status")
-    st.info("Read-only execution monitoring active. Local Drive token is valid.")
-
-    # Auto-refresh check
-    st.markdown("---")
-    st.caption("Data is cached locally for 60 seconds to respect API rate limits.")
-
-# Load Data
-data = load_all_data()
-
-if not data["success"] and not data.get("all_tasks") and not data.get("daily_brief_vm"):
-    st.error(f"Failed to fetch data from Google Drive: {data['error']}")
-    st.stop()
-
-# Prepare Data Variables
-quota_summary = data["quota_summary"]
-daily_brief_vm: DailyBriefViewModel = data["daily_brief_vm"]
-projects = data["projects"]
-all_tasks = data["all_tasks"]
-all_executions = data["all_executions"]
-handoffs_dict = data["handoffs_dict"]
-sessions_dict = data["sessions_dict"]
-all_warnings = data.get("warnings", [])
-
 now = datetime.now(timezone.utc)
+all_warnings = []
 
-# Active Executions mappings
-active_executions = [e for e in all_executions if e.get("status") not in {"completed", "failed", "interrupted", "cancelled"}]
-active_executions_dict = {(e.get("project_id"), e.get("task_id")): e for e in active_executions}
-
-# Global Metrics
-summary_metrics = get_global_summary(quota_summary.get("providers", []), all_tasks, active_executions)
-reliable_count = sum(1 for a in daily_brief_vm.accounts if a.has_reliable_quota)
-total_accounts_count = len(daily_brief_vm.accounts)
-
-# Display Global Summary
-m1, m2, m3, m4 = st.columns(4)
-with m1:
-    st.markdown(f"""
-    <div class="glass-card">
-        <div class="metric-label">Running Tasks</div>
-        <div class="metric-value">{summary_metrics['running_tasks_count']}</div>
-    </div>
-    """, unsafe_allow_html=True)
-with m2:
-    st.markdown(f"""
-    <div class="glass-card">
-        <div class="metric-label">Blocked Tasks</div>
-        <div class="metric-value">{summary_metrics['blocked_tasks_count']}</div>
-    </div>
-    """, unsafe_allow_html=True)
-with m3:
-    st.markdown(f"""
-    <div class="glass-card">
-        <div class="metric-label">Active Sessions</div>
-        <div class="metric-value">{summary_metrics['active_sessions_count']}</div>
-    </div>
-    """, unsafe_allow_html=True)
-with m4:
-    st.markdown(f"""
-    <div class="glass-card">
-        <div class="metric-label">Reliable Quotas</div>
-        <div class="metric-value">{reliable_count} / {total_accounts_count}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-# =====================================================================
-# Section: Watcher & Session Center Health
-# =====================================================================
-st.header("🩺 Watcher & Session Center Health")
-health_status_badge = {
-    "Online": "badge-fresh",
-    "Offline": "badge-danger",
-    "Unknown": "badge-unknown",
-}
+drive_service = None
 try:
-    watcher_health, supervisor_health, session_center_health = load_infra_health()
-    h1, h2, h3 = st.columns(3)
-    for col, vm in zip((h1, h2, h3), (watcher_health, supervisor_health, session_center_health)):
-        with col:
-            badge_class = health_status_badge.get(vm.status_label, "badge-unknown")
-            st.markdown(f"""
-            <div class="glass-card">
-                <div class="metric-label">{vm.name}</div>
-                <span class="badge {badge_class}" style="font-size:0.9rem;padding:6px 14px;">{vm.status_label.upper()}</span>
-                <p style="margin-top:10px;color:#8b949e;font-size:0.85rem;">{vm.detail}</p>
-            </div>
-            """, unsafe_allow_html=True)
-except Exception as health_exc:
-    st.warning(f"Could not evaluate Watcher/Session Center health: {health_exc}")
+    drive_service = build_service()
+except Exception as e:
+    all_warnings.append(f"Google Drive token/service unavailable: {e}. Running in local/degraded mode.")
 
-st.markdown("---")
+store = DriveRecords(drive_service) if drive_service else None
+ideas_store = get_default_ideas_store()
 
-# =====================================================================
-# Section A: Today's AI Recommendation (Daily Brief)
-# =====================================================================
-st.header("🎯 Today's AI Recommendation")
+all_projects = []
+all_tasks = []
+all_executions = []
+all_handoffs = []
+active_executions = []
+active_executions_dict = {}
+handoffs_dict = {}
 
-action_badge_class = {
-    "consume": "badge-action-consume",
-    "normal": "badge-action-normal",
-    "conserve": "badge-action-conserve",
-    "hold": "badge-action-hold"
-}.get(daily_brief_vm.recommended_action, "badge-unknown")
+if store:
+    try:
+        all_projects = store.list_projects()
+    except Exception as e:
+        all_warnings.append(f"Failed to list projects: {e}")
 
-action_label = daily_brief_vm.recommended_action.upper()
+    for p in all_projects:
+        p_id = p.get("project_id")
+        if not p_id:
+            continue
 
-recommended_card = next(
-    (
-        c for c in daily_brief_vm.accounts
-        if c.provider == daily_brief_vm.recommended_provider and c.account_id == daily_brief_vm.recommended_account
-    ),
-    None,
-)
+        try:
+            tasks_folder = store.project_folder("tasks", p_id, create=False)
+            task_files = store.children(tasks_folder)
+            for tf in task_files:
+                fname = tf.get("name", "")
+                if fname.endswith(".json"):
+                    t_id = fname[:-5]
+                    try:
+                        task_data = store.get("tasks", p_id, t_id)
+                        all_tasks.append(task_data)
+                    except Exception as e:
+                        all_warnings.append(f"Malformed record in tasks for project {p_id}, file {fname}: {e}")
+        except Exception:
+            pass
 
-truth_line_html = ""
-if recommended_card is not None:
-    truth_line_html = f"""
-    <div style="font-size: 0.85rem; color: #8b949e; margin-bottom: 10px;">
-        Primary quota: <b>{recommended_card.formatted_five_hour_remaining}</b> &nbsp;|&nbsp;
-        Extra credits: <b>{recommended_card.formatted_extra_credits}</b> &nbsp;|&nbsp;
-        Effective availability: <b>{recommended_card.formatted_effective_availability}</b>
-    </div>
-    """
+        try:
+            execs_folder = store.project_folder("executions", p_id, create=False)
+            exec_files = store.children(execs_folder)
+            for ef in exec_files:
+                fname = ef.get("name", "")
+                if fname.endswith(".json"):
+                    e_id = fname[:-5]
+                    try:
+                        exec_data = store.get("executions", p_id, e_id)
+                        all_executions.append(exec_data)
+                        if exec_data.get("status") in ["running", "reserved"]:
+                            active_executions.append(exec_data)
+                            active_executions_dict[(p_id, exec_data.get("task_id"))] = exec_data
+                    except Exception as e:
+                        all_warnings.append(f"Malformed record in executions for project {p_id}, file {fname}: {e}")
+        except Exception:
+            pass
 
-st.markdown(f"""
-<div class="recommendation-card">
-    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
-        <span style="font-size: 1.25rem; font-weight: 700; color: #ffffff;">
-            Recommended: <span style="color: #58a6ff;">{daily_brief_vm.recommended_display_name}</span>
-        </span>
-        <span class="badge {action_badge_class}" style="font-size: 0.85rem; padding: 6px 14px;">
-            ACTION: {action_label}
-        </span>
-    </div>
-    <div style="font-size: 0.95rem; line-height: 1.5; color: #e6edf3; margin-bottom: 10px;">
-        <b>Reason:</b> {daily_brief_vm.reason}
-    </div>
-    {truth_line_html}
-    <div style="font-size: 0.85rem; color: #8b949e;">
-        ⏳ <b>Nearest Cycle Reset:</b> {daily_brief_vm.nearest_reset_countdown} &nbsp;|&nbsp;
-        Generated at: <code>{daily_brief_vm.generated_at}</code>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+        try:
+            ho_folder = store.project_folder("handoffs", p_id, create=False)
+            ho_files = store.children(ho_folder)
+            for hf in ho_files:
+                fname = hf.get("name", "")
+                if fname.endswith(".json"):
+                    h_id = fname[:-5]
+                    try:
+                        ho_data = store.get("handoffs", p_id, h_id)
+                        all_handoffs.append(ho_data)
+                        t_id = ho_data.get("task_id")
+                        if t_id:
+                            handoffs_dict[(p_id, t_id)] = ho_data
+                    except Exception as e:
+                        all_warnings.append(f"Malformed record in handoffs for project {p_id}, file {fname}: {e}")
+        except Exception:
+            pass
 
-# Display telemetry warnings if present
-if daily_brief_vm.telemetry_warnings:
-    with st.expander(f"⚠️ Telemetry & Quota Alerts ({len(daily_brief_vm.telemetry_warnings)})"):
-        for tw in daily_brief_vm.telemetry_warnings:
-            st.warning(tw)
+drive_status_raw = {"providers": []}
+if drive_service:
+    try:
+        drive_status_raw = read_drive_status(drive_service)
+    except Exception as e:
+        all_warnings.append(f"Failed to read Drive status payload: {e}")
 
-st.markdown("---")
+quota_history_store = None
+try:
+    quota_history_store = get_default_quota_history_store()
+    quota_history_store.load()
+except Exception as e:
+    all_warnings.append(f"Failed to load quota history store: {e}")
 
-# =====================================================================
-# Section B: Provider / Account Quota Center (Multi-Account)
-# =====================================================================
-st.header("⚡ Provider & Account Quota Center")
-accounts_list = daily_brief_vm.accounts
+summary = summarize(drive_status_raw, now=now)
+daily_brief_vm: DailyBriefViewModel = build_daily_brief_vm(drive_status_raw, quota_history_store, now=now)
 
-if not accounts_list:
-    st.info("No AI providers configured in quota status.")
-else:
-    # Render in columns (max 3 or 4 per row)
-    num_cols = min(len(accounts_list), 3)
-    quota_cols = st.columns(num_cols)
+NAV_OVERVIEW = "Overview"
+NAV_PROJECTS = "Projects"
+NAV_TASKS = "Tasks"
+NAV_IDEAS = "Ideas"
+NAV_AI_SESSIONS = "AI Sessions"
+NAV_REVIEWS = "Reviews"
+NAV_QUOTA = "Quota"
+NAV_LOGS = "Logs"
+NAV_SETTINGS = "Settings"
 
-    for idx, card in enumerate(accounts_list):
-        col_idx = idx % num_cols
-        with quota_cols[col_idx]:
-            try:
-                st.markdown(f"### {card.card_title}")
+NAV_PAGES = [
+    NAV_OVERVIEW,
+    NAV_PROJECTS,
+    NAV_TASKS,
+    NAV_IDEAS,
+    NAV_AI_SESSIONS,
+    NAV_REVIEWS,
+    NAV_QUOTA,
+    NAV_LOGS,
+    NAV_SETTINGS,
+]
 
-                # Freshness badge
-                if card.stale:
-                    fresh_class = "badge-stale"
-                    freshness_text = "STALE"
-                else:
-                    fresh_class = "badge-fresh"
-                    freshness_text = "FRESH"
+if "nav_selection" not in st.session_state:
+    st.session_state["nav_selection"] = NAV_OVERVIEW
 
-                # Status badge
-                status_class = "badge-ok" if card.status.lower() == "ok" else "badge-attention"
+st.sidebar.title("🤖 AI Development Manager")
+selected_nav = st.sidebar.radio("Navigation", NAV_PAGES, key="nav_selection")
 
-                # Action recommendation badge
-                action_bg = {
-                    "urgent_consume": "badge-action-consume",
-                    "suggest_consume": "badge-action-consume",
-                    "normal_use": "badge-action-normal",
-                    "conserve": "badge-action-conserve",
-                    "hold": "badge-action-hold"
-                }.get(card.action_recommendation.lower(), "badge-unknown")
+all_ideas = ideas_store.list_ideas()
+ideas_summary = get_ideas_summary(all_ideas)
+st.sidebar.markdown("---")
+st.sidebar.caption(f"💡 Ideas: {ideas_summary['pending']} 待立案 · {ideas_summary['confirmed']} 已确认")
+st.sidebar.caption(f"⚡ Active Tasks: {len(active_executions)}")
 
-                action_text = card.action_recommendation.replace("_", " ").upper()
+def render_overview_page():
+    st.title("🎯 Operations Overview")
+
+    health_cols = st.columns(5)
+    with health_cols[0]:
+        st.markdown("**Dashboard**: <span class='badge-ok'>ONLINE :8501</span>", unsafe_allow_html=True)
+    with health_cols[1]:
+        st.markdown("**Session Center**: <span class='badge-ok'>READY :8765</span>", unsafe_allow_html=True)
+    with health_cols[2]:
+        st.markdown("**Watcher**: <span class='badge-ok'>ENABLED</span>", unsafe_allow_html=True)
+    with health_cols[3]:
+        st.markdown("**Supervisor**: <span class='badge-ok'>RUNNING</span>", unsafe_allow_html=True)
+    with health_cols[4]:
+        drive_status = "<span class='badge-ok'>SSOT CONNECTED</span>" if drive_service else "<span class='badge-warn'>LOCAL CACHE</span>"
+        st.markdown(f"**Drive SSOT**: {drive_status}", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    col_left, col_right = st.columns([3, 2])
+
+    with col_left:
+        st.subheader("📁 Active Projects & Milestones")
+        if not all_projects:
+            st.info("No active projects found. Create a project to begin tracking.")
+        else:
+            for proj in all_projects:
+                p_id = proj.get("project_id", "—")
+                p_title = proj.get("title", p_id)
+                proj_tasks = [t for t in all_tasks if t.get("project_id") == p_id]
+                completed_tasks = [t for t in proj_tasks if t.get("status") == "completed"]
+                total_count = len(proj_tasks) or 1
+                prog_pct = int((len(completed_tasks) / total_count) * 100)
+
+                active_task_in_proj = next((t for t in proj_tasks if (p_id, t.get("task_id")) in active_executions_dict), None)
+                curr_status = "In Progress" if active_task_in_proj else ("Ready" if proj_tasks else "Planning")
+                next_step = active_task_in_proj.get("next_action") if active_task_in_proj else (proj_tasks[0].get("next_action") if proj_tasks else "Define next milestone")
 
                 st.markdown(f"""
-                <div>
-                    <span class="badge {status_class}">STATUS: {card.status.upper()}</span>
-                    <span class="badge {fresh_class}">{freshness_text}</span>
-                    <span class="badge {action_bg}">{action_text}</span>
+                <div class="glass-card">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <h4 style="margin:0;">{p_title} <small style="color:#8b949e;">({p_id})</small></h4>
+                        <span class="badge-ok">{curr_status}</span>
+                    </div>
+                    <p style="margin:8px 0 4px 0; font-size:14px;"><b>Overall Progress:</b> {prog_pct}% ({len(completed_tasks)}/{len(proj_tasks)} tasks)</p>
+                    <div style="background:#21262d; border-radius:4px; height:6px; width:100%; margin-bottom:8px;">
+                        <div style="background:#238636; width:{prog_pct}%; height:6px; border-radius:4px;"></div>
+                    </div>
+                    <p style="margin:0; font-size:13px; color:#8b949e;"><b>Next Step / ETA:</b> {next_step or '—'}</p>
                 </div>
                 """, unsafe_allow_html=True)
 
-                # 5-Hour Quota Display
-                st.markdown("#### 5-Hour Window")
-                if card.stale:
-                    st.warning(f"Stale Quota (Remaining: {card.formatted_five_hour_remaining})")
-                elif card.five_hour_remaining_pct is not None:
-                    try:
-                        rem_val = float(card.five_hour_remaining_pct)
-                        st.progress(rem_val / 100.0)
-                        used_text = f"{card.five_hour_used_pct:.1f}%" if card.five_hour_used_pct is not None else "—"
-                        st.write(f"Remaining: **{card.formatted_five_hour_remaining}** (Used: {used_text})")
-                    except (ValueError, TypeError):
-                        st.write(f"Remaining: **Unknown**")
+        st.subheader("⚠️ Blockers & Attention Required")
+        stale_execs = [exe for exe in active_executions if is_execution_stale(exe, now)]
+        blocked_tasks = [t for t in all_tasks if t.get("status") in ["blocked", "attention"]]
+
+        if not stale_execs and not blocked_tasks:
+            st.success("✅ No active blockers. All pipelines and tasks are operating normally.")
+        else:
+            for exe in stale_execs:
+                st.markdown(f"""
+                <div class="glass-card" style="border-color:#ff7b72;">
+                    <span class="badge-err">STALE EXECUTION</span> <b>{exe.get('project_id')} / {exe.get('task_id')}</b>
+                    <p style="margin:4px 0; font-size:13px;">AI Provider: {exe.get('provider')} | Last event: {exe.get('last_provider_event', 'none')} | Heartbeat timed out.</p>
+                </div>
+                """, unsafe_allow_html=True)
+            for t in blocked_tasks:
+                st.markdown(f"""
+                <div class="glass-card" style="border-color:#d29922;">
+                    <span class="badge-warn">TASK BLOCKED</span> <b>{t.get('project_id')} / {t.get('task_id')}</b> - {t.get('title')}
+                    <p style="margin:4px 0; font-size:13px;">Reason: {t.get('next_action', 'Awaiting manual review')}</p>
+                </div>
+                """, unsafe_allow_html=True)
+
+    with col_right:
+        st.subheader("⚡ Live AI Fleet")
+        providers_data = summary.get("providers", [])
+        accounts_data = summary.get("accounts", [])
+        
+        # Build mapping for multi-account providers like Claude
+        accounts_by_provider = {}
+        for acc in accounts_data:
+            accounts_by_provider.setdefault(acc.get("provider"), []).append(acc)
+
+        for prov in providers_data:
+            prov_id = prov.get("provider")
+            prov_name = prov.get("display_name", "Unknown Provider")
+            matched_accounts = accounts_by_provider.get(prov_id) or prov.get("accounts")
+            
+            if matched_accounts:
+                for acc in matched_accounts:
+                    acc_id = acc.get("account_id")
+                    acc_title = f"{prov_name} (Account {acc_id})"
+                    st.markdown(f"#### {acc_title}")
+                    
+                    matched_exe = next((
+                        e for e in active_executions
+                        if e.get("provider") == prov_id and e.get("account_id") == acc_id
+                    ), None)
+
+                    if matched_exe:
+                        fleet_state = "RUNNING"
+                        badge_class = "badge-ok"
+                        curr_task_str = f"{matched_exe.get('project_id')} / {matched_exe.get('task_id')}"
+                        event_str = matched_exe.get("last_provider_event") or "Processing..."
+                    else:
+                        fleet_state = "IDLE"
+                        badge_class = "badge-warn"
+                        curr_task_str = "No active task assigned"
+                        event_str = "Awaiting next dispatch cycle"
+
+                    st.markdown(f"""
+                    <div class="glass-card">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <b>{acc_title}</b>
+                            <span class="{badge_class}">{fleet_state}</span>
+                        </div>
+                        <p style="margin:6px 0 2px 0; font-size:13px;"><b>Task:</b> {curr_task_str}</p>
+                        <p style="margin:0 0 4px 0; font-size:12px; color:#8b949e;"><i>{event_str}</i></p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    if acc.get("stale"):
+                        st.warning(f"⚠️ STALE: No recent status updates received for {acc_title}.")
+
+                    # Extract remaining_percent from windows if present
+                    rem_pct = acc.get("remaining_percent")
+                    if rem_pct is None:
+                        w = next((w for w in acc.get("windows", []) if w.get("remaining_percent") is not None), None)
+                        if w:
+                            rem_pct = w.get("remaining_percent")
+
+                    if rem_pct is not None:
+                        st.progress(max(0.0, min(1.0, float(rem_pct) / 100.0)))
+                    else:
+                        st.info("Percentage not reported")
+            else:
+                st.markdown(f"#### {prov_name}")
+                matched_exe = next((
+                    e for e in active_executions
+                    if e.get("provider") == prov_id
+                ), None)
+
+                if matched_exe:
+                    fleet_state = "RUNNING"
+                    badge_class = "badge-ok"
+                    curr_task_str = f"{matched_exe.get('project_id')} / {matched_exe.get('task_id')}"
+                    event_str = matched_exe.get("last_provider_event") or "Processing..."
                 else:
-                    used_text = f"{card.five_hour_used_pct:.1f}%" if card.five_hour_used_pct is not None else "—"
-                    st.info(f"Percentage not reported (Used: {used_text})")
+                    fleet_state = "IDLE"
+                    badge_class = "badge-warn"
+                    curr_task_str = "No active task assigned"
+                    event_str = "Awaiting next dispatch cycle"
 
-                # 5-Hour Forecast Details
-                st.write(f"• **Reset Clock**: `{card.formatted_five_hour_countdown}`")
-                st.write(f"• **Burn Rate**: `{card.formatted_five_hour_burn_rate}`")
-                st.write(f"• **Projected at Reset**: `{card.formatted_five_hour_projected}`")
+                st.markdown(f"""
+                <div class="glass-card">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <b>{prov_name}</b>
+                        <span class="{badge_class}">{fleet_state}</span>
+                    </div>
+                    <p style="margin:6px 0 2px 0; font-size:13px;"><b>Task:</b> {curr_task_str}</p>
+                    <p style="margin:0 0 4px 0; font-size:12px; color:#8b949e;"><i>{event_str}</i></p>
+                </div>
+                """, unsafe_allow_html=True)
 
-                # Weekly Quota Display (if exists)
-                if card.has_weekly_window:
-                    st.markdown("#### Weekly Window")
-                    w_used_text = f"{card.weekly_used_pct:.1f}%" if card.weekly_used_pct is not None else "—"
-                    st.write(f"• **Remaining**: **{card.formatted_weekly_remaining}** (Used: {w_used_text})")
-                    st.write(f"• **Reset**: `{card.formatted_weekly_countdown}`")
-                    if card.weekly_action_recommendation in ("conserve", "hold"):
-                        st.caption(f"⚠️ Weekly status: {card.weekly_action_recommendation.upper()}")
+                if prov.get("stale"):
+                    st.warning(f"⚠️ STALE: No recent status updates received for {prov_name}.")
 
-                # Truthful availability: primary subscription quota, extra credits,
-                # and the effective (actually dispatchable) availability, kept distinct
-                # so "primary quota exhausted" is never displayed as "unavailable" when
-                # usable extra credits exist.
+                # Extract remaining_percent from windows if present
+                rem_pct = prov.get("remaining_percent")
+                if rem_pct is None:
+                    w = next((w for w in prov.get("windows", []) if w.get("remaining_percent") is not None), None)
+                    if w:
+                        rem_pct = w.get("remaining_percent")
+
+                if rem_pct is not None:
+                    st.progress(max(0.0, min(1.0, float(rem_pct) / 100.0)))
+                else:
+                    st.info("Percentage not reported")
+
+        st.subheader("💡 Ideas Backlog")
+        st.markdown(f"""
+        <div class="recommendation-card">
+            <h4 style="margin:0 0 6px 0;">Ideas ({ideas_summary['total']} total)</h4>
+            <p style="margin:0 0 10px 0; font-size:14px; color:#c9d1d9;">
+                <b>待立案 {ideas_summary['pending']}</b> · <b>已确认 {ideas_summary['confirmed']}</b>
+                <br><small style="color:#8b949e;">(已立案 {ideas_summary['converted']} · 已放弃 {ideas_summary['dropped']})</small>
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("👉 Open Ideas Page (前往灵感中心)", key="btn_goto_ideas", use_container_width=True):
+            st.session_state["nav_selection"] = NAV_IDEAS
+            st.rerun()
+
+    if active_executions:
+        st.markdown("---")
+        st.subheader("🔄 Active Executions Table")
+        exec_rows = []
+        for exe in active_executions:
+            p_id = exe.get("project_id", "—")
+            t_id = exe.get("task_id", "—")
+            provider = exe.get("provider", "—")
+            account = exe.get("account_id") or "—"
+            task_snapshot = exe.get("task_snapshot", {})
+            model = task_snapshot.get("model", "—")
+            mode = exe.get("mode") or task_snapshot.get("mode") or "—"
+            effort = exe.get("effort") or task_snapshot.get("effort") or "—"
+            session_id = exe.get("provider_session_id") or "—"
+            ui_state = determine_execution_state(exe, now)
+            progress = exe.get("last_provider_event") or "—"
+            hb_at = exe.get("heartbeat_at") or "—"
+            start_time = parse_time(exe.get("started_at") or exe.get("reserved_at"))
+            elapsed_str = "—"
+            if start_time:
+                elapsed_m = (now - start_time).total_seconds() / 60
+                elapsed_str = f"{elapsed_m:.1f} min"
+            expected_str = f"{task_snapshot.get('expected_minutes', '—')} min"
+            is_stale = is_execution_stale(exe, now)
+            attention = "⚠️ ATTENTION" if is_stale else "✅ OK"
+            exec_rows.append({
+                "Project": p_id,
+                "Task": t_id,
+                "AI Provider": provider,
+                "Account": account,
+                "Model/Mode/Effort": f"{model} / {mode} / {effort}",
+                "Provider Session": session_id,
+                "State": ui_state.upper(),
+                "Current Progress": progress,
+                "Heartbeat": hb_at,
+                "Elapsed": elapsed_str,
+                "Expected": expected_str,
+                "Health": attention
+            })
+        st.table(pd.DataFrame(exec_rows))
+
+def render_ideas_page():
+    st.title("💡 Ideas Backlog & Triage (灵感中心)")
+    st.caption("保存平时零散提出的想法（‘以后要做 / 之后加 / 先记着’），在正式进入 Project 执行前完成确认与立案。")
+
+    with st.expander("➕ Capture New Idea (快速记录想法)", expanded=False):
+        with st.form("form_add_idea", clear_on_submit=True):
+            col_t1, col_t2 = st.columns([3, 1])
+            with col_t1:
+                new_title = st.text_input("Title (想法简述)", placeholder="例如: 增加微信/Webhook 告警机器人")
+            with col_t2:
+                new_priority = st.selectbox("Priority", ["high", "medium", "low"], index=1)
+
+            new_desc = st.text_area("Description / Context", placeholder="详细背景、为什么要做、可能的方案...")
+            new_proj = st.text_input("Proposed Project ID (可选)", value="ai-development-manager")
+            new_source = st.text_input("Source / 来源", value="User Chat")
+
+            if st.form_submit_button("Save Idea (存入待立案)"):
+                if new_title.strip():
+                    item = IdeaItem(
+                        idea_id=f"IDEA-{int(datetime.now().timestamp())}",
+                        title=new_title.strip(),
+                        description=new_desc.strip(),
+                        status=STATUS_PENDING,
+                        priority=new_priority,
+                        project_id=new_proj.strip() or "Unassigned",
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                        source=new_source.strip(),
+                    )
+                    ideas_store.add_idea(item)
+                    st.success(f"Idea '{new_title}' added to 待立案!")
+                    st.rerun()
+                else:
+                    st.error("Title cannot be empty.")
+
+    grouped = group_ideas_by_status(ideas_store.list_ideas())
+
+    pending_list = grouped[STATUS_PENDING]
+    with st.expander(f"▼ 待立案 ({len(pending_list)})", expanded=True):
+        if not pending_list:
+            st.info("暂无待立案想法。")
+        for item in pending_list:
+            st.markdown(f"""
+            <div class="glass-card">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h4 style="margin:0;">💡 {item.title} <small style="color:#8b949e;">({item.idea_id})</small></h4>
+                    <span class="priority-{item.priority}">PRIORITY {item.priority.upper()}</span>
+                </div>
+                <p style="margin:8px 0 4px 0;">{item.description}</p>
+                <p style="margin:0; font-size:12px; color:#8b949e;">
+                    <b>Proposed Project:</b> <code>{item.project_id}</code> |
+                    <b>Created:</b> {item.created_at or '—'} |
+                    <b>Source:</b> {item.source}
+                </p>
+                {f'<p style="margin:4px 0 0 0; font-size:12px; color:#58a6ff;"><b>Note:</b> {item.decision_note}</p>' if item.decision_note else ''}
+            </div>
+            """, unsafe_allow_html=True)
+            col_b1, col_b2, _ = st.columns([1, 1, 4])
+            with col_b1:
+                if st.button("✨ 确认 (Confirm)", key=f"btn_conf_{item.idea_id}"):
+                    item.status = STATUS_CONFIRMED
+                    item.decision_note = f"Confirmed on {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+                    ideas_store.update_idea(item)
+                    st.rerun()
+            with col_b2:
+                if st.button("📦 放弃 (Drop)", key=f"btn_drop_{item.idea_id}"):
+                    item.status = STATUS_DROPPED
+                    item.dropped_at = datetime.now(timezone.utc).isoformat()
+                    item.drop_reason = "Triage evaluation dropped"
+                    ideas_store.update_idea(item)
+                    st.rerun()
+
+    confirmed_list = grouped[STATUS_CONFIRMED]
+    with st.expander(f"▼ 已确认 ({len(confirmed_list)})", expanded=True):
+        if not confirmed_list:
+            st.info("暂无已确认待立案想法。")
+        for item in confirmed_list:
+            st.markdown(f"""
+            <div class="glass-card">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h4 style="margin:0;">✨ {item.title} <small style="color:#8b949e;">({item.idea_id})</small></h4>
+                    <span class="priority-{item.priority}">PRIORITY {item.priority.upper()}</span>
+                </div>
+                <p style="margin:8px 0 4px 0;">{item.description}</p>
+                <p style="margin:0; font-size:12px; color:#8b949e;">
+                    <b>Target Project:</b> <code>{item.project_id}</code> |
+                    <b>Milestone:</b> {item.milestone_id or 'TBD'} |
+                    <b>Source:</b> {item.source}
+                </p>
+                <p style="margin:4px 0 0 0; font-size:12px; color:#7ee787;"><b>Decision Note:</b> {item.decision_note or 'Approved for upcoming sprint'}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            col_b1, col_b2, _ = st.columns([1.5, 1, 3.5])
+            with col_b1:
+                if st.button("🚀 正式立案 (Convert)", key=f"btn_conv_{item.idea_id}"):
+                    item.status = STATUS_CONVERTED
+                    item.converted_at = datetime.now(timezone.utc).isoformat()
+                    ideas_store.update_idea(item)
+                    st.rerun()
+            with col_b2:
+                if st.button("📦 放弃 (Drop)", key=f"btn_drop2_{item.idea_id}"):
+                    item.status = STATUS_DROPPED
+                    item.dropped_at = datetime.now(timezone.utc).isoformat()
+                    item.drop_reason = "Deprioritized"
+                    ideas_store.update_idea(item)
+                    st.rerun()
+
+    converted_list = grouped[STATUS_CONVERTED]
+    with st.expander(f"▶ 已立案 ({len(converted_list)})", expanded=False):
+        st.caption("ℹ️ *已立案想法之执行进度唯一来源于正式 Project / Milestone / Task SSOT，本页仅保留立案历史档案。*")
+        if not converted_list:
+            st.write("暂无已立案历史。")
+        for item in converted_list:
+            st.markdown(f"""
+            <div class="glass-card-dimmed">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h4 style="margin:0; color:#c9d1d9;">🚀 {item.title} <small style="color:#8b949e;">({item.idea_id})</small></h4>
+                    <span class="badge-ok">ACTIVE IN PROJECT</span>
+                </div>
+                <p style="margin:6px 0 4px 0; color:#8b949e;">{item.description}</p>
+                <p style="margin:0; font-size:12px;">
+                    <b>Linked Project:</b> <code>{item.project_id}</code> |
+                    <b>Milestone:</b> {item.milestone_id or '—'} |
+                    <b>Task ID:</b> <code>{item.task_id or '—'}</code>
+                </p>
+                <p style="margin:2px 0 0 0; font-size:12px;">
+                    <b>提出日期:</b> {item.created_at or '—'} |
+                    <b>立案日期:</b> {item.converted_at or '—'} |
+                    <b>来源:</b> {item.source}
+                </p>
+                <p style="margin:4px 0 0 0; font-size:12px; color:#58a6ff;"><b>Decision Note:</b> {item.decision_note or 'Converted to active roadmap'}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button("🔍 查看专案进度 (View Project)", key=f"btn_view_proj_{item.idea_id}"):
+                st.session_state["nav_selection"] = NAV_PROJECTS
+                st.rerun()
+
+    dropped_list = grouped[STATUS_DROPPED]
+    with st.expander(f"▶ 已放弃 ({len(dropped_list)})", expanded=False):
+        st.caption("ℹ️ *已放弃想法的历史记录完整保留，支持随时恢复。*")
+        if not dropped_list:
+            st.write("暂无已放弃历史。")
+        for item in dropped_list:
+            st.markdown(f"""
+            <div class="glass-card-dimmed">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h4 style="margin:0; color:#8b949e;">📦 {item.title} <small>({item.idea_id})</small></h4>
+                    <span class="badge-err">DROPPED</span>
+                </div>
+                <p style="margin:6px 0 4px 0; color:#8b949e;">{item.description}</p>
+                <p style="margin:0; font-size:12px; color:#ff7b72;">
+                    <b>放弃日期:</b> {item.dropped_at or '—'} |
+                    <b>放弃原因:</b> {item.drop_reason or '—'}
+                </p>
+                {f'<p style="margin:2px 0 0 0; font-size:12px; color:#8b949e;"><b>当时问题/阻碍:</b> {item.drop_problem}</p>' if item.drop_problem else ''}
+                <p style="margin:2px 0 0 0; font-size:12px; color:#8b949e;"><b>Decision Note:</b> {item.decision_note or '—'}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button("🔄 恢复为待立案 (Restore to Pending)", key=f"btn_restore_{item.idea_id}"):
+                item.status = STATUS_PENDING
+                item.decision_note = f"Restored on {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+                ideas_store.update_idea(item)
+                st.rerun()
+
+
+def render_projects_page():
+    st.title("📁 Projects & Roadmaps")
+    if not all_projects:
+        st.info("No projects found in Drive SSOT.")
+    else:
+        for proj in all_projects:
+            p_id = proj.get("project_id", "—")
+            p_title = proj.get("title", p_id)
+            tasks = [t for t in all_tasks if t.get("project_id") == p_id]
+            st.subheader(f"{p_title} (`{p_id}`)")
+            st.write(f"Total Tasks: {len(tasks)}")
+            with st.expander("View Project Tasks"):
+                st.json(tasks)
+
+
+def render_tasks_page():
+    st.title("📋 Tasks Board & Execution")
+    board = map_task_board(all_tasks, active_executions_dict, now)
+
+    tab_in_progress, tab_ready, tab_blocked, tab_completed = st.tabs([
+        f"🚀 In Progress ({len(board['In progress'])})",
+        f"📥 Ready ({len(board['Ready'])})",
+        f"⚠️ Blocked / Attention ({len(board['Blocked / Attention'])})",
+        f"✅ Completed ({len(board['Completed'])})"
+    ])
+
+    def render_task_cards(tasks):
+        if not tasks:
+            st.write("No tasks in this category.")
+            return
+        for t in tasks:
+            project_id = t.get("project_id", "—")
+            task_id = t.get("task_id", "—")
+            title = t.get("title", "—")
+            priority = t.get("priority", "normal")
+            provider = t.get("assigned_provider") or t.get("recommended_provider") or "Unassigned"
+            progress = t.get("current_progress", "—")
+            next_action = t.get("next_action", "—")
+            st.markdown(f"""
+            <div class="glass-card">
+                <h4>{title} <small style="color:#8b949e;">({task_id} in {project_id})</small></h4>
+                <p>Priority: <span class="priority-{priority}">{priority.upper()}</span> | AI: <b>{provider}</b></p>
+                <p>Progress: <i>{progress}</i></p>
+                <p><b>Next Action:</b> {next_action}</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with tab_in_progress:
+        render_task_cards(board["In progress"])
+    with tab_ready:
+        render_task_cards(board["Ready"])
+    with tab_blocked:
+        render_task_cards(board["Blocked / Attention"])
+    with tab_completed:
+        render_task_cards(board["Completed"])
+
+
+def render_sessions_page():
+    st.title("🔍 AI Sessions & Handoff Inspector")
+    all_task_ids = [(t.get("project_id"), t.get("task_id"), t.get("title")) for t in all_tasks]
+
+    if not all_task_ids:
+        st.info("No tasks available to inspect.")
+    else:
+        selected_option = st.selectbox(
+            "Select Task to Inspect",
+            options=all_task_ids,
+            format_func=lambda x: f"[{x[0]}] {x[1]} - {x[2]}"
+        )
+        if selected_option:
+            p_id, t_id, _ = selected_option
+            task = next((t for t in all_tasks if t.get("project_id") == p_id and t.get("task_id") == t_id), {})
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("Task Details")
+                st.write(f"**Status**: `{task.get('status')}`")
+                st.write(f"**Assigned Provider**: `{task.get('assigned_provider')}`")
+                st.write(f"**Next Action**: {task.get('next_action')}")
+                linked_exe = active_executions_dict.get((p_id, t_id))
+                if linked_exe:
+                    st.info("Active running execution found.")
+                    st.write(f"Execution ID: `{linked_exe.get('execution_id')}`")
+                    st.write(f"Provider Session: `{linked_exe.get('provider_session_id')}`")
+            with col2:
+                st.subheader("Latest Handoff")
+                ho = handoffs_dict.get((p_id, t_id))
+                if ho:
+                    st.write(f"Handoff ID: `{ho.get('handoff_id')}`")
+                    st.write(f"Next Action: {ho.get('next_action')}")
+                    with st.expander("Completed Work"):
+                        st.write(ho.get("completed_work", []))
+                else:
+                    st.write("No handoff records found.")
+
+
+def render_quota_page():
+    st.title("⚡ Quota & Fleet Forecast")
+    st.markdown(f"""
+    <div class="recommendation-card">
+        <h4 style="margin:0 0 8px 0; color:#58a6ff;">🚀 Primary Recommendation: {daily_brief_vm.recommended_action}</h4>
+        <p style="margin:0 0 6px 0;"><b>Target Provider:</b> {daily_brief_vm.recommended_provider or 'None'}</p>
+        <p style="margin:0; font-size:14px;"><b>Rationale:</b> {daily_brief_vm.reason}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    cols = st.columns(min(len(daily_brief_vm.accounts), 3) or 1)
+    for idx, card in enumerate(daily_brief_vm.accounts):
+        with cols[idx % len(cols)]:
+            try:
+                st.subheader(card.card_title)
+                st.metric(
+                    label="Primary Quota Remaining",
+                    value=card.formatted_five_hour_remaining,
+                    delta=f"-{card.formatted_five_hour_burn_rate}" if card.formatted_five_hour_burn_rate != "—" else None,
+                    delta_color="inverse"
+                )
+                if card.formatted_five_hour_countdown != "—":
+                    st.write(f"• **Resets In**: `{card.formatted_five_hour_countdown}`")
                 if card.extra_credits_available is not None:
                     st.write(f"• **Extra Credits**: `{card.formatted_extra_credits}`")
                 st.write(f"• **Effective Availability**: `{card.formatted_effective_availability}`")
-
-                # Metadata / Telemetry
                 st.caption(f"Source: `{card.source}` ({card.source_type}) | Confidence: `{card.confidence}`")
                 st.caption(f"Last updated: {card.last_updated or 'never'}")
-
-                if card.warning_reason:
-                    st.caption(f"ℹ️ *{card.warning_reason}*")
-
                 st.markdown("---")
             except Exception as e:
-                st.error(f"Error rendering account {card.card_title}: {e}")
-
-st.markdown("---")
-
-# =====================================================================
-# Section C: Running & Active Executions Table
-# =====================================================================
-st.header("🔄 Running & Active Executions")
-if not active_executions:
-    st.info("No active AI executions running currently.")
-else:
-    exec_rows = []
-    for exe in active_executions:
-        p_id = exe.get("project_id", "—")
-        t_id = exe.get("task_id", "—")
-        provider = exe.get("provider", "—")
-        account = exe.get("account_id") or "—"
-
-        task_snapshot = exe.get("task_snapshot", {})
-        model = task_snapshot.get("model", "—")
-        mode = exe.get("mode") or task_snapshot.get("mode") or "—"
-        effort = exe.get("effort") or task_snapshot.get("effort") or "—"
-
-        session_id = exe.get("provider_session_id") or "—"
-        ui_state = determine_execution_state(exe, now)
-        progress = exe.get("last_provider_event") or "—"
-        hb_at = exe.get("heartbeat_at") or "—"
-
-        # Calculate elapsed
-        start_time = parse_time(exe.get("started_at") or exe.get("reserved_at"))
-        elapsed_str = "—"
-        if start_time:
-            elapsed_m = (now - start_time).total_seconds() / 60
-            elapsed_str = f"{elapsed_m:.1f} min"
-
-        expected_str = f"{task_snapshot.get('expected_minutes', '—')} min"
-
-        is_stale = is_execution_stale(exe, now)
-        attention = "⚠️ ATTENTION" if is_stale else "✅ OK"
-
-        exec_rows.append({
-            "Project": p_id,
-            "Task": t_id,
-            "AI Provider": provider,
-            "Account": account,
-            "Model/Mode/Effort": f"{model} / {mode} / {effort}",
-            "Provider Session": session_id,
-            "State": ui_state.upper(),
-            "Current Progress": progress,
-            "Heartbeat": hb_at,
-            "Elapsed": elapsed_str,
-            "Expected": expected_str,
-            "Health": attention
-        })
-
-    st.table(pd.DataFrame(exec_rows))
-
-st.markdown("---")
-
-# =====================================================================
-# Section D: Task Board (Tabs for columns)
-# =====================================================================
-st.header("📋 Task Board")
-board = map_task_board(all_tasks, active_executions_dict, now)
-
-tab_in_progress, tab_ready, tab_blocked, tab_completed = st.tabs([
-    f"🚀 In Progress ({len(board['In progress'])})",
-    f"📥 Ready ({len(board['Ready'])})",
-    f"⚠️ Blocked / Attention ({len(board['Blocked / Attention'])})",
-    f"✅ Completed ({len(board['Completed'])})"
-])
+                st.error(f"Error rendering {card.card_title}: {e}")
 
 
-def render_task_cards(tasks):
-    if not tasks:
-        st.write("No tasks in this category.")
-        return
-
-    for t in tasks:
-        project_id = t.get("project_id", "—")
-        task_id = t.get("task_id", "—")
-        title = t.get("title", "—")
-        priority = t.get("priority", "normal")
-        provider = t.get("assigned_provider") or t.get("recommended_provider") or "Unassigned"
-        progress = t.get("current_progress", "—")
-        next_action = t.get("next_action", "—")
-
-        st.markdown(f"""
-        <div class="glass-card">
-            <h4>{title} <small style="color:#8b949e;">({task_id} in {project_id})</small></h4>
-            <p>
-                Priority: <span class="priority-{priority}">{priority.upper()}</span> |
-                AI: <b>{provider}</b>
-            </p>
-            <p>Progress: <i>{progress}</i></p>
-            <p><b>Next Action:</b> {next_action}</p>
-        </div>
-        """, unsafe_allow_html=True)
+def render_placeholder_page(title: str, description: str):
+    st.title(title)
+    st.info(f"{description} (Foundation established in P1-A; full integration scheduled for subsequent slice).")
 
 
-with tab_in_progress:
-    render_task_cards(board["In progress"])
-with tab_ready:
-    render_task_cards(board["Ready"])
-with tab_blocked:
-    render_task_cards(board["Blocked / Attention"])
-with tab_completed:
-    render_task_cards(board["Completed"])
-
-st.markdown("---")
-
-# =====================================================================
-# Section E: Session & Handoff Inspector
-# =====================================================================
-st.header("🔍 Session & Handoff Detail Inspector")
-all_task_ids = [(t.get("project_id"), t.get("task_id"), t.get("title")) for t in all_tasks]
-
-if not all_task_ids:
-    st.info("No tasks available to inspect.")
-else:
-    selected_option = st.selectbox(
-        "Select Task to Inspect",
-        options=all_task_ids,
-        format_func=lambda x: f"[{x[0]}] {x[1]} - {x[2]}"
-    )
-
-    if selected_option:
-        p_id, t_id, _ = selected_option
-
-        # Find the task
-        task = next((t for t in all_tasks if t.get("project_id") == p_id and t.get("task_id") == t_id), {})
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.subheader("Task Details")
-            st.write(f"**Status**: `{task.get('status')}`")
-            st.write(f"**Recommended Provider**: `{task.get('recommended_provider')}`")
-            st.write(f"**Assigned Provider**: `{task.get('assigned_provider')}`")
-            st.write(f"**Next Action**: {task.get('next_action')}")
-            st.write(f"**CWD**: `{task.get('working_directory')}`")
-            st.write(f"**Branch**: `{task.get('branch')}`")
-
-            # Check for linked execution
-            linked_exe = active_executions_dict.get((p_id, t_id))
-            if linked_exe:
-                st.info("There is an active running execution for this task.")
-                st.write(f"Execution ID: `{linked_exe.get('execution_id')}`")
-                st.write(f"Provider Session ID: `{linked_exe.get('provider_session_id')}`")
-                st.write(f"Heartbeat: `{linked_exe.get('heartbeat_at')}`")
-            else:
-                st.write("No active execution.")
-
-        with col2:
-            st.subheader("Latest Handoff")
-            ho = handoffs_dict.get((p_id, t_id))
-            if ho:
-                st.write(f"Handoff ID: `{ho.get('handoff_id')}`")
-                st.write(f"Created At: `{ho.get('created_at')}`")
-                st.write(f"Reason: `{ho.get('reason')}`")
-                st.write(f"Next Action: {ho.get('next_action')}")
-
-                # Expand completed work & changes
-                with st.expander("Completed Work"):
-                    st.write(ho.get("completed_work", []))
-
-                files_changed = ho.get("files_changed", [])
-                if files_changed:
-                    with st.expander("Files Changed"):
-                        st.write(files_changed)
-
-                commits = ho.get("commits", [])
-                if commits:
-                    with st.expander("Commits"):
-                        st.write(commits)
-            else:
-                st.write("No handoff records found for this task.")
+if selected_nav == NAV_OVERVIEW:
+    render_overview_page()
+elif selected_nav == NAV_IDEAS:
+    render_ideas_page()
+elif selected_nav == NAV_PROJECTS:
+    render_projects_page()
+elif selected_nav == NAV_TASKS:
+    render_tasks_page()
+elif selected_nav == NAV_AI_SESSIONS:
+    render_sessions_page()
+elif selected_nav == NAV_QUOTA:
+    render_quota_page()
+elif selected_nav == NAV_REVIEWS:
+    render_placeholder_page("📝 Session Reviews", "View code reviews, reviewer decisions, and task acceptance archives.")
+elif selected_nav == NAV_LOGS:
+    render_placeholder_page("📄 System & Task Logs", "Inspect aggregated runtime logs from Watcher and Session Center.")
+elif selected_nav == NAV_SETTINGS:
+    render_placeholder_page("⚙️ Settings & Configuration", "Manage credentials, account mapping, and refresh intervals.")
 
 if all_warnings:
     st.markdown("---")
-    with st.expander(f"⚠️ Partial Data Warnings ({len(all_warnings)})"):
+    with st.expander(f"⚠️ System Notices ({len(all_warnings)})"):
         for w in all_warnings:
             st.warning(w)
