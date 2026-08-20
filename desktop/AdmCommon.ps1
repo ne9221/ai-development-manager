@@ -1,12 +1,14 @@
-# Shared helpers for the ADM one-click desktop launcher scripts.
+﻿# Shared helpers for the ADM one-click desktop launcher scripts.
 # Read-only status gathering + idempotent Scheduled Task enable/trigger.
 # Deliberately does not touch execution lifecycle, launchers, or credentials --
 # it only confirms/starts the two existing production Scheduled Tasks and
-# reads Session Center's already-public /health and /api/session endpoints.
+# reads Session Center's already-public /health and /api/session endpoints
+# and Streamlit Dashboard's /_stcore/health endpoint.
 
 $AdmSupervisorTask = "AI Development Manager - Session Center Supervisor"
 $AdmWatcherTask = "AI Development Manager - Command Watcher"
 $AdmSessionCenterUrl = "http://127.0.0.1:8765"
+$AdmDashboardUrl = "http://127.0.0.1:8501"
 
 function Get-AdmTaskStatus {
     param([Parameter(Mandatory = $true)][string]$TaskName)
@@ -43,12 +45,78 @@ function Get-AdmSessionCenterHealth {
     return [PSCustomObject]@{ Listening = $listening; Session = $session }
 }
 
+function Get-AdmDashboardHealth {
+    param([string]$Url = $AdmDashboardUrl)
+    $listening = $false
+    try {
+        $res = Invoke-WebRequest -Uri "$Url/_stcore/health" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+        if ($res.StatusCode -eq 200) {
+            $listening = $true
+        }
+    } catch {
+        try {
+            $res = Invoke-WebRequest -Uri "$Url/" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+            if ($res.StatusCode -ge 200 -and $res.StatusCode -lt 400) {
+                $listening = $true
+            }
+        } catch {
+            $listening = $false
+        }
+    }
+    return [PSCustomObject]@{ Listening = $listening; Url = $Url }
+}
+
+function Get-AdmComprehensiveHealth {
+    $supervisor = Get-AdmTaskStatus -TaskName $AdmSupervisorTask
+    $watcher = Get-AdmTaskStatus -TaskName $AdmWatcherTask
+    $sc = Get-AdmSessionCenterHealth
+    $dash = Get-AdmDashboardHealth
+
+    $dashState = if ($dash.Listening) { "running" } else { "unavailable" }
+    $scState = if ($sc.Listening) {
+        if ($sc.Session -and $sc.Session.current_state -and $sc.Session.current_state -ne "idle") {
+            "running"
+        } else {
+            "idle"
+        }
+    } else {
+        "unavailable"
+    }
+
+    $watcherState = if ($watcher.Exists) {
+        $watcher.State.ToLowerInvariant()
+    } else {
+        "missing"
+    }
+
+    $supervisorState = if ($supervisor.Exists) {
+        $supervisor.State.ToLowerInvariant()
+    } else {
+        "missing"
+    }
+
+    $preferredUrl = if ($dash.Listening) {
+        "$AdmDashboardUrl/"
+    } elseif ($sc.Listening) {
+        "$AdmSessionCenterUrl/"
+    } else {
+        $null
+    }
+
+    return [PSCustomObject]@{
+        DashboardStatus     = $dashState
+        SessionCenterStatus = $scState
+        WatcherStatus       = $watcherState
+        SupervisorStatus    = $supervisorState
+        PreferredUrl        = $preferredUrl
+        SupervisorObject    = $supervisor
+        WatcherObject       = $watcher
+        SessionCenterObject = $sc
+        DashboardObject     = $dash
+    }
+}
+
 function Confirm-AdmTaskEnabled {
-    # "Confirm/start" per the task's own idempotent-safe framing: only flips
-    # Disabled -> Enabled; never touches an already-Enabled/Running task's
-    # trigger, principal, or action. Throws (caller decides how to surface it)
-    # if the task doesn't exist at all -- that's a real setup problem, not
-    # something this launcher should silently paper over.
     param([Parameter(Mandatory = $true)][string]$TaskName)
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if (-not $task) {
@@ -60,7 +128,11 @@ function Confirm-AdmTaskEnabled {
 }
 
 function New-AdmStatusHtml {
-    param($SupervisorStatus, $WatcherStatus, $SessionCenter)
+    param($SupervisorStatus, $WatcherStatus, $SessionCenter, $DashboardStatus = $null)
+
+    if ($null -eq $DashboardStatus) {
+        $DashboardStatus = Get-AdmDashboardHealth
+    }
 
     function Badge($ok) {
         if ($ok) { return '<span style="color:#8ff0c0;background:#164e3b;padding:2px 8px;border-radius:99px;">OK</span>' }
@@ -85,6 +157,12 @@ function New-AdmStatusHtml {
         "<p>Session Center: idle &mdash; no active AI execution right now (this is the normal state when nothing is running)</p>"
     }
 
+    $dashRow = if ($DashboardStatus -and $DashboardStatus.Listening) {
+        "<p>Streamlit Dashboard: $(Badge($true)) listening on 8501</p>"
+    } else {
+        "<p>Streamlit Dashboard: unavailable (not currently listening on 8501)</p>"
+    }
+
     return @"
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>ADM Status</title>
@@ -104,6 +182,7 @@ $(TaskRow($WatcherStatus))
 </table>
 </div>
 <div class="card">
+$dashRow
 $scRow
 </div>
 <p><small>Generated $(Get-Date). This is a static snapshot -- reload this launcher to refresh.</small></p>
