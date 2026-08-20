@@ -25,6 +25,40 @@ from manager.ideas import (
     get_ideas_summary,
     group_ideas_by_status,
 )
+from manager.actions import (
+    STATUS_OPEN,
+    STATUS_ACKNOWLEDGED,
+    STATUS_RESOLVED,
+    STATUS_DISMISSED,
+    TYPE_REVIEW_REQUIRED,
+    TYPE_ACTION_NEEDED,
+    TYPE_BLOCKED,
+    TYPE_MILESTONE_REACHED,
+    TYPE_INFO,
+    SEVERITY_HIGH,
+    SEVERITY_MEDIUM,
+    SEVERITY_LOW,
+    ActionItem,
+    ActionsStore,
+    get_default_actions_store,
+    derive_automatic_actions,
+    get_actions_summary,
+    format_waiting_duration,
+)
+from manager.runtime_visibility import (
+    STATE_AUTO_RUNNING,
+    STATE_WAITING_USER,
+    STATE_BLOCKED,
+    STATE_IDLE,
+    STATE_AUTO_STALLED,
+    STATE_UNKNOWN,
+    format_elapsed_duration,
+    format_activity_timestamp_and_age,
+    get_latest_activity_timestamp,
+    determine_ai_runtime_activity,
+    compute_global_runtime_state,
+    compute_next_auto_action,
+)
 from manager.dashboard_core import (
     parse_time,
     determine_execution_state,
@@ -76,10 +110,20 @@ st.markdown("""
         padding: 16px 20px;
         margin-bottom: 16px;
     }
+    .runtime-state-banner {
+        background: rgba(22, 27, 34, 0.95);
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 12px 18px;
+        margin-bottom: 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
     .badge-ok {
         color: #7ee787;
         background: #193c2c;
-        padding: 2px 8px;
+        padding: 3px 9px;
         border-radius: 6px;
         font-size: 12px;
         font-weight: 600;
@@ -87,7 +131,7 @@ st.markdown("""
     .badge-warn {
         color: #ffa657;
         background: #482914;
-        padding: 2px 8px;
+        padding: 3px 9px;
         border-radius: 6px;
         font-size: 12px;
         font-weight: 600;
@@ -95,10 +139,34 @@ st.markdown("""
     .badge-err {
         color: #ff7b72;
         background: #49181d;
-        padding: 2px 8px;
+        padding: 3px 9px;
         border-radius: 6px;
         font-size: 12px;
         font-weight: 600;
+    }
+    .badge-high {
+        color: #ffffff;
+        background: #b91c1c;
+        padding: 2px 7px;
+        border-radius: 5px;
+        font-size: 11px;
+        font-weight: 700;
+    }
+    .badge-med {
+        color: #ffffff;
+        background: #b45309;
+        padding: 2px 7px;
+        border-radius: 5px;
+        font-size: 11px;
+        font-weight: 700;
+    }
+    .badge-low {
+        color: #ffffff;
+        background: #1e3a8a;
+        padding: 2px 7px;
+        border-radius: 5px;
+        font-size: 11px;
+        font-weight: 700;
     }
     .priority-high { color: #ff7b72; font-weight: bold; }
     .priority-medium { color: #d29922; font-weight: bold; }
@@ -186,6 +254,7 @@ except Exception as e:
 
 store = DriveRecords(drive_service) if drive_service else None
 ideas_store = get_default_ideas_store(drive_service=drive_service)
+actions_store = get_default_actions_store(drive_service=drive_service)
 
 all_projects = []
 all_tasks = []
@@ -274,7 +343,33 @@ except Exception as e:
 summary = summarize(drive_status_raw, now=now)
 daily_brief_vm: DailyBriefViewModel = build_daily_brief_vm(drive_status_raw, quota_history_store, now=now)
 
+infra_health_list = load_infra_health(drive_service)
+all_ideas = ideas_store.list_ideas()
+ideas_summary = get_ideas_summary(all_ideas)
+conflicted_ideas = [i for i in all_ideas if i.is_conflicted or i.status == STATUS_CONFLICTED]
+
+persisted_actions = actions_store.list_actions()
+all_actions = derive_automatic_actions(
+    all_tasks=all_tasks,
+    active_executions=active_executions,
+    ideas_conflicted=conflicted_ideas,
+    infra_health_list=infra_health_list,
+    persisted_actions=persisted_actions,
+    now=now,
+)
+actions_summary = get_actions_summary(all_actions)
+
+global_runtime_state, global_badge_class, global_state_desc = compute_global_runtime_state(
+    active_executions=active_executions,
+    all_tasks=all_tasks,
+    open_actions=all_actions,
+    infra_health_list=infra_health_list,
+    now=now,
+)
+next_auto_action_str = compute_next_auto_action(all_tasks, active_executions, all_actions, daily_brief_vm)
+
 NAV_OVERVIEW = "Overview"
+NAV_ACTION_CENTER = "Action Center"
 NAV_PROJECTS = "Projects"
 NAV_TASKS = "Tasks"
 NAV_IDEAS = "Ideas"
@@ -286,6 +381,7 @@ NAV_SETTINGS = "Settings"
 
 NAV_PAGES = [
     NAV_OVERVIEW,
+    NAV_ACTION_CENTER,
     NAV_PROJECTS,
     NAV_TASKS,
     NAV_IDEAS,
@@ -302,9 +398,14 @@ if "nav_selection" not in st.session_state:
 st.sidebar.title("🤖 AI Development Manager")
 selected_nav = st.sidebar.radio("Navigation", NAV_PAGES, key="nav_selection")
 
-all_ideas = ideas_store.list_ideas()
-ideas_summary = get_ideas_summary(all_ideas)
 st.sidebar.markdown("---")
+if actions_summary["need_user_action"] > 0:
+    st.sidebar.error(f"🚨 待你处理: {actions_summary['need_user_action']} 项")
+elif actions_summary["open"] > 0:
+    st.sidebar.warning(f"⚡ Action Center: {actions_summary['open']} open")
+else:
+    st.sidebar.caption(f"✅ Action Center: All clear")
+
 conflict_tag = f" · ⚠️ {ideas_summary['conflicted']} 冲突" if ideas_summary.get('conflicted', 0) > 0 else ""
 st.sidebar.caption(f"💡 Ideas: {ideas_summary['pending']} 待立案 · {ideas_summary['confirmed']} 已确认{conflict_tag}")
 st.sidebar.caption(f"⚡ Active Tasks: {len(active_executions)}")
@@ -312,7 +413,39 @@ st.sidebar.caption(f"⚡ Active Tasks: {len(active_executions)}")
 def render_overview_page():
     st.title("🎯 Operations Overview")
 
-    infra_health_list = load_infra_health(drive_service)
+    # Section 1: Global Runtime State Banner
+    st.markdown(f"""
+    <div class="runtime-state-banner">
+        <div>
+            <span style="font-size:13px; color:#8b949e; margin-right:8px;">GLOBAL ADM RUNTIME STATE:</span>
+            <span class="{global_badge_class}" style="font-size:14px;">{global_runtime_state}</span>
+            <span style="font-size:13px; margin-left:10px; color:#c9d1d9;">{global_state_desc}</span>
+        </div>
+        <div style="font-size:13px; color:#8b949e;">
+            <b>Next Auto Action:</b> <span style="color:#58a6ff;">{next_auto_action_str}</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Section 2: Action Center Quick Alert Bar
+    col_act1, col_act2, col_act3, col_act4 = st.columns([1.5, 1.5, 1.5, 2.5])
+    with col_act1:
+        st.metric("🚨 Need User Action", actions_summary["need_user_action"])
+    with col_act2:
+        st.metric("📝 Review Required", actions_summary["review_required"])
+    with col_act3:
+        st.metric("⚠️ Blocked Items", actions_summary["blocked"])
+    with col_act4:
+        if actions_summary["need_user_action"] > 0:
+            if st.button("👉 Open Action Center (前往处理)", key="btn_goto_actions_top", use_container_width=True):
+                st.session_state["nav_selection"] = NAV_ACTION_CENTER
+                st.rerun()
+        else:
+            st.caption("✅ No critical user interventions pending.")
+
+    st.markdown("---")
+
+    # Section 3: Technical Health Status Bar
     health_cols = st.columns(len(infra_health_list))
     for idx, h in enumerate(infra_health_list):
         with health_cols[idx]:
@@ -363,7 +496,7 @@ def render_overview_page():
         stale_execs = [exe for exe in active_executions if is_execution_stale(exe, now)]
         blocked_tasks = [t for t in all_tasks if t.get("status") in ["blocked", "attention"]]
 
-        if not stale_execs and not blocked_tasks:
+        if not stale_execs and not blocked_tasks and not conflicted_ideas and actions_summary["blocked"] == 0:
             st.success("✅ No active blockers. All pipelines and tasks are operating normally.")
         else:
             for exe in stale_execs:
@@ -380,9 +513,16 @@ def render_overview_page():
                     <p style="margin:4px 0; font-size:13px;">Reason: {t.get('next_action', 'Awaiting manual review')}</p>
                 </div>
                 """, unsafe_allow_html=True)
+            for ci in conflicted_ideas:
+                st.markdown(f"""
+                <div class="glass-card" style="border-color:#ff7b72;">
+                    <span class="badge-err">SSOT CONFLICT</span> <b>Idea {ci.idea_id}</b> - {ci.title}
+                    <p style="margin:4px 0; font-size:13px;">Conflicting duplicate copies exist in Drive SSOT. Mutations locked.</p>
+                </div>
+                """, unsafe_allow_html=True)
 
     with col_right:
-        st.subheader("⚡ Live AI Fleet")
+        st.subheader("⚡ Live AI Fleet & Runtime Visibility")
         providers_data = summary.get("providers", [])
         accounts_data = summary.get("accounts", [])
         
@@ -407,26 +547,55 @@ def render_overview_page():
                     ), None)
 
                     if matched_exe:
-                        fleet_state = "RUNNING"
-                        badge_class = "badge-ok"
+                        fleet_state, badge_class, state_exp = determine_ai_runtime_activity(matched_exe, now)
                         curr_task_str = f"{matched_exe.get('project_id')} / {matched_exe.get('task_id')}"
-                        event_str = matched_exe.get("last_provider_event") or "Processing..."
+                        event_str = matched_exe.get("last_provider_event") or "Processing task..."
+                        
+                        task_snap = matched_exe.get("task_snapshot", {})
+                        model_str = task_snap.get("model") or matched_exe.get("model") or "—"
+                        mode_str = matched_exe.get("mode") or task_snap.get("mode") or "—"
+                        effort_str = matched_exe.get("effort") or task_snap.get("effort") or "—"
+                        sess_id = matched_exe.get("provider_session_id") or "—"
+
+                        start_ts = matched_exe.get("started_at") or matched_exe.get("reserved_at")
+                        started_display = start_ts[:16].replace("T", " ") if start_ts else "Unknown"
+                        elapsed_display = format_elapsed_duration(start_ts, now)
+
+                        act_ts, act_src = get_latest_activity_timestamp(matched_exe)
+                        activity_display = format_activity_timestamp_and_age(act_ts, now)
+
+                        exp_mins = task_snap.get("expected_minutes")
+                        eta_str = f"~{exp_mins}m" if exp_mins else "—"
+
+                        st.markdown(f"""
+                        <div class="glass-card">
+                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <b>{acc_title}</b>
+                                <span class="{badge_class}">{fleet_state}</span>
+                            </div>
+                            <p style="margin:6px 0 2px 0; font-size:13px;"><b>Task:</b> {curr_task_str}</p>
+                            <p style="margin:0 0 2px 0; font-size:12px; color:#8b949e;"><b>Model/Mode:</b> {model_str} ({mode_str}/{effort_str}) | <b>Session:</b> <code>{sess_id}</code></p>
+                            <p style="margin:0 0 2px 0; font-size:12px;"><b>Started:</b> {started_display} · <b>Elapsed:</b> {elapsed_display}</p>
+                            <p style="margin:0 0 2px 0; font-size:12px;"><b>Last Activity ({act_src}):</b> {activity_display} {f'| <b>ETA:</b> {eta_str}' if eta_str != '—' else ''}</p>
+                            <p style="margin:2px 0 0 0; font-size:12px; color:#58a6ff;"><i>Current Step: {event_str}</i></p>
+                        </div>
+                        """, unsafe_allow_html=True)
                     else:
                         fleet_state = "IDLE"
                         badge_class = "badge-warn"
                         curr_task_str = "No active task assigned"
                         event_str = "Awaiting next dispatch cycle"
 
-                    st.markdown(f"""
-                    <div class="glass-card">
-                        <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <b>{acc_title}</b>
-                            <span class="{badge_class}">{fleet_state}</span>
+                        st.markdown(f"""
+                        <div class="glass-card">
+                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <b>{acc_title}</b>
+                                <span class="{badge_class}">{fleet_state}</span>
+                            </div>
+                            <p style="margin:6px 0 2px 0; font-size:13px;"><b>Task:</b> {curr_task_str}</p>
+                            <p style="margin:0 0 4px 0; font-size:12px; color:#8b949e;"><i>{event_str}</i></p>
                         </div>
-                        <p style="margin:6px 0 2px 0; font-size:13px;"><b>Task:</b> {curr_task_str}</p>
-                        <p style="margin:0 0 4px 0; font-size:12px; color:#8b949e;"><i>{event_str}</i></p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                        """, unsafe_allow_html=True)
 
                     if acc.get("stale"):
                         st.warning(f"⚠️ STALE: No recent status updates received for {acc_title}.")
@@ -449,26 +618,55 @@ def render_overview_page():
                 ), None)
 
                 if matched_exe:
-                    fleet_state = "RUNNING"
-                    badge_class = "badge-ok"
+                    fleet_state, badge_class, state_exp = determine_ai_runtime_activity(matched_exe, now)
                     curr_task_str = f"{matched_exe.get('project_id')} / {matched_exe.get('task_id')}"
-                    event_str = matched_exe.get("last_provider_event") or "Processing..."
+                    event_str = matched_exe.get("last_provider_event") or "Processing task..."
+
+                    task_snap = matched_exe.get("task_snapshot", {})
+                    model_str = task_snap.get("model") or matched_exe.get("model") or "—"
+                    mode_str = matched_exe.get("mode") or task_snap.get("mode") or "—"
+                    effort_str = matched_exe.get("effort") or task_snap.get("effort") or "—"
+                    sess_id = matched_exe.get("provider_session_id") or "—"
+
+                    start_ts = matched_exe.get("started_at") or matched_exe.get("reserved_at")
+                    started_display = start_ts[:16].replace("T", " ") if start_ts else "Unknown"
+                    elapsed_display = format_elapsed_duration(start_ts, now)
+
+                    act_ts, act_src = get_latest_activity_timestamp(matched_exe)
+                    activity_display = format_activity_timestamp_and_age(act_ts, now)
+
+                    exp_mins = task_snap.get("expected_minutes")
+                    eta_str = f"~{exp_mins}m" if exp_mins else "—"
+
+                    st.markdown(f"""
+                    <div class="glass-card">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <b>{prov_name}</b>
+                            <span class="{badge_class}">{fleet_state}</span>
+                        </div>
+                        <p style="margin:6px 0 2px 0; font-size:13px;"><b>Task:</b> {curr_task_str}</p>
+                        <p style="margin:0 0 2px 0; font-size:12px; color:#8b949e;"><b>Model/Mode:</b> {model_str} ({mode_str}/{effort_str}) | <b>Session:</b> <code>{sess_id}</code></p>
+                        <p style="margin:0 0 2px 0; font-size:12px;"><b>Started:</b> {started_display} · <b>Elapsed:</b> {elapsed_display}</p>
+                        <p style="margin:0 0 2px 0; font-size:12px;"><b>Last Activity ({act_src}):</b> {activity_display} {f'| <b>ETA:</b> {eta_str}' if eta_str != '—' else ''}</p>
+                        <p style="margin:2px 0 0 0; font-size:12px; color:#58a6ff;"><i>Current Step: {event_str}</i></p>
+                    </div>
+                    """, unsafe_allow_html=True)
                 else:
                     fleet_state = "IDLE"
                     badge_class = "badge-warn"
                     curr_task_str = "No active task assigned"
                     event_str = "Awaiting next dispatch cycle"
 
-                st.markdown(f"""
-                <div class="glass-card">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <b>{prov_name}</b>
-                        <span class="{badge_class}">{fleet_state}</span>
+                    st.markdown(f"""
+                    <div class="glass-card">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <b>{prov_name}</b>
+                            <span class="{badge_class}">{fleet_state}</span>
+                        </div>
+                        <p style="margin:6px 0 2px 0; font-size:13px;"><b>Task:</b> {curr_task_str}</p>
+                        <p style="margin:0 0 4px 0; font-size:12px; color:#8b949e;"><i>{event_str}</i></p>
                     </div>
-                    <p style="margin:6px 0 2px 0; font-size:13px;"><b>Task:</b> {curr_task_str}</p>
-                    <p style="margin:0 0 4px 0; font-size:12px; color:#8b949e;"><i>{event_str}</i></p>
-                </div>
-                """, unsafe_allow_html=True)
+                    """, unsafe_allow_html=True)
 
                 if prov.get("stale"):
                     st.warning(f"⚠️ STALE: No recent status updates received for {prov_name}.")
@@ -516,10 +714,7 @@ def render_overview_page():
             progress = exe.get("last_provider_event") or "—"
             hb_at = exe.get("heartbeat_at") or "—"
             start_time = parse_time(exe.get("started_at") or exe.get("reserved_at"))
-            elapsed_str = "—"
-            if start_time:
-                elapsed_m = (now - start_time).total_seconds() / 60
-                elapsed_str = f"{elapsed_m:.1f} min"
+            elapsed_str = format_elapsed_duration(start_time, now)
             expected_str = f"{task_snapshot.get('expected_minutes', '—')} min"
             is_stale = is_execution_stale(exe, now)
             attention = "⚠️ ATTENTION" if is_stale else "✅ OK"
@@ -538,6 +733,150 @@ def render_overview_page():
                 "Health": attention
             })
         st.table(pd.DataFrame(exec_rows))
+
+def render_action_center_page():
+    st.title("🚨 Action Center (待你处理)")
+    st.caption("当 AI Fleet 无法自动继续或需要人工决策验收时，集中在此处记录和响应，确保任务不发生无声停滞。")
+
+    if actions_store.is_degraded:
+        st.warning("⚠️ Action Center: Running in Local Cache / Degraded Mode (Google Drive SSOT disconnected). Action updates are read-only.")
+    else:
+        st.caption("✅ Action Center: Google Drive SSOT Connected")
+
+    if actions_store.last_error:
+        st.error(f"{actions_store.last_error}")
+
+    # Summary Metrics Row
+    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+    with m_col1:
+        st.metric("🚨 Need User Action", actions_summary["need_user_action"])
+    with m_col2:
+        st.metric("📝 Review Required", actions_summary["review_required"])
+    with m_col3:
+        st.metric("⚠️ Blocked Items", actions_summary["blocked"])
+    with m_col4:
+        st.metric("📦 Action History", actions_summary["history"])
+
+    st.markdown("---")
+
+    open_actions_list = [a for a in all_actions if a.status == STATUS_OPEN]
+    ack_actions_list = [a for a in all_actions if a.status == STATUS_ACKNOWLEDGED]
+    history_actions_list = [a for a in all_actions if a.status in [STATUS_RESOLVED, STATUS_DISMISSED]]
+
+    # Category 1: Needs Attention (Open Items)
+    with st.expander(f"🚨 Needs Attention / 待处理 ({len(open_actions_list)})", expanded=True):
+        if not open_actions_list:
+            st.info("✅ 当前没有任何待处理事项，所有任务均在自主运行或已就绪。")
+        for item in open_actions_list:
+            sev_badge = f"<span class='badge-{item.severity[:4].lower()}'>{item.severity.upper()}</span>"
+            waiting_dur = format_waiting_duration(item.waiting_since, now)
+            need_action_str = "YES (需人工介入)" if item.need_user_action else "NO (仅需知情)"
+
+            st.markdown(f"""
+            <div class="glass-card" style="border-left: 4px solid {'#ff7b72' if item.severity == 'high' else '#ffa657'};">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h4 style="margin:0;">{item.title} <small style="color:#8b949e;">({item.action_id})</small></h4>
+                    <div>
+                        <span class="badge-warn">{item.type}</span>
+                        {sev_badge}
+                    </div>
+                </div>
+                <p style="margin:8px 0 4px 0; font-size:14px;"><b>Reason:</b> {item.reason}</p>
+                <p style="margin:0 0 4px 0; font-size:13px; color:#ff7b72;"><b>Impact:</b> {item.impact}</p>
+                <p style="margin:0 0 6px 0; font-size:13px; color:#58a6ff;"><b>Recommended Next Step:</b> {item.recommended_next_step}</p>
+                <p style="margin:0; font-size:12px; color:#8b949e;">
+                    <b>Project:</b> <code>{item.project_id}</code> |
+                    <b>Task:</b> <code>{item.task_id or '—'}</code> |
+                    <b>Waiting Since:</b> {item.waiting_since[:16].replace('T', ' ') if item.waiting_since else '—'} (<b>Duration:</b> {waiting_dur}) |
+                    <b>Need User Action:</b> <b>{need_action_str}</b>
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            col_b1, col_b2, col_b3 = st.columns([1.5, 1.5, 3])
+            with col_b1:
+                if st.button("👀 知晓 (Acknowledge)", key=f"btn_ack_{item.action_id}", disabled=actions_store.is_degraded):
+                    try:
+                        actions_store.acknowledge_action(item.action_id, note=f"Acknowledged by user at {datetime.now(timezone.utc).strftime('%H:%M:%S')}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Acknowledge failed: {e}")
+            with col_b2:
+                if st.button("✅ 标记已解决 (Resolve)", key=f"btn_res_{item.action_id}", disabled=actions_store.is_degraded):
+                    try:
+                        actions_store.resolve_action(item.action_id, note="Resolved by user via Action Center")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Resolve failed: {e}")
+            with col_b3:
+                if st.button("✖ 忽略 (Dismiss)", key=f"btn_dsm_{item.action_id}", disabled=actions_store.is_degraded):
+                    try:
+                        actions_store.dismiss_action(item.action_id, note="Dismissed by user")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Dismiss failed: {e}")
+
+    # Category 2: Acknowledged Items
+    with st.expander(f"👀 Acknowledged / 已知晓待完成 ({len(ack_actions_list)})", expanded=bool(ack_actions_list)):
+        if not ack_actions_list:
+            st.write("暂无已知晓事项。")
+        for item in ack_actions_list:
+            sev_badge = f"<span class='badge-{item.severity[:4].lower()}'>{item.severity.upper()}</span>"
+            waiting_dur = format_waiting_duration(item.waiting_since, now)
+
+            st.markdown(f"""
+            <div class="glass-card-dimmed">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h4 style="margin:0; color:#c9d1d9;">👀 {item.title} <small>({item.action_id})</small></h4>
+                    {sev_badge}
+                </div>
+                <p style="margin:6px 0 2px 0; font-size:13px;"><b>Recommended Step:</b> {item.recommended_next_step}</p>
+                <p style="margin:0; font-size:12px; color:#8b949e;">
+                    <b>Acknowledged At:</b> {item.acknowledged_at or '—'} |
+                    <b>Waiting Duration:</b> {waiting_dur} |
+                    <b>Note:</b> {item.resolution_note or '—'}
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            col_b1, col_b2, _ = st.columns([1.5, 1.5, 3])
+            with col_b1:
+                if st.button("✅ 标记已解决 (Resolve)", key=f"btn_res_ack_{item.action_id}", disabled=actions_store.is_degraded):
+                    try:
+                        actions_store.resolve_action(item.action_id, note="Resolved after acknowledgment")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Resolve failed: {e}")
+            with col_b2:
+                if st.button("✖ 忽略 (Dismiss)", key=f"btn_dsm_ack_{item.action_id}", disabled=actions_store.is_degraded):
+                    try:
+                        actions_store.dismiss_action(item.action_id, note="Dismissed after acknowledgment")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Dismiss failed: {e}")
+
+    # Category 3: History (Resolved & Dismissed) - Default Collapsed
+    with st.expander(f"📜 Action History / 历史归档 ({len(history_actions_list)})", expanded=False):
+        st.caption("ℹ️ *已解决与已忽略的历史事项保留完整审计记录。*")
+        if not history_actions_list:
+            st.write("暂无历史归档事项。")
+        for item in history_actions_list:
+            badge_type = "badge-ok" if item.status == STATUS_RESOLVED else "badge-err"
+            resolved_ts = item.resolved_at or item.dismissed_at or "—"
+            st.markdown(f"""
+            <div class="glass-card-dimmed">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h4 style="margin:0; color:#8b949e;">{item.title} <small>({item.action_id})</small></h4>
+                    <span class="{badge_type}">{item.status.upper()}</span>
+                </div>
+                <p style="margin:4px 0 0 0; font-size:12px; color:#8b949e;">
+                    <b>Finished At:</b> {resolved_ts} |
+                    <b>Project:</b> {item.project_id} |
+                    <b>Note:</b> {item.resolution_note or '—'}
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
 
 def render_ideas_page():
     st.title("💡 Ideas Backlog & Triage (灵感中心)")
@@ -565,7 +904,9 @@ def render_ideas_page():
             new_source = st.text_input("Source / 来源", value="User Chat")
 
             if st.form_submit_button("Save Idea (存入待立案)"):
-                if new_title.strip():
+                if ideas_store.is_degraded:
+                    st.error("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
+                elif new_title.strip():
                     item = IdeaItem(
                         idea_id=f"IDEA-{int(datetime.now().timestamp())}",
                         title=new_title.strip(),
@@ -797,7 +1138,7 @@ def render_projects_page():
             p_title = proj.get("title", p_id)
             tasks = [t for t in all_tasks if t.get("project_id") == p_id]
             is_highlighted = (p_id == selected_p_id)
-            
+
             st.markdown(f"""
             <div class="glass-card" {'style="border: 2px solid #388bfd;"' if is_highlighted else ''}>
                 <h3 style="margin:0;">{p_title} <small style="color:#8b949e;">({p_id})</small></h3>
@@ -928,6 +1269,8 @@ def render_placeholder_page(title: str, description: str):
 
 if selected_nav == NAV_OVERVIEW:
     render_overview_page()
+elif selected_nav == NAV_ACTION_CENTER:
+    render_action_center_page()
 elif selected_nav == NAV_IDEAS:
     render_ideas_page()
 elif selected_nav == NAV_PROJECTS:

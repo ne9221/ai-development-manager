@@ -1,0 +1,43 @@
+﻿{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Action Item Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "action_id",
+    "title",
+    "type",
+    "severity",
+    "project_id",
+    "created_at",
+    "waiting_since",
+    "reason",
+    "impact",
+    "recommended_next_step",
+    "need_user_action",
+    "status",
+    "source"
+  ],
+  "properties": {
+    "action_id": {"type": "string", "minLength": 1},
+    "title": {"type": "string", "minLength": 1, "maxLength": 500},
+    "type": {"enum": ["REVIEW_REQUIRED", "ACTION_NEEDED", "BLOCKED", "MILESTONE_REACHED", "INFO"]},
+    "severity": {"enum": ["high", "medium", "low"]},
+    "project_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": ["string", "null"]},
+    "milestone_id": {"type": ["string", "null"]},
+    "created_at": {"type": "string"},
+    "waiting_since": {"type": "string"},
+    "reason": {"type": "string", "maxLength": 5000},
+    "impact": {"type": "string", "maxLength": 5000},
+    "recommended_next_step": {"type": "string", "maxLength": 5000},
+    "need_user_action": {"type": "boolean"},
+    "status": {"enum": ["open", "acknowledged", "resolved", "dismissed"]},
+    "source": {"type": "string", "maxLength": 500},
+    "linked_entity_ids": {"type": "array", "items": {"type": "string"}},
+    "acknowledged_at": {"type": ["string", "null"]},
+    "resolved_at": {"type": ["string", "null"]},
+    "dismissed_at": {"type": ["string", "null"]},
+    "resolution_note": {"type": ["string", "null"], "maxLength": 5000}
+  }
+}
