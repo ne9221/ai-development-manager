@@ -18,7 +18,8 @@ class TestDashboardP1ARequirements(unittest.TestCase):
     @patch("manager.tasks.DriveRecords")
     @patch("manager.quota_reader.read_drive_status")
     @patch("collectors.publish_drive.build_service")
-    def test_overview_ia_and_ideas_navigation(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+    def test_overview_ia_and_truth_contract_health(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+        mock_build_service.return_value = None  # Drive unavailable
         mock_read_drive_status.return_value = {"providers": []}
         mock_store = mock_drive_records.return_value
         mock_store.list_projects.return_value = [
@@ -29,7 +30,7 @@ class TestDashboardP1ARequirements(unittest.TestCase):
         at.run(timeout=30)
         self.assertFalse(at.exception, f"App crashed on Overview: {at.exception}")
 
-        # Check title and sections
+        # Check title
         title_texts = [el.value for el in at.title]
         self.assertTrue(any("Operations Overview" in t for t in title_texts))
 
@@ -46,10 +47,15 @@ class TestDashboardP1ARequirements(unittest.TestCase):
         ideas_btn = [b for b in at.button if "Ideas" in b.label or "灵感" in b.label]
         self.assertTrue(len(ideas_btn) >= 1)
 
+        # Verify truth contract: Drive SSOT was mocked as None, so it must display OFFLINE / LOCAL FALLBACK
+        # and NOT pretend to be ONLINE green
+        markdown_texts = [el.value for el in at.markdown]
+        self.assertTrue(any("LOCAL FALLBACK" in m or "UNAVAILABLE" in m for m in markdown_texts))
+
     @patch("manager.tasks.DriveRecords")
     @patch("manager.quota_reader.read_drive_status")
     @patch("collectors.publish_drive.build_service")
-    def test_ideas_page_rendering_and_four_categories(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+    def test_ideas_page_empty_state_and_four_categories(self, mock_build_service, mock_read_drive_status, mock_drive_records):
         mock_read_drive_status.return_value = {"providers": []}
         mock_store = mock_drive_records.return_value
         mock_store.list_projects.return_value = []
@@ -65,12 +71,16 @@ class TestDashboardP1ARequirements(unittest.TestCase):
         title_texts = [el.value for el in at.title]
         self.assertTrue(any("Ideas" in t or "灵感" in t for t in title_texts))
 
-        # Check that expanders for the 4 categories exist with correct glyphs
+        # Check that expanders for the 4 categories exist
         expander_labels = [el.label for el in at.expander]
         self.assertTrue(any("▼ 待立案" in l for l in expander_labels))
         self.assertTrue(any("▼ 已确认" in l for l in expander_labels))
         self.assertTrue(any("▶ 已立案" in l for l in expander_labels))
         self.assertTrue(any("▶ 已放弃" in l for l in expander_labels))
+
+        # Check that empty state message exists (no fake ideas injected)
+        info_texts = [el.value for el in at.info]
+        self.assertTrue(any("0 Ideas" in i or "暂无" in i for i in info_texts))
 
     def test_idea_ssot_separation_contract(self):
         """Verify converted idea delegates execution progress solely to Project/Task SSOT."""
@@ -84,7 +94,6 @@ class TestDashboardP1ARequirements(unittest.TestCase):
             task_id="adm-windows-launcher-p0",
             converted_at="2026-08-21T01:37:00Z",
         )
-        # Verify idea item itself does not hold execution progress field
         d = converted_idea.to_dict()
         self.assertNotIn("progress_percent", d)
         self.assertNotIn("execution_progress", d)

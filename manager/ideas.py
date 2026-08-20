@@ -1,4 +1,4 @@
-﻿"""Ideas domain model, persistence, and summary helpers for ADM Dashboard."""
+﻿"""Ideas domain model and Cloud-first Drive SSOT store for ADM Dashboard."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
 
 STATUS_PENDING = "pending"       # 待立案
 STATUS_CONFIRMED = "confirmed"   # 已确认
@@ -28,6 +27,10 @@ STATUS_ICONS = {
     STATUS_CONVERTED: "🚀",
     STATUS_DROPPED: "📦",
 }
+
+ROOT_FOLDER_ID = "1pXvl8BglU05ZrXMHIVIDyK-lOWNShXSO"
+MIME_JSON = "application/json"
+MIME_FOLDER = "application/vnd.google-apps.folder"
 
 
 @dataclass
@@ -55,7 +58,7 @@ class IdeaItem:
     def from_dict(cls, data: Dict[str, Any]) -> IdeaItem:
         return cls(
             idea_id=str(data.get("idea_id", "")),
-            title=str(data.get("title", "Untitled Idea")),
+            title=str(data.get("title", "")),
             description=str(data.get("description", "")),
             status=str(data.get("status", STATUS_PENDING)),
             priority=str(data.get("priority", "medium")),
@@ -72,127 +75,129 @@ class IdeaItem:
         )
 
 
-def get_sample_ideas() -> List[IdeaItem]:
-    """Provide realistic initial seed ideas for ADM."""
-    return [
-        IdeaItem(
-            idea_id="IDEA-001",
-            title="Auto-capture Ideas from AI conversation transcripts",
-            description="Listen to session transcripts for phrases like '以后要做', '之后加', '记一下' and automatically extract candidate ideas into 待立案.",
-            status=STATUS_PENDING,
-            priority="high",
-            project_id="ai-development-manager",
-            created_at="2026-08-20T10:15:00Z",
-            source="Chat with Antigravity",
-            decision_note="Needs NLP filter to avoid false positives from ordinary task explanations.",
-        ),
-        IdeaItem(
-            idea_id="IDEA-002",
-            title="Mobile / WeChat notification bridge for urgent blockers",
-            description="Send webhook / Telegram / WeChat message when an active AI Fleet task hits attention/stale or requires manual quota replenishment.",
-            status=STATUS_PENDING,
-            priority="medium",
-            project_id="Unassigned",
-            created_at="2026-08-19T14:30:00Z",
-            source="User note",
-            decision_note="Evaluate privacy and token security before sending project names.",
-        ),
-        IdeaItem(
-            idea_id="IDEA-003",
-            title="Dark mode high-contrast color scheme toggle in Dashboard",
-            description="Provide an accessibility toggle for OLED displays and high-contrast ambient environments.",
-            status=STATUS_PENDING,
-            priority="low",
-            project_id="ai-development-manager",
-            created_at="2026-08-18T09:00:00Z",
-            source="User feedback",
-            decision_note="CSS custom variables ready; needs UI switch in Settings.",
-        ),
-        IdeaItem(
-            idea_id="IDEA-004",
-            title="Fleet Quota Auto-switching on reset window boundary",
-            description="Automatically schedule pending tasks to execute when Claude 5h reset or Codex weekly reset boundary arrives.",
-            status=STATUS_CONFIRMED,
-            priority="high",
-            project_id="ai-development-manager",
-            milestone_id="M2-Quota-Routing",
-            created_at="2026-08-17T11:20:00Z",
-            source="Sprint planning",
-            decision_note="Confirmed for M2 milestone. Needs deterministic reset time forecasting.",
-        ),
-        IdeaItem(
-            idea_id="IDEA-005",
-            title="Daily brief export to Markdown & PDF report",
-            description="One-click export of daily brief and cost/quota trends for weekly review meetings.",
-            status=STATUS_CONFIRMED,
-            priority="medium",
-            project_id="Unassigned",
-            created_at="2026-08-16T16:45:00Z",
-            source="Operations team",
-            decision_note="Confirmed. Will integrate with Streamlit download button.",
-        ),
-        IdeaItem(
-            idea_id="IDEA-006",
-            title="Windows Native Launcher & System Tray Entry (P0)",
-            description="One-click Windows login launcher with system tray icon and automatic dashboard/task readiness polling.",
-            status=STATUS_CONVERTED,
-            priority="high",
-            project_id="ai-development-manager",
-            milestone_id="M1-Windows-Launcher",
-            task_id="adm-windows-launcher-p0",
-            created_at="2026-08-15T08:00:00Z",
-            source="P0 User Requirement",
-            decision_note="Converted into formal Project M1 Milestone task. Production fast-forward merged on 2026-08-21.",
-            converted_at="2026-08-21T01:37:00Z",
-        ),
-        IdeaItem(
-            idea_id="IDEA-007",
-            title="Direct Electron app wrapping for ADM desktop",
-            description="Bundle the entire python dashboard into a heavy Electron standalone binary.",
-            status=STATUS_DROPPED,
-            priority="low",
-            project_id="ai-development-manager",
-            created_at="2026-08-14T10:00:00Z",
-            source="Architecture spike",
-            decision_note="Dropped in favor of native lightweight .NET NotifyIcon + Streamlit browser launcher. Saves 300MB binary footprint.",
-            dropped_at="2026-08-20T18:00:00Z",
-            drop_reason="Overkill for local dashboard; violates Ponytail minimal-change rule",
-            drop_problem="Heavy packaging maintenance, binary distribution complexity",
-        ),
-    ]
-
-
 class IdeasStore:
-    """JSON and in-memory backing store for Ideas."""
+    """Cloud-first Ideas backing store using Google Drive SSOT with local cache fallback."""
 
-    def __init__(self, file_path: Optional[str] = None):
-        if file_path:
-            self.file_path = Path(file_path)
+    def __init__(self, drive_service: Any = None, local_file_path: Optional[str] = None):
+        self.drive_service = drive_service
+        if local_file_path:
+            self.local_file_path = Path(local_file_path)
         else:
             home = os.environ.get("AI_MANAGER_HOME") or os.path.expanduser("~/.ai-development-manager")
-            self.file_path = Path(home) / "ideas.json"
+            self.local_file_path = Path(home) / "ideas.json"
         self._ideas: List[IdeaItem] = []
+        self.is_degraded: bool = drive_service is None
+        self.last_error: Optional[str] = None
         self.load()
 
-    def load(self) -> None:
-        if self.file_path.exists():
+    def _get_drive_folder(self, parent_id: str, name: str, create: bool = True) -> Optional[str]:
+        if not self.drive_service:
+            return None
+        files_client = self.drive_service.files()
+        query = f"'{parent_id}' in parents and name='{name}' and mimeType='{MIME_FOLDER}' and trashed=false"
+        res = files_client.list(q=query, spaces="drive", fields="files(id, name)").execute()
+        files = res.get("files", [])
+        if files:
+            return files[0]["id"]
+        if not create:
+            return None
+        created = files_client.create(
+            body={"name": name, "parents": [parent_id], "mimeType": MIME_FOLDER},
+            fields="id"
+        ).execute()
+        return created.get("id")
+
+    def load(self) -> List[IdeaItem]:
+        """Load ideas from Drive SSOT; fallback to local cache if unavailable."""
+        self._ideas = []
+        self.last_error = None
+
+        if self.drive_service:
             try:
-                raw = json.loads(self.file_path.read_text(encoding="utf-8"))
+                ideas_root_id = self._get_drive_folder(ROOT_FOLDER_ID, "IDEAS", create=False)
+                if not ideas_root_id:
+                    # Root IDEAS folder does not exist yet; start clean
+                    self._ideas = []
+                    self.is_degraded = False
+                    self._save_local_cache()
+                    return self._ideas
+
+                files_client = self.drive_service.files()
+                # List project folders in IDEAS
+                q_folders = f"'{ideas_root_id}' in parents and mimeType='{MIME_FOLDER}' and trashed=false"
+                res_folders = files_client.list(q=q_folders, spaces="drive", fields="files(id, name)").execute()
+                proj_folders = res_folders.get("files", [])
+
+                loaded = []
+                for pf in proj_folders:
+                    pf_id = pf["id"]
+                    q_files = f"'{pf_id}' in parents and mimeType='{MIME_JSON}' and trashed=false"
+                    res_files = files_client.list(q=q_files, spaces="drive", fields="files(id, name)").execute()
+                    for f in res_files.get("files", []):
+                        raw = files_client.get_media(fileId=f["id"]).execute()
+                        doc = json.loads(raw.decode("utf-8"))
+                        loaded.append(IdeaItem.from_dict(doc))
+
+                self._ideas = loaded
+                self.is_degraded = False
+                self._save_local_cache()
+                return self._ideas
+            except Exception as exc:
+                self.last_error = f"Failed to load Ideas from Drive SSOT: {exc}"
+                self.is_degraded = True
+                self._load_local_cache()
+                return self._ideas
+        else:
+            self.is_degraded = True
+            self._load_local_cache()
+            return self._ideas
+
+    def _load_local_cache(self) -> None:
+        if self.local_file_path.exists():
+            try:
+                raw = json.loads(self.local_file_path.read_text(encoding="utf-8"))
                 if isinstance(raw, list):
                     self._ideas = [IdeaItem.from_dict(d) for d in raw]
                     return
-            except Exception:
-                pass
-        # Default fallback
-        self._ideas = get_sample_ideas()
+            except Exception as exc:
+                self.last_error = f"Corrupt local ideas cache: {exc}"
+        self._ideas = []
 
-    def save(self) -> None:
+    def _save_local_cache(self) -> None:
         try:
-            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+            self.local_file_path.parent.mkdir(parents=True, exist_ok=True)
             raw = [i.to_dict() for i in self._ideas]
-            self.file_path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
+            self.local_file_path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            self.last_error = f"Local cache write failed: {exc}"
+            raise RuntimeError(f"Failed to write local ideas cache: {exc}") from exc
+
+    def _write_to_drive(self, idea: IdeaItem) -> None:
+        if not self.drive_service:
+            return
+        files_client = self.drive_service.files()
+        ideas_root_id = self._get_drive_folder(ROOT_FOLDER_ID, "IDEAS", create=True)
+        proj_folder_id = self._get_drive_folder(ideas_root_id, idea.project_id or "Unassigned", create=True)
+
+        filename = f"{idea.idea_id}.json"
+        query = f"'{proj_folder_id}' in parents and name='{filename}' and trashed=false"
+        res = files_client.list(q=query, spaces="drive", fields="files(id, name)").execute()
+        files = res.get("files", [])
+
+        body_content = json.dumps(idea.to_dict(), indent=2, ensure_ascii=False).encode("utf-8")
+
+        from googleapiclient.http import MediaInMemoryUpload
+        media = MediaInMemoryUpload(body_content, mimetype=MIME_JSON, resumable=False)
+
+        if files:
+            file_id = files[0]["id"]
+            files_client.update(fileId=file_id, media_body=media).execute()
+        else:
+            files_client.create(
+                body={"name": filename, "parents": [proj_folder_id], "mimeType": MIME_JSON},
+                media_body=media,
+                fields="id"
+            ).execute()
 
     def list_ideas(self) -> List[IdeaItem]:
         return list(self._ideas)
@@ -204,24 +209,95 @@ class IdeasStore:
         return None
 
     def add_idea(self, idea: IdeaItem) -> None:
+        self.last_error = None
+        if not idea.title.strip():
+            raise ValueError("Idea title cannot be empty.")
+
+        if self.drive_service:
+            try:
+                self._write_to_drive(idea)
+                self.is_degraded = False
+            except Exception as exc:
+                self.last_error = f"Drive SSOT write failed: {exc}"
+                raise RuntimeError(f"Failed to persist Idea to Drive SSOT: {exc}") from exc
+
         self._ideas.append(idea)
-        self.save()
+        self._save_local_cache()
 
     def update_idea(self, idea: IdeaItem) -> None:
+        self.last_error = None
+        if self.drive_service:
+            try:
+                self._write_to_drive(idea)
+                self.is_degraded = False
+            except Exception as exc:
+                self.last_error = f"Drive SSOT write failed: {exc}"
+                raise RuntimeError(f"Failed to update Idea in Drive SSOT: {exc}") from exc
+
         for idx, existing in enumerate(self._ideas):
             if existing.idea_id == idea.idea_id:
                 self._ideas[idx] = idea
-                self.save()
+                self._save_local_cache()
                 return
-        self.add_idea(idea)
+        self._ideas.append(idea)
+        self._save_local_cache()
+
+    def confirm_idea(self, idea_id: str, note: str = "") -> None:
+        idea = self.get_by_id(idea_id)
+        if not idea:
+            raise KeyError(f"Idea not found: {idea_id}")
+        idea.status = STATUS_CONFIRMED
+        if note:
+            idea.decision_note = note
+        self.update_idea(idea)
+
+    def convert_idea(self, idea_id: str, project_id: str, milestone_id: Optional[str] = None, task_id: Optional[str] = None, note: str = "") -> None:
+        idea = self.get_by_id(idea_id)
+        if not idea:
+            raise KeyError(f"Idea not found: {idea_id}")
+        if not project_id or project_id == "Unassigned":
+            raise ValueError("Converted idea must be bound to a valid project_id.")
+        idea.status = STATUS_CONVERTED
+        idea.project_id = project_id
+        idea.milestone_id = milestone_id
+        idea.task_id = task_id
+        idea.converted_at = datetime.now(timezone.utc).isoformat()
+        if note:
+            idea.decision_note = note
+        self.update_idea(idea)
+
+    def drop_idea(self, idea_id: str, drop_reason: str, drop_problem: str, note: str = "") -> None:
+        idea = self.get_by_id(idea_id)
+        if not idea:
+            raise KeyError(f"Idea not found: {idea_id}")
+        if not drop_reason or not drop_reason.strip():
+            raise ValueError("drop_reason is required to drop an idea.")
+        if not drop_problem or not drop_problem.strip():
+            raise ValueError("drop_problem is required to drop an idea.")
+
+        idea.status = STATUS_DROPPED
+        idea.dropped_at = datetime.now(timezone.utc).isoformat()
+        idea.drop_reason = drop_reason.strip()
+        idea.drop_problem = drop_problem.strip()
+        if note:
+            idea.decision_note = note
+        self.update_idea(idea)
+
+    def restore_idea(self, idea_id: str, note: str = "") -> None:
+        idea = self.get_by_id(idea_id)
+        if not idea:
+            raise KeyError(f"Idea not found: {idea_id}")
+        idea.status = STATUS_PENDING
+        if note:
+            idea.decision_note = note
+        self.update_idea(idea)
 
 
-def get_default_ideas_store() -> IdeasStore:
-    return IdeasStore()
+def get_default_ideas_store(drive_service: Any = None) -> IdeasStore:
+    return IdeasStore(drive_service=drive_service)
 
 
 def group_ideas_by_status(ideas: List[IdeaItem]) -> Dict[str, List[IdeaItem]]:
-    """Group list of ideas into four fixed status categories."""
     grouped = {
         STATUS_PENDING: [],
         STATUS_CONFIRMED: [],
@@ -235,7 +311,6 @@ def group_ideas_by_status(ideas: List[IdeaItem]) -> Dict[str, List[IdeaItem]]:
 
 
 def get_ideas_summary(ideas: List[IdeaItem]) -> Dict[str, int]:
-    """Compute summary counts for Overview card."""
     grouped = group_ideas_by_status(ideas)
     return {
         "total": len(ideas),

@@ -1,4 +1,7 @@
 import os
+import json
+import urllib.request
+import subprocess
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import pandas as pd
@@ -31,6 +34,8 @@ from manager.dashboard_core import (
     DailyBriefViewModel,
     AccountQuotaCardViewModel,
     ServiceHealthViewModel,
+    parse_scheduled_task_health,
+    build_session_center_health,
 )
 
 st.set_page_config(
@@ -100,6 +105,75 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
+def query_scheduled_task_raw(task_name: str) -> Optional[str]:
+    try:
+        cmd = ["schtasks.exe", "/Query", "/TN", task_name, "/FO", "LIST"]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+        if res.returncode == 0:
+            return res.stdout
+        return res.stdout if res.stdout else res.stderr
+    except Exception:
+        return None
+
+
+def query_session_center_raw(port: int = 8765) -> tuple[bool, Optional[dict]]:
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/health")
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            if resp.status == 200:
+                try:
+                    s_req = urllib.request.Request(f"http://127.0.0.1:{port}/api/session")
+                    with urllib.request.urlopen(s_req, timeout=1) as s_resp:
+                        if s_resp.status == 200:
+                            data = json.loads(s_resp.read().decode("utf-8"))
+                            return True, data
+                except Exception:
+                    pass
+                return True, None
+    except Exception:
+        return False, None
+    return False, None
+
+
+def query_dashboard_raw(port: int = 8501) -> tuple[bool, str]:
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/_stcore/health")
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            if resp.status == 200:
+                return True, f"ONLINE :{port}"
+    except Exception:
+        return False, f"UNAVAILABLE :{port}"
+    return False, f"UNAVAILABLE :{port}"
+
+
+def load_infra_health(drive_service_inst: Any = None) -> List[ServiceHealthViewModel]:
+    dash_ok, dash_detail = query_dashboard_raw(8501)
+    dash_vm = ServiceHealthViewModel(
+        name="Dashboard (:8501)",
+        found=dash_ok,
+        detail=dash_detail,
+        status_label="Online" if dash_ok else "Offline"
+    )
+
+    sc_listening, sc_session = query_session_center_raw(8765)
+    sc_vm = build_session_center_health(sc_listening, sc_session)
+
+    watcher_raw = query_scheduled_task_raw("AI Development Manager - Command Watcher")
+    watcher_vm = parse_scheduled_task_health("Command Watcher", watcher_raw)
+
+    supervisor_raw = query_scheduled_task_raw("AI Development Manager - Session Center Supervisor")
+    supervisor_vm = parse_scheduled_task_health("Supervisor", supervisor_raw)
+
+    drive_vm = ServiceHealthViewModel(
+        name="Google Drive SSOT",
+        found=bool(drive_service_inst),
+        detail="Connected" if drive_service_inst else "Unavailable / Local Fallback",
+        status_label="Online" if drive_service_inst else "Offline"
+    )
+
+    return [dash_vm, sc_vm, watcher_vm, supervisor_vm, drive_vm]
+
 now = datetime.now(timezone.utc)
 all_warnings = []
 
@@ -110,7 +184,7 @@ except Exception as e:
     all_warnings.append(f"Google Drive token/service unavailable: {e}. Running in local/degraded mode.")
 
 store = DriveRecords(drive_service) if drive_service else None
-ideas_store = get_default_ideas_store()
+ideas_store = get_default_ideas_store(drive_service=drive_service)
 
 all_projects = []
 all_tasks = []
@@ -236,18 +310,17 @@ st.sidebar.caption(f"⚡ Active Tasks: {len(active_executions)}")
 def render_overview_page():
     st.title("🎯 Operations Overview")
 
-    health_cols = st.columns(5)
-    with health_cols[0]:
-        st.markdown("**Dashboard**: <span class='badge-ok'>ONLINE :8501</span>", unsafe_allow_html=True)
-    with health_cols[1]:
-        st.markdown("**Session Center**: <span class='badge-ok'>READY :8765</span>", unsafe_allow_html=True)
-    with health_cols[2]:
-        st.markdown("**Watcher**: <span class='badge-ok'>ENABLED</span>", unsafe_allow_html=True)
-    with health_cols[3]:
-        st.markdown("**Supervisor**: <span class='badge-ok'>RUNNING</span>", unsafe_allow_html=True)
-    with health_cols[4]:
-        drive_status = "<span class='badge-ok'>SSOT CONNECTED</span>" if drive_service else "<span class='badge-warn'>LOCAL CACHE</span>"
-        st.markdown(f"**Drive SSOT**: {drive_status}", unsafe_allow_html=True)
+    infra_health_list = load_infra_health(drive_service)
+    health_cols = st.columns(len(infra_health_list))
+    for idx, h in enumerate(infra_health_list):
+        with health_cols[idx]:
+            if h.status_label == "Online":
+                badge = f"<span class='badge-ok'>{h.detail.upper() if h.detail else 'ONLINE'}</span>"
+            elif h.status_label == "Offline":
+                badge = f"<span class='badge-err'>{h.detail.upper() if h.detail else 'OFFLINE'}</span>"
+            else:
+                badge = f"<span class='badge-warn'>{h.detail.upper() if h.detail else 'UNKNOWN'}</span>"
+            st.markdown(f"**{h.name}**: {badge}", unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -311,7 +384,6 @@ def render_overview_page():
         providers_data = summary.get("providers", [])
         accounts_data = summary.get("accounts", [])
         
-        # Build mapping for multi-account providers like Claude
         accounts_by_provider = {}
         for acc in accounts_data:
             accounts_by_provider.setdefault(acc.get("provider"), []).append(acc)
@@ -357,7 +429,6 @@ def render_overview_page():
                     if acc.get("stale"):
                         st.warning(f"⚠️ STALE: No recent status updates received for {acc_title}.")
 
-                    # Extract remaining_percent from windows if present
                     rem_pct = acc.get("remaining_percent")
                     if rem_pct is None:
                         w = next((w for w in acc.get("windows", []) if w.get("remaining_percent") is not None), None)
@@ -400,7 +471,6 @@ def render_overview_page():
                 if prov.get("stale"):
                     st.warning(f"⚠️ STALE: No recent status updates received for {prov_name}.")
 
-                # Extract remaining_percent from windows if present
                 rem_pct = prov.get("remaining_percent")
                 if rem_pct is None:
                     w = next((w for w in prov.get("windows", []) if w.get("remaining_percent") is not None), None)
@@ -471,6 +541,15 @@ def render_ideas_page():
     st.title("💡 Ideas Backlog & Triage (灵感中心)")
     st.caption("保存平时零散提出的想法（‘以后要做 / 之后加 / 先记着’），在正式进入 Project 执行前完成确认与立案。")
 
+    if ideas_store.is_degraded:
+        st.warning("⚠️ Ideas Store: Running in Local Cache / Degraded Mode (Google Drive SSOT disconnected)")
+    else:
+        st.caption("✅ Ideas Store: Google Drive SSOT Connected")
+
+    if ideas_store.last_error:
+        st.error(f"Ideas Store Notice: {ideas_store.last_error}")
+
+    # Quick Add Idea Expander
     with st.expander("➕ Capture New Idea (快速记录想法)", expanded=False):
         with st.form("form_add_idea", clear_on_submit=True):
             col_t1, col_t2 = st.columns([3, 1])
@@ -495,18 +574,22 @@ def render_ideas_page():
                         created_at=datetime.now(timezone.utc).isoformat(),
                         source=new_source.strip(),
                     )
-                    ideas_store.add_idea(item)
-                    st.success(f"Idea '{new_title}' added to 待立案!")
-                    st.rerun()
+                    try:
+                        ideas_store.add_idea(item)
+                        st.success(f"Idea '{new_title}' added to 待立案!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to add idea: {e}")
                 else:
                     st.error("Title cannot be empty.")
 
     grouped = group_ideas_by_status(ideas_store.list_ideas())
 
+    # Category 1: 待立案 (Default Expanded)
     pending_list = grouped[STATUS_PENDING]
     with st.expander(f"▼ 待立案 ({len(pending_list)})", expanded=True):
         if not pending_list:
-            st.info("暂无待立案想法。")
+            st.info("暂无待立案想法 (0 Ideas)。")
         for item in pending_list:
             st.markdown(f"""
             <div class="glass-card">
@@ -514,7 +597,7 @@ def render_ideas_page():
                     <h4 style="margin:0;">💡 {item.title} <small style="color:#8b949e;">({item.idea_id})</small></h4>
                     <span class="priority-{item.priority}">PRIORITY {item.priority.upper()}</span>
                 </div>
-                <p style="margin:8px 0 4px 0;">{item.description}</p>
+                <p style="margin:8px 0 4px 0;">{item.description or '—'}</p>
                 <p style="margin:0; font-size:12px; color:#8b949e;">
                     <b>Proposed Project:</b> <code>{item.project_id}</code> |
                     <b>Created:</b> {item.created_at or '—'} |
@@ -523,25 +606,42 @@ def render_ideas_page():
                 {f'<p style="margin:4px 0 0 0; font-size:12px; color:#58a6ff;"><b>Note:</b> {item.decision_note}</p>' if item.decision_note else ''}
             </div>
             """, unsafe_allow_html=True)
-            col_b1, col_b2, _ = st.columns([1, 1, 4])
+            col_b1, col_b2, _ = st.columns([1.2, 1.2, 3.6])
             with col_b1:
                 if st.button("✨ 确认 (Confirm)", key=f"btn_conf_{item.idea_id}"):
-                    item.status = STATUS_CONFIRMED
-                    item.decision_note = f"Confirmed on {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
-                    ideas_store.update_idea(item)
-                    st.rerun()
+                    try:
+                        ideas_store.confirm_idea(item.idea_id, note=f"Confirmed on {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Confirm failed: {e}")
             with col_b2:
-                if st.button("📦 放弃 (Drop)", key=f"btn_drop_{item.idea_id}"):
-                    item.status = STATUS_DROPPED
-                    item.dropped_at = datetime.now(timezone.utc).isoformat()
-                    item.drop_reason = "Triage evaluation dropped"
-                    ideas_store.update_idea(item)
+                show_drop_form = st.session_state.get(f"show_drop_{item.idea_id}", False)
+                if st.button("📦 放弃 (Drop)...", key=f"btn_drop_toggle_{item.idea_id}"):
+                    st.session_state[f"show_drop_{item.idea_id}"] = not show_drop_form
                     st.rerun()
 
+            if st.session_state.get(f"show_drop_{item.idea_id}", False):
+                with st.form(f"form_drop_{item.idea_id}"):
+                    st.markdown(f"**放弃想法: {item.title}**")
+                    drop_r = st.text_input("Drop Reason (放弃原因，必填)*", key=f"dr_{item.idea_id}")
+                    drop_p = st.text_input("Drop Problem / Blocker (当时问题/阻碍，必填)*", key=f"dp_{item.idea_id}")
+                    drop_n = st.text_input("Decision Note (说明)", value="Dropped after review", key=f"dn_{item.idea_id}")
+                    if st.form_submit_button("Confirm Drop (确认放弃)"):
+                        if drop_r.strip() and drop_p.strip():
+                            try:
+                                ideas_store.drop_idea(item.idea_id, drop_reason=drop_r, drop_problem=drop_p, note=drop_n)
+                                st.session_state[f"show_drop_{item.idea_id}"] = False
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Drop failed: {e}")
+                        else:
+                            st.error("放弃原因 (Drop Reason) 与 当时问题 (Drop Problem) 均为必填项，不得留空。")
+
+    # Category 2: 已确认 (Default Expanded)
     confirmed_list = grouped[STATUS_CONFIRMED]
     with st.expander(f"▼ 已确认 ({len(confirmed_list)})", expanded=True):
         if not confirmed_list:
-            st.info("暂无已确认待立案想法。")
+            st.info("暂无已确认待立案想法 (0 Ideas)。")
         for item in confirmed_list:
             st.markdown(f"""
             <div class="glass-card">
@@ -549,7 +649,7 @@ def render_ideas_page():
                     <h4 style="margin:0;">✨ {item.title} <small style="color:#8b949e;">({item.idea_id})</small></h4>
                     <span class="priority-{item.priority}">PRIORITY {item.priority.upper()}</span>
                 </div>
-                <p style="margin:8px 0 4px 0;">{item.description}</p>
+                <p style="margin:8px 0 4px 0;">{item.description or '—'}</p>
                 <p style="margin:0; font-size:12px; color:#8b949e;">
                     <b>Target Project:</b> <code>{item.project_id}</code> |
                     <b>Milestone:</b> {item.milestone_id or 'TBD'} |
@@ -558,26 +658,59 @@ def render_ideas_page():
                 <p style="margin:4px 0 0 0; font-size:12px; color:#7ee787;"><b>Decision Note:</b> {item.decision_note or 'Approved for upcoming sprint'}</p>
             </div>
             """, unsafe_allow_html=True)
-            col_b1, col_b2, _ = st.columns([1.5, 1, 3.5])
+            col_b1, col_b2, _ = st.columns([1.5, 1.2, 3.3])
             with col_b1:
-                if st.button("🚀 正式立案 (Convert)", key=f"btn_conv_{item.idea_id}"):
-                    item.status = STATUS_CONVERTED
-                    item.converted_at = datetime.now(timezone.utc).isoformat()
-                    ideas_store.update_idea(item)
+                show_conv_form = st.session_state.get(f"show_conv_{item.idea_id}", False)
+                if st.button("🚀 正式立案 (Convert)...", key=f"btn_conv_toggle_{item.idea_id}"):
+                    st.session_state[f"show_conv_{item.idea_id}"] = not show_conv_form
                     st.rerun()
             with col_b2:
-                if st.button("📦 放弃 (Drop)", key=f"btn_drop2_{item.idea_id}"):
-                    item.status = STATUS_DROPPED
-                    item.dropped_at = datetime.now(timezone.utc).isoformat()
-                    item.drop_reason = "Deprioritized"
-                    ideas_store.update_idea(item)
+                show_drop_form2 = st.session_state.get(f"show_drop2_{item.idea_id}", False)
+                if st.button("📦 放弃 (Drop)...", key=f"btn_drop2_toggle_{item.idea_id}"):
+                    st.session_state[f"show_drop2_{item.idea_id}"] = not show_drop_form2
                     st.rerun()
 
+            if st.session_state.get(f"show_conv_{item.idea_id}", False):
+                with st.form(f"form_conv_{item.idea_id}"):
+                    st.markdown(f"**正式立案: {item.title}**")
+                    conv_proj = st.text_input("Target Project ID (必填)*", value=item.project_id if item.project_id != "Unassigned" else "ai-development-manager")
+                    conv_ms = st.text_input("Milestone ID (可选)", value=item.milestone_id or "")
+                    conv_t = st.text_input("Task ID (可选)", value=item.task_id or "")
+                    conv_n = st.text_input("Decision Note", value=item.decision_note or "Converted to project task")
+                    if st.form_submit_button("Confirm Conversion (确认立案)"):
+                        if conv_proj.strip() and conv_proj.strip() != "Unassigned":
+                            try:
+                                ideas_store.convert_idea(item.idea_id, project_id=conv_proj.strip(), milestone_id=conv_ms.strip() or None, task_id=conv_t.strip() or None, note=conv_n)
+                                st.session_state[f"show_conv_{item.idea_id}"] = False
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Convert failed: {e}")
+                        else:
+                            st.error("立案必须绑定明确有效的 Project ID，不能为 Unassigned。")
+
+            if st.session_state.get(f"show_drop2_{item.idea_id}", False):
+                with st.form(f"form_drop2_{item.idea_id}"):
+                    st.markdown(f"**放弃想法: {item.title}**")
+                    drop_r2 = st.text_input("Drop Reason (放弃原因，必填)*", key=f"dr2_{item.idea_id}")
+                    drop_p2 = st.text_input("Drop Problem / Blocker (当时问题/阻碍，必填)*", key=f"dp2_{item.idea_id}")
+                    drop_n2 = st.text_input("Decision Note (说明)", value="Dropped from confirmed queue", key=f"dn2_{item.idea_id}")
+                    if st.form_submit_button("Confirm Drop (确认放弃)"):
+                        if drop_r2.strip() and drop_p2.strip():
+                            try:
+                                ideas_store.drop_idea(item.idea_id, drop_reason=drop_r2, drop_problem=drop_p2, note=drop_n2)
+                                st.session_state[f"show_drop2_{item.idea_id}"] = False
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Drop failed: {e}")
+                        else:
+                            st.error("放弃原因 (Drop Reason) 与 当时问题 (Drop Problem) 均为必填项，不得留空。")
+
+    # Category 3: 已立案 (Default Collapsed / Folded)
     converted_list = grouped[STATUS_CONVERTED]
     with st.expander(f"▶ 已立案 ({len(converted_list)})", expanded=False):
         st.caption("ℹ️ *已立案想法之执行进度唯一来源于正式 Project / Milestone / Task SSOT，本页仅保留立案历史档案。*")
         if not converted_list:
-            st.write("暂无已立案历史。")
+            st.write("暂无已立案历史 (0 Ideas)。")
         for item in converted_list:
             st.markdown(f"""
             <div class="glass-card-dimmed">
@@ -585,7 +718,7 @@ def render_ideas_page():
                     <h4 style="margin:0; color:#c9d1d9;">🚀 {item.title} <small style="color:#8b949e;">({item.idea_id})</small></h4>
                     <span class="badge-ok">ACTIVE IN PROJECT</span>
                 </div>
-                <p style="margin:6px 0 4px 0; color:#8b949e;">{item.description}</p>
+                <p style="margin:6px 0 4px 0; color:#8b949e;">{item.description or '—'}</p>
                 <p style="margin:0; font-size:12px;">
                     <b>Linked Project:</b> <code>{item.project_id}</code> |
                     <b>Milestone:</b> {item.milestone_id or '—'} |
@@ -600,14 +733,16 @@ def render_ideas_page():
             </div>
             """, unsafe_allow_html=True)
             if st.button("🔍 查看专案进度 (View Project)", key=f"btn_view_proj_{item.idea_id}"):
+                st.session_state["selected_project_id"] = item.project_id
                 st.session_state["nav_selection"] = NAV_PROJECTS
                 st.rerun()
 
+    # Category 4: 已放弃 (Default Collapsed / Folded)
     dropped_list = grouped[STATUS_DROPPED]
     with st.expander(f"▶ 已放弃 ({len(dropped_list)})", expanded=False):
         st.caption("ℹ️ *已放弃想法的历史记录完整保留，支持随时恢复。*")
         if not dropped_list:
-            st.write("暂无已放弃历史。")
+            st.write("暂无已放弃历史 (0 Ideas)。")
         for item in dropped_list:
             st.markdown(f"""
             <div class="glass-card-dimmed">
@@ -615,7 +750,7 @@ def render_ideas_page():
                     <h4 style="margin:0; color:#8b949e;">📦 {item.title} <small>({item.idea_id})</small></h4>
                     <span class="badge-err">DROPPED</span>
                 </div>
-                <p style="margin:6px 0 4px 0; color:#8b949e;">{item.description}</p>
+                <p style="margin:6px 0 4px 0; color:#8b949e;">{item.description or '—'}</p>
                 <p style="margin:0; font-size:12px; color:#ff7b72;">
                     <b>放弃日期:</b> {item.dropped_at or '—'} |
                     <b>放弃原因:</b> {item.drop_reason or '—'}
@@ -625,14 +760,19 @@ def render_ideas_page():
             </div>
             """, unsafe_allow_html=True)
             if st.button("🔄 恢复为待立案 (Restore to Pending)", key=f"btn_restore_{item.idea_id}"):
-                item.status = STATUS_PENDING
-                item.decision_note = f"Restored on {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
-                ideas_store.update_idea(item)
-                st.rerun()
+                try:
+                    ideas_store.restore_idea(item.idea_id, note=f"Restored on {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Restore failed: {e}")
 
 
 def render_projects_page():
     st.title("📁 Projects & Roadmaps")
+    selected_p_id = st.session_state.get("selected_project_id")
+    if selected_p_id:
+        st.info(f"Targeting Project: **{selected_p_id}**")
+
     if not all_projects:
         st.info("No projects found in Drive SSOT.")
     else:
@@ -640,9 +780,15 @@ def render_projects_page():
             p_id = proj.get("project_id", "—")
             p_title = proj.get("title", p_id)
             tasks = [t for t in all_tasks if t.get("project_id") == p_id]
-            st.subheader(f"{p_title} (`{p_id}`)")
-            st.write(f"Total Tasks: {len(tasks)}")
-            with st.expander("View Project Tasks"):
+            is_highlighted = (p_id == selected_p_id)
+            
+            st.markdown(f"""
+            <div class="glass-card" {'style="border: 2px solid #388bfd;"' if is_highlighted else ''}>
+                <h3 style="margin:0;">{p_title} <small style="color:#8b949e;">({p_id})</small></h3>
+                <p style="margin:6px 0;">Total Tasks: {len(tasks)}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            with st.expander(f"View Tasks for {p_title}", expanded=is_highlighted):
                 st.json(tasks)
 
 
