@@ -1,4 +1,4 @@
-"""Minimal reserved-to-terminal execution runner.
+﻿"""Minimal reserved-to-terminal execution runner.
 
 launch_task()/run_execution() are provider-parameterized (default "codex" for
 backward compatibility); main()'s CLI entry point remains Codex-only.
@@ -251,10 +251,17 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     reserve_execution(store, project_id, task_id, execution_id, provider, dispatched["quota_evidence"],
                       dispatched["mode"], dispatched["effort"], retry_count=retry_count,
                       retry_of_execution_id=retry_of_execution_id)
-    request = LaunchRequest(working_directory, model=model, reasoning_effort=dispatched["effort"],
-                            sandbox="read-only" if task["read_only"] else None,
-                            approval_policy="never" if task["read_only"] else None,
-                            timeout_seconds=RPC_TIMEOUT_SECONDS, turn_timeout_seconds=turn_timeout)
+    if provider == "antigravity":
+        from manager.ag_runner import LaunchRequest as _AgLaunchRequest
+        request = _AgLaunchRequest(working_directory, model=model, reasoning_effort=dispatched["effort"],
+                                   sandbox="read-only" if task["read_only"] else None,
+                                   approval_policy="never" if task["read_only"] else None,
+                                   timeout_seconds=RPC_TIMEOUT_SECONDS, turn_timeout_seconds=turn_timeout)
+    else:
+        request = LaunchRequest(working_directory, model=model, reasoning_effort=dispatched["effort"],
+                                sandbox="read-only" if task["read_only"] else None,
+                                approval_policy="never" if task["read_only"] else None,
+                                timeout_seconds=RPC_TIMEOUT_SECONDS, turn_timeout_seconds=turn_timeout)
     result = run_execution(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                            execution_id, dispatched["generated_prompt"], request,
                            access="read_only" if task["read_only"] else "production_write",

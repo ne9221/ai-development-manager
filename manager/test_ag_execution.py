@@ -1,4 +1,4 @@
-"""Tests for Antigravity execution lifecycle integration."""
+﻿"""Tests for Antigravity execution lifecycle integration."""
 
 import os
 import tempfile
@@ -125,6 +125,246 @@ class TestAgExecutionLifecycle(unittest.TestCase):
 
         # Verify launcher lifecycle sequence
         self.assertEqual(mock_bridge.events, ["prepare", "start", "wait", "close"])
+
+
+
+class MockCliProcess:
+    """Minimal mock for AgCliProcess in CLI-mode launch_task tests."""
+    def __init__(self):
+        self.events = []
+        self._process = type("P", (), {
+            "poll": lambda self: 0,
+            "wait": lambda self, timeout=None: 0,
+            "pid": 9999,
+        })()
+        self.pid = 9999
+
+    def poll(self): return 0
+    def wait(self, timeout=None): return 0
+
+
+class MockCliRunner:
+    """Mock OfficialAgCliRunner compatible with AgRunner facade for CLI path."""
+
+    def __init__(self):
+        self.events = []
+
+    def prepare(self, request):
+        self.events.append("prepare")
+        prep = PreparedLaunch(
+            thread_id="ag-cli-abc99999",
+            session_path=None,
+            pid=9999,
+            process_creation_identity="cli-user",
+            prepared_at="2026-08-20T00:00:00Z",
+            mode="cli",
+            _target=None,
+            _request=request,
+        )
+        prep._process = type("P", (), {
+            "poll": lambda self: 0,
+            "wait": lambda self, timeout=None: 0,
+            "pid": 9999,
+        })()
+        return prep
+
+    def start(self, prepared, prompt):
+        self.events.append("start")
+        return RunningLaunch(
+            prepared=prepared,
+            turn_id="turn-cli-001",
+            started_at="2026-08-20T00:00:01Z",
+        )
+
+    def set_heartbeat(self, running, callback):
+        running._heartbeat = callback
+
+    def wait(self, running):
+        self.events.append("wait")
+        return LaunchOutcome(
+            status="completed",
+            thread_id="ag-cli-abc99999",
+            turn_id="turn-cli-001",
+            completed_at="2026-08-20T00:00:10Z",
+            response_text="Preflight complete",
+            stats={},
+        )
+
+    def close(self, prepared):
+        self.events.append("close")
+
+
+class TestAgLaunchTaskPath(unittest.TestCase):
+    """Tests covering launch_task(provider='antigravity') — the full dispatch path."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.working_directory = str(Path(self.temp.name).resolve())
+        self.store = build_store(
+            read_only=True,
+            working_directory=self.working_directory,
+            provider="antigravity",
+        )
+        self.store.latest = lambda *args: (_ for _ in ()).throw(TaskError("found 0"))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _make_runner(self):
+        cli_runner = MockCliRunner()
+        launcher = AgRunner(cli_runner=cli_runner)
+        launcher.last_fallback_reason = None
+        return launcher, cli_runner
+
+    def test_launch_task_antigravity_session_id_format(self):
+        launcher, cli_runner = self._make_runner()
+        service = MagicMock()
+        claim_registry = MemoryClaimRegistry()
+
+        with patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()), \
+             patch("manager.dispatcher.dispatch") as mock_dispatch, \
+             patch("manager.execution_runner.dispatch") as mock_er_dispatch:
+
+            dispatched = {
+                "recommended_provider": "antigravity",
+                "provider": "antigravity",
+                "account_id": None,
+                "model": None,
+                "fallback_model": None,
+                "mode": "interactive",
+                "effort": "medium",
+                "selection_reason": ["test"],
+                "quota_evidence": {"antigravity": {}},
+                "estimated_minutes": 20,
+                "split_recommended": False,
+                "phase_count": 1,
+                "alternatives": [],
+                "quota_summary": "unknown",
+                "warnings": [],
+                "generated_prompt": "Analyze the repo structure.",
+            }
+            mock_dispatch.return_value = dispatched
+            mock_er_dispatch.return_value = dispatched
+
+            result = launch_task(
+                self.store,
+                service,
+                None,  # read-only: no writer registry
+                claim_registry,
+                launcher,
+                "p1",
+                "t1",
+                execution_id="exec-ag-001",
+                provider="antigravity",
+            )
+
+        self.assertEqual(result["dispatch"]["provider"], "antigravity")
+        session_id = result["terminal"]["execution"]["session_id"]
+        self.assertTrue(
+            session_id.startswith("antigravity:ag-cli-"),
+            f"Expected 'antigravity:ag-cli-...' prefix, got {session_id!r}",
+        )
+        self.assertEqual(result["terminal"]["execution"]["status"], "completed")
+        self.assertEqual(result["terminal"]["execution"]["provider"], "antigravity")
+
+    def test_launch_task_antigravity_read_only_preserved(self):
+        """read_only task produces read_only execution with no lease_evidence."""
+        launcher, _ = self._make_runner()
+        claim_registry = MemoryClaimRegistry()
+
+        with patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()), \
+             patch("manager.execution_runner.dispatch") as mock_dispatch:
+
+            mock_dispatch.return_value = {
+                "recommended_provider": "antigravity",
+                "provider": "antigravity",
+                "account_id": None,
+                "model": None,
+                "fallback_model": None,
+                "mode": "interactive",
+                "effort": "medium",
+                "selection_reason": ["test"],
+                "quota_evidence": {"antigravity": {}},
+                "estimated_minutes": 20,
+                "split_recommended": False,
+                "phase_count": 1,
+                "alternatives": [],
+                "quota_summary": "unknown",
+                "warnings": [],
+                "generated_prompt": "Preflight read-only analysis.",
+            }
+            result = launch_task(
+                self.store,
+                MagicMock(),
+                None,
+                claim_registry,
+                launcher,
+                "p1",
+                "t1",
+                execution_id="exec-ag-002",
+                provider="antigravity",
+            )
+
+        execution = result["terminal"]["execution"]
+        self.assertEqual(execution["access"], "read_only")
+        self.assertIsNone(execution["lease_evidence"])
+
+    def test_launch_task_antigravity_failure_classification_propagates(self):
+        """A provider failure classification reaches the terminal execution record."""
+        cli_runner = MockCliRunner()
+        cli_runner.wait = lambda running: LaunchOutcome(
+            status="failed",
+            thread_id="ag-cli-abc99999",
+            turn_id="turn-cli-001",
+            completed_at="2026-08-20T00:00:05Z",
+            failure_classification="turn_timeout",
+            failure_detail="Antigravity turn exceeded timeout",
+        )
+        launcher = AgRunner(cli_runner=cli_runner)
+        claim_registry = MemoryClaimRegistry()
+
+        with patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()), \
+             patch("manager.execution_runner.dispatch") as mock_dispatch:
+
+            mock_dispatch.return_value = {
+                "recommended_provider": "antigravity",
+                "provider": "antigravity",
+                "account_id": None,
+                "model": None,
+                "fallback_model": None,
+                "mode": "interactive",
+                "effort": "medium",
+                "selection_reason": ["test"],
+                "quota_evidence": {"antigravity": {}},
+                "estimated_minutes": 20,
+                "split_recommended": False,
+                "phase_count": 1,
+                "alternatives": [],
+                "quota_summary": "unknown",
+                "warnings": [],
+                "generated_prompt": "Analyze with timeout.",
+            }
+            result = launch_task(
+                self.store,
+                MagicMock(),
+                None,
+                claim_registry,
+                launcher,
+                "p1",
+                "t1",
+                execution_id="exec-ag-003",
+                provider="antigravity",
+            )
+
+        execution = result["terminal"]["execution"]
+        self.assertEqual(execution["status"], "failed")
+        self.assertEqual(execution["provider"], "antigravity")
 
 
 if __name__ == "__main__":
