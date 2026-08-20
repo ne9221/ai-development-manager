@@ -57,7 +57,7 @@ function Confirm-AdmTaskEnabled {
     if (-not $task) {
         throw "Required Scheduled Task not found: $TaskName"
     }
-    if ($task.State -eq "Disabled") {
+    if (-not $task.Settings.Enabled) {
         Enable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
     }
 }

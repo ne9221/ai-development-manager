@@ -33,10 +33,12 @@ class WatcherMaintenanceTests(unittest.TestCase):
     TASK = "AI Development Manager - Command Watcher"
 
     @staticmethod
-    def task(repo, state="Disabled", task_name=TASK, task_path="\\"):
+    def task(repo, state="Disabled", task_name=TASK, task_path="\\", enabled=None):
         runner = str(Path(repo) / "manager" / "run_command_watcher.ps1")
+        if enabled is None:
+            enabled = state != "Disabled"
         return {
-            "task_name": task_name, "task_path": task_path, "state": state,
+            "task_name": task_name, "task_path": task_path, "state": state, "enabled": enabled,
             "actions": [{"execute": "powershell.exe",
                          "arguments": f"-File '{runner}' -RepositoryPath '{repo}'"}],
         }
@@ -80,6 +82,16 @@ class WatcherMaintenanceTests(unittest.TestCase):
         saved = json.loads(incident.read_text(encoding="utf-8"))
         self.assertEqual({"detected_at", "previous_state", "sentinel", "attempted", "result"}, set(saved))
         self.assertTrue(saved["attempted"])
+
+    def test_running_but_disabled_watcher_is_still_recovered(self):
+        calls = []
+        def task(repo):
+            calls.append(1)
+            return self.task(repo, "Running", enabled=len(calls) > 1)
+        result, _, enable, _, _ = self.run_case(task)
+        enable.assert_called_once_with(self.TASK)
+        self.assertEqual("enabled", result["result"])
+        self.assertEqual("Running", result["previous_state"])
 
     def test_action_from_another_clone_is_never_enabled(self):
         result, _, enable, incident, repo = self.run_case(

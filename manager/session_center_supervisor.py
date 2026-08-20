@@ -64,7 +64,7 @@ def query_command_watcher_task():
     script = (
         f"$t=Get-ScheduledTask -TaskName '{quoted}' -ErrorAction Stop; "
         "$a=@($t.Actions|ForEach-Object{[pscustomobject]@{execute=$_.Execute;arguments=$_.Arguments}}); "
-        "[pscustomobject]@{task_name=$t.TaskName;task_path=$t.TaskPath;state=[string]$t.State;actions=$a} "
+        "[pscustomobject]@{task_name=$t.TaskName;task_path=$t.TaskPath;state=[string]$t.State;enabled=[bool]$t.Settings.Enabled;actions=$a} "
         "| ConvertTo-Json -Depth 5 -Compress"
     )
     return _powershell_json(script)
@@ -126,7 +126,7 @@ def maintain_command_watcher(repository_path, maintenance_path, incident_path,
     }
     if not task or not _approved_watcher_identity(task, repository_path):
         evidence["result"] = "identity_rejected"
-    elif previous_state.lower() != "disabled":
+    elif task.get("enabled") is not False:
         return evidence
     elif sentinel:
         evidence["result"] = "intentional_maintenance"
@@ -140,7 +140,7 @@ def maintain_command_watcher(repository_path, maintenance_path, incident_path,
             restored = query_task()
             evidence["result"] = "enabled" if (
                 _approved_watcher_identity(restored, repository_path)
-                and str(restored.get("state", "")).lower() != "disabled"
+                and restored.get("enabled") is True
             ) else "enable_unconfirmed"
         except Exception:
             evidence["result"] = "enable_failed"

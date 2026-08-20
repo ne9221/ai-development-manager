@@ -8,6 +8,7 @@ function New-TestTask([string]$Name, [string]$State = "Ready", [string]$Repo = $
         TaskName = $Name
         TaskPath = "\"
         State = $State
+        Settings = [pscustomobject]@{ Enabled = ($State -ne "Disabled") }
         Actions = @([pscustomobject]@{
             Execute = "powershell.exe"
             Arguments = "-File '$Repo\manager\run_command_watcher.ps1' -RepositoryPath '$Repo'"
