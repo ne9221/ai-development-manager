@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 from unittest.mock import Mock
 
 from manager.drive_dispatch_ingress import (
-    FOLDER_NAME, poll_drive_dispatch_requests, read_request, verify_ingress_folder,
+    FOLDER_NAME, METADATA_FIELDS, _request_files, poll_drive_dispatch_requests, read_request,
+    verify_ingress_folder,
 )
 from manager.tasks import MIME_FOLDER, MIME_JSON, TaskError
 
@@ -68,7 +69,72 @@ class Service:
     def about(self): return About()
 
 
+class PagedFiles:
+    def __init__(self, pages): self.pages, self.calls = pages, []
+    def list(self, **kwargs):
+        self.calls.append(kwargs)
+        return Call(self.pages.get(kwargs.get("pageToken")))
+
+
+class PagedService:
+    def __init__(self, pages): self._files = PagedFiles(pages)
+    def files(self): return self._files
+
+
 class DriveDispatchIngressTests(unittest.TestCase):
+    def test_request_files_single_page(self):
+        service = PagedService({None: {"files": [{"id": "one"}]}})
+        self.assertEqual([{"id": "one"}], _request_files(service, FOLDER_ID))
+        self.assertNotIn("pageToken", service._files.calls[0])
+
+    def test_request_files_exactly_100_stays_single_page(self):
+        page = [{"id": str(index)} for index in range(100)]
+        service = PagedService({None: {"files": page}})
+        self.assertEqual(page, _request_files(service, FOLDER_ID))
+        self.assertEqual(1, len(service._files.calls))
+
+    def test_request_files_101_uses_second_page(self):
+        first = [{"id": str(index)} for index in range(100)]
+        service = PagedService({
+            None: {"files": first, "nextPageToken": "page-2"},
+            "page-2": {"files": [{"id": "100"}]},
+        })
+        self.assertEqual(first + [{"id": "100"}], _request_files(service, FOLDER_ID))
+        self.assertEqual("page-2", service._files.calls[1]["pageToken"])
+
+    def test_request_files_multiple_pages_keep_metadata_fields(self):
+        service = PagedService({
+            None: {"files": [{"id": "one"}], "nextPageToken": "page-2"},
+            "page-2": {"files": [{"id": "two"}], "nextPageToken": "page-3"},
+            "page-3": {"files": [{"id": "three"}]},
+        })
+        self.assertEqual([{"id": "one"}, {"id": "two"}, {"id": "three"}],
+                         _request_files(service, FOLDER_ID))
+        self.assertEqual([None, "page-2", "page-3"],
+                         [call.get("pageToken") for call in service._files.calls])
+        self.assertTrue(all(call["fields"] == f"nextPageToken,files({METADATA_FIELDS})"
+                            and call["pageSize"] == 100 for call in service._files.calls))
+
+    def test_request_files_malformed_page_or_token_fails_closed(self):
+        malformed = [None, {}, {"files": "bad"}, {"files": [], "nextPageToken": ""},
+                     {"files": [], "nextPageToken": 2}]
+        for page in malformed:
+            with self.subTest(page=page), self.assertRaises(TaskError):
+                _request_files(PagedService({None: page}), FOLDER_ID)
+        with self.assertRaises(TaskError):
+            _request_files(PagedService({
+                None: {"files": [], "nextPageToken": "page-2"}, "page-2": None,
+            }), FOLDER_ID)
+
+    def test_request_files_repeated_token_fails_closed(self):
+        service = PagedService({
+            None: {"files": [], "nextPageToken": "repeat"},
+            "repeat": {"files": [], "nextPageToken": "repeat"},
+        })
+        with self.assertRaises(TaskError):
+            _request_files(service, FOLDER_ID)
+        self.assertEqual(2, len(service._files.calls))
+
     def test_valid_private_request_maps_only_allowed_fields(self):
         service = Service()
         handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1", "task_id": "dispatch-drive-e2e-1",

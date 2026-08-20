@@ -48,13 +48,26 @@ def verify_ingress_folder(service, folder_id, expected_owner):
 
 def _request_files(service, folder_id):
     query = f"'{folder_id}' in parents and trashed=false"
-    response = service.files().list(
-        q=query, spaces="drive", fields=f"nextPageToken,files({METADATA_FIELDS})", pageSize=100
-    ).execute()
-    files = response.get("files") if isinstance(response, dict) else None
-    if not isinstance(files, list) or response.get("nextPageToken") is not None:
-        raise TaskError("malformed Drive ingress listing response")
-    return files
+    files, page_token, seen_tokens = [], None, set()
+    while True:
+        params = {
+            "q": query, "spaces": "drive",
+            "fields": f"nextPageToken,files({METADATA_FIELDS})", "pageSize": 100,
+        }
+        if page_token is not None:
+            params["pageToken"] = page_token
+        response = service.files().list(**params).execute()
+        page = response.get("files") if isinstance(response, dict) else None
+        next_token = response.get("nextPageToken") if isinstance(response, dict) else None
+        if (not isinstance(page, list)
+                or (next_token is not None and (not isinstance(next_token, str)
+                                                or not next_token or next_token in seen_tokens))):
+            raise TaskError("malformed Drive ingress listing response")
+        files.extend(page)
+        if next_token is None:
+            return files
+        seen_tokens.add(next_token)
+        page_token = next_token
 
 
 def read_request(service, folder_id, expected_owner, metadata, now=None):
