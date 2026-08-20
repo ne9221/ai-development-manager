@@ -368,16 +368,32 @@ class ClaudeLauncher:
         # provider process, not on this call blocking for the full run. Without
         # this flag a Task-Scheduler-owned job can kill the child the moment its
         # spawning process exits, before Claude ever produces output.
-        popen_kwargs = {}
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_BREAKAWAY_FROM_JOB
+        #
+        # CREATE_BREAKAWAY_FROM_JOB itself requires the *current* job to have
+        # been created with JOB_OBJECT_LIMIT_BREAKAWAY_OK -- Task Scheduler's
+        # own job does not grant that, so CreateProcess fails closed with
+        # ERROR_ACCESS_DENIED (OSError WinError 5) the moment this flag is
+        # requested from inside it (confirmed live: works from an ordinary
+        # shell, spawn_failed with zero PID from inside the Scheduled Task).
+        # Retry once without the flag rather than let a job that disallows
+        # breakaway turn "try to protect the child" into "never launch it".
+        def _spawn(creationflags):
+            kwargs = {"creationflags": creationflags} if creationflags else {}
+            return self._popen(
+                argv, cwd=str(cwd), stdin=subprocess.PIPE,
+                stdout=stdout_handle, stderr=stderr_handle, shell=False, env=env,
+                **kwargs,
+            )
+
         try:
             try:
-                process = self._popen(
-                    argv, cwd=str(cwd), stdin=subprocess.PIPE,
-                    stdout=stdout_handle, stderr=stderr_handle, shell=False, env=env,
-                    **popen_kwargs,
-                )
+                if os.name == "nt":
+                    try:
+                        process = _spawn(subprocess.CREATE_BREAKAWAY_FROM_JOB)
+                    except OSError:
+                        process = _spawn(None)
+                else:
+                    process = _spawn(None)
             except OSError as exc:
                 raise ClaudeLaunchError("spawn_failed", f"failed to start Claude CLI: {exc}") from exc
         finally:

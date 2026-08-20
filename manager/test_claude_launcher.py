@@ -152,6 +152,33 @@ class ClaudeLauncherTests(unittest.TestCase):
         else:
             self.assertNotIn("creationflags", kwargs)
 
+    # Regression: requesting CREATE_BREAKAWAY_FROM_JOB from inside a job that
+    # was not itself created with JOB_OBJECT_LIMIT_BREAKAWAY_OK (Task
+    # Scheduler's own job, confirmed live) makes CreateProcess fail closed
+    # with ERROR_ACCESS_DENIED before any process exists at all -- strictly
+    # worse than not requesting breakaway. The launcher must retry once
+    # without the flag rather than let that turn into a total spawn failure.
+    def test_breakaway_denied_falls_back_to_plain_spawn(self):
+        attempts = []
+
+        def flaky_popen(*args, **kwargs):
+            attempts.append(kwargs.get("creationflags"))
+            if kwargs.get("creationflags") == subprocess.CREATE_BREAKAWAY_FROM_JOB:
+                raise OSError(5, "Access is denied")
+            self.calls.append((args, kwargs))
+            return FakeProcess()
+
+        launcher = ClaudeLauncher(executable=__file__, popen=flaky_popen, log_dir=self.temp.name,
+                                  auth_check=lambda *a, **k: True)
+        prepared = launcher.prepare(self.request())
+        self.assertIsInstance(prepared, PreparedLaunch)
+        if os.name == "nt":
+            self.assertEqual(attempts, [subprocess.CREATE_BREAKAWAY_FROM_JOB, None])
+        else:
+            self.assertEqual(attempts, [None])
+        _, kwargs = self.calls[-1]
+        self.assertNotIn("creationflags", kwargs)
+
     # 7. read-only permission mapping
     def test_read_only_profile_maps_to_plan_mode_with_safe_tools(self):
         prepared = self.prepare(sandbox="read-only", approval_policy="never")
