@@ -16,6 +16,7 @@ STATE_AUTO_STALLED = "AUTO STALLED"
 STATE_UNKNOWN = "UNKNOWN"
 
 STALE_ACTIVITY_MINUTES = 10.0
+INITIALIZING_GRACE_MINUTES = 2.0
 
 
 def format_elapsed_duration(start_val: Any, now: Optional[datetime] = None) -> str:
@@ -60,6 +61,40 @@ def format_activity_timestamp_and_age(activity_val: Any, now: Optional[datetime]
     return f"{exact_time_str} · {age_str}"
 
 
+def format_duration_and_remaining_eta(
+    expected_minutes: Optional[float | int],
+    start_val: Any,
+    now: Optional[datetime] = None
+) -> Tuple[str, str]:
+    """Calculate expected total duration and remaining duration safely.
+
+    Truth Contract: Never label total expected duration as remaining ETA.
+    Returns: (expected_total_display, est_remaining_display)
+    """
+    if expected_minutes is None:
+        return "—", "—"
+
+    expected_total_str = f"~{int(expected_minutes)}m"
+
+    if not start_val:
+        return expected_total_str, "—"
+
+    start_dt = parse_time(start_val) if isinstance(start_val, str) else start_val
+    if not start_dt:
+        return expected_total_str, "—"
+
+    now_dt = now or datetime.now(timezone.utc)
+    elapsed_minutes = max(0.0, (now_dt - start_dt).total_seconds() / 60.0)
+    remaining_minutes = max(0.0, float(expected_minutes) - elapsed_minutes)
+
+    if remaining_minutes <= 0.0:
+        est_remaining_str = "Overdue / finishing"
+    else:
+        est_remaining_str = f"~{int(remaining_minutes)}m"
+
+    return expected_total_str, est_remaining_str
+
+
 def get_latest_activity_timestamp(exe: Dict[str, Any]) -> Tuple[Optional[str], str]:
     """Retrieve the most trustworthy live activity timestamp and its source label."""
     # Priority 1: true last provider event timestamp if recorded
@@ -68,17 +103,17 @@ def get_latest_activity_timestamp(exe: Dict[str, Any]) -> Tuple[Optional[str], s
     # Priority 2: heartbeat timestamp
     if exe.get("heartbeat_at"):
         return exe["heartbeat_at"], "heartbeat"
-    # Priority 3: started / reserved timestamp
-    if exe.get("started_at"):
-        return exe["started_at"], "start"
-    if exe.get("reserved_at"):
-        return exe["reserved_at"], "reservation"
+    # Priority 3: session updated timestamp
+    if exe.get("session_updated_at"):
+        return exe["session_updated_at"], "session update"
     return None, "none"
 
 
 def determine_ai_runtime_activity(exe: Dict[str, Any], now: Optional[datetime] = None) -> Tuple[str, str, str]:
     """Determine live execution state distinguishing healthy long runs from stalled runs.
 
+    Truth Contract: If status='running' but no heartbeat or event evidence exists,
+    do NOT fabricate green RUNNING. Use UNKNOWN / WAITING FOR EVIDENCE.
     Returns: (state_label, badge_class, explanation)
     """
     now_dt = now or datetime.now(timezone.utc)
@@ -91,13 +126,19 @@ def determine_ai_runtime_activity(exe: Dict[str, Any], now: Optional[datetime] =
     if status in ["blocked", "attention"]:
         return "BLOCKED", "badge-err", "Execution is blocked."
 
-    # Check start & activity
     start_time_val = exe.get("started_at") or exe.get("reserved_at")
+    start_dt = parse_time(start_time_val) if start_time_val else None
+
     act_time_val, act_source = get_latest_activity_timestamp(exe)
     act_dt = parse_time(act_time_val) if act_time_val else None
 
+    # Truth Contract: No activity evidence -> Not green RUNNING
     if not act_dt:
-        return "RUNNING", "badge-ok", "Active execution in progress."
+        if start_dt:
+            elapsed_seconds = max(0.0, (now_dt - start_dt).total_seconds())
+            if elapsed_seconds <= (INITIALIZING_GRACE_MINUTES * 60):
+                return "INITIALIZING", "badge-warn", "Worker process initializing; awaiting first heartbeat."
+        return "UNKNOWN", "badge-warn", "Execution marked running but no activity or heartbeat evidence received."
 
     idle_seconds = max(0.0, (now_dt - act_dt).total_seconds())
     idle_minutes = idle_seconds / 60.0
@@ -108,7 +149,7 @@ def determine_ai_runtime_activity(exe: Dict[str, Any], now: Optional[datetime] =
     if idle_minutes >= (STALE_ACTIVITY_MINUTES / 2):
         return "WAITING", "badge-warn", f"Awaiting next event ({int(idle_minutes)}m since last {act_source})."
 
-    return "RUNNING", "badge-ok", "Actively processing with recent updates."
+    return "RUNNING", "badge-ok", f"Actively processing ({act_source} received {int(idle_seconds)}s ago)."
 
 
 def compute_global_runtime_state(
@@ -131,7 +172,6 @@ def compute_global_runtime_state(
         if dash_health and dash_health.status_label == "Offline":
             return STATE_UNKNOWN, "badge-warn", "Dashboard communication unconfirmed."
         if drive_health and drive_health.status_label == "Offline":
-            # If open blocking actions exist while drive is offline, flag blocked
             high_actions = [a for a in open_actions if getattr(a, "severity", "") == "high" and getattr(a, "status", "") == "open"]
             if high_actions:
                 return STATE_BLOCKED, "badge-err", "Google Drive SSOT disconnected with unresolved high-severity actions."
@@ -139,7 +179,7 @@ def compute_global_runtime_state(
     # Check for active running executions
     if active_executions:
         states = [determine_ai_runtime_activity(e, now_dt)[0] for e in active_executions]
-        if all(s in ["POSSIBLY STALLED", "STALE", "BLOCKED"] for s in states):
+        if all(s in ["POSSIBLY STALLED", "STALE", "BLOCKED", "UNKNOWN"] for s in states):
             return STATE_AUTO_STALLED, "badge-err", "Active executions have stopped emitting progress updates."
         return STATE_AUTO_RUNNING, "badge-ok", f"Autonomous fleet active ({len(active_executions)} running task{'s' if len(active_executions) > 1 else ''})."
 

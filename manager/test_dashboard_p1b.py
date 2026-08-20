@@ -14,6 +14,7 @@ from manager.runtime_visibility import (
     compute_next_auto_action,
     determine_ai_runtime_activity,
     format_activity_timestamp_and_age,
+    format_duration_and_remaining_eta,
     format_elapsed_duration,
 )
 from manager.actions import ActionItem, STATUS_OPEN, TYPE_REVIEW_REQUIRED, SEVERITY_HIGH
@@ -35,6 +36,31 @@ class TestDashboardP1BRuntimeVisibilityAndActionCenter(unittest.TestCase):
         self.assertEqual(format_elapsed_duration("", now), "Unknown")
         self.assertEqual(format_elapsed_duration("invalid-timestamp", now), "Unknown")
 
+    def test_eta_truth_contract_calculation(self):
+        """Blocker 2: expected_minutes is total duration.
+
+        Remaining duration must be calculated accurately as total - elapsed.
+        Never label total expected duration as remaining ETA.
+        """
+        now = datetime(2026, 8, 21, 12, 0, 0, tzinfo=timezone.utc)
+
+        # Scenario 1: expected 20m, started 18m ago -> remaining is ~2m
+        start_18m_ago = (now - timedelta(minutes=18)).isoformat()
+        exp_total, est_rem = format_duration_and_remaining_eta(20, start_18m_ago, now)
+        self.assertEqual(exp_total, "~20m")
+        self.assertEqual(est_rem, "~2m")
+
+        # Scenario 2: expected 20m, start time unknown -> remaining is '—', total is '~20m'
+        exp_total2, est_rem2 = format_duration_and_remaining_eta(20, None, now)
+        self.assertEqual(exp_total2, "~20m")
+        self.assertEqual(est_rem2, "—")
+
+        # Scenario 3: expected 20m, elapsed 25m -> overdue
+        start_25m_ago = (now - timedelta(minutes=25)).isoformat()
+        exp_total3, est_rem3 = format_duration_and_remaining_eta(20, start_25m_ago, now)
+        self.assertEqual(exp_total3, "~20m")
+        self.assertEqual(est_rem3, "Overdue / finishing")
+
     def test_activity_timestamp_and_age_formatting(self):
         now = datetime(2026, 8, 21, 12, 31, 8, tzinfo=timezone.utc)
         # 1m ago
@@ -51,10 +77,29 @@ class TestDashboardP1BRuntimeVisibilityAndActionCenter(unittest.TestCase):
         # Unknown
         self.assertEqual(format_activity_timestamp_and_age(None, now), "Unknown")
 
-    def test_ai_runtime_activity_stalled_vs_healthy_long_run(self):
+    def test_ai_runtime_activity_evidence_truth_and_stalled_distinction(self):
+        """Runtime Truth: status='running' with NO activity evidence must NOT return green RUNNING."""
         now = datetime(2026, 8, 21, 12, 0, 0, tzinfo=timezone.utc)
 
-        # Case A: Long running (elapsed 45m) with RECENT activity (1m ago) -> Healthy RUNNING
+        # Case A: status running + NO activity evidence and started long ago -> UNKNOWN
+        no_evidence_exe = {
+            "status": "running",
+            "started_at": (now - timedelta(minutes=10)).isoformat(),
+        }
+        state_ne, badge_ne, _ = determine_ai_runtime_activity(no_evidence_exe, now)
+        self.assertEqual(state_ne, "UNKNOWN")
+        self.assertEqual(badge_ne, "badge-warn")
+
+        # Case B: freshly started (< 2m) awaiting first heartbeat -> INITIALIZING
+        init_exe = {
+            "status": "running",
+            "started_at": (now - timedelta(seconds=30)).isoformat(),
+        }
+        state_init, badge_init, _ = determine_ai_runtime_activity(init_exe, now)
+        self.assertEqual(state_init, "INITIALIZING")
+        self.assertEqual(badge_init, "badge-warn")
+
+        # Case C: Long running (elapsed 45m) with RECENT activity (1m ago) -> Healthy RUNNING
         healthy_long_exe = {
             "status": "running",
             "started_at": (now - timedelta(minutes=45)).isoformat(),
@@ -65,7 +110,7 @@ class TestDashboardP1BRuntimeVisibilityAndActionCenter(unittest.TestCase):
         self.assertEqual(state, "RUNNING")
         self.assertEqual(badge, "badge-ok")
 
-        # Case B: Execution with OLD activity (15m ago) -> POSSIBLY STALLED
+        # Case D: Execution with OLD activity (15m ago) -> POSSIBLY STALLED
         stalled_exe = {
             "status": "running",
             "started_at": (now - timedelta(minutes=45)).isoformat(),
@@ -82,7 +127,7 @@ class TestDashboardP1BRuntimeVisibilityAndActionCenter(unittest.TestCase):
         s1, b1, _ = compute_global_runtime_state([], [], [], now=now)
         self.assertEqual(s1, STATE_IDLE)
 
-        # 2. Active running execution -> AUTO RUNNING
+        # 2. Active running execution with recent heartbeat -> AUTO RUNNING
         active_exec = [{"status": "running", "heartbeat_at": (now - timedelta(minutes=1)).isoformat()}]
         s2, b2, _ = compute_global_runtime_state(active_exec, [], [], now=now)
         self.assertEqual(s2, STATE_AUTO_RUNNING)

@@ -52,6 +52,70 @@ class ActionCenterDomainAndStoreTests(unittest.TestCase):
         self.assertEqual(format_waiting_duration("", now), "Unknown")
         self.assertEqual(format_waiting_duration("invalid-date", now), "Unknown")
 
+    def test_derive_and_reconcile_automatic_actions_lifecycle(self):
+        """Blocker 1 & 3: Auto-derived actions must be persisted into ActionsStore,
+
+        support Acknowledge/Resolve/Dismiss, retain status and stable waiting_since across reruns,
+        and not immediately recreate duplicate open copies when resolved.
+        """
+        now1 = datetime(2026, 8, 21, 2, 0, 0, tzinfo=timezone.utc)
+
+        mock_drive = MagicMock()
+        mock_files = MagicMock()
+        mock_drive.files.return_value = mock_files
+        mock_files.list.return_value.execute.return_value = {"files": []}
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_file = Path(td) / "actions.json"
+            store = ActionsStore(drive_service=mock_drive, local_file_path=str(cache_file))
+
+            tasks = [
+                {"task_id": "T-BLOCKED-1", "project_id": "proj-a", "title": "Blocked Pipeline", "status": "blocked", "created_at": "2026-08-21T02:00:00Z"},
+            ]
+
+            # Step 1: First detection and reconciliation at 02:00
+            candidates1 = derive_automatic_actions(all_tasks=tasks, active_executions=[], ideas_conflicted=[], now=now1)
+            reconciled1 = store.reconcile_automatic_actions(candidates1)
+
+            self.assertEqual(len(reconciled1), 1)
+            item1 = reconciled1[0]
+            self.assertEqual(item1.status, STATUS_OPEN)
+            self.assertEqual(item1.waiting_since, "2026-08-21T02:00:00Z")
+
+            # Step 2: User Acknowledges the action at 02:10
+            store.acknowledge_action(item1.action_id, note="Investigating blocker")
+            self.assertEqual(store.get_by_id(item1.action_id).status, STATUS_ACKNOWLEDGED)
+
+            # Step 3: Rerun at 02:15 with same underlying blocked task
+            now2 = datetime(2026, 8, 21, 2, 15, 0, tzinfo=timezone.utc)
+            candidates2 = derive_automatic_actions(all_tasks=tasks, active_executions=[], ideas_conflicted=[], now=now2)
+            reconciled2 = store.reconcile_automatic_actions(candidates2)
+
+            self.assertEqual(len(reconciled2), 1)
+            item2 = reconciled2[0]
+            # State must remain ACKNOWLEDGED (not reset to OPEN)
+            self.assertEqual(item2.status, STATUS_ACKNOWLEDGED)
+            # waiting_since must remain stable at 02:00
+            self.assertEqual(item2.waiting_since, "2026-08-21T02:00:00Z")
+            # Waiting duration derived at 02:15 is 15m
+            self.assertEqual(format_waiting_duration(item2.waiting_since, now2), "15m 00s")
+
+            # Step 4: User Resolves the action at 02:20
+            store.resolve_action(item1.action_id, note="Blocker resolved")
+            self.assertEqual(store.get_by_id(item1.action_id).status, STATUS_RESOLVED)
+
+            # Step 5: Rerun at 02:25 does NOT reopen or duplicate the resolved action
+            now3 = datetime(2026, 8, 21, 2, 25, 0, tzinfo=timezone.utc)
+            candidates3 = derive_automatic_actions(all_tasks=tasks, active_executions=[], ideas_conflicted=[], now=now3)
+            reconciled3 = store.reconcile_automatic_actions(candidates3)
+
+            self.assertEqual(len(reconciled3), 1)
+            self.assertEqual(reconciled3[0].status, STATUS_RESOLVED)
+            # Summary shows in history, 0 open
+            summary = get_actions_summary(reconciled3)
+            self.assertEqual(summary["open"], 0)
+            self.assertEqual(summary["history"], 1)
+
     def test_derive_automatic_actions_for_all_scenarios(self):
         now = datetime(2026, 8, 21, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -67,7 +131,7 @@ class ActionCenterDomainAndStoreTests(unittest.TestCase):
                 "execution_id": "EXE-STALE",
                 "project_id": "proj-a",
                 "task_id": "T-STALE",
-                "provider": "claude",
+                "provider": "codex",
                 "status": "running",
                 "started_at": (now - timedelta(minutes=45)).isoformat(),
                 "heartbeat_at": (now - timedelta(minutes=30)).isoformat(),

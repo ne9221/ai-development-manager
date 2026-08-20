@@ -328,6 +328,51 @@ class ActionsStore:
                 return a
         return None
 
+    def reconcile_automatic_actions(self, derived_candidates: List[ActionItem]) -> List[ActionItem]:
+        """Reconcile auto-derived actions into canonical Action SSOT store.
+
+        - Creates and persists newly detected actions.
+        - Preserves user-managed lifecycle status (Acknowledged, Resolved, Dismissed) for existing actions.
+        - Keeps initial waiting_since and created_at timestamps stable across Dashboard reruns.
+        """
+        persisted_by_id = {a.action_id: a for a in self._actions}
+        reconciled: List[ActionItem] = []
+
+        for cand in derived_candidates:
+            if cand.action_id in persisted_by_id:
+                existing = persisted_by_id[cand.action_id]
+                # Update descriptive text while strictly preserving user lifecycle & stable timestamps
+                existing.reason = cand.reason
+                existing.impact = cand.impact
+                existing.recommended_next_step = cand.recommended_next_step
+                if not existing.waiting_since and cand.waiting_since:
+                    existing.waiting_since = cand.waiting_since
+                reconciled.append(existing)
+            else:
+                # Newly detected action occurrence: persist to store
+                if not self.is_degraded and self.drive_service:
+                    try:
+                        self._write_to_drive(cand)
+                    except Exception as exc:
+                        self.last_error = f"Failed to persist auto-derived action to Drive: {exc}"
+                self._actions.append(cand)
+                persisted_by_id[cand.action_id] = cand
+                reconciled.append(cand)
+
+        # Update local cache with reconciled items
+        try:
+            self._save_local_cache()
+        except Exception:
+            pass
+
+        # Include any manually persisted actions not present in current derived candidates
+        cand_ids = {c.action_id for c in derived_candidates}
+        for p_act in self._actions:
+            if p_act.action_id not in cand_ids and p_act not in reconciled:
+                reconciled.append(p_act)
+
+        return reconciled
+
     def add_action(self, action: ActionItem) -> None:
         self.last_error = None
         if self.is_degraded or not self.drive_service:
@@ -417,7 +462,7 @@ def derive_automatic_actions(
     persisted_actions: Optional[List[ActionItem]] = None,
     now: Optional[datetime] = None,
 ) -> List[ActionItem]:
-    """Derive live Action Items from current SSOT state and merge with user persistent statuses."""
+    """Derive live Action Item candidates from current SSOT state."""
     now_dt = now or datetime.now(timezone.utc)
     persisted_by_id = {a.action_id: a for a in (persisted_actions or [])}
     derived: List[ActionItem] = []
@@ -432,6 +477,7 @@ def derive_automatic_actions(
             if act_id in persisted_by_id:
                 derived.append(persisted_by_id[act_id])
             else:
+                initial_waiting = t.get("updated_at") or t.get("created_at") or now_dt.isoformat()
                 derived.append(ActionItem(
                     action_id=act_id,
                     title=f"Task Blocked: {t.get('title', t_id)}",
@@ -440,7 +486,7 @@ def derive_automatic_actions(
                     project_id=p_id,
                     task_id=t_id,
                     created_at=t.get("created_at") or now_dt.isoformat(),
-                    waiting_since=t.get("updated_at") or t.get("created_at") or now_dt.isoformat(),
+                    waiting_since=initial_waiting,
                     reason=f"Task marked as '{st}'. Next Action: {t.get('next_action', 'None')}",
                     impact=f"Project roadmap for '{p_id}' cannot progress.",
                     recommended_next_step="Inspect task logs, resolve blocker dependencies, or update status.",
@@ -455,6 +501,7 @@ def derive_automatic_actions(
             if act_id in persisted_by_id:
                 derived.append(persisted_by_id[act_id])
             else:
+                initial_waiting = t.get("updated_at") or now_dt.isoformat()
                 derived.append(ActionItem(
                     action_id=act_id,
                     title=f"Review Required: {t.get('title', t_id)}",
@@ -463,7 +510,7 @@ def derive_automatic_actions(
                     project_id=p_id,
                     task_id=t_id,
                     created_at=t.get("updated_at") or now_dt.isoformat(),
-                    waiting_since=t.get("updated_at") or now_dt.isoformat(),
+                    waiting_since=initial_waiting,
                     reason="Task reached validation/review gate and requires explicit human verification.",
                     impact="Dependent tasks and milestone completion are on hold.",
                     recommended_next_step="Review code diff and mark task completed or request changes.",
@@ -478,6 +525,7 @@ def derive_automatic_actions(
             if act_id in persisted_by_id:
                 derived.append(persisted_by_id[act_id])
             else:
+                initial_waiting = t.get("created_at") or now_dt.isoformat()
                 derived.append(ActionItem(
                     action_id=act_id,
                     title=f"Manual AG Dispatch Required: {t.get('title', t_id)}",
@@ -486,7 +534,7 @@ def derive_automatic_actions(
                     project_id=p_id,
                     task_id=t_id,
                     created_at=t.get("created_at") or now_dt.isoformat(),
-                    waiting_since=t.get("created_at") or now_dt.isoformat(),
+                    waiting_since=initial_waiting,
                     reason="Task prepared for Antigravity (AG); AG has no direct background connector and requires manual prompt injection.",
                     impact="Automatic autonomous execution cannot proceed until dispatched to AG.",
                     recommended_next_step="Copy task prompt to Antigravity IDE and start execution session.",
@@ -508,6 +556,7 @@ def derive_automatic_actions(
             if act_id in persisted_by_id:
                 derived.append(persisted_by_id[act_id])
             else:
+                initial_waiting = exe.get("heartbeat_at") or exe.get("started_at") or now_dt.isoformat()
                 derived.append(ActionItem(
                     action_id=act_id,
                     title=f"Stalled Execution: {prov} on {t_id}",
@@ -516,7 +565,7 @@ def derive_automatic_actions(
                     project_id=p_id,
                     task_id=t_id,
                     created_at=exe.get("started_at") or now_dt.isoformat(),
-                    waiting_since=exe.get("heartbeat_at") or exe.get("started_at") or now_dt.isoformat(),
+                    waiting_since=initial_waiting,
                     reason=f"Execution heartbeat or activity timed out on {prov}.",
                     impact="Provider worker may have crashed or hung.",
                     recommended_next_step="Restart provider session or trigger rollback.",
@@ -547,12 +596,6 @@ def derive_automatic_actions(
                 source="SSOT Truth Guard",
                 linked_entity_ids=[idea_id],
             ))
-
-    # Also append any user-managed actions in persisted store that are not auto-derived
-    derived_ids = {a.action_id for a in derived}
-    for p_act in (persisted_actions or []):
-        if p_act.action_id not in derived_ids:
-            derived.append(p_act)
 
     return derived
 

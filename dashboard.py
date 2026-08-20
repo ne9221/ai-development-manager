@@ -54,6 +54,7 @@ from manager.runtime_visibility import (
     STATE_UNKNOWN,
     format_elapsed_duration,
     format_activity_timestamp_and_age,
+    format_duration_and_remaining_eta,
     get_latest_activity_timestamp,
     determine_ai_runtime_activity,
     compute_global_runtime_state,
@@ -349,7 +350,7 @@ ideas_summary = get_ideas_summary(all_ideas)
 conflicted_ideas = [i for i in all_ideas if i.is_conflicted or i.status == STATUS_CONFLICTED]
 
 persisted_actions = actions_store.list_actions()
-all_actions = derive_automatic_actions(
+derived_candidates = derive_automatic_actions(
     all_tasks=all_tasks,
     active_executions=active_executions,
     ideas_conflicted=conflicted_ideas,
@@ -357,6 +358,7 @@ all_actions = derive_automatic_actions(
     persisted_actions=persisted_actions,
     now=now,
 )
+all_actions = actions_store.reconcile_automatic_actions(derived_candidates)
 actions_summary = get_actions_summary(all_actions)
 
 global_runtime_state, global_badge_class, global_state_desc = compute_global_runtime_state(
@@ -565,7 +567,10 @@ def render_overview_page():
                         activity_display = format_activity_timestamp_and_age(act_ts, now)
 
                         exp_mins = task_snap.get("expected_minutes")
-                        eta_str = f"~{exp_mins}m" if exp_mins else "—"
+                        exp_total_disp, est_rem_disp = format_duration_and_remaining_eta(exp_mins, start_ts, now)
+                        eta_line = f" | <b>Expected:</b> {exp_total_disp}" if exp_total_disp != "—" else ""
+                        if est_rem_disp != "—":
+                            eta_line += f" (<b>Est. remaining:</b> {est_rem_disp})"
 
                         st.markdown(f"""
                         <div class="glass-card">
@@ -576,7 +581,7 @@ def render_overview_page():
                             <p style="margin:6px 0 2px 0; font-size:13px;"><b>Task:</b> {curr_task_str}</p>
                             <p style="margin:0 0 2px 0; font-size:12px; color:#8b949e;"><b>Model/Mode:</b> {model_str} ({mode_str}/{effort_str}) | <b>Session:</b> <code>{sess_id}</code></p>
                             <p style="margin:0 0 2px 0; font-size:12px;"><b>Started:</b> {started_display} · <b>Elapsed:</b> {elapsed_display}</p>
-                            <p style="margin:0 0 2px 0; font-size:12px;"><b>Last Activity ({act_src}):</b> {activity_display} {f'| <b>ETA:</b> {eta_str}' if eta_str != '—' else ''}</p>
+                            <p style="margin:0 0 2px 0; font-size:12px;"><b>Last Activity ({act_src}):</b> {activity_display}{eta_line}</p>
                             <p style="margin:2px 0 0 0; font-size:12px; color:#58a6ff;"><i>Current Step: {event_str}</i></p>
                         </div>
                         """, unsafe_allow_html=True)
@@ -636,7 +641,10 @@ def render_overview_page():
                     activity_display = format_activity_timestamp_and_age(act_ts, now)
 
                     exp_mins = task_snap.get("expected_minutes")
-                    eta_str = f"~{exp_mins}m" if exp_mins else "—"
+                    exp_total_disp, est_rem_disp = format_duration_and_remaining_eta(exp_mins, start_ts, now)
+                    eta_line = f" | <b>Expected:</b> {exp_total_disp}" if exp_total_disp != "—" else ""
+                    if est_rem_disp != "—":
+                        eta_line += f" (<b>Est. remaining:</b> {est_rem_disp})"
 
                     st.markdown(f"""
                     <div class="glass-card">
@@ -647,7 +655,7 @@ def render_overview_page():
                         <p style="margin:6px 0 2px 0; font-size:13px;"><b>Task:</b> {curr_task_str}</p>
                         <p style="margin:0 0 2px 0; font-size:12px; color:#8b949e;"><b>Model/Mode:</b> {model_str} ({mode_str}/{effort_str}) | <b>Session:</b> <code>{sess_id}</code></p>
                         <p style="margin:0 0 2px 0; font-size:12px;"><b>Started:</b> {started_display} · <b>Elapsed:</b> {elapsed_display}</p>
-                        <p style="margin:0 0 2px 0; font-size:12px;"><b>Last Activity ({act_src}):</b> {activity_display} {f'| <b>ETA:</b> {eta_str}' if eta_str != '—' else ''}</p>
+                        <p style="margin:0 0 2px 0; font-size:12px;"><b>Last Activity ({act_src}):</b> {activity_display}{eta_line}</p>
                         <p style="margin:2px 0 0 0; font-size:12px; color:#58a6ff;"><i>Current Step: {event_str}</i></p>
                     </div>
                     """, unsafe_allow_html=True)
