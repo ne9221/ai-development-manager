@@ -24,6 +24,17 @@ try {
     $createdNew = $false
 }
 
+function Start-AdmServicesSafe {
+    try {
+        Confirm-AdmTaskEnabled -TaskName $AdmSupervisorTask
+        Confirm-AdmTaskEnabled -TaskName $AdmWatcherTask
+        Start-ScheduledTask -TaskName $AdmSupervisorTask -ErrorAction SilentlyContinue
+        Start-ScheduledTask -TaskName $AdmWatcherTask -ErrorAction SilentlyContinue
+    } catch {
+        # Non-fatal during background start
+    }
+}
+
 function Open-AdmDashboardSafe {
     try {
         $health = Get-AdmComprehensiveHealth
@@ -45,6 +56,9 @@ if (-not $createdNew) {
     Open-AdmDashboardSafe
     exit 0
 }
+
+# Cold start: idempotently ensure required ADM background tasks are enabled and triggered
+Start-AdmServicesSafe
 
 # Add required .NET assemblies for WinForms NotifyIcon & System Icons
 Add-Type -AssemblyName System.Windows.Forms
@@ -91,11 +105,7 @@ $menuRestart = New-Object System.Windows.Forms.ToolStripMenuItem
 $menuRestart.Text = "Start / Restart Services"
 $menuRestart.add_Click({
     try {
-        Confirm-AdmTaskEnabled -TaskName $AdmSupervisorTask
-        Confirm-AdmTaskEnabled -TaskName $AdmWatcherTask
-        Start-ScheduledTask -TaskName $AdmSupervisorTask -ErrorAction SilentlyContinue
-        Start-ScheduledTask -TaskName $AdmWatcherTask -ErrorAction SilentlyContinue
-        
+        Start-AdmServicesSafe
         $notifyIcon.ShowBalloonTip(3000, "ADM Services", "Scheduled tasks verified & triggered.", [System.Windows.Forms.ToolTipIcon]::Info)
     } catch {
         [System.Windows.Forms.MessageBox]::Show("Service start failed: $($_.Exception.Message)", "ADM Service Manager", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null

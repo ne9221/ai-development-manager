@@ -55,8 +55,29 @@ $h = Get-AdmComprehensiveHealth
         self.assertIn(data["WatcherStatus"], ["running", "ready", "disabled", "missing", "unknown"])
         self.assertIn(data["SupervisorStatus"], ["running", "ready", "disabled", "missing", "unknown"])
 
+    def test_cold_start_calls_service_confirmation_automatically(self):
+        launcher_path = DESKTOP_DIR / "AdmTrayLauncher.ps1"
+        content = launcher_path.read_text(encoding="utf-8", errors="ignore")
+        self.assertIn("Start-AdmServicesSafe", content)
+        # Ensure Start-AdmServicesSafe is invoked outside context menu (i.e. at top level cold start)
+        lines = [l.strip() for l in content.splitlines()]
+        self.assertIn("Start-AdmServicesSafe", lines)
+
+        # Test Start-AdmServicesSafe execution idempotency
+        script = f'''
+$ErrorActionPreference = "Stop"
+. "{DESKTOP_DIR / 'AdmCommon.ps1'}"
+Confirm-AdmTaskEnabled -TaskName $AdmSupervisorTask
+Confirm-AdmTaskEnabled -TaskName $AdmWatcherTask
+Start-ScheduledTask -TaskName $AdmSupervisorTask -ErrorAction SilentlyContinue
+Start-ScheduledTask -TaskName $AdmWatcherTask -ErrorAction SilentlyContinue
+'''
+        cmd = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        self.assertEqual(0, res.returncode, f"Cold start service trigger failed: {res.stderr}")
+
     def test_single_instance_mutex_second_launch_exits_immediately(self):
-        # We start a mock mutex holder in a background PowerShell process
+        # Start a mock mutex holder in a background PowerShell process
         holder_script = '''
 $mutex = New-Object System.Threading.Mutex($true, "Local\\ADM_Windows_Tray_Launcher_Mutex")
 Start-Sleep -Seconds 5
@@ -65,11 +86,10 @@ $mutex.Close()
 '''
         holder = subprocess.Popen([POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", holder_script])
         try:
-            # Wait briefly for mutex to be acquired
             import time
             time.sleep(0.8)
             
-            # Now run the actual AdmTrayLauncher.ps1 - it should detect mutex, try to open dashboard, and exit immediately
+            # Now run AdmTrayLauncher.ps1 - it should detect mutex, try to open dashboard, and exit immediately
             launcher_script = DESKTOP_DIR / "AdmTrayLauncher.ps1"
             cmd = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(launcher_script)]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
