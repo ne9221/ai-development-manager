@@ -14,6 +14,7 @@ from manager.command_watcher import (
 )
 from manager.tasks import TaskError, create_project, create_task
 from manager.test_execution_lifecycle import project, task
+from manager.test_task_claims import MemoryClaimRegistry
 from manager.trusted_ingress import REQUIRED_TASK_POLICIES
 
 
@@ -211,20 +212,17 @@ class TestProcessCommandAgRouting(unittest.TestCase):
 
         with patch("manager.command_watcher.validate_task_enforcement"), \
              patch("manager.command_watcher.session_center_healthy", return_value=True), \
-             patch("manager.execution_runner.launch_task", return_value=fake_outcome), \
              patch("manager.command_watcher.launch_task", return_value=fake_outcome) as mock_launch:
             result = process_command(
                 store, MagicMock(), cmd,
                 quota_check=lambda svc: True,
+                claim_factory=lambda *_args: MemoryClaimRegistry(),
                 allowlist=frozenset({("p1", "t1")}),
             )
-        # Whether process_command reached the launch path is observable from the command status
-        self.assertIn(result["status"], ("completed", "failed", "claimed"))
-        # launch_task must have been called with provider="antigravity" if it ran
-        if mock_launch.call_count > 0:
-            call_kwargs = mock_launch.call_args
-            provider_arg = call_kwargs.kwargs.get("provider")
-            self.assertEqual(provider_arg, "antigravity")
+        # launch_task must actually have been reached and called with provider="antigravity"
+        mock_launch.assert_called_once()
+        self.assertEqual(mock_launch.call_args.kwargs.get("provider"), "antigravity")
+        self.assertEqual(result["status"], "completed")
 
 
 if __name__ == "__main__":

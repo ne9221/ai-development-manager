@@ -1,4 +1,4 @@
-﻿"""Bounded, Drive-backed command watcher that delegates every launch to execution_runner."""
+"""Bounded, Drive-backed command watcher that delegates every launch to execution_runner."""
 
 import argparse
 import json

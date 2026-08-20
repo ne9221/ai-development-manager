@@ -1,4 +1,4 @@
-﻿"""Tests for Antigravity execution lifecycle integration."""
+"""Tests for Antigravity execution lifecycle integration."""
 
 import os
 import tempfile
