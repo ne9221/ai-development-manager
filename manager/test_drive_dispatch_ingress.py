@@ -156,6 +156,42 @@ class DriveDispatchIngressTests(unittest.TestCase):
                     service, FOLDER_ID, OWNER, service._files.file, NOW,
                 )["preferred_provider"])
 
+    def test_account_id_schema_accepts_known_logical_ids_and_omission(self):
+        for account_id in ("account-a", "account-b"):
+            with self.subTest(account_id=account_id):
+                service = Service(request(preferred_provider="claude", account_id=account_id))
+                self.assertEqual(account_id, read_request(
+                    service, FOLDER_ID, OWNER, service._files.file, NOW,
+                )["account_id"])
+        service = Service(request(preferred_provider="claude"))
+        self.assertNotIn("account_id", read_request(
+            service, FOLDER_ID, OWNER, service._files.file, NOW,
+        ))
+
+    def test_malformed_account_id_types_reject_before_dispatch(self):
+        for account_id in (False, 1, [], {}):
+            with self.subTest(account_id=account_id):
+                service = Service(request(preferred_provider="claude", account_id=account_id))
+                handler = Mock()
+                with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+                    result = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW)
+                self.assertFalse(result[0]["accepted"])
+                handler.assert_not_called()
+
+    def test_claude_account_id_reaches_existing_trusted_ingress_contract(self):
+        service = Service(request(preferred_provider="claude", account_id="account-a"))
+        handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1",
+                                     "task_id": "dispatch-drive-e2e-1",
+                                     "command_id": "dispatch-drive-e2e-1", "status": "queued"})
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            result = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                                  registry_factory=lambda *_args: object())
+        self.assertTrue(result[0]["accepted"])
+        payload = handler.call_args.args[3]
+        self.assertEqual("claude", payload["provider"])
+        self.assertEqual("account-a", payload["account_id"])
+        self.assertEqual({"read_only": True}, payload["constraints"])
+
     def test_antigravity_request_reaches_trusted_read_only_ingress(self):
         service = Service(request(preferred_provider="antigravity"))
         handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1",

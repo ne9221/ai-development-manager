@@ -429,6 +429,8 @@ class ExplicitProviderAccountRoutingTests(unittest.TestCase):
         self.assertEqual("claude-a", command["account_id"])
         self.assertEqual("claude", command["requested_provider"])
         self.assertEqual("claude-a", command["requested_account_id"])
+        task = self.store.get("tasks", "p1", result["task_id"])
+        self.assertEqual("claude-a", task["account_id"])
 
     def test_explicit_claude_b_gets_exact_account(self):
         with _registry_env(self.REGISTRY):
@@ -437,6 +439,8 @@ class ExplicitProviderAccountRoutingTests(unittest.TestCase):
         self.assertEqual("claude", command["provider"])
         self.assertEqual("claude-b", command["account_id"])
         self.assertEqual("claude-b", command["requested_account_id"])
+        task = self.store.get("tasks", "p1", result["task_id"])
+        self.assertEqual("claude-b", task["account_id"])
 
     def test_explicit_provider_is_never_overridden_by_auto_selector(self):
         # Quota fixture strongly favors codex; without the explicit route

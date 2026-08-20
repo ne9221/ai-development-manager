@@ -190,6 +190,8 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
         "scope": request.get("scope", []), "constraints": request.get("constraints", []), "acceptance_criteria": request.get("acceptance_criteria", []), "source_context": request.get("source_context", {}),
         "current_progress": "Not started", "next_action": "Confirm dispatch recommendation",
     }
+    if request.get("account_id") is not None:
+        task_input["account_id"] = request["account_id"]
     estimates = {provider: estimate({**task_input, "provider": provider, "mode": CAPABILITIES[provider]["mode"], "effort": "high" if task_input.get("complexity") == "high" else "medium"}, history) for provider in CAPABILITIES}
     decision = decide(task_input, quota, estimates=estimates)
     selected = request.get("preferred_provider") or decision["recommended_provider"] or decision["alternatives"][0]

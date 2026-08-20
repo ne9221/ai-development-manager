@@ -117,6 +117,8 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
             }
             if request.get("preferred_provider") is not None:
                 payload["provider"] = request["preferred_provider"]
+            if request.get("account_id") is not None:
+                payload["account_id"] = request["account_id"]
             result = handle_dispatch(store, service, lambda project_id, request_id:
                                      registry_factory(bucket, project_id, request_id), payload)
             results.append({"file_id": metadata["id"], **result})
