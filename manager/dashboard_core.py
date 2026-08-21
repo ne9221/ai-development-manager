@@ -510,6 +510,8 @@ def build_account_quota_card_vm(fc: AccountQuotaForecast) -> AccountQuotaCardVie
     # and never invent an answer when telemetry is stale/unknown.
     if fc.stale:
         effective_availability = "unknown"
+    elif not fc.source_reliable or fc.confidence in (None, "unknown") or fc.source in ("not_reported", "manual"):
+        effective_availability = "unknown"
     elif overall_risk_str == "available_via_credits":
         effective_availability = "available_via_credits"
     elif fc.dispatchable:
@@ -518,7 +520,7 @@ def build_account_quota_card_vm(fc: AccountQuotaForecast) -> AccountQuotaCardVie
         effective_availability = "unavailable"
 
     formatted_effective_availability = {
-        "unknown": "Unknown / Stale",
+        "unknown": "Unknown / Stale" if fc.stale else "Unknown / Unverified",
         "available_via_credits": "Available via credits",
         "available": "Available",
         "unavailable": "Unavailable",
@@ -587,6 +589,29 @@ def build_account_quota_card_vm(fc: AccountQuotaForecast) -> AccountQuotaCardVie
         formatted_extra_credits=formatted_extra_credits,
         formatted_effective_availability=formatted_effective_availability,
     )
+
+
+def classify_account_non_dispatchable_reason(fc: AccountQuotaForecast, vm: AccountQuotaCardViewModel) -> str:
+    """Return a truthful, specific explanation for why an account is non-dispatchable."""
+    if fc.stale or vm.stale:
+        return "telemetry is stale"
+    if not fc.source_reliable or fc.confidence in (None, "unknown") or fc.source in ("not_reported", "manual"):
+        return f"unsupported automated telemetry ({fc.source_type}/{fc.source})"
+    if fc.overall_risk_status == RiskStatus.EXHAUSTED:
+        return "verified quota exhausted (0% remaining)"
+    if (
+        fc.overall_risk_status == RiskStatus.LIKELY_EXHAUST_BEFORE_RESET
+        or fc.overall_action_recommendation == ActionRecommendation.CONSERVE
+    ):
+        rem_str = f" ({vm.five_hour_remaining_pct:.0f}% remaining)" if vm.five_hour_remaining_pct is not None else ""
+        return f"quota conservation required{rem_str}"
+    if fc.overall_action_recommendation == ActionRecommendation.HOLD:
+        if fc.warning_reason:
+            return fc.warning_reason
+        return "awaiting observation"
+    if not fc.windows:
+        return "no quota windows reported"
+    return "insufficient dispatchability evidence"
 
 
 def build_daily_brief_vm(
@@ -672,7 +697,33 @@ def build_daily_brief_vm(
         rec_account = None
         rec_display = "No AI Available"
         rec_action = "hold"
-        rec_reason = "No dispatchable AI accounts available; fresh official quota is unavailable or no account is eligible."
+
+        if not brief_fc.accounts:
+            rec_reason = "No AI accounts configured in runtime status."
+        else:
+            all_stale = all(fc.stale for fc in brief_fc.accounts)
+            all_unsupported = all(
+                (not fc.source_reliable or fc.confidence in (None, "unknown") or fc.source in ("not_reported", "manual"))
+                and not fc.stale
+                for fc in brief_fc.accounts
+            )
+            all_exhausted = all(
+                fc.overall_risk_status == RiskStatus.EXHAUSTED and not fc.stale and fc.has_reliable_quota
+                for fc in brief_fc.accounts
+            )
+
+            if all_stale:
+                rec_reason = "No dispatchable AI accounts available (all account telemetry is stale; awaiting fresh collection)."
+            elif all_unsupported:
+                rec_reason = "No dispatchable AI accounts available (automated telemetry unsupported/unknown for configured providers)."
+            elif all_exhausted:
+                rec_reason = "No dispatchable AI accounts available (all account quotas are verified exhausted at 0%)."
+            else:
+                breakdowns = []
+                for fc, vm in zip(brief_fc.accounts, account_vms):
+                    reason_desc = classify_account_non_dispatchable_reason(fc, vm)
+                    breakdowns.append(f"{vm.card_title}: {reason_desc}")
+                rec_reason = f"No dispatchable AI accounts available ({'; '.join(breakdowns)})."
     else:
         # Sort descending by score tuple: (is_eligible, action_tier, remaining_percent, reset_urgency, account_id)
         eligible.sort(key=lambda c: c[0], reverse=True)
