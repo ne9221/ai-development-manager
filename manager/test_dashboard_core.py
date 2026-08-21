@@ -33,6 +33,10 @@ from manager.dashboard_core import (
     build_quota_truth,
     build_dispatch_truth_row,
     compute_visible_dispatch_gate,
+    parse_task_to_run_path,
+    build_provenance_vm,
+    compute_provenance_gate,
+    compute_overall_visible_dispatch_gate,
 )
 from manager.quota_forecast import (
     AccountQuotaForecast,
@@ -1040,6 +1044,94 @@ class VisibleDispatchTruthGateTests(unittest.TestCase):
         self.assertEqual(row["dispatch_state"], DISPATCH_STATE_SUBMITTED)
         self.assertEqual(row["quota"]["freshness"], UNKNOWN_LABEL)
         self.assertFalse(row["quota"]["found"])
+
+
+class ProductionProvenanceContractTests(unittest.TestCase):
+    """Dashboard-vs-Watcher runtime identity truth (2026-08-22 hard
+    constraint): the Gate must require Dashboard reviewed SHA == Watcher
+    running_sha == tested_sha == activated_sha, all real -- any UNKNOWN or
+    mismatch must FAIL, never be hidden, and never be overridden by other
+    tests/gates passing."""
+
+    def setUp(self):
+        self.now = datetime(2026, 8, 22, 6, 0, 0, tzinfo=timezone.utc)
+
+    def test_parse_task_to_run_path_extracts_quoted_script_path(self):
+        raw = 'Task To Run:                          wscript.exe "C:\\repo\\manager\\generated\\command-watcher.vbs"'
+        self.assertEqual(parse_task_to_run_path(raw), "C:\\repo\\manager\\generated\\command-watcher.vbs")
+
+    def test_parse_task_to_run_path_handles_unquoted_path(self):
+        raw = "Task To Run:                          C:\\repo\\run.exe"
+        self.assertEqual(parse_task_to_run_path(raw), "C:\\repo\\run.exe")
+
+    def test_parse_task_to_run_path_missing_line_is_none(self):
+        self.assertIsNone(parse_task_to_run_path("TaskName: \\Foo\nStatus: Ready\n"))
+        self.assertIsNone(parse_task_to_run_path(None))
+
+    def test_all_four_shas_matching_passes(self):
+        vm = build_provenance_vm(
+            "C:\\dash", "main", "abc123",
+            "C:\\watcher", "main", "abc123", "abc123", "abc123",
+            now=self.now,
+        )
+        self.assertTrue(vm.all_match)
+        self.assertEqual(compute_provenance_gate(vm)["result"], "PASS")
+
+    def test_dashboard_and_watcher_on_different_sha_fails(self):
+        vm = build_provenance_vm(
+            "C:\\dash", "fix/dashboard-x", "aa5216f",
+            "C:\\watcher", "integration/runtime-v2", "680b107", "680b107", "680b107",
+            now=self.now,
+        )
+        self.assertFalse(vm.all_match)
+        gate = compute_provenance_gate(vm)
+        self.assertEqual(gate["result"], "FAIL")
+        self.assertIn("mismatch", gate["reasons"][0].lower())
+
+    def test_missing_tested_and_activated_sha_fails_not_silently_passes(self):
+        # No real Production Provenance Contract evidence yet: tested_sha/
+        # activated_sha are UNKNOWN. This must FAIL, never be treated as a
+        # pass just because running_sha matches the dashboard's own SHA.
+        vm = build_provenance_vm(
+            "C:\\dash", "main", "abc123",
+            "C:\\watcher", "main", "abc123", None, None,
+            now=self.now,
+        )
+        self.assertFalse(vm.all_match)
+        self.assertEqual(vm.watcher_tested_sha, UNKNOWN_LABEL)
+        self.assertEqual(vm.watcher_activated_sha, UNKNOWN_LABEL)
+        gate = compute_provenance_gate(vm)
+        self.assertEqual(gate["result"], "FAIL")
+        self.assertIn("no real evidence", gate["reasons"][0])
+
+    def test_missing_watcher_evidence_entirely_fails(self):
+        vm = build_provenance_vm("C:\\dash", "main", "abc123", None, None, None, None, None, now=self.now)
+        self.assertEqual(vm.watcher_repository_path, UNKNOWN_LABEL)
+        self.assertEqual(compute_provenance_gate(vm)["result"], "FAIL")
+
+    def test_overall_gate_requires_both_dispatch_and_provenance_pass(self):
+        passing_dispatch = {"result": "PASS", "reasons": []}
+        failing_dispatch = {"result": "FAIL", "reasons": ["task t1: missing required truth field 'provider'"]}
+        passing_provenance = {"result": "PASS", "reasons": []}
+        failing_provenance = {"result": "FAIL", "reasons": ["SHA mismatch: dashboard_reviewed_sha=aa5216f, watcher_running_sha=680b107"]}
+
+        self.assertEqual(compute_overall_visible_dispatch_gate(passing_dispatch, passing_provenance)["result"], "PASS")
+        self.assertEqual(compute_overall_visible_dispatch_gate(failing_dispatch, passing_provenance)["result"], "FAIL")
+        self.assertEqual(compute_overall_visible_dispatch_gate(passing_dispatch, failing_provenance)["result"], "FAIL")
+        overall = compute_overall_visible_dispatch_gate(failing_dispatch, failing_provenance)
+        self.assertEqual(overall["result"], "FAIL")
+        self.assertEqual(len(overall["reasons"]), 2)
+
+    def test_28_other_passing_checks_never_override_a_provenance_fail(self):
+        # Regression guard for the explicit hard constraint: passing every
+        # other row/dispatch check must not paper over a provenance FAIL.
+        many_passing_dispatch_reasons = {"result": "PASS", "reasons": []}
+        provenance_fail = compute_provenance_gate(build_provenance_vm(
+            "C:\\dash", "main", "aa5216f", "C:\\watcher", "main", "680b107", "680b107", "680b107", now=self.now,
+        ))
+        overall = compute_overall_visible_dispatch_gate(many_passing_dispatch_reasons, provenance_fail)
+        self.assertEqual(overall["result"], "FAIL")
+
 
 if __name__ == "__main__":
     unittest.main()

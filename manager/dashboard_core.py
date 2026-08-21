@@ -1047,3 +1047,144 @@ def compute_visible_dispatch_gate(rows: Sequence[Dict[str, Any]]) -> Dict[str, A
     if reasons:
         return {"result": "FAIL", "reasons": reasons}
     return {"result": "PASS", "reasons": []}
+
+
+# =====================================================================
+# Production Provenance (Dashboard self-identity vs. Watcher runtime)
+# =====================================================================
+#
+# INTERIM, HONEST evidence source: as of this slice, no real Production
+# Provenance Contract exists yet anywhere in this repo (verified against
+# origin: no such branch/file, confirmed with the session -- "A2" --
+# reportedly building it). Until that lands, watcher_tested_sha and
+# watcher_activated_sha have no real evidence to report and MUST stay
+# UNKNOWN rather than being guessed, copied from running_sha, or borrowed
+# from a test fixture -- an UNKNOWN there correctly fails the gate below,
+# which is the honest outcome, not a bug. repository_path/branch/
+# running_sha ARE real: they come from actual `git` introspection of the
+# actual on-disk checkouts (see dashboard.py's query_git_head_raw() /
+# discover_repository_root_from_script_path(), which read the real
+# Scheduled Task configuration and the real git HEAD -- never mocked).
+# When the real Provenance Contract exists, only dashboard.py's I/O layer
+# needs to change to source watcher_tested_sha/watcher_activated_sha from
+# it; build_provenance_vm() below already accepts them as plain parameters.
+
+
+def parse_task_to_run_path(verbose_schtasks_output: Optional[str]) -> Optional[str]:
+    """Extract the launcher script path from `schtasks /FO LIST /V` output's
+    "Task To Run:" line (may be quoted and may carry a leading executable
+    like wscript.exe, or trailing arguments)."""
+    if not verbose_schtasks_output:
+        return None
+    for line in verbose_schtasks_output.splitlines():
+        line = line.strip()
+        if not line.lower().startswith("task to run:"):
+            continue
+        raw = line.split(":", 1)[1].strip()
+        if not raw:
+            return None
+        quote_start = raw.find('"')
+        if quote_start != -1:
+            quote_end = raw.find('"', quote_start + 1)
+            if quote_end != -1:
+                return raw[quote_start + 1:quote_end]
+        return raw.split(" ")[0]
+    return None
+
+
+@dataclass
+class ProvenanceViewModel:
+    """User-visible Dashboard-vs-Watcher runtime identity truth."""
+    dashboard_repository_path: str
+    dashboard_branch: str
+    dashboard_reviewed_sha: str
+    watcher_repository_path: str
+    watcher_branch: str
+    watcher_running_sha: str
+    watcher_tested_sha: str
+    watcher_activated_sha: str
+    captured_at: str
+    all_match: bool
+    match_detail: str
+    evidence_source: str
+
+
+def build_provenance_vm(
+    dashboard_repository_path: Optional[str],
+    dashboard_branch: Optional[str],
+    dashboard_sha: Optional[str],
+    watcher_repository_path: Optional[str],
+    watcher_branch: Optional[str],
+    watcher_running_sha: Optional[str],
+    watcher_tested_sha: Optional[str] = None,
+    watcher_activated_sha: Optional[str] = None,
+    now: Optional[datetime] = None,
+    evidence_source: str = "git introspection (interim; Production Provenance Contract pending)",
+) -> ProvenanceViewModel:
+    """Pure builder: every missing/blank input becomes the literal
+    "UNKNOWN" string. The gate requires all four SHAs (Dashboard's own
+    reviewed release SHA, and the Watcher's running/tested/activated SHAs)
+    to be known AND identical -- any UNKNOWN or any mismatch is reported
+    truthfully, never hidden and never silently passed."""
+    now = now or datetime.now(timezone.utc)
+
+    def _s(value: Optional[str]) -> str:
+        return value if isinstance(value, str) and value.strip() else UNKNOWN_LABEL
+
+    d_path, d_branch, d_sha = _s(dashboard_repository_path), _s(dashboard_branch), _s(dashboard_sha)
+    w_path, w_branch = _s(watcher_repository_path), _s(watcher_branch)
+    w_running, w_tested, w_activated = _s(watcher_running_sha), _s(watcher_tested_sha), _s(watcher_activated_sha)
+
+    shas = {
+        "dashboard_reviewed_sha": d_sha,
+        "watcher_running_sha": w_running,
+        "watcher_tested_sha": w_tested,
+        "watcher_activated_sha": w_activated,
+    }
+    known = {k: v for k, v in shas.items() if v != UNKNOWN_LABEL}
+    all_known = len(known) == len(shas)
+    all_match = all_known and len(set(shas.values())) == 1
+
+    if not all_known:
+        missing = ", ".join(k for k, v in shas.items() if v == UNKNOWN_LABEL)
+        detail = f"cannot verify: no real evidence for {missing}"
+    elif all_match:
+        detail = f"all four SHAs match ({d_sha})"
+    else:
+        detail = "SHA mismatch: " + ", ".join(f"{k}={v}" for k, v in shas.items())
+
+    return ProvenanceViewModel(
+        dashboard_repository_path=d_path,
+        dashboard_branch=d_branch,
+        dashboard_reviewed_sha=d_sha,
+        watcher_repository_path=w_path,
+        watcher_branch=w_branch,
+        watcher_running_sha=w_running,
+        watcher_tested_sha=w_tested,
+        watcher_activated_sha=w_activated,
+        captured_at=now.isoformat(),
+        all_match=all_match,
+        match_detail=detail,
+        evidence_source=evidence_source,
+    )
+
+
+def compute_provenance_gate(vm: ProvenanceViewModel) -> Dict[str, Any]:
+    """PASS only when Dashboard reviewed SHA == Watcher running_sha ==
+    tested_sha == activated_sha, all real (non-UNKNOWN). This never falls
+    back to a mock/test fixture and is never overridden by any other gate
+    or test suite passing."""
+    if vm.all_match:
+        return {"result": "PASS", "reasons": []}
+    return {"result": "FAIL", "reasons": [vm.match_detail]}
+
+
+def compute_overall_visible_dispatch_gate(
+    dispatch_gate: Dict[str, Any], provenance_gate: Dict[str, Any]
+) -> Dict[str, Any]:
+    """The Dashboard's single top-level PASS/FAIL banner: requires both the
+    per-task dispatch-truth gate AND the Dashboard/Watcher provenance gate
+    to pass. Either one failing fails the whole banner."""
+    if dispatch_gate["result"] == "PASS" and provenance_gate["result"] == "PASS":
+        return {"result": "PASS", "reasons": []}
+    return {"result": "FAIL", "reasons": [*dispatch_gate["reasons"], *provenance_gate["reasons"]]}

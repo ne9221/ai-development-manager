@@ -6,6 +6,7 @@ import time
 import urllib.request
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
@@ -83,7 +84,13 @@ from manager.dashboard_core import (
     DISPATCH_STATE_RUNNING,
     build_dispatch_truth_row,
     compute_visible_dispatch_gate,
+    parse_task_to_run_path,
+    build_provenance_vm,
+    compute_provenance_gate,
+    compute_overall_visible_dispatch_gate,
 )
+
+COMMAND_WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
 
 st.set_page_config(
     page_title="ADM 營運儀表板",
@@ -205,6 +212,61 @@ def query_scheduled_task_raw(task_name: str) -> Optional[str]:
         return res.stdout if res.stdout else res.stderr
     except Exception:
         return None
+
+
+def query_scheduled_task_verbose_raw(task_name: str) -> Optional[str]:
+    """Like query_scheduled_task_raw, but /V so "Task To Run:" (the real
+    launcher script path) is included -- needed to discover which on-disk
+    checkout the production Watcher is actually running from."""
+    try:
+        cmd = ["schtasks.exe", "/Query", "/TN", task_name, "/FO", "LIST", "/V"]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+        if res.returncode == 0:
+            return res.stdout
+        return res.stdout if res.stdout else res.stderr
+    except Exception:
+        return None
+
+
+def discover_repository_root_from_script_path(script_path: Optional[str]) -> Optional[str]:
+    """Walk up from a launcher script's path to the nearest git repo root
+    (a directory containing .git) -- deliberately doesn't hardcode the
+    wrapper's internal layout (e.g. manager/generated/*.vbs), so it stays
+    correct if that layout ever changes."""
+    if not script_path:
+        return None
+    try:
+        current = Path(script_path).resolve().parent
+        for _ in range(10):
+            if (current / ".git").exists():
+                return str(current)
+            if current.parent == current:
+                break
+            current = current.parent
+    except Exception:
+        pass
+    return None
+
+
+def query_git_head_raw(repository_path: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """(branch, sha) via real `git` introspection of an on-disk checkout;
+    (None, None) on any failure -- never a guessed or cached value."""
+    if not repository_path:
+        return None, None
+    try:
+        branch_res = subprocess.run(
+            ["git", "-C", repository_path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        sha_res = subprocess.run(
+            ["git", "-C", repository_path, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        branch = branch_res.stdout.strip() if branch_res.returncode == 0 else None
+        sha = sha_res.stdout.strip() if sha_res.returncode == 0 else None
+        return branch or None, sha or None
+    except Exception:
+        return None, None
 
 
 def query_session_center_raw(port: int = 8765) -> tuple[bool, Optional[dict]]:
@@ -1363,14 +1425,57 @@ def render_dispatch_truth_page():
         project = projects_by_id.get(task.get("project_id"))
         rows.append(build_dispatch_truth_row(project, task, command, execution, daily_brief_vm.accounts, now))
 
-    gate = compute_visible_dispatch_gate(rows)
-    if gate["result"] == "PASS":
+    dispatch_gate = compute_visible_dispatch_gate(rows)
+
+    # --- Production Provenance: this Dashboard's own identity vs. the real
+    # running Command Watcher's identity. Real git/schtasks introspection
+    # only -- no cached/mock/demo values. See manager/dashboard_core.py's
+    # build_provenance_vm() docstring for why tested_sha/activated_sha are
+    # currently UNKNOWN (no Production Provenance Contract evidence exists
+    # yet anywhere in this repo).
+    dashboard_repo_path = str(Path(__file__).resolve().parent)
+    dashboard_branch, dashboard_sha = query_git_head_raw(dashboard_repo_path)
+
+    watcher_task_raw = query_scheduled_task_verbose_raw(COMMAND_WATCHER_TASK_NAME)
+    watcher_script_path = parse_task_to_run_path(watcher_task_raw)
+    watcher_repo_path = discover_repository_root_from_script_path(watcher_script_path)
+    watcher_branch, watcher_running_sha = query_git_head_raw(watcher_repo_path)
+
+    provenance_vm = build_provenance_vm(
+        dashboard_repo_path, dashboard_branch, dashboard_sha,
+        watcher_repo_path, watcher_branch, watcher_running_sha,
+        watcher_tested_sha=None, watcher_activated_sha=None, now=now,
+    )
+    provenance_gate = compute_provenance_gate(provenance_vm)
+    overall_gate = compute_overall_visible_dispatch_gate(dispatch_gate, provenance_gate)
+
+    if overall_gate["result"] == "PASS":
         st.success("VISIBLE DISPATCH GATE: PASS")
     else:
         st.error("VISIBLE DISPATCH GATE: FAIL")
-        with st.expander(f"原因（{len(gate['reasons'])}）", expanded=True):
-            for reason in gate["reasons"]:
+        with st.expander(f"原因（{len(overall_gate['reasons'])}）", expanded=True):
+            for reason in overall_gate["reasons"]:
                 st.write(f"- {reason}")
+
+    with st.expander("🧬 Production Provenance（Dashboard vs. Watcher runtime identity）", expanded=(provenance_gate["result"] == "FAIL")):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Dashboard（本頁面）**")
+            st.write(f"repository_path=`{provenance_vm.dashboard_repository_path}`")
+            st.write(f"branch=`{provenance_vm.dashboard_branch}`")
+            st.write(f"reviewed_sha=`{provenance_vm.dashboard_reviewed_sha}`")
+        with col2:
+            st.markdown(f"**Watcher（{COMMAND_WATCHER_TASK_NAME}）**")
+            st.write(f"repository_path=`{provenance_vm.watcher_repository_path}`")
+            st.write(f"branch=`{provenance_vm.watcher_branch}`")
+            st.write(f"running_sha=`{provenance_vm.watcher_running_sha}`")
+            st.write(f"tested_sha=`{provenance_vm.watcher_tested_sha}`")
+            st.write(f"activated_sha=`{provenance_vm.watcher_activated_sha}`")
+        st.caption(f"captured_at: {provenance_vm.captured_at} · evidence_source: {provenance_vm.evidence_source}")
+        if provenance_gate["result"] == "PASS":
+            st.success(provenance_vm.match_detail)
+        else:
+            st.error(provenance_vm.match_detail)
 
     if not rows:
         st.info("目前沒有任務可顯示。")
