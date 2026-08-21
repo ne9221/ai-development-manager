@@ -1043,3 +1043,50 @@ def compute_overall_visible_dispatch_gate(
     if dispatch_gate["result"] == "PASS" and provenance_gate["result"] == "PASS":
         return {"result": "PASS", "reasons": []}
     return {"result": "FAIL", "reasons": [*dispatch_gate["reasons"], *provenance_gate["reasons"]]}
+
+
+_PROVENANCE_EVIDENCE_REQUIRED_FIELDS = (
+    "running_sha", "tested_sha", "activated_sha", "repository_path", "branch", "captured_at",
+)
+
+
+def validate_provenance_evidence_document(doc: Any) -> Optional[Dict[str, str]]:
+    """Validate a persisted Production Provenance Contract evidence
+    document (e.g. <AI_MANAGER_HOME>/provenance/runtime_evidence.json).
+    Returns a normalized dict on success, None on any structural problem --
+    a malformed or incomplete file is never partially trusted."""
+    if not isinstance(doc, dict):
+        return None
+    for key in _PROVENANCE_EVIDENCE_REQUIRED_FIELDS:
+        value = doc.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return None
+    return {key: doc[key] for key in _PROVENANCE_EVIDENCE_REQUIRED_FIELDS}
+
+
+def reconcile_watcher_provenance_evidence(
+    independently_observed_repository_path: Optional[str],
+    independently_observed_running_sha: Optional[str],
+    evidence_document: Optional[Dict[str, str]],
+) -> Dict[str, Optional[str]]:
+    """Only trust a persisted evidence document's tested_sha/activated_sha
+    when its own repository_path AND running_sha agree with what this
+    Dashboard independently observed via real git introspection of the
+    Watcher's actual on-disk checkout -- a stale or mismatched evidence
+    file must never silently override live ground truth. Always returns
+    UNKNOWN-safe fallbacks (None) rather than guessing."""
+    if evidence_document is None:
+        return {"tested_sha": None, "activated_sha": None, "captured_at": None,
+                "note": "no persisted Production Provenance Contract evidence file found"}
+    if evidence_document["repository_path"] != independently_observed_repository_path:
+        return {"tested_sha": None, "activated_sha": None, "captured_at": None,
+                "note": "evidence file repository_path does not match the live Watcher checkout -- ignored"}
+    if evidence_document["running_sha"] != independently_observed_running_sha:
+        return {"tested_sha": None, "activated_sha": None, "captured_at": None,
+                "note": "evidence file running_sha does not match the live Watcher HEAD -- ignored (stale evidence)"}
+    return {
+        "tested_sha": evidence_document["tested_sha"],
+        "activated_sha": evidence_document["activated_sha"],
+        "captured_at": evidence_document["captured_at"],
+        "note": "evidence file matches the live Watcher checkout",
+    }

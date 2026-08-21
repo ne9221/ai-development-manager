@@ -37,6 +37,8 @@ from manager.dashboard_core import (
     build_provenance_vm,
     compute_provenance_gate,
     compute_overall_visible_dispatch_gate,
+    validate_provenance_evidence_document,
+    reconcile_watcher_provenance_evidence,
 )
 from manager.quota_forecast import (
     AccountQuotaForecast,
@@ -980,6 +982,63 @@ class ProductionProvenanceContractTests(unittest.TestCase):
         ))
         overall = compute_overall_visible_dispatch_gate(many_passing_dispatch_reasons, provenance_fail)
         self.assertEqual(overall["result"], "FAIL")
+
+
+class ProvenanceEvidenceFileReconciliationTests(unittest.TestCase):
+    """A persisted Production Provenance Contract evidence file (e.g.
+    <AI_MANAGER_HOME>/provenance/runtime_evidence.json) is only trusted for
+    tested_sha/activated_sha when it agrees with what the Dashboard
+    independently observed via real git introspection -- never blindly."""
+
+    def _doc(self, **overrides):
+        base = {
+            "running_sha": "6d41645", "tested_sha": "6d41645", "activated_sha": "6d41645",
+            "repository_path": "C:\\watcher-repo", "branch": "integration/x", "captured_at": "2026-08-21T18:39:03Z",
+        }
+        base.update(overrides)
+        return base
+
+    def test_valid_document_normalizes_cleanly(self):
+        normalized = validate_provenance_evidence_document(self._doc())
+        self.assertEqual(normalized["tested_sha"], "6d41645")
+
+    def test_missing_field_is_rejected(self):
+        doc = self._doc()
+        del doc["activated_sha"]
+        self.assertIsNone(validate_provenance_evidence_document(doc))
+
+    def test_blank_field_is_rejected(self):
+        self.assertIsNone(validate_provenance_evidence_document(self._doc(tested_sha="  ")))
+
+    def test_non_dict_is_rejected(self):
+        self.assertIsNone(validate_provenance_evidence_document(None))
+        self.assertIsNone(validate_provenance_evidence_document("not a dict"))
+
+    def test_matching_repository_and_sha_is_trusted(self):
+        doc = validate_provenance_evidence_document(self._doc())
+        result = reconcile_watcher_provenance_evidence("C:\\watcher-repo", "6d41645", doc)
+        self.assertEqual(result["tested_sha"], "6d41645")
+        self.assertEqual(result["activated_sha"], "6d41645")
+        self.assertIn("matches", result["note"])
+
+    def test_no_evidence_document_is_unknown_not_guessed(self):
+        result = reconcile_watcher_provenance_evidence("C:\\watcher-repo", "6d41645", None)
+        self.assertIsNone(result["tested_sha"])
+        self.assertIsNone(result["activated_sha"])
+
+    def test_mismatched_repository_path_is_ignored_not_trusted(self):
+        doc = validate_provenance_evidence_document(self._doc(repository_path="C:\\different-repo"))
+        result = reconcile_watcher_provenance_evidence("C:\\watcher-repo", "6d41645", doc)
+        self.assertIsNone(result["tested_sha"])
+        self.assertIn("does not match", result["note"])
+
+    def test_stale_running_sha_in_evidence_file_is_ignored_not_trusted(self):
+        # The Dashboard independently sees a newer live HEAD than the
+        # evidence file claims -- the file is stale and must not be used.
+        doc = validate_provenance_evidence_document(self._doc(running_sha="old-sha"))
+        result = reconcile_watcher_provenance_evidence("C:\\watcher-repo", "new-sha", doc)
+        self.assertIsNone(result["tested_sha"])
+        self.assertIn("stale", result["note"])
 
 
 if __name__ == "__main__":

@@ -32,6 +32,8 @@ from manager.dashboard_core import (
     build_provenance_vm,
     compute_provenance_gate,
     compute_overall_visible_dispatch_gate,
+    validate_provenance_evidence_document,
+    reconcile_watcher_provenance_evidence,
 )
 
 WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
@@ -130,6 +132,23 @@ def query_git_head_raw(repository_path):
         return branch or None, sha or None
     except Exception:
         return None, None
+
+
+def read_provenance_evidence_file():
+    """Read the persisted Production Provenance Contract evidence file, if
+    one exists, from <AI_MANAGER_HOME>/provenance/runtime_evidence.json --
+    the same AI_MANAGER_HOME convention already used by
+    manager/quota_history.py, manager/refresh_status.py, and
+    manager/claude_config_locks.py. Returns the raw parsed document, or
+    None on any failure (missing file, unreadable, malformed JSON) -- the
+    caller (validate_provenance_evidence_document) decides whether its
+    shape can be trusted."""
+    home = os.environ.get("AI_MANAGER_HOME") or os.path.expanduser("~/.ai-development-manager")
+    evidence_path = Path(home) / "provenance" / "runtime_evidence.json"
+    try:
+        return json.loads(evidence_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=15)
@@ -529,10 +548,18 @@ _watcher_script_path = parse_task_to_run_path(_watcher_task_raw)
 _watcher_repo_path = discover_repository_root_from_script_path(_watcher_script_path)
 _watcher_branch, _watcher_running_sha = query_git_head_raw(_watcher_repo_path)
 
+# Production Provenance Contract evidence: only trusted for tested_sha/
+# activated_sha when its own repository_path AND running_sha agree with
+# what we just independently observed above via real git introspection --
+# a stale or mismatched evidence file is never silently trusted.
+_evidence_doc = validate_provenance_evidence_document(read_provenance_evidence_file())
+_evidence = reconcile_watcher_provenance_evidence(_watcher_repo_path, _watcher_running_sha, _evidence_doc)
+
 provenance_vm = build_provenance_vm(
     _dashboard_repo_path, _dashboard_branch, _dashboard_sha,
     _watcher_repo_path, _watcher_branch, _watcher_running_sha,
-    watcher_tested_sha=None, watcher_activated_sha=None, now=now,
+    watcher_tested_sha=_evidence["tested_sha"], watcher_activated_sha=_evidence["activated_sha"], now=now,
+    evidence_source=_evidence["note"],
 )
 provenance_gate = compute_provenance_gate(provenance_vm)
 overall_gate = compute_overall_visible_dispatch_gate(dispatch_gate, provenance_gate)
