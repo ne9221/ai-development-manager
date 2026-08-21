@@ -22,6 +22,7 @@ from manager.executions import MAX_HARD_TIMEOUT_SECONDS, heartbeat_execution, ha
 from manager.gcs_lock_registry import GCSLockRegistry
 from manager.project_registry import get_global_registry
 from manager.quota_reader import read_drive_status
+from manager.repo_write_enforcement import enforce_allowed_paths, is_bounded_repo_write_snapshot
 from manager.session_identity import manager_session_key
 from manager.task_claims import task_claim_registry
 from manager.tasks import DriveRecords, TaskError, update_task, validate
@@ -402,6 +403,28 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
         if close_error:
             error.add_note(f"close: {close_error}")
         raise error
+
+    # Global Hands-off Execution Layer, Slice D: a v2-repo-write Task's
+    # provider only ever ran inside its own isolated worktree (Slice C), but
+    # nothing yet checked that its *actual* git changes stayed within the
+    # Task's admitted allowed_paths -- so a provider-reported "completed"
+    # outcome could otherwise persist even if it edited files outside its
+    # bounded scope. This runs only once the provider has fully, provably
+    # stopped (never while it could still be writing), only when it claimed
+    # success, and only for a genuine repo-write Task (never legacy/
+    # read-only, whose working_directory may still be the shared canonical
+    # checkout this check must never be pointed at). Any failure here --
+    # a real scope violation or an unexpected git error -- downgrades status
+    # before terminalize_execution() ever persists "completed", so a
+    # violation can never reach a successful completion or any future
+    # commit/push step gated on that status.
+    snapshot = execution["task_snapshot"]
+    if status == "completed" and is_bounded_repo_write_snapshot(snapshot):
+        try:
+            enforce_allowed_paths(snapshot["working_directory"], snapshot["baseline_head"], snapshot["allowed_paths"])
+        except TaskError as exc:
+            status = "failed"
+            summary = f"{provider} turn rejected: {exc}"
 
     terminal = terminalize_execution(
         store, service, writer_registry, claim_registry, project_id, task_id, execution_id, provider,
