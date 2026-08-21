@@ -70,17 +70,6 @@ def query_command_watcher_task():
     return _powershell_json(script)
 
 
-def enable_command_watcher_task(task_name):
-    if task_name != WATCHER_TASK_NAME:
-        raise ValueError("refusing to enable any task except the approved Command Watcher")
-    quoted = task_name.replace("'", "''")
-    subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-         f"Enable-ScheduledTask -TaskName '{quoted}' -ErrorAction Stop | Out-Null"],
-        capture_output=True, text=True, check=True,
-    )
-
-
 def _same_path(left, right):
     return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(os.path.abspath(str(right)))
 
@@ -92,9 +81,18 @@ def _approved_watcher_identity(task, repository_path):
     if not isinstance(actions, list) or len(actions) != 1:
         return False
     action = actions[0]
-    if os.path.basename(action.get("execute") or "").lower() != "powershell.exe":
-        return False
+    executable = os.path.basename(action.get("execute") or "").lower()
     arguments = action.get("arguments") or ""
+    if executable == "wscript.exe":
+        # Hidden-launch installers (see AdmHiddenLaunch.ps1) route through a
+        # generated per-repository VBS wrapper instead of invoking
+        # powershell.exe directly, so identity is proven by that wrapper's
+        # path living exactly under this repository -- not by inspecting
+        # -RepositoryPath, which no longer appears at the Task Action level.
+        expected_vbs = str(Path(repository_path) / "manager" / "generated" / "command-watcher.vbs")
+        return arguments.strip() in (f'"{expected_vbs}"', f"'{expected_vbs}'")
+    if executable != "powershell.exe":
+        return False
     match = re.search(r"-RepositoryPath\s+(['\"])(.*?)\1", arguments, re.IGNORECASE)
     if not match or not _same_path(match.group(2), repository_path):
         return False
@@ -102,18 +100,22 @@ def _approved_watcher_identity(task, repository_path):
     return any(quoted in arguments for quoted in (f"'{runner}'", f'"{runner}"'))
 
 
-def _read_json(path):
-    try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return None
-
-
 def maintain_command_watcher(repository_path, maintenance_path, incident_path,
                              query_task=query_command_watcher_task,
-                             enable_task=enable_command_watcher_task,
                              now=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")):
-    """Self-heal one verified disabled watcher without ever executing it."""
+    """Report the Command Watcher task's health -- never re-enables it.
+
+    A Scheduled Task only ever becomes Disabled through some deliberate
+    action (Stop-ADM, the Tray, or a user disabling it directly in Task
+    Scheduler); there is no reliable way to distinguish that from an
+    "unexpected" disable worth auto-recovering, so this must never guess.
+    Silently re-enabling a task the user just disabled is exactly the P0
+    HOME popup/focus-steal bug this closes: every automatic re-enable
+    unblocks the next Scheduled Task trigger, which runs again and can pop a
+    console. Recovery from a genuine external disable is an explicit user
+    action (Tray "Start Services" / "Restart Services"), never a silent
+    per-tick side effect of this supervisor.
+    """
     sentinel = Path(maintenance_path).is_file()
     try:
         task = query_task()
@@ -128,22 +130,8 @@ def maintain_command_watcher(repository_path, maintenance_path, incident_path,
         evidence["result"] = "identity_rejected"
     elif task.get("enabled") is not False:
         return evidence
-    elif sentinel:
-        evidence["result"] = "intentional_maintenance"
-    elif (_read_json(incident_path) or {}).get("result") in ("enable_failed", "enable_unconfirmed"):
-        evidence["result"] = "failed_closed"
-        return evidence  # preserve the failure latch; do not create a retry loop
     else:
-        evidence["attempted"] = True
-        try:
-            enable_task(WATCHER_TASK_NAME)
-            restored = query_task()
-            evidence["result"] = "enabled" if (
-                _approved_watcher_identity(restored, repository_path)
-                and restored.get("enabled") is True
-            ) else "enable_unconfirmed"
-        except Exception:
-            evidence["result"] = "enable_failed"
+        evidence["result"] = "intentional_maintenance" if sentinel else "disabled_left_alone"
     write_atomic(Path(incident_path), evidence)
     return evidence
 
@@ -372,4 +360,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    from manager.win_background_guard import install_hidden_subprocess_guard
+    install_hidden_subprocess_guard()
     raise SystemExit(main())

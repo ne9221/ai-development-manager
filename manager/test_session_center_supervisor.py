@@ -43,7 +43,7 @@ class WatcherMaintenanceTests(unittest.TestCase):
                          "arguments": f"-File '{runner}' -RepositoryPath '{repo}'"}],
         }
 
-    def run_case(self, task, sentinel=False, enable=None, prior=None):
+    def run_case(self, task, sentinel=False):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -54,73 +54,61 @@ class WatcherMaintenanceTests(unittest.TestCase):
         if sentinel:
             maintenance.parent.mkdir()
             maintenance.write_text('{"reason":"intentional"}', encoding="utf-8")
-        if prior:
-            incident.parent.mkdir(exist_ok=True)
-            incident.write_text(json.dumps(prior), encoding="utf-8")
         query = Mock(side_effect=(lambda: task(repo))) if callable(task) else Mock(return_value=task)
-        enable = enable or Mock()
         result = maintain_command_watcher(
-            repo, maintenance, incident, query_task=query, enable_task=enable,
+            repo, maintenance, incident, query_task=query,
             now=lambda: "2026-08-20T00:00:00Z",
         )
-        return result, query, enable, incident, repo
+        return result, query, incident, repo
 
     def test_healthy_watcher_is_a_true_noop(self):
-        result, query, enable, incident, _ = self.run_case(lambda repo: self.task(repo, "Ready"))
+        result, query, incident, _ = self.run_case(lambda repo: self.task(repo, "Ready"))
         self.assertEqual("healthy", result["result"])
-        enable.assert_not_called()
         self.assertFalse(incident.exists())
 
-    def test_unexpected_disabled_watcher_is_enabled_exactly_once(self):
-        states = []
-        def task(repo):
-            states.append(1)
-            return self.task(repo, "Disabled" if len(states) == 1 else "Ready")
-        result, query, enable, incident, _ = self.run_case(task)
-        enable.assert_called_once_with(self.TASK)
-        self.assertEqual("enabled", result["result"])
+    def test_disabled_watcher_is_never_silently_reenabled(self):
+        """The exact P0: a user-disabled task must stay disabled. Self-heal
+        only ever reports the state -- it must never call Enable-ScheduledTask
+        or Start-ScheduledTask itself, no matter how many ticks pass."""
+        result, query, incident, _ = self.run_case(lambda repo: self.task(repo, "Disabled"))
+        self.assertEqual("disabled_left_alone", result["result"])
+        self.assertFalse(result["sentinel"])
         saved = json.loads(incident.read_text(encoding="utf-8"))
         self.assertEqual({"detected_at", "previous_state", "sentinel", "attempted", "result"}, set(saved))
-        self.assertTrue(saved["attempted"])
+        self.assertFalse(saved["attempted"])
 
-    def test_running_but_disabled_watcher_is_still_recovered(self):
-        calls = []
-        def task(repo):
-            calls.append(1)
-            return self.task(repo, "Running", enabled=len(calls) > 1)
-        result, _, enable, _, _ = self.run_case(task)
-        enable.assert_called_once_with(self.TASK)
-        self.assertEqual("enabled", result["result"])
+    def test_running_but_disabled_watcher_is_left_alone(self):
+        result, _, incident, _ = self.run_case(lambda repo: self.task(repo, "Running", enabled=False))
+        self.assertEqual("disabled_left_alone", result["result"])
         self.assertEqual("Running", result["previous_state"])
 
-    def test_action_from_another_clone_is_never_enabled(self):
-        result, _, enable, incident, repo = self.run_case(
+    def test_action_from_another_clone_is_never_trusted(self):
+        result, _, incident, repo = self.run_case(
             lambda _repo: self.task(str(Path(_repo).parent / "scratch")))
-        enable.assert_not_called()
         self.assertEqual("identity_rejected", result["result"])
         self.assertTrue(incident.exists())
 
-    def test_maintenance_sentinel_blocks_reenable(self):
-        result, _, enable, _, _ = self.run_case(lambda repo: self.task(repo), sentinel=True)
-        enable.assert_not_called()
+    def test_maintenance_sentinel_is_recorded_as_intentional(self):
+        result, _, _, _ = self.run_case(lambda repo: self.task(repo), sentinel=True)
         self.assertEqual("intentional_maintenance", result["result"])
         self.assertTrue(result["sentinel"])
 
-    def test_failed_enable_is_visible_and_fails_closed_without_retry_loop(self):
-        failed = Mock(side_effect=OSError("access denied"))
-        result, _, failed, incident, _ = self.run_case(lambda repo: self.task(repo), enable=failed)
-        self.assertEqual("enable_failed", result["result"])
-        failed.assert_called_once()
-        prior = json.loads(incident.read_text(encoding="utf-8"))
-        result, _, second, _, _ = self.run_case(lambda repo: self.task(repo), prior=prior)
-        second.assert_not_called()
-        self.assertEqual("failed_closed", result["result"])
+    def test_wscript_hidden_launch_identity_is_also_approved(self):
+        def wscript_task(repo):
+            vbs = str(Path(repo) / "manager" / "generated" / "command-watcher.vbs")
+            return {
+                "task_name": self.TASK, "task_path": "\\", "state": "Disabled", "enabled": False,
+                "actions": [{"execute": "wscript.exe", "arguments": f'"{vbs}"'}],
+            }
+        result, _, _, _ = self.run_case(wscript_task)
+        self.assertEqual("disabled_left_alone", result["result"])
 
-    def test_self_heal_never_manually_runs_the_watcher(self):
+    def test_self_heal_never_manually_runs_or_enables_the_watcher(self):
         import inspect
         source = inspect.getsource(maintain_command_watcher)
         self.assertNotIn("Start-ScheduledTask", source)
         self.assertNotIn("poll_once", source)
+        self.assertNotIn("enable_task", source)
 
 
 def cmd(command_id="c1", project_id="p1", task_id="t1", status="queued", execution_id=None, created_at="2026-08-14T00:00:00Z"):

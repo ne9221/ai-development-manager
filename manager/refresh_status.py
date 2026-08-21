@@ -231,4 +231,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from manager.win_background_guard import install_hidden_subprocess_guard
+    install_hidden_subprocess_guard()
     raise SystemExit(main())
