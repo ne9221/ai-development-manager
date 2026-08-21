@@ -121,7 +121,7 @@ def determine_ai_runtime_activity(exe: Dict[str, Any], now: Optional[datetime] =
 
     if status in ["completed", "succeeded"]:
         return "COMPLETED", "badge-ok", "Execution finished successfully."
-    if status in ["failed", "crashed"]:
+    if status in ["failed", "crashed", "correlation_failed"]:
         return "FAILED", "badge-err", "Execution failed with errors."
     if status in ["blocked", "attention"]:
         return "BLOCKED", "badge-err", "Execution is blocked."
