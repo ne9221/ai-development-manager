@@ -153,7 +153,15 @@ $notifyIcon.Visible = $true
 Update-AdmActionNotifications
 $pollTimer = New-Object System.Windows.Forms.Timer
 $pollTimer.Interval = 60000
-$pollTimer.add_Tick({ Update-AdmActionNotifications })
+$pollTimer.add_Tick({
+    Update-AdmActionNotifications
+    # P1-G Global Self-Heal: this existing 60s tick *is* Dashboard's
+    # periodic supervisor -- no separate Python tray, no new Scheduled
+    # Task. Confirm-AdmDashboardAlive is idempotent (Start-AdmDashboardBackground
+    # no-ops if already listening), so running it every tick can never
+    # spawn a duplicate backend.
+    try { Confirm-AdmDashboardAlive -RepositoryPath $RepositoryPath | Out-Null } catch {}
+})
 $pollTimer.Start()
 
 # Context Menu

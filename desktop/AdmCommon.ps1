@@ -94,6 +94,86 @@ function Start-AdmDashboardBackground {
     }
 }
 
+function Get-AdmPortOwnerPid {
+    # Read-only discovery only -- see Confirm-AdmDashboardAlive, which
+    # never kills whatever this returns; it only records it as evidence.
+    param([Parameter(Mandatory = $true)][int]$Port)
+    try {
+        $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($conn) { return $conn.OwningProcess }
+    } catch {
+        # Best-effort discovery only; caller treats $null as "unknown", not "no owner".
+    }
+    return $null
+}
+
+function Confirm-AdmDashboardAlive {
+    # Bounded, idempotent Dashboard self-heal (P1-G Global Self-Heal).
+    # Called from the tray's existing 60s poll timer (see
+    # AdmTrayLauncher.ps1) -- this function is never its own loop and
+    # never registers a new Scheduled Task; the tray's already-running
+    # timer *is* the periodic supervisor for Dashboard.
+    #
+    # Never kills anything. Start-AdmDashboardBackground already no-ops
+    # (returns $true immediately) if Dashboard is genuinely already
+    # listening, so calling this every tick can never spawn a duplicate
+    # backend. If an unrelated process holds port 8501, Streamlit simply
+    # fails to bind and Get-AdmDashboardHealth still reports not-listening
+    # afterward -- reported truthfully as a failed remediation, never
+    # silently retried into "healthy".
+    param(
+        [string]$RepositoryPath = $(Split-Path -Parent $PSScriptRoot),
+        [string]$ManagerHome = "C:\Users\EE\.ai-development-manager",
+        [string]$PythonPath = "C:\Users\EE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+    )
+
+    $port = ([uri]$AdmDashboardUrl).Port
+    $before = Get-AdmDashboardHealth
+    $state = if ($before.Listening) { "healthy" } else { "unknown" }
+    $degradedReason = $null
+    $remediation = $null
+    $remediationResult = $null
+    $blocker = $null
+
+    if (-not $before.Listening) {
+        $degradedReason = "dashboard_process_missing"
+        $remediation = "dashboard_process_missing"
+        $started = Start-AdmDashboardBackground -RepositoryPath $RepositoryPath
+        Start-Sleep -Seconds 3
+        $after = Get-AdmDashboardHealth
+        if ($after.Listening) {
+            $state = "healthy"
+            $remediationResult = "recovered"
+            $degradedReason = $null
+        } else {
+            $state = "degraded"
+            $remediationResult = if ($started) { "attempted_still_unavailable" } else { "spawn_failed" }
+            $blocker = "Dashboard did not become reachable on $AdmDashboardUrl after a bounded restart attempt"
+        }
+    }
+
+    $observedPid = Get-AdmPortOwnerPid -Port $port
+    $resolvedPython = $PythonPath
+    if (-not (Test-Path -LiteralPath $resolvedPython)) { $resolvedPython = "python" }
+    $storePath = Join-Path $ManagerHome "health-evidence.json"
+    $pyArgs = @("-m", "manager.health_evidence", "record-dashboard", "--store-path", $storePath, "--state", $state, "--observed-port", $port)
+    if ($degradedReason) { $pyArgs += @("--degraded-reason", $degradedReason) }
+    if ($remediation) { $pyArgs += @("--last-remediation", $remediation) }
+    if ($remediationResult) { $pyArgs += @("--remediation-result", $remediationResult) }
+    if ($blocker) { $pyArgs += @("--unresolved-blocker", $blocker) }
+    if ($observedPid) { $pyArgs += @("--observed-pid", $observedPid) }
+
+    try {
+        Push-Location -LiteralPath $RepositoryPath
+        try { & $resolvedPython @pyArgs 2>$null | Out-Null } finally { Pop-Location }
+    } catch {
+        # Evidence recording is best-effort visibility -- a failure here
+        # must never be treated as a health/remediation failure itself.
+    }
+
+    return [PSCustomObject]@{ State = $state; DegradedReason = $degradedReason; RemediationResult = $remediationResult }
+}
+
 function Get-AdmComprehensiveHealth {
     $supervisor = Get-AdmTaskStatus -TaskName $AdmSupervisorTask
     $watcher = Get-AdmTaskStatus -TaskName $AdmWatcherTask
