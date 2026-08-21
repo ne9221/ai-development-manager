@@ -10,6 +10,7 @@ import os
 import socket
 import sys
 import uuid
+from pathlib import Path
 
 from collectors.publish_drive import build_service
 from manager.claude_account_selector import AccountSelectionError, resolve_claude_account
@@ -19,11 +20,14 @@ from manager.dispatcher import dispatch
 from manager.execution_lifecycle import enter_running_gate, terminalize_execution
 from manager.executions import MAX_HARD_TIMEOUT_SECONDS, heartbeat_execution, hard_timeout_seconds, link_execution_session, reserve_execution
 from manager.gcs_lock_registry import GCSLockRegistry
+from manager.project_registry import get_global_registry
 from manager.quota_reader import read_drive_status
 from manager.session_identity import manager_session_key
 from manager.task_claims import task_claim_registry
 from manager.tasks import DriveRecords, TaskError, update_task, validate
+from manager.trusted_ingress import repo_write_policy_satisfied
 from manager.worktree_locks import link_session as link_writer_session
+from manager.worktree_materializer import materialize_worktree
 
 
 RPC_TIMEOUT_SECONDS = 30.0
@@ -158,6 +162,30 @@ def _dispatch_request(task, provider, account_id=None):
     }
 
 
+def _materialize_repo_write_working_directory(store, task):
+    """Slice C of the Global Hands-off Execution Layer: a Task that actually
+    carries Slice A's v2-repo-write admission evidence (bounded allowed_paths/
+    baseline_head/repo, not merely the common needs_repo_edit=True default
+    every ordinary production task also carries) must launch inside its own
+    deterministic, isolated git worktree -- never the project's single shared
+    canonical checkout, which every other task (read-only or otherwise) also
+    reads. Resolution
+    goes through the Global Project Registry (manager.project_registry,
+    Slice B) rather than any hardcoded machine path; any failure here (wrong
+    repo, invalid/mismatched baseline, ownership conflict, ...) propagates
+    and must never fall through to the canonical-checkout fallback below.
+    """
+    project_id = task["project_id"]
+    project = get_global_registry().get_project(project_id)
+    drive_project = store.get("projects", project_id, project_id)
+    canonical_checkout = drive_project.get("working_directory")
+    if not isinstance(canonical_checkout, str) or not canonical_checkout.strip():
+        raise TaskError(f"project {project_id!r} has no canonical working_directory to materialize a worktree from")
+    workspace_root = os.environ.get("ADM_WORKTREE_WORKSPACE_ROOT") or str(Path(canonical_checkout).parent / "adm-worktrees")
+    result = materialize_worktree(store, project, task, canonical_checkout, workspace_root)
+    return result["working_directory"]
+
+
 def _resolve_working_directory(store, task):
     """Resolve the launch-time working_directory, backfilling a legacy Task.
 
@@ -165,7 +193,10 @@ def _resolve_working_directory(store, task):
     it creates going forward, so this is normally a pass-through read of the
     Task's own value. A Task persisted before that contract existed has no
     such field; only then does this fall back to reading the Task's Project
-    (never any caller-supplied value -- there is none available here). The
+    (never any caller-supplied value -- there is none available here) --
+    except for a Task carrying genuine v2-repo-write admission evidence,
+    which is never allowed to fall back to the shared canonical checkout and
+    instead materializes (or reuses) its own isolated worktree (Slice C). The
     resolved value is validated (string, absolute, existing directory) before
     it is trusted, and only *then* backfilled onto the Task record itself, so
     a bad Project value is never persisted, and every later launch/retry of
@@ -175,6 +206,8 @@ def _resolve_working_directory(store, task):
     """
     value = task.get("working_directory")
     from_project = False
+    if value is None and repo_write_policy_satisfied(task):
+        value = _materialize_repo_write_working_directory(store, task)
     if value is None:
         project = store.get("projects", task["project_id"], task["project_id"])
         value = project.get("working_directory")
