@@ -19,6 +19,24 @@ from manager.dashboard_core import (
     DailyBriefViewModel,
     parse_scheduled_task_health,
     build_session_center_health,
+    UNKNOWN_LABEL,
+    DISPATCH_STATE_SUBMITTED,
+    DISPATCH_STATE_ACCEPTED,
+    DISPATCH_STATE_QUEUED,
+    DISPATCH_STATE_CLAIMED,
+    DISPATCH_STATE_RUNNING,
+    DISPATCH_STATE_COMPLETED,
+    DISPATCH_STATE_BLOCKED,
+    DISPATCH_STATE_UNKNOWN,
+    compute_dispatch_state,
+    build_provider_truth,
+    build_quota_truth,
+    build_dispatch_truth_row,
+    compute_visible_dispatch_gate,
+    parse_task_to_run_path,
+    build_provenance_vm,
+    compute_provenance_gate,
+    compute_overall_visible_dispatch_gate,
 )
 from manager.quota_forecast import (
     AccountQuotaForecast,
@@ -647,6 +665,321 @@ class WatcherSessionCenterHealthTests(unittest.TestCase):
     def test_session_center_listening_without_session_payload_is_online(self):
         vm = build_session_center_health(listening=True, session=None)
         self.assertEqual("Online", vm.status_label)
+
+
+class VisibleDispatchTruthGateTests(unittest.TestCase):
+    """Task/Provider/Account/Quota truth for the Dashboard's Visible
+    Dispatch Gate. Covers the acceptance checklist from the Dashboard
+    Visible Dispatch Truth Gate task spec (2026-08-22): dispatch-state
+    honesty, per-account quota isolation, and graceful UNKNOWN/STALE
+    rather than any guessed or demo value."""
+
+    def setUp(self):
+        self.now = datetime(2026, 8, 22, 6, 0, 0, tzinfo=timezone.utc)
+        self.project = {"project_id": "p1", "name": "Project One"}
+
+    def task(self, **overrides):
+        base = {"task_id": "t1", "project_id": "p1", "status": "in_progress", "title": "Do the thing"}
+        base.update(overrides)
+        return base
+
+    def command(self, **overrides):
+        base = {
+            "command_id": "cmd-1", "project_id": "p1", "task_id": "t1", "provider": "claude",
+            "account_id": "claude-b", "model": "claude-opus", "mode": "code", "status": "running",
+        }
+        base.update(overrides)
+        return base
+
+    def execution(self, **overrides):
+        base = {
+            "execution_id": "exec-1", "project_id": "p1", "task_id": "t1", "provider": "claude",
+            "status": "running", "provider_session_id": "sess-abc",
+        }
+        base.update(overrides)
+        return base
+
+    def quota_accounts(self, entries):
+        doc = {"providers": entries}
+        return build_daily_brief_vm(doc, now=self.now).accounts
+
+    # 1. submitted must not display as running.
+    def test_submitted_task_is_not_running(self):
+        result = compute_dispatch_state(self.task(status="ready"), None, None, self.now)
+        self.assertEqual(result["state"], DISPATCH_STATE_SUBMITTED)
+        self.assertNotEqual(result["state"], DISPATCH_STATE_RUNNING)
+
+    # 2. accepted (dispatch-request evidence only, no command yet) must not display as running.
+    def test_accepted_task_is_not_running(self):
+        result = compute_dispatch_state(self.task(status="ready"), None, None, self.now, has_dispatch_request=True)
+        self.assertEqual(result["state"], DISPATCH_STATE_ACCEPTED)
+        self.assertNotEqual(result["state"], DISPATCH_STATE_RUNNING)
+
+    # queued/claimed must not display as running either.
+    def test_queued_and_claimed_are_not_running(self):
+        queued = compute_dispatch_state(self.task(), self.command(status="queued"), None, self.now)
+        claimed = compute_dispatch_state(self.task(), self.command(status="claimed"), None, self.now)
+        self.assertEqual(queued["state"], DISPATCH_STATE_QUEUED)
+        self.assertEqual(claimed["state"], DISPATCH_STATE_CLAIMED)
+        self.assertNotIn(DISPATCH_STATE_RUNNING, (queued["state"], claimed["state"]))
+
+    # 3. RUNNING requires execution.status == running AND provider session evidence.
+    def test_running_requires_execution_status_and_session_evidence(self):
+        result = compute_dispatch_state(self.task(), self.command(), self.execution(), self.now)
+        self.assertEqual(result["state"], DISPATCH_STATE_RUNNING)
+
+    def test_command_running_without_execution_record_is_not_running(self):
+        result = compute_dispatch_state(self.task(), self.command(status="running"), None, self.now)
+        self.assertEqual(result["state"], DISPATCH_STATE_CLAIMED)
+        self.assertNotEqual(result["state"], DISPATCH_STATE_RUNNING)
+
+    def test_execution_running_without_provider_session_id_is_not_running(self):
+        exe = self.execution(provider_session_id=None)
+        result = compute_dispatch_state(self.task(), self.command(), exe, self.now)
+        self.assertNotEqual(result["state"], DISPATCH_STATE_RUNNING)
+        self.assertEqual(result["state"], DISPATCH_STATE_CLAIMED)
+
+    # 4. Claude A / Claude B must never share a quota card.
+    def test_claude_a_and_b_quota_not_shared(self):
+        accounts = self.quota_accounts([
+            {"provider": "claude", "account_id": "claude-a", "display_name": "Claude A",
+             "source": "claude_code_statusline_rate_limits", "source_type": "official", "confidence": "official",
+             "status": "ok", "last_updated": self.now.isoformat(),
+             "windows": [{"name": "five_hour", "remaining_percent": 90.0, "resets_at": (self.now + timedelta(hours=3)).isoformat()}]},
+            {"provider": "claude", "account_id": "claude-b", "display_name": "Claude B",
+             "source": "claude_code_statusline_rate_limits", "source_type": "official", "confidence": "official",
+             "status": "ok", "last_updated": self.now.isoformat(),
+             "windows": [{"name": "five_hour", "remaining_percent": 10.0, "resets_at": (self.now + timedelta(hours=1)).isoformat()}]},
+        ])
+        quota_a = build_quota_truth(accounts, "claude", "claude-a")
+        quota_b = build_quota_truth(accounts, "claude", "claude-b")
+        self.assertEqual(quota_a["five_hour_remaining_pct"], 90.0)
+        self.assertEqual(quota_b["five_hour_remaining_pct"], 10.0)
+        self.assertNotEqual(quota_a["five_hour_remaining_pct"], quota_b["five_hour_remaining_pct"])
+
+    # 5. 5h and weekly windows displayed independently.
+    def test_five_hour_and_weekly_shown_independently(self):
+        accounts = self.quota_accounts([
+            {"provider": "claude", "account_id": "claude-b", "display_name": "Claude B",
+             "source": "claude_code_statusline_rate_limits", "source_type": "official", "confidence": "official",
+             "status": "ok", "last_updated": self.now.isoformat(),
+             "windows": [
+                 {"name": "five_hour", "remaining_percent": 40.0, "resets_at": (self.now + timedelta(hours=2)).isoformat()},
+                 {"name": "seven_day", "remaining_percent": 70.0, "resets_at": (self.now + timedelta(days=3)).isoformat()},
+             ]},
+        ])
+        quota = build_quota_truth(accounts, "claude", "claude-b")
+        self.assertEqual(quota["five_hour_remaining_pct"], 40.0)
+        self.assertEqual(quota["weekly_remaining_pct"], 70.0)
+        self.assertNotEqual(quota["five_hour_reset_at"], quota["weekly_reset_at"])
+
+    # 6. Stale telemetry displayed explicitly, not hidden.
+    def test_stale_quota_marked_explicitly(self):
+        accounts = self.quota_accounts([
+            {"provider": "claude", "account_id": "claude-b", "display_name": "Claude B",
+             "source": "claude_code_statusline_rate_limits", "source_type": "official", "confidence": "official",
+             "status": "ok", "last_updated": (self.now - timedelta(hours=5)).isoformat(),
+             "windows": [{"name": "five_hour", "remaining_percent": 50.0, "resets_at": (self.now + timedelta(hours=1)).isoformat()}]},
+        ])
+        quota = build_quota_truth(accounts, "claude", "claude-b")
+        self.assertEqual(quota["freshness"], "STALE")
+
+    # 7. Missing account quota is explicit UNKNOWN, never borrowed from another account.
+    def test_missing_account_quota_is_unknown(self):
+        accounts = self.quota_accounts([
+            {"provider": "claude", "account_id": "claude-a", "display_name": "Claude A",
+             "source": "claude_code_statusline_rate_limits", "source_type": "official", "confidence": "official",
+             "status": "ok", "last_updated": self.now.isoformat(),
+             "windows": [{"name": "five_hour", "remaining_percent": 90.0, "resets_at": (self.now + timedelta(hours=3)).isoformat()}]},
+        ])
+        quota = build_quota_truth(accounts, "claude", "claude-b")
+        self.assertFalse(quota["found"])
+        self.assertEqual(quota["freshness"], UNKNOWN_LABEL)
+        self.assertEqual(quota["formatted_five_hour_remaining"], UNKNOWN_LABEL)
+        self.assertIsNone(quota["five_hour_remaining_pct"])
+
+    # 8. Null reset_at is UNKNOWN, never a guessed timestamp.
+    def test_null_reset_at_is_unknown_not_guessed(self):
+        accounts = self.quota_accounts([
+            {"provider": "claude", "account_id": "claude-b", "display_name": "Claude B",
+             "source": "claude_code_statusline_rate_limits", "source_type": "official", "confidence": "official",
+             "status": "ok", "last_updated": self.now.isoformat(),
+             "windows": [{"name": "five_hour", "remaining_percent": 50.0, "resets_at": None}]},
+        ])
+        quota = build_quota_truth(accounts, "claude", "claude-b")
+        self.assertIsNone(quota["five_hour_reset_at"])
+        self.assertEqual(quota["formatted_five_hour_reset_at"], UNKNOWN_LABEL)
+
+    # 9. Task/provider/account correspondence: two tasks must not cross-bind.
+    def test_row_binds_task_to_its_own_provider_and_account(self):
+        accounts = self.quota_accounts([
+            {"provider": "claude", "account_id": "claude-a", "display_name": "Claude A",
+             "source": "claude_code_statusline_rate_limits", "source_type": "official", "confidence": "official",
+             "status": "ok", "last_updated": self.now.isoformat(),
+             "windows": [{"name": "five_hour", "remaining_percent": 90.0, "resets_at": (self.now + timedelta(hours=3)).isoformat()}]},
+            {"provider": "codex", "account_id": "codex-1", "display_name": "Codex",
+             "source": "codex_app_server", "source_type": "official", "confidence": "official",
+             "status": "ok", "last_updated": self.now.isoformat(),
+             "windows": [{"name": "primary", "remaining_percent": 20.0, "resets_at": (self.now + timedelta(hours=4)).isoformat()}]},
+        ])
+        row_claude = build_dispatch_truth_row(
+            self.project, self.task(task_id="t1"), self.command(task_id="t1", provider="claude", account_id="claude-a"),
+            None, accounts, self.now,
+        )
+        row_codex = build_dispatch_truth_row(
+            self.project, self.task(task_id="t2"), self.command(task_id="t2", command_id="cmd-2", provider="codex", account_id="codex-1", model="gpt", status="queued"),
+            None, accounts, self.now,
+        )
+        self.assertEqual(row_claude["provider"], "claude")
+        self.assertEqual(row_claude["account_id"], "claude-a")
+        self.assertEqual(row_claude["quota"]["five_hour_remaining_pct"], 90.0)
+        self.assertEqual(row_codex["provider"], "codex")
+        self.assertEqual(row_codex["account_id"], "codex-1")
+        self.assertEqual(row_codex["quota"]["five_hour_remaining_pct"], 20.0)
+
+    # 10. Wrong execution linkage must FAIL to prove running.
+    def test_mismatched_execution_linkage_does_not_prove_running(self):
+        wrong_execution = self.execution(task_id="other-task", project_id="p1")
+        result = compute_dispatch_state(self.task(), self.command(), wrong_execution, self.now)
+        self.assertNotEqual(result["state"], DISPATCH_STATE_RUNNING)
+        self.assertEqual(result["state"], DISPATCH_STATE_CLAIMED)
+        self.assertIn("linkage mismatch", result["reason"])
+
+    # 11. Stale session/heartbeat must not be mis-bound as running.
+    def test_stale_session_not_treated_as_running(self):
+        stale_execution = self.execution(
+            provider="codex", heartbeat_at=(self.now - timedelta(minutes=30)).isoformat(),
+            started_at=(self.now - timedelta(minutes=45)).isoformat(),
+        )
+        result = compute_dispatch_state(self.task(), self.command(provider="codex"), stale_execution, self.now)
+        self.assertNotEqual(result["state"], DISPATCH_STATE_RUNNING)
+
+    # 12. Missing Drive record degrades gracefully to UNKNOWN.
+    def test_missing_task_record_is_unknown(self):
+        result = compute_dispatch_state(None, None, None, self.now)
+        self.assertEqual(result["state"], DISPATCH_STATE_UNKNOWN)
+
+    # 13. Dashboard truth rows use the real schema fields (not renamed/invented ones).
+    def test_visible_dispatch_gate_passes_on_a_complete_real_schema_row(self):
+        accounts = self.quota_accounts([
+            {"provider": "claude", "account_id": "claude-b", "display_name": "Claude B",
+             "source": "claude_code_statusline_rate_limits", "source_type": "official", "confidence": "official",
+             "status": "ok", "last_updated": self.now.isoformat(),
+             "windows": [{"name": "five_hour", "remaining_percent": 50.0, "resets_at": (self.now + timedelta(hours=1)).isoformat()}]},
+        ])
+        row = build_dispatch_truth_row(self.project, self.task(), self.command(), self.execution(), accounts, self.now)
+        gate = compute_visible_dispatch_gate([row])
+        self.assertEqual(gate["result"], "PASS")
+        self.assertEqual(gate["reasons"], [])
+
+    def test_visible_dispatch_gate_fails_on_incomplete_row(self):
+        row = build_dispatch_truth_row(self.project, self.task(), self.command(), self.execution(), [], self.now)
+        del row["provider"]
+        gate = compute_visible_dispatch_gate([row])
+        self.assertEqual(gate["result"], "FAIL")
+        self.assertTrue(any("provider" in reason for reason in gate["reasons"]))
+
+    def test_visible_dispatch_gate_fails_on_no_rows(self):
+        gate = compute_visible_dispatch_gate([])
+        self.assertEqual(gate["result"], "FAIL")
+
+    # 14. No mock/demo fallback: empty real inputs must yield explicit UNKNOWN, never invented numbers.
+    def test_empty_inputs_never_fabricate_demo_data(self):
+        row = build_dispatch_truth_row(None, self.task(status="ready"), None, None, [], self.now)
+        self.assertEqual(row["provider"], UNKNOWN_LABEL)
+        self.assertEqual(row["account_id"], UNKNOWN_LABEL)
+        self.assertEqual(row["model"], UNKNOWN_LABEL)
+        self.assertEqual(row["mode"], UNKNOWN_LABEL)
+        self.assertEqual(row["dispatch_state"], DISPATCH_STATE_SUBMITTED)
+        self.assertEqual(row["quota"]["freshness"], UNKNOWN_LABEL)
+        self.assertFalse(row["quota"]["found"])
+
+
+class ProductionProvenanceContractTests(unittest.TestCase):
+    """Dashboard-vs-Watcher runtime identity truth (2026-08-22 hard
+    constraint): the Gate must require Dashboard reviewed SHA == Watcher
+    running_sha == tested_sha == activated_sha, all real -- any UNKNOWN or
+    mismatch must FAIL, never be hidden, and never be overridden by other
+    tests/gates passing."""
+
+    def setUp(self):
+        self.now = datetime(2026, 8, 22, 6, 0, 0, tzinfo=timezone.utc)
+
+    def test_parse_task_to_run_path_extracts_quoted_script_path(self):
+        raw = 'Task To Run:                          wscript.exe "C:\\repo\\manager\\generated\\command-watcher.vbs"'
+        self.assertEqual(parse_task_to_run_path(raw), "C:\\repo\\manager\\generated\\command-watcher.vbs")
+
+    def test_parse_task_to_run_path_handles_unquoted_path(self):
+        raw = "Task To Run:                          C:\\repo\\run.exe"
+        self.assertEqual(parse_task_to_run_path(raw), "C:\\repo\\run.exe")
+
+    def test_parse_task_to_run_path_missing_line_is_none(self):
+        self.assertIsNone(parse_task_to_run_path("TaskName: \\Foo\nStatus: Ready\n"))
+        self.assertIsNone(parse_task_to_run_path(None))
+
+    def test_all_four_shas_matching_passes(self):
+        vm = build_provenance_vm(
+            "C:\\dash", "main", "abc123",
+            "C:\\watcher", "main", "abc123", "abc123", "abc123",
+            now=self.now,
+        )
+        self.assertTrue(vm.all_match)
+        self.assertEqual(compute_provenance_gate(vm)["result"], "PASS")
+
+    def test_dashboard_and_watcher_on_different_sha_fails(self):
+        vm = build_provenance_vm(
+            "C:\\dash", "fix/dashboard-x", "aa5216f",
+            "C:\\watcher", "integration/runtime-v2", "680b107", "680b107", "680b107",
+            now=self.now,
+        )
+        self.assertFalse(vm.all_match)
+        gate = compute_provenance_gate(vm)
+        self.assertEqual(gate["result"], "FAIL")
+        self.assertIn("mismatch", gate["reasons"][0].lower())
+
+    def test_missing_tested_and_activated_sha_fails_not_silently_passes(self):
+        # No real Production Provenance Contract evidence yet: tested_sha/
+        # activated_sha are UNKNOWN. This must FAIL, never be treated as a
+        # pass just because running_sha matches the dashboard's own SHA.
+        vm = build_provenance_vm(
+            "C:\\dash", "main", "abc123",
+            "C:\\watcher", "main", "abc123", None, None,
+            now=self.now,
+        )
+        self.assertFalse(vm.all_match)
+        self.assertEqual(vm.watcher_tested_sha, UNKNOWN_LABEL)
+        self.assertEqual(vm.watcher_activated_sha, UNKNOWN_LABEL)
+        gate = compute_provenance_gate(vm)
+        self.assertEqual(gate["result"], "FAIL")
+        self.assertIn("no real evidence", gate["reasons"][0])
+
+    def test_missing_watcher_evidence_entirely_fails(self):
+        vm = build_provenance_vm("C:\\dash", "main", "abc123", None, None, None, None, None, now=self.now)
+        self.assertEqual(vm.watcher_repository_path, UNKNOWN_LABEL)
+        self.assertEqual(compute_provenance_gate(vm)["result"], "FAIL")
+
+    def test_overall_gate_requires_both_dispatch_and_provenance_pass(self):
+        passing_dispatch = {"result": "PASS", "reasons": []}
+        failing_dispatch = {"result": "FAIL", "reasons": ["task t1: missing required truth field 'provider'"]}
+        passing_provenance = {"result": "PASS", "reasons": []}
+        failing_provenance = {"result": "FAIL", "reasons": ["SHA mismatch: dashboard_reviewed_sha=aa5216f, watcher_running_sha=680b107"]}
+
+        self.assertEqual(compute_overall_visible_dispatch_gate(passing_dispatch, passing_provenance)["result"], "PASS")
+        self.assertEqual(compute_overall_visible_dispatch_gate(failing_dispatch, passing_provenance)["result"], "FAIL")
+        self.assertEqual(compute_overall_visible_dispatch_gate(passing_dispatch, failing_provenance)["result"], "FAIL")
+        overall = compute_overall_visible_dispatch_gate(failing_dispatch, failing_provenance)
+        self.assertEqual(overall["result"], "FAIL")
+        self.assertEqual(len(overall["reasons"]), 2)
+
+    def test_28_other_passing_checks_never_override_a_provenance_fail(self):
+        # Regression guard for the explicit hard constraint: passing every
+        # other row/dispatch check must not paper over a provenance FAIL.
+        many_passing_dispatch_reasons = {"result": "PASS", "reasons": []}
+        provenance_fail = compute_provenance_gate(build_provenance_vm(
+            "C:\\dash", "main", "aa5216f", "C:\\watcher", "main", "680b107", "680b107", "680b107", now=self.now,
+        ))
+        overall = compute_overall_visible_dispatch_gate(many_passing_dispatch_reasons, provenance_fail)
+        self.assertEqual(overall["result"], "FAIL")
 
 
 if __name__ == "__main__":

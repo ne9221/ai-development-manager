@@ -647,3 +647,399 @@ def build_daily_brief_vm(
         summary_counts=brief_fc.summary_counts,
         accounts=account_vms,
     )
+
+
+# =====================================================================
+# Visible Dispatch Truth Gate (Task / Provider / Account / Quota truth)
+# =====================================================================
+#
+# This section builds a single, honest, per-task row combining Task +
+# Command + Execution + per-account Quota truth for the Dashboard's main
+# view. It never fabricates a value: anything not provable from a real
+# SSOT record is surfaced as the literal string "UNKNOWN" (or "STALE" for
+# quota freshness), never inferred or borrowed from another record.
+
+UNKNOWN_LABEL = "UNKNOWN"
+
+DISPATCH_STATE_SUBMITTED = "SUBMITTED"
+DISPATCH_STATE_ACCEPTED = "ACCEPTED"
+DISPATCH_STATE_QUEUED = "QUEUED"
+DISPATCH_STATE_CLAIMED = "CLAIMED"
+DISPATCH_STATE_RUNNING = "RUNNING"
+DISPATCH_STATE_COMPLETED = "COMPLETED"
+DISPATCH_STATE_FAILED = "FAILED"
+DISPATCH_STATE_BLOCKED = "BLOCKED"
+DISPATCH_STATE_CANCELLED = "CANCELLED"
+DISPATCH_STATE_UNKNOWN = "UNKNOWN"
+
+# Maps manager.dashboard_core.determine_execution_state()'s execution-level
+# vocabulary onto the Dispatch Truth state a *terminal* execution proves,
+# for the (unusual) case where an execution has already reached a terminal
+# outcome while its parent command record still says "running". Only
+# reached from compute_dispatch_state() below; "interrupted" is truthfully
+# a failure outcome from the dispatch-visibility standpoint, not its own
+# 10th state the task spec did not ask for.
+_TERMINAL_EXECUTION_STATE_TO_DISPATCH_STATE = {
+    "completed": DISPATCH_STATE_COMPLETED,
+    "failed": DISPATCH_STATE_FAILED,
+    "interrupted": DISPATCH_STATE_FAILED,
+    "cancelled": DISPATCH_STATE_CANCELLED,
+}
+
+
+def compute_dispatch_state(
+    task: Optional[Dict[str, Any]],
+    command: Optional[Dict[str, Any]],
+    execution: Optional[Dict[str, Any]],
+    now: datetime,
+    has_dispatch_request: bool = False,
+) -> Dict[str, str]:
+    """Truthfully classify one task's dispatch state.
+
+    Never reports SUBMITTED/ACCEPTED/QUEUED/CLAIMED as RUNNING: RUNNING is
+    only reached when the *command* says running AND
+    determine_execution_state() independently proves the execution is
+    running (status == "running" with provider session evidence) --
+    reusing that existing, already-tested distinction rather than
+    duplicating it. `has_dispatch_request` is real evidence (a
+    dispatch-requests/*.json idempotency record) that ingress accepted the
+    request before a Task/Command was observed; without it, ACCEPTED is
+    never guessed as a phase distinct from SUBMITTED, because the current
+    schema has no independent signal for it.
+    """
+    if not isinstance(task, dict):
+        return {"state": DISPATCH_STATE_UNKNOWN, "reason": "no task record found"}
+
+    task_status = task.get("status")
+    if task_status == "blocked":
+        return {"state": DISPATCH_STATE_BLOCKED, "reason": task.get("blocked_reason") or "task marked blocked"}
+
+    if not isinstance(command, dict):
+        if task_status == "completed":
+            return {"state": DISPATCH_STATE_COMPLETED, "reason": "task completed with no command record"}
+        if task_status == "cancelled":
+            return {"state": DISPATCH_STATE_CANCELLED, "reason": "task cancelled with no command record"}
+        if has_dispatch_request:
+            return {"state": DISPATCH_STATE_ACCEPTED, "reason": "dispatch request accepted; no command observed yet"}
+        return {"state": DISPATCH_STATE_SUBMITTED, "reason": "task created, not yet dispatched to a command"}
+
+    cmd_status = command.get("status")
+    if cmd_status == "queued":
+        return {"state": DISPATCH_STATE_QUEUED, "reason": "command queued, not yet claimed"}
+    if cmd_status == "claimed":
+        return {"state": DISPATCH_STATE_CLAIMED, "reason": "command claimed, launch not yet proven running"}
+    if cmd_status == "attention":
+        return {"state": DISPATCH_STATE_BLOCKED, "reason": command.get("recovery_reason") or "command requires attention"}
+    if cmd_status == "completed":
+        return {"state": DISPATCH_STATE_COMPLETED, "reason": "command completed"}
+    if cmd_status == "failed":
+        return {"state": DISPATCH_STATE_FAILED, "reason": "command failed"}
+    if cmd_status == "running":
+        if not isinstance(execution, dict):
+            return {"state": DISPATCH_STATE_CLAIMED, "reason": "command reports running but no execution record found (not proven running)"}
+        if execution.get("task_id") != task.get("task_id") or execution.get("project_id") != task.get("project_id"):
+            return {"state": DISPATCH_STATE_CLAIMED, "reason": "execution record does not match this task's (project_id, task_id) -- linkage mismatch, not proven running"}
+        exec_state = determine_execution_state(execution, now)
+        if exec_state == "running":
+            evidence = execution.get("provider_session_id") or "provider session evidence present"
+            return {"state": DISPATCH_STATE_RUNNING, "reason": f"execution running with provider session evidence ({evidence})"}
+        if exec_state in ("correlating", "waiting", "finishing"):
+            return {"state": DISPATCH_STATE_CLAIMED, "reason": f"command running but execution state={exec_state} (provider session evidence not yet proven)"}
+        mapped = _TERMINAL_EXECUTION_STATE_TO_DISPATCH_STATE.get(exec_state)
+        if mapped:
+            return {"state": mapped, "reason": f"execution reached terminal state '{exec_state}'"}
+        return {"state": DISPATCH_STATE_UNKNOWN, "reason": f"command running but execution state unrecognized ({exec_state!r})"}
+    return {"state": DISPATCH_STATE_UNKNOWN, "reason": f"unrecognized command status: {cmd_status!r}"}
+
+
+def build_provider_truth(command: Optional[Dict[str, Any]], execution: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """provider/account_id/model/mode from the most authoritative record
+    available (command, then execution); any missing/blank field is the
+    literal "UNKNOWN" string, never a guess or another record's value."""
+    source = command if isinstance(command, dict) else (execution if isinstance(execution, dict) else {})
+
+    def _val(key: str) -> str:
+        value = source.get(key)
+        return value if isinstance(value, str) and value.strip() else UNKNOWN_LABEL
+
+    return {
+        "provider": _val("provider"),
+        "account_id": _val("account_id"),
+        "model": _val("model"),
+        "mode": _val("mode"),
+    }
+
+
+def find_account_quota_vm(
+    account_vms: Sequence[AccountQuotaCardViewModel], provider: Optional[str], account_id: Optional[str]
+) -> Optional[AccountQuotaCardViewModel]:
+    """Exact (provider, account_id) match only -- never falls back to a
+    provider-level representative, so Claude A and Claude B never share a
+    quota card by accident."""
+    for vm in account_vms:
+        if vm.provider == provider and vm.account_id == account_id:
+            return vm
+    return None
+
+
+def build_quota_truth(
+    account_vms: Sequence[AccountQuotaCardViewModel], provider: str, account_id: str
+) -> Dict[str, Any]:
+    """5h + weekly used/remaining/reset_at, captured_at, and freshness for
+    one exact (provider, account_id). No captured entry -> every field is
+    explicitly "UNKNOWN", never borrowed from another account or provider."""
+    unknown_row = {
+        "found": False,
+        "five_hour_used_pct": None, "five_hour_remaining_pct": None, "five_hour_reset_at": None,
+        "weekly_used_pct": None, "weekly_remaining_pct": None, "weekly_reset_at": None,
+        "captured_at": None, "freshness": UNKNOWN_LABEL,
+        "formatted_five_hour_used": UNKNOWN_LABEL, "formatted_five_hour_remaining": UNKNOWN_LABEL,
+        "formatted_five_hour_reset_at": UNKNOWN_LABEL,
+        "formatted_weekly_used": UNKNOWN_LABEL, "formatted_weekly_remaining": UNKNOWN_LABEL,
+        "formatted_weekly_reset_at": UNKNOWN_LABEL,
+        "formatted_captured_at": UNKNOWN_LABEL,
+    }
+    if provider == UNKNOWN_LABEL or account_id == UNKNOWN_LABEL:
+        return unknown_row
+
+    vm = find_account_quota_vm(account_vms, provider, account_id)
+    if vm is None:
+        return unknown_row
+
+    freshness = "STALE" if vm.stale else "fresh"
+    return {
+        "found": True,
+        "five_hour_used_pct": vm.five_hour_used_pct,
+        "five_hour_remaining_pct": vm.five_hour_remaining_pct,
+        "five_hour_reset_at": vm.five_hour_resets_at,
+        "weekly_used_pct": vm.weekly_used_pct if vm.has_weekly_window else None,
+        "weekly_remaining_pct": vm.weekly_remaining_pct if vm.has_weekly_window else None,
+        "weekly_reset_at": vm.weekly_resets_at if vm.has_weekly_window else None,
+        "captured_at": vm.last_updated,
+        "freshness": freshness,
+        "formatted_five_hour_used": format_percent(vm.five_hour_used_pct),
+        "formatted_five_hour_remaining": vm.formatted_five_hour_remaining,
+        "formatted_five_hour_reset_at": vm.five_hour_resets_at or UNKNOWN_LABEL,
+        "formatted_weekly_used": format_percent(vm.weekly_used_pct) if vm.has_weekly_window else UNKNOWN_LABEL,
+        "formatted_weekly_remaining": vm.formatted_weekly_remaining if vm.has_weekly_window else UNKNOWN_LABEL,
+        "formatted_weekly_reset_at": (vm.weekly_resets_at or UNKNOWN_LABEL) if vm.has_weekly_window else UNKNOWN_LABEL,
+        "formatted_captured_at": vm.last_updated or UNKNOWN_LABEL,
+    }
+
+
+def build_dispatch_truth_row(
+    project: Optional[Dict[str, Any]],
+    task: Dict[str, Any],
+    command: Optional[Dict[str, Any]],
+    execution: Optional[Dict[str, Any]],
+    account_vms: Sequence[AccountQuotaCardViewModel],
+    now: datetime,
+    has_dispatch_request: bool = False,
+) -> Dict[str, Any]:
+    """One user-visible truth row: Project/Task/Provider/Account/Model/Mode/
+    Dispatch State/Execution/Session, plus that account's Quota truth."""
+    dispatch = compute_dispatch_state(task, command, execution, now, has_dispatch_request=has_dispatch_request)
+    provider_truth = build_provider_truth(command, execution)
+    quota = build_quota_truth(account_vms, provider_truth["provider"], provider_truth["account_id"])
+
+    execution_id = execution.get("execution_id") if isinstance(execution, dict) else None
+    session_id = None
+    if isinstance(execution, dict):
+        session_id = execution.get("provider_session_id") or execution.get("session_id") or execution.get("conversation_id")
+
+    project_id = task.get("project_id") or UNKNOWN_LABEL
+    project_name = (project.get("name") if isinstance(project, dict) else None) or project_id
+
+    return {
+        "project_id": project_id,
+        "project_name": project_name,
+        "task_id": task.get("task_id") or UNKNOWN_LABEL,
+        "task_title": task.get("title") or UNKNOWN_LABEL,
+        "provider": provider_truth["provider"],
+        "account_id": provider_truth["account_id"],
+        "model": provider_truth["model"],
+        "mode": provider_truth["mode"],
+        "dispatch_state": dispatch["state"],
+        "dispatch_reason": dispatch["reason"],
+        "execution_id": execution_id or UNKNOWN_LABEL,
+        "session_id": session_id or UNKNOWN_LABEL,
+        "quota": quota,
+    }
+
+
+# Every key a Dispatch Truth row must carry for the Visible Dispatch Gate to
+# PASS. "quota" itself is always present (build_quota_truth() never omits
+# it, even as the all-UNKNOWN row) -- the gate additionally checks that its
+# "freshness" sub-field is populated, since freshness must be visible even
+# when quota is otherwise unknown.
+_REQUIRED_DISPATCH_TRUTH_FIELDS = (
+    "project_id", "task_id", "provider", "account_id", "model", "mode",
+    "dispatch_state", "execution_id", "session_id", "quota",
+)
+
+
+def compute_visible_dispatch_gate(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """PASS/FAIL for the Visible Dispatch Gate banner.
+
+    A row carrying the literal "UNKNOWN"/"STALE" marker for a field is a
+    truthful PASS for that field -- the gate only FAILs when a required
+    field is outright missing from the row (a read/build failure), or when
+    there are no rows to show at all.
+    """
+    if not rows:
+        return {"result": "FAIL", "reasons": ["no dispatch-visible task rows available"]}
+
+    reasons: List[str] = []
+    for row in rows:
+        label = row.get("task_id", "unknown task")
+        for key in _REQUIRED_DISPATCH_TRUTH_FIELDS:
+            if key not in row or row[key] in (None, ""):
+                reasons.append(f"{label}: missing required truth field '{key}'")
+        quota = row.get("quota")
+        if not isinstance(quota, dict) or "freshness" not in quota or quota["freshness"] in (None, ""):
+            reasons.append(f"{label}: quota freshness not visible")
+
+    if reasons:
+        return {"result": "FAIL", "reasons": reasons}
+    return {"result": "PASS", "reasons": []}
+
+
+# =====================================================================
+# Production Provenance (Dashboard self-identity vs. Watcher runtime)
+# =====================================================================
+#
+# INTERIM, HONEST evidence source: as of this slice, no real Production
+# Provenance Contract exists yet anywhere in this repo (verified against
+# origin: no such branch/file, confirmed with the session -- "A2" --
+# reportedly building it). Until that lands, watcher_tested_sha and
+# watcher_activated_sha have no real evidence to report and MUST stay
+# UNKNOWN rather than being guessed, copied from running_sha, or borrowed
+# from a test fixture -- an UNKNOWN there correctly fails the gate below,
+# which is the honest outcome, not a bug. repository_path/branch/
+# running_sha ARE real: they come from actual `git` introspection of the
+# actual on-disk checkouts (see dashboard.py's query_git_head_raw() /
+# discover_repository_root_from_script_path(), which read the real
+# Scheduled Task configuration and the real git HEAD -- never mocked).
+# When the real Provenance Contract exists, only dashboard.py's I/O layer
+# needs to change to source watcher_tested_sha/watcher_activated_sha from
+# it; build_provenance_vm() below already accepts them as plain parameters.
+
+
+def parse_task_to_run_path(verbose_schtasks_output: Optional[str]) -> Optional[str]:
+    """Extract the launcher script path from `schtasks /FO LIST /V` output's
+    "Task To Run:" line (may be quoted and may carry a leading executable
+    like wscript.exe, or trailing arguments)."""
+    if not verbose_schtasks_output:
+        return None
+    for line in verbose_schtasks_output.splitlines():
+        line = line.strip()
+        if not line.lower().startswith("task to run:"):
+            continue
+        raw = line.split(":", 1)[1].strip()
+        if not raw:
+            return None
+        quote_start = raw.find('"')
+        if quote_start != -1:
+            quote_end = raw.find('"', quote_start + 1)
+            if quote_end != -1:
+                return raw[quote_start + 1:quote_end]
+        return raw.split(" ")[0]
+    return None
+
+
+@dataclass
+class ProvenanceViewModel:
+    """User-visible Dashboard-vs-Watcher runtime identity truth."""
+    dashboard_repository_path: str
+    dashboard_branch: str
+    dashboard_reviewed_sha: str
+    watcher_repository_path: str
+    watcher_branch: str
+    watcher_running_sha: str
+    watcher_tested_sha: str
+    watcher_activated_sha: str
+    captured_at: str
+    all_match: bool
+    match_detail: str
+    evidence_source: str
+
+
+def build_provenance_vm(
+    dashboard_repository_path: Optional[str],
+    dashboard_branch: Optional[str],
+    dashboard_sha: Optional[str],
+    watcher_repository_path: Optional[str],
+    watcher_branch: Optional[str],
+    watcher_running_sha: Optional[str],
+    watcher_tested_sha: Optional[str] = None,
+    watcher_activated_sha: Optional[str] = None,
+    now: Optional[datetime] = None,
+    evidence_source: str = "git introspection (interim; Production Provenance Contract pending)",
+) -> ProvenanceViewModel:
+    """Pure builder: every missing/blank input becomes the literal
+    "UNKNOWN" string. The gate requires all four SHAs (Dashboard's own
+    reviewed release SHA, and the Watcher's running/tested/activated SHAs)
+    to be known AND identical -- any UNKNOWN or any mismatch is reported
+    truthfully, never hidden and never silently passed."""
+    now = now or datetime.now(timezone.utc)
+
+    def _s(value: Optional[str]) -> str:
+        return value if isinstance(value, str) and value.strip() else UNKNOWN_LABEL
+
+    d_path, d_branch, d_sha = _s(dashboard_repository_path), _s(dashboard_branch), _s(dashboard_sha)
+    w_path, w_branch = _s(watcher_repository_path), _s(watcher_branch)
+    w_running, w_tested, w_activated = _s(watcher_running_sha), _s(watcher_tested_sha), _s(watcher_activated_sha)
+
+    shas = {
+        "dashboard_reviewed_sha": d_sha,
+        "watcher_running_sha": w_running,
+        "watcher_tested_sha": w_tested,
+        "watcher_activated_sha": w_activated,
+    }
+    known = {k: v for k, v in shas.items() if v != UNKNOWN_LABEL}
+    all_known = len(known) == len(shas)
+    all_match = all_known and len(set(shas.values())) == 1
+
+    if not all_known:
+        missing = ", ".join(k for k, v in shas.items() if v == UNKNOWN_LABEL)
+        detail = f"cannot verify: no real evidence for {missing}"
+    elif all_match:
+        detail = f"all four SHAs match ({d_sha})"
+    else:
+        detail = "SHA mismatch: " + ", ".join(f"{k}={v}" for k, v in shas.items())
+
+    return ProvenanceViewModel(
+        dashboard_repository_path=d_path,
+        dashboard_branch=d_branch,
+        dashboard_reviewed_sha=d_sha,
+        watcher_repository_path=w_path,
+        watcher_branch=w_branch,
+        watcher_running_sha=w_running,
+        watcher_tested_sha=w_tested,
+        watcher_activated_sha=w_activated,
+        captured_at=now.isoformat(),
+        all_match=all_match,
+        match_detail=detail,
+        evidence_source=evidence_source,
+    )
+
+
+def compute_provenance_gate(vm: ProvenanceViewModel) -> Dict[str, Any]:
+    """PASS only when Dashboard reviewed SHA == Watcher running_sha ==
+    tested_sha == activated_sha, all real (non-UNKNOWN). This never falls
+    back to a mock/test fixture and is never overridden by any other gate
+    or test suite passing."""
+    if vm.all_match:
+        return {"result": "PASS", "reasons": []}
+    return {"result": "FAIL", "reasons": [vm.match_detail]}
+
+
+def compute_overall_visible_dispatch_gate(
+    dispatch_gate: Dict[str, Any], provenance_gate: Dict[str, Any]
+) -> Dict[str, Any]:
+    """The Dashboard's single top-level PASS/FAIL banner: requires both the
+    per-task dispatch-truth gate AND the Dashboard/Watcher provenance gate
+    to pass. Either one failing fails the whole banner."""
+    if dispatch_gate["result"] == "PASS" and provenance_gate["result"] == "PASS":
+        return {"result": "PASS", "reasons": []}
+    return {"result": "FAIL", "reasons": [*dispatch_gate["reasons"], *provenance_gate["reasons"]]}

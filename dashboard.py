@@ -6,6 +6,7 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
+from pathlib import Path
 import pandas as pd
 
 from collectors.publish_drive import build_service
@@ -23,6 +24,14 @@ from manager.dashboard_core import (
     AccountQuotaCardViewModel,
     parse_scheduled_task_health,
     build_session_center_health,
+    UNKNOWN_LABEL,
+    DISPATCH_STATE_RUNNING,
+    build_dispatch_truth_row,
+    compute_visible_dispatch_gate,
+    parse_task_to_run_path,
+    build_provenance_vm,
+    compute_provenance_gate,
+    compute_overall_visible_dispatch_gate,
 )
 
 WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
@@ -64,6 +73,63 @@ def query_session_center_raw():
         except Exception:
             session = None
     return listening, session
+
+
+def query_scheduled_task_verbose_raw(task_name):
+    """Like query_scheduled_task_raw, but /V so "Task To Run:" (the real
+    launcher script path) is included -- needed to discover which on-disk
+    checkout the production Watcher is actually running from."""
+    try:
+        result = subprocess.run(
+            ["schtasks", "/Query", "/TN", task_name, "/FO", "LIST", "/V"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout
+    except Exception:
+        return None
+
+
+def discover_repository_root_from_script_path(script_path):
+    """Walk up from a launcher script's path to the nearest git repo root
+    (a directory containing .git) -- deliberately doesn't hardcode the
+    wrapper's internal layout (e.g. manager/generated/*.vbs), so it stays
+    correct if that layout ever changes."""
+    if not script_path:
+        return None
+    try:
+        current = Path(script_path).resolve().parent
+        for _ in range(10):
+            if (current / ".git").exists():
+                return str(current)
+            if current.parent == current:
+                break
+            current = current.parent
+    except Exception:
+        pass
+    return None
+
+
+def query_git_head_raw(repository_path):
+    """(branch, sha) via real `git` introspection of an on-disk checkout;
+    (None, None) on any failure -- never a guessed or cached value."""
+    if not repository_path:
+        return None, None
+    try:
+        branch_res = subprocess.run(
+            ["git", "-C", repository_path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        sha_res = subprocess.run(
+            ["git", "-C", repository_path, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        branch = branch_res.stdout.strip() if branch_res.returncode == 0 else None
+        sha = sha_res.stdout.strip() if sha_res.returncode == 0 else None
+        return branch or None, sha or None
+    except Exception:
+        return None, None
 
 
 @st.cache_data(ttl=15)
@@ -415,6 +481,110 @@ if visibility_rows:
 else:
     st.info("No recent HOME Task / Command / Execution records found.")
 st.caption(f"Showing the {RECENT_RECORD_LIMIT} most recently modified records per lifecycle type for `{DASHBOARD_PROJECT_ID}`. Drive load: {load_duration_seconds}s. Use Sync with Google Drive for an immediate refresh.")
+
+# =====================================================================
+# Visible Dispatch Truth Gate: stricter, task-provider-account-quota-bound
+# truth than the table above. Never displays a pre-authority dispatch
+# state (SUBMITTED/ACCEPTED/QUEUED/CLAIMED) as RUNNING -- RUNNING requires
+# both Command.status == "running" AND determine_execution_state() to
+# independently prove provider session evidence. Any field the SSOT does
+# not prove is the literal "UNKNOWN"/"STALE", never guessed. See
+# manager/dashboard_core.py's compute_dispatch_state()/build_quota_truth()
+# for the full contract.
+# =====================================================================
+st.header("🔎 Visible Dispatch Truth Gate")
+
+_dispatch_commands_by_task = {}
+for _cmd in all_commands:
+    _key = (_cmd.get("project_id"), _cmd.get("task_id"))
+    _existing = _dispatch_commands_by_task.get(_key)
+    if _existing is None or (_cmd.get("created_at") or "") >= (_existing.get("created_at") or ""):
+        _dispatch_commands_by_task[_key] = _cmd
+
+_dispatch_executions_by_id = {e.get("execution_id"): e for e in all_executions if e.get("execution_id")}
+_dispatch_projects_by_id = {p.get("project_id"): p for p in projects if p.get("project_id")}
+
+_dispatch_rows = []
+for _task in all_tasks:
+    if _task.get("status") == "cancelled":
+        continue
+    _key = (_task.get("project_id"), _task.get("task_id"))
+    _command = _dispatch_commands_by_task.get(_key)
+    _execution = _dispatch_executions_by_id.get(_command.get("execution_id")) if _command else None
+    _project = _dispatch_projects_by_id.get(_task.get("project_id"))
+    _dispatch_rows.append(build_dispatch_truth_row(_project, _task, _command, _execution, daily_brief_vm.accounts, now))
+
+dispatch_gate = compute_visible_dispatch_gate(_dispatch_rows)
+
+# Production Provenance: this Dashboard's own identity vs. the real running
+# Command Watcher's identity. Real git/schtasks introspection only -- no
+# cached/mock/demo values. See build_provenance_vm()'s docstring for why
+# tested_sha/activated_sha are currently UNKNOWN (no Production Provenance
+# Contract evidence exists anywhere in this repo yet).
+_dashboard_repo_path = str(Path(__file__).resolve().parent)
+_dashboard_branch, _dashboard_sha = query_git_head_raw(_dashboard_repo_path)
+
+_watcher_task_raw = query_scheduled_task_verbose_raw(WATCHER_TASK_NAME)
+_watcher_script_path = parse_task_to_run_path(_watcher_task_raw)
+_watcher_repo_path = discover_repository_root_from_script_path(_watcher_script_path)
+_watcher_branch, _watcher_running_sha = query_git_head_raw(_watcher_repo_path)
+
+provenance_vm = build_provenance_vm(
+    _dashboard_repo_path, _dashboard_branch, _dashboard_sha,
+    _watcher_repo_path, _watcher_branch, _watcher_running_sha,
+    watcher_tested_sha=None, watcher_activated_sha=None, now=now,
+)
+provenance_gate = compute_provenance_gate(provenance_vm)
+overall_gate = compute_overall_visible_dispatch_gate(dispatch_gate, provenance_gate)
+
+if overall_gate["result"] == "PASS":
+    st.success("VISIBLE DISPATCH GATE: PASS")
+else:
+    st.error("VISIBLE DISPATCH GATE: FAIL")
+    with st.expander(f"Reasons ({len(overall_gate['reasons'])})", expanded=True):
+        for _reason in overall_gate["reasons"]:
+            st.write(f"- {_reason}")
+
+with st.expander("🧬 Production Provenance (Dashboard vs. Watcher runtime identity)", expanded=(provenance_gate["result"] == "FAIL")):
+    _col1, _col2 = st.columns(2)
+    with _col1:
+        st.markdown("**Dashboard (this page)**")
+        st.write(f"repository_path=`{provenance_vm.dashboard_repository_path}`")
+        st.write(f"branch=`{provenance_vm.dashboard_branch}`")
+        st.write(f"reviewed_sha=`{provenance_vm.dashboard_reviewed_sha}`")
+    with _col2:
+        st.markdown(f"**Watcher ({WATCHER_TASK_NAME})**")
+        st.write(f"repository_path=`{provenance_vm.watcher_repository_path}`")
+        st.write(f"branch=`{provenance_vm.watcher_branch}`")
+        st.write(f"running_sha=`{provenance_vm.watcher_running_sha}`")
+        st.write(f"tested_sha=`{provenance_vm.watcher_tested_sha}`")
+        st.write(f"activated_sha=`{provenance_vm.watcher_activated_sha}`")
+    st.caption(f"captured_at: {provenance_vm.captured_at} · evidence_source: {provenance_vm.evidence_source}")
+    if provenance_gate["result"] == "PASS":
+        st.success(provenance_vm.match_detail)
+    else:
+        st.error(provenance_vm.match_detail)
+
+if not _dispatch_rows:
+    st.info("No tasks to show.")
+else:
+    for _row in _dispatch_rows:
+        _state = _row["dispatch_state"]
+        _badge = "🟢" if _state == DISPATCH_STATE_RUNNING else ("🔴" if _state in ("FAILED", "BLOCKED") else "⚪")
+        with st.container():
+            st.markdown(f"""<div class="glass-card">
+                <b>{_badge} {_row['project_name']} → {_row['task_title']}</b><br>
+                <b>Dispatch State:</b> <code>{_state}</code> — {_row['dispatch_reason']}<br>
+                <b>AI / Account:</b> {_row['provider']} / {_row['account_id']} · <b>Model/Mode:</b> {_row['model']} / {_row['mode']}<br>
+                <b>5h remaining:</b> {_row['quota']['formatted_five_hour_remaining']} (resets {_row['quota']['formatted_five_hour_reset_at']})
+                · <b>Weekly remaining:</b> {_row['quota']['formatted_weekly_remaining']} (resets {_row['quota']['formatted_weekly_reset_at']})<br>
+                <b>Quota captured_at:</b> {_row['quota']['formatted_captured_at']} · <b>Freshness:</b> {_row['quota']['freshness']}
+                </div>""", unsafe_allow_html=True)
+            with st.expander("Technical IDs"):
+                st.write(f"project_id=`{_row['project_id']}` · task_id=`{_row['task_id']}`")
+                st.write(f"execution_id=`{_row['execution_id']}` · session_id=`{_row['session_id']}`")
+
+st.markdown("---")
 
 # Active Executions mappings
 active_executions = [e for e in all_executions if e.get("status") not in {"completed", "failed", "interrupted", "cancelled"}]
