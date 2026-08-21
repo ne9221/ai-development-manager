@@ -15,7 +15,7 @@ try {
     Confirm-AdmTaskEnabled -TaskName $AdmSupervisorTask
     Confirm-AdmTaskEnabled -TaskName $AdmWatcherTask
 } catch {
-    Show-AdmError "ADM could not start: $($_.Exception.Message)`n`nCheck that the ADM Scheduled Tasks were installed on this machine."
+    Show-AdmError "ADM 無法啟動：$($_.Exception.Message)`n`n請確認此電腦已安裝 ADM 排程工作（Scheduled Tasks）。"
     exit 1
 }
 
@@ -37,7 +37,7 @@ $watcherStatus = Get-AdmTaskStatus -TaskName $AdmWatcherTask
 $sessionCenter = Get-AdmSessionCenterHealth
 
 if (-not $supervisorStatus.Exists -or -not $watcherStatus.Exists) {
-    Show-AdmError "ADM started with a problem: one or more required Scheduled Tasks are missing.`n`nSupervisor found: $($supervisorStatus.Exists)`nWatcher found: $($watcherStatus.Exists)"
+    Show-AdmError "ADM 啟動時發生問題：缺少一個或多個必要的排程工作。`n`nSupervisor 是否存在：$($supervisorStatus.Exists)`nWatcher 是否存在：$($watcherStatus.Exists)"
 }
 
 $html = New-AdmStatusHtml -SupervisorStatus $supervisorStatus -WatcherStatus $watcherStatus -SessionCenter $sessionCenter
@@ -45,7 +45,10 @@ $statusPath = Join-Path $env:TEMP "adm-status.html"
 $html | Out-File -FilePath $statusPath -Encoding utf8
 
 if ($sessionCenter.Listening) {
-    Start-Process "$AdmSessionCenterUrl/"
+    $result = Open-AdmAppWindow -Url "$AdmSessionCenterUrl/"
 } else {
-    Start-Process $statusPath
+    $result = Open-AdmAppWindow -Url $statusPath
+}
+if (-not $result.Success) {
+    Show-AdmError "無法開啟 ADM 視窗：$($result.Detail)"
 }

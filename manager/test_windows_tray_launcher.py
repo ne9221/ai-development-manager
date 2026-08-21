@@ -112,6 +112,68 @@ $mutex.Close()
             holder.terminate()
             holder.wait()
 
+    def test_start_dashboard_streamlit_headless_true(self):
+        # Streamlit must never pop its own browser tab -- the tray/app-window
+        # layer (Open-AdmAppWindow) is the only allowed product entry point.
+        content = (DESKTOP_DIR / "Start-Dashboard.ps1").read_text(encoding="utf-8", errors="ignore")
+        self.assertIn("--server.headless true", content)
+        self.assertNotIn("--server.headless false", content)
+
+    def test_tray_menu_localized_traditional_chinese(self):
+        content = (DESKTOP_DIR / "AdmTrayLauncher.ps1").read_text(encoding="utf-8", errors="ignore")
+        for label in ["開啟 ADM", "系統狀態", "啟動服務", "重新啟動服務", "結束 ADM"]:
+            self.assertIn(label, content, f"Expected tray menu label {label!r} in AdmTrayLauncher.ps1")
+
+    def test_no_raw_start_process_on_adm_urls_in_product_entry_scripts(self):
+        # Normal path must route dashboard/session-center opens through
+        # Open-AdmAppWindow (Edge app-window host), never a raw Start-Process
+        # on the http:// URL -- that would show the user a browser address
+        # bar / raw localhost URL.
+        for filename in ["AdmTrayLauncher.ps1", "Start-ADM.ps1"]:
+            content = (DESKTOP_DIR / filename).read_text(encoding="utf-8", errors="ignore")
+            self.assertNotIn('Start-Process "$AdmDashboardUrl', content, filename)
+            self.assertNotIn('Start-Process "$AdmSessionCenterUrl', content, filename)
+
+    def test_open_adm_app_window_and_find_edge_path_are_defined(self):
+        script = f'''
+$ErrorActionPreference = "Stop"
+. "{DESKTOP_DIR / 'AdmCommon.ps1'}"
+$cmd1 = Get-Command Open-AdmAppWindow -ErrorAction SilentlyContinue
+$cmd2 = Get-Command Find-AdmEdgePath -ErrorAction SilentlyContinue
+[PSCustomObject]@{{ HasOpenWindow = [bool]$cmd1; HasFindEdge = [bool]$cmd2 }} | ConvertTo-Json -Compress
+'''
+        cmd = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        self.assertEqual(0, res.returncode, f"PowerShell failed: {res.stderr}")
+        import json
+        data = json.loads(res.stdout.strip())
+        self.assertTrue(data["HasOpenWindow"])
+        self.assertTrue(data["HasFindEdge"])
+
+    def test_open_adm_app_window_truthful_fallback_when_edge_missing(self):
+        # Simulate Edge not being installed: Open-AdmAppWindow must degrade
+        # truthfully (BrowserFallback) rather than silently no-op or claim
+        # an app window opened when it didn't.
+        tmp_html = Path(tempfile.gettempdir()) / "adm-test-fallback-status.html"
+        tmp_html.write_text("<html><body>adm test</body></html>", encoding="utf-8")
+        try:
+            script = f'''
+$ErrorActionPreference = "Stop"
+. "{DESKTOP_DIR / 'AdmCommon.ps1'}"
+function Find-AdmEdgePath {{ return $null }}
+$result = Open-AdmAppWindow -Url "{tmp_html}"
+$result | ConvertTo-Json -Compress
+'''
+            cmd = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            self.assertEqual(0, res.returncode, f"PowerShell failed: {res.stderr}")
+            import json
+            data = json.loads(res.stdout.strip())
+            self.assertEqual("BrowserFallback", data["Mode"])
+            self.assertTrue(data["Success"])
+        finally:
+            tmp_html.unlink(missing_ok=True)
+
     def test_install_and_uninstall_shortcuts(self):
         # Run installer
         install_script = DESKTOP_DIR / "Install-AdmStartup.ps1"

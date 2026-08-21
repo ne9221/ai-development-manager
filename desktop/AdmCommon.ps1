@@ -218,6 +218,75 @@ $scRow
 "@
 }
 
+function Find-AdmEdgePath {
+    # Looks in the normal per-machine/per-user install locations first, then
+    # PATH, then the registry App Paths fallback that Edge's installer
+    # always registers regardless of install location.
+    $candidates = @()
+    if ($env:ProgramFiles) { $candidates += (Join-Path $env:ProgramFiles "Microsoft\Edge\Application\msedge.exe") }
+    $pf86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    if ($pf86) { $candidates += (Join-Path $pf86 "Microsoft\Edge\Application\msedge.exe") }
+    if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA "Microsoft\Edge\Application\msedge.exe") }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+
+    $cmd = Get-Command "msedge.exe" -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    try {
+        $key = Get-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe" -ErrorAction Stop
+        $regValue = $key.GetValue("")
+        if ($regValue -and (Test-Path -LiteralPath $regValue)) { return $regValue }
+    } catch {
+        # No registered App Paths entry -- Edge is genuinely not installed.
+    }
+
+    return $null
+}
+
+function Open-AdmAppWindow {
+    # Single product-entry function for "open ADM as a Windows app window":
+    # Edge --app=<url> gives a chromeless window (no address bar, no tabs)
+    # so the user never sees or types a localhost URL. Callers must route
+    # every dashboard/session-center open through this instead of a raw
+    # Start-Process on an http:// URL.
+    param(
+        [Parameter(Mandatory = $true)][string]$Url
+    )
+
+    $targetUrl = $Url
+    if ($Url -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*://') {
+        # Local file path (e.g. the diagnostic status page) -- normalize to
+        # a file:// URI so --app treats it the same as an http(s) URL.
+        try {
+            $targetUrl = ([uri]$Url).AbsoluteUri
+        } catch {
+            $targetUrl = $Url
+        }
+    }
+
+    $edgePath = Find-AdmEdgePath
+    if ($edgePath) {
+        try {
+            Start-Process -FilePath $edgePath -ArgumentList @("--app=$targetUrl") -ErrorAction Stop | Out-Null
+            return [PSCustomObject]@{ Mode = "EdgeApp"; Success = $true; Detail = $edgePath }
+        } catch {
+            # Fall through to the truthful degraded fallback below.
+        }
+    }
+
+    # Truthful degradation: Edge app-window mode is unavailable, so fall
+    # back to the OS default browser rather than silently doing nothing or
+    # claiming an app window opened when it didn't.
+    try {
+        Start-Process -FilePath $targetUrl -ErrorAction Stop | Out-Null
+        return [PSCustomObject]@{ Mode = "BrowserFallback"; Success = $true; Detail = "msedge.exe not found or failed to launch; opened in the default browser instead" }
+    } catch {
+        return [PSCustomObject]@{ Mode = "Failed"; Success = $false; Detail = $_.Exception.Message }
+    }
+}
+
 function Show-AdmError {
     param([string]$Message)
     Add-Type -AssemblyName System.Windows.Forms
