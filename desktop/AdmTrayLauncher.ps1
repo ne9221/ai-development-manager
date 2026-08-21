@@ -87,10 +87,18 @@ function Update-AdmActionNotifications {
     try {
         $cachePath = Join-Path $env:LOCALAPPDATA "AI-Development-Manager\tray-actions.json"
         $cacheDir = Split-Path $cachePath -Parent; New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
-        $python = "python"; $raw = & $python -m manager.tray_actions 2>$null
+        $python = Get-Command python.exe -ErrorAction Stop
+        Push-Location -LiteralPath $RepositoryPath
+        try { $raw = & $python.Source -m manager.tray_actions 2>$null } finally { Pop-Location }
         $snapshot = $raw | ConvertFrom-Json
         if ($snapshot.state -ne "ok") { $notifyIcon.Text = "ADM: Action state Unknown"; return }
-        $seen = @{}; if (Test-Path $cachePath) { $seen = (Get-Content -Raw $cachePath | ConvertFrom-Json -AsHashtable) }
+        $seen = @{}
+        if (Test-Path $cachePath) {
+            try {
+                $cached = Get-Content -Raw $cachePath | ConvertFrom-Json
+                foreach ($property in $cached.PSObject.Properties) { $seen[$property.Name] = $property.Value }
+            } catch { $seen = @{} }
+        }
         foreach ($action in $snapshot.actions) {
             $key = "$($action.id)|$($action.status)|$($action.timestamp)"
             if (-not $seen.ContainsKey($key)) { $notifyIcon.ShowBalloonTip(5000, "ADM Action: $($action.severity)", $action.title, [System.Windows.Forms.ToolTipIcon]::Warning); $seen[$key] = $true }
