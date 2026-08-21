@@ -1115,6 +1115,87 @@ class RepoWriteAdmissionTests(unittest.TestCase):
         self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
         launch.assert_not_called()
 
+    def broken_v2_task(self, mutate):
+        """Like v2_task(), but lets the caller mutate/delete fields after
+        construction (v2_task's own **overrides can only replace a field's
+        value, never remove a key) -- needed to simulate a Task whose
+        v2-repo-write evidence is missing, empty, or otherwise corrupted,
+        e.g. by a post-creation Drive edit that cloud.dispatch_ingress never
+        saw. Every scenario below proves the Watcher's own admission check
+        (not just the ingress-time create-time check) independently fails
+        closed on that evidence."""
+        built = create_task(self.store, task(read_only=False), assign=False, persist=False)
+        built["execution_policies"] = sorted(REQUIRED_REPO_WRITE_TASK_POLICIES)
+        built["source_context"] = {
+            "origin": "direct_dispatch_ingress", "external_request_id": "req-1",
+            "admission_version": ADMISSION_VERSION_V2_REPO_WRITE, "repo": "https://github.com/example/project",
+        }
+        mutate(built)
+        self.store.put("tasks", "p1", "t1", built)
+        return built
+
+    def assert_v2_admission_defense_in_depth_rejects(self, mutate):
+        self.broken_v2_task(mutate)
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), self.v2_command(), claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), health_check=lambda: True, quota_check=lambda service: True,
+                ingress_registry_factory=self.registry_factory,
+            )
+        # verify_trusted_ingress_admission fails closed (returns None) whether
+        # the failure is task-schema validation or the repo-write policy gate
+        # itself -- both are real, both mean admitted_task is None, both
+        # collapse to the same observable outcome here: never admitted.
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
+    def test_v2_allowed_paths_missing_rejected_at_admission(self):
+        """Caught by repo_write_policy_satisfied -> _repo_write_evidence_valid."""
+        self.assert_v2_admission_defense_in_depth_rejects(lambda t: t.pop("allowed_paths"))
+
+    def test_v2_allowed_paths_empty_list_rejected_at_admission(self):
+        """Caught by repo_write_policy_satisfied -> _repo_write_evidence_valid."""
+        self.assert_v2_admission_defense_in_depth_rejects(lambda t: t.__setitem__("allowed_paths", []))
+
+    def test_v2_allowed_paths_containing_empty_string_rejected_at_admission(self):
+        """Caught by repo_write_policy_satisfied -> _repo_write_evidence_valid."""
+        self.assert_v2_admission_defense_in_depth_rejects(lambda t: t.__setitem__("allowed_paths", [""]))
+
+    def test_v2_baseline_head_missing_rejected_at_admission(self):
+        """Caught by repo_write_policy_satisfied -> _repo_write_evidence_valid."""
+        self.assert_v2_admission_defense_in_depth_rejects(lambda t: t.pop("baseline_head"))
+
+    def test_v2_baseline_head_empty_string_rejected_at_admission(self):
+        """Note: an empty-string baseline_head fails schema.task's own hex
+        pattern (type allows string-or-null, but a non-null string must be a
+        40/64-char hex commit SHA) before repo_write_policy_satisfied ever
+        runs -- verify_trusted_ingress_admission's own validate("task", ...)
+        call catches it first. Still a real, independent Watcher-side
+        fail-closed layer (not the ingress-time check), and still produces
+        the identical observable rejection, so it still proves the intended
+        defense-in-depth property: a corrupted baseline_head never launches."""
+        self.assert_v2_admission_defense_in_depth_rejects(lambda t: t.__setitem__("baseline_head", ""))
+
+    def test_v2_source_context_repo_missing_rejected_at_admission(self):
+        """Caught by repo_write_policy_satisfied -> _repo_write_evidence_valid."""
+        self.assert_v2_admission_defense_in_depth_rejects(lambda t: t["source_context"].pop("repo"))
+
+    def test_v2_bounded_repo_write_policy_marker_missing_rejected_at_admission(self):
+        """Caught by repo_write_policy_satisfied's REQUIRED_REPO_WRITE_TASK_POLICIES check."""
+        self.assert_v2_admission_defense_in_depth_rejects(
+            lambda t: t.__setitem__("execution_policies", ["disposable", "no_external_writes"]))
+
+    def test_v2_read_only_true_task_rejected_despite_v2_admission_version(self):
+        """Caught by repo_write_policy_satisfied's read_only-must-be-False check:
+        a Task cannot claim to be both read-only and a v2-repo-write Task."""
+        self.assert_v2_admission_defense_in_depth_rejects(lambda t: t.__setitem__("read_only", True))
+
+    def test_v2_needs_repo_edit_false_rejected_despite_v2_admission_version(self):
+        """Caught by repo_write_policy_satisfied's needs_repo_edit-must-be-True check."""
+        self.assert_v2_admission_defense_in_depth_rejects(lambda t: t.__setitem__("needs_repo_edit", False))
+
 
 class WatcherSessionCenterBootstrapIntegrationTests(unittest.TestCase):
     """Reproduces the exact deadlock the reviewer found and proves the fix:
