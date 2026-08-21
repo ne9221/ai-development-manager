@@ -185,7 +185,10 @@ def credentials(allow_interactive=False):
 def build_service():
     try:
         from googleapiclient.discovery import build
-        return build("drive", "v3", credentials=credentials(), cache_discovery=False)
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
+        http = AuthorizedHttp(credentials(), http=httplib2.Http(timeout=5))
+        return build("drive", "v3", http=http, cache_discovery=False)
     except PublisherError:
         raise
     except Exception as exc:

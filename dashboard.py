@@ -1,5 +1,7 @@
 import os
 import json
+import queue
+import threading
 import urllib.request
 import subprocess
 from datetime import datetime, timezone
@@ -248,6 +250,23 @@ def load_infra_health(drive_service_inst: Any = None) -> List[ServiceHealthViewM
 
     return [dash_vm, sc_vm, watcher_vm, supervisor_vm, drive_vm]
 
+
+def bounded_read(callback, timeout_seconds: float = 3.0):
+    """Return a canonical read result without allowing it to block page bootstrap."""
+    result = queue.Queue(maxsize=1)
+
+    def run():
+        try:
+            result.put((True, callback()))
+        except Exception as exc:
+            result.put((False, exc))
+
+    threading.Thread(target=run, daemon=True).start()
+    try:
+        return result.get(timeout=timeout_seconds)
+    except queue.Empty:
+        return False, TimeoutError(f"canonical Drive read timed out after {timeout_seconds:g}s")
+
 now = datetime.now(timezone.utc)
 all_warnings = []
 
@@ -269,12 +288,15 @@ all_handoffs = []
 active_executions = []
 active_executions_dict = {}
 handoffs_dict = {}
+canonical_records_available = bool(store)
 
 if store:
-    try:
-        all_projects = store.list_projects()
-    except Exception as e:
-        all_warnings.append(f"Failed to list projects: {e}")
+    projects_ok, projects_result = bounded_read(store.list_projects)
+    if projects_ok:
+        all_projects = projects_result
+    else:
+        canonical_records_available = False
+        all_warnings.append(f"Failed to list projects: {projects_result}")
 
     for p in all_projects:
         p_id = p.get("project_id")
@@ -383,6 +405,10 @@ global_runtime_state, global_badge_class, global_state_desc = compute_global_run
     infra_health_list=infra_health_list,
     now=now,
 )
+if not canonical_records_available:
+    global_runtime_state, global_badge_class, global_state_desc = (
+        STATE_UNKNOWN, "badge-warn", "Canonical project/task records unavailable; Drive request timed out or failed."
+    )
 next_auto_action_str = compute_next_auto_action(all_tasks, active_executions, all_actions, daily_brief_vm)
 
 NAV_OVERVIEW = "Overview"
@@ -425,7 +451,7 @@ else:
 
 conflict_tag = f" · ⚠️ {ideas_summary['conflicted']} 冲突" if ideas_summary.get('conflicted', 0) > 0 else ""
 st.sidebar.caption(f"💡 Ideas: {ideas_summary['pending']} 待立案 · {ideas_summary['confirmed']} 已确认{conflict_tag}")
-st.sidebar.caption(f"⚡ Active Tasks: {len(active_executions)}")
+st.sidebar.caption(f"⚡ Active Tasks: {len(active_executions) if canonical_records_available else 'Unavailable'}")
 
 def render_overview_page():
     st.title("🎯 Operations Overview")
@@ -480,7 +506,9 @@ def render_overview_page():
 
     with col_left:
         st.subheader("📁 Active Projects & Milestones")
-        if not all_projects:
+        if not canonical_records_available:
+            st.warning("Unavailable — canonical project/task records could not be read from Drive. No empty result is inferred.")
+        elif not all_projects:
             st.info("No active projects found. Create a project to begin tracking.")
         else:
             for proj in all_projects:
@@ -513,7 +541,9 @@ def render_overview_page():
         stale_execs = [exe for exe in active_executions if is_execution_stale(exe, now)]
         blocked_tasks = [t for t in all_tasks if t.get("status") in ["blocked", "attention"]]
 
-        if not stale_execs and not blocked_tasks and not conflicted_ideas and actions_summary["blocked"] == 0:
+        if not canonical_records_available:
+            st.warning("Unavailable — task blockers cannot be assessed while canonical project/task records are unavailable.")
+        elif not stale_execs and not blocked_tasks and not conflicted_ideas and actions_summary["blocked"] == 0:
             st.success("✅ No active blockers. All pipelines and tasks are operating normally.")
         else:
             for exe in stale_execs:
@@ -1153,7 +1183,9 @@ def render_projects_page():
     if selected_p_id:
         st.info(f"Targeting Project: **{selected_p_id}**")
 
-    if not all_projects:
+    if not canonical_records_available:
+        st.warning("Unavailable — canonical project/task records could not be read from Drive. No empty result is inferred.")
+    elif not all_projects:
         st.info("No projects found in Drive SSOT.")
     else:
         for proj in all_projects:
@@ -1198,6 +1230,9 @@ def render_projects_page():
 
 def render_tasks_page():
     st.title("📋 Tasks Board & Execution")
+    if not canonical_records_available:
+        st.warning("Unavailable — canonical task records could not be read from Drive. No empty task counts are inferred.")
+        return
     board = map_task_board(all_tasks, active_executions_dict, now)
 
     tab_in_progress, tab_ready, tab_blocked, tab_completed = st.tabs([
