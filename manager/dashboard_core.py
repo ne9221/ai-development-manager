@@ -225,6 +225,45 @@ def map_task_board(all_tasks: list, active_executions_dict: dict, now: datetime)
     return board
 
 
+def build_project_detail_vm(project: Dict[str, Any], tasks: List[Dict[str, Any]],
+                            executions: List[Dict[str, Any]], actions: List[Any],
+                            ideas: List[Any], now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Truthful, deterministic project/task linkage for the dashboard."""
+    project_id = project.get("project_id", "—")
+    project_tasks = [t for t in tasks if t.get("project_id") == project_id]
+    priority = {"critical": 0, "high": 1, "medium": 2, "normal": 3, "low": 4}
+    key = lambda t: (priority.get(str(t.get("priority", "normal")).lower(), 3),
+                     t.get("created_at") or "", t.get("task_id") or "")
+    current = sorted([t for t in project_tasks if t.get("status") == "in_progress"], key=key)
+    next_tasks = sorted([t for t in project_tasks if t.get("status") in ("ready", "queued")],
+                        key=lambda t: (0 if t.get("status") == "ready" else 1, *key(t)))
+    blocked = sorted([t for t in project_tasks if t.get("status") == "blocked"], key=key)
+    completed = sorted([t for t in project_tasks if t.get("status") == "completed"],
+                       key=lambda t: (t.get("completed_at") or t.get("updated_at") or "", t.get("task_id") or ""), reverse=True)
+    task_ids = {t.get("task_id") for t in project_tasks}
+    linked_executions = [e for e in executions if e.get("project_id") == project_id and e.get("task_id") in task_ids]
+    relevant_actions = [a for a in actions if getattr(a, "project_id", None) == project_id
+                        and getattr(a, "status", None) in ("open", "acknowledged")]
+    linked_ideas = [i for i in ideas if (i.get("project_id") if isinstance(i, dict) else getattr(i, "project_id", None)) == project_id]
+    orphan_ideas = [i for i in ideas if (i.get("project_id") if isinstance(i, dict) else getattr(i, "project_id", None))
+                    and (i.get("project_id") if isinstance(i, dict) else getattr(i, "project_id", None)) != project_id]
+    activity = []
+    for t in project_tasks:
+        if t.get("updated_at") or t.get("completed_at"):
+            activity.append((t.get("completed_at") or t.get("updated_at"), "Task", t.get("task_id", "—"), t.get("status", "Unknown")))
+    for e in linked_executions:
+        if e.get("last_provider_event_at") or e.get("heartbeat_at") or e.get("started_at"):
+            activity.append((e.get("last_provider_event_at") or e.get("heartbeat_at") or e.get("started_at"), "Execution", e.get("execution_id", "—"), e.get("status", "Unknown")))
+    return {"project": project, "tasks": project_tasks, "current": current, "next": next_tasks,
+            "blocked": blocked, "completed": completed[:5], "executions": linked_executions,
+            "actions": relevant_actions, "ideas": linked_ideas, "orphan_ideas": orphan_ideas,
+            "task_completion": None if not project_tasks else (len(completed), len(project_tasks)),
+            "current_phase": project.get("current_phase") or "Unavailable / Not recorded",
+            "priority_roadmap": project.get("priority_roadmap") or [],
+            "milestone_progress": "Unavailable / Not recorded",
+            "recent_activity": sorted(activity, key=lambda x: x[0] or "", reverse=True)[:8]}
+
+
 # =====================================================================
 # Dashboard ViewModels for Quota & Daily Brief (Slice 4A)
 # =====================================================================

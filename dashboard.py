@@ -66,6 +66,7 @@ from manager.dashboard_core import (
     is_execution_stale,
     get_global_summary,
     map_task_board,
+    build_project_detail_vm,
     build_daily_brief_vm,
     DailyBriefViewModel,
     AccountQuotaCardViewModel,
@@ -1155,17 +1156,41 @@ def render_projects_page():
         for proj in all_projects:
             p_id = proj.get("project_id", "—")
             p_title = proj.get("title", p_id)
-            tasks = [t for t in all_tasks if t.get("project_id") == p_id]
             is_highlighted = (p_id == selected_p_id)
+            detail = build_project_detail_vm(proj, all_tasks, all_executions, all_actions, all_ideas, now)
+            completion = detail["task_completion"]
+            completion_text = f"{completion[0]} / {completion[1]}" if completion else "Unavailable"
 
             st.markdown(f"""
             <div class="glass-card" {'style="border: 2px solid #388bfd;"' if is_highlighted else ''}>
                 <h3 style="margin:0;">{p_title} <small style="color:#8b949e;">({p_id})</small></h3>
-                <p style="margin:6px 0;">Total Tasks: {len(tasks)}</p>
+                <p style="margin:6px 0;"><b>Current Phase:</b> {detail['current_phase']} | <b>Task completion:</b> {completion_text} | <b>Milestone progress:</b> {detail['milestone_progress']}</p>
             </div>
             """, unsafe_allow_html=True)
-            with st.expander(f"View Tasks for {p_title}", expanded=is_highlighted):
-                st.json(tasks)
+            with st.expander(f"View Project Detail: {p_title}", expanded=is_highlighted):
+                st.caption(f"SSOT: {'Connected' if not actions_store.is_degraded else 'Unavailable / degraded'} · Task completion is not milestone progress.")
+                st.write(f"**Priority Roadmap:** {detail['priority_roadmap'] or 'Unavailable / Not recorded'}")
+                cols = st.columns(4)
+                for col, label, items in zip(cols, ("Current", "Next", "Blocked", "Recently Completed"),
+                                             (detail['current'], detail['next'], detail['blocked'], detail['completed'])):
+                    with col:
+                        st.caption(label)
+                        if items:
+                            for task in items:
+                                st.write(f"`{task.get('task_id', '—')}` {task.get('title', '—')} · {task.get('status', 'Unknown')}")
+                        else:
+                            st.write("Unavailable / none")
+                st.write("**Execution / Session**")
+                if detail['executions']:
+                    for exe in detail['executions']:
+                        st.write(f"`{exe.get('execution_id', '—')}` · {exe.get('provider', 'Unknown')} · session `{exe.get('provider_session_id') or exe.get('session_id') or 'Not recorded'}` · {exe.get('status', 'Unknown')}")
+                else:
+                    st.write("Unavailable / Not recorded")
+                if detail['actions']:
+                    st.write("**Open Actions:** " + "; ".join(f"{a.type}/{a.severity}: {a.reason}" for a in detail['actions']))
+                st.write(f"**Relevant Ideas:** {len(detail['ideas'])}")
+                if detail['recent_activity']:
+                    st.write("**Recent Activity (canonical timestamps):** " + "; ".join(f"{x[0]} {x[1]} {x[2]} → {x[3]}" for x in detail['recent_activity']))
 
 
 def render_tasks_page():
@@ -1231,11 +1256,20 @@ def render_sessions_page():
                 st.write(f"**Status**: `{task.get('status')}`")
                 st.write(f"**Assigned Provider**: `{task.get('assigned_provider')}`")
                 st.write(f"**Next Action**: {task.get('next_action')}")
-                linked_exe = active_executions_dict.get((p_id, t_id))
+                linked_exe = next((e for e in all_executions if e.get("project_id") == p_id and e.get("task_id") == t_id), None)
                 if linked_exe:
-                    st.info("Active running execution found.")
+                    started = linked_exe.get("started_at") or linked_exe.get("reserved_at")
+                    activity, _ = get_latest_activity_timestamp(linked_exe)
+                    expected, remaining = format_duration_and_remaining_eta(linked_exe.get("expected_minutes"), started, now)
                     st.write(f"Execution ID: `{linked_exe.get('execution_id')}`")
-                    st.write(f"Provider Session: `{linked_exe.get('provider_session_id')}`")
+                    st.write(f"Provider / model: `{linked_exe.get('provider') or 'Unknown'}` / `{linked_exe.get('model') or 'Not recorded'}`")
+                    st.write(f"Provider Session: `{linked_exe.get('provider_session_id') or linked_exe.get('session_id') or 'Not recorded'}`")
+                    st.write(f"State: `{linked_exe.get('status', 'Unknown')}` · Started: {started or 'Unknown'} · Elapsed: {format_elapsed_duration(started, now)}")
+                    st.write(f"Last activity: {format_activity_timestamp_and_age(activity, now)} · Expected total: {expected} · Estimated remaining: {remaining}")
+                    st.write(f"Result / reason: {linked_exe.get('result') or linked_exe.get('recovery_reason') or 'Not recorded'}")
+                linked_actions = [a for a in all_actions if a.project_id == p_id and a.task_id == t_id and a.status in (STATUS_OPEN, STATUS_ACKNOWLEDGED)]
+                if linked_actions:
+                    st.write("Action Center: " + "; ".join(f"{a.type}/{a.severity} ({a.status}): {a.reason}" for a in linked_actions))
             with col2:
                 st.subheader("Latest Handoff")
                 ho = handoffs_dict.get((p_id, t_id))
