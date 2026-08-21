@@ -446,6 +446,8 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertIn('-IngressFolderId `"$IngressFolderId`"', installer)
         self.assertIn('$env:ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID = $IngressFolderId', runner)
         self.assertIn('$env:ADM_DRIVE_DISPATCH_INGRESS_OWNER = $IngressOwner', runner)
+        self.assertIn('-ClaudeAccountsConfig `"$ClaudeAccountsConfig`"', installer)
+        self.assertIn('$env:CLAUDE_ACCOUNTS_CONFIG = $ClaudeAccountsConfig', runner)
 
     # -- Phase 4C: provider routing + Claude quota fail-closed wiring --
 

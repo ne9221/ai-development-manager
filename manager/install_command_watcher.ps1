@@ -10,7 +10,8 @@ param(
     [Parameter(Mandatory=$true)][string]$GcsBucket,
     [Parameter(Mandatory=$true)][string]$GcsObject,
     [string]$IngressFolderId,
-    [string]$IngressOwner
+    [string]$IngressOwner,
+    [string]$ClaudeAccountsConfig
 )
 
 . (Join-Path $PSScriptRoot "AdmHiddenLaunch.ps1")
@@ -34,8 +35,12 @@ if ($activationExit -ne 0) {
     exit 1
 }
 
+if (-not $ClaudeAccountsConfig) {
+    $ClaudeAccountsConfig = Join-Path $ManagerHome "config\claude_accounts.json"
+}
+
 $runner = Join-Path $RepositoryPath "manager\run_command_watcher.ps1"
-$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -CodexBin `"$CodexBin`" -CodexHome `"$CodexHome`" -PythonDeps `"$PythonDeps`" -AllowlistPath `"$AllowlistPath`" -GcsBucket `"$GcsBucket`" -GcsObject `"$GcsObject`" -IngressFolderId `"$IngressFolderId`" -IngressOwner `"$IngressOwner`""
+$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -CodexBin `"$CodexBin`" -CodexHome `"$CodexHome`" -PythonDeps `"$PythonDeps`" -AllowlistPath `"$AllowlistPath`" -GcsBucket `"$GcsBucket`" -GcsObject `"$GcsObject`" -IngressFolderId `"$IngressFolderId`" -IngressOwner `"$IngressOwner`" -ClaudeAccountsConfig `"$ClaudeAccountsConfig`""
 $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $RepositoryPath -WrapperName "command-watcher" -PowerShellArguments $arguments
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)

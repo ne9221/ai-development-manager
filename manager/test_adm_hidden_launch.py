@@ -142,8 +142,81 @@ class InstallerHiddenLaunchWiringTest(unittest.TestCase):
         runner = (MANAGER_DIR / "run_command_watcher.ps1").read_text(encoding="utf-8")
         self.assertIn('-AllowlistPath `"$AllowlistPath`"', installer)
         self.assertIn('$env:ADM_WATCHER_ALLOWLIST_PATH = $AllowlistPath', runner)
+        self.assertIn('-ClaudeAccountsConfig `"$ClaudeAccountsConfig`"', installer)
+        self.assertIn('$env:CLAUDE_ACCOUNTS_CONFIG = $ClaudeAccountsConfig', runner)
         self.assertIn('-WindowStyle Hidden', installer)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+@unittest.skipUnless(POWERSHELL and os.name == "nt", "Windows PowerShell required")
+class CommandWatcherRunnerClaudeAccountsConfigTest(unittest.TestCase):
+    """Tests that run_command_watcher.ps1 correctly resolves and validates
+    CLAUDE_ACCOUNTS_CONFIG before invoking command_watcher."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.tmp.name)
+        self.manager_home = self.tmp_path / ".ai-development-manager"
+        self.manager_home.mkdir(parents=True, exist_ok=True)
+        self.config_dir = self.manager_home / "config"
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.default_config = self.config_dir / "claude_accounts.json"
+        self.default_config.write_text('{"accounts":[{"account_id":"account-b","enabled":true,"config_dir":"C:\\\\fake"}]}', encoding="utf-8")
+
+        # Fake repo with dummy provenance output so provenance check passes
+        self.fake_repo = self.tmp_path / "repo"
+        (self.fake_repo / "manager").mkdir(parents=True, exist_ok=True)
+        shutil.copy(MANAGER_DIR / "run_command_watcher.ps1", self.fake_repo / "manager" / "run_command_watcher.ps1")
+        
+        self.fake_python = self.tmp_path / "fake_python.bat"
+        # Script that prints env:CLAUDE_ACCOUNTS_CONFIG when called with -m manager.command_watcher
+        bat_content = (
+            '@echo off\n'
+            'if "%1"=="-m" if "%2"=="-c" ( echo {"running_sha":"sha1","tested_sha":"sha1","activated_sha":"sha1"} & exit /b 0 )\n'
+            'if "%1"=="-m" if "%2"=="manager.provenance" ( echo {"running_sha":"sha1","tested_sha":"sha1","activated_sha":"sha1"} & exit /b 0 )\n'
+            'if "%1"=="-m" if "%2"=="manager.command_watcher" ( echo CLAUDE_CONFIG=%CLAUDE_ACCOUNTS_CONFIG% & exit /b 0 )\n'
+            'exit /b 0\n'
+        )
+        self.fake_python.write_text(bat_content, encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run_watcher(self, extra_args=""):
+        runner = self.fake_repo / "manager" / "run_command_watcher.ps1"
+        allowlist = self.tmp_path / "allowlist.json"
+        allowlist.write_text("{}", encoding="utf-8")
+        cmd = f'& "{runner}" -PythonPath "{self.fake_python}" -RepositoryPath "{self.fake_repo}" -ManagerHome "{self.manager_home}" -AllowlistPath "{allowlist}" -GcsBucket "b" -GcsObject "o" {extra_args}'
+        return subprocess.run(
+            [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd],
+            capture_output=True, text=True, timeout=20,
+        )
+
+    def test_default_config_path_exported_when_present(self):
+        res = self._run_watcher()
+        self.assertEqual(0, res.returncode, f"stderr: {res.stderr}")
+        self.assertIn(f"CLAUDE_CONFIG={self.default_config}", res.stdout)
+
+    def test_explicit_config_path_exported(self):
+        custom_config = self.tmp_path / "custom_accounts.json"
+        custom_config.write_text('{"accounts":[]}', encoding="utf-8")
+        res = self._run_watcher(f'-ClaudeAccountsConfig "{custom_config}"')
+        self.assertEqual(0, res.returncode, f"stderr: {res.stderr}")
+        self.assertIn(f"CLAUDE_CONFIG={custom_config}", res.stdout)
+
+    def test_missing_config_fails_closed(self):
+        self.default_config.unlink()
+        res = self._run_watcher()
+        self.assertNotEqual(0, res.returncode)
+        self.assertIn("CLAUDE_ACCOUNTS_CONFIG_MISSING", res.stderr)
+
+    def test_unicode_and_spaces_in_config_path(self):
+        unicode_dir = self.tmp_path / "test_dir_with_spaces"
+        unicode_dir.mkdir(parents=True, exist_ok=True)
+        unicode_config = unicode_dir / "claude_accounts.json"
+        unicode_config.write_text('{"accounts":[]}', encoding="utf-8")
+        res = self._run_watcher(f'-ClaudeAccountsConfig "{unicode_config}"')
+        self.assertEqual(0, res.returncode, f"stderr: {res.stderr}")
+        self.assertIn(f"CLAUDE_CONFIG={unicode_config}", res.stdout)
