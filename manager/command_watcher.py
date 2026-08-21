@@ -22,7 +22,10 @@ from manager.quota_reader import read_drive_status, summarize
 from manager.runtime_bridge import all_projects
 from manager.task_claims import check_task_execution_claim, task_claim_registry
 from manager.tasks import DriveRecords, TaskError, now_iso, validate
-from manager.trusted_ingress import REQUIRED_TASK_POLICIES, task_policy_satisfied, verify_trusted_ingress_admission
+from manager.trusted_ingress import (
+    ADMISSION_VERSION_V1, REQUIRED_TASK_POLICIES, task_policy_satisfied,
+    task_policy_satisfied_for_admission, verify_trusted_ingress_admission,
+)
 from manager.dispatch_requests import dispatch_request_registry
 
 
@@ -59,7 +62,7 @@ def load_allowlist(path=None):
     return frozenset(allowed)
 
 
-_policy_satisfied = task_policy_satisfied
+_policy_satisfied = task_policy_satisfied  # kept for any external import; process_command itself now goes through task_policy_satisfied_for_admission
 
 
 def session_center_healthy(url=None, timeout=2.0):
@@ -363,18 +366,28 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     launcher_factory = launcher_factory or runtime["launcher_factory"]
     quota_check = quota_check or runtime["quota_check"]
     admitted_task = None
+    # Static-allowlist admission is always evaluated under v1 read-only
+    # semantics, never whatever admission_version the Command itself claims
+    # -- a static allowlist entry alone must never be able to grant
+    # repo-write. Only a command that independently passes
+    # verify_trusted_ingress_admission() below gets its own claimed
+    # admission_version (and therefore access to the v2-repo-write policy
+    # gate).
+    admission_version = ADMISSION_VERSION_V1
     if (command["project_id"], command["task_id"]) not in allowlist:
         # Off the static allowlist is not automatically out of scope: a
         # command stamped by the authenticated Direct Dispatch ingress can
-        # still be safely auto-admitted under the narrow v1 trusted-ingress
-        # contract (disposable read-only only, evidence cross-checked
-        # against the ingress-only-writable idempotency record -- see
-        # manager.trusted_ingress). Anything that satisfies neither path is
+        # still be safely auto-admitted under a narrow, explicitly versioned
+        # trusted-ingress contract (v1 disposable-read-only, or v2-repo-write
+        # bounded-write), evidence cross-checked against the
+        # ingress-only-writable idempotency record -- see
+        # manager.trusted_ingress. Anything that satisfies neither path is
         # left untouched (no write), same as before.
         admitted_task = verify_trusted_ingress_admission(
             store, command, os.environ.get("ADM_LOCK_GCS_BUCKET"), ingress_registry_factory)
         if admitted_task is None:
             return {"status": "rejected", "reason": "not_allowlisted"}
+        admission_version = command.get("admission_version")
     try:
         candidate_task = admitted_task or store.get("tasks", command["project_id"], command["task_id"])
         validate("task", candidate_task)
@@ -384,7 +397,7 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         validate_task_enforcement(candidate_task)
     except TaskError:
         return {"status": "rejected", "reason": "mandatory_governance_missing_or_stale"}
-    if not _policy_satisfied(candidate_task):
+    if not task_policy_satisfied_for_admission(candidate_task, admission_version):
         return _attention(store, command, None, "allowlisted_task_policy_not_satisfied")
     if not health_check():
         # Transient/recoverable, not a policy problem: leave queued untouched,
