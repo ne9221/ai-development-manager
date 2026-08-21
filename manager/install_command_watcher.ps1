@@ -15,6 +15,17 @@ param(
 
 . (Join-Path $PSScriptRoot "AdmHiddenLaunch.ps1")
 
+# Production provenance contract: refuse to (re)install the Scheduled Task
+# unless this exact checkout's HEAD was already proven by a TESTED evidence
+# capture (manager.provenance capture-tested). This is what makes "source
+# tests must pass before the Scheduled Task changes" fail-closed instead of
+# a procedural reminder.
+$activationOutput = & $PythonPath -m manager.provenance activate --repository-path $RepositoryPath --manager-home $ManagerHome 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "PROVENANCE_MISMATCH: cannot activate Watcher install, TESTED evidence missing or does not match this checkout's HEAD.`n$activationOutput"
+    exit 1
+}
+
 $runner = Join-Path $RepositoryPath "manager\run_command_watcher.ps1"
 $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -CodexBin `"$CodexBin`" -CodexHome `"$CodexHome`" -PythonDeps `"$PythonDeps`" -AllowlistPath `"$AllowlistPath`" -GcsBucket `"$GcsBucket`" -GcsObject `"$GcsObject`" -IngressFolderId `"$IngressFolderId`" -IngressOwner `"$IngressOwner`""
 $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $RepositoryPath -WrapperName "command-watcher" -PowerShellArguments $arguments
