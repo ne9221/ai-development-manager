@@ -27,7 +27,7 @@ function New-AdmHiddenScheduledTaskAction {
         "' Scheduler never flashes a console, and propagates the real exit code so",
         "' LastTaskResult stays meaningful.",
         "Set shell = CreateObject(""WScript.Shell"")",
-        "exitCode = shell.Run ""powershell.exe $escapedArgs"", 0, True",
+        "exitCode = shell.Run(""powershell.exe $escapedArgs"", 0, True)",
         "WScript.Quit exitCode"
     )
     Set-Content -LiteralPath $vbsPath -Value $vbsLines -Encoding ASCII
