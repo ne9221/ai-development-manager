@@ -11,7 +11,7 @@ from manager.claude_launcher import ClaudeLaunchError
 from manager.codex_launcher import CodexLaunchError, LaunchOutcome, LaunchRequest
 from manager.execution_runner import _stopped, launch_task, run_execution
 from manager.task_claims import check_task_execution_claim
-from manager.tasks import TaskError, create_project, create_task
+from manager.tasks import TaskError, create_project, create_task, update_task
 from manager.test_execution_lifecycle import MemoryStore, build_store, quota_document
 from manager.test_task_claims import MemoryClaimRegistry
 from manager.test_worktree_locks import HEAD, REPO, MemoryRegistry
@@ -767,6 +767,85 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         store.records[("projects", "p1", "p1")]["working_directory"] = str(Path(other.name).resolve())
         result, launcher = self._launch(store)
         self.assertEqual(self.valid_dir, launcher.request.working_directory)
+
+    # -- Slice C: a genuine v2-repo-write Task never falls back to the
+    # project's shared canonical checkout; it launches inside its own
+    # materialized, isolated worktree instead. --
+
+    def _repo_write_task(self, **overrides):
+        document = {
+            "task_id": "t1", "project_id": "p1", "title": "Bounded write task", "task_type": "implementation",
+            "complexity": "medium", "expected_minutes": 20, "needs_repo_edit": True,
+            "needs_research": False, "needs_browser": False, "parallelizable": False,
+            "read_only": False, "scope": ["manager/executions.py"], "constraints": [],
+            "acceptance_criteria": ["gate"], "baseline_head": HEAD,
+            "allowed_paths": ["manager/executions.py"],
+            "execution_policies": ["disposable", "bounded_repo_write", "no_external_writes"],
+            "source_context": {"repo": REPO, "admission_version": "v2-repo-write"},
+        }
+        document.update(overrides)
+        return document
+
+    def test_repo_write_task_launches_in_materialized_worktree_not_canonical_checkout(self):
+        from manager.project_registry import ProjectMetadata
+
+        worktree_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(worktree_dir.cleanup)
+        materialized = str(Path(worktree_dir.name).resolve())
+        self.assertNotEqual(self.valid_dir, materialized)
+
+        fake_project = ProjectMetadata(
+            project_id="p1", display_name="Project", aliases=(), repo={"canonical_url": REPO},
+            default_branch="main", baseline_resolution_policy={}, common_governance={}, project_rules={},
+            working_directory_policy={}, isolation_policy={"mode": "worktree_per_task"}, provider_restrictions={},
+            protected_paths=(), default_write_boundaries=("*",), pointer_rules={},
+            status="enabled", resolution_status="verified",
+        )
+
+        store = MemoryStore()
+        create_project(store, self._project(self.valid_dir))
+        create_task(store, self._repo_write_task(), assign=False)
+
+        materialized_result = {"working_directory": materialized, "branch": "refs/heads/adm-worktree/p1/t1",
+                               "worktree_id": "p1--t1", "baseline_head": HEAD}
+
+        def fake_materialize(store_arg, project_arg, task_arg, canonical_checkout, workspace_root, **kwargs):
+            # A real materialize_worktree() persists onto the Task before
+            # returning (Slice C's own read-back contract, tested in
+            # manager.test_worktree_materializer) -- mirror that here so the
+            # downstream running-gate's task_snapshot() sees a consistent
+            # branch/working_directory, exactly as it would in production.
+            update_task(store_arg, "p1", "t1", **materialized_result)
+            return dict(materialized_result)
+
+        with patch("manager.execution_runner.get_global_registry") as get_registry, \
+             patch("manager.execution_runner.materialize_worktree", side_effect=fake_materialize) as materialize:
+            get_registry.return_value.get_project.return_value = fake_project
+            result, launcher = self._launch(store)
+
+        get_registry.return_value.get_project.assert_called_once_with("p1")
+        materialize.assert_called_once()
+        self.assertEqual(materialized, launcher.request.working_directory)
+        self.assertNotEqual(self.valid_dir, launcher.request.working_directory)
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+
+    def test_repo_write_task_materialization_failure_never_falls_back_to_canonical_checkout(self):
+        from manager.worktree_materializer import WorktreeMaterializationError
+
+        store = MemoryStore()
+        create_project(store, self._project(self.valid_dir))
+        create_task(store, self._repo_write_task(), assign=False)
+
+        with patch("manager.execution_runner.get_global_registry") as get_registry, \
+             patch("manager.execution_runner.materialize_worktree") as materialize:
+            get_registry.return_value.get_project.return_value = object()
+            materialize.side_effect = WorktreeMaterializationError("baseline_lineage_mismatch", "nope")
+            with self.assertRaises(WorktreeMaterializationError):
+                self._launch(store)
+        # Must fail closed rather than silently falling back to Project's
+        # own canonical working_directory.
+        with self.assertRaises((TaskError, KeyError)):
+            store.get("executions", "p1", "exec-a")
 
     # -- B3: missing everywhere fails closed --
 
