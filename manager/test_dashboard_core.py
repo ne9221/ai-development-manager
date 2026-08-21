@@ -646,5 +646,158 @@ class WatcherSessionCenterHealthTests(unittest.TestCase):
         self.assertEqual("Online", vm.status_label)
 
 
+
+
+class FleetQuotaTruthClassificationTests(unittest.TestCase):
+    """Rigorous tests enforcing the Truth Contract for Fleet Dispatchability & Quota Reasons."""
+
+    def test_stale_telemetry_never_emits_quota_exhausted(self):
+        now = datetime(2026, 8, 21, 12, 0, 0, tzinfo=timezone.utc)
+        doc = {
+            "providers": [
+                {
+                    "provider": "claude",
+                    "account_id": "acc-1",
+                    "display_name": "Claude Code (acc-1)",
+                    "source": "claude_code_statusline_rate_limits",
+                    "source_type": "official",
+                    "confidence": "official",
+                    "status": "ok",
+                    "last_updated": (now - timedelta(hours=3)).isoformat(),
+                    "windows": [
+                        {"name": "five_hour", "remaining_percent": 0.0, "resets_at": (now + timedelta(hours=1)).isoformat()}
+                    ]
+                }
+            ]
+        }
+        brief = build_daily_brief_vm(doc, now=now)
+        self.assertEqual(brief.recommended_display_name, "No AI Available")
+        self.assertEqual(brief.recommended_action, "hold")
+        # Stale telemetry must be reported as stale, NEVER as verified quota exhausted
+        self.assertIn("stale", brief.reason.lower())
+        self.assertNotIn("quota-exhausted", brief.reason.lower())
+        self.assertNotIn("quota exhausted", brief.reason.lower())
+
+    def test_unknown_manual_never_emits_quota_exhausted(self):
+        now = datetime(2026, 8, 21, 12, 0, 0, tzinfo=timezone.utc)
+        doc = {
+            "providers": [
+                {
+                    "provider": "gemini_app",
+                    "account_id": None,
+                    "display_name": "Gemini App",
+                    "source": "not_reported",
+                    "source_type": "manual",
+                    "confidence": "unknown",
+                    "status": "unknown",
+                    "last_updated": now.isoformat(),
+                    "windows": []
+                },
+                {
+                    "provider": "antigravity",
+                    "account_id": None,
+                    "display_name": "Antigravity",
+                    "source": "not_reported",
+                    "source_type": "manual",
+                    "confidence": "unknown",
+                    "status": "unknown",
+                    "last_updated": now.isoformat(),
+                    "windows": []
+                }
+            ]
+        }
+        brief = build_daily_brief_vm(doc, now=now)
+        self.assertEqual(brief.recommended_display_name, "No AI Available")
+        self.assertEqual(brief.recommended_action, "hold")
+        self.assertNotIn("quota-exhausted", brief.reason.lower())
+        self.assertNotIn("quota exhausted", brief.reason.lower())
+        self.assertIn("unsupported/unknown", brief.reason.lower())
+
+        for acc in brief.accounts:
+            self.assertEqual(acc.effective_availability, "unknown")
+            self.assertEqual(acc.formatted_effective_availability, "Unknown / Unverified")
+
+    def test_verified_official_zero_percent_quota_emits_quota_exhausted(self):
+        now = datetime(2026, 8, 21, 12, 0, 0, tzinfo=timezone.utc)
+        doc = {
+            "providers": [
+                {
+                    "provider": "claude",
+                    "account_id": "acc-1",
+                    "display_name": "Claude Code",
+                    "source": "claude_code_statusline_rate_limits",
+                    "source_type": "official",
+                    "confidence": "official",
+                    "status": "ok",
+                    "last_updated": now.isoformat(),
+                    "windows": [
+                        {"name": "five_hour", "remaining_percent": 0.0, "resets_at": (now + timedelta(hours=2)).isoformat()}
+                    ]
+                }
+            ]
+        }
+        brief = build_daily_brief_vm(doc, now=now)
+        self.assertEqual(brief.recommended_display_name, "No AI Available")
+        self.assertEqual(brief.recommended_action, "hold")
+        self.assertIn("exhausted", brief.reason.lower())
+        self.assertIn("0%", brief.reason)
+
+    def test_mixed_account_states_summarized_truthfully(self):
+        now = datetime(2026, 8, 21, 12, 0, 0, tzinfo=timezone.utc)
+        doc = {
+            "providers": [
+                {
+                    "provider": "codex",
+                    "account_id": "codex-1",
+                    "display_name": "Codex Primary",
+                    "source": "codex_app_server",
+                    "source_type": "official",
+                    "confidence": "official",
+                    "status": "ok",
+                    "last_updated": (now - timedelta(hours=2)).isoformat(),
+                    "windows": [
+                        {"name": "primary", "remaining_percent": 50.0, "resets_at": (now + timedelta(hours=4)).isoformat()}
+                    ]
+                },
+                {
+                    "provider": "claude",
+                    "account_id": "claude-1",
+                    "display_name": "Claude Fast",
+                    "source": "claude_code_statusline_rate_limits",
+                    "source_type": "official",
+                    "confidence": "official",
+                    "status": "ok",
+                    "last_updated": now.isoformat(),
+                    "windows": [
+                        {"name": "five_hour", "remaining_percent": 0.0, "resets_at": (now + timedelta(hours=2)).isoformat()}
+                    ]
+                },
+                {
+                    "provider": "gemini_app",
+                    "account_id": None,
+                    "display_name": "Gemini App",
+                    "source": "not_reported",
+                    "source_type": "manual",
+                    "confidence": "unknown",
+                    "status": "unknown",
+                    "last_updated": now.isoformat(),
+                    "windows": []
+                }
+            ]
+        }
+        brief = build_daily_brief_vm(doc, now=now)
+        self.assertEqual(brief.recommended_display_name, "No AI Available")
+        # Ensure itemized truth is preserved in reason
+        self.assertIn("telemetry is stale", brief.reason.lower())
+        self.assertIn("verified quota exhausted", brief.reason.lower())
+        self.assertIn("unsupported automated telemetry", brief.reason.lower())
+
+    def test_empty_accounts_does_not_invent_quota_exhausted(self):
+        now = datetime(2026, 8, 21, 12, 0, 0, tzinfo=timezone.utc)
+        doc = {"providers": []}
+        brief = build_daily_brief_vm(doc, now=now)
+        self.assertEqual(brief.recommended_display_name, "No AI Available")
+        self.assertEqual(brief.reason, "No AI accounts configured in runtime status.")
+
 if __name__ == "__main__":
     unittest.main()
