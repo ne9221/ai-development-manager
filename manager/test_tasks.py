@@ -243,6 +243,18 @@ class DriveFolderRaceTests(unittest.TestCase):
         root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["commands"], create=False)
         self.assertEqual(1, len(store.children(root, "project-a")))
 
+    def test_list_projects_reads_each_project_without_relisting_projects_root(self):
+        service = FakeDriveService()
+        writer = DriveRecords(service)
+        for project_id in ("project-a", "project-b", "project-c"):
+            writer.put("projects", project_id, project_id, {"project_id": project_id})
+        projects_root = writer.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"], create=False)
+        queries = []
+        service.transport.on_list = queries.append
+        self.assertEqual(["project-a", "project-b", "project-c"],
+                         [item["project_id"] for item in DriveRecords(service).list_projects()])
+        self.assertEqual(1, sum(f"'{projects_root}' in parents" in query for query in queries))
+
     def test_pre_existing_duplicate_folders_still_fail_closed(self):
         store = DriveRecords(FakeDriveService())
         root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["sessions"])

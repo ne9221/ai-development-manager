@@ -2,6 +2,7 @@ import os
 import json
 import queue
 import threading
+import time
 import urllib.request
 import subprocess
 from datetime import datetime, timezone
@@ -260,21 +261,24 @@ def load_infra_health(drive_service_inst: Any = None) -> List[ServiceHealthViewM
     return [dash_vm, sc_vm, watcher_vm, supervisor_vm, drive_vm]
 
 
-def bounded_read(callback, timeout_seconds: float = 3.0):
+def bounded_read(callback, timeout_seconds: float = 3.0, retries: int = 1):
     """Return a canonical read result without allowing it to block page bootstrap."""
-    result = queue.Queue(maxsize=1)
-
-    def run():
+    deadline = time.monotonic() + timeout_seconds
+    for _ in range(retries + 1):
+        result = queue.Queue(maxsize=1)
+        def run():
+            try:
+                result.put((True, callback()))
+            except Exception as exc:
+                result.put((False, exc))
+        threading.Thread(target=run, daemon=True).start()
         try:
-            result.put((True, callback()))
-        except Exception as exc:
-            result.put((False, exc))
-
-    threading.Thread(target=run, daemon=True).start()
-    try:
-        return result.get(timeout=timeout_seconds)
-    except queue.Empty:
-        return False, TimeoutError(f"canonical Drive read timed out after {timeout_seconds:g}s")
+            ok, value = result.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            return False, TimeoutError(f"canonical Drive read timed out after {timeout_seconds:g}s")
+        if ok or time.monotonic() >= deadline:
+            return ok, value
+    return False, value
 
 now = datetime.now(timezone.utc)
 all_warnings = []
@@ -298,79 +302,37 @@ active_executions = []
 active_executions_dict = {}
 handoffs_dict = {}
 canonical_records_available = bool(store)
+records_are_last_known = False
+last_successful_sync = None
 
 if store:
-    projects_ok, projects_result = bounded_read(store.list_projects)
+    projects_ok, projects_result = bounded_read(store.dashboard_records)
     if projects_ok:
-        all_projects = projects_result
+        all_projects = projects_result["projects"]
+        all_tasks = projects_result["tasks"]
+        all_commands = projects_result["commands"]
+        all_executions = projects_result["executions"]
+        all_handoffs = projects_result["handoffs"]
+        last_successful_sync = now.isoformat()
+        st.session_state["dashboard_last_known"] = (last_successful_sync, projects_result)
     else:
         canonical_records_available = False
         all_warnings.append(f"Failed to list projects: {projects_result}")
+        last_known = st.session_state.get("dashboard_last_known")
+        if last_known:
+            last_successful_sync, records = last_known
+            all_projects, all_tasks = records["projects"], records["tasks"]
+            all_commands, all_executions = records["commands"], records["executions"]
+            all_handoffs, records_are_last_known = records["handoffs"], True
 
-    for p in all_projects:
-        p_id = p.get("project_id")
-        if not p_id:
-            continue
-
-        try:
-            tasks_folder = store.project_folder("tasks", p_id, create=False)
-            task_files = store.children(tasks_folder)
-            for tf in task_files:
-                fname = tf.get("name", "")
-                if fname.endswith(".json"):
-                    t_id = fname[:-5]
-                    try:
-                        task_data = store.get("tasks", p_id, t_id)
-                        all_tasks.append(task_data)
-                    except Exception as e:
-                        all_warnings.append(f"Malformed record in tasks for project {p_id}, file {fname}: {e}")
-        except Exception:
-            pass
-
-        try:
-            commands_folder = store.project_folder("commands", p_id, create=False)
-            for cf in store.children(commands_folder):
-                fname = cf.get("name", "")
-                if fname.endswith(".json"):
-                    all_commands.append(store.get("commands", p_id, fname[:-5]))
-        except Exception:
-            pass
-
-        try:
-            execs_folder = store.project_folder("executions", p_id, create=False)
-            exec_files = store.children(execs_folder)
-            for ef in exec_files:
-                fname = ef.get("name", "")
-                if fname.endswith(".json"):
-                    e_id = fname[:-5]
-                    try:
-                        exec_data = store.get("executions", p_id, e_id)
-                        all_executions.append(exec_data)
-                        if exec_data.get("status") in ["running", "reserved"]:
-                            active_executions.append(exec_data)
-                            active_executions_dict[(p_id, exec_data.get("task_id"))] = exec_data
-                    except Exception as e:
-                        all_warnings.append(f"Malformed record in executions for project {p_id}, file {fname}: {e}")
-        except Exception:
-            pass
-
-        try:
-            ho_folder = store.project_folder("handoffs", p_id, create=False)
-            ho_files = store.children(ho_folder)
-            for hf in ho_files:
-                fname = hf.get("name", "")
-                if fname.endswith(".json"):
-                    h_id = fname[:-5]
-                    try:
-                        ho_data = store.get("handoffs", p_id, h_id)
-                        all_handoffs.append(ho_data)
-                        t_id = ho_data.get("task_id")
-                        if t_id:
-                            handoffs_dict[(p_id, t_id)] = ho_data
-                    except Exception as e:
-                        all_warnings.append(f"Malformed record in handoffs for project {p_id}, file {fname}: {e}")
-        except Exception:
-            pass
+for exec_data in all_executions:
+    if exec_data.get("status") in ["running", "reserved"]:
+        active_executions.append(exec_data)
+        active_executions_dict[(exec_data.get("project_id"), exec_data.get("task_id"))] = exec_data
+for ho_data in all_handoffs:
+    if ho_data.get("task_id"):
+        handoffs_dict[(ho_data.get("project_id"), ho_data["task_id"])] = ho_data
+records_available = canonical_records_available or records_are_last_known
 
 drive_status_raw = {"providers": []}
 if drive_service:
@@ -461,6 +423,8 @@ else:
 conflict_tag = f" · ⚠️ {ideas_summary['conflicted']} 衝突" if ideas_summary.get('conflicted', 0) > 0 else ""
 st.sidebar.caption(f"💡 構想：{ideas_summary['pending']} 待立案 · {ideas_summary['confirmed']} 已確認{conflict_tag}")
 st.sidebar.caption(f"⚡ 執行中任務：{len(active_executions) if canonical_records_available else '無法取得'}")
+if records_are_last_known:
+    st.sidebar.warning(f"⚠️ 顯示上次成功同步資料（{last_successful_sync}）；非目前狀態。")
 
 def render_overview_page():
     st.title("🎯 營運總覽")
@@ -515,7 +479,7 @@ def render_overview_page():
 
     with col_left:
         st.subheader("📁 專案、里程碑與任務")
-        if not canonical_records_available:
+        if not records_available:
             st.warning("無法取得 — 無法讀取 Drive 的 canonical 專案／任務記錄；不會推論為空結果。")
         elif not all_projects:
             st.info("目前沒有可用的專案記錄。請建立專案後再追蹤。")
@@ -544,7 +508,7 @@ def render_overview_page():
         stale_execs = [exe for exe in active_executions if is_execution_stale(exe, now)]
         blocked_tasks = [t for t in all_tasks if t.get("status") in ["blocked", "attention"]]
 
-        if not canonical_records_available:
+        if not records_available:
             st.warning("無法取得 — canonical 專案／任務記錄不可用，無法判定任務阻礙。")
         elif not stale_execs and not blocked_tasks and not conflicted_ideas and actions_summary["blocked"] == 0:
             st.info("✅ 目前未記錄任何阻礙；此訊息不代表系統健康。")
@@ -1187,7 +1151,7 @@ def render_projects_page():
     if selected_p_id:
         st.info(f"目前專案：**{selected_p_id}**")
 
-    if not canonical_records_available:
+    if not records_available:
         st.warning("無法取得 — 無法讀取 Drive 的 canonical 專案／任務記錄；不會推論為空結果。")
     elif not all_projects:
         st.info("Drive SSOT 中沒有可用的專案記錄。")
@@ -1234,7 +1198,7 @@ def render_projects_page():
 
 def render_tasks_page():
     st.title("📋 任務看板與執行狀態")
-    if not canonical_records_available:
+    if not records_available:
         st.warning("無法取得 — canonical 任務記錄不可讀；不會推論為零筆任務。")
         return
     board = map_task_board(all_tasks, active_executions_dict, now)
