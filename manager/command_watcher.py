@@ -62,7 +62,8 @@ def load_allowlist(path=None):
     return frozenset(allowed)
 
 
-_policy_satisfied = task_policy_satisfied  # kept for any external import; process_command itself now goes through task_policy_satisfied_for_admission
+def _policy_satisfied(task, admission_version=ADMISSION_VERSION_V1):
+    return task_policy_satisfied_for_admission(task, admission_version)
 
 
 def session_center_healthy(url=None, timeout=2.0):
@@ -410,7 +411,7 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         validate_task_enforcement(candidate_task)
     except TaskError:
         return {"status": "rejected", "reason": "mandatory_governance_missing_or_stale"}
-    if not task_policy_satisfied_for_admission(candidate_task, admission_version):
+    if not _policy_satisfied(candidate_task, admission_version):
         return _attention(store, command, None, "allowlisted_task_policy_not_satisfied")
     if not health_check():
         # Transient/recoverable, not a policy problem: leave queued untouched,
