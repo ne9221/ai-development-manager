@@ -314,6 +314,12 @@ class PendingCorrelation:
     execution_id: str | None
     provider: str = "codex"
     error: str | None = None
+    # First-failure timestamp only -- see SessionView.fail(). Exists so a
+    # supervisor probing /api/session before respawning this process (to
+    # re-attempt correlation, see manager.session_center_supervisor) can
+    # durably record the *original* failure evidence before it is lost with
+    # this process. Never reset by a later fail() call within this process.
+    failed_at: str | None = None
 
     def snapshot(self) -> dict:
         return {
@@ -329,6 +335,8 @@ class PendingCorrelation:
             "latest_activity": None,
             "correlated": False,
             "account_id": None,
+            "error": self.error,
+            "failed_at": self.failed_at,
         }
 
 
@@ -356,6 +364,11 @@ class SessionView:
                 self._current = PendingCorrelation(
                     self._current.project_id, self._current.task_id,
                     self._current.execution_id, self._current.provider, error=message,
+                    # First-failure wins: a repeated fail() (there is none
+                    # today, but this must not silently start rewriting
+                    # history if one is ever added) never overwrites the
+                    # original failure timestamp.
+                    failed_at=self._current.failed_at or utc_iso(time.time()),
                 )
 
 
