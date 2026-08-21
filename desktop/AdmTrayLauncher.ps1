@@ -83,6 +83,23 @@ function Open-AdmDashboardSafe {
     }
 }
 
+function Update-AdmActionNotifications {
+    try {
+        $cachePath = Join-Path $env:LOCALAPPDATA "AI-Development-Manager\tray-actions.json"
+        $cacheDir = Split-Path $cachePath -Parent; New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+        $python = "python"; $raw = & $python -m manager.tray_actions 2>$null
+        $snapshot = $raw | ConvertFrom-Json
+        if ($snapshot.state -ne "ok") { $notifyIcon.Text = "ADM: Action state Unknown"; return }
+        $seen = @{}; if (Test-Path $cachePath) { $seen = (Get-Content -Raw $cachePath | ConvertFrom-Json -AsHashtable) }
+        foreach ($action in $snapshot.actions) {
+            $key = "$($action.id)|$($action.status)|$($action.timestamp)"
+            if (-not $seen.ContainsKey($key)) { $notifyIcon.ShowBalloonTip(5000, "ADM Action: $($action.severity)", $action.title, [System.Windows.Forms.ToolTipIcon]::Warning); $seen[$key] = $true }
+        }
+        $seen | ConvertTo-Json | Set-Content -Encoding utf8 $cachePath
+        $notifyIcon.Text = "ADM: $($snapshot.count) actionable actions; severity $($snapshot.highest_severity)"
+    } catch { $notifyIcon.Text = "ADM: Action state Unknown" }
+}
+
 if (-not $createdNew) {
     # Another instance is already running. Open the dashboard directly and exit this secondary instance.
     Open-AdmDashboardSafe
@@ -101,6 +118,11 @@ $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $notifyIcon.Icon = [System.Drawing.SystemIcons]::Application
 $notifyIcon.Text = "AI Development Manager"
 $notifyIcon.Visible = $true
+Update-AdmActionNotifications
+$pollTimer = New-Object System.Windows.Forms.Timer
+$pollTimer.Interval = 60000
+$pollTimer.add_Tick({ Update-AdmActionNotifications })
+$pollTimer.Start()
 
 # Context Menu
 $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -166,7 +188,7 @@ $notifyIcon.ContextMenuStrip = $contextMenu
 
 # Double Click action
 $notifyIcon.add_DoubleClick({
-    Open-AdmDashboardSafe
+    Open-AdmDashboardSafe # Streamlit has no stable Action Center route; opens supported Dashboard entry point.
 })
 
 # Show initial balloon notification
