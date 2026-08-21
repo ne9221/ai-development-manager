@@ -10,8 +10,9 @@ from unittest.mock import Mock, patch
 
 from manager.refresh_status import RefreshError, runtime_lock
 from manager.session_center_supervisor import (
-    decide, find_active_command, kill, lock_path_for, main, port_available,
-    read_state, run_once, target_execution_id, write_state,
+    attempt_orphan_recovery, decide, evidence_path_for, find_active_command, kill, lock_path_for, main,
+    port_available, read_evidence, read_state, run_once, target_execution_id, verify_adm_session_center_ownership,
+    write_state,
 )
 from manager.tasks import create_project, create_task
 from manager.test_command_watcher import Store as DriveStore, command as ingress_command
@@ -332,6 +333,327 @@ class RunOnceTests(unittest.TestCase):
             self.assertEqual([111], killed)
             self.assertEqual({"status": "idle"}, result)
             self.assertEqual((None, None, None), read_state(state_path))
+
+
+def _genuine_spawn_cmdline(port=8765, project_id="ai-development-manager", execution_id="exec-a", provider="codex",
+                            python="python.exe"):
+    """Exactly the shape spawn_session_center() actually produces."""
+    return (f'"{python}" -m manager.session_center --execution-project-id {project_id} '
+            f'--execution-id {execution_id} --wait-seconds 1800.0 --port {port} --provider {provider}')
+
+
+class VerifyAdmSessionCenterOwnershipTests(unittest.TestCase):
+    """P1-G orphan recovery: positive verification only -- see
+    verify_adm_session_center_ownership's own docstring. Every case here is
+    a pure function call, no real process/subprocess involved."""
+
+    def test_accepts_a_genuine_spawn_session_center_command_line(self):
+        self.assertTrue(verify_adm_session_center_ownership(_genuine_spawn_cmdline(port=8765), 8765))
+
+    def test_rejects_wrong_port(self):
+        self.assertFalse(verify_adm_session_center_ownership(_genuine_spawn_cmdline(port=8765), 9999))
+
+    def test_rejects_unrelated_process(self):
+        self.assertFalse(verify_adm_session_center_ownership('"C:\\nginx\\nginx.exe" -p 8765', 8765))
+
+    def test_rejects_missing_project_identity_argument(self):
+        cmdline = '"python.exe" -m manager.session_center --port 8765 --provider codex'
+        self.assertFalse(verify_adm_session_center_ownership(cmdline, 8765))
+
+    def test_rejects_missing_provider_argument(self):
+        cmdline = '"python.exe" -m manager.session_center --execution-project-id p1 --port 8765'
+        self.assertFalse(verify_adm_session_center_ownership(cmdline, 8765))
+
+    def test_rejects_wrong_module(self):
+        cmdline = '"python.exe" -m manager.command_watcher --port 8765'
+        self.assertFalse(verify_adm_session_center_ownership(cmdline, 8765))
+
+    def test_rejects_empty_or_none_command_line(self):
+        self.assertFalse(verify_adm_session_center_ownership("", 8765))
+        self.assertFalse(verify_adm_session_center_ownership(None, 8765))
+
+
+class AttemptOrphanRecoveryTests(unittest.TestCase):
+    """Every case here injects fake find_owner_pid/read_cmdline/kill_fn --
+    no real subprocess, network, or OS process is ever touched by these
+    tests, matching the incident's safety rule: only deterministic
+    fake/mock/subprocess-isolated tests for anything process-lifecycle
+    shaped."""
+
+    def test_verified_adm_orphan_is_killed_exactly_once_and_port_freed_is_reported(self):
+        kill_fn = Mock()
+        with patch("manager.session_center_supervisor.port_available", return_value=True):
+            result = attempt_orphan_recovery(
+                "127.0.0.1", 8765,
+                find_owner_pid=lambda host, port: 9999,
+                read_cmdline=lambda pid: _genuine_spawn_cmdline(port=8765),
+                kill_fn=kill_fn,
+            )
+        kill_fn.assert_called_once_with(9999)
+        self.assertEqual(
+            {"verified": True, "owner_pid": 9999, "action": "killed",
+             "reason": "verified_adm_orphan_session_center", "port_freed": True},
+            result,
+        )
+
+    def test_unrelated_process_is_never_killed(self):
+        kill_fn = Mock()
+        result = attempt_orphan_recovery(
+            "127.0.0.1", 8765,
+            find_owner_pid=lambda host, port: 4242,
+            read_cmdline=lambda pid: '"C:\\nginx\\nginx.exe" -p 8765',
+            kill_fn=kill_fn,
+        )
+        kill_fn.assert_not_called()
+        self.assertFalse(result["verified"])
+        self.assertEqual(4242, result["owner_pid"])
+        self.assertEqual("command_line_not_adm_session_center", result["reason"])
+
+    def test_unreadable_command_line_is_never_killed(self):
+        kill_fn = Mock()
+        result = attempt_orphan_recovery(
+            "127.0.0.1", 8765,
+            find_owner_pid=lambda host, port: 4242,
+            read_cmdline=lambda pid: None,
+            kill_fn=kill_fn,
+        )
+        kill_fn.assert_not_called()
+        self.assertFalse(result["verified"])
+        self.assertEqual("command_line_unreadable", result["reason"])
+
+    def test_unknown_port_owner_is_never_killed(self):
+        kill_fn = Mock()
+        result = attempt_orphan_recovery(
+            "127.0.0.1", 8765,
+            find_owner_pid=lambda host, port: None,
+            read_cmdline=lambda pid: _genuine_spawn_cmdline(),
+            kill_fn=kill_fn,
+        )
+        kill_fn.assert_not_called()
+        self.assertFalse(result["verified"])
+        self.assertIsNone(result["owner_pid"])
+        self.assertEqual("port_owner_unknown", result["reason"])
+
+
+class RunOnceOrphanRecoveryIntegrationTests(unittest.TestCase):
+    """run_once()'s own recover_orphan defaults to a no-op (see
+    _no_orphan_recovery) so these must explicitly inject a fake to exercise
+    the wiring -- no real subprocess call happens in this class either."""
+
+    def test_unrelated_occupied_port_stays_fail_closed_and_never_spawns(self):
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        port = holder.getsockname()[1]
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                state_path = str(Path(directory) / "state.json")
+                store = Store({"p1": [cmd(execution_id="exec-a")]})
+                spawn = Mock()
+                fake_recover = Mock(return_value={"verified": False, "owner_pid": 4242, "action": "none",
+                                                   "reason": "command_line_not_adm_session_center"})
+                with patch("manager.session_center_supervisor.spawn_session_center", spawn):
+                    result = run_once(store, frozenset({("p1", "t1")}), state_path, "python", ".", port, 60,
+                                       recover_orphan=fake_recover)
+                self.assertEqual({"status": "attention", "reason": "port_occupied_unverified"}, result)
+                spawn.assert_not_called()
+                self.assertFalse(Path(state_path).exists())
+                evidence = read_evidence(evidence_path_for(state_path))
+                self.assertEqual("port_occupied_unverified", evidence["degraded_reason"])
+                self.assertEqual("orphan_check", evidence["last_remediation"]["event"])
+                self.assertFalse(evidence["last_remediation"]["verified"])
+        finally:
+            holder.close()
+
+    def test_verified_orphan_is_recovered_and_a_fresh_session_center_is_spawned(self):
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        port = holder.getsockname()[1]
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                state_path = str(Path(directory) / "state.json")
+                store = Store({"p1": [cmd(execution_id="exec-a")]})
+                spawned = Mock()
+                spawned.pid = 777
+                spawn = Mock(return_value=spawned)
+                fake_recover = Mock(return_value={"verified": True, "owner_pid": 9999, "action": "killed",
+                                                   "reason": "verified_adm_orphan_session_center", "port_freed": True})
+                # Deliberately no port_available patch: the real `holder`
+                # socket above already makes the port genuinely occupied on
+                # entry, which is what should trigger the orphan-recovery
+                # branch in the first place. recover_orphan itself is
+                # faked (see AttemptOrphanRecoveryTests for its own real
+                # port-freeing behavior), so run_once is only being tested
+                # here on whether it *trusts* a verified+port_freed result.
+                with patch("manager.session_center_supervisor.spawn_session_center", spawn), \
+                     patch("manager.session_center_supervisor.process_creation_identity", return_value="id-777"):
+                    result = run_once(store, frozenset({("p1", "t1")}), state_path, "python", ".", port, 60,
+                                       recover_orphan=fake_recover)
+                spawn.assert_called_once()
+                self.assertEqual({"status": "spawned", "execution_id": "exec-a", "pid": 777}, result)
+                evidence = read_evidence(evidence_path_for(state_path))
+                self.assertEqual("orphan_recovery", evidence["last_remediation"]["event"])
+                # last_remediation still shows the orphan-kill that made this
+                # possible; recovery_result reflects this cycle's overall
+                # outcome, which is the subsequent successful spawn.
+                self.assertEqual("spawned", evidence["recovery_result"])
+        finally:
+            holder.close()
+
+
+class ReobserveTests(unittest.TestCase):
+    """P1-G correlation re-observe: correlation_failed must not be a
+    permanent dead end, but this must never re-dispatch a Command or spawn
+    a second provider session -- see decide()'s and run_once()'s
+    docstrings. read_session_state defaults to a no-op in run_once(), so
+    every test here injects a deterministic fake instead of touching a
+    real port."""
+
+    def test_correlation_failed_triggers_kill_and_respawn_of_the_same_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "state.json")
+            write_state(state_path, 111, "exec-a", "id-111")
+            store = Store({"p1": [cmd(execution_id="exec-a")]})
+            spawned = Mock()
+            spawned.pid = 222
+            spawn = Mock(return_value=spawned)
+            killed = []
+            fake_session_state = Mock(return_value={
+                "current_state": "correlation_failed", "error": "timed out", "failed_at": "2026-08-01T00:00:00+00:00",
+            })
+            with patch("manager.session_center_supervisor.process_identity_state", return_value="live"), \
+                 patch("manager.session_center_supervisor.kill", side_effect=lambda pid: killed.append(pid)), \
+                 patch("manager.session_center_supervisor.port_available", return_value=True), \
+                 patch("manager.session_center_supervisor.process_creation_identity", return_value="id-222"), \
+                 patch("manager.session_center_supervisor.spawn_session_center", spawn):
+                result = run_once(store, frozenset({("p1", "t1")}), state_path, "python", ".", 8765, 60,
+                                   read_session_state=fake_session_state)
+            # Same execution_id, same project -- a re-observe of the exact
+            # thing that failed, never a new dispatch or a different target.
+            self.assertEqual([111], killed)
+            spawn.assert_called_once_with("python", ".", "p1", "exec-a", 8765, 60, provider="codex")
+            self.assertEqual({"status": "spawned", "execution_id": "exec-a", "pid": 222}, result)
+
+    def test_healthy_correlated_session_is_left_alone_not_reobserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "state.json")
+            write_state(state_path, 111, "exec-a", "id-111")
+            store = Store({"p1": [cmd(execution_id="exec-a")]})
+            spawn = Mock()
+            fake_session_state = Mock(return_value={"current_state": "running", "correlated": True})
+            with patch("manager.session_center_supervisor.process_identity_state", return_value="live"), \
+                 patch("manager.session_center_supervisor.spawn_session_center", spawn):
+                result = run_once(store, frozenset({("p1", "t1")}), state_path, "python", ".", 8765, 60,
+                                   read_session_state=fake_session_state)
+            spawn.assert_not_called()
+            self.assertEqual({"status": "unchanged", "execution_id": "exec-a"}, result)
+
+    def test_unreadable_session_state_never_regresses_below_pid_liveness_behavior(self):
+        # read_session_state returning None (unreachable/malformed) must
+        # behave identically to never having probed at all.
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "state.json")
+            write_state(state_path, 111, "exec-a", "id-111")
+            store = Store({"p1": [cmd(execution_id="exec-a")]})
+            spawn = Mock()
+            with patch("manager.session_center_supervisor.process_identity_state", return_value="live"), \
+                 patch("manager.session_center_supervisor.spawn_session_center", spawn):
+                result = run_once(store, frozenset({("p1", "t1")}), state_path, "python", ".", 8765, 60,
+                                   read_session_state=lambda host, port: None)
+            spawn.assert_not_called()
+            self.assertEqual({"status": "unchanged", "execution_id": "exec-a"}, result)
+
+    def test_reobserve_records_original_failure_before_the_process_is_killed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "state.json")
+            write_state(state_path, 111, "exec-a", "id-111")
+            store = Store({"p1": [cmd(execution_id="exec-a")]})
+            spawned = Mock()
+            spawned.pid = 222
+            fake_session_state = Mock(return_value={
+                "current_state": "correlation_failed", "error": "timed out", "failed_at": "2026-08-01T00:00:00+00:00",
+            })
+            with patch("manager.session_center_supervisor.process_identity_state", return_value="live"), \
+                 patch("manager.session_center_supervisor.kill"), \
+                 patch("manager.session_center_supervisor.port_available", return_value=True), \
+                 patch("manager.session_center_supervisor.process_creation_identity", return_value="id-222"), \
+                 patch("manager.session_center_supervisor.spawn_session_center", return_value=spawned):
+                run_once(store, frozenset({("p1", "t1")}), state_path, "python", ".", 8765, 60,
+                         read_session_state=fake_session_state)
+            evidence = read_evidence(evidence_path_for(state_path))
+            entry = next(e for e in evidence["history"] if e["event"] == "correlation_failed_detected")
+            self.assertEqual("timed out", entry["error"])
+            self.assertEqual("2026-08-01T00:00:00+00:00", entry["failed_at"])
+            self.assertEqual("exec-a", entry["execution_id"])
+            self.assertEqual({"execution_id": "exec-a", "failed_at": "2026-08-01T00:00:00+00:00", "error": "timed out"},
+                              evidence["open_degradation"])
+
+    def test_recovery_appends_new_history_entry_without_rewriting_the_original_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "state.json")
+            evidence_path = evidence_path_for(state_path)
+
+            # Cycle 1: correlation_failed detected, killed, respawned as pid 222.
+            write_state(state_path, 111, "exec-a", "id-111")
+            store = Store({"p1": [cmd(execution_id="exec-a")]})
+            spawned_222 = Mock(); spawned_222.pid = 222
+            failed_state = Mock(return_value={
+                "current_state": "correlation_failed", "error": "timed out", "failed_at": "2026-08-01T00:00:00+00:00",
+            })
+            with patch("manager.session_center_supervisor.process_identity_state", return_value="live"), \
+                 patch("manager.session_center_supervisor.kill"), \
+                 patch("manager.session_center_supervisor.port_available", return_value=True), \
+                 patch("manager.session_center_supervisor.process_creation_identity", return_value="id-222"), \
+                 patch("manager.session_center_supervisor.spawn_session_center", return_value=spawned_222):
+                run_once(store, frozenset({("p1", "t1")}), state_path, "python", ".", 8765, 60,
+                         read_session_state=failed_state)
+            original_entry = next(e for e in read_evidence(evidence_path)["history"]
+                                   if e["event"] == "correlation_failed_detected")
+
+            # Cycle 2: the new process (pid 222) has now correlated successfully.
+            recovered_state = Mock(return_value={"current_state": "running", "correlated": True})
+            spawn2 = Mock()
+            with patch("manager.session_center_supervisor.process_identity_state", return_value="live"), \
+                 patch("manager.session_center_supervisor.spawn_session_center", spawn2):
+                run_once(store, frozenset({("p1", "t1")}), state_path, "python", ".", 8765, 60,
+                         read_session_state=recovered_state)
+            spawn2.assert_not_called()  # healthy now -- must not respawn again
+
+            evidence = read_evidence(evidence_path)
+            # The original failure entry is untouched, byte for byte.
+            replayed_original = next(e for e in evidence["history"] if e["event"] == "correlation_failed_detected")
+            self.assertEqual(original_entry, replayed_original)
+            # A separate "recovered" entry was appended alongside it.
+            recovered_entry = next(e for e in evidence["history"] if e["event"] == "recovered")
+            self.assertEqual("2026-08-01T00:00:00+00:00", recovered_entry["original_failed_at"])
+            self.assertEqual("timed out", recovered_entry["original_error"])
+            self.assertIsNone(evidence["open_degradation"])
+            self.assertEqual("recovered", evidence["recovery_result"])
+
+    def test_reobserve_never_dispatches_a_second_execution_or_writes_to_the_drive_store(self):
+        """Duplicate safety: a reobserve respawn must target the exact same
+        execution_id/project_id already on record, and the read-only Store
+        stub used throughout this file structurally cannot accept writes --
+        it only ever offers list_records()."""
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "state.json")
+            write_state(state_path, 111, "exec-a", "id-111")
+            store = Store({"p1": [cmd(execution_id="exec-a")]})
+            self.assertFalse(hasattr(store, "create") or hasattr(store, "write") or hasattr(store, "update"))
+            spawned = Mock(); spawned.pid = 222
+            spawn = Mock(return_value=spawned)
+            fake_session_state = Mock(return_value={"current_state": "correlation_failed", "error": "x", "failed_at": "t"})
+            with patch("manager.session_center_supervisor.process_identity_state", return_value="live"), \
+                 patch("manager.session_center_supervisor.kill"), \
+                 patch("manager.session_center_supervisor.port_available", return_value=True), \
+                 patch("manager.session_center_supervisor.process_creation_identity", return_value="id-222"), \
+                 patch("manager.session_center_supervisor.spawn_session_center", spawn):
+                run_once(store, frozenset({("p1", "t1")}), state_path, "python", ".", 8765, 60,
+                         read_session_state=fake_session_state)
+            spawn.assert_called_once()
+            _, _, _, spawned_execution_id, *_ = spawn.call_args[0]
+            self.assertEqual("exec-a", spawned_execution_id)  # never a fresh/second execution id
 
 
 class LockTests(unittest.TestCase):
