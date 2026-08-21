@@ -50,11 +50,24 @@ class WorktreeMaterializationError(TaskError):
         self.code = code
 
 
-def compute_worktree_identity(project_id: str, task_id: str) -> Dict[str, str]:
-    """Pure function of (project_id, task_id) -- the only durable identity
-    this slice is allowed to key off. No session/conversation/timestamp
-    input ever participates, so a retry (same project_id/task_id) always
+DEFAULT_BRANCH_PREFIX = "adm-worktree"
+DEFAULT_WORKTREE_ID_PREFIX = ""
+SUPPORTED_ISOLATION_MODES = frozenset({"worktree_per_task"})
+
+
+def compute_worktree_identity(project_id: str, task_id: str, branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+                              worktree_id_prefix: str = DEFAULT_WORKTREE_ID_PREFIX) -> Dict[str, str]:
+    """Pure function of (project_id, task_id, and the project's own registered
+    isolation_policy naming -- itself a pure function of project_id via the
+    Global Project Registry) -- never a session/conversation/timestamp
+    identity. A retry (same project_id/task_id, same registry state) always
     recomputes the exact same branch/worktree_id.
+
+    `branch_prefix`/`worktree_id_prefix` come from the project's own
+    isolation_policy.branch_prefix/worktree_prefix (Slice B) when materialize_
+    worktree() calls this -- never hardcoded per-project -- so this stays
+    project-agnostic; the defaults here only apply when a project's registry
+    entry declares no explicit prefix.
 
     `branch` is the full ref (`refs/heads/...`) persisted onto the Task --
     manager.execution_lifecycle.enter_running_gate() requires a
@@ -67,11 +80,31 @@ def compute_worktree_identity(project_id: str, task_id: str) -> Dict[str, str]:
         raise WorktreeMaterializationError("invalid_identity", f"invalid project_id: {project_id!r}")
     if not isinstance(task_id, str) or not ID_PATTERN.match(task_id):
         raise WorktreeMaterializationError("invalid_identity", f"invalid task_id: {task_id!r}")
-    short_branch = f"adm-worktree/{project_id}/{task_id}"
+    short_branch = f"{branch_prefix.strip('/')}/{project_id}/{task_id}"
     return {
         "branch": f"refs/heads/{short_branch}",
         "branch_short": short_branch,
-        "worktree_id": f"{project_id}--{task_id}",
+        "worktree_id": f"{worktree_id_prefix}{project_id}--{task_id}",
+    }
+
+
+def _verify_isolation_policy(project) -> Dict[str, str]:
+    """The project's own registered isolation_policy (Slice B) must actually
+    call for per-task worktree isolation -- this is what makes worktree
+    materialization the correct/expected execution path for this project at
+    all, rather than an assumption this module bakes in unconditionally.
+    Any other (or missing) mode fails closed rather than silently
+    materializing a worktree the project's own policy never asked for."""
+    policy = project.isolation_policy if isinstance(project.isolation_policy, dict) else {}
+    mode = policy.get("mode")
+    if mode not in SUPPORTED_ISOLATION_MODES:
+        raise WorktreeMaterializationError(
+            "isolation_policy_not_worktree_per_task",
+            f"project {project.project_id!r} isolation_policy.mode is {mode!r}, not one of {sorted(SUPPORTED_ISOLATION_MODES)}",
+        )
+    return {
+        "branch_prefix": policy.get("branch_prefix") or DEFAULT_BRANCH_PREFIX,
+        "worktree_id_prefix": policy.get("worktree_prefix") or DEFAULT_WORKTREE_ID_PREFIX,
     }
 
 
@@ -231,12 +264,13 @@ def materialize_worktree(store, project, task: Dict[str, Any], canonical_checkou
 
     _verify_repo_write_evidence(task)
     _verify_repo_identity(project, task)
+    naming = _verify_isolation_policy(project)
 
     baseline_head = task["baseline_head"]
     default_branch = project.default_branch or "main"
     _verify_baseline_lineage(canonical_checkout, baseline_head, default_branch, runner)
 
-    identity = compute_worktree_identity(project_id, task_id)
+    identity = compute_worktree_identity(project_id, task_id, **naming)
     branch, branch_short, worktree_id = identity["branch"], identity["branch_short"], identity["worktree_id"]
     worktree_path = Path(workspace_root) / "worktrees" / project_id / task_id
 

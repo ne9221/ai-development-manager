@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for deterministic branch/worktree materialization (Slice C)."""
 
+import dataclasses
 import subprocess
 from copy import deepcopy
 
@@ -170,6 +171,39 @@ def test_non_repo_write_task_rejected(canonical_repo, project):
     with pytest.raises(WorktreeMaterializationError) as exc:
         materialize_worktree(store, project, task, canonical_repo["path"], canonical_repo["path"].parent / "workspace")
     assert exc.value.code == "not_repo_write_task"
+
+
+def test_isolation_policy_mode_not_worktree_per_task_rejected(canonical_repo, project):
+    unsupported_project = dataclasses.replace(project, isolation_policy={"mode": "shared_checkout"})
+    task = _task(baseline_head=canonical_repo["head"])
+    store = _store_with_task(task)
+    with pytest.raises(WorktreeMaterializationError) as exc:
+        materialize_worktree(store, unsupported_project, task, canonical_repo["path"], canonical_repo["path"].parent / "workspace")
+    assert exc.value.code == "isolation_policy_not_worktree_per_task"
+
+
+def test_missing_isolation_policy_rejected(canonical_repo, project):
+    no_policy_project = dataclasses.replace(project, isolation_policy={})
+    task = _task(baseline_head=canonical_repo["head"])
+    store = _store_with_task(task)
+    with pytest.raises(WorktreeMaterializationError) as exc:
+        materialize_worktree(store, no_policy_project, task, canonical_repo["path"], canonical_repo["path"].parent / "workspace")
+    assert exc.value.code == "isolation_policy_not_worktree_per_task"
+
+
+def test_registered_isolation_policy_naming_prefixes_are_consumed(canonical_repo, project):
+    """A project's registered isolation_policy.branch_prefix/worktree_prefix
+    (Slice B) drive the actual branch/worktree_id naming -- never a
+    hardcoded literal -- so a different project's registered convention
+    (e.g. this repo's real "feat/" branch_prefix + "wt-adm-" worktree_prefix)
+    is genuinely honored, keeping this module project-agnostic."""
+    prefixed_project = dataclasses.replace(
+        project, isolation_policy={"mode": "worktree_per_task", "branch_prefix": "feat/", "worktree_prefix": "wt-adm-"})
+    task = _task(baseline_head=canonical_repo["head"])
+    store = _store_with_task(task)
+    result = materialize_worktree(store, prefixed_project, task, canonical_repo["path"], canonical_repo["path"].parent / "workspace")
+    assert result["branch"] == "refs/heads/feat/proj-a/task-1"
+    assert result["worktree_id"] == "wt-adm-proj-a--task-1"
 
 
 # --- create / reuse / persistence ------------------------------------------
