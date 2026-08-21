@@ -78,11 +78,14 @@ from manager.dispatch_requests import claim_dispatch_request
 from manager.dispatcher import dispatch as dispatcher_dispatch
 from manager.executions import MAX_RETRY_COUNT, linked_command_for_execution, retry_eligible
 from manager.tasks import TaskError, now_iso, update_task, validate
-from manager.trusted_ingress import ADMISSION_VERSION, REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN
+from manager.trusted_ingress import (
+    ADMISSION_VERSION, ADMISSION_VERSION_V2_REPO_WRITE, REQUIRED_REPO_WRITE_TASK_POLICIES,
+    REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN,
+)
 
 
 ALLOWED_FIELDS = {"request_id", "project_id", "title", "goal", "priority", "constraints",
-                   "provider", "account_id", "retry_of_execution_id"}
+                   "provider", "account_id", "retry_of_execution_id", "repo_write"}
 ALLOWED_CONSTRAINT_FIELDS = {"read_only"}
 ALLOWED_PRIORITIES = {"low", "normal", "high", "urgent"}
 # Matches schema/command.schema.json's provider enum -- the only providers
@@ -94,6 +97,36 @@ ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 EXECUTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 MAX_TITLE_LENGTH = 300
 MAX_GOAL_LENGTH = 4000
+
+# --- v2-repo-write request shape -------------------------------------------------
+#
+# A caller opts into bounded repo-write (constraints.read_only: false) only
+# by also supplying `repo_write`, an explicit, narrow, server-validated
+# request for edit authority. The server -- never the caller -- decides the
+# resulting execution_policies/admission_version; `repo_write` can only ever
+# name *what* the caller wants touched, not grant itself write policies
+# directly (ALLOWED_REPO_WRITE_FIELDS makes it impossible to smuggle any
+# other field in).
+ALLOWED_REPO_WRITE_FIELDS = {"allowed_paths", "baseline_head", "repo"}
+MAX_ALLOWED_PATH_ENTRIES = 100
+MAX_ALLOWED_PATH_LENGTH = 300
+# repo-relative POSIX-style path segments only: letters/digits/._- and `/`
+# as separator. No leading `/`, no `\`, no drive letter, no glob metachar
+# (`*?[]`), no `..`/`.` segment, no `.git` segment -- this pattern already
+# excludes glob metacharacters and backslashes by construction (unbounded
+# wildcards and Windows-style absolute paths cannot even match it).
+ALLOWED_PATH_ENTRY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$")
+# schema/task.schema.json's own baseline_head pattern: a full (not
+# abbreviated) 40-char SHA-1 or 64-char SHA-256 hex commit id.
+BASELINE_HEAD_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+REPO_IDENTITY_PATTERN = re.compile(r"^[A-Za-z0-9_.:/-]{1,300}$")
+# Path segments/filenames that name credentials/secrets rather than source --
+# rejected regardless of case, wherever they appear in the path.
+CREDENTIAL_PATH_DENYLIST = re.compile(
+    r"(^|/)(\.env(\..+)?|\.npmrc|\.netrc|\.pypirc|\.aws|\.ssh|id_rsa(\..+)?|"
+    r"[^/]*\.(pem|key|pfx|p12)|[^/]*(secret|credential)[^/]*)(/|$)",
+    re.IGNORECASE,
+)
 
 # A claim record alone is never sufficient proof a retry can report success:
 # the original claimant may have died between winning the CAS and finishing
@@ -110,6 +143,53 @@ class DispatchIngressError(TaskError):
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
+
+
+def _safe_repo_write_path(path):
+    """A single repo_write.allowed_paths entry: repo-relative only, no
+    traversal, no `.git`, no credential/secret path, no glob metacharacter
+    (ALLOWED_PATH_ENTRY_PATTERN's charset already excludes `*?[]\\` and any
+    leading `/` or drive letter -- those simply cannot match)."""
+    if not isinstance(path, str) or not path or len(path) > MAX_ALLOWED_PATH_LENGTH:
+        return False
+    if not ALLOWED_PATH_ENTRY_PATTERN.match(path):
+        return False
+    segments = path.split("/")
+    if any(segment in ("..", ".") for segment in segments):
+        return False
+    if any(segment == ".git" for segment in segments):
+        return False
+    if CREDENTIAL_PATH_DENYLIST.search(path):
+        return False
+    return True
+
+
+def _validate_repo_write_request(value):
+    """Validate the caller-supplied `repo_write` object and return its
+    cleaned form. This only validates shape/safety of what the caller
+    named; handle_dispatch() separately cross-checks `repo` against the
+    Project's own registered repo before trusting it as identity evidence."""
+    if not isinstance(value, dict) or set(value) != ALLOWED_REPO_WRITE_FIELDS:
+        raise DispatchIngressError(
+            "malformed_repo_write", f"repo_write must be an object containing exactly {sorted(ALLOWED_REPO_WRITE_FIELDS)}")
+    allowed_paths = value.get("allowed_paths")
+    if not isinstance(allowed_paths, list) or not allowed_paths:
+        raise DispatchIngressError("empty_allowed_paths", "repo_write.allowed_paths must be a non-empty list of repo-relative paths")
+    if len(allowed_paths) > MAX_ALLOWED_PATH_ENTRIES:
+        raise DispatchIngressError("empty_allowed_paths", f"repo_write.allowed_paths must not exceed {MAX_ALLOWED_PATH_ENTRIES} entries")
+    for path in allowed_paths:
+        if not _safe_repo_write_path(path):
+            raise DispatchIngressError(
+                "unsafe_allowed_path",
+                f"repo_write.allowed_paths entry is not a safe, bounded, repo-relative path: {path!r}",
+            )
+    baseline_head = value.get("baseline_head")
+    if not isinstance(baseline_head, str) or not BASELINE_HEAD_PATTERN.match(baseline_head):
+        raise DispatchIngressError("invalid_baseline_head", "repo_write.baseline_head must be a full 40 or 64 character hex commit id")
+    repo = value.get("repo")
+    if not isinstance(repo, str) or not repo.strip() or not REPO_IDENTITY_PATTERN.match(repo):
+        raise DispatchIngressError("missing_repo_identity", "repo_write.repo must be a non-empty repo identity string")
+    return {"allowed_paths": list(allowed_paths), "baseline_head": baseline_head, "repo": repo}
 
 
 def validate_dispatch_payload(payload):
@@ -136,16 +216,28 @@ def validate_dispatch_payload(payload):
     read_only = constraints.get("read_only", True)
     if not isinstance(read_only, bool):
         raise DispatchIngressError("malformed_request", "constraints.read_only must be a boolean")
+    repo_write_payload = payload.get("repo_write")
     if read_only is not True:
         # v1 Safe Auto-Admission only ever creates disposable read-only
         # tasks -- the caller cannot opt out of read_only, not even
-        # explicitly. There is deliberately no server-side override to
-        # true here: a caller that actually wants write access is rejected
-        # outright, not silently downgraded.
-        raise DispatchIngressError(
-            "read_only_required",
-            "direct dispatch ingress v1 only accepts disposable read-only tasks; constraints.read_only must be true or omitted",
-        )
+        # explicitly, unless it also supplies an explicit, validated
+        # `repo_write` request: that is the only way to opt into the
+        # separate, explicitly versioned v2-repo-write admission contract.
+        # There is deliberately no server-side override to true here: a
+        # caller that wants write access without naming repo_write is
+        # rejected outright, not silently downgraded.
+        if repo_write_payload is None:
+            raise DispatchIngressError(
+                "read_only_required",
+                "constraints.read_only: false requires an explicit repo_write request (v2-repo-write); "
+                "read-only requests must omit constraints.read_only or set it true",
+            )
+        repo_write = _validate_repo_write_request(repo_write_payload)
+    else:
+        if repo_write_payload is not None:
+            raise DispatchIngressError(
+                "malformed_request", "repo_write requires constraints.read_only: false explicitly")
+        repo_write = None
     provider = payload.get("provider")
     if provider is not None and (not isinstance(provider, str) or provider not in ALLOWED_PROVIDERS):
         raise DispatchIngressError("malformed_request", f"provider must be one of {sorted(ALLOWED_PROVIDERS)} or omitted")
@@ -173,9 +265,17 @@ def validate_dispatch_payload(payload):
                 "malformed_request",
                 "retry_of_execution_id cannot be combined with provider/account_id",
             )
+        if repo_write is not None:
+            # This slice's retry path only ever relaunches a prior attempt's
+            # exact existing (and, so far, always read-only) Task -- it does
+            # not carry its own repo_write evidence to validate or admit
+            # under. Keeping the two mutually exclusive avoids an ambiguous
+            # "retry of a write task" shape this slice does not define.
+            raise DispatchIngressError(
+                "malformed_request", "retry_of_execution_id cannot be combined with repo_write")
     return {
         "request_id": request_id, "project_id": project_id, "title": title.strip(),
-        "goal": goal.strip(), "priority": priority, "read_only": read_only,
+        "goal": goal.strip(), "priority": priority, "read_only": read_only, "repo_write": repo_write,
         "provider": provider, "account_id": account_id, "retry_of_execution_id": retry_of_execution_id,
     }
 
@@ -212,7 +312,22 @@ def _fetch_if_exists(store, area, project_id, name):
         raise
 
 
-def _resolve_existing_claim(store, project_id, request_id, claim):
+def _repo_write_replay_matches(task, requested_repo_write):
+    """Same request_id, resubmitted with a repo_write shape: this must be a
+    pure idempotent replay of the *original* contract, never a channel to
+    widen (or otherwise change) allowed_paths/baseline_head/repo, and never
+    a way to escalate a request_id originally admitted read-only into a
+    write one. Any difference at all -- not just a widening -- fails
+    closed, since a request_id is only ever supposed to name one fixed
+    request."""
+    if task.get("read_only") is not False:
+        return False
+    return (sorted(task.get("allowed_paths") or []) == sorted(requested_repo_write["allowed_paths"])
+            and task.get("baseline_head") == requested_repo_write["baseline_head"]
+            and (task.get("source_context") or {}).get("repo") == requested_repo_write["repo"])
+
+
+def _resolve_existing_claim(store, project_id, request_id, claim, clean=None):
     """The retry path for an already-claimed request_id (`claim["claimed"]
     is False`). Cases:
 
@@ -228,6 +343,11 @@ def _resolve_existing_claim(store, project_id, request_id, claim):
     - Command found but its own identity does not match the claim it was
       created under (task_id/request_id linkage): fail closed rather than
       trust a record that could belong to a different, colliding claim.
+    - `clean` (the newly-submitted, freshly-validated payload) names a
+      repo_write contract that does not exactly match the one the original
+      request created -- or claims read-only replay of an originally
+      repo-write request_id, or vice versa: fail closed rather than let a
+      request_id replay silently widen or change write scope.
 
     A retry-linked Command (retry_of_execution_id is not None) targets a
     pre-existing task, so its Task's source_context.external_request_id
@@ -249,6 +369,20 @@ def _resolve_existing_claim(store, project_id, request_id, claim):
                     "dispatch_state_inconsistent",
                     f"claimed request {request_id} resolves to a Task/Command whose identity does not match the claim",
                 )
+            if clean is not None:
+                requested_repo_write = clean.get("repo_write")
+                if requested_repo_write is not None and not _repo_write_replay_matches(task, requested_repo_write):
+                    raise DispatchIngressError(
+                        "request_replay_scope_mismatch",
+                        f"request {request_id} was already claimed under a different (or non-repo-write) "
+                        "contract; the same request_id cannot widen or change allowed_paths/baseline_head/repo on replay",
+                    )
+                if requested_repo_write is None and task.get("read_only") is False:
+                    raise DispatchIngressError(
+                        "request_replay_scope_mismatch",
+                        f"request {request_id} was originally claimed as a repo-write request; "
+                        "a read-only replay of the same request_id is rejected rather than silently downgraded",
+                    )
             return {"accepted": True, "request_id": request_id, "task_id": task_id,
                     "command_id": command_id, "status": command.get("status", "queued")}
         if attempt + 1 < CLAIM_VERIFICATION_ATTEMPTS:
@@ -346,9 +480,18 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
     clean = validate_dispatch_payload(payload)
     project_id, request_id = clean["project_id"], clean["request_id"]
     try:
-        store.get("projects", project_id, project_id)
+        project = store.get("projects", project_id, project_id)
     except TaskError as exc:
         raise DispatchIngressError("unknown_project", f"unknown project: {project_id}") from exc
+
+    if clean["repo_write"] is not None and clean["repo_write"]["repo"] != project.get("repo"):
+        # The caller's repo identity is only ever trusted once cross-checked
+        # against the Project's own registered repo -- never taken on its
+        # own say-so, even though its shape was already validated above.
+        raise DispatchIngressError(
+            "repo_identity_mismatch",
+            f"repo_write.repo does not match project {project_id}'s registered repo",
+        )
 
     if clean["retry_of_execution_id"] is not None:
         return _handle_retry_dispatch(store, lock_registry_factory, project_id, request_id, clean["retry_of_execution_id"])
@@ -372,25 +515,30 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
         raise DispatchIngressError("idempotency_backend_unavailable", "could not establish request idempotency") from exc
 
     if not claim["claimed"]:
-        return _resolve_existing_claim(store, project_id, request_id, claim)
+        return _resolve_existing_claim(store, project_id, request_id, claim, clean=clean)
 
+    is_repo_write = clean["repo_write"] is not None
+    admission_version = ADMISSION_VERSION_V2_REPO_WRITE if is_repo_write else ADMISSION_VERSION
     internal_request = {
         "project_id": project_id, "task_id": task_id, "title": clean["title"],
         "task_type": "general", "complexity": "medium",
-        # This ingress is unconditionally read-only (read_only=True is forced
-        # below, server-side, with no caller override -- see the read_only
-        # rejection above). manager.dispatcher.dispatch() has no read_only
-        # concept of its own and defaults needs_repo_edit=True for any new
-        # task that doesn't specify it, which would create a self-contradictory
-        # Task (read_only=True, needs_repo_edit=True) that
+        # v1: this ingress is unconditionally read-only (read_only=True is
+        # forced below, server-side, with no caller override). v2-repo-write:
+        # needs_repo_edit=True is likewise forced here, from clean/repo_write
+        # having already been fully validated above, never a raw caller flag.
+        # manager.dispatcher.dispatch() has no read_only concept of its own
+        # and defaults needs_repo_edit=True for any new task that doesn't
+        # specify it, which would create a self-contradictory read-only Task
+        # (read_only=True, needs_repo_edit=True) that
         # manager.execution_lifecycle.enter_running_gate() correctly refuses
-        # to ever launch (read-only access requires needs_repo_edit is not
-        # True). Setting it False here keeps the Task's own contract
-        # internally consistent from the moment it is first persisted.
-        "needs_repo_edit": False,
+        # to ever launch. Setting needs_repo_edit explicitly, matching the
+        # request shape, keeps the Task's own contract internally consistent
+        # from the moment it is first persisted.
+        "needs_repo_edit": is_repo_write,
         "source_context": {
             "origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": request_id,
-            "goal": clean["goal"], "admission_version": ADMISSION_VERSION,
+            "goal": clean["goal"], "admission_version": admission_version,
+            **({"repo": clean["repo_write"]["repo"]} if is_repo_write else {}),
         },
     }
     if requested_provider is not None:
@@ -418,13 +566,20 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
             f"requested account_id {requested_account_id!r} but dispatcher resolved {result.get('account_id')!r}",
         )
 
-    # read_only and execution_policies are forced here, server-side, from
-    # the fixed REQUIRED_TASK_POLICIES set -- never from clean/payload --
-    # so this Task always satisfies the Safe Auto-Admission policy gate
-    # (manager.trusted_ingress.task_policy_satisfied) the Command Watcher
-    # re-checks independently before ever launching it.
-    update_task(store, project_id, task_id, priority=clean["priority"],
-                read_only=True, execution_policies=sorted(REQUIRED_TASK_POLICIES))
+    # read_only and execution_policies are forced here, server-side, from a
+    # fixed policy set -- never from clean/payload -- so this Task always
+    # satisfies the matching policy gate in manager.trusted_ingress
+    # (task_policy_satisfied for v1, repo_write_policy_satisfied for
+    # v2-repo-write) the Command Watcher re-checks independently before
+    # ever launching it. v2-repo-write additionally stamps allowed_paths/
+    # baseline_head -- the Task's own bounded-write evidence.
+    if is_repo_write:
+        update_task(store, project_id, task_id, priority=clean["priority"],
+                    read_only=False, execution_policies=sorted(REQUIRED_REPO_WRITE_TASK_POLICIES),
+                    allowed_paths=clean["repo_write"]["allowed_paths"], baseline_head=clean["repo_write"]["baseline_head"])
+    else:
+        update_task(store, project_id, task_id, priority=clean["priority"],
+                    read_only=True, execution_policies=sorted(REQUIRED_TASK_POLICIES))
 
     command = {
         "command_id": command_id, "project_id": project_id, "task_id": task_id,
@@ -434,7 +589,7 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
         "mode": result["mode"], "effort": result["effort"], "selection_reason": result["selection_reason"],
         "quota_evidence": result["quota_evidence"], "created_at": now_iso(), "status": "queued",
         "execution_id": None, "claimed_at": None, "completed_at": None, "result": None,
-        "created_via": TRUSTED_INGRESS_ORIGIN, "admission_version": ADMISSION_VERSION, "request_id": request_id,
+        "created_via": TRUSTED_INGRESS_ORIGIN, "admission_version": admission_version, "request_id": request_id,
     }
     validate("command", command)
     store.put("commands", project_id, command_id, command)

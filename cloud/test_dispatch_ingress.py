@@ -17,7 +17,10 @@ from manager.test_command_watcher import CommandWatcherTests
 from manager.test_dispatcher import quota as quota_fixture
 from manager.test_task_claims import MemoryClaimRegistry
 from manager.test_tasks import FakeDriveService
-from manager.trusted_ingress import ADMISSION_VERSION, REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN
+from manager.trusted_ingress import (
+    ADMISSION_VERSION, ADMISSION_VERSION_V2_REPO_WRITE, REQUIRED_REPO_WRITE_TASK_POLICIES,
+    REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN,
+)
 
 
 def project(project_id="p1"):
@@ -813,6 +816,154 @@ class TrustedRetryLinkageTests(unittest.TestCase):
         # later by manager.command_watcher at claim time.
         self.assertEqual(task_before, task_after)
         self.assertEqual(TRUSTED_INGRESS_ORIGIN, task_after["source_context"]["origin"])
+
+
+class RepoWriteAdmissionIngressTests(unittest.TestCase):
+    """Slice A of the Global Hands-off Execution Layer: cloud.dispatch_ingress's
+    explicit, bounded v2-repo-write request shape (constraints.read_only:
+    false + an explicit `repo_write` object). Preserving v1: a write
+    request with no `repo_write` is still rejected exactly as before --
+    see DispatchIngressTests.test_read_only_false_is_rejected_outright,
+    unchanged by this slice."""
+
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+        create_project(self.store, project())
+        self.registries = SharedMemoryRegistries()
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=quota_fixture())
+        self.quota_patch.start()
+
+    def tearDown(self):
+        self.quota_patch.stop()
+
+    def call(self, body=None):
+        return handle_dispatch(self.store, self.service, self.registries.factory, body if body is not None else self.write_payload())
+
+    @staticmethod
+    def write_payload(**changes):
+        value = payload(request_id="req-w1", constraints={"read_only": False},
+                         repo_write={"allowed_paths": ["manager/foo.py"], "baseline_head": "a" * 40,
+                                     "repo": "https://github.com/example/project"})
+        value.update(changes)
+        return value
+
+    def test_valid_repo_write_request_creates_bounded_write_task_and_command(self):
+        result = self.call()
+        task = self.store.get("tasks", "p1", result["task_id"])
+        validate("task", task)
+        self.assertIs(False, task["read_only"])
+        self.assertIs(True, task["needs_repo_edit"])
+        self.assertEqual(["manager/foo.py"], task["allowed_paths"])
+        self.assertEqual("a" * 40, task["baseline_head"])
+        self.assertEqual(sorted(REQUIRED_REPO_WRITE_TASK_POLICIES), sorted(task["execution_policies"]))
+        self.assertEqual(ADMISSION_VERSION_V2_REPO_WRITE, task["source_context"]["admission_version"])
+        self.assertEqual("https://github.com/example/project", task["source_context"]["repo"])
+        command = self.store.get("commands", "p1", result["command_id"])
+        validate("command", command)
+        self.assertEqual(ADMISSION_VERSION_V2_REPO_WRITE, command["admission_version"])
+        self.assertEqual(TRUSTED_INGRESS_ORIGIN, command["created_via"])
+
+    def test_read_only_false_without_repo_write_still_rejected_as_before(self):
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-w-noop", constraints={"read_only": False}))
+        self.assertEqual("read_only_required", ctx.exception.code)
+
+    def test_repo_write_without_explicit_read_only_false_rejected(self):
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(self.write_payload(constraints={"read_only": True}))
+        self.assertEqual("malformed_request", ctx.exception.code)
+
+    def test_missing_allowed_paths_rejected(self):
+        bad = self.write_payload()
+        del bad["repo_write"]["allowed_paths"]
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(bad)
+        self.assertEqual("malformed_repo_write", ctx.exception.code)
+
+    def test_empty_allowed_paths_rejected(self):
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(self.write_payload(repo_write={**self.write_payload()["repo_write"], "allowed_paths": []}))
+        self.assertEqual("empty_allowed_paths", ctx.exception.code)
+
+    def test_missing_baseline_head_rejected(self):
+        bad = self.write_payload()
+        del bad["repo_write"]["baseline_head"]
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(bad)
+        self.assertEqual("malformed_repo_write", ctx.exception.code)
+
+    def test_invalid_baseline_head_rejected(self):
+        for bad_head in ("abc123", "g" * 40, "A" * 40, "a" * 39, ""):
+            with self.subTest(bad_head=bad_head):
+                with self.assertRaises(DispatchIngressError) as ctx:
+                    self.call(self.write_payload(request_id=f"req-bh-{len(bad_head)}",
+                                                  repo_write={**self.write_payload()["repo_write"], "baseline_head": bad_head}))
+                self.assertEqual("invalid_baseline_head", ctx.exception.code)
+
+    def test_unsafe_allowed_path_entries_rejected(self):
+        unsafe_paths = ("../secret.py", "/etc/passwd", "manager/.git/config", ".git/HEAD",
+                         "manager/.env", "config/id_rsa", "creds/secret.key", "manager/*.py", "a/../../b")
+        for index, bad_path in enumerate(unsafe_paths):
+            with self.subTest(bad_path=bad_path):
+                with self.assertRaises(DispatchIngressError) as ctx:
+                    self.call(self.write_payload(request_id=f"req-p-{index}",
+                                                  repo_write={**self.write_payload()["repo_write"], "allowed_paths": [bad_path]}))
+                self.assertEqual("unsafe_allowed_path", ctx.exception.code)
+
+    def test_missing_repo_identity_rejected(self):
+        bad = self.write_payload()
+        del bad["repo_write"]["repo"]
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(bad)
+        self.assertEqual("malformed_repo_write", ctx.exception.code)
+
+    def test_repo_identity_mismatch_with_project_rejected(self):
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(self.write_payload(repo_write={**self.write_payload()["repo_write"], "repo": "https://github.com/example/other-repo"}))
+        self.assertEqual("repo_identity_mismatch", ctx.exception.code)
+
+    def test_replay_with_widened_allowed_paths_fails_closed(self):
+        self.call()
+        widened = self.write_payload(repo_write={**self.write_payload()["repo_write"], "allowed_paths": ["manager/foo.py", "manager/bar.py"]})
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(widened)
+        self.assertEqual("request_replay_scope_mismatch", ctx.exception.code)
+        # The rejected replay must not have mutated the already-created Task.
+        task = self.store.get("tasks", "p1", "dispatch-req-w1")
+        self.assertEqual(["manager/foo.py"], task["allowed_paths"])
+
+    def test_replay_with_different_baseline_head_fails_closed(self):
+        self.call()
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(self.write_payload(repo_write={**self.write_payload()["repo_write"], "baseline_head": "b" * 40}))
+        self.assertEqual("request_replay_scope_mismatch", ctx.exception.code)
+
+    def test_replay_with_different_repo_rejected_as_identity_mismatch_before_replay_check(self):
+        # A replay naming a different repo never reaches the replay-scope
+        # check at all: it is rejected earlier, on every call (not just
+        # replays), for not matching the Project's own registered repo.
+        # Both are fail-closed; this documents which check fires first.
+        self.call()
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(self.write_payload(repo_write={**self.write_payload()["repo_write"], "repo": "https://github.com/example/other-repo"}))
+        self.assertEqual("repo_identity_mismatch", ctx.exception.code)
+
+    def test_replay_downgrading_to_read_only_fails_closed(self):
+        self.call()
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-w1", constraints={"read_only": True}))
+        self.assertEqual("request_replay_scope_mismatch", ctx.exception.code)
+
+    def test_replay_with_identical_repo_write_contract_is_idempotent(self):
+        first = self.call()
+        second = self.call()
+        self.assertEqual(first, second)
+
+    def test_retry_of_execution_id_combined_with_repo_write_rejected(self):
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(self.write_payload(retry_of_execution_id="some-execution"))
+        self.assertEqual("malformed_request", ctx.exception.code)
 
 
 if __name__ == "__main__":

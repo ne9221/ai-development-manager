@@ -20,6 +20,7 @@ from manager.execution_lifecycle import enter_running_gate
 from manager.executions import execution_health, heartbeat_execution, reserve_execution
 from manager.task_claims import TaskClaimConflict
 from manager.tasks import TaskError, create_project, create_task, now_iso
+from manager.trusted_ingress import ADMISSION_VERSION_V2_REPO_WRITE, REQUIRED_REPO_WRITE_TASK_POLICIES
 from manager.test_execution_lifecycle import project, task
 from manager.test_execution_lifecycle import quota_document
 from manager.test_task_claims import MemoryClaimRegistry
@@ -963,6 +964,139 @@ class TrustedIngressAdmissionTests(unittest.TestCase):
         runner.assert_called_once()
         self.assertEqual("completed", first["status"])
         self.assertEqual({"status": "completed", "skipped": True}, second)
+
+
+class RepoWriteAdmissionTests(unittest.TestCase):
+    """Slice A of the Global Hands-off Execution Layer: v2-repo-write
+    admission. manager.command_watcher must become admission-version-aware
+    (v1 keeps its existing disposable-read-only semantics; v2-repo-write
+    gets its own bounded-write policy gate) rather than running every
+    admitted Task through one global read-only gate -- and the static
+    ADM_WATCHER_ALLOWLIST_PATH allowlist must never, by itself, be able to
+    grant repo-write authority to a Task, no matter how compliant that
+    Task's own self-declared fields look."""
+
+    def setUp(self):
+        self.store = Store()
+        create_project(self.store, project())
+        self.registry = MemoryClaimRegistry()
+        self.registry.document = {
+            "schema_version": "0.1.0", "project_id": "p1", "request_id": "req-1",
+            "task_id": "t1", "command_id": "cmd-1", "created_at": now_iso(),
+        }
+        self.registry.generation = 1
+
+    def registry_factory(self, bucket, project_id, request_id):
+        return self.registry
+
+    def v2_task(self, **overrides):
+        built = create_task(self.store, task(read_only=False), assign=False, persist=False)
+        built["execution_policies"] = sorted(REQUIRED_REPO_WRITE_TASK_POLICIES)
+        built["source_context"] = {
+            "origin": "direct_dispatch_ingress", "external_request_id": "req-1",
+            "admission_version": ADMISSION_VERSION_V2_REPO_WRITE, "repo": "https://github.com/example/project",
+        }
+        built.update(overrides)
+        self.store.put("tasks", "p1", "t1", built)
+        return built
+
+    @staticmethod
+    def v2_command(**overrides):
+        value = command(created_via="direct_dispatch_ingress", admission_version=ADMISSION_VERSION_V2_REPO_WRITE, request_id="req-1")
+        value.update(overrides)
+        return value
+
+    def test_correct_v2_triple_launches_without_static_allowlist(self):
+        self.v2_task()
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", runner):
+            result = process_command(
+                self.store, object(), self.v2_command(), claim_factory=lambda *_: MemoryClaimRegistry(),
+                # A repo-write Task takes the writer-authority branch
+                # (writer_registry = None if read_only else writer_factory());
+                # this is a bare stand-in since launch_task itself is mocked
+                # and never actually touches the registry.
+                writer_factory=lambda: object(),
+                allowlist=frozenset(), health_check=lambda: True, quota_check=lambda service: True,
+                ingress_registry_factory=self.registry_factory,
+            )
+        runner.assert_called_once()
+        self.assertEqual("completed", result["status"])
+
+    def test_command_admission_version_alone_cannot_upgrade_a_v1_task(self):
+        """A v1-shaped Task (its own source_context.admission_version is
+        still "v1") whose Command alone claims admission_version
+        "v2-repo-write" must not be admitted: Task, Command, and
+        source_context admission_version must all agree, not just the
+        Command's own field."""
+        built = create_task(self.store, task(read_only=True), assign=False, persist=False)
+        built["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)
+        built["source_context"] = {
+            "origin": "direct_dispatch_ingress", "external_request_id": "req-1", "admission_version": "v1",
+        }
+        self.store.put("tasks", "p1", "t1", built)
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), self.v2_command(),  # Command alone claims v2-repo-write
+                claim_factory=lambda *_: MemoryClaimRegistry(), allowlist=frozenset(),
+                ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
+    def test_static_allowlist_alone_cannot_launch_repo_write(self):
+        """Even a Task that is fully v2-repo-write-policy-compliant must
+        not launch off the static allowlist alone: static-allowlist
+        admission is always evaluated under v1 read-only semantics, never
+        the Task's own claimed admission_version."""
+        self.v2_task()
+        launch = Mock()
+        with patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), command(), claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset({("p1", "t1")}), health_check=lambda: True, quota_check=lambda service: True,
+            )
+        launch.assert_not_called()
+        self.assertEqual("attention", result["status"])
+        self.assertEqual("allowlisted_task_policy_not_satisfied", result["recovery_reason"])
+
+    def test_unknown_admission_version_never_admitted(self):
+        self.v2_task()
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), self.v2_command(admission_version="v3-unsupported"),
+                claim_factory=lambda *_: MemoryClaimRegistry(), allowlist=frozenset(),
+                ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
+
+    def test_v1_read_only_false_task_still_never_admitted(self):
+        """Regression: a Command claiming plain v1 admission for a
+        read_only=False Task must still be rejected exactly as before --
+        v2-repo-write is a separate, additive contract, not a relaxation of
+        v1's own read-only requirement."""
+        built = create_task(self.store, task(read_only=False), assign=False, persist=False)
+        built["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)
+        built["source_context"] = {
+            "origin": "direct_dispatch_ingress", "external_request_id": "req-1", "admission_version": "v1",
+        }
+        self.store.put("tasks", "p1", "t1", built)
+        launch = Mock()
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}), \
+             patch("manager.command_watcher.launch_task", launch):
+            result = process_command(
+                self.store, object(), command(created_via="direct_dispatch_ingress", admission_version="v1", request_id="req-1"),
+                claim_factory=lambda *_: MemoryClaimRegistry(), allowlist=frozenset(),
+                ingress_registry_factory=self.registry_factory,
+            )
+        self.assertEqual({"status": "rejected", "reason": "not_allowlisted"}, result)
+        launch.assert_not_called()
 
 
 class WatcherSessionCenterBootstrapIntegrationTests(unittest.TestCase):
