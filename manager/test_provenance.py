@@ -162,6 +162,21 @@ class ProvenanceContractTests(unittest.TestCase):
     # 12. hidden launch regression: install script's provenance gate must not
     # disturb the existing AdmHiddenLaunch.ps1 wiring, and must run before
     # the Scheduled Task is actually registered.
+    def test_install_script_runs_provenance_activate_with_repo_on_cwd_or_pythonpath(self):
+        """Regression: the installer's `-m manager.provenance activate` call
+        must resolve the `manager` package regardless of the caller's own
+        working directory. A first version of this gate ran with whatever
+        CWD the installer itself was invoked from and failed closed with a
+        ModuleNotFoundError on a real HOME activation attempt -- caught by
+        the fail-closed gate doing its job, but still a real bug: fix by
+        scoping CWD to $RepositoryPath around the call."""
+        installer = (MANAGER_DIR / "install_command_watcher.ps1").read_text(encoding="utf-8")
+        activate_index = installer.index("manager.provenance activate")
+        push_location_index = installer.index("Push-Location -LiteralPath $RepositoryPath")
+        pop_location_index = installer.index("Pop-Location")
+        self.assertLess(push_location_index, activate_index)
+        self.assertLess(activate_index, pop_location_index)
+
     def test_install_script_still_wires_hidden_launch_and_gates_before_register(self):
         installer = (MANAGER_DIR / "install_command_watcher.ps1").read_text(encoding="utf-8")
         self.assertIn('. (Join-Path $PSScriptRoot "AdmHiddenLaunch.ps1")', installer)

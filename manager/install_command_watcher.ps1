@@ -19,9 +19,17 @@ param(
 # unless this exact checkout's HEAD was already proven by a TESTED evidence
 # capture (manager.provenance capture-tested). This is what makes "source
 # tests must pass before the Scheduled Task changes" fail-closed instead of
-# a procedural reminder.
-$activationOutput = & $PythonPath -m manager.provenance activate --repository-path $RepositoryPath --manager-home $ManagerHome 2>&1
-if ($LASTEXITCODE -ne 0) {
+# a procedural reminder. Runs with CWD set to $RepositoryPath so the
+# `manager` package resolves regardless of the caller's own working
+# directory (this script itself is not otherwise CWD-sensitive).
+Push-Location -LiteralPath $RepositoryPath
+try {
+    $activationOutput = & $PythonPath -m manager.provenance activate --repository-path $RepositoryPath --manager-home $ManagerHome 2>&1
+    $activationExit = $LASTEXITCODE
+} finally {
+    Pop-Location
+}
+if ($activationExit -ne 0) {
     Write-Error "PROVENANCE_MISMATCH: cannot activate Watcher install, TESTED evidence missing or does not match this checkout's HEAD.`n$activationOutput"
     exit 1
 }
