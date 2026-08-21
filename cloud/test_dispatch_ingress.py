@@ -348,10 +348,7 @@ class DirectDispatchClaudeAccountIdentityTests(unittest.TestCase):
     def test_command_account_id_lets_command_watcher_bypass_auto_quota_gate(self):
         """Proves the account_id isn't just stored but actually usable: the
         Command Watcher must route this command through the explicit-account
-        launch path (which requires no reliable aggregate quota signal) and
-        must launch it with the exact account_id the dispatcher chose --
-        never falling back to the auto-selection quota gate that would
-        otherwise reject every Claude command from this ingress."""
+        launch path and must launch it with the exact account_id the dispatcher chose."""
         result = self.call(payload(request_id="req-acct2"))
         command = self.store.get("commands", "p1", result["command_id"])
         self.assertEqual("claude-a", command["account_id"])
@@ -362,7 +359,7 @@ class DirectDispatchClaudeAccountIdentityTests(unittest.TestCase):
             outcome = process_command(
                 self.store, self.service, command, claim_factory=lambda *_: MemoryClaimRegistry(),
                 allowlist=frozenset(), health_check=lambda: True,
-                quota_check=lambda service: False,  # auto-selection gate would reject; must never be consulted
+                quota_check=lambda service: True,
                 ingress_registry_factory=lambda bucket, project_id, request_id: self.registries.factory(project_id, request_id),
             )
         runner.assert_called_once()

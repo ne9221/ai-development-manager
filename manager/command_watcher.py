@@ -84,7 +84,7 @@ def session_center_healthy(url=None, timeout=2.0):
     return isinstance(body, dict) and body.get("status") == "ok"
 
 
-def provider_quota_reliable(service, provider):
+def provider_quota_reliable(service, provider, account_id=None):
     """Fail-closed: stale/unknown/unreachable quota is never treated as
     "enough to launch", for any provider. Reuses quota_reader.summarize()'s
     own reliability computation unchanged -- no scoring/routing rework, just
@@ -92,21 +92,34 @@ def provider_quota_reliable(service, provider):
     already computes but does not itself hard-block on. A provider's
     has_reliable_quota is read from that provider's own quota_reader entry
     only; one provider's fresh quota can never satisfy another's gate.
+    When account_id is provided, checks that specific account's reliability
+    and ensures no quota window is exhausted.
     """
     try:
         quota = summarize(read_drive_status(service=service), max_age_minutes=60)
     except Exception:
         return False
-    entry = next((item for item in quota["providers"] if item["provider"] == provider), None)
-    return bool(entry and entry.get("has_reliable_quota"))
+    if account_id is not None:
+        entry = next((item for item in quota.get("accounts", []) if item.get("provider") == provider and item.get("account_id") == account_id), None)
+        if not entry or not entry.get("has_reliable_quota"):
+            return False
+        if any(w.get("remaining_percent") == 0.0 or w.get("used_percent") == 100.0 for w in entry.get("windows", [])):
+            return False
+        return True
+    entry = next((item for item in quota.get("providers", []) if item.get("provider") == provider), None)
+    if not entry or not entry.get("has_reliable_quota"):
+        return False
+    if any(w.get("remaining_percent") == 0.0 or w.get("used_percent") == 100.0 for w in entry.get("windows", [])):
+        return False
+    return True
 
 
-def codex_quota_reliable(service):
-    return provider_quota_reliable(service, "codex")
+def codex_quota_reliable(service, account_id=None):
+    return provider_quota_reliable(service, "codex", account_id=account_id)
 
 
-def claude_quota_reliable(service):
-    return provider_quota_reliable(service, "claude")
+def claude_quota_reliable(service, account_id=None):
+    return provider_quota_reliable(service, "claude", account_id=account_id)
 
 
 # provider -> {launcher_factory, quota_check}. An unrecognized provider must
@@ -407,22 +420,24 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     explicit_account_id = _explicit_account_id(command, candidate_task) if command["provider"] == "claude" else None
     claude_accounts = _claude_account_registry()
     if explicit_account_id is not None:
-        # Human/system explicit account selection overrides the quota-based
-        # AUTO-selection gate below -- it does not fabricate quota. Every
-        # other safety gate above and below this block (allowlist, task
-        # policy, Session Center health, task claim, launcher permission
-        # profile) still applies unchanged; this only skips the
-        # reliable-quota precondition, and only after independently proving
-        # the id names a real, enabled, locally-registered account.
+        # Human/system explicit account selection must validate against registry
+        # and enforce the fail-closed quota truth gate.
         if not _explicit_account_is_valid(claude_accounts, explicit_account_id):
             return {"status": "rejected", "reason": "unknown_or_disabled_claude_account"}
-    elif not quota_check(service):
-        # Same treatment: stale/unknown quota is transient, not a policy
-        # violation -- retried automatically once quota data refreshes.
-        # Unchanged for Codex, and unchanged for Claude when no explicit
-        # account_id was given (P0.0: official Claude quota is not reliably
-        # available headless today, so automatic selection correctly stays
-        # blocked until that changes).
+        quota_gate_fn = quota_check or runtime["quota_check"]
+        account_quota_ok = False
+        try:
+            import inspect
+            sig = inspect.signature(quota_gate_fn)
+            if "account_id" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                account_quota_ok = quota_gate_fn(service, account_id=explicit_account_id)
+            else:
+                account_quota_ok = quota_gate_fn(service)
+        except TypeError:
+            account_quota_ok = quota_gate_fn(service)
+        if not account_quota_ok:
+            return {"status": "rejected", "reason": "quota_unreliable"}
+    elif not (quota_check(service) if quota_check is not None else runtime["quota_check"](service)):
         return {"status": "rejected", "reason": "quota_unreliable"}
 
     retry_count = command.get("retry_count", 0)
