@@ -835,15 +835,18 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         store = MemoryStore()
         create_project(store, self._project(self.valid_dir))
         create_task(store, self._repo_write_task(), assign=False)
+        launcher = Launcher()
 
         with patch("manager.execution_runner.get_global_registry") as get_registry, \
              patch("manager.execution_runner.materialize_worktree") as materialize:
             get_registry.return_value.get_project.return_value = object()
             materialize.side_effect = WorktreeMaterializationError("baseline_lineage_mismatch", "nope")
             with self.assertRaises(WorktreeMaterializationError):
-                self._launch(store)
+                self._launch(store, launcher=launcher)
         # Must fail closed rather than silently falling back to Project's
-        # own canonical working_directory.
+        # own canonical working_directory: no provider process is ever
+        # spawned, and no Execution reservation is ever persisted.
+        self.assertEqual([], launcher.events)
         with self.assertRaises((TaskError, KeyError)):
             store.get("executions", "p1", "exec-a")
 
