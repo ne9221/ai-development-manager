@@ -3,3 +3,4 @@ __pycache__/
 .test-deps/
 .venv/
 venv/
+manager/generated/
