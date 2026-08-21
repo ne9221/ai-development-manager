@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -819,12 +820,19 @@ class WorkingDirectoryContractTests(unittest.TestCase):
             return dict(materialized_result)
 
         with patch("manager.execution_runner.get_global_registry") as get_registry, \
-             patch("manager.execution_runner.materialize_worktree", side_effect=fake_materialize) as materialize:
+             patch("manager.execution_runner.materialize_worktree", side_effect=fake_materialize) as materialize, \
+             patch("manager.execution_runner.enforce_allowed_paths", return_value=[]) as enforce:
+            # Slice D's actual allowed_paths enforcement (real git diff
+            # against an isolated worktree) is covered end-to-end in
+            # manager.test_repo_write_enforcement; this test's own concern is
+            # purely the working_directory wiring, so it stubs enforcement
+            # to a clean no-op rather than needing a real git repo here too.
             get_registry.return_value.get_project.return_value = fake_project
             result, launcher = self._launch(store)
 
         get_registry.return_value.get_project.assert_called_once_with("p1")
         materialize.assert_called_once()
+        enforce.assert_called_once_with(materialized, HEAD, ["manager/executions.py"])
         self.assertEqual(materialized, launcher.request.working_directory)
         self.assertNotEqual(self.valid_dir, launcher.request.working_directory)
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
@@ -953,6 +961,118 @@ class WorkingDirectoryContractTests(unittest.TestCase):
                 store = self._store(project_working_directory=self.valid_dir)
                 self._launch(store, launcher=launcher, provider=provider)
                 self.assertEqual(self.valid_dir, launcher.request.working_directory)
+
+
+def _git(cwd, *args):
+    result = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    assert result.returncode == 0, f"git {' '.join(args)} failed: {result.stderr}"
+    return result.stdout.strip()
+
+
+class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
+    """End-to-end proof (real git, real launch_task() pipeline, no mocked
+    enforcement) of Slice D: a provider that actually writes outside its
+    Task's allowed_paths inside its isolated worktree can never have that
+    execution -- or its Task -- persisted as successfully completed."""
+
+    def setUp(self):
+        self.repo_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.repo_dir.cleanup)
+        root = Path(self.repo_dir.name).resolve()
+        _git(root, "init")
+        _git(root, "symbolic-ref", "HEAD", "refs/heads/main")
+        _git(root, "config", "user.email", "test@example.com")
+        _git(root, "config", "user.name", "Test")
+        (root / "manager").mkdir()
+        (root / "other").mkdir()
+        (root / "manager" / "foo.py").write_text("original\n", encoding="utf-8")
+        (root / "other" / "bar.py").write_text("original\n", encoding="utf-8")
+        _git(root, "add", ".")
+        _git(root, "commit", "-m", "init")
+        self.worktree = root
+        self.baseline_head = _git(root, "rev-parse", "HEAD")
+
+        self.lock_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.lock_home.cleanup)
+        self._lock_home_patch = patch.dict(os.environ, {"AI_MANAGER_HOME": self.lock_home.name})
+        self._lock_home_patch.start()
+        self.addCleanup(self._lock_home_patch.stop)
+
+    def _repo_write_task(self):
+        return {
+            "task_id": "t1", "project_id": "p1", "title": "Bounded write task", "task_type": "implementation",
+            "complexity": "medium", "expected_minutes": 20, "needs_repo_edit": True,
+            "needs_research": False, "needs_browser": False, "parallelizable": False,
+            "read_only": False, "scope": ["manager/foo.py"], "constraints": [],
+            "acceptance_criteria": ["gate"], "branch": "refs/heads/main", "baseline_head": self.baseline_head,
+            "working_directory": str(self.worktree), "worktree_id": "p1--t1",
+            "allowed_paths": ["manager/foo.py"],
+            "execution_policies": ["disposable", "bounded_repo_write", "no_external_writes"],
+        }
+
+    def _store(self):
+        store = MemoryStore()
+        create_project(store, {
+            "project_id": "p1", "name": "Project", "repo": REPO, "default_branch": "main",
+            "runtime_ssot": "Drive", "project_rules": [], "active_tasks": ["t1"],
+            "current_phase": "Phase 3C", "important_constraints": [],
+        })
+        create_task(store, self._repo_write_task(), assign=False)
+        return store
+
+    def _launch(self, store, launcher):
+        with patch("manager.execution_runner.dispatch", return_value={
+            "recommended_provider": "codex", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
+            "generated_prompt": "bounded task",
+        }), patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            return launch_task(store, object(), MemoryRegistry(), MemoryClaimRegistry(), launcher,
+                               "p1", "t1", "exec-a", provider="codex")
+
+    def test_out_of_scope_write_is_rejected_and_never_completes(self):
+        class OutOfScopeLauncher(Launcher):
+            def wait(self, running):
+                (Path(self.request.working_directory) / "other" / "bar.py").write_text("hacked\n", encoding="utf-8")
+                return super().wait(running)
+
+        store = self._store()
+        result = self._launch(store, OutOfScopeLauncher())
+
+        self.assertEqual("failed", result["terminal"]["execution"]["status"])
+        self.assertNotEqual("completed", result["terminal"]["execution"]["status"])
+        self.assertIn("other/bar.py", result["terminal"]["execution"]["notes"][-1])
+        # The Task itself must not be persisted as completed either.
+        self.assertNotEqual("completed", store.get("tasks", "p1", "t1")["status"])
+
+    def test_out_of_scope_write_blocks_downstream_success_style_hook(self):
+        """No future commit/push step -- represented here by a stub only a
+        genuinely successful launch_task() call would be free to invoke --
+        can ever run after an out-of-scope write."""
+        class OutOfScopeLauncher(Launcher):
+            def wait(self, running):
+                (Path(self.request.working_directory) / "escaped.py").write_text("hacked\n", encoding="utf-8")
+                return super().wait(running)
+
+        store = self._store()
+        result = self._launch(store, OutOfScopeLauncher())
+
+        commit_and_push_calls = []
+        if result["terminal"]["execution"]["status"] == "completed":
+            commit_and_push_calls.append("called")  # would be the real future hook
+        self.assertEqual([], commit_and_push_calls)
+
+    def test_in_scope_write_completes_normally(self):
+        class InScopeLauncher(Launcher):
+            def wait(self, running):
+                (Path(self.request.working_directory) / "manager" / "foo.py").write_text("edited\n", encoding="utf-8")
+                return super().wait(running)
+
+        store = self._store()
+        result = self._launch(store, InScopeLauncher())
+
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+        self.assertEqual("completed", store.get("tasks", "p1", "t1")["status"])
 
 
 if __name__ == "__main__":
