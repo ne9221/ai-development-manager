@@ -522,7 +522,7 @@ class CommandWatcherTests(unittest.TestCase):
 
     _NO_OVERRIDE = object()
 
-    def _run_explicit(self, cmd, quota_reliable=False, registry=_NO_OVERRIDE):
+    def _run_explicit(self, cmd, quota_reliable=True, registry=_NO_OVERRIDE):
         runner = Mock(return_value=self.complete("exec-claude"))
         with patch("manager.command_watcher.launch_task", runner), \
              patch("manager.command_watcher._claude_account_registry",
@@ -586,9 +586,9 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertEqual({"status": "rejected", "reason": "unknown_or_disabled_claude_account"}, result)
         runner.assert_not_called()
 
-    def test_claude_explicit_valid_account_bypasses_quota_gate_even_when_unreliable(self):
-        # This is the core of Blocker 2: quota_check is never even called
-        # when an explicit, validated account_id is present.
+    def test_claude_explicit_valid_account_enforces_quota_gate_when_unreliable(self):
+        # Truth Contract Fix: quota_check is enforced even when an explicit,
+        # validated account_id is present. Unreliable/exhausted quota fails closed.
         quota_check = Mock(return_value=False)
         runner = Mock(return_value=self.complete("exec-claude"))
         with patch("manager.command_watcher.launch_task", runner), \
@@ -598,7 +598,21 @@ class CommandWatcherTests(unittest.TestCase):
                 claim_factory=self.claim_factory, allowlist=frozenset({("p1", "t1")}),
                 health_check=lambda: True, quota_check=quota_check,
             )
-        quota_check.assert_not_called()
+        quota_check.assert_called_once()
+        runner.assert_not_called()
+        self.assertEqual({"status": "rejected", "reason": "quota_unreliable"}, result)
+
+    def test_claude_explicit_valid_account_launches_when_quota_reliable(self):
+        quota_check = Mock(return_value=True)
+        runner = Mock(return_value=self.complete("exec-claude"))
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher._claude_account_registry", return_value=self.REGISTRY):
+            result = process_command(
+                self.store, object(), command(provider="claude", account_id="account-a"),
+                claim_factory=self.claim_factory, allowlist=frozenset({("p1", "t1")}),
+                health_check=lambda: True, quota_check=quota_check,
+            )
+        quota_check.assert_called_once()
         runner.assert_called_once()
         self.assertEqual("completed", result["status"])
 

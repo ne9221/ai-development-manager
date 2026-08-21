@@ -209,6 +209,33 @@ def _additional_claude_accounts():
     return {account_id: Path(path) for account_id, path in parsed.items()}
 
 
+def discover_claude_accounts(home_path=None):
+    """Discover enabled Claude accounts from claude_accounts.json in config dir,
+    and merge with any explicit CLAUDE_STATUSLINE_PAYLOADS environment variable overrides.
+    Returns {account_id: payload_path}."""
+    home = Path(home_path or os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
+    registry_path = home / "config" / "claude_accounts.json"
+    accounts_map = {}
+    if registry_path.is_file():
+        try:
+            from manager.claude_account_selector import load_claude_accounts
+            for acc in load_claude_accounts(registry_path):
+                if acc.get("enabled", True):
+                    acc_id = acc["account_id"]
+                    config_dir = acc.get("config_dir")
+                    if config_dir:
+                        accounts_map[acc_id] = Path(config_dir) / "statusline-payload.json"
+                    else:
+                        accounts_map[acc_id] = Path(os.environ.get("CLAUDE_STATUSLINE_PAYLOAD", Path.home() / ".claude" / "statusline-payload.json"))
+        except Exception:
+            pass
+
+    # Merge explicit CLAUDE_STATUSLINE_PAYLOADS env overrides
+    env_accounts = _additional_claude_accounts()
+    accounts_map.update(env_accounts)
+    return accounts_map
+
+
 def main():
     home = Path(os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
     try:
@@ -218,7 +245,7 @@ def main():
             log_path=home / "logs" / "refresh.log",
             lock_path=home / "refresh.lock",
             claude_path=Path(os.environ.get("CLAUDE_STATUSLINE_PAYLOAD", Path.home() / ".claude" / "statusline-payload.json")),
-            claude_accounts=_additional_claude_accounts(),
+            claude_accounts=discover_claude_accounts(home),
         )
         print(f"REFRESHED Drive status.json ({result['publish']['action']})")
         return 0
