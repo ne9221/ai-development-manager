@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory=$true)][string]$StateFile,
     [string]$PythonDeps,
     [string]$AllowlistPath,
-    [int]$Port = 8765
+    [int]$Port = 8765,
+    [string]$GcsBucket
 )
 
 . (Join-Path $PSScriptRoot "AdmHiddenLaunch.ps1")
@@ -16,6 +17,7 @@ $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy By
 if ($PythonDeps) { $arguments += " -PythonDeps `"$PythonDeps`"" }
 if ($AllowlistPath) { $arguments += " -AllowlistPath `"$AllowlistPath`"" }
 $arguments += " -Port $Port"
+if ($GcsBucket) { $arguments += " -GcsBucket `"$GcsBucket`"" }
 $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $RepositoryPath -WrapperName "session-center-supervisor" -PowerShellArguments $arguments
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)

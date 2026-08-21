@@ -53,6 +53,15 @@ class InstallerHiddenLaunchWiringTest(unittest.TestCase):
                 )
                 self.assertNotIn('New-ScheduledTaskAction -Execute "powershell.exe"', content)
 
+    def test_session_center_supervisor_installer_can_pass_gcs_bucket(self):
+        """run_session_center_supervisor.ps1 has always accepted -GcsBucket
+        (needed for trusted-ingress command discovery), but the installer
+        never exposed it -- a real functional regression risk when
+        reinstalling live HOME tasks through this installer. Preserve it."""
+        installer = (MANAGER_DIR / "install_session_center_supervisor.ps1").read_text(encoding="utf-8")
+        self.assertIn("[string]$GcsBucket", installer)
+        self.assertIn('$arguments += " -GcsBucket `"$GcsBucket`""', installer)
+
     def test_legacy_powershell_arguments_are_preserved(self):
         installer = (MANAGER_DIR / "install_command_watcher.ps1").read_text(encoding="utf-8")
         runner = (MANAGER_DIR / "run_command_watcher.ps1").read_text(encoding="utf-8")
