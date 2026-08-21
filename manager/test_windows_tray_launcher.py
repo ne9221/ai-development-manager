@@ -75,20 +75,83 @@ $started = Start-AdmDashboardBackground -RepositoryPath "{REPO_ROOT}"
         content = launcher_path.read_text(encoding="utf-8", errors="ignore")
         self.assertIn("Start-AdmServicesSafe", content)
         self.assertIn("Start-AdmDashboardBackground", content)
-        
-        # Test Start-AdmServicesSafe execution idempotency
+
+        # Start-AdmServicesSafe itself is exercised without touching real
+        # Scheduled Tasks by the AllowEnable tests below; this only proves
+        # AdmCommon.ps1 loads and its dashboard-confirmation entry point
+        # runs cleanly (a real side effect, but never registers/enables/
+        # triggers any Scheduled Task).
         script = f'''
 $ErrorActionPreference = "Stop"
 . "{DESKTOP_DIR / 'AdmCommon.ps1'}"
-Confirm-AdmTaskEnabled -TaskName $AdmSupervisorTask
-Confirm-AdmTaskEnabled -TaskName $AdmWatcherTask
-Start-ScheduledTask -TaskName $AdmSupervisorTask -ErrorAction SilentlyContinue
-Start-ScheduledTask -TaskName $AdmWatcherTask -ErrorAction SilentlyContinue
 Start-AdmDashboardBackground -RepositoryPath "{REPO_ROOT}" -ErrorAction SilentlyContinue
 '''
         cmd = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        self.assertEqual(0, res.returncode, f"Cold start service trigger failed: {res.stderr}")
+        self.assertEqual(0, res.returncode, f"Cold start dashboard trigger failed: {res.stderr}")
+
+    def test_cold_start_never_auto_enables_a_disabled_task(self):
+        """P0: a user-disabled ADM Scheduled Task must stay disabled across
+        Tray restarts/reboots. Exercises the real Start-AdmServicesSafe
+        function (dot-sourced, never run as the full Tray app) against fake
+        Get-ScheduledTask/Enable-ScheduledTask/Start-ScheduledTask/
+        Start-AdmDashboardBackground so no real Scheduled Task is ever
+        touched, and asserts cold start (no -AllowEnable) leaves a Disabled
+        task alone, while an explicit -AllowEnable call (the "啟動服務"/
+        "重新啟動服務" menu path) still recovers it."""
+        launcher_path = DESKTOP_DIR / "AdmTrayLauncher.ps1"
+        content = launcher_path.read_text(encoding="utf-8", errors="ignore")
+        # Only the function definition is needed; the file's top-level
+        # executable statements (mutex/NotifyIcon/Application.Run) must not
+        # run in-process, so extract just the function body textually.
+        marker = "function Start-AdmServicesSafe {"
+        start = content.index(marker)
+        end = content.index("\nfunction Restart-AdmServicesSafe", start)
+        function_source = content[start:end]
+
+        script = f'''
+$ErrorActionPreference = "Stop"
+$script:EnableCalls = New-Object System.Collections.Generic.List[string]
+$script:StartCalls = New-Object System.Collections.Generic.List[string]
+$AdmSupervisorTask = "Fake Supervisor"
+$AdmWatcherTask = "Fake Watcher"
+function Get-ScheduledTask {{ param($TaskName) [pscustomobject]@{{ State = "Disabled" }} }}
+function Confirm-AdmTaskEnabled {{ param($TaskName) $script:EnableCalls.Add($TaskName) }}
+function Start-ScheduledTask {{ param($TaskName) $script:StartCalls.Add($TaskName) }}
+function Start-AdmDashboardBackground {{ param($RepositoryPath) $true }}
+
+{function_source}
+
+Start-AdmServicesSafe | Out-Null
+[PSCustomObject]@{{
+    ColdStartEnableCalls = $script:EnableCalls.Count
+    ColdStartStartCalls  = $script:StartCalls.Count
+}} | ConvertTo-Json -Compress
+$script:EnableCalls.Clear(); $script:StartCalls.Clear()
+Start-AdmServicesSafe -AllowEnable | Out-Null
+[PSCustomObject]@{{
+    ExplicitEnableCalls = $script:EnableCalls.Count
+    ExplicitStartCalls  = $script:StartCalls.Count
+}} | ConvertTo-Json -Compress
+'''
+        cmd = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        self.assertEqual(0, res.returncode, f"PowerShell failed: {res.stderr}")
+        import json
+        cold, explicit = (json.loads(line) for line in res.stdout.strip().splitlines())
+        self.assertEqual(0, cold["ColdStartEnableCalls"], "cold start must never enable a disabled task")
+        self.assertEqual(0, cold["ColdStartStartCalls"], "cold start must never start a disabled task")
+        self.assertEqual(2, explicit["ExplicitEnableCalls"], "-AllowEnable must still recover a disabled task")
+        self.assertEqual(2, explicit["ExplicitStartCalls"])
+
+    def test_explicit_menu_actions_pass_allow_enable(self):
+        content = (DESKTOP_DIR / "AdmTrayLauncher.ps1").read_text(encoding="utf-8", errors="ignore")
+        self.assertIn("Start-AdmServicesSafe -AllowEnable", content)
+        cold_start_line = next(
+            line for line in content.splitlines()
+            if line.strip() == "Start-AdmServicesSafe"
+        )
+        self.assertNotIn("-AllowEnable", cold_start_line)
 
     def test_single_instance_mutex_second_launch_exits_immediately(self):
         # Start a mock mutex holder in a background PowerShell process

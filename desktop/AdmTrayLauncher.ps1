@@ -25,11 +25,27 @@ try {
 }
 
 function Start-AdmServicesSafe {
+    # -AllowEnable must only ever be passed from an explicit user action (the
+    # "啟動服務"/"重新啟動服務" menu clicks below, or Restart-AdmServicesSafe
+    # which is itself only reachable from that same menu click). Cold start
+    # (Tray launch / user login) always runs with the default $false, so a
+    # task the user disabled on purpose -- via Stop-ADM.ps1 or directly in
+    # Task Scheduler -- is never silently re-enabled just because the Tray
+    # happened to (re)start. That silent auto-re-enable, running every time
+    # Explorer relaunched the Tray, is what let a disabled Command Watcher
+    # keep coming back and popping a console every minute even after the
+    # user disabled it.
+    param([switch]$AllowEnable)
     try {
-        Confirm-AdmTaskEnabled -TaskName $AdmSupervisorTask
-        Confirm-AdmTaskEnabled -TaskName $AdmWatcherTask
-        Start-ScheduledTask -TaskName $AdmSupervisorTask -ErrorAction SilentlyContinue
-        Start-ScheduledTask -TaskName $AdmWatcherTask -ErrorAction SilentlyContinue
+        foreach ($name in @($AdmSupervisorTask, $AdmWatcherTask)) {
+            $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+            if (-not $task) { continue }
+            if ($task.State -eq "Disabled") {
+                if ($AllowEnable) { Confirm-AdmTaskEnabled -TaskName $name }
+                else { continue }
+            }
+            Start-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        }
         Start-AdmDashboardBackground -RepositoryPath $RepositoryPath -ErrorAction SilentlyContinue
     } catch {
         # Non-fatal during background start
@@ -40,7 +56,9 @@ function Restart-AdmServicesSafe {
     # Same disable-then-enable-and-trigger pattern as Stop-ADM.ps1 +
     # Start-ADM.ps1, done inline so the tray doesn't spawn extra processes.
     # Never kills an already-running child process -- disabling only blocks
-    # the *next* Scheduled Task trigger.
+    # the *next* Scheduled Task trigger. Only reachable from the "重新啟動
+    # 服務" menu click, i.e. always an explicit user action -- so re-enabling
+    # here is intentional, not the automatic cold-start self-heal this fixes.
     try {
         foreach ($name in @($AdmSupervisorTask, $AdmWatcherTask)) {
             $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
@@ -49,7 +67,7 @@ function Restart-AdmServicesSafe {
             }
         }
         Start-Sleep -Seconds 1
-        Start-AdmServicesSafe
+        Start-AdmServicesSafe -AllowEnable
     } catch {
         # Non-fatal during background restart
     }
@@ -199,7 +217,9 @@ $menuStart = New-Object System.Windows.Forms.ToolStripMenuItem
 $menuStart.Text = "啟動服務"
 $menuStart.add_Click({
     try {
-        Start-AdmServicesSafe
+        # Explicit user click: unlike cold start, this may re-enable a
+        # disabled task -- the user is asking for it right now.
+        Start-AdmServicesSafe -AllowEnable
         $notifyIcon.ShowBalloonTip(3000, "ADM 服務", "已確認並觸發排程工作與儀表板。", [System.Windows.Forms.ToolTipIcon]::Info)
     } catch {
         [System.Windows.Forms.MessageBox]::Show("服務啟動失敗：$($_.Exception.Message)", "ADM 服務管理", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
