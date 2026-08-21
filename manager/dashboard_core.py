@@ -264,6 +264,61 @@ def build_project_detail_vm(project: Dict[str, Any], tasks: List[Dict[str, Any]]
             "recent_activity": sorted(activity, key=lambda x: x[0] or "", reverse=True)[:8]}
 
 
+def build_sessions_vm(executions: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Exact execution-backed sessions; execution IDs never stand in for session IDs."""
+    rows = []
+    for exe in executions:
+        row = {key: exe.get(key) for key in ("project_id", "task_id", "execution_id", "provider", "account_id", "model", "mode", "effort", "status", "started_at", "completed_at", "finished_at", "recovery_reason", "retry_of_execution_id", "result")}
+        row["provider_session_id"] = exe.get("provider_session_id") or exe.get("session_id") or exe.get("conversation_id") or "Not recorded"
+        row["last_activity"] = exe.get("last_provider_event_at") or exe.get("heartbeat_at") or exe.get("session_updated_at")
+        rows.append(row)
+    rows.sort(key=lambda r: (r["last_activity"] or r["started_at"] or "", r["execution_id"] or ""), reverse=True)
+    terminal = {"completed", "failed", "interrupted", "cancelled"}
+    return {"current": [r for r in rows if r["status"] not in terminal],
+            "historical": [r for r in rows if r["status"] in terminal]}
+
+
+def build_review_evidence_vm(handoffs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Handoffs are evidence, never an inferred review verdict."""
+    rows = []
+    for handoff in handoffs:
+        report = handoff.get("completion_report") or {}
+        rows.append({"project_id": handoff.get("project_id"), "task_id": handoff.get("task_id"),
+                     "execution_id": handoff.get("execution_id"), "timestamp": handoff.get("created_at"),
+                     "source": "Handoff canonical evidence", "reviewer": handoff.get("reviewer") or report.get("reviewer") or "Not recorded",
+                     "verdict": handoff.get("review_verdict") or report.get("review_verdict") or "Not recorded",
+                     "tests": handoff.get("tests") or [], "commits": handoff.get("commits") or [],
+                     "known_issues": handoff.get("known_issues") or [], "completion_report": report or None})
+    return sorted(rows, key=lambda r: (r["timestamp"] or "", r["task_id"] or ""), reverse=True)
+
+
+def build_operational_events(commands: List[Dict[str, Any]], executions: List[Dict[str, Any]],
+                             actions: List[Any], handoffs: List[Dict[str, Any]], limit: int = 30,
+                             project_id: Optional[str] = None, provider: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Capped canonical-state timeline; at most one last-activity event per execution."""
+    events = []
+    def add(timestamp, kind, project, task, event, source, provider_name=None, severity=""):
+        if timestamp and (not project_id or project == project_id) and (not provider or provider_name == provider):
+            events.append({"timestamp": timestamp, "kind": kind, "project_id": project, "task_id": task,
+                           "event": event, "source": source, "provider": provider_name or "Not recorded", "severity": severity})
+    for command in commands:
+        add(command.get("completed_at") or command.get("claimed_at") or command.get("created_at"), "Command", command.get("project_id"), command.get("task_id"), command.get("status", "Unknown"), "canonical command state", command.get("provider"), "high" if command.get("status") in ("attention", "failed") else "")
+    for exe in executions:
+        p, t, provider_name = exe.get("project_id"), exe.get("task_id"), exe.get("provider")
+        add(exe.get("started_at") or exe.get("reserved_at"), "Execution", p, t, "started", "canonical execution timestamp", provider_name)
+        add(exe.get("last_provider_event_at") or exe.get("heartbeat_at"), "Execution", p, t, "last activity", "canonical activity timestamp", provider_name)
+        if exe.get("status") in TERMINAL_EXECUTION_STATUSES:
+            add(exe.get("completed_at") or exe.get("finished_at"), "Execution", p, t, exe.get("status"), "canonical terminal state", provider_name, "high" if exe.get("status") != "completed" else "")
+        if exe.get("recovery_reason"):
+            add(exe.get("updated_at") or exe.get("heartbeat_at"), "Execution", p, t, f"recovery: {exe['recovery_reason']}", "canonical recovery field", provider_name, "high")
+    for action in actions:
+        timestamp = getattr(action, "resolved_at", None) or getattr(action, "dismissed_at", None) or getattr(action, "acknowledged_at", None) or getattr(action, "created_at", None)
+        add(timestamp, "Action", getattr(action, "project_id", None), getattr(action, "task_id", None), getattr(action, "status", "Unknown"), "canonical Action record", None, getattr(action, "severity", ""))
+    for handoff in handoffs:
+        add(handoff.get("created_at"), "Handoff", handoff.get("project_id"), handoff.get("task_id"), "created", "canonical handoff record", handoff.get("from_provider"))
+    return sorted(events, key=lambda e: (e["timestamp"], e["kind"], e["event"]), reverse=True)[:limit]
+
+
 # =====================================================================
 # Dashboard ViewModels for Quota & Daily Brief (Slice 4A)
 # =====================================================================

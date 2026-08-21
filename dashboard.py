@@ -67,6 +67,9 @@ from manager.dashboard_core import (
     get_global_summary,
     map_task_board,
     build_project_detail_vm,
+    build_sessions_vm,
+    build_review_evidence_vm,
+    build_operational_events,
     build_daily_brief_vm,
     DailyBriefViewModel,
     AccountQuotaCardViewModel,
@@ -1237,6 +1240,13 @@ def render_tasks_page():
 
 def render_sessions_page():
     st.title("🔍 AI Sessions & Handoff Inspector")
+    sessions = build_sessions_vm(all_executions)
+    for title, rows in (("Current Sessions", sessions["current"]), ("Historical Sessions", sessions["historical"])):
+        st.subheader(f"{title} ({len(rows)})")
+        if not rows:
+            st.write("Unavailable / Not recorded")
+        for row in rows:
+            st.markdown(f"""<div class="glass-card"><b>{row['provider'] or 'Unknown'}</b> · `{row['execution_id'] or '—'}` · session `{row['provider_session_id']}`<br><small>Project `{row['project_id'] or '—'}` → Task `{row['task_id'] or '—'}` · model `{row['model'] or 'Not recorded'}` · mode `{row['mode'] or 'Not recorded'}` · status `{row['status'] or 'Unknown'}` · started {row['started_at'] or 'Unknown'} · last activity {row['last_activity'] or 'Unknown'} · ended {row['completed_at'] or row['finished_at'] or 'Not recorded'}</small></div>""", unsafe_allow_html=True)
     all_task_ids = [(t.get("project_id"), t.get("task_id"), t.get("title")) for t in all_tasks]
 
     if not all_task_ids:
@@ -1315,6 +1325,31 @@ def render_quota_page():
                 st.error(f"Error rendering {card.card_title}: {e}")
 
 
+def render_reviews_page():
+    st.title("📝 Review Evidence")
+    rows = build_review_evidence_vm(all_handoffs)
+    if not rows:
+        st.write("Unavailable / Not recorded")
+    for row in rows:
+        st.markdown(f"""<div class="glass-card"><b>Review Verdict:</b> {row['verdict']}<br><small>Source: {row['source']} · Project `{row['project_id'] or '—'}` → Task `{row['task_id'] or '—'}` · reviewer `{row['reviewer']}` · {row['timestamp'] or 'Not recorded'}</small><br>Tests: {row['tests'] or 'Unavailable'}<br>Commits: {row['commits'] or 'Unavailable'}<br>Known issues: {row['known_issues'] or 'None recorded'}</div>""", unsafe_allow_html=True)
+
+
+def render_logs_page():
+    st.title("📄 Operational Logs / Recent Events")
+    projects = ["All"] + sorted({p.get("project_id") for p in all_projects if p.get("project_id")})
+    project_filter = st.selectbox("Project", projects, key="log_project")
+    providers = ["All"] + sorted({e.get("provider") for e in all_executions if e.get("provider")})
+    provider_filter = st.selectbox("Provider", providers, key="log_provider")
+    events = build_operational_events(all_commands, all_executions, all_actions, all_handoffs, limit=30,
+                                      project_id=None if project_filter == "All" else project_filter,
+                                      provider=None if provider_filter == "All" else provider_filter)
+    st.caption("Source: canonical state timestamps; activity is capped to one latest event per execution.")
+    if not events:
+        st.write("Unavailable / Not recorded")
+    for event in events:
+        st.write(f"`{event['timestamp']}` · {event['kind']} · `{event['project_id'] or '—'}`/`{event['task_id'] or '—'}` · {event['event']} · {event['provider']} · {event['source']}")
+
+
 def render_placeholder_page(title: str, description: str):
     st.title(title)
     st.info(f"{description} (Foundation established in P1-A; full integration scheduled for subsequent slice).")
@@ -1335,9 +1370,9 @@ elif selected_nav == NAV_AI_SESSIONS:
 elif selected_nav == NAV_QUOTA:
     render_quota_page()
 elif selected_nav == NAV_REVIEWS:
-    render_placeholder_page("📝 Session Reviews", "View code reviews, reviewer decisions, and task acceptance archives.")
+    render_reviews_page()
 elif selected_nav == NAV_LOGS:
-    render_placeholder_page("📄 System & Task Logs", "Inspect aggregated runtime logs from Watcher and Session Center.")
+    render_logs_page()
 elif selected_nav == NAV_SETTINGS:
     render_placeholder_page("⚙️ Settings & Configuration", "Manage credentials, account mapping, and refresh intervals.")
 
