@@ -79,6 +79,10 @@ from manager.dashboard_core import (
     ServiceHealthViewModel,
     parse_scheduled_task_health,
     build_session_center_health,
+    UNKNOWN_LABEL,
+    DISPATCH_STATE_RUNNING,
+    build_dispatch_truth_row,
+    compute_visible_dispatch_gate,
 )
 
 st.set_page_config(
@@ -386,6 +390,7 @@ NAV_OVERVIEW = "總覽"
 NAV_ACTION_CENTER = "操作中心"
 NAV_PROJECTS = "專案"
 NAV_TASKS = "任務"
+NAV_DISPATCH_TRUTH = "派工真相"
 NAV_IDEAS = "構想"
 NAV_AI_SESSIONS = "AI 工作階段"
 NAV_REVIEWS = "審查"
@@ -398,6 +403,7 @@ NAV_PAGES = [
     NAV_ACTION_CENTER,
     NAV_PROJECTS,
     NAV_TASKS,
+    NAV_DISPATCH_TRUTH,
     NAV_IDEAS,
     NAV_AI_SESSIONS,
     NAV_REVIEWS,
@@ -1330,6 +1336,63 @@ def render_quota_page():
                 st.error(f"Error rendering {card.card_title}: {e}")
 
 
+def render_dispatch_truth_page():
+    st.title("🔎 派工真相 (Visible Dispatch Truth Gate)")
+    st.caption("任務／AI／帳號／狀態／額度 一律取自真實 SSOT 紀錄；無法取得的欄位一律顯示 UNKNOWN／STALE，絕不猜測。")
+
+    if not canonical_records_available and not records_are_last_known:
+        st.error("VISIBLE DISPATCH GATE: FAIL — 目前無法讀取 Task/Command/Execution 正式紀錄。")
+        return
+
+    commands_by_task: Dict[tuple, Dict[str, Any]] = {}
+    for cmd in all_commands:
+        key = (cmd.get("project_id"), cmd.get("task_id"))
+        existing = commands_by_task.get(key)
+        if existing is None or (cmd.get("created_at") or "") >= (existing.get("created_at") or ""):
+            commands_by_task[key] = cmd
+
+    executions_by_id = {e.get("execution_id"): e for e in all_executions if e.get("execution_id")}
+    projects_by_id = {p.get("project_id"): p for p in all_projects}
+
+    visible_tasks = [t for t in all_tasks if t.get("status") != "cancelled"]
+    rows = []
+    for task in visible_tasks:
+        key = (task.get("project_id"), task.get("task_id"))
+        command = commands_by_task.get(key)
+        execution = executions_by_id.get(command.get("execution_id")) if command else None
+        project = projects_by_id.get(task.get("project_id"))
+        rows.append(build_dispatch_truth_row(project, task, command, execution, daily_brief_vm.accounts, now))
+
+    gate = compute_visible_dispatch_gate(rows)
+    if gate["result"] == "PASS":
+        st.success("VISIBLE DISPATCH GATE: PASS")
+    else:
+        st.error("VISIBLE DISPATCH GATE: FAIL")
+        with st.expander(f"原因（{len(gate['reasons'])}）", expanded=True):
+            for reason in gate["reasons"]:
+                st.write(f"- {reason}")
+
+    if not rows:
+        st.info("目前沒有任務可顯示。")
+        return
+
+    for row in rows:
+        state = row["dispatch_state"]
+        badge = "🟢" if state == DISPATCH_STATE_RUNNING else ("🔴" if state in ("FAILED", "BLOCKED") else "⚪")
+        with st.container():
+            st.markdown(f"""<div class="glass-card">
+                <b>{badge} {row['project_name']} → {row['task_title']}</b><br>
+                <b>狀態 (Dispatch State):</b> <code>{state}</code> — {row['dispatch_reason']}<br>
+                <b>AI／帳號：</b> {row['provider']} / {row['account_id']} · <b>Model/Mode：</b> {row['model']} / {row['mode']}<br>
+                <b>5h 剩餘：</b> {row['quota']['formatted_five_hour_remaining']}（重設 {row['quota']['formatted_five_hour_reset_at']}）
+                · <b>Weekly 剩餘：</b> {row['quota']['formatted_weekly_remaining']}（重設 {row['quota']['formatted_weekly_reset_at']}）<br>
+                <b>額度取得時間 (captured_at)：</b> {row['quota']['formatted_captured_at']} · <b>新鮮度：</b> {row['quota']['freshness']}
+                </div>""", unsafe_allow_html=True)
+            with st.expander("技術細節 (Technical IDs)"):
+                st.write(f"project_id=`{row['project_id']}` · task_id=`{row['task_id']}`")
+                st.write(f"execution_id=`{row['execution_id']}` · session_id=`{row['session_id']}`")
+
+
 def render_reviews_page():
     st.title("📝 審查證據")
     rows = build_review_evidence_vm(all_handoffs)
@@ -1370,6 +1433,8 @@ elif selected_nav == NAV_PROJECTS:
     render_projects_page()
 elif selected_nav == NAV_TASKS:
     render_tasks_page()
+elif selected_nav == NAV_DISPATCH_TRUTH:
+    render_dispatch_truth_page()
 elif selected_nav == NAV_AI_SESSIONS:
     render_sessions_page()
 elif selected_nav == NAV_QUOTA:

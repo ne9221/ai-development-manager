@@ -792,3 +792,258 @@ def build_daily_brief_vm(
         summary_counts=brief_fc.summary_counts,
         accounts=account_vms,
     )
+
+
+# =====================================================================
+# Visible Dispatch Truth Gate (Task / Provider / Account / Quota truth)
+# =====================================================================
+#
+# This section builds a single, honest, per-task row combining Task +
+# Command + Execution + per-account Quota truth for the Dashboard's main
+# view. It never fabricates a value: anything not provable from a real
+# SSOT record is surfaced as the literal string "UNKNOWN" (or "STALE" for
+# quota freshness), never inferred or borrowed from another record.
+
+UNKNOWN_LABEL = "UNKNOWN"
+
+DISPATCH_STATE_SUBMITTED = "SUBMITTED"
+DISPATCH_STATE_ACCEPTED = "ACCEPTED"
+DISPATCH_STATE_QUEUED = "QUEUED"
+DISPATCH_STATE_CLAIMED = "CLAIMED"
+DISPATCH_STATE_RUNNING = "RUNNING"
+DISPATCH_STATE_COMPLETED = "COMPLETED"
+DISPATCH_STATE_FAILED = "FAILED"
+DISPATCH_STATE_BLOCKED = "BLOCKED"
+DISPATCH_STATE_CANCELLED = "CANCELLED"
+DISPATCH_STATE_UNKNOWN = "UNKNOWN"
+
+# Maps manager.dashboard_core.determine_execution_state()'s execution-level
+# vocabulary onto the Dispatch Truth state a *terminal* execution proves,
+# for the (unusual) case where an execution has already reached a terminal
+# outcome while its parent command record still says "running". Only
+# reached from compute_dispatch_state() below; "interrupted" is truthfully
+# a failure outcome from the dispatch-visibility standpoint, not its own
+# 10th state the task spec did not ask for.
+_TERMINAL_EXECUTION_STATE_TO_DISPATCH_STATE = {
+    "completed": DISPATCH_STATE_COMPLETED,
+    "failed": DISPATCH_STATE_FAILED,
+    "interrupted": DISPATCH_STATE_FAILED,
+    "cancelled": DISPATCH_STATE_CANCELLED,
+}
+
+
+def compute_dispatch_state(
+    task: Optional[Dict[str, Any]],
+    command: Optional[Dict[str, Any]],
+    execution: Optional[Dict[str, Any]],
+    now: datetime,
+    has_dispatch_request: bool = False,
+) -> Dict[str, str]:
+    """Truthfully classify one task's dispatch state.
+
+    Never reports SUBMITTED/ACCEPTED/QUEUED/CLAIMED as RUNNING: RUNNING is
+    only reached when the *command* says running AND
+    determine_execution_state() independently proves the execution is
+    running (status == "running" with provider session evidence) --
+    reusing that existing, already-tested distinction rather than
+    duplicating it. `has_dispatch_request` is real evidence (a
+    dispatch-requests/*.json idempotency record) that ingress accepted the
+    request before a Task/Command was observed; without it, ACCEPTED is
+    never guessed as a phase distinct from SUBMITTED, because the current
+    schema has no independent signal for it.
+    """
+    if not isinstance(task, dict):
+        return {"state": DISPATCH_STATE_UNKNOWN, "reason": "no task record found"}
+
+    task_status = task.get("status")
+    if task_status == "blocked":
+        return {"state": DISPATCH_STATE_BLOCKED, "reason": task.get("blocked_reason") or "task marked blocked"}
+
+    if not isinstance(command, dict):
+        if task_status == "completed":
+            return {"state": DISPATCH_STATE_COMPLETED, "reason": "task completed with no command record"}
+        if task_status == "cancelled":
+            return {"state": DISPATCH_STATE_CANCELLED, "reason": "task cancelled with no command record"}
+        if has_dispatch_request:
+            return {"state": DISPATCH_STATE_ACCEPTED, "reason": "dispatch request accepted; no command observed yet"}
+        return {"state": DISPATCH_STATE_SUBMITTED, "reason": "task created, not yet dispatched to a command"}
+
+    cmd_status = command.get("status")
+    if cmd_status == "queued":
+        return {"state": DISPATCH_STATE_QUEUED, "reason": "command queued, not yet claimed"}
+    if cmd_status == "claimed":
+        return {"state": DISPATCH_STATE_CLAIMED, "reason": "command claimed, launch not yet proven running"}
+    if cmd_status == "attention":
+        return {"state": DISPATCH_STATE_BLOCKED, "reason": command.get("recovery_reason") or "command requires attention"}
+    if cmd_status == "completed":
+        return {"state": DISPATCH_STATE_COMPLETED, "reason": "command completed"}
+    if cmd_status == "failed":
+        return {"state": DISPATCH_STATE_FAILED, "reason": "command failed"}
+    if cmd_status == "running":
+        if not isinstance(execution, dict):
+            return {"state": DISPATCH_STATE_CLAIMED, "reason": "command reports running but no execution record found (not proven running)"}
+        if execution.get("task_id") != task.get("task_id") or execution.get("project_id") != task.get("project_id"):
+            return {"state": DISPATCH_STATE_CLAIMED, "reason": "execution record does not match this task's (project_id, task_id) -- linkage mismatch, not proven running"}
+        exec_state = determine_execution_state(execution, now)
+        if exec_state == "running":
+            evidence = execution.get("provider_session_id") or "provider session evidence present"
+            return {"state": DISPATCH_STATE_RUNNING, "reason": f"execution running with provider session evidence ({evidence})"}
+        if exec_state in ("correlating", "waiting", "finishing"):
+            return {"state": DISPATCH_STATE_CLAIMED, "reason": f"command running but execution state={exec_state} (provider session evidence not yet proven)"}
+        mapped = _TERMINAL_EXECUTION_STATE_TO_DISPATCH_STATE.get(exec_state)
+        if mapped:
+            return {"state": mapped, "reason": f"execution reached terminal state '{exec_state}'"}
+        return {"state": DISPATCH_STATE_UNKNOWN, "reason": f"command running but execution state unrecognized ({exec_state!r})"}
+    return {"state": DISPATCH_STATE_UNKNOWN, "reason": f"unrecognized command status: {cmd_status!r}"}
+
+
+def build_provider_truth(command: Optional[Dict[str, Any]], execution: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """provider/account_id/model/mode from the most authoritative record
+    available (command, then execution); any missing/blank field is the
+    literal "UNKNOWN" string, never a guess or another record's value."""
+    source = command if isinstance(command, dict) else (execution if isinstance(execution, dict) else {})
+
+    def _val(key: str) -> str:
+        value = source.get(key)
+        return value if isinstance(value, str) and value.strip() else UNKNOWN_LABEL
+
+    return {
+        "provider": _val("provider"),
+        "account_id": _val("account_id"),
+        "model": _val("model"),
+        "mode": _val("mode"),
+    }
+
+
+def find_account_quota_vm(
+    account_vms: Sequence[AccountQuotaCardViewModel], provider: Optional[str], account_id: Optional[str]
+) -> Optional[AccountQuotaCardViewModel]:
+    """Exact (provider, account_id) match only -- never falls back to a
+    provider-level representative, so Claude A and Claude B never share a
+    quota card by accident."""
+    for vm in account_vms:
+        if vm.provider == provider and vm.account_id == account_id:
+            return vm
+    return None
+
+
+def build_quota_truth(
+    account_vms: Sequence[AccountQuotaCardViewModel], provider: str, account_id: str
+) -> Dict[str, Any]:
+    """5h + weekly used/remaining/reset_at, captured_at, and freshness for
+    one exact (provider, account_id). No captured entry -> every field is
+    explicitly "UNKNOWN", never borrowed from another account or provider."""
+    unknown_row = {
+        "found": False,
+        "five_hour_used_pct": None, "five_hour_remaining_pct": None, "five_hour_reset_at": None,
+        "weekly_used_pct": None, "weekly_remaining_pct": None, "weekly_reset_at": None,
+        "captured_at": None, "freshness": UNKNOWN_LABEL,
+        "formatted_five_hour_used": UNKNOWN_LABEL, "formatted_five_hour_remaining": UNKNOWN_LABEL,
+        "formatted_five_hour_reset_at": UNKNOWN_LABEL,
+        "formatted_weekly_used": UNKNOWN_LABEL, "formatted_weekly_remaining": UNKNOWN_LABEL,
+        "formatted_weekly_reset_at": UNKNOWN_LABEL,
+        "formatted_captured_at": UNKNOWN_LABEL,
+    }
+    if provider == UNKNOWN_LABEL or account_id == UNKNOWN_LABEL:
+        return unknown_row
+
+    vm = find_account_quota_vm(account_vms, provider, account_id)
+    if vm is None:
+        return unknown_row
+
+    freshness = "STALE" if vm.stale else "fresh"
+    return {
+        "found": True,
+        "five_hour_used_pct": vm.five_hour_used_pct,
+        "five_hour_remaining_pct": vm.five_hour_remaining_pct,
+        "five_hour_reset_at": vm.five_hour_resets_at,
+        "weekly_used_pct": vm.weekly_used_pct if vm.has_weekly_window else None,
+        "weekly_remaining_pct": vm.weekly_remaining_pct if vm.has_weekly_window else None,
+        "weekly_reset_at": vm.weekly_resets_at if vm.has_weekly_window else None,
+        "captured_at": vm.last_updated,
+        "freshness": freshness,
+        "formatted_five_hour_used": format_percent(vm.five_hour_used_pct),
+        "formatted_five_hour_remaining": vm.formatted_five_hour_remaining,
+        "formatted_five_hour_reset_at": vm.five_hour_resets_at or UNKNOWN_LABEL,
+        "formatted_weekly_used": format_percent(vm.weekly_used_pct) if vm.has_weekly_window else UNKNOWN_LABEL,
+        "formatted_weekly_remaining": vm.formatted_weekly_remaining if vm.has_weekly_window else UNKNOWN_LABEL,
+        "formatted_weekly_reset_at": (vm.weekly_resets_at or UNKNOWN_LABEL) if vm.has_weekly_window else UNKNOWN_LABEL,
+        "formatted_captured_at": vm.last_updated or UNKNOWN_LABEL,
+    }
+
+
+def build_dispatch_truth_row(
+    project: Optional[Dict[str, Any]],
+    task: Dict[str, Any],
+    command: Optional[Dict[str, Any]],
+    execution: Optional[Dict[str, Any]],
+    account_vms: Sequence[AccountQuotaCardViewModel],
+    now: datetime,
+    has_dispatch_request: bool = False,
+) -> Dict[str, Any]:
+    """One user-visible truth row: Project/Task/Provider/Account/Model/Mode/
+    Dispatch State/Execution/Session, plus that account's Quota truth."""
+    dispatch = compute_dispatch_state(task, command, execution, now, has_dispatch_request=has_dispatch_request)
+    provider_truth = build_provider_truth(command, execution)
+    quota = build_quota_truth(account_vms, provider_truth["provider"], provider_truth["account_id"])
+
+    execution_id = execution.get("execution_id") if isinstance(execution, dict) else None
+    session_id = None
+    if isinstance(execution, dict):
+        session_id = execution.get("provider_session_id") or execution.get("session_id") or execution.get("conversation_id")
+
+    project_id = task.get("project_id") or UNKNOWN_LABEL
+    project_name = (project.get("name") if isinstance(project, dict) else None) or project_id
+
+    return {
+        "project_id": project_id,
+        "project_name": project_name,
+        "task_id": task.get("task_id") or UNKNOWN_LABEL,
+        "task_title": task.get("title") or UNKNOWN_LABEL,
+        "provider": provider_truth["provider"],
+        "account_id": provider_truth["account_id"],
+        "model": provider_truth["model"],
+        "mode": provider_truth["mode"],
+        "dispatch_state": dispatch["state"],
+        "dispatch_reason": dispatch["reason"],
+        "execution_id": execution_id or UNKNOWN_LABEL,
+        "session_id": session_id or UNKNOWN_LABEL,
+        "quota": quota,
+    }
+
+
+# Every key a Dispatch Truth row must carry for the Visible Dispatch Gate to
+# PASS. "quota" itself is always present (build_quota_truth() never omits
+# it, even as the all-UNKNOWN row) -- the gate additionally checks that its
+# "freshness" sub-field is populated, since freshness must be visible even
+# when quota is otherwise unknown.
+_REQUIRED_DISPATCH_TRUTH_FIELDS = (
+    "project_id", "task_id", "provider", "account_id", "model", "mode",
+    "dispatch_state", "execution_id", "session_id", "quota",
+)
+
+
+def compute_visible_dispatch_gate(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """PASS/FAIL for the Visible Dispatch Gate banner.
+
+    A row carrying the literal "UNKNOWN"/"STALE" marker for a field is a
+    truthful PASS for that field -- the gate only FAILs when a required
+    field is outright missing from the row (a read/build failure), or when
+    there are no rows to show at all.
+    """
+    if not rows:
+        return {"result": "FAIL", "reasons": ["no dispatch-visible task rows available"]}
+
+    reasons: List[str] = []
+    for row in rows:
+        label = row.get("task_id", "unknown task")
+        for key in _REQUIRED_DISPATCH_TRUTH_FIELDS:
+            if key not in row or row[key] in (None, ""):
+                reasons.append(f"{label}: missing required truth field '{key}'")
+        quota = row.get("quota")
+        if not isinstance(quota, dict) or "freshness" not in quota or quota["freshness"] in (None, ""):
+            reasons.append(f"{label}: quota freshness not visible")
+
+    if reasons:
+        return {"result": "FAIL", "reasons": reasons}
+    return {"result": "PASS", "reasons": []}
