@@ -12,8 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from manager.session_center import (
-    LiveSession, SessionCenterError, SessionView, build_pending, drive_status_source, file_status_source,
-    find_claude_session, handler_for, load_execution, read_claude_meta, read_codex_meta,
+    LiveSession, PendingCorrelation, SessionCenterError, SessionView, build_pending, drive_status_source,
+    file_status_source, find_claude_session, handler_for, load_execution, read_claude_meta, read_codex_meta,
     resolve_provider_meta, resolve_session, wait_for_execution,
 )
 
@@ -26,6 +26,40 @@ def bootstrap_args(**overrides):
     }
     base.update(overrides)
     return argparse.Namespace(**base)
+
+
+class PendingCorrelationFailureEvidenceTests(unittest.TestCase):
+    """P1-G self-heal: correlation_failed must carry its original failure
+    reason/timestamp so a supervisor can durably record it before
+    respawning this process away (see manager.session_center_supervisor's
+    re-observe contract) -- see failed_at on PendingCorrelation."""
+
+    def test_correlating_has_no_error_or_failed_at(self):
+        view = SessionView(PendingCorrelation("p1", "t1", None, "codex"))
+        snap = view.snapshot()
+        self.assertEqual("correlating", snap["current_state"])
+        self.assertIsNone(snap["error"])
+        self.assertIsNone(snap["failed_at"])
+
+    def test_fail_records_error_and_failed_at(self):
+        view = SessionView(PendingCorrelation("p1", "t1", "exec-a", "claude"))
+        view.fail("timed out waiting for the provider session")
+        snap = view.snapshot()
+        self.assertEqual("correlation_failed", snap["current_state"])
+        self.assertEqual("timed out waiting for the provider session", snap["error"])
+        self.assertIsInstance(snap["failed_at"], str)
+        self.assertTrue(snap["failed_at"])
+
+    def test_repeated_fail_never_overwrites_the_original_failed_at(self):
+        view = SessionView(PendingCorrelation("p1", "t1", "exec-a", "claude"))
+        view.fail("first failure")
+        first_failed_at = view.snapshot()["failed_at"]
+        view.fail("second failure")
+        second_snap = view.snapshot()
+        # The original failure timestamp is never rewritten, even though a
+        # later failure's message is reflected -- see failed_at's docstring.
+        self.assertEqual(first_failed_at, second_snap["failed_at"])
+        self.assertEqual("second failure", second_snap["error"])
 
 
 class SessionCenterTest(unittest.TestCase):
