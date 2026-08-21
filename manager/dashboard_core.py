@@ -70,6 +70,8 @@ def build_session_center_health(listening: bool, session: dict | None) -> Servic
         )
     if session:
         detail = f"provider={session.get('provider', '—')}, state={session.get('current_state', '—')}"
+        if str(session.get("current_state", "")).upper() == "CORRELATION_FAILED":
+            return ServiceHealthViewModel(name="Session Center (HTTP :8765)", found=True, detail=detail, status_label="Offline")
     else:
         detail = "listening, but /api/session did not respond"
     return ServiceHealthViewModel(name="Session Center (HTTP :8765)", found=True, detail=detail, status_label="Online")
@@ -670,7 +672,7 @@ def build_daily_brief_vm(
         rec_account = None
         rec_display = "No AI Available"
         rec_action = "hold"
-        rec_reason = "No dispatchable AI accounts available (all accounts are stale, unconfigured, or quota-exhausted)."
+        rec_reason = "No dispatchable AI accounts available; fresh official quota is unavailable or no account is eligible."
     else:
         # Sort descending by score tuple: (is_eligible, action_tier, remaining_percent, reset_urgency, account_id)
         eligible.sort(key=lambda c: c[0], reverse=True)
