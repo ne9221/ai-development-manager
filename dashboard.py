@@ -260,6 +260,7 @@ actions_store = get_default_actions_store(drive_service=drive_service)
 all_projects = []
 all_tasks = []
 all_executions = []
+all_commands = []
 all_handoffs = []
 active_executions = []
 active_executions_dict = {}
@@ -288,6 +289,15 @@ if store:
                         all_tasks.append(task_data)
                     except Exception as e:
                         all_warnings.append(f"Malformed record in tasks for project {p_id}, file {fname}: {e}")
+        except Exception:
+            pass
+
+        try:
+            commands_folder = store.project_folder("commands", p_id, create=False)
+            for cf in store.children(commands_folder):
+                fname = cf.get("name", "")
+                if fname.endswith(".json"):
+                    all_commands.append(store.get("commands", p_id, fname[:-5]))
         except Exception:
             pass
 
@@ -352,10 +362,11 @@ conflicted_ideas = [i for i in all_ideas if i.is_conflicted or i.status == STATU
 persisted_actions = actions_store.list_actions()
 derived_candidates = derive_automatic_actions(
     all_tasks=all_tasks,
-    active_executions=active_executions,
+    active_executions=all_executions,
     ideas_conflicted=conflicted_ideas,
     infra_health_list=infra_health_list,
     persisted_actions=persisted_actions,
+    commands=all_commands,
     now=now,
 )
 all_actions = actions_store.reconcile_automatic_actions(derived_candidates)

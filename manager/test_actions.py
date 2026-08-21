@@ -68,6 +68,7 @@ class ActionCenterDomainAndStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             cache_file = Path(td) / "actions.json"
             store = ActionsStore(drive_service=mock_drive, local_file_path=str(cache_file))
+            store._write_to_drive = MagicMock()
 
             tasks = [
                 {"task_id": "T-BLOCKED-1", "project_id": "proj-a", "title": "Blocked Pipeline", "status": "blocked", "created_at": "2026-08-21T02:00:00Z"},
@@ -149,9 +150,9 @@ class ActionCenterDomainAndStoreTests(unittest.TestCase):
         )
 
         summary = get_actions_summary(actions)
-        self.assertEqual(summary["total"], 5)
-        self.assertTrue(summary["need_user_action"] >= 4)
-        self.assertTrue(summary["review_required"] >= 1)
+        self.assertEqual(summary["total"], 4)
+        self.assertTrue(summary["need_user_action"] >= 3)
+        self.assertEqual(summary["review_required"], 0)
         self.assertTrue(summary["blocked"] >= 2)
         self.assertTrue(summary["high_severity"] >= 4)
 
@@ -214,6 +215,7 @@ class ActionCenterDomainAndStoreTests(unittest.TestCase):
             f = Path(td) / "actions_cache.json"
             store = ActionsStore(drive_service=mock_drive, local_file_path=str(f))
             self.assertFalse(store.is_degraded)
+            store._write_to_drive = MagicMock()
 
             act = ActionItem(
                 action_id="ACT-LIFECYCLE",
@@ -238,6 +240,54 @@ class ActionCenterDomainAndStoreTests(unittest.TestCase):
             self.assertEqual(item.status, STATUS_RESOLVED)
             self.assertEqual(item.resolution_note, "Accepted by reviewer")
             self.assertIsNotNone(item.resolved_at)
+
+    def test_canonical_recovery_closes_and_recurrence_gets_new_occurrence(self):
+        now = datetime(2026, 8, 21, 2, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            store = ActionsStore(drive_service=MagicMock(), local_file_path=str(Path(td) / "actions.json"))
+            store.is_degraded = False
+            store._write_to_drive = MagicMock()
+            blocked = [{"task_id": "T1", "project_id": "P1", "status": "blocked"}]
+            first = store.reconcile_automatic_actions(derive_automatic_actions(blocked, [], [], now=now))[0]
+            self.assertEqual(first.status, STATUS_OPEN)
+            store.acknowledge_action(first.action_id)
+            self.assertEqual(store.reconcile_automatic_actions(derive_automatic_actions(blocked, [], [], now=now + timedelta(minutes=1)))[0].status, STATUS_ACKNOWLEDGED)
+            store.reconcile_automatic_actions([])
+            closed = store.get_by_id(first.action_id)
+            self.assertEqual(closed.status, STATUS_RESOLVED)
+            self.assertIn("canonical recovery", closed.resolution_note)
+            again = store.reconcile_automatic_actions(derive_automatic_actions(blocked, [], [], now=now + timedelta(minutes=2)))
+            self.assertEqual(len(again), 2)
+            reopened = next(a for a in again if a.status == STATUS_OPEN)
+            self.assertNotEqual(first.action_id, reopened.action_id)
+            self.assertEqual(first.incident_key, reopened.incident_key)
+
+    def test_manual_conflicted_and_failed_persistence_are_never_misrepresented(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = ActionsStore(drive_service=MagicMock(), local_file_path=str(Path(td) / "actions.json"))
+            store.is_degraded = False
+            manual = ActionItem(action_id="MANUAL", title="Manual")
+            conflicted = ActionItem(action_id="AUTO-CONFLICT", title="Conflict", incident_key="AUTO-CONFLICT", is_conflicted=True)
+            store._actions = [manual, conflicted]
+            store._write_to_drive = MagicMock(side_effect=RuntimeError("Drive down"))
+            store.reconcile_automatic_actions([])
+            self.assertEqual(manual.status, STATUS_OPEN)
+            self.assertEqual(conflicted.status, STATUS_OPEN)
+            candidates = derive_automatic_actions([{"task_id": "T1", "project_id": "P1", "status": "blocked"}], [], [])
+            self.assertEqual(store.reconcile_automatic_actions(candidates), [manual, conflicted])
+            self.assertIn("Failed to persist", store.last_error)
+            self.assertTrue(store.is_degraded)
+
+    def test_execution_command_evidence_and_root_dedup(self):
+        now = datetime(2026, 8, 21, 12, tzinfo=timezone.utc)
+        task = {"task_id": "T1", "project_id": "P1", "status": "blocked"}
+        execution = {"execution_id": "E1", "project_id": "P1", "task_id": "T1", "status": "failed", "error_kind": "provider_error"}
+        command = {"command_id": "C1", "project_id": "P2", "task_id": "T2", "status": "attention", "recovery_reason": "stale"}
+        actions = derive_automatic_actions([task], [execution], [], commands=[command], now=now)
+        self.assertEqual(len(actions), 2)
+        self.assertEqual(actions[0].linked_entity_ids, ["T1", "E1"])
+        self.assertIn("provider_error", actions[0].reason)
+        self.assertEqual(actions[1].type, TYPE_REVIEW_REQUIRED)
 
     def test_save_and_cleanup_errors_are_not_silent(self):
         mock_drive = MagicMock()

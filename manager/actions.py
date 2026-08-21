@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -51,6 +51,8 @@ class ActionItem:
     status: str = STATUS_OPEN
     source: str = "System Detector"
     linked_entity_ids: List[str] = field(default_factory=list)
+    # Stable detector identity; action_id identifies one occurrence of it.
+    incident_key: Optional[str] = None
     acknowledged_at: Optional[str] = None
     resolved_at: Optional[str] = None
     dismissed_at: Optional[str] = None
@@ -83,6 +85,7 @@ class ActionItem:
             status=str(data.get("status", STATUS_OPEN)),
             source=str(data.get("source", "System Detector")),
             linked_entity_ids=list(data.get("linked_entity_ids", [])),
+            incident_key=data.get("incident_key"),
             acknowledged_at=data.get("acknowledged_at"),
             resolved_at=data.get("resolved_at"),
             dismissed_at=data.get("dismissed_at"),
@@ -332,32 +335,67 @@ class ActionsStore:
         """Reconcile auto-derived actions into canonical Action SSOT store.
 
         - Creates and persists newly detected actions.
-        - Preserves user-managed lifecycle status (Acknowledged, Resolved, Dismissed) for existing actions.
+        - Closes detector-owned occurrences when their canonical evidence clears.
+        - Preserves acknowledged/dismissed lifecycle state while the condition persists.
         - Keeps initial waiting_since and created_at timestamps stable across Dashboard reruns.
         """
-        persisted_by_id = {a.action_id: a for a in self._actions}
         reconciled: List[ActionItem] = []
+        candidate_incidents = {c.incident_key or c.action_id for c in derived_candidates}
+
+        def incident_of(action: ActionItem) -> Optional[str]:
+            return action.incident_key
+
+        def persist(action: ActionItem) -> bool:
+            if self.is_degraded or not self.drive_service:
+                return False
+            try:
+                self._write_to_drive(action)
+                return True
+            except Exception as exc:
+                self.last_error = f"Failed to persist auto-derived action to Drive: {exc}"
+                self.is_degraded = True
+                return False
 
         for cand in derived_candidates:
-            if cand.action_id in persisted_by_id:
-                existing = persisted_by_id[cand.action_id]
+            incident_key = cand.incident_key or cand.action_id
+            matching = [a for a in self._actions if incident_of(a) == incident_key]
+            existing = next((a for a in reversed(matching)
+                             if a.status in (STATUS_OPEN, STATUS_ACKNOWLEDGED)), None)
+            if existing:
                 # Update descriptive text while strictly preserving user lifecycle & stable timestamps
-                existing.reason = cand.reason
-                existing.impact = cand.impact
-                existing.recommended_next_step = cand.recommended_next_step
-                if not existing.waiting_since and cand.waiting_since:
-                    existing.waiting_since = cand.waiting_since
+                updated = replace(existing, reason=cand.reason, impact=cand.impact,
+                                  recommended_next_step=cand.recommended_next_step,
+                                  linked_entity_ids=cand.linked_entity_ids)
+                if not updated.waiting_since and cand.waiting_since:
+                    updated.waiting_since = cand.waiting_since
+                if persist(updated):
+                    self._actions[self._actions.index(existing)] = updated
+                    existing = updated
                 reconciled.append(existing)
             else:
-                # Newly detected action occurrence: persist to store
-                if not self.is_degraded and self.drive_service:
-                    try:
-                        self._write_to_drive(cand)
-                    except Exception as exc:
-                        self.last_error = f"Failed to persist auto-derived action to Drive: {exc}"
-                self._actions.append(cand)
-                persisted_by_id[cand.action_id] = cand
-                reconciled.append(cand)
+                prior = next((a for a in reversed(matching) if a.status in (STATUS_RESOLVED, STATUS_DISMISSED)), None)
+                # A user-dismissed/resolved incident remains closed while its evidence persists.
+                if prior and not (prior.resolution_note or "").startswith("Automatically resolved: canonical recovery"):
+                    reconciled.append(prior)
+                    continue
+                occurrence = cand
+                if matching:
+                    occurrence = replace(cand, action_id=f"{cand.action_id}-OCC-{len(matching) + 1}")
+                if persist(occurrence):
+                    self._actions.append(occurrence)
+                    reconciled.append(occurrence)
+
+        # Canonical recovery closes only new detector-owned, non-conflicted occurrences.
+        for existing in list(self._actions):
+            incident_key = incident_of(existing)
+            if (not incident_key or incident_key in candidate_incidents or existing.is_conflicted
+                    or existing.status not in (STATUS_OPEN, STATUS_ACKNOWLEDGED)):
+                continue
+            closed = replace(existing, status=STATUS_RESOLVED,
+                             resolved_at=datetime.now(timezone.utc).isoformat(),
+                             resolution_note="Automatically resolved: canonical recovery / condition cleared")
+            if persist(closed):
+                self._actions[self._actions.index(existing)] = closed
 
         # Update local cache with reconciled items
         try:
@@ -366,7 +404,7 @@ class ActionsStore:
             pass
 
         # Include any manually persisted actions not present in current derived candidates
-        cand_ids = {c.action_id for c in derived_candidates}
+        cand_ids = {a.action_id for a in reconciled}
         for p_act in self._actions:
             if p_act.action_id not in cand_ids and p_act not in reconciled:
                 reconciled.append(p_act)
@@ -460,11 +498,11 @@ def derive_automatic_actions(
     ideas_conflicted: List[Any],
     infra_health_list: Optional[List[Any]] = None,
     persisted_actions: Optional[List[ActionItem]] = None,
+    commands: Optional[List[Dict[str, Any]]] = None,
     now: Optional[datetime] = None,
 ) -> List[ActionItem]:
     """Derive live Action Item candidates from current SSOT state."""
     now_dt = now or datetime.now(timezone.utc)
-    persisted_by_id = {a.action_id: a for a in (persisted_actions or [])}
     derived: List[ActionItem] = []
 
     # 1. Blocked Tasks
@@ -472,13 +510,10 @@ def derive_automatic_actions(
         t_id = t.get("task_id", "")
         p_id = t.get("project_id", "Unassigned")
         st = t.get("status", "")
-        if st in ["blocked", "attention"]:
+        if st == "blocked":
             act_id = f"ACT-TASK-BLOCKED-{p_id}-{t_id}"
-            if act_id in persisted_by_id:
-                derived.append(persisted_by_id[act_id])
-            else:
-                initial_waiting = t.get("updated_at") or t.get("created_at") or now_dt.isoformat()
-                derived.append(ActionItem(
+            initial_waiting = t.get("updated_at") or t.get("created_at") or now_dt.isoformat()
+            derived.append(ActionItem(
                     action_id=act_id,
                     title=f"Task Blocked: {t.get('title', t_id)}",
                     type=TYPE_BLOCKED,
@@ -493,40 +528,14 @@ def derive_automatic_actions(
                     need_user_action=True,
                     source="Task State Monitor",
                     linked_entity_ids=[t_id],
-                ))
-
-        # 2. Human Review Required
-        elif st in ["awaiting_validation", "review_required"]:
-            act_id = f"ACT-TASK-REVIEW-{p_id}-{t_id}"
-            if act_id in persisted_by_id:
-                derived.append(persisted_by_id[act_id])
-            else:
-                initial_waiting = t.get("updated_at") or now_dt.isoformat()
-                derived.append(ActionItem(
-                    action_id=act_id,
-                    title=f"Review Required: {t.get('title', t_id)}",
-                    type=TYPE_REVIEW_REQUIRED,
-                    severity=SEVERITY_HIGH,
-                    project_id=p_id,
-                    task_id=t_id,
-                    created_at=t.get("updated_at") or now_dt.isoformat(),
-                    waiting_since=initial_waiting,
-                    reason="Task reached validation/review gate and requires explicit human verification.",
-                    impact="Dependent tasks and milestone completion are on hold.",
-                    recommended_next_step="Review code diff and mark task completed or request changes.",
-                    need_user_action=True,
-                    source="Review Gate Detector",
-                    linked_entity_ids=[t_id],
+                    incident_key=act_id,
                 ))
 
         # 3. Manual AG Dispatch Needed
         elif st == "ready" and (t.get("assigned_provider") == "antigravity" or t.get("recommended_provider") == "antigravity"):
             act_id = f"ACT-AG-DISPATCH-{p_id}-{t_id}"
-            if act_id in persisted_by_id:
-                derived.append(persisted_by_id[act_id])
-            else:
-                initial_waiting = t.get("created_at") or now_dt.isoformat()
-                derived.append(ActionItem(
+            initial_waiting = t.get("created_at") or now_dt.isoformat()
+            derived.append(ActionItem(
                     action_id=act_id,
                     title=f"Manual AG Dispatch Required: {t.get('title', t_id)}",
                     type=TYPE_ACTION_NEEDED,
@@ -541,47 +550,72 @@ def derive_automatic_actions(
                     need_user_action=True,
                     source="Provider Dispatch Matrix",
                     linked_entity_ids=[t_id],
+                    incident_key=act_id,
                 ))
 
     # 4. Stale Executions
     from manager.runtime_visibility import determine_ai_runtime_activity
     for exe in active_executions:
         ai_state = determine_ai_runtime_activity(exe, now_dt)[0]
-        if is_execution_stale(exe, now_dt) or ai_state in ["POSSIBLY STALLED", "STALE"]:
+        status = exe.get("status", "")
+        failed = status in ("failed", "interrupted", "cancelled")
+        if is_execution_stale(exe, now_dt) or ai_state in ["POSSIBLY STALLED", "STALE"] or failed:
             e_id = exe.get("execution_id", "unknown")
             p_id = exe.get("project_id", "Unassigned")
             t_id = exe.get("task_id", "")
             prov = exe.get("provider", "AI")
-            act_id = f"ACT-STALE-EXEC-{p_id}-{t_id}-{e_id}"
-            if act_id in persisted_by_id:
-                derived.append(persisted_by_id[act_id])
-            else:
-                initial_waiting = exe.get("heartbeat_at") or exe.get("started_at") or now_dt.isoformat()
-                derived.append(ActionItem(
+            task_block = next((a for a in derived if a.project_id == p_id and a.task_id == t_id and a.type == TYPE_BLOCKED), None)
+            act_id = task_block.action_id if task_block else f"ACT-EXEC-ISSUE-{p_id}-{t_id}-{e_id}"
+            initial_waiting = exe.get("stale_at") or exe.get("heartbeat_at") or exe.get("started_at") or now_dt.isoformat()
+            result = exe.get("result") or {}
+            detail = exe.get("error_kind") or result.get("error_kind") or exe.get("recovery_reason") or status or "activity timeout"
+            candidate = ActionItem(
                     action_id=act_id,
-                    title=f"Stalled Execution: {prov} on {t_id}",
+                    title=f"Execution Needs Attention: {prov} on {t_id}",
                     type=TYPE_BLOCKED,
                     severity=SEVERITY_HIGH,
                     project_id=p_id,
                     task_id=t_id,
                     created_at=exe.get("started_at") or now_dt.isoformat(),
                     waiting_since=initial_waiting,
-                    reason=f"Execution heartbeat or activity timed out on {prov}.",
+                    reason=f"Execution {status or 'liveness'} evidence on {prov}: {detail}.",
                     impact="Provider worker may have crashed or hung.",
                     recommended_next_step="Restart provider session or trigger rollback.",
                     need_user_action=True,
                     source="Execution Liveness Watcher",
                     linked_entity_ids=[e_id, t_id],
-                ))
+                    incident_key=act_id,
+                )
+            if task_block:
+                task_block.reason = candidate.reason
+                task_block.linked_entity_ids = list(dict.fromkeys(task_block.linked_entity_ids + candidate.linked_entity_ids))
+            else:
+                derived.append(candidate)
+
+    # Command status is canonical evidence; Task status is deliberately not overloaded.
+    for command in commands or []:
+        status = command.get("status", "")
+        if status not in ("attention", "failed"):
+            continue
+        p_id, t_id = command.get("project_id", "Unassigned"), command.get("task_id", "")
+        c_id = command.get("command_id", "unknown")
+        act_id = f"ACT-COMMAND-{status.upper()}-{p_id}-{t_id}-{c_id}"
+        result = command.get("result") or {}
+        detail = command.get("recovery_reason") or result.get("error_kind") or command.get("error_kind") or status
+        derived.append(ActionItem(action_id=act_id, incident_key=act_id,
+            title=f"Command {status.title()}: {c_id}", type=TYPE_REVIEW_REQUIRED if status == "attention" else TYPE_BLOCKED,
+            severity=SEVERITY_HIGH, project_id=p_id, task_id=t_id,
+            created_at=command.get("created_at") or now_dt.isoformat(),
+            waiting_since=command.get("stale_at") or command.get("created_at") or now_dt.isoformat(),
+            reason=f"Command {status} evidence: {detail}.", impact="Execution requires review or recovery.",
+            recommended_next_step="Inspect command and execution evidence before retrying.", source="Command State Monitor",
+            linked_entity_ids=[c_id, t_id]))
 
     # 5. Conflicted SSOT records
     for conf in ideas_conflicted:
         idea_id = getattr(conf, "idea_id", str(conf))
         act_id = f"ACT-SSOT-CONFLICT-{idea_id}"
-        if act_id in persisted_by_id:
-            derived.append(persisted_by_id[act_id])
-        else:
-            derived.append(ActionItem(
+        derived.append(ActionItem(
                 action_id=act_id,
                 title=f"SSOT Record Conflict: Idea {idea_id}",
                 type=TYPE_BLOCKED,
@@ -595,6 +629,7 @@ def derive_automatic_actions(
                 need_user_action=True,
                 source="SSOT Truth Guard",
                 linked_entity_ids=[idea_id],
+                incident_key=act_id,
             ))
 
     return derived
