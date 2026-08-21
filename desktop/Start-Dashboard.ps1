@@ -19,7 +19,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not (Test-Path -LiteralPath $PythonPath)) {
-    Write-Host "Configured PythonPath not found ($PythonPath) -- falling back to 'python' on PATH." -ForegroundColor Yellow
+    Write-Host "找不到設定的 PythonPath（$PythonPath），改用 PATH 中的 'python'。" -ForegroundColor Yellow
     $PythonPath = "python"
 }
 
@@ -32,13 +32,15 @@ if ($PythonDeps -and (Test-Path -LiteralPath $PythonDeps)) {
 if (-not (Test-Path -LiteralPath $env:GOOGLE_DRIVE_TOKEN)) {
     Add-Type -AssemblyName System.Windows.Forms
     [System.Windows.Forms.MessageBox]::Show(
-        "Google Drive token not found at:`n$($env:GOOGLE_DRIVE_TOKEN)`n`nThe Dashboard needs this to read live Drive data.",
+        "找不到 Google Drive 驗證權杖：`n$($env:GOOGLE_DRIVE_TOKEN)`n`n儀表板需要這個檔案才能讀取即時 Drive 資料。",
         "AI Development Manager", 'OK', 'Error'
     ) | Out-Null
     exit 1
 }
 
 Set-Location -LiteralPath $RepositoryPath
-Write-Host "Starting ADM Dashboard from $RepositoryPath on port $Port ..." -ForegroundColor Cyan
-& $PythonPath -m streamlit run dashboard.py --server.port $Port --server.headless false
+Write-Host "正在從 $RepositoryPath 啟動 ADM 儀表板（連接埠 $Port）..." -ForegroundColor Cyan
+# --server.headless true: Streamlit must never pop its own browser tab --
+# the tray/app-window layer (Open-AdmAppWindow) is the only product entry.
+& $PythonPath -m streamlit run dashboard.py --server.port $Port --server.headless true
 exit $LASTEXITCODE

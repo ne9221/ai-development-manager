@@ -2,6 +2,7 @@ import os
 import json
 import queue
 import threading
+import time
 import urllib.request
 import subprocess
 from datetime import datetime, timezone
@@ -81,7 +82,7 @@ from manager.dashboard_core import (
 )
 
 st.set_page_config(
-    page_title="ADM Operations Dashboard",
+    page_title="ADM 營運儀表板",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -94,6 +95,15 @@ st.markdown("""
         color: #c9d1d9;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }
+    [data-testid="stSidebar"] { background: #101722 !important; border-right: 1px solid #30363d; }
+    [data-testid="stSidebar"] * { color: #d8e1ea; }
+    [data-testid="stSidebar"] [role="radiogroup"] { gap: .18rem; padding-right: .45rem; }
+    [data-testid="stSidebar"] label { min-width: 0; overflow: visible; white-space: normal; }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: #b7c3d0; }
+    [data-testid="stHeader"] { background: #0d1117; }
+    [data-testid="stMainBlockContainer"] { padding-top: 1.25rem; }
+    .fleet-anchor { height: 0; }
+    [data-testid="stColumn"]:has(.fleet-anchor) { position: sticky; top: 1rem; align-self: flex-start; }
     .glass-card {
         background: rgba(22, 27, 34, 0.85);
         border: 1px solid #30363d;
@@ -251,21 +261,24 @@ def load_infra_health(drive_service_inst: Any = None) -> List[ServiceHealthViewM
     return [dash_vm, sc_vm, watcher_vm, supervisor_vm, drive_vm]
 
 
-def bounded_read(callback, timeout_seconds: float = 3.0):
+def bounded_read(callback, timeout_seconds: float = 3.0, retries: int = 1):
     """Return a canonical read result without allowing it to block page bootstrap."""
-    result = queue.Queue(maxsize=1)
-
-    def run():
+    deadline = time.monotonic() + timeout_seconds
+    for _ in range(retries + 1):
+        result = queue.Queue(maxsize=1)
+        def run():
+            try:
+                result.put((True, callback()))
+            except Exception as exc:
+                result.put((False, exc))
+        threading.Thread(target=run, daemon=True).start()
         try:
-            result.put((True, callback()))
-        except Exception as exc:
-            result.put((False, exc))
-
-    threading.Thread(target=run, daemon=True).start()
-    try:
-        return result.get(timeout=timeout_seconds)
-    except queue.Empty:
-        return False, TimeoutError(f"canonical Drive read timed out after {timeout_seconds:g}s")
+            ok, value = result.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            return False, TimeoutError(f"canonical Drive read timed out after {timeout_seconds:g}s")
+        if ok or time.monotonic() >= deadline:
+            return ok, value
+    return False, value
 
 now = datetime.now(timezone.utc)
 all_warnings = []
@@ -289,79 +302,37 @@ active_executions = []
 active_executions_dict = {}
 handoffs_dict = {}
 canonical_records_available = bool(store)
+records_are_last_known = False
+last_successful_sync = None
 
 if store:
-    projects_ok, projects_result = bounded_read(store.list_projects)
+    projects_ok, projects_result = bounded_read(store.dashboard_records)
     if projects_ok:
-        all_projects = projects_result
+        all_projects = projects_result["projects"]
+        all_tasks = projects_result["tasks"]
+        all_commands = projects_result["commands"]
+        all_executions = projects_result["executions"]
+        all_handoffs = projects_result["handoffs"]
+        last_successful_sync = now.isoformat()
+        st.session_state["dashboard_last_known"] = (last_successful_sync, projects_result)
     else:
         canonical_records_available = False
         all_warnings.append(f"Failed to list projects: {projects_result}")
+        last_known = st.session_state.get("dashboard_last_known")
+        if last_known:
+            last_successful_sync, records = last_known
+            all_projects, all_tasks = records["projects"], records["tasks"]
+            all_commands, all_executions = records["commands"], records["executions"]
+            all_handoffs, records_are_last_known = records["handoffs"], True
 
-    for p in all_projects:
-        p_id = p.get("project_id")
-        if not p_id:
-            continue
-
-        try:
-            tasks_folder = store.project_folder("tasks", p_id, create=False)
-            task_files = store.children(tasks_folder)
-            for tf in task_files:
-                fname = tf.get("name", "")
-                if fname.endswith(".json"):
-                    t_id = fname[:-5]
-                    try:
-                        task_data = store.get("tasks", p_id, t_id)
-                        all_tasks.append(task_data)
-                    except Exception as e:
-                        all_warnings.append(f"Malformed record in tasks for project {p_id}, file {fname}: {e}")
-        except Exception:
-            pass
-
-        try:
-            commands_folder = store.project_folder("commands", p_id, create=False)
-            for cf in store.children(commands_folder):
-                fname = cf.get("name", "")
-                if fname.endswith(".json"):
-                    all_commands.append(store.get("commands", p_id, fname[:-5]))
-        except Exception:
-            pass
-
-        try:
-            execs_folder = store.project_folder("executions", p_id, create=False)
-            exec_files = store.children(execs_folder)
-            for ef in exec_files:
-                fname = ef.get("name", "")
-                if fname.endswith(".json"):
-                    e_id = fname[:-5]
-                    try:
-                        exec_data = store.get("executions", p_id, e_id)
-                        all_executions.append(exec_data)
-                        if exec_data.get("status") in ["running", "reserved"]:
-                            active_executions.append(exec_data)
-                            active_executions_dict[(p_id, exec_data.get("task_id"))] = exec_data
-                    except Exception as e:
-                        all_warnings.append(f"Malformed record in executions for project {p_id}, file {fname}: {e}")
-        except Exception:
-            pass
-
-        try:
-            ho_folder = store.project_folder("handoffs", p_id, create=False)
-            ho_files = store.children(ho_folder)
-            for hf in ho_files:
-                fname = hf.get("name", "")
-                if fname.endswith(".json"):
-                    h_id = fname[:-5]
-                    try:
-                        ho_data = store.get("handoffs", p_id, h_id)
-                        all_handoffs.append(ho_data)
-                        t_id = ho_data.get("task_id")
-                        if t_id:
-                            handoffs_dict[(p_id, t_id)] = ho_data
-                    except Exception as e:
-                        all_warnings.append(f"Malformed record in handoffs for project {p_id}, file {fname}: {e}")
-        except Exception:
-            pass
+for exec_data in all_executions:
+    if exec_data.get("status") in ["running", "reserved"]:
+        active_executions.append(exec_data)
+        active_executions_dict[(exec_data.get("project_id"), exec_data.get("task_id"))] = exec_data
+for ho_data in all_handoffs:
+    if ho_data.get("task_id"):
+        handoffs_dict[(ho_data.get("project_id"), ho_data["task_id"])] = ho_data
+records_available = canonical_records_available or records_are_last_known
 
 drive_status_raw = {"providers": []}
 if drive_service:
@@ -411,16 +382,16 @@ if not canonical_records_available:
     )
 next_auto_action_str = compute_next_auto_action(all_tasks, active_executions, all_actions, daily_brief_vm)
 
-NAV_OVERVIEW = "Overview"
-NAV_ACTION_CENTER = "Action Center"
-NAV_PROJECTS = "Projects"
-NAV_TASKS = "Tasks"
-NAV_IDEAS = "Ideas"
-NAV_AI_SESSIONS = "AI Sessions"
-NAV_REVIEWS = "Reviews"
-NAV_QUOTA = "Quota"
-NAV_LOGS = "Logs"
-NAV_SETTINGS = "Settings"
+NAV_OVERVIEW = "總覽"
+NAV_ACTION_CENTER = "操作中心"
+NAV_PROJECTS = "專案"
+NAV_TASKS = "任務"
+NAV_IDEAS = "構想"
+NAV_AI_SESSIONS = "AI 工作階段"
+NAV_REVIEWS = "審查"
+NAV_QUOTA = "用量與 AI Fleet"
+NAV_LOGS = "日誌"
+NAV_SETTINGS = "設定"
 
 NAV_PAGES = [
     NAV_OVERVIEW,
@@ -438,34 +409,36 @@ NAV_PAGES = [
 if "nav_selection" not in st.session_state:
     st.session_state["nav_selection"] = NAV_OVERVIEW
 
-st.sidebar.title("🤖 AI Development Manager")
-selected_nav = st.sidebar.radio("Navigation", NAV_PAGES, key="nav_selection")
+st.sidebar.title("🤖 AI 開發管理員")
+selected_nav = st.sidebar.radio("導覽", NAV_PAGES, key="nav_selection")
 
 st.sidebar.markdown("---")
 if actions_summary["need_user_action"] > 0:
-    st.sidebar.error(f"🚨 待你处理: {actions_summary['need_user_action']} 项")
+    st.sidebar.error(f"🚨 待你處理：{actions_summary['need_user_action']} 項")
 elif actions_summary["open"] > 0:
-    st.sidebar.warning(f"⚡ Action Center: {actions_summary['open']} open")
+    st.sidebar.warning(f"⚡ 操作中心：{actions_summary['open']} 項待處理")
 else:
-    st.sidebar.caption(f"✅ Action Center: All clear")
+    st.sidebar.caption("✅ 操作中心：目前無需人工處理（不代表系統健康）")
 
-conflict_tag = f" · ⚠️ {ideas_summary['conflicted']} 冲突" if ideas_summary.get('conflicted', 0) > 0 else ""
-st.sidebar.caption(f"💡 Ideas: {ideas_summary['pending']} 待立案 · {ideas_summary['confirmed']} 已确认{conflict_tag}")
-st.sidebar.caption(f"⚡ Active Tasks: {len(active_executions) if canonical_records_available else 'Unavailable'}")
+conflict_tag = f" · ⚠️ {ideas_summary['conflicted']} 衝突" if ideas_summary.get('conflicted', 0) > 0 else ""
+st.sidebar.caption(f"💡 構想：{ideas_summary['pending']} 待立案 · {ideas_summary['confirmed']} 已確認{conflict_tag}")
+st.sidebar.caption(f"⚡ 執行中任務：{len(active_executions) if canonical_records_available else '無法取得'}")
+if records_are_last_known:
+    st.sidebar.warning(f"⚠️ 顯示上次成功同步資料（{last_successful_sync}）；非目前狀態。")
 
 def render_overview_page():
-    st.title("🎯 Operations Overview")
+    st.title("🎯 營運總覽")
 
     # Section 1: Global Runtime State Banner
     st.markdown(f"""
     <div class="runtime-state-banner">
         <div>
-            <span style="font-size:13px; color:#8b949e; margin-right:8px;">GLOBAL ADM RUNTIME STATE:</span>
+            <span style="font-size:13px; color:#b7c3d0; margin-right:8px;">ADM 整體執行狀態：</span>
             <span class="{global_badge_class}" style="font-size:14px;">{global_runtime_state}</span>
             <span style="font-size:13px; margin-left:10px; color:#c9d1d9;">{global_state_desc}</span>
         </div>
         <div style="font-size:13px; color:#8b949e;">
-            <b>Next Auto Action:</b> <span style="color:#58a6ff;">{next_auto_action_str}</span>
+            <b>下一個自動動作：</b> <span style="color:#79c0ff;">{next_auto_action_str}</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -473,18 +446,18 @@ def render_overview_page():
     # Section 2: Action Center Quick Alert Bar
     col_act1, col_act2, col_act3, col_act4 = st.columns([1.5, 1.5, 1.5, 2.5])
     with col_act1:
-        st.metric("🚨 Need User Action", actions_summary["need_user_action"])
+        st.metric("🚨 需人工處理", actions_summary["need_user_action"])
     with col_act2:
-        st.metric("📝 Review Required", actions_summary["review_required"])
+        st.metric("📝 需審查", actions_summary["review_required"])
     with col_act3:
-        st.metric("⚠️ Blocked Items", actions_summary["blocked"])
+        st.metric("⚠️ 受阻項目", actions_summary["blocked"])
     with col_act4:
         if actions_summary["need_user_action"] > 0:
-            if st.button("👉 Open Action Center (前往处理)", key="btn_goto_actions_top", use_container_width=True):
+            if st.button("👉 前往操作中心", key="btn_goto_actions_top", use_container_width=True):
                 st.session_state["nav_selection"] = NAV_ACTION_CENTER
                 st.rerun()
         else:
-            st.caption("✅ No critical user interventions pending.")
+            st.caption("✅ 目前無需人工處理；此訊息不代表系統健康。")
 
     st.markdown("---")
 
@@ -505,46 +478,40 @@ def render_overview_page():
     col_left, col_right = st.columns([3, 2])
 
     with col_left:
-        st.subheader("📁 Active Projects & Milestones")
-        if not canonical_records_available:
-            st.warning("Unavailable — canonical project/task records could not be read from Drive. No empty result is inferred.")
+        st.subheader("📁 專案、里程碑與任務")
+        if not records_available:
+            st.warning("無法取得 — 無法讀取 Drive 的 canonical 專案／任務記錄；不會推論為空結果。")
         elif not all_projects:
-            st.info("No active projects found. Create a project to begin tracking.")
+            st.info("目前沒有可用的專案記錄。請建立專案後再追蹤。")
         else:
             for proj in all_projects:
                 p_id = proj.get("project_id", "—")
                 p_title = proj.get("title", p_id)
                 proj_tasks = [t for t in all_tasks if t.get("project_id") == p_id]
-                completed_tasks = [t for t in proj_tasks if t.get("status") == "completed"]
-                total_count = len(proj_tasks) or 1
-                prog_pct = int((len(completed_tasks) / total_count) * 100)
-
                 active_task_in_proj = next((t for t in proj_tasks if (p_id, t.get("task_id")) in active_executions_dict), None)
-                curr_status = "In Progress" if active_task_in_proj else ("Ready" if proj_tasks else "Planning")
-                next_step = active_task_in_proj.get("next_action") if active_task_in_proj else (proj_tasks[0].get("next_action") if proj_tasks else "Define next milestone")
+                status_text = active_task_in_proj.get("status", "—") if active_task_in_proj else "無法取得／未記錄"
+                status_badge = "badge-warn" if not active_task_in_proj else "badge-ok"
+                next_step = active_task_in_proj.get("next_action") if active_task_in_proj else "無法取得／未記錄"
 
                 st.markdown(f"""
                 <div class="glass-card">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
                         <h4 style="margin:0;">{p_title} <small style="color:#8b949e;">({p_id})</small></h4>
-                        <span class="badge-ok">{curr_status}</span>
+                        <span class="{status_badge}">{status_text}</span>
                     </div>
-                    <p style="margin:8px 0 4px 0; font-size:14px;"><b>Overall Progress:</b> {prog_pct}% ({len(completed_tasks)}/{len(proj_tasks)} tasks)</p>
-                    <div style="background:#21262d; border-radius:4px; height:6px; width:100%; margin-bottom:8px;">
-                        <div style="background:#238636; width:{prog_pct}%; height:6px; border-radius:4px;"></div>
-                    </div>
-                    <p style="margin:0; font-size:13px; color:#8b949e;"><b>Next Step / ETA:</b> {next_step or '—'}</p>
+                    <p style="margin:8px 0 4px 0; font-size:14px;"><b>專案總進度：</b>無法取得（未記錄 canonical 百分比；不以任務數推算）</p>
+                    <p style="margin:0; font-size:13px; color:#b7c3d0;"><b>下一步：</b>{next_step or '無法取得／未記錄'}</p>
                 </div>
                 """, unsafe_allow_html=True)
 
-        st.subheader("⚠️ Blockers & Attention Required")
+        st.subheader("⚠️ 阻礙與待注意事項")
         stale_execs = [exe for exe in active_executions if is_execution_stale(exe, now)]
         blocked_tasks = [t for t in all_tasks if t.get("status") in ["blocked", "attention"]]
 
-        if not canonical_records_available:
-            st.warning("Unavailable — task blockers cannot be assessed while canonical project/task records are unavailable.")
+        if not records_available:
+            st.warning("無法取得 — canonical 專案／任務記錄不可用，無法判定任務阻礙。")
         elif not stale_execs and not blocked_tasks and not conflicted_ideas and actions_summary["blocked"] == 0:
-            st.success("✅ No active blockers. All pipelines and tasks are operating normally.")
+            st.info("✅ 目前未記錄任何阻礙；此訊息不代表系統健康。")
         else:
             for exe in stale_execs:
                 st.markdown(f"""
@@ -569,7 +536,8 @@ def render_overview_page():
                 """, unsafe_allow_html=True)
 
     with col_right:
-        st.subheader("⚡ Live AI Fleet & Runtime Visibility")
+        st.markdown('<div class="fleet-anchor"></div>', unsafe_allow_html=True)
+        st.subheader("⚡ AI Fleet 與執行狀態")
         providers_data = summary.get("providers", [])
         accounts_data = summary.get("accounts", [])
         
@@ -623,7 +591,7 @@ def render_overview_page():
                                 <b>{acc_title}</b>
                                 <span class="{badge_class}">{fleet_state}</span>
                             </div>
-                            <p style="margin:6px 0 2px 0; font-size:13px;"><b>Task:</b> {curr_task_str}</p>
+                            <p style="margin:6px 0 2px 0; font-size:13px;"><b>任務：</b> {curr_task_str}</p>
                             <p style="margin:0 0 2px 0; font-size:12px; color:#8b949e;"><b>Model/Mode:</b> {model_str} ({mode_str}/{effort_str}) | <b>Session:</b> <code>{sess_id}</code></p>
                             <p style="margin:0 0 2px 0; font-size:12px;"><b>Started:</b> {started_display} · <b>Elapsed:</b> {elapsed_display}</p>
                             <p style="margin:0 0 2px 0; font-size:12px;"><b>Last Activity ({act_src}):</b> {activity_display}{eta_line}</p>
@@ -631,10 +599,10 @@ def render_overview_page():
                         </div>
                         """, unsafe_allow_html=True)
                     else:
-                        fleet_state = "IDLE"
+                        fleet_state = "UNKNOWN" if not canonical_records_available else "IDLE"
                         badge_class = "badge-warn"
-                        curr_task_str = "No active task assigned"
-                        event_str = "Awaiting next dispatch cycle"
+                        curr_task_str = "無法確認執行任務" if not canonical_records_available else "目前未指派執行中任務"
+                        event_str = "canonical 專案／任務資料不可用" if not canonical_records_available else "等待下一次派送週期"
 
                         st.markdown(f"""
                         <div class="glass-card">
@@ -648,7 +616,7 @@ def render_overview_page():
                         """, unsafe_allow_html=True)
 
                     if acc.get("stale"):
-                        st.warning(f"⚠️ STALE: No recent status updates received for {acc_title}.")
+                        st.warning(f"⚠️ 資料過期：{acc_title} 沒有最近的狀態更新。")
 
                     rem_pct = acc.get("remaining_percent")
                     if rem_pct is None:
@@ -659,7 +627,7 @@ def render_overview_page():
                     if rem_pct is not None:
                         st.progress(max(0.0, min(1.0, float(rem_pct) / 100.0)))
                     else:
-                        st.info("Percentage not reported")
+                        st.info("用量百分比無法取得")
             else:
                 st.markdown(f"#### {prov_name}")
                 matched_exe = next((
@@ -697,7 +665,7 @@ def render_overview_page():
                             <b>{prov_name}</b>
                             <span class="{badge_class}">{fleet_state}</span>
                         </div>
-                        <p style="margin:6px 0 2px 0; font-size:13px;"><b>Task:</b> {curr_task_str}</p>
+                        <p style="margin:6px 0 2px 0; font-size:13px;"><b>任務：</b> {curr_task_str}</p>
                         <p style="margin:0 0 2px 0; font-size:12px; color:#8b949e;"><b>Model/Mode:</b> {model_str} ({mode_str}/{effort_str}) | <b>Session:</b> <code>{sess_id}</code></p>
                         <p style="margin:0 0 2px 0; font-size:12px;"><b>Started:</b> {started_display} · <b>Elapsed:</b> {elapsed_display}</p>
                         <p style="margin:0 0 2px 0; font-size:12px;"><b>Last Activity ({act_src}):</b> {activity_display}{eta_line}</p>
@@ -705,10 +673,10 @@ def render_overview_page():
                     </div>
                     """, unsafe_allow_html=True)
                 else:
-                    fleet_state = "IDLE"
+                    fleet_state = "UNKNOWN" if not canonical_records_available else "IDLE"
                     badge_class = "badge-warn"
-                    curr_task_str = "No active task assigned"
-                    event_str = "Awaiting next dispatch cycle"
+                    curr_task_str = "無法確認執行任務" if not canonical_records_available else "目前未指派執行中任務"
+                    event_str = "canonical 專案／任務資料不可用" if not canonical_records_available else "等待下一次派送週期"
 
                     st.markdown(f"""
                     <div class="glass-card">
@@ -722,7 +690,7 @@ def render_overview_page():
                     """, unsafe_allow_html=True)
 
                 if prov.get("stale"):
-                    st.warning(f"⚠️ STALE: No recent status updates received for {prov_name}.")
+                    st.warning(f"⚠️ 資料過期：{prov_name} 沒有最近的狀態更新。")
 
                 rem_pct = prov.get("remaining_percent")
                 if rem_pct is None:
@@ -733,19 +701,19 @@ def render_overview_page():
                 if rem_pct is not None:
                     st.progress(max(0.0, min(1.0, float(rem_pct) / 100.0)))
                 else:
-                    st.info("Percentage not reported")
+                    st.info("用量百分比無法取得")
 
-        st.subheader("💡 Ideas Backlog")
+        st.subheader("💡 構想清單")
         st.markdown(f"""
         <div class="recommendation-card">
-            <h4 style="margin:0 0 6px 0;">Ideas ({ideas_summary['total']} total)</h4>
+            <h4 style="margin:0 0 6px 0;">構想（共 {ideas_summary['total']} 項）</h4>
             <p style="margin:0 0 10px 0; font-size:14px; color:#c9d1d9;">
-                <b>待立案 {ideas_summary['pending']}</b> · <b>已确认 {ideas_summary['confirmed']}</b>
-                <br><small style="color:#8b949e;">(已立案 {ideas_summary['converted']} · 已放弃 {ideas_summary['dropped']})</small>
+                <b>待立案 {ideas_summary['pending']}</b> · <b>已確認 {ideas_summary['confirmed']}</b>
+                <br><small style="color:#b7c3d0;">(已立案 {ideas_summary['converted']} · 已放棄 {ideas_summary['dropped']})</small>
             </p>
         </div>
         """, unsafe_allow_html=True)
-        if st.button("👉 Open Ideas Page (前往灵感中心)", key="btn_goto_ideas", use_container_width=True):
+        if st.button("👉 前往構想中心", key="btn_goto_ideas", use_container_width=True):
             st.session_state["nav_selection"] = NAV_IDEAS
             st.rerun()
 
@@ -788,13 +756,13 @@ def render_overview_page():
         st.table(pd.DataFrame(exec_rows))
 
 def render_action_center_page():
-    st.title("🚨 Action Center (待你处理)")
-    st.caption("当 AI Fleet 无法自动继续或需要人工决策验收时，集中在此处记录和响应，确保任务不发生无声停滞。")
+    st.title("🚨 操作中心")
+    st.caption("當 AI Fleet 無法自動繼續或需要人工決策／驗收時，集中在此記錄與回應，避免任務無聲停滯。")
 
     if actions_store.is_degraded:
-        st.warning("⚠️ Action Center: Running in Local Cache / Degraded Mode (Google Drive SSOT disconnected). Action updates are read-only.")
+        st.warning("⚠️ 操作中心：本機快取／降級模式（Google Drive SSOT 未連線），操作項目為唯讀。")
     else:
-        st.caption("✅ Action Center: Google Drive SSOT Connected")
+        st.caption("✅ 操作中心：Google Drive SSOT 已連線。")
 
     if actions_store.last_error:
         st.error(f"{actions_store.last_error}")
@@ -802,13 +770,13 @@ def render_action_center_page():
     # Summary Metrics Row
     m_col1, m_col2, m_col3, m_col4 = st.columns(4)
     with m_col1:
-        st.metric("🚨 Need User Action", actions_summary["need_user_action"])
+        st.metric("🚨 需人工處理", actions_summary["need_user_action"])
     with m_col2:
-        st.metric("📝 Review Required", actions_summary["review_required"])
+        st.metric("📝 需審查", actions_summary["review_required"])
     with m_col3:
-        st.metric("⚠️ Blocked Items", actions_summary["blocked"])
+        st.metric("⚠️ 受阻項目", actions_summary["blocked"])
     with m_col4:
-        st.metric("📦 Action History", actions_summary["history"])
+        st.metric("📦 操作紀錄", actions_summary["history"])
 
     st.markdown("---")
 
@@ -817,9 +785,9 @@ def render_action_center_page():
     history_actions_list = [a for a in all_actions if a.status in [STATUS_RESOLVED, STATUS_DISMISSED]]
 
     # Category 1: Needs Attention (Open Items)
-    with st.expander(f"🚨 Needs Attention / 待处理 ({len(open_actions_list)})", expanded=True):
+    with st.expander(f"🚨 需注意／待處理 ({len(open_actions_list)})", expanded=True):
         if not open_actions_list:
-            st.info("✅ 当前没有任何待处理事项，所有任务均在自主运行或已就绪。")
+            st.info("✅ 目前沒有待處理事項；這不代表所有任務或系統均健康。")
         for item in open_actions_list:
             sev_badge = f"<span class='badge-{item.severity[:4].lower()}'>{item.severity.upper()}</span>"
             waiting_dur = format_waiting_duration(item.waiting_since, now)
@@ -848,21 +816,21 @@ def render_action_center_page():
 
             col_b1, col_b2, col_b3 = st.columns([1.5, 1.5, 3])
             with col_b1:
-                if st.button("👀 知晓 (Acknowledge)", key=f"btn_ack_{item.action_id}", disabled=actions_store.is_degraded):
+                if st.button("👀 已知悉", key=f"btn_ack_{item.action_id}", disabled=actions_store.is_degraded):
                     try:
                         actions_store.acknowledge_action(item.action_id, note=f"Acknowledged by user at {datetime.now(timezone.utc).strftime('%H:%M:%S')}")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Acknowledge failed: {e}")
             with col_b2:
-                if st.button("✅ 标记已解决 (Resolve)", key=f"btn_res_{item.action_id}", disabled=actions_store.is_degraded):
+                if st.button("✅ 標記為已解決", key=f"btn_res_{item.action_id}", disabled=actions_store.is_degraded):
                     try:
                         actions_store.resolve_action(item.action_id, note="Resolved by user via Action Center")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Resolve failed: {e}")
             with col_b3:
-                if st.button("✖ 忽略 (Dismiss)", key=f"btn_dsm_{item.action_id}", disabled=actions_store.is_degraded):
+                if st.button("✖ 忽略", key=f"btn_dsm_{item.action_id}", disabled=actions_store.is_degraded):
                     try:
                         actions_store.dismiss_action(item.action_id, note="Dismissed by user")
                         st.rerun()
@@ -870,9 +838,9 @@ def render_action_center_page():
                         st.error(f"Dismiss failed: {e}")
 
     # Category 2: Acknowledged Items
-    with st.expander(f"👀 Acknowledged / 已知晓待完成 ({len(ack_actions_list)})", expanded=bool(ack_actions_list)):
+    with st.expander(f"👀 已知悉、待完成 ({len(ack_actions_list)})", expanded=bool(ack_actions_list)):
         if not ack_actions_list:
-            st.write("暂无已知晓事项。")
+            st.write("目前沒有已知悉事項。")
         for item in ack_actions_list:
             sev_badge = f"<span class='badge-{item.severity[:4].lower()}'>{item.severity.upper()}</span>"
             waiting_dur = format_waiting_duration(item.waiting_since, now)
@@ -894,14 +862,14 @@ def render_action_center_page():
 
             col_b1, col_b2, _ = st.columns([1.5, 1.5, 3])
             with col_b1:
-                if st.button("✅ 标记已解决 (Resolve)", key=f"btn_res_ack_{item.action_id}", disabled=actions_store.is_degraded):
+                if st.button("✅ 標記為已解決", key=f"btn_res_ack_{item.action_id}", disabled=actions_store.is_degraded):
                     try:
                         actions_store.resolve_action(item.action_id, note="Resolved after acknowledgment")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Resolve failed: {e}")
             with col_b2:
-                if st.button("✖ 忽略 (Dismiss)", key=f"btn_dsm_ack_{item.action_id}", disabled=actions_store.is_degraded):
+                if st.button("✖ 忽略", key=f"btn_dsm_ack_{item.action_id}", disabled=actions_store.is_degraded):
                     try:
                         actions_store.dismiss_action(item.action_id, note="Dismissed after acknowledgment")
                         st.rerun()
@@ -909,10 +877,10 @@ def render_action_center_page():
                         st.error(f"Dismiss failed: {e}")
 
     # Category 3: History (Resolved & Dismissed) - Default Collapsed
-    with st.expander(f"📜 Action History / 历史归档 ({len(history_actions_list)})", expanded=False):
-        st.caption("ℹ️ *已解决与已忽略的历史事项保留完整审计记录。*")
+    with st.expander(f"📜 操作紀錄 ({len(history_actions_list)})", expanded=False):
+        st.caption("ℹ️ *已解決與已忽略的歷史事項保留完整稽核記錄。*")
         if not history_actions_list:
-            st.write("暂无历史归档事项。")
+            st.write("目前沒有歷史歸檔事項。")
         for item in history_actions_list:
             badge_type = "badge-ok" if item.status == STATUS_RESOLVED else "badge-err"
             resolved_ts = item.resolved_at or item.dismissed_at or "—"
@@ -932,8 +900,8 @@ def render_action_center_page():
 
 
 def render_ideas_page():
-    st.title("💡 Ideas Backlog & Triage (灵感中心)")
-    st.caption("保存平时零散提出的想法（‘以后要做 / 之后加 / 先记着’），在正式进入 Project 执行前完成确认与立案。")
+    st.title("💡 構想中心")
+    st.caption("保存平時零散提出的構想（「以後要做／之後加／先記著」），在正式進入專案執行前完成確認與立案。")
 
     if ideas_store.is_degraded:
         st.warning("⚠️ Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
@@ -944,19 +912,19 @@ def render_ideas_page():
         st.error(f"{ideas_store.last_error}")
 
     # Quick Add Idea Expander
-    with st.expander("➕ Capture New Idea (快速记录想法)", expanded=False):
+    with st.expander("➕ 快速記錄構想", expanded=False):
         with st.form("form_add_idea", clear_on_submit=True):
             col_t1, col_t2 = st.columns([3, 1])
             with col_t1:
-                new_title = st.text_input("Title (想法简述)", placeholder="例如: 增加微信/Webhook 告警机器人")
+                new_title = st.text_input("標題（構想簡述）", placeholder="例如：新增 Webhook 警示機器人")
             with col_t2:
-                new_priority = st.selectbox("Priority", ["high", "medium", "low"], index=1)
+                new_priority = st.selectbox("優先級", ["high", "medium", "low"], index=1)
 
-            new_desc = st.text_area("Description / Context", placeholder="详细背景、为什么要做、可能的方案...")
-            new_proj = st.text_input("Proposed Project ID (可选)", value="ai-development-manager")
-            new_source = st.text_input("Source / 来源", value="User Chat")
+            new_desc = st.text_area("說明／背景", placeholder="詳細背景、為什麼要做、可能方案……")
+            new_proj = st.text_input("建議專案 ID（選填）", value="ai-development-manager")
+            new_source = st.text_input("來源", value="使用者對話")
 
-            if st.form_submit_button("Save Idea (存入待立案)"):
+            if st.form_submit_button("儲存構想（存入待立案）"):
                 if ideas_store.is_degraded:
                     st.error("Drive SSOT unavailable — Ideas are read-only until cloud connection is restored.")
                 elif new_title.strip():
@@ -972,20 +940,20 @@ def render_ideas_page():
                     )
                     try:
                         ideas_store.add_idea(item)
-                        st.success(f"Idea '{new_title}' added to 待立案!")
+                        st.success(f"構想「{new_title}」已加入待立案。")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Failed to add idea: {e}")
                 else:
-                    st.error("Title cannot be empty.")
+                    st.error("標題不得為空。")
 
     grouped = group_ideas_by_status(ideas_store.list_ideas())
 
     # Conflicted Ideas Warning Section (Fail Closed)
     conflicted_list = grouped.get(STATUS_CONFLICTED, [])
     if conflicted_list:
-        with st.expander(f"⚠️ 冲突锁定中的 Ideas ({len(conflicted_list)})", expanded=True):
-            st.error("检测到以下 Idea 在 Drive SSOT 中存在多份冲突记录。为确保真实性，禁止自动合并或选择胜出者，已锁定所有变更操作。请在云端排查修复后刷新。")
+        with st.expander(f"⚠️ 衝突鎖定中的構想 ({len(conflicted_list)})", expanded=True):
+            st.error("偵測到下列構想在 Drive SSOT 有多份衝突記錄。為確保真實性，禁止自動合併或選擇版本，所有變更已鎖定；請在雲端排查修復後重新整理。")
             for c_item in conflicted_list:
                 st.markdown(f"""
                 <div class="glass-card" style="border: 1px solid #ff7b72;">
@@ -999,7 +967,7 @@ def render_ideas_page():
     pending_list = grouped[STATUS_PENDING]
     with st.expander(f"▼ 待立案 ({len(pending_list)})", expanded=True):
         if not pending_list:
-            st.info("暂无待立案想法 (0 Ideas)。")
+            st.info("目前沒有待立案構想。")
         for item in pending_list:
             st.markdown(f"""
             <div class="glass-card">
@@ -1018,7 +986,7 @@ def render_ideas_page():
             """, unsafe_allow_html=True)
             col_b1, col_b2, _ = st.columns([1.2, 1.2, 3.6])
             with col_b1:
-                if st.button("✨ 确认 (Confirm)", key=f"btn_conf_{item.idea_id}"):
+                if st.button("✨ 確認", key=f"btn_conf_{item.idea_id}"):
                     try:
                         ideas_store.confirm_idea(item.idea_id, note=f"Confirmed on {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
                         st.rerun()
@@ -1026,17 +994,17 @@ def render_ideas_page():
                         st.error(f"Confirm failed: {e}")
             with col_b2:
                 show_drop_form = st.session_state.get(f"show_drop_{item.idea_id}", False)
-                if st.button("📦 放弃 (Drop)...", key=f"btn_drop_toggle_{item.idea_id}"):
+                if st.button("📦 放棄……", key=f"btn_drop_toggle_{item.idea_id}"):
                     st.session_state[f"show_drop_{item.idea_id}"] = not show_drop_form
                     st.rerun()
 
             if st.session_state.get(f"show_drop_{item.idea_id}", False):
                 with st.form(f"form_drop_{item.idea_id}"):
-                    st.markdown(f"**放弃想法: {item.title}**")
-                    drop_r = st.text_input("Drop Reason (放弃原因，必填)*", key=f"dr_{item.idea_id}")
-                    drop_p = st.text_input("Drop Problem / Blocker (当时问题/阻碍，必填)*", key=f"dp_{item.idea_id}")
+                    st.markdown(f"**放棄構想：{item.title}**")
+                    drop_r = st.text_input("放棄原因（必填）*", key=f"dr_{item.idea_id}")
+                    drop_p = st.text_input("當時問題／阻礙（必填）*", key=f"dp_{item.idea_id}")
                     drop_n = st.text_input("Decision Note (说明)", value="Dropped after review", key=f"dn_{item.idea_id}")
-                    if st.form_submit_button("Confirm Drop (确认放弃)"):
+                    if st.form_submit_button("確認放棄"):
                         if drop_r.strip() and drop_p.strip():
                             try:
                                 ideas_store.drop_idea(item.idea_id, drop_reason=drop_r, drop_problem=drop_p, note=drop_n)
@@ -1045,13 +1013,13 @@ def render_ideas_page():
                             except Exception as e:
                                 st.error(f"Drop failed: {e}")
                         else:
-                            st.error("放弃原因 (Drop Reason) 与 当时问题 (Drop Problem) 均为必填项，不得留空。")
+                            st.error("放棄原因與當時問題均為必填，不得留空。")
 
-    # Category 2: 已确认 (Default Expanded)
+    # Category 2: 已確認 (Default Expanded)
     confirmed_list = grouped[STATUS_CONFIRMED]
-    with st.expander(f"▼ 已确认 ({len(confirmed_list)})", expanded=True):
+    with st.expander(f"▼ 已確認 ({len(confirmed_list)})", expanded=True):
         if not confirmed_list:
-            st.info("暂无已确认待立案想法 (0 Ideas)。")
+            st.info("目前沒有已確認、待立案的構想。")
         for item in confirmed_list:
             st.markdown(f"""
             <div class="glass-card">
@@ -1076,7 +1044,7 @@ def render_ideas_page():
                     st.rerun()
             with col_b2:
                 show_drop_form2 = st.session_state.get(f"show_drop2_{item.idea_id}", False)
-                if st.button("📦 放弃 (Drop)...", key=f"btn_drop2_toggle_{item.idea_id}"):
+                if st.button("📦 放棄……", key=f"btn_drop2_toggle_{item.idea_id}"):
                     st.session_state[f"show_drop2_{item.idea_id}"] = not show_drop_form2
                     st.rerun()
 
@@ -1087,7 +1055,7 @@ def render_ideas_page():
                     conv_ms = st.text_input("Milestone ID (可选)", value=item.milestone_id or "")
                     conv_t = st.text_input("Task ID (可选)", value=item.task_id or "")
                     conv_n = st.text_input("Decision Note", value=item.decision_note or "Converted to project task")
-                    if st.form_submit_button("Confirm Conversion (确认立案)"):
+                    if st.form_submit_button("確認立案"):
                         if conv_proj.strip() and conv_proj.strip() != "Unassigned":
                             try:
                                 ideas_store.convert_idea(item.idea_id, project_id=conv_proj.strip(), milestone_id=conv_ms.strip() or None, task_id=conv_t.strip() or None, note=conv_n)
@@ -1100,11 +1068,11 @@ def render_ideas_page():
 
             if st.session_state.get(f"show_drop2_{item.idea_id}", False):
                 with st.form(f"form_drop2_{item.idea_id}"):
-                    st.markdown(f"**放弃想法: {item.title}**")
-                    drop_r2 = st.text_input("Drop Reason (放弃原因，必填)*", key=f"dr2_{item.idea_id}")
-                    drop_p2 = st.text_input("Drop Problem / Blocker (当时问题/阻碍，必填)*", key=f"dp2_{item.idea_id}")
+                    st.markdown(f"**放棄構想：{item.title}**")
+                    drop_r2 = st.text_input("放棄原因（必填）*", key=f"dr2_{item.idea_id}")
+                    drop_p2 = st.text_input("當時問題／阻礙（必填）*", key=f"dp2_{item.idea_id}")
                     drop_n2 = st.text_input("Decision Note (说明)", value="Dropped from confirmed queue", key=f"dn2_{item.idea_id}")
-                    if st.form_submit_button("Confirm Drop (确认放弃)"):
+                    if st.form_submit_button("確認放棄"):
                         if drop_r2.strip() and drop_p2.strip():
                             try:
                                 ideas_store.drop_idea(item.idea_id, drop_reason=drop_r2, drop_problem=drop_p2, note=drop_n2)
@@ -1113,14 +1081,14 @@ def render_ideas_page():
                             except Exception as e:
                                 st.error(f"Drop failed: {e}")
                         else:
-                            st.error("放弃原因 (Drop Reason) 与 当时问题 (Drop Problem) 均为必填项，不得留空。")
+                            st.error("放棄原因與當時問題均為必填，不得留空。")
 
     # Category 3: 已立案 (Default Collapsed / Folded)
     converted_list = grouped[STATUS_CONVERTED]
     with st.expander(f"▶ 已立案 ({len(converted_list)})", expanded=False):
-        st.caption("ℹ️ *已立案想法之执行进度唯一来源于正式 Project / Milestone / Task SSOT，本页仅保留立案历史档案。*")
+        st.caption("ℹ️ *已立案構想的執行進度唯一來源為正式 Project／Milestone／Task SSOT，本頁僅保留立案歷史檔案。*")
         if not converted_list:
-            st.write("暂无已立案历史 (0 Ideas)。")
+            st.write("目前沒有已立案歷史。")
         for item in converted_list:
             st.markdown(f"""
             <div class="glass-card-dimmed">
@@ -1137,22 +1105,22 @@ def render_ideas_page():
                 <p style="margin:2px 0 0 0; font-size:12px;">
                     <b>提出日期:</b> {item.created_at or '—'} |
                     <b>立案日期:</b> {item.converted_at or '—'} |
-                    <b>来源:</b> {item.source}
+                    <b>來源：</b> {item.source}
                 </p>
                 <p style="margin:4px 0 0 0; font-size:12px; color:#58a6ff;"><b>Decision Note:</b> {item.decision_note or 'Converted to active roadmap'}</p>
             </div>
             """, unsafe_allow_html=True)
-            if st.button("🔍 查看专案进度 (View Project)", key=f"btn_view_proj_{item.idea_id}"):
+            if st.button("🔍 查看專案進度", key=f"btn_view_proj_{item.idea_id}"):
                 st.session_state["selected_project_id"] = item.project_id
                 st.session_state["nav_selection"] = NAV_PROJECTS
                 st.rerun()
 
-    # Category 4: 已放弃 (Default Collapsed / Folded)
+    # Category 4: 已放棄 (Default Collapsed / Folded)
     dropped_list = grouped[STATUS_DROPPED]
-    with st.expander(f"▶ 已放弃 ({len(dropped_list)})", expanded=False):
-        st.caption("ℹ️ *已放弃想法的历史记录完整保留，支持随时恢复。*")
+    with st.expander(f"▶ 已放棄 ({len(dropped_list)})", expanded=False):
+        st.caption("ℹ️ *已放棄構想的歷史記錄完整保留，支援隨時恢復。*")
         if not dropped_list:
-            st.write("暂无已放弃历史 (0 Ideas)。")
+            st.write("目前沒有已放棄歷史。")
         for item in dropped_list:
             st.markdown(f"""
             <div class="glass-card-dimmed">
@@ -1162,10 +1130,10 @@ def render_ideas_page():
                 </div>
                 <p style="margin:6px 0 4px 0; color:#8b949e;">{item.description or '—'}</p>
                 <p style="margin:0; font-size:12px; color:#ff7b72;">
-                    <b>放弃日期:</b> {item.dropped_at or '—'} |
-                    <b>放弃原因:</b> {item.drop_reason or '—'}
+                    <b>放棄日期：</b> {item.dropped_at or '—'} |
+                    <b>放棄原因：</b> {item.drop_reason or '—'}
                 </p>
-                {f'<p style="margin:2px 0 0 0; font-size:12px; color:#8b949e;"><b>当时问题/阻碍:</b> {item.drop_problem}</p>' if item.drop_problem else ''}
+                {f'<p style="margin:2px 0 0 0; font-size:12px; color:#b7c3d0;"><b>當時問題／阻礙：</b> {item.drop_problem}</p>' if item.drop_problem else ''}
                 <p style="margin:2px 0 0 0; font-size:12px; color:#8b949e;"><b>Decision Note:</b> {item.decision_note or '—'}</p>
             </div>
             """, unsafe_allow_html=True)
@@ -1178,15 +1146,15 @@ def render_ideas_page():
 
 
 def render_projects_page():
-    st.title("📁 Projects & Roadmaps")
+    st.title("📁 專案與路線圖")
     selected_p_id = st.session_state.get("selected_project_id")
     if selected_p_id:
-        st.info(f"Targeting Project: **{selected_p_id}**")
+        st.info(f"目前專案：**{selected_p_id}**")
 
-    if not canonical_records_available:
-        st.warning("Unavailable — canonical project/task records could not be read from Drive. No empty result is inferred.")
+    if not records_available:
+        st.warning("無法取得 — 無法讀取 Drive 的 canonical 專案／任務記錄；不會推論為空結果。")
     elif not all_projects:
-        st.info("No projects found in Drive SSOT.")
+        st.info("Drive SSOT 中沒有可用的專案記錄。")
     else:
         for proj in all_projects:
             p_id = proj.get("project_id", "—")
@@ -1194,19 +1162,19 @@ def render_projects_page():
             is_highlighted = (p_id == selected_p_id)
             detail = build_project_detail_vm(proj, all_tasks, all_executions, all_actions, all_ideas, now)
             completion = detail["task_completion"]
-            completion_text = f"{completion[0]} / {completion[1]}" if completion else "Unavailable"
+            completion_text = f"{completion[0]} / {completion[1]}" if completion else "無法取得"
 
             st.markdown(f"""
             <div class="glass-card" {'style="border: 2px solid #388bfd;"' if is_highlighted else ''}>
                 <h3 style="margin:0;">{p_title} <small style="color:#8b949e;">({p_id})</small></h3>
-                <p style="margin:6px 0;"><b>Current Phase:</b> {detail['current_phase']} | <b>Task completion:</b> {completion_text} | <b>Milestone progress:</b> {detail['milestone_progress']}</p>
+                <p style="margin:6px 0;"><b>目前階段：</b>{detail['current_phase']} | <b>任務完成數：</b>{completion_text} | <b>里程碑進度：</b>{detail['milestone_progress']}</p>
             </div>
             """, unsafe_allow_html=True)
-            with st.expander(f"View Project Detail: {p_title}", expanded=is_highlighted):
-                st.caption(f"SSOT: {'Connected' if not actions_store.is_degraded else 'Unavailable / degraded'} · Task completion is not milestone progress.")
-                st.write(f"**Priority Roadmap:** {detail['priority_roadmap'] or 'Unavailable / Not recorded'}")
+            with st.expander(f"查看專案詳情：{p_title}", expanded=is_highlighted):
+                st.caption(f"SSOT：{'已連線' if not actions_store.is_degraded else '無法取得／降級'} · 任務完成數不等於里程碑進度。")
+                st.write(f"**優先路線圖：** {detail['priority_roadmap'] or '無法取得／未記錄'}")
                 cols = st.columns(4)
-                for col, label, items in zip(cols, ("Current", "Next", "Blocked", "Recently Completed"),
+                for col, label, items in zip(cols, ("目前", "下一步", "受阻", "最近完成"),
                                              (detail['current'], detail['next'], detail['blocked'], detail['completed'])):
                     with col:
                         st.caption(label)
@@ -1214,13 +1182,13 @@ def render_projects_page():
                             for task in items:
                                 st.write(f"`{task.get('task_id', '—')}` {task.get('title', '—')} · {task.get('status', 'Unknown')}")
                         else:
-                            st.write("Unavailable / none")
-                st.write("**Execution / Session**")
+                            st.write("無法取得／無記錄")
+                st.write("**執行／工作階段**")
                 if detail['executions']:
                     for exe in detail['executions']:
                         st.write(f"`{exe.get('execution_id', '—')}` · {exe.get('provider', 'Unknown')} · session `{exe.get('provider_session_id') or exe.get('session_id') or 'Not recorded'}` · {exe.get('status', 'Unknown')}")
                 else:
-                    st.write("Unavailable / Not recorded")
+                    st.write("無法取得／未記錄")
                 if detail['actions']:
                     st.write("**Open Actions:** " + "; ".join(f"{a.type}/{a.severity}: {a.reason}" for a in detail['actions']))
                 st.write(f"**Relevant Ideas:** {len(detail['ideas'])}")
@@ -1229,22 +1197,22 @@ def render_projects_page():
 
 
 def render_tasks_page():
-    st.title("📋 Tasks Board & Execution")
-    if not canonical_records_available:
-        st.warning("Unavailable — canonical task records could not be read from Drive. No empty task counts are inferred.")
+    st.title("📋 任務看板與執行狀態")
+    if not records_available:
+        st.warning("無法取得 — canonical 任務記錄不可讀；不會推論為零筆任務。")
         return
     board = map_task_board(all_tasks, active_executions_dict, now)
 
     tab_in_progress, tab_ready, tab_blocked, tab_completed = st.tabs([
-        f"🚀 In Progress ({len(board['In progress'])})",
-        f"📥 Ready ({len(board['Ready'])})",
-        f"⚠️ Blocked / Attention ({len(board['Blocked / Attention'])})",
-        f"✅ Completed ({len(board['Completed'])})"
+        f"🚀 進行中 ({len(board['In progress'])})",
+        f"📥 就緒 ({len(board['Ready'])})",
+        f"⚠️ 受阻／待注意 ({len(board['Blocked / Attention'])})",
+        f"✅ 已完成 ({len(board['Completed'])})"
     ])
 
     def render_task_cards(tasks):
         if not tasks:
-            st.write("No tasks in this category.")
+            st.write("此分類目前沒有任務。")
             return
         for t in tasks:
             project_id = t.get("project_id", "—")
@@ -1274,12 +1242,12 @@ def render_tasks_page():
 
 
 def render_sessions_page():
-    st.title("🔍 AI Sessions & Handoff Inspector")
+    st.title("🔍 AI 工作階段與交接檢視")
     sessions = build_sessions_vm(all_executions)
-    for title, rows in (("Current Sessions", sessions["current"]), ("Historical Sessions", sessions["historical"])):
+    for title, rows in (("目前工作階段", sessions["current"]), ("歷史工作階段", sessions["historical"])):
         st.subheader(f"{title} ({len(rows)})")
         if not rows:
-            st.write("Unavailable / Not recorded")
+            st.write("無法取得／未記錄")
         for row in rows:
             st.markdown(f"""<div class="glass-card"><b>{row['provider'] or 'Unknown'}</b> · `{row['execution_id'] or '—'}` · session `{row['provider_session_id']}`<br><small>Project `{row['project_id'] or '—'}` → Task `{row['task_id'] or '—'}` · model `{row['model'] or 'Not recorded'}` · mode `{row['mode'] or 'Not recorded'}` · status `{row['status'] or 'Unknown'}` · started {row['started_at'] or 'Unknown'} · last activity {row['last_activity'] or 'Unknown'} · ended {row['completed_at'] or row['finished_at'] or 'Not recorded'}</small></div>""", unsafe_allow_html=True)
     all_task_ids = [(t.get("project_id"), t.get("task_id"), t.get("title")) for t in all_tasks]
@@ -1328,12 +1296,12 @@ def render_sessions_page():
 
 
 def render_quota_page():
-    st.title("⚡ Quota & Fleet Forecast")
+    st.title("⚡ 用量與 AI Fleet 預測")
     st.markdown(f"""
     <div class="recommendation-card">
-        <h4 style="margin:0 0 8px 0; color:#58a6ff;">🚀 Primary Recommendation: {daily_brief_vm.recommended_action}</h4>
-        <p style="margin:0 0 6px 0;"><b>Target Provider:</b> {daily_brief_vm.recommended_provider or 'None'}</p>
-        <p style="margin:0; font-size:14px;"><b>Rationale:</b> {daily_brief_vm.reason}</p>
+        <h4 style="margin:0 0 8px 0; color:#79c0ff;">🚀 主要建議：{daily_brief_vm.recommended_action}</h4>
+        <p style="margin:0 0 6px 0;"><b>目標供應商：</b>{daily_brief_vm.recommended_provider or '無法取得'}</p>
+        <p style="margin:0; font-size:14px;"><b>依據：</b>{daily_brief_vm.reason}</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1343,13 +1311,15 @@ def render_quota_page():
             try:
                 st.subheader(card.card_title)
                 st.metric(
-                    label="Primary Quota Remaining",
-                    value=card.formatted_five_hour_remaining,
+                    label="主要用量剩餘",
+                    value="無法取得" if card.stale else card.formatted_five_hour_remaining,
                     delta=f"-{card.formatted_five_hour_burn_rate}" if card.formatted_five_hour_burn_rate != "—" else None,
                     delta_color="inverse"
                 )
-                if card.formatted_five_hour_countdown != "—":
-                    st.write(f"• **Resets In**: `{card.formatted_five_hour_countdown}`")
+                if card.stale:
+                    st.warning("用量資料已過期，無法判定可用量或是否耗盡。")
+                elif card.formatted_five_hour_countdown != "—":
+                    st.write(f"• **重設倒數**：`{card.formatted_five_hour_countdown}`")
                 if card.extra_credits_available is not None:
                     st.write(f"• **Extra Credits**: `{card.formatted_extra_credits}`")
                 st.write(f"• **Effective Availability**: `{card.formatted_effective_availability}`")
@@ -1361,26 +1331,26 @@ def render_quota_page():
 
 
 def render_reviews_page():
-    st.title("📝 Review Evidence")
+    st.title("📝 審查證據")
     rows = build_review_evidence_vm(all_handoffs)
     if not rows:
-        st.write("Unavailable / Not recorded")
+        st.write("無法取得／未記錄")
     for row in rows:
         st.markdown(f"""<div class="glass-card"><b>Review Verdict:</b> {row['verdict']}<br><small>Source: {row['source']} · Project `{row['project_id'] or '—'}` → Task `{row['task_id'] or '—'}` · reviewer `{row['reviewer']}` · {row['timestamp'] or 'Not recorded'}</small><br>Tests: {row['tests'] or 'Unavailable'}<br>Commits: {row['commits'] or 'Unavailable'}<br>Known issues: {row['known_issues'] or 'None recorded'}</div>""", unsafe_allow_html=True)
 
 
 def render_logs_page():
-    st.title("📄 Operational Logs / Recent Events")
+    st.title("📄 營運日誌／最近事件")
     projects = ["All"] + sorted({p.get("project_id") for p in all_projects if p.get("project_id")})
-    project_filter = st.selectbox("Project", projects, key="log_project")
+    project_filter = st.selectbox("專案", projects, key="log_project")
     providers = ["All"] + sorted({e.get("provider") for e in all_executions if e.get("provider")})
-    provider_filter = st.selectbox("Provider", providers, key="log_provider")
+    provider_filter = st.selectbox("供應商", providers, key="log_provider")
     events = build_operational_events(all_commands, all_executions, all_actions, all_handoffs, limit=30,
                                       project_id=None if project_filter == "All" else project_filter,
                                       provider=None if provider_filter == "All" else provider_filter)
     st.caption("Source: canonical state timestamps; activity is capped to one latest event per execution.")
     if not events:
-        st.write("Unavailable / Not recorded")
+        st.write("無法取得／未記錄")
     for event in events:
         st.write(f"`{event['timestamp']}` · {event['kind']} · `{event['project_id'] or '—'}`/`{event['task_id'] or '—'}` · {event['event']} · {event['provider']} · {event['source']}")
 
@@ -1409,7 +1379,7 @@ elif selected_nav == NAV_REVIEWS:
 elif selected_nav == NAV_LOGS:
     render_logs_page()
 elif selected_nav == NAV_SETTINGS:
-    render_placeholder_page("⚙️ Settings & Configuration", "Manage credentials, account mapping, and refresh intervals.")
+    render_placeholder_page("⚙️ 設定", "管理憑證、帳戶對應與重新整理間隔。")
 
 if all_warnings:
     st.markdown("---")

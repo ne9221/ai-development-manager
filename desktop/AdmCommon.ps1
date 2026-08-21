@@ -94,6 +94,86 @@ function Start-AdmDashboardBackground {
     }
 }
 
+function Get-AdmPortOwnerPid {
+    # Read-only discovery only -- see Confirm-AdmDashboardAlive, which
+    # never kills whatever this returns; it only records it as evidence.
+    param([Parameter(Mandatory = $true)][int]$Port)
+    try {
+        $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($conn) { return $conn.OwningProcess }
+    } catch {
+        # Best-effort discovery only; caller treats $null as "unknown", not "no owner".
+    }
+    return $null
+}
+
+function Confirm-AdmDashboardAlive {
+    # Bounded, idempotent Dashboard self-heal (P1-G Global Self-Heal).
+    # Called from the tray's existing 60s poll timer (see
+    # AdmTrayLauncher.ps1) -- this function is never its own loop and
+    # never registers a new Scheduled Task; the tray's already-running
+    # timer *is* the periodic supervisor for Dashboard.
+    #
+    # Never kills anything. Start-AdmDashboardBackground already no-ops
+    # (returns $true immediately) if Dashboard is genuinely already
+    # listening, so calling this every tick can never spawn a duplicate
+    # backend. If an unrelated process holds port 8501, Streamlit simply
+    # fails to bind and Get-AdmDashboardHealth still reports not-listening
+    # afterward -- reported truthfully as a failed remediation, never
+    # silently retried into "healthy".
+    param(
+        [string]$RepositoryPath = $(Split-Path -Parent $PSScriptRoot),
+        [string]$ManagerHome = "C:\Users\EE\.ai-development-manager",
+        [string]$PythonPath = "C:\Users\EE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+    )
+
+    $port = ([uri]$AdmDashboardUrl).Port
+    $before = Get-AdmDashboardHealth
+    $state = if ($before.Listening) { "healthy" } else { "unknown" }
+    $degradedReason = $null
+    $remediation = $null
+    $remediationResult = $null
+    $blocker = $null
+
+    if (-not $before.Listening) {
+        $degradedReason = "dashboard_process_missing"
+        $remediation = "dashboard_process_missing"
+        $started = Start-AdmDashboardBackground -RepositoryPath $RepositoryPath
+        Start-Sleep -Seconds 3
+        $after = Get-AdmDashboardHealth
+        if ($after.Listening) {
+            $state = "healthy"
+            $remediationResult = "recovered"
+            $degradedReason = $null
+        } else {
+            $state = "degraded"
+            $remediationResult = if ($started) { "attempted_still_unavailable" } else { "spawn_failed" }
+            $blocker = "Dashboard did not become reachable on $AdmDashboardUrl after a bounded restart attempt"
+        }
+    }
+
+    $observedPid = Get-AdmPortOwnerPid -Port $port
+    $resolvedPython = $PythonPath
+    if (-not (Test-Path -LiteralPath $resolvedPython)) { $resolvedPython = "python" }
+    $storePath = Join-Path $ManagerHome "health-evidence.json"
+    $pyArgs = @("-m", "manager.health_evidence", "record-dashboard", "--store-path", $storePath, "--state", $state, "--observed-port", $port)
+    if ($degradedReason) { $pyArgs += @("--degraded-reason", $degradedReason) }
+    if ($remediation) { $pyArgs += @("--last-remediation", $remediation) }
+    if ($remediationResult) { $pyArgs += @("--remediation-result", $remediationResult) }
+    if ($blocker) { $pyArgs += @("--unresolved-blocker", $blocker) }
+    if ($observedPid) { $pyArgs += @("--observed-pid", $observedPid) }
+
+    try {
+        Push-Location -LiteralPath $RepositoryPath
+        try { & $resolvedPython @pyArgs 2>$null | Out-Null } finally { Pop-Location }
+    } catch {
+        # Evidence recording is best-effort visibility -- a failure here
+        # must never be treated as a health/remediation failure itself.
+    }
+
+    return [PSCustomObject]@{ State = $state; DegradedReason = $degradedReason; RemediationResult = $remediationResult }
+}
+
 function Get-AdmComprehensiveHealth {
     $supervisor = Get-AdmTaskStatus -TaskName $AdmSupervisorTask
     $watcher = Get-AdmTaskStatus -TaskName $AdmWatcherTask
@@ -216,6 +296,75 @@ $scRow
 <p><small>Generated $(Get-Date). This is a static snapshot -- reload this launcher to refresh.</small></p>
 </main></body></html>
 "@
+}
+
+function Find-AdmEdgePath {
+    # Looks in the normal per-machine/per-user install locations first, then
+    # PATH, then the registry App Paths fallback that Edge's installer
+    # always registers regardless of install location.
+    $candidates = @()
+    if ($env:ProgramFiles) { $candidates += (Join-Path $env:ProgramFiles "Microsoft\Edge\Application\msedge.exe") }
+    $pf86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    if ($pf86) { $candidates += (Join-Path $pf86 "Microsoft\Edge\Application\msedge.exe") }
+    if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA "Microsoft\Edge\Application\msedge.exe") }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+
+    $cmd = Get-Command "msedge.exe" -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    try {
+        $key = Get-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe" -ErrorAction Stop
+        $regValue = $key.GetValue("")
+        if ($regValue -and (Test-Path -LiteralPath $regValue)) { return $regValue }
+    } catch {
+        # No registered App Paths entry -- Edge is genuinely not installed.
+    }
+
+    return $null
+}
+
+function Open-AdmAppWindow {
+    # Single product-entry function for "open ADM as a Windows app window":
+    # Edge --app=<url> gives a chromeless window (no address bar, no tabs)
+    # so the user never sees or types a localhost URL. Callers must route
+    # every dashboard/session-center open through this instead of a raw
+    # Start-Process on an http:// URL.
+    param(
+        [Parameter(Mandatory = $true)][string]$Url
+    )
+
+    $targetUrl = $Url
+    if ($Url -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*://') {
+        # Local file path (e.g. the diagnostic status page) -- normalize to
+        # a file:// URI so --app treats it the same as an http(s) URL.
+        try {
+            $targetUrl = ([uri]$Url).AbsoluteUri
+        } catch {
+            $targetUrl = $Url
+        }
+    }
+
+    $edgePath = Find-AdmEdgePath
+    if ($edgePath) {
+        try {
+            Start-Process -FilePath $edgePath -ArgumentList @("--app=$targetUrl") -ErrorAction Stop | Out-Null
+            return [PSCustomObject]@{ Mode = "EdgeApp"; Success = $true; Detail = $edgePath }
+        } catch {
+            # Fall through to the truthful degraded fallback below.
+        }
+    }
+
+    # Truthful degradation: Edge app-window mode is unavailable, so fall
+    # back to the OS default browser rather than silently doing nothing or
+    # claiming an app window opened when it didn't.
+    try {
+        Start-Process -FilePath $targetUrl -ErrorAction Stop | Out-Null
+        return [PSCustomObject]@{ Mode = "BrowserFallback"; Success = $true; Detail = "msedge.exe not found or failed to launch; opened in the default browser instead" }
+    } catch {
+        return [PSCustomObject]@{ Mode = "Failed"; Success = $false; Detail = $_.Exception.Message }
+    }
 }
 
 function Show-AdmError {

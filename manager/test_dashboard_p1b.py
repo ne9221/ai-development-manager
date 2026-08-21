@@ -160,42 +160,42 @@ class TestDashboardP1BRuntimeVisibilityAndActionCenter(unittest.TestCase):
     def test_dashboard_action_center_navigation_and_rendering(self, mock_build_service, mock_read_drive_status, mock_drive_records):
         mock_read_drive_status.return_value = {"providers": []}
         mock_store = mock_drive_records.return_value
-        mock_store.list_projects.return_value = []
+        mock_store.dashboard_records.return_value = {"projects": [], "tasks": [], "commands": [], "executions": [], "handoffs": []}
 
         at = AppTest.from_file("../dashboard.py")
         at.run(timeout=30)
         self.assertFalse(at.exception, f"App crashed on Overview: {at.exception}")
 
-        # Verify Action Center is present in sidebar navigation
+        # Verify 操作中心 is present in sidebar navigation.
         self.assertEqual(len(at.sidebar.radio), 1)
-        self.assertIn("Action Center", at.sidebar.radio[0].options)
+        self.assertIn("操作中心", at.sidebar.radio[0].options)
 
         # Switch to Action Center
-        at.sidebar.radio[0].set_value("Action Center")
+        at.sidebar.radio[0].set_value("操作中心")
         at.run(timeout=30)
         self.assertFalse(at.exception, f"App crashed on Action Center page: {at.exception}")
 
         title_texts = [el.value for el in at.title]
-        self.assertTrue(any("Action Center" in t for t in title_texts))
+        self.assertTrue(any("操作中心" in t for t in title_texts))
 
         # Check expanders for Needs Attention and History
         expander_labels = [el.label for el in at.expander]
-        self.assertTrue(any("Needs Attention" in l or "待处理" in l for l in expander_labels))
-        self.assertTrue(any("Action History" in l or "历史归档" in l for l in expander_labels))
+        self.assertTrue(any("待處理" in l for l in expander_labels))
+        self.assertTrue(any("操作紀錄" in l for l in expander_labels))
 
     @patch("manager.tasks.DriveRecords")
     @patch("manager.quota_reader.read_drive_status")
     @patch("collectors.publish_drive.build_service")
     def test_dashboard_drive_listing_failure_is_visible_not_empty(self, mock_build_service, mock_read_drive_status, mock_drive_records):
         mock_read_drive_status.return_value = {"providers": []}
-        mock_drive_records.return_value.list_projects.side_effect = TimeoutError("Drive request timed out")
+        mock_drive_records.return_value.dashboard_records.side_effect = TimeoutError("Drive request timed out")
 
         at = AppTest.from_file("../dashboard.py")
         at.run(timeout=30)
 
         self.assertFalse(at.exception, f"App crashed after Drive timeout: {at.exception}")
         self.assertEqual(len(at.sidebar.radio), 1)
-        self.assertTrue(any("Unavailable" in warning.value for warning in at.warning))
+        self.assertTrue(any("無法取得" in warning.value for warning in at.warning))
         self.assertFalse(any("No active projects found" in info.value for info in at.info))
 
     @patch("manager.tasks.DriveRecords")
@@ -203,7 +203,7 @@ class TestDashboardP1BRuntimeVisibilityAndActionCenter(unittest.TestCase):
     @patch("collectors.publish_drive.build_service")
     def test_dashboard_slow_drive_listing_cannot_block_bootstrap(self, mock_build_service, mock_read_drive_status, mock_drive_records):
         mock_read_drive_status.return_value = {"providers": []}
-        mock_drive_records.return_value.list_projects.side_effect = lambda: time.sleep(10)
+        mock_drive_records.return_value.dashboard_records.side_effect = lambda: time.sleep(10)
 
         started = time.monotonic()
         at = AppTest.from_file("../dashboard.py")
@@ -212,7 +212,21 @@ class TestDashboardP1BRuntimeVisibilityAndActionCenter(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5)
         self.assertFalse(at.exception, f"App crashed after Drive timeout: {at.exception}")
         self.assertEqual(len(at.sidebar.radio), 1)
-        self.assertTrue(any("Unavailable" in warning.value for warning in at.warning))
+        self.assertTrue(any("無法取得" in warning.value for warning in at.warning))
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_dashboard_timeout_uses_truthful_last_known_snapshot(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+        mock_read_drive_status.return_value = {"providers": []}
+        records = {"projects": [{"project_id": "P1", "title": "Last known"}], "tasks": [], "commands": [], "executions": [], "handoffs": []}
+        mock_drive_records.return_value.dashboard_records.side_effect = [records, TimeoutError("Drive timed out")]
+        at = AppTest.from_file("../dashboard.py")
+        at.run(timeout=30)
+        at.run(timeout=30)
+        self.assertFalse(at.exception)
+        self.assertTrue(any("上次成功同步資料" in warning.value for warning in at.warning))
+        self.assertTrue(any("Last known" in markdown.value for markdown in at.markdown))
 
 
 if __name__ == "__main__":

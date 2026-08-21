@@ -1,0 +1,227 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Global Project Registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "updated_at", "projects"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "description": {
+      "type": "string"
+    },
+    "projects": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/project_entry"
+      }
+    }
+  },
+  "$defs": {
+    "project_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "project_id",
+        "display_name",
+        "aliases",
+        "default_branch",
+        "status",
+        "resolution_status"
+      ],
+      "properties": {
+        "project_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9_\\-]+$"
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "repo": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["canonical_url"],
+          "properties": {
+            "canonical_url": {
+              "type": "string",
+              "minLength": 1
+            },
+            "owner": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "default_branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "baseline_resolution_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy"],
+          "properties": {
+            "strategy": {
+              "type": "string",
+              "enum": ["origin_default", "pinned_commit", "latest_release", "custom"]
+            },
+            "pinned_ref": {
+              "type": ["string", "null"]
+            }
+          }
+        },
+        "common_governance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reference"],
+          "properties": {
+            "reference": {
+              "type": "string",
+              "minLength": 1
+            },
+            "version": {
+              "type": "string"
+            },
+            "digest": {
+              "type": "string"
+            }
+          }
+        },
+        "project_rules": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reference"],
+          "properties": {
+            "reference": {
+              "type": "string",
+              "minLength": 1
+            },
+            "mandatory_rule_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "working_directory_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["relative_path", "resolver_strategy"],
+          "properties": {
+            "relative_path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "resolver_strategy": {
+              "type": "string",
+              "enum": ["workspace_relative", "environment_variable", "custom"]
+            },
+            "env_var": {
+              "type": "string"
+            }
+          }
+        },
+        "isolation_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["worktree_per_task", "isolated_branch", "direct_branch"]
+            },
+            "worktree_prefix": {
+              "type": "string"
+            },
+            "branch_prefix": {
+              "type": "string"
+            }
+          }
+        },
+        "provider_restrictions": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allowed_providers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "blocked_providers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "quota_tier_minimum": {
+              "type": "string"
+            }
+          }
+        },
+        "protected_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "default_write_boundaries": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pointer_rules": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tasks_area": {
+              "type": "string"
+            },
+            "executions_area": {
+              "type": "string"
+            },
+            "handoffs_area": {
+              "type": "string"
+            },
+            "sessions_area": {
+              "type": "string"
+            },
+            "overviews_area": {
+              "type": "string"
+            }
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": ["enabled", "disabled", "archived"]
+        },
+        "resolution_status": {
+          "type": "string",
+          "enum": ["verified", "unresolved"]
+        },
+        "unresolved_reason": {
+          "type": ["string", "null"]
+        }
+      }
+    }
+  }
+}

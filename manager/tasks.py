@@ -78,6 +78,7 @@ def logical_record_id(value):
 class DriveRecords:
     def __init__(self, service):
         self.files = service.files()
+        self._folder_ids = {}
 
     def children(self, parent, name=None):
         query = f"'{parent}' in parents and trashed=false"
@@ -101,15 +102,21 @@ class DriveRecords:
             token = next_token
 
     def folder(self, parent, name, create=True):
+        cached = self._folder_ids.get((parent, name))
+        if cached:
+            return cached
         matches = [item for item in self.children(parent, name) if item.get("mimeType") == MIME_FOLDER]
         if len(matches) > 1:
             raise TaskError(f"duplicate Drive folder: {name}")
         if matches:
+            self._folder_ids[(parent, name)] = matches[0]["id"]
             return matches[0]["id"]
         if not create:
             raise TaskError(f"Drive folder not found: {name}")
         created_id = self.files.create(body={"name": name, "parents": [parent], "mimeType": MIME_FOLDER}, fields="id").execute()["id"]
-        return self._reconcile_created_folder(parent, name, created_id)
+        folder_id = self._reconcile_created_folder(parent, name, created_id)
+        self._folder_ids[(parent, name)] = folder_id
+        return folder_id
 
     def _reconcile_created_folder(self, parent, name, created_id):
         """Resolve a concurrent first-create race for the same (parent, name) folder.
@@ -201,13 +208,43 @@ class DriveRecords:
 
     def list_records(self, area, project_id):
         parent = self.project_folder(area, project_id, create=False)
-        names = [logical_record_id(item["name"][:-5]) for item in self.children(parent) if item.get("name", "").endswith(".json")]
-        return [self.get(area, project_id, name) for name in names]
+        items = [item for item in self.children(parent) if item.get("name", "").endswith(".json")]
+        return [self._read_record_item(item) for item in items]
 
     def list_projects(self):
         root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"], create=False)
-        return [self.get("projects", item["name"], item["name"])
-                for item in self.children(root) if item.get("mimeType") == MIME_FOLDER]
+        projects = [item for item in self.children(root) if item.get("mimeType") == MIME_FOLDER]
+        result = []
+        for item in projects:
+            project_id = safe_id(item["name"])
+            records = [record for record in self.children(item["id"], self.record_filename(project_id))
+                       if record.get("mimeType") == MIME_JSON]
+            if len(records) != 1:
+                raise TaskError(f"expected one Drive record {self.record_filename(project_id)}; found {len(records)}")
+            self._folder_ids[(root, project_id)] = item["id"]
+            result.append(self._read_record_item(records[0]))
+        return result
+
+    def _read_record_item(self, item):
+        try:
+            return json.loads(self.files.get_media(fileId=item["id"]).execute().decode("utf-8"))
+        except Exception as exc:
+            raise TaskError(f"could not read Drive record: {item.get('name', 'unknown')}") from exc
+
+    def dashboard_records(self):
+        """Read dashboard records once per folder; callers retain the 3s UI boundary."""
+        projects = self.list_projects()
+        result = {"projects": projects, "tasks": [], "commands": [], "executions": [], "handoffs": []}
+        for project in projects:
+            project_id = project.get("project_id")
+            if project_id:
+                for area, key in (("tasks", "tasks"), ("commands", "commands"),
+                                  ("executions", "executions"), ("handoffs", "handoffs")):
+                    try:
+                        result[key].extend(self.list_records(area, project_id))
+                    except TaskError:
+                        pass
+        return result
 
     def latest(self, area, project_id, task_id):
         parent = self.project_folder(area, project_id, create=False)

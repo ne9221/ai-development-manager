@@ -1,0 +1,320 @@
+{
+  "schema_version": "1.0.0",
+  "updated_at": "2026-08-21T20:26:00Z",
+  "description": "Canonical Global Project Registry for AI Development Manager",
+  "projects": [
+    {
+      "project_id": "ai-development-manager",
+      "display_name": "AI Development Manager (AI 一體化)",
+      "aliases": [
+        "adm",
+        "ai-dev-mgr",
+        "AI 一體化",
+        "ai_development_manager",
+        "ai-development-manager"
+      ],
+      "repo": {
+        "canonical_url": "https://github.com/ne9221/ai-development-manager.git",
+        "owner": "ne9221",
+        "name": "ai-development-manager"
+      },
+      "default_branch": "main",
+      "baseline_resolution_policy": {
+        "strategy": "origin_default",
+        "pinned_ref": null
+      },
+      "common_governance": {
+        "reference": "governance-rules.json",
+        "version": "1.0.0"
+      },
+      "project_rules": {
+        "reference": "AI-DEVELOPMENT-RULES.md",
+        "mandatory_rule_ids": [
+          "parallel_first",
+          "research_before_build",
+          "copy_ready_dispatch",
+          "real_running_truth",
+          "visibility_first",
+          "mandatory_status_report",
+          "cloud_first",
+          "task_identity"
+        ]
+      },
+      "working_directory_policy": {
+        "relative_path": "ai-development-manager",
+        "resolver_strategy": "workspace_relative",
+        "env_var": "ADM_WORKSPACE_ROOT"
+      },
+      "isolation_policy": {
+        "mode": "worktree_per_task",
+        "worktree_prefix": "wt-adm-",
+        "branch_prefix": "feat/"
+      },
+      "provider_restrictions": {
+        "allowed_providers": [
+          "claude",
+          "codex",
+          "antigravity",
+          "gemini"
+        ],
+        "blocked_providers": []
+      },
+      "protected_paths": [
+        "governance-rules.json",
+        "AI-DEVELOPMENT-RULES.md"
+      ],
+      "default_write_boundaries": [
+        "*"
+      ],
+      "pointer_rules": {
+        "tasks_area": "tasks",
+        "executions_area": "executions",
+        "handoffs_area": "handoffs",
+        "sessions_area": "sessions",
+        "overviews_area": "overviews"
+      },
+      "status": "enabled",
+      "resolution_status": "verified",
+      "unresolved_reason": null
+    },
+    {
+      "project_id": "ledger-organizer",
+      "display_name": "明細帳整理器 (Ledger Organizer)",
+      "aliases": [
+        "明細帳整理器",
+        "ledger-organizer",
+        "ledger_organizer",
+        "ledger"
+      ],
+      "repo": {
+        "canonical_url": "https://github.com/ne9221/ledger-organizer.git",
+        "owner": "ne9221",
+        "name": "ledger-organizer"
+      },
+      "default_branch": "main",
+      "baseline_resolution_policy": {
+        "strategy": "origin_default",
+        "pinned_ref": null
+      },
+      "common_governance": {
+        "reference": "governance-rules.json",
+        "version": "1.0.0"
+      },
+      "project_rules": {
+        "reference": "PROJECT-RULES.md"
+      },
+      "working_directory_policy": {
+        "relative_path": "ledger-organizer",
+        "resolver_strategy": "workspace_relative",
+        "env_var": "ADM_WORKSPACE_ROOT"
+      },
+      "isolation_policy": {
+        "mode": "worktree_per_task",
+        "worktree_prefix": "wt-ledger-",
+        "branch_prefix": "feat/"
+      },
+      "provider_restrictions": {
+        "allowed_providers": [
+          "claude",
+          "codex",
+          "antigravity",
+          "gemini"
+        ],
+        "blocked_providers": []
+      },
+      "protected_paths": [],
+      "default_write_boundaries": [
+        "*"
+      ],
+      "pointer_rules": {
+        "tasks_area": "tasks",
+        "executions_area": "executions",
+        "handoffs_area": "handoffs",
+        "sessions_area": "sessions",
+        "overviews_area": "overviews"
+      },
+      "status": "enabled",
+      "resolution_status": "unresolved",
+      "unresolved_reason": "Remote repository metadata and PROJECT-RULES pending cloud SSOT verification"
+    },
+    {
+      "project_id": "outlook-mail",
+      "display_name": "Outlook 群發 Mail (Outlook Mail)",
+      "aliases": [
+        "Outlook 群發 Mail",
+        "outlook-mail",
+        "outlook_mail",
+        "outlook-bulk-mail",
+        "outlook"
+      ],
+      "repo": {
+        "canonical_url": "https://github.com/ne9221/outlook-mail.git",
+        "owner": "ne9221",
+        "name": "outlook-mail"
+      },
+      "default_branch": "main",
+      "baseline_resolution_policy": {
+        "strategy": "origin_default",
+        "pinned_ref": null
+      },
+      "common_governance": {
+        "reference": "governance-rules.json",
+        "version": "1.0.0"
+      },
+      "project_rules": {
+        "reference": "PROJECT-RULES.md"
+      },
+      "working_directory_policy": {
+        "relative_path": "outlook-mail",
+        "resolver_strategy": "workspace_relative",
+        "env_var": "ADM_WORKSPACE_ROOT"
+      },
+      "isolation_policy": {
+        "mode": "worktree_per_task",
+        "worktree_prefix": "wt-outlook-",
+        "branch_prefix": "feat/"
+      },
+      "provider_restrictions": {
+        "allowed_providers": [
+          "claude",
+          "codex",
+          "antigravity",
+          "gemini"
+        ],
+        "blocked_providers": []
+      },
+      "protected_paths": [],
+      "default_write_boundaries": [
+        "*"
+      ],
+      "pointer_rules": {
+        "tasks_area": "tasks",
+        "executions_area": "executions",
+        "handoffs_area": "handoffs",
+        "sessions_area": "sessions",
+        "overviews_area": "overviews"
+      },
+      "status": "enabled",
+      "resolution_status": "unresolved",
+      "unresolved_reason": "Remote repository metadata and PROJECT-RULES pending cloud SSOT verification"
+    },
+    {
+      "project_id": "email-organizer",
+      "display_name": "Email 整理器 (Email Organizer)",
+      "aliases": [
+        "Email 整理器",
+        "email-organizer",
+        "email_organizer"
+      ],
+      "repo": {
+        "canonical_url": "https://github.com/ne9221/email-organizer.git",
+        "owner": "ne9221",
+        "name": "email-organizer"
+      },
+      "default_branch": "main",
+      "baseline_resolution_policy": {
+        "strategy": "origin_default",
+        "pinned_ref": null
+      },
+      "common_governance": {
+        "reference": "governance-rules.json",
+        "version": "1.0.0"
+      },
+      "project_rules": {
+        "reference": "PROJECT-RULES.md"
+      },
+      "working_directory_policy": {
+        "relative_path": "email-organizer",
+        "resolver_strategy": "workspace_relative",
+        "env_var": "ADM_WORKSPACE_ROOT"
+      },
+      "isolation_policy": {
+        "mode": "worktree_per_task",
+        "worktree_prefix": "wt-email-",
+        "branch_prefix": "feat/"
+      },
+      "provider_restrictions": {
+        "allowed_providers": [
+          "claude",
+          "codex",
+          "antigravity",
+          "gemini"
+        ],
+        "blocked_providers": []
+      },
+      "protected_paths": [],
+      "default_write_boundaries": [
+        "*"
+      ],
+      "pointer_rules": {
+        "tasks_area": "tasks",
+        "executions_area": "executions",
+        "handoffs_area": "handoffs",
+        "sessions_area": "sessions",
+        "overviews_area": "overviews"
+      },
+      "status": "enabled",
+      "resolution_status": "unresolved",
+      "unresolved_reason": "Remote repository metadata and PROJECT-RULES pending cloud SSOT verification"
+    },
+    {
+      "project_id": "bookkeeping",
+      "display_name": "記帳系統 (Bookkeeping)",
+      "aliases": [
+        "記帳系統",
+        "bookkeeping",
+        "bookkeeping_system"
+      ],
+      "repo": {
+        "canonical_url": "https://github.com/ne9221/bookkeeping.git",
+        "owner": "ne9221",
+        "name": "bookkeeping"
+      },
+      "default_branch": "main",
+      "baseline_resolution_policy": {
+        "strategy": "origin_default",
+        "pinned_ref": null
+      },
+      "common_governance": {
+        "reference": "governance-rules.json",
+        "version": "1.0.0"
+      },
+      "project_rules": {
+        "reference": "PROJECT-RULES.md"
+      },
+      "working_directory_policy": {
+        "relative_path": "bookkeeping",
+        "resolver_strategy": "workspace_relative",
+        "env_var": "ADM_WORKSPACE_ROOT"
+      },
+      "isolation_policy": {
+        "mode": "worktree_per_task",
+        "worktree_prefix": "wt-bookkeeping-",
+        "branch_prefix": "feat/"
+      },
+      "provider_restrictions": {
+        "allowed_providers": [
+          "claude",
+          "codex",
+          "antigravity",
+          "gemini"
+        ],
+        "blocked_providers": []
+      },
+      "protected_paths": [],
+      "default_write_boundaries": [
+        "*"
+      ],
+      "pointer_rules": {
+        "tasks_area": "tasks",
+        "executions_area": "executions",
+        "handoffs_area": "handoffs",
+        "sessions_area": "sessions",
+        "overviews_area": "overviews"
+      },
+      "status": "enabled",
+      "resolution_status": "unresolved",
+      "unresolved_reason": "Remote repository metadata and PROJECT-RULES pending cloud SSOT verification"
+    }
+  ]
+}

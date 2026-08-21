@@ -36,12 +36,32 @@ function Start-AdmServicesSafe {
     }
 }
 
+function Restart-AdmServicesSafe {
+    # Same disable-then-enable-and-trigger pattern as Stop-ADM.ps1 +
+    # Start-ADM.ps1, done inline so the tray doesn't spawn extra processes.
+    # Never kills an already-running child process -- disabling only blocks
+    # the *next* Scheduled Task trigger.
+    try {
+        foreach ($name in @($AdmSupervisorTask, $AdmWatcherTask)) {
+            $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+            if ($task -and $task.State -ne "Disabled") {
+                Disable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Out-Null
+            }
+        }
+        Start-Sleep -Seconds 1
+        Start-AdmServicesSafe
+    } catch {
+        # Non-fatal during background restart
+    }
+}
+
 function Open-AdmDashboardSafe {
     param([int]$TimeoutSec = 8)
     try {
         $dashHealth = Get-AdmDashboardHealth
         if ($dashHealth.Listening) {
-            Start-Process "$AdmDashboardUrl/"
+            $result = Open-AdmAppWindow -Url "$AdmDashboardUrl/"
+            if (-not $result.Success) { Show-AdmError "無法開啟 ADM 視窗：$($result.Detail)" }
             return
         }
 
@@ -61,14 +81,16 @@ function Open-AdmDashboardSafe {
         }
 
         if ($ready) {
-            Start-Process "$AdmDashboardUrl/"
+            $result = Open-AdmAppWindow -Url "$AdmDashboardUrl/"
+            if (-not $result.Success) { Show-AdmError "無法開啟 ADM 視窗：$($result.Detail)" }
             return
         }
 
         # Fallback: check Session Center
         $sc = Get-AdmSessionCenterHealth
         if ($sc.Listening) {
-            Start-Process "$AdmSessionCenterUrl/"
+            $result = Open-AdmAppWindow -Url "$AdmSessionCenterUrl/"
+            if (-not $result.Success) { Show-AdmError "無法開啟 ADM 視窗：$($result.Detail)" }
             return
         }
 
@@ -77,9 +99,11 @@ function Open-AdmDashboardSafe {
         $statusPath = Join-Path $env:TEMP "adm-status.html"
         $html = New-AdmStatusHtml -SupervisorStatus $health.SupervisorObject -WatcherStatus $health.WatcherObject -SessionCenter $health.SessionCenterObject -DashboardStatus $health.DashboardObject
         $html | Out-File -FilePath $statusPath -Encoding utf8
-        Start-Process $statusPath
+        $result = Open-AdmAppWindow -Url $statusPath
+        if (-not $result.Success) { Show-AdmError "無法開啟 ADM 視窗：$($result.Detail)" }
     } catch {
-        Start-Process "$AdmDashboardUrl/"
+        $result = Open-AdmAppWindow -Url "$AdmDashboardUrl/"
+        if (-not $result.Success) { Show-AdmError "無法開啟 ADM 視窗：$($result.Detail)" }
     }
 }
 
@@ -129,15 +153,23 @@ $notifyIcon.Visible = $true
 Update-AdmActionNotifications
 $pollTimer = New-Object System.Windows.Forms.Timer
 $pollTimer.Interval = 60000
-$pollTimer.add_Tick({ Update-AdmActionNotifications })
+$pollTimer.add_Tick({
+    Update-AdmActionNotifications
+    # P1-G Global Self-Heal: this existing 60s tick *is* Dashboard's
+    # periodic supervisor -- no separate Python tray, no new Scheduled
+    # Task. Confirm-AdmDashboardAlive is idempotent (Start-AdmDashboardBackground
+    # no-ops if already listening), so running it every tick can never
+    # spawn a duplicate backend.
+    try { Confirm-AdmDashboardAlive -RepositoryPath $RepositoryPath | Out-Null } catch {}
+})
 $pollTimer.Start()
 
 # Context Menu
 $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
 
-# 1. Open Dashboard (Default / Bold)
+# 1. Open ADM (Default / Bold)
 $menuOpenDash = New-Object System.Windows.Forms.ToolStripMenuItem
-$menuOpenDash.Text = "Open Dashboard"
+$menuOpenDash.Text = "開啟 ADM"
 $menuOpenDash.Font = New-Object System.Drawing.Font($menuOpenDash.Font, [System.Drawing.FontStyle]::Bold)
 $menuOpenDash.add_Click({
     Open-AdmDashboardSafe
@@ -146,31 +178,44 @@ $contextMenu.Items.Add($menuOpenDash) | Out-Null
 
 # 2. Status Details
 $menuStatus = New-Object System.Windows.Forms.ToolStripMenuItem
-$menuStatus.Text = "Status"
+$menuStatus.Text = "系統狀態"
 $menuStatus.add_Click({
     try {
         $health = Get-AdmComprehensiveHealth
-        $msg = "AI Development Manager Status:`n`n" +
-               "Streamlit Dashboard: $($health.DashboardStatus)`n" +
-               "Session Center:     $($health.SessionCenterStatus)`n" +
-               "Command Watcher:    $($health.WatcherStatus)`n" +
-               "Supervisor Task:    $($health.SupervisorStatus)"
-        [System.Windows.Forms.MessageBox]::Show($msg, "ADM Health Status", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        $msg = "AI Development Manager 狀態：`n`n" +
+               "Streamlit 儀表板： $($health.DashboardStatus)`n" +
+               "Session Center：   $($health.SessionCenterStatus)`n" +
+               "Command Watcher：  $($health.WatcherStatus)`n" +
+               "Supervisor Task：  $($health.SupervisorStatus)"
+        [System.Windows.Forms.MessageBox]::Show($msg, "ADM 健康狀態", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
     } catch {
-        [System.Windows.Forms.MessageBox]::Show("Could not check ADM status: $($_.Exception.Message)", "ADM Health Status", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("無法檢查 ADM 狀態：$($_.Exception.Message)", "ADM 健康狀態", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
     }
 })
 $contextMenu.Items.Add($menuStatus) | Out-Null
 
-# 3. Start / Restart ADM Services
-$menuRestart = New-Object System.Windows.Forms.ToolStripMenuItem
-$menuRestart.Text = "Start / Restart Services"
-$menuRestart.add_Click({
+# 3. Start ADM Services (idempotent -- safe no-op if already running)
+$menuStart = New-Object System.Windows.Forms.ToolStripMenuItem
+$menuStart.Text = "啟動服務"
+$menuStart.add_Click({
     try {
         Start-AdmServicesSafe
-        $notifyIcon.ShowBalloonTip(3000, "ADM Services", "Scheduled tasks & Dashboard verified and triggered.", [System.Windows.Forms.ToolTipIcon]::Info)
+        $notifyIcon.ShowBalloonTip(3000, "ADM 服務", "已確認並觸發排程工作與儀表板。", [System.Windows.Forms.ToolTipIcon]::Info)
     } catch {
-        [System.Windows.Forms.MessageBox]::Show("Service start failed: $($_.Exception.Message)", "ADM Service Manager", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("服務啟動失敗：$($_.Exception.Message)", "ADM 服務管理", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+})
+$contextMenu.Items.Add($menuStart) | Out-Null
+
+# 4. Restart ADM Services (disable then re-enable + trigger)
+$menuRestart = New-Object System.Windows.Forms.ToolStripMenuItem
+$menuRestart.Text = "重新啟動服務"
+$menuRestart.add_Click({
+    try {
+        Restart-AdmServicesSafe
+        $notifyIcon.ShowBalloonTip(3000, "ADM 服務", "已重新啟動排程工作與儀表板。", [System.Windows.Forms.ToolTipIcon]::Info)
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("服務重新啟動失敗：$($_.Exception.Message)", "ADM 服務管理", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
     }
 })
 $contextMenu.Items.Add($menuRestart) | Out-Null
@@ -178,9 +223,9 @@ $contextMenu.Items.Add($menuRestart) | Out-Null
 # Separator
 $contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
-# 4. Exit Launcher
+# 5. Exit Launcher
 $menuExit = New-Object System.Windows.Forms.ToolStripMenuItem
-$menuExit.Text = "Exit Launcher"
+$menuExit.Text = "結束 ADM"
 $menuExit.add_Click({
     $notifyIcon.Visible = $false
     $notifyIcon.Dispose()
@@ -200,7 +245,7 @@ $notifyIcon.add_DoubleClick({
 })
 
 # Show initial balloon notification
-$notifyIcon.ShowBalloonTip(3000, "AI Development Manager", "ADM is running in the system tray. Double-click to open Dashboard.", [System.Windows.Forms.ToolTipIcon]::Info)
+$notifyIcon.ShowBalloonTip(3000, "AI Development Manager", "ADM 正在系統匣執行中。連按兩下即可開啟 ADM。", [System.Windows.Forms.ToolTipIcon]::Info)
 
 try {
     # Run the application message loop
