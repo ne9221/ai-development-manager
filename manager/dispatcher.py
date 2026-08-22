@@ -194,7 +194,7 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
         task_input["account_id"] = request["account_id"]
     estimates = {provider: estimate({**task_input, "provider": provider, "mode": CAPABILITIES[provider]["mode"], "effort": "high" if task_input.get("complexity") == "high" else "medium"}, history) for provider in CAPABILITIES}
     decision = decide(task_input, quota, estimates=estimates)
-    selected = request.get("preferred_provider") or decision["recommended_provider"] or decision["alternatives"][0]
+    selected = request.get("preferred_provider") or decision["recommended_provider"] or next(iter(decision["alternatives"]), None)
     excluded = request.get("excluded_provider")
     if selected == excluded:
         selected = next((item for item in decision["alternatives"] if item != excluded), None)
@@ -246,6 +246,9 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
             selected_quota = next(item for item in quota["providers"] if item["provider"] == selected)
     else:
         selected_quota = next(item for item in quota["providers"] if item["provider"] == selected)
+
+    if request.get("preferred_provider") == "claude" and not selected_quota["has_reliable_quota"]:
+        raise TaskError("preferred Claude provider has no reliable quota")
 
     # Scoped quota and forecast evidence for selected provider/account
     selected_evidence = {

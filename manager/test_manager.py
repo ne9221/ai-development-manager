@@ -38,10 +38,27 @@ class ManagerTest(unittest.TestCase):
         result = decide(self.task(task_type="architecture", needs_repo_edit=False), quota(provider("codex", 5), provider("claude", 80)), NOW)
         self.assertEqual(result["recommended_provider"], "claude")
 
-    def test_both_unknown_still_recommends_by_capability(self):
+    def test_both_unknown_fails_closed_for_automatic_routing(self):
         result = decide(self.task(), quota(provider("codex"), provider("claude")), NOW)
-        self.assertEqual(result["recommended_provider"], "codex")
+        self.assertIsNone(result["recommended_provider"])
+        self.assertIsNone(result["recommended_mode"])
         self.assertIn("unknown", result["warning"])
+
+    def test_automatic_routing_ignores_stale_provider_even_when_capability_scores_higher(self):
+        result = decide(
+            self.task(task_type="architecture", needs_repo_edit=False),
+            quota(provider("codex", 80), provider("claude", 90, NOW - timedelta(hours=2))),
+            NOW,
+        )
+        self.assertEqual("codex", result["recommended_provider"])
+
+    def test_automatic_routing_keeps_fresh_claude_when_codex_is_stale(self):
+        result = decide(
+            self.task(),
+            quota(provider("codex", 90, NOW - timedelta(hours=2)), provider("claude", 20)),
+            NOW,
+        )
+        self.assertEqual("claude", result["recommended_provider"])
 
     def test_stale_quota_is_not_reliable(self):
         summary = quota(provider("codex", 90, NOW - timedelta(hours=2)))

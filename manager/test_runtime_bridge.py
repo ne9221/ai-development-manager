@@ -57,7 +57,7 @@ class RuntimeBridgeTests(unittest.TestCase):
         self.assertEqual("adm", resolve_project(self.store, None, "请让 ADM 处理") ["project_id"])
 
     def test_new_task_current_quota_provider_alternatives_and_json(self):
-        result = self.call({"project_id": "ADM", "user_request": "Implement runtime bridge", "task_type": "implementation", "complexity": "medium"})
+        result = self.call({"project_id": "ADM", "user_request": "Implement runtime bridge", "task_type": "implementation", "complexity": "medium"}, quota(80, 60))
         self.assertEqual("new_task", result["request_type"]); self.assertEqual("codex", result["recommended_provider"])
         self.assertTrue(result["alternatives"]); self.assertEqual("fresh", result["quota_freshness"]); self.assertIn("80% remaining", result["quota_summary"])
         self.assertIsInstance(json.loads(json.dumps(result)), dict); self.assertIn("推荐：codex", human_summary(result))
@@ -79,9 +79,8 @@ class RuntimeBridgeTests(unittest.TestCase):
 
     def test_status_split_stale_unknown_and_safety(self):
         create_task(self.store, task(expected_minutes=45, constraints=["token=sensitive", "Task scope is narrow"]), assign=False); self.store.records[("projects", "adm", "adm")]["active_tasks"] = ["t1"]
-        result = self.call({"project_id": "adm", "task_id": "t1", "user_request": "进度状态"}, quota(updated=NOW-timedelta(hours=2)))
-        self.assertEqual("status", result["request_type"]); self.assertTrue(result["split_recommended"]); self.assertEqual("stale", result["quota_freshness"]); self.assertTrue(result["warnings"])
-        serialized = json.dumps(result); self.assertNotIn("sensitive", serialized); self.assertNotIn('"providers"', serialized)
+        with self.assertRaisesRegex(TaskError, "no eligible provider"):
+            self.call({"project_id": "adm", "task_id": "t1", "user_request": "进度状态"}, quota(updated=NOW-timedelta(hours=2)))
 
     def test_shared_project_task_rule_priority_in_prompt(self):
         create_task(self.store, task(), assign=False); self.store.records[("projects", "adm", "adm")]["active_tasks"] = ["t1"]
@@ -98,8 +97,8 @@ class RuntimeBridgeTests(unittest.TestCase):
         self.assertNotIn("Ponytail minimal-change preference", research)
 
     def test_preferred_and_excluded(self):
-        preferred = self.call({"project_id": "adm", "user_request": "Research design", "task_type": "research", "complexity": "medium", "preferred_provider": "claude"}, quota(50, None))
-        self.assertEqual("claude", preferred["recommended_provider"]); self.assertTrue(preferred["warnings"])
+        with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
+            self.call({"project_id": "adm", "user_request": "Research design", "task_type": "research", "complexity": "medium", "preferred_provider": "claude"}, quota(50, None))
         excluded = self.call({"project_id": "adm", "user_request": "Implement second bridge", "task_type": "implementation", "complexity": "medium", "excluded_provider": "codex"}, quota(90, 80))
         self.assertNotEqual("codex", excluded["recommended_provider"])
 
