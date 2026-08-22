@@ -29,7 +29,11 @@ EVENTS = (
 # the record stays put pending a condition, not an error and not progress.
 TRANSITIONS = {
     "task_planned": {"idle": {"task_planned"}},
-    "dispatch_requested": {"task_planned": {"dispatching", "stop_requires_user"}},
+    # The self-loop (task_planned -> task_planned) is a "hold": the shared
+    # single-production-writer gate (see continuation_decision._dispatch_gate)
+    # can decline to dispatch a production-mutating candidate while another
+    # production-mutating actor is active, without that being a STOP.
+    "dispatch_requested": {"task_planned": {"dispatching", "stop_requires_user", "task_planned"}},
     "dispatch_accepted": {"dispatching": {"queued"}},
     "dispatch_failed": {"dispatching": {"fail", "stop_requires_user"}},
     "provider_started": {"queued": {"running"}},

@@ -5,15 +5,15 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version", "chain_id", "request_id", "project_id", "state",
+    "schema_version", "chain_id", "root_request_id", "project_id", "state",
     "task_id", "execution_id", "session_id", "handoff_id",
     "depth", "max_depth", "retry_count", "max_retries",
-    "created_at", "updated_at", "last_reason", "history"
+    "created_at", "updated_at", "last_reason", "history", "slices"
   ],
   "properties": {
     "schema_version": {"const": 1},
     "chain_id": {"type": "string", "minLength": 1, "description": "Stable identity for one autonomous continuation lineage; carried across every task/execution the chain dispatches."},
-    "request_id": {"type": "string", "minLength": 1, "description": "Originating dispatch request id; used for duplicate-authority detection."},
+    "root_request_id": {"type": "string", "minLength": 1, "description": "Originating dispatch request id for the chain as a whole. Immutable for the life of the chain; never reused as a later slice's own dispatch request_id."},
     "project_id": {"type": "string", "minLength": 1},
     "state": {
       "enum": [
@@ -22,13 +22,13 @@
         "next_task_ready", "stop_requires_user"
       ]
     },
-    "task_id": {"type": ["string", "null"], "minLength": 1},
-    "execution_id": {"type": ["string", "null"], "minLength": 1},
-    "session_id": {"type": ["string", "null"], "minLength": 1},
-    "handoff_id": {"type": ["string", "null"], "minLength": 1},
-    "depth": {"type": "integer", "minimum": 0, "description": "Number of automatic continuations already taken in this chain."},
+    "task_id": {"type": ["string", "null"], "minLength": 1, "description": "Convenience mirror of the current slice's task_id; full per-slice history lives in `slices`."},
+    "execution_id": {"type": ["string", "null"], "minLength": 1, "description": "Convenience mirror of the current slice's most recent execution_id; full retry history lives in `slices[].execution_ids`."},
+    "session_id": {"type": ["string", "null"], "minLength": 1, "description": "Convenience mirror of the current slice's session_id."},
+    "handoff_id": {"type": ["string", "null"], "minLength": 1, "description": "Convenience mirror of the current slice's handoff_id."},
+    "depth": {"type": "integer", "minimum": 0, "description": "Number of automatic continuations already taken in this chain; equals the current slice's slice_index."},
     "max_depth": {"type": "integer", "minimum": 1, "description": "Configurable ceiling on automatic continuation depth."},
-    "retry_count": {"type": "integer", "minimum": 0, "description": "Bounded retry counter for the current task slice."},
+    "retry_count": {"type": "integer", "minimum": 0, "description": "Bounded retry counter for the CURRENT slice only. Reset to 0 whenever a new slice starts; mirrors slices[-1].retry_count."},
     "max_retries": {"type": "integer", "minimum": 0, "description": "Configurable ceiling on bounded automatic retries per slice."},
     "is_production_mutating": {"type": "boolean", "description": "Whether the current/candidate slice writes to production; drives the single-writer mutual-exclusion gate."},
     "action_kind": {
@@ -51,6 +51,30 @@
           "from_state": {"type": "string", "minLength": 1},
           "to_state": {"type": "string", "minLength": 1},
           "reason": {"type": "string", "maxLength": 500}
+        }
+      }
+    },
+    "slices": {
+      "type": "array",
+      "description": "Append-only per-slice lineage. Never mutated once a later slice exists; a retry updates the current (last) slice in place, a new automatic continuation appends a new entry.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "slice_index", "request_id", "task_id", "execution_ids", "session_id",
+          "handoff_id", "outcome", "retry_count", "started_at", "terminal_at"
+        ],
+        "properties": {
+          "slice_index": {"type": "integer", "minimum": 0},
+          "request_id": {"type": "string", "minLength": 1, "description": "This slice's own dispatch request_id/idempotency key -- always distinct from root_request_id and from every other slice's request_id."},
+          "task_id": {"type": ["string", "null"], "minLength": 1},
+          "execution_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Every execution attempt for this slice, in order, including retries."},
+          "session_id": {"type": ["string", "null"], "minLength": 1},
+          "handoff_id": {"type": ["string", "null"], "minLength": 1},
+          "outcome": {"enum": ["pass", "fail", "blocked", null], "description": "This slice's most recent validation outcome; overwritten in place if a retry re-validates the same slice."},
+          "retry_count": {"type": "integer", "minimum": 0},
+          "started_at": {"type": "string", "format": "date-time"},
+          "terminal_at": {"type": ["string", "null"], "format": "date-time"}
         }
       }
     }

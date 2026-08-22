@@ -43,17 +43,36 @@ def plan_task(from_state="idle"):
     return _decision("task_planned", from_state, "task_planned", "task planned for dispatch")
 
 
-def decide_dispatch(from_state, action_kind, duplicate_authority):
-    """TASK_PLANNED -> DISPATCHING, gated by the irreversible-action and
-    duplicate-request/task-authority rules that apply to every dispatch,
-    not only continuations."""
+def _dispatch_gate(action_kind, duplicate_authority, is_production_mutating, active_production_mutating_count):
+    """Shared authorization gate for any TASK_PLANNED -> DISPATCHING style
+    transition. Both the initial dispatch (decide_dispatch) and every later
+    continuation dispatch (decide_next_dispatch) call this exact function so
+    the two paths cannot drift apart. Returns (outcome, reason) where
+    outcome is one of "proceed", "hold", "stop". Read-only/prework
+    candidates (is_production_mutating=False) are exempt from the
+    single-production-writer mutual-exclusion check and may proceed in
+    parallel with any number of active actors."""
     if duplicate_authority:
-        return _decision("dispatch_requested", from_state, "stop_requires_user",
-                          "duplicate request/task authority detected; requires user")
+        return "stop", "duplicate request/task authority detected; requires user"
     if action_kind in IRREVERSIBLE_ACTION_KINDS:
-        return _decision("dispatch_requested", from_state, "stop_requires_user",
-                          f"action_kind={action_kind} is production/irreversible; requires user")
-    return _decision("dispatch_requested", from_state, "dispatching", "dispatch authorized")
+        return "stop", f"action_kind={action_kind} is production/irreversible; requires user"
+    if is_production_mutating and active_production_mutating_count > 0:
+        return "hold", f"holding: {active_production_mutating_count} production-mutating actor(s) already active"
+    return "proceed", "dispatch authorized"
+
+
+def decide_dispatch(from_state, action_kind, duplicate_authority, is_production_mutating, active_production_mutating_count):
+    """TASK_PLANNED -> DISPATCHING, gated by the same shared _dispatch_gate
+    as decide_next_dispatch: irreversible-action, duplicate-request/task
+    authority, and the single-production-writer mutual-exclusion rule all
+    apply identically to the very first dispatch of a chain, not only to
+    later continuations."""
+    outcome, reason = _dispatch_gate(action_kind, duplicate_authority, is_production_mutating, active_production_mutating_count)
+    if outcome == "stop":
+        return _decision("dispatch_requested", from_state, "stop_requires_user", reason)
+    if outcome == "hold":
+        return _decision("dispatch_requested", from_state, "task_planned", reason)
+    return _decision("dispatch_requested", from_state, "dispatching", reason)
 
 
 def dispatch_accepted(from_state="dispatching"):
@@ -131,20 +150,16 @@ def decide_continuation(from_state, depth, max_depth):
 
 
 def decide_next_dispatch(from_state, action_kind, duplicate_authority, is_production_mutating, active_production_mutating_count):
-    """NEXT_TASK_READY -> TASK_PLANNED, gated by the same irreversible-action
-    and duplicate-authority rules as the first dispatch, plus the
-    single-production-writer mutual-exclusion rule. Read-only/prework
-    candidates are exempt from mutual exclusion and may proceed in
-    parallel."""
-    if duplicate_authority:
-        return _decision("next_dispatch_check", from_state, "stop_requires_user",
-                          "duplicate request/task authority detected; requires user")
-    if action_kind in IRREVERSIBLE_ACTION_KINDS:
-        return _decision("next_dispatch_check", from_state, "stop_requires_user",
-                          f"next slice action_kind={action_kind} is production/irreversible; requires user")
-    if is_production_mutating and active_production_mutating_count > 0:
-        return _decision("next_dispatch_check", from_state, "next_task_ready",
-                          f"holding: {active_production_mutating_count} production-mutating actor(s) already active")
+    """NEXT_TASK_READY -> TASK_PLANNED, gated by the same shared
+    _dispatch_gate as decide_dispatch: irreversible-action,
+    duplicate-authority, and single-production-writer mutual exclusion.
+    Read-only/prework candidates are exempt from mutual exclusion and may
+    proceed in parallel."""
+    outcome, reason = _dispatch_gate(action_kind, duplicate_authority, is_production_mutating, active_production_mutating_count)
+    if outcome == "stop":
+        return _decision("next_dispatch_check", from_state, "stop_requires_user", reason)
+    if outcome == "hold":
+        return _decision("next_dispatch_check", from_state, "next_task_ready", reason)
     return _decision("next_dispatch_check", from_state, "task_planned", "next slice authorized")
 
 

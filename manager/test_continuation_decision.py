@@ -37,7 +37,8 @@ class HappyPathTests(unittest.TestCase):
         d = plan_task()
         self.assertEqual((d.from_state, d.to_state), ("idle", "task_planned"))
 
-        d = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False)
+        d = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False,
+                             is_production_mutating=False, active_production_mutating_count=0)
         self.assertEqual(d.to_state, "dispatching")
 
         d = dispatch_accepted()
@@ -104,19 +105,39 @@ class DispatchGateTests(unittest.TestCase):
     def test_irreversible_action_stops(self):
         for kind in ("production_deploy", "auth", "payment", "irreversible"):
             with self.subTest(kind=kind):
-                d = decide_dispatch("task_planned", action_kind=kind, duplicate_authority=False)
+                d = decide_dispatch("task_planned", action_kind=kind, duplicate_authority=False,
+                                     is_production_mutating=False, active_production_mutating_count=0)
                 self.assertEqual(d.to_state, "stop_requires_user")
 
     def test_duplicate_authority_stops(self):
-        d = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=True)
+        d = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=True,
+                             is_production_mutating=False, active_production_mutating_count=0)
         self.assertEqual(d.to_state, "stop_requires_user")
 
     def test_duplicate_authority_beats_irreversible_reason_but_still_stops(self):
-        d = decide_dispatch("task_planned", action_kind="production_deploy", duplicate_authority=True)
+        d = decide_dispatch("task_planned", action_kind="production_deploy", duplicate_authority=True,
+                             is_production_mutating=False, active_production_mutating_count=0)
         self.assertEqual(d.to_state, "stop_requires_user")
 
     def test_ordinary_dispatch_authorized(self):
-        d = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False)
+        d = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False,
+                             is_production_mutating=False, active_production_mutating_count=0)
+        self.assertEqual(d.to_state, "dispatching")
+
+    def test_read_only_bypasses_mutual_exclusion_on_initial_dispatch(self):
+        d = decide_dispatch("task_planned", action_kind="read_only", duplicate_authority=False,
+                             is_production_mutating=False, active_production_mutating_count=5)
+        self.assertEqual(d.to_state, "dispatching")
+
+    def test_production_mutating_holds_on_initial_dispatch_when_actor_active(self):
+        d = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False,
+                             is_production_mutating=True, active_production_mutating_count=1)
+        self.assertEqual(d.to_state, "task_planned")
+        self.assertIn("holding", d.reason)
+
+    def test_production_mutating_proceeds_on_initial_dispatch_when_no_actor_active(self):
+        d = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False,
+                             is_production_mutating=True, active_production_mutating_count=0)
         self.assertEqual(d.to_state, "dispatching")
 
     def test_dispatch_failed_retryable_goes_to_fail(self):
@@ -177,6 +198,62 @@ class NextDispatchGateTests(unittest.TestCase):
         self.assertEqual(d.to_state, "stop_requires_user")
 
 
+class SingleWriterGateTests(unittest.TestCase):
+    """Regression coverage for the shared _dispatch_gate: the initial
+    TASK_PLANNED -> DISPATCHING path and the NEXT_TASK_READY -> TASK_PLANNED
+    continuation path must agree on every input, and two independent chains
+    must never both be authorized to hold the sole production-mutating
+    slot concurrently."""
+
+    def test_initial_and_continuation_paths_agree_on_every_gate_outcome(self):
+        cases = [
+            dict(action_kind="implementation", duplicate_authority=False, is_production_mutating=False, active_production_mutating_count=4),
+            dict(action_kind="implementation", duplicate_authority=False, is_production_mutating=True, active_production_mutating_count=0),
+            dict(action_kind="implementation", duplicate_authority=False, is_production_mutating=True, active_production_mutating_count=1),
+            dict(action_kind="payment", duplicate_authority=False, is_production_mutating=False, active_production_mutating_count=0),
+            dict(action_kind="implementation", duplicate_authority=True, is_production_mutating=True, active_production_mutating_count=0),
+        ]
+        for case in cases:
+            with self.subTest(**case):
+                initial = decide_dispatch("task_planned", **case)
+                continuation = decide_next_dispatch("next_task_ready", **case)
+                # Same outcome family (proceed/hold/stop), regardless of the
+                # differing state names each path's self-loop hold targets.
+                self.assertEqual(initial.to_state == "stop_requires_user", continuation.to_state == "stop_requires_user")
+                initial_proceeded = initial.to_state == "dispatching"
+                continuation_proceeded = continuation.to_state == "task_planned"
+                self.assertEqual(initial_proceeded, continuation_proceeded)
+                initial_held = initial.to_state == "task_planned" and not initial_proceeded
+                continuation_held = continuation.to_state == "next_task_ready"
+                self.assertEqual(initial_held, continuation_held)
+
+    def test_two_independent_chains_cannot_both_authorize_production_mutation(self):
+        # Chain A dispatches first and becomes the sole active production
+        # writer (active_production_mutating_count reflects chain B's view
+        # of the world once A is active).
+        chain_a_initial = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False,
+                                           is_production_mutating=True, active_production_mutating_count=0)
+        self.assertEqual(chain_a_initial.to_state, "dispatching")
+
+        # Chain B, independently, tries the same gate while A is active --
+        # both the initial-dispatch path and the continuation path must hold
+        # B rather than let it proceed alongside A.
+        chain_b_initial = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False,
+                                           is_production_mutating=True, active_production_mutating_count=1)
+        self.assertNotEqual(chain_b_initial.to_state, "dispatching")
+        self.assertEqual(chain_b_initial.to_state, "task_planned")
+
+        chain_b_continuation = decide_next_dispatch("next_task_ready", action_kind="implementation", duplicate_authority=False,
+                                                      is_production_mutating=True, active_production_mutating_count=1)
+        self.assertNotEqual(chain_b_continuation.to_state, "task_planned")
+        self.assertEqual(chain_b_continuation.to_state, "next_task_ready")
+
+        # Once A's slot frees (count drops back to 0), B may proceed.
+        chain_b_retry = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False,
+                                         is_production_mutating=True, active_production_mutating_count=0)
+        self.assertEqual(chain_b_retry.to_state, "dispatching")
+
+
 class RetryTests(unittest.TestCase):
     def test_retryable_under_limit_retries(self):
         d = decide_retry("fail", retryable=True, retry_count=0, max_retries=2)
@@ -210,8 +287,10 @@ class RetryTests(unittest.TestCase):
 
 class DecisionEqualityTests(unittest.TestCase):
     def test_equal_decisions_compare_equal(self):
-        d1 = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False)
-        d2 = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False)
+        d1 = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False,
+                              is_production_mutating=False, active_production_mutating_count=0)
+        d2 = decide_dispatch("task_planned", action_kind="implementation", duplicate_authority=False,
+                              is_production_mutating=False, active_production_mutating_count=0)
         self.assertEqual(d1, d2)
 
 
