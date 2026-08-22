@@ -11,11 +11,12 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from collectors.claude import normalize as normalize_claude
+from collectors.claude_oauth import RateLimitedError as ClaudeOauthRateLimited, AuthStaleError as ClaudeOauthAuthStale
 from manager.claude_account_selector import select_claude_account, resolve_claude_account
 from manager.command_watcher import process_command, provider_quota_reliable, claude_quota_reliable
 from manager.quota_forecast import forecast_account, RiskStatus, ActionRecommendation, WarningLevel
 from manager.quota_reader import summarize, unknown_account_summary
-from manager.refresh_status import refresh, discover_claude_accounts, claude_snapshot
+from manager.refresh_status import refresh, discover_claude_accounts, discover_claude_config_dirs, claude_snapshot
 
 
 def now_iso():
@@ -314,6 +315,254 @@ class ClaudeQuotaTruthTests(unittest.TestCase):
             # Must reject and must NOT call launch_task
             self.assertEqual({"status": "rejected", "reason": "quota_unreliable"}, res)
             mock_launch.assert_not_called()
+
+
+class ClaudeOauthRefreshIntegrationTests(unittest.TestCase):
+    """Covers the refresh()-level contract for the new OAuth usage
+    collector: preference over statusline, 429/401 handling, account
+    isolation in the published Drive document, and Codex non-interference."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _empty_doc(self, *, existing_claude=None):
+        providers = [{
+            "provider": "codex", "display_name": "Codex", "collection_mode": "automatic",
+            "source": "codex_app_server", "source_type": "official", "confidence": "unknown",
+            "last_updated": now_iso(), "status": "unknown", "windows": []
+        }]
+        if existing_claude:
+            providers.append(existing_claude)
+        return {"schema_version": "0.1.0", "generated_at": now_iso(), "providers": providers}
+
+    # 13. Drive output contains account_id exact binding for OAuth-sourced entries
+    def test_13_drive_output_account_id_exact_binding_oauth(self):
+        def oauth_collector(config_dir, account_id, timeout=15):
+            return {
+                "provider": "claude", "account_id": account_id, "display_name": "Claude Code",
+                "collection_mode": "automatic", "source": "claude_oauth_usage", "source_type": "official",
+                "confidence": "official", "last_updated": now_iso(), "status": "ok",
+                "windows": [{"name": "five_hour", "duration_minutes": 300,
+                             "used_percent": 10.0 if account_id == "account-a" else 90.0,
+                             "remaining_percent": 90.0 if account_id == "account-a" else 10.0,
+                             "resets_at": None}],
+                "metadata": {"official_rate_limits_available": True, "missing_windows": ["seven_day"]},
+            }
+
+        published = []
+        payload_fallback = self.base / "unused.json"
+        result = refresh(
+            service=object(),
+            runtime_path=self.base / "status.json",
+            log_path=self.base / "refresh.log",
+            lock_path=self.base / "refresh.lock",
+            claude_path=payload_fallback,
+            claude_accounts={"account-a": payload_fallback, "account-b": payload_fallback},
+            # Distinct config_dirs for both -- avoids colliding with the
+            # legacy account_id=None slot's own "<default>" cache bucket
+            # (see test_14 for that dedup-cache behavior specifically).
+            claude_config_dirs={"account-a": str(self.base / ".claude-a"), "account-b": str(self.base / ".claude-b")},
+            claude_oauth_collector=oauth_collector,
+            reader=lambda **_: self._empty_doc(),
+            codex_collector=lambda **_: ({}, {"providers": [self._empty_doc()["providers"][0]]}),
+            publisher=lambda s, p: published.append(json.loads(p.read_text())) or {"action": "updated"},
+            history_store=False,
+        )
+        self.assertEqual("success", result["providers"]["claude:account-a"])
+        self.assertEqual("success", result["providers"]["claude:account-b"])
+        claude_entries = {p["account_id"]: p for p in published[0]["providers"] if p.get("provider") == "claude"}
+        self.assertEqual("claude_oauth_usage", claude_entries["account-a"]["source"])
+        self.assertEqual(10.0, claude_entries["account-a"]["windows"][0]["used_percent"])
+        self.assertEqual(90.0, claude_entries["account-b"]["windows"][0]["used_percent"])
+
+    # 14. Claude A/B never cross-contaminate even when both resolve via the
+    #     OAuth path in the same refresh() call
+    def test_14_a_b_never_cross_account_via_oauth(self):
+        seen_account_ids = []
+
+        def oauth_collector(config_dir, account_id, timeout=15):
+            seen_account_ids.append((account_id, config_dir))
+            return {
+                "provider": "claude", "account_id": account_id, "display_name": "Claude Code",
+                "collection_mode": "automatic", "source": "claude_oauth_usage", "source_type": "official",
+                "confidence": "official", "last_updated": now_iso(), "status": "ok",
+                "windows": [{"name": "five_hour", "duration_minutes": 300, "used_percent": 1.0,
+                             "remaining_percent": 99.0, "resets_at": None}],
+                "metadata": {},
+            }
+
+        payload_fallback = self.base / "unused.json"
+        refresh(
+            service=object(),
+            runtime_path=self.base / "status.json",
+            log_path=self.base / "refresh.log",
+            lock_path=self.base / "refresh.lock",
+            claude_path=payload_fallback,
+            claude_accounts={"account-a": payload_fallback, "account-b": payload_fallback},
+            claude_config_dirs={"account-a": None, "account-b": str(self.base / ".claude-b")},
+            claude_oauth_collector=oauth_collector,
+            reader=lambda **_: self._empty_doc(),
+            codex_collector=lambda **_: ({}, {"providers": [self._empty_doc()["providers"][0]]}),
+            publisher=lambda s, p: {"action": "updated"},
+            history_store=False,
+        )
+        # account-a (default config_dir) and account-b (its own config_dir)
+        # are the only two account_ids present in claude_config_dirs here,
+        # so exactly 2 real requests happen -- the legacy account_id=None
+        # slot is not in claude_config_dirs at all in this test, so it is
+        # skipped for OAuth entirely (falls to the statusline path instead).
+        self.assertEqual(2, len(seen_account_ids))
+        config_dirs_used = {cd for _, cd in seen_account_ids}
+        self.assertEqual(2, len(config_dirs_used), "each distinct credential must be fetched exactly once")
+
+    # Explicit dedup-cache proof: when the legacy account_id=None slot IS
+    # included in claude_config_dirs and shares a config_dir with a named
+    # account, exactly one real request is made for that shared credential.
+    def test_dedup_cache_collapses_shared_credential_to_one_request(self):
+        seen_account_ids = []
+
+        def oauth_collector(config_dir, account_id, timeout=15):
+            seen_account_ids.append(account_id)
+            return {
+                "provider": "claude", "account_id": account_id, "display_name": "Claude Code",
+                "collection_mode": "automatic", "source": "claude_oauth_usage", "source_type": "official",
+                "confidence": "official", "last_updated": now_iso(), "status": "ok",
+                "windows": [{"name": "five_hour", "duration_minutes": 300, "used_percent": 5.0,
+                             "remaining_percent": 95.0, "resets_at": None}],
+                "metadata": {},
+            }
+
+        payload_fallback = self.base / "unused.json"
+        refresh(
+            service=object(),
+            runtime_path=self.base / "status.json",
+            log_path=self.base / "refresh.log",
+            lock_path=self.base / "refresh.lock",
+            claude_path=payload_fallback,
+            claude_accounts={"account-a": payload_fallback},
+            claude_config_dirs={None: None, "account-a": None},
+            claude_oauth_collector=oauth_collector,
+            reader=lambda **_: self._empty_doc(),
+            codex_collector=lambda **_: ({}, {"providers": [self._empty_doc()["providers"][0]]}),
+            publisher=lambda s, p: {"action": "updated"},
+            history_store=False,
+        )
+        self.assertEqual(1, len(seen_account_ids), "None and account-a share config_dir -- only 1 real request")
+
+    # 15. HTTP 429 preserves last-good Claude entry untouched (not overwritten,
+    #     not silently dropped, outcome explicitly rate_limited)
+    def test_15_429_preserves_last_good_entry(self):
+        last_good = {
+            "provider": "claude", "account_id": "account-a", "display_name": "Claude Code",
+            "collection_mode": "automatic", "source": "claude_oauth_usage", "source_type": "official",
+            "confidence": "official", "last_updated": "2026-08-22T01:00:00Z", "status": "ok",
+            "windows": [{"name": "five_hour", "duration_minutes": 300, "used_percent": 33.0,
+                         "remaining_percent": 67.0, "resets_at": None}],
+            "metadata": {},
+        }
+
+        def oauth_collector(config_dir, account_id, timeout=15):
+            raise ClaudeOauthRateLimited(retry_after="60")
+
+        published = []
+        payload_fallback = self.base / "unused.json"
+        result = refresh(
+            service=object(),
+            runtime_path=self.base / "status.json",
+            log_path=self.base / "refresh.log",
+            lock_path=self.base / "refresh.lock",
+            claude_path=payload_fallback,
+            claude_accounts={"account-a": payload_fallback},
+            claude_config_dirs={"account-a": None},
+            claude_oauth_collector=oauth_collector,
+            reader=lambda **_: self._empty_doc(existing_claude=last_good),
+            codex_collector=lambda **_: ({}, {"providers": [self._empty_doc()["providers"][0]]}),
+            publisher=lambda s, p: published.append(json.loads(p.read_text())) or {"action": "updated"},
+            history_store=False,
+        )
+        self.assertEqual("rate_limited", result["providers"]["claude:account-a"])
+        published_claude = next(p for p in published[0]["providers"] if p.get("provider") == "claude" and p.get("account_id") == "account-a")
+        self.assertEqual(last_good, published_claude, "429 must leave the last-good entry byte-for-byte untouched")
+
+    # HTTP 401 falls back to statusline compatibility path instead of guessing
+    def test_401_falls_back_to_statusline_without_guessing(self):
+        payload_a = self.base / "payload_a.json"
+        payload_a.write_text(json.dumps({
+            "rate_limits": {"five_hour": {"used_percentage": 15, "resets_at": None}}
+        }), encoding="utf-8")
+
+        def oauth_collector(config_dir, account_id, timeout=15):
+            raise ClaudeOauthAuthStale()
+
+        published = []
+        result = refresh(
+            service=object(),
+            runtime_path=self.base / "status.json",
+            log_path=self.base / "refresh.log",
+            lock_path=self.base / "refresh.lock",
+            claude_path=payload_a,
+            claude_accounts={"account-a": payload_a},
+            claude_config_dirs={"account-a": None},
+            claude_oauth_collector=oauth_collector,
+            reader=lambda **_: self._empty_doc(),
+            codex_collector=lambda **_: ({}, {"providers": [self._empty_doc()["providers"][0]]}),
+            publisher=lambda s, p: published.append(json.loads(p.read_text())) or {"action": "updated"},
+            history_store=False,
+        )
+        self.assertEqual("success", result["providers"]["claude:account-a"])
+        published_claude = next(p for p in published[0]["providers"] if p.get("provider") == "claude" and p.get("account_id") == "account-a")
+        self.assertEqual("claude_code_statusline_rate_limits", published_claude["source"])
+        self.assertEqual(85, published_claude["windows"][0]["remaining_percent"])
+
+    # Codex refresh path is completely unaffected by the OAuth changes
+    def test_codex_refresh_unaffected_by_oauth_changes(self):
+        codex_provider = {
+            "provider": "codex", "display_name": "Codex", "collection_mode": "automatic",
+            "source": "codex_app_server", "source_type": "official", "confidence": "official",
+            "last_updated": now_iso(), "status": "ok",
+            "windows": [{"name": "primary", "duration_minutes": 10080, "used_percent": 50.0,
+                         "remaining_percent": 50.0, "resets_at": None}],
+            "metadata": {},
+        }
+        published = []
+        result = refresh(
+            service=object(),
+            runtime_path=self.base / "status.json",
+            log_path=self.base / "refresh.log",
+            lock_path=self.base / "refresh.lock",
+            claude_path=self.base / "unused.json",
+            reader=lambda **_: self._empty_doc(),
+            codex_collector=lambda **_: ({}, {"providers": [codex_provider]}),
+            publisher=lambda s, p: published.append(json.loads(p.read_text())) or {"action": "updated"},
+            history_store=False,
+        )
+        self.assertEqual("success", result["providers"]["codex"])
+        published_codex = next(p for p in published[0]["providers"] if p.get("provider") == "codex")
+        self.assertEqual(50.0, published_codex["windows"][0]["used_percent"])
+
+    # discover_claude_config_dirs reads config_dir straight from the registry
+    def test_discover_claude_config_dirs_reads_registry(self):
+        home = self.base / "home"
+        cfg_dir = home / "config"
+        cfg_dir.mkdir(parents=True)
+        registry_file = cfg_dir / "claude_accounts.json"
+        registry_file.write_text(json.dumps({
+            "accounts": [
+                {"account_id": "account-a", "enabled": True, "config_dir": None},
+                {"account_id": "account-b", "enabled": True, "config_dir": str(self.base / ".claude-b")},
+                {"account_id": "account-c", "enabled": False, "config_dir": str(self.base / ".claude-c")},
+            ]
+        }), encoding="utf-8")
+
+        config_dirs = discover_claude_config_dirs(home)
+        self.assertIn("account-a", config_dirs)
+        self.assertIsNone(config_dirs["account-a"])
+        self.assertEqual(str(self.base / ".claude-b"), config_dirs["account-b"])
+        self.assertNotIn("account-c", config_dirs, "disabled account must not be discovered")
 
 
 if __name__ == "__main__":

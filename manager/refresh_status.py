@@ -11,6 +11,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from collectors.claude import normalize as normalize_claude
+from collectors.claude_oauth import (
+    CollectorError as ClaudeOauthError,
+    RateLimitedError as ClaudeOauthRateLimited,
+    collect as collect_claude_oauth,
+)
 from collectors.codex import collect as collect_codex
 from collectors.publish_drive import build_service, sync_drive
 from manager.quota_reader import read_drive_status, validate_status
@@ -90,6 +95,31 @@ def claude_snapshot(path, account_id=None):
     return provider
 
 
+def claude_oauth_snapshot(config_dir, account_id=None, timeout=15, collector=collect_claude_oauth, log_path=None):
+    """Attempts one real OAuth usage fetch for one account. Returns
+    (outcome, provider_or_None):
+      - ("success", provider) on a real 200 response with at least one window
+      - ("rate_limited", None) on HTTP 429 -- caller must not touch any
+        existing last-good entry for this account at all
+      - ("unavailable", None) on missing/unreadable credentials, HTTP 401,
+        malformed JSON, or any other collector failure -- caller may still
+        try the statusline compatibility fallback
+    Never logs or returns the access token; only exception type names are
+    logged, matching the rest of this module's logging convention."""
+    try:
+        provider = collector(config_dir, account_id, timeout=timeout)
+        return "success", provider
+    except ClaudeOauthRateLimited as exc:
+        if log_path is not None:
+            retry_note = f" retry_after={exc.retry_after}" if exc.retry_after else ""
+            log_line(log_path, f"claude oauth rate_limited{retry_note}")
+        return "rate_limited", None
+    except ClaudeOauthError as exc:
+        if log_path is not None:
+            log_line(log_path, f"claude oauth unavailable: {type(exc).__name__}")
+        return "unavailable", None
+
+
 def write_atomic(path, document):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -98,6 +128,7 @@ def write_atomic(path, document):
 
 
 def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_accounts=None,
+            claude_config_dirs=None, claude_oauth_collector=collect_claude_oauth, claude_oauth_timeout=15,
             reader=read_drive_status, codex_collector=collect_codex,
             publisher=sync_drive, validator=validate_status, history_store=None):
     """`claude_path` remains the single/legacy-account payload path (account_id=None),
@@ -106,7 +137,15 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_a
     logged, and published independently under its own (provider="claude",
     account_id=...) key -- one account's missing/stale payload never
     overwrites or blocks another's, and omitting claude_accounts entirely
-    reproduces today's single-account behavior byte-for-byte."""
+    reproduces today's single-account behavior byte-for-byte.
+
+    `claude_config_dirs`, if given, is an additional {account_id: config_dir}
+    mapping used to attempt one real OAuth usage fetch per account BEFORE
+    falling back to that account's statusline payload path. Omitting it
+    entirely (the default) skips OAuth for every account and reproduces the
+    pre-OAuth statusline-only behavior byte-for-byte -- this keeps every
+    existing caller/test that doesn't pass this parameter unaffected,
+    including Codex, which this parameter has no effect on at all."""
     with runtime_lock(lock_path):
         log_line(log_path, "refresh start")
         try:
@@ -145,10 +184,58 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_a
             log_line(log_path, f"provider codex unavailable: {type(exc).__name__}")
 
         accounts = {None: claude_path, **(claude_accounts or {})}
+        # Deliberately NOT auto-injecting a {None: None} default here: unlike
+        # `accounts`, which must always have a legacy slot, OAuth must stay
+        # fully opt-in per account_id so every existing caller/test that
+        # doesn't pass claude_config_dirs reproduces pre-OAuth behavior
+        # byte-for-byte, including for the legacy account_id=None slot.
+        config_dirs = dict(claude_config_dirs or {})
+        # Two account_ids can legitimately point at the same real Claude
+        # account (e.g. the legacy account_id=None slot and an explicit
+        # "account-a" entry both defaulting to ~/.claude) -- this cache
+        # ensures each *distinct underlying credential* gets at most one
+        # OAuth request per refresh() call, satisfying the "max 1
+        # request/account/refresh" contract even when two schema-level
+        # account_ids alias the same real account.
+        oauth_cache = {}
         for account_id, path in accounts.items():
             outcome_key = "claude" if account_id is None else f"claude:{account_id}"
             try:
-                claude = claude_snapshot(path, account_id=account_id)
+                claude = None
+                if account_id in config_dirs:
+                    cache_key = str(config_dirs[account_id]) if config_dirs[account_id] else "<default>"
+                    if cache_key in oauth_cache:
+                        oauth_outcome, oauth_provider = oauth_cache[cache_key]
+                    else:
+                        oauth_outcome, oauth_provider = claude_oauth_snapshot(
+                            config_dirs[account_id], account_id=account_id,
+                            timeout=claude_oauth_timeout, collector=claude_oauth_collector,
+                            log_path=log_path,
+                        )
+                        oauth_cache[cache_key] = (oauth_outcome, oauth_provider)
+                    if oauth_provider is not None:
+                        oauth_provider = dict(oauth_provider, account_id=account_id)
+                    if oauth_outcome == "rate_limited":
+                        # Explicit contract: a 429 must never overwrite or be
+                        # papered over by any other source (including the
+                        # statusline fallback) this cycle -- last-good stays
+                        # exactly as it was, and freshness is judged purely
+                        # from that last-good entry's own captured_at.
+                        outcomes[outcome_key] = "rate_limited"
+                        log_line(log_path, f"provider {outcome_key} rate_limited")
+                        continue
+                    if oauth_outcome == "success":
+                        claude = oauth_provider
+
+                if claude is None:
+                    # OAuth unavailable (no config_dirs entry, missing/stale
+                    # credentials, 401, network/parse failure) -- fall back to
+                    # the statusline payload as compatibility/last-good
+                    # evidence only. Its captured_at is the file's real mtime,
+                    # never "now", so a stale fallback still reports itself as
+                    # stale rather than pretending to be fresh.
+                    claude = claude_snapshot(path, account_id=account_id)
+
                 existing = next(
                     (item for item in document["providers"]
                      if item.get("provider") == "claude" and item.get("account_id") == account_id),
@@ -236,6 +323,28 @@ def discover_claude_accounts(home_path=None):
     return accounts_map
 
 
+def discover_claude_config_dirs(home_path=None):
+    """Discover enabled Claude accounts' config_dir (for OAuth credential
+    lookup) from the same claude_accounts.json registry
+    discover_claude_accounts reads. Returns {account_id: config_dir_or_None}
+    -- config_dir=None means "use the default ~/.claude location", matching
+    collectors.claude_oauth.read_access_token's own default. Never reads or
+    returns any credential contents itself, only the directory path the
+    OAuth collector should look in."""
+    home = Path(home_path or os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
+    registry_path = home / "config" / "claude_accounts.json"
+    config_dirs = {}
+    if registry_path.is_file():
+        try:
+            from manager.claude_account_selector import load_claude_accounts
+            for acc in load_claude_accounts(registry_path):
+                if acc.get("enabled", True):
+                    config_dirs[acc["account_id"]] = acc.get("config_dir")
+        except Exception:
+            pass
+    return config_dirs
+
+
 def main():
     home = Path(os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
     try:
@@ -246,6 +355,12 @@ def main():
             lock_path=home / "refresh.lock",
             claude_path=Path(os.environ.get("CLAUDE_STATUSLINE_PAYLOAD", Path.home() / ".claude" / "statusline-payload.json")),
             claude_accounts=discover_claude_accounts(home),
+            # Real production run: also attempt OAuth for the legacy
+            # account_id=None slot against the default ~/.claude location,
+            # in addition to whatever discover_claude_config_dirs finds in
+            # the registry. Test callers that don't pass claude_config_dirs
+            # at all are unaffected -- this injection only happens here.
+            claude_config_dirs={None: None, **discover_claude_config_dirs(home)},
         )
         print(f"REFRESHED Drive status.json ({result['publish']['action']})")
         return 0
