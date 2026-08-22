@@ -20,7 +20,7 @@ from manager.dispatcher import dispatch
 from manager.execution_lifecycle import enter_running_gate, terminalize_execution
 from manager.executions import MAX_HARD_TIMEOUT_SECONDS, heartbeat_execution, hard_timeout_seconds, link_execution_session, reserve_execution
 from manager.gcs_lock_registry import GCSLockRegistry
-from manager.project_registry import get_global_registry, resolve_authoritative_working_directory
+from manager.project_registry import get_global_registry, resolve_authoritative_working_directory_with_project
 from manager.quota_forecast import DEFAULT_MAX_AGE_MINUTES
 from manager.quota_reader import read_drive_status
 from manager.repo_write_enforcement import enforce_allowed_paths, is_bounded_repo_write_snapshot
@@ -29,7 +29,7 @@ from manager.task_claims import task_claim_registry
 from manager.tasks import DriveRecords, TaskError, update_task, validate
 from manager.trusted_ingress import repo_write_policy_satisfied
 from manager.worktree_locks import link_session as link_writer_session
-from manager.worktree_materializer import materialize_worktree
+from manager.worktree_materializer import materialize_worktree, verify_checkout_repo_identity
 
 
 RPC_TIMEOUT_SECONDS = 30.0
@@ -191,33 +191,39 @@ def _materialize_repo_write_working_directory(store, task):
 def _resolve_working_directory(store, task):
     """Resolve the launch-time working_directory, backfilling a legacy Task.
 
-    manager.dispatcher.dispatch() snapshots working_directory onto every Task
-    it creates going forward, so this is normally a pass-through read of the
-    Task's own value. A Task persisted before that contract existed has no
-    such field; only then does this fall back to the same
-    resolve_authoritative_working_directory() the dispatcher itself uses --
-    never any caller-supplied value (there is none available here), and
-    never the Drive Project record's raw `working_directory` literal taken
-    at face value, since nothing keeps that literal synchronized with the
-    actual current checkout (see
-    fix/direct-dispatch-working-directory-authority-p0-20260822) -- except
-    for a Task carrying genuine v2-repo-write admission evidence, which is
-    never allowed to fall back to the shared canonical checkout and instead
-    materializes (or reuses) its own isolated worktree (Slice C). The
-    resolved value is validated (string, absolute, existing directory) before
-    it is trusted, and only *then* backfilled onto the Task record itself, so
-    a bad value is never persisted, and every later launch/retry of this
-    same Task reuses this Task's own snapshot instead of re-resolving it
-    again (matching the immutable-snapshot guarantee dispatch() already
-    provides for a Task that had the field from creation).
+    manager.dispatcher.dispatch() normally runs in Cloud Run, which has no
+    HOME-local ADM_WORKSPACE_ROOT, so for a project registered in the
+    Global Project Registry it deliberately snapshots working_directory as
+    None rather than the Drive Project record's raw `working_directory`
+    literal (see
+    fix/direct-dispatch-working-directory-authority-p0-20260822 R2) --
+    machine-local authority belongs on the actual execution host, which is
+    here. This is that re-resolution: never any caller-supplied value
+    (there is none available here), and never the Drive literal taken at
+    face value, since nothing keeps it synchronized with the actual current
+    checkout -- except for a Task carrying genuine v2-repo-write admission
+    evidence, which is never allowed to fall back to the shared canonical
+    checkout and instead materializes (or reuses) its own isolated worktree
+    (Slice C). A project NOT registered in the Global Project Registry at
+    all still gets the legacy Drive-literal fallback, for backward
+    compatibility. The resolved value is validated (string, absolute,
+    existing directory, and -- when it came from the registry -- a real
+    git checkout of the project's own registered repo, never a stale or
+    mis-pointed workspace) before it is trusted, and only *then* backfilled
+    onto the Task record itself, so a bad value is never persisted, and
+    every later launch/retry of this same Task reuses this Task's own
+    snapshot instead of re-resolving it again.
     """
     value = task.get("working_directory")
     from_project = False
+    registry_project = None
     if value is None and repo_write_policy_satisfied(task):
         value = _materialize_repo_write_working_directory(store, task)
     if value is None:
         project = store.get("projects", task["project_id"], task["project_id"])
-        value = resolve_authoritative_working_directory(task["project_id"], project.get("working_directory"))
+        value, registry_project = resolve_authoritative_working_directory_with_project(
+            task["project_id"], project.get("working_directory")
+        )
         from_project = True
     if not isinstance(value, str) or not value.strip():
         raise TaskError(f"no working_directory is configured for task {task['task_id']!r} or its project")
@@ -225,6 +231,8 @@ def _resolve_working_directory(store, task):
         raise TaskError(f"working_directory must be an absolute path: {value!r}")
     if not os.path.isdir(value):
         raise TaskError(f"working_directory does not exist or is not a directory: {value!r}")
+    if registry_project is not None:
+        verify_checkout_repo_identity(value, registry_project)
     if from_project:
         update_task(store, task["project_id"], task["task_id"], working_directory=value)
     return value

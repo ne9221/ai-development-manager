@@ -184,12 +184,17 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
         # relative_path) when available -- never taken at face value from
         # `request` (Direct Dispatch's own payload allowlist has no
         # working_directory field, and this must stay true even if that ever
-        # changes). The Drive Project record's own `working_directory`
-        # literal is only used as a fallback for a project that isn't
-        # registered yet: nothing keeps that literal synchronized with the
-        # actual current checkout, so it must never be trusted as
-        # authoritative once the registry can resolve the path itself (see
-        # fix/direct-dispatch-working-directory-authority-p0-20260822).
+        # changes). manager.dispatcher.dispatch() itself typically runs in
+        # Cloud Run (via cloud.dispatch_ingress), which has no HOME-local
+        # ADM_WORKSPACE_ROOT at all -- for a REGISTERED project this
+        # correctly resolves to None here (not the Drive Project record's
+        # own `working_directory` literal, which nothing keeps synchronized
+        # with the actual current checkout), deferring real resolution to
+        # wherever the workspace *is* configured: manager.execution_runner,
+        # on the actual HOME execution host (see
+        # fix/direct-dispatch-working-directory-authority-p0-20260822 R2).
+        # The Drive literal is only ever used as a fallback for a project
+        # that isn't registered in the Global Project Registry at all.
         # This is a one-time, dispatch-time snapshot: once a Task exists,
         # this branch never runs again for it, so a later change to either
         # source cannot silently drift an already-dispatched or retried Task

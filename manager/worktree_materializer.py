@@ -249,6 +249,35 @@ def _ensure_physical_worktree(canonical_checkout, worktree_path: Path, branch: s
     _write_owner_marker(worktree_path, owner)
 
 
+def verify_checkout_repo_identity(checkout_path, project, runner=subprocess.run) -> None:
+    """Verify that `checkout_path` is a real git checkout whose `origin`
+    remote matches `project`'s registered repo identity.
+
+    Used by manager.execution_runner's legacy (non-worktree) working_
+    directory resolution path: when a working_directory is resolved via the
+    Global Project Registry's workspace_root convention rather than through
+    materialize_worktree() itself, nothing else has ever confirmed the
+    resolved local path (a machine-local junction/pointer someone else
+    maintains) actually points at the right repository -- a stale or
+    mis-pointed workspace pointer must fail closed here rather than
+    silently running a task against the wrong repository (see
+    fix/direct-dispatch-working-directory-authority-p0-20260822 R2)."""
+    result = _run(checkout_path, "remote", "get-url", "origin", runner=runner)
+    if result.returncode != 0:
+        raise WorktreeMaterializationError(
+            "workspace_checkout_invalid",
+            f"{checkout_path} does not look like a git checkout with an 'origin' remote "
+            f"(git remote get-url origin failed): {(result.stderr or '').strip()}",
+        )
+    remote_identity = normalize_repo_identity((result.stdout or "").strip())
+    if remote_identity != project.repo_identity:
+        raise WorktreeMaterializationError(
+            "workspace_checkout_repo_mismatch",
+            f"{checkout_path} is a checkout of {remote_identity!r}, not project "
+            f"{project.project_id!r}'s registered repo {project.repo_identity!r}",
+        )
+
+
 def materialize_worktree(store, project, task: Dict[str, Any], canonical_checkout, workspace_root, runner=subprocess.run) -> Dict[str, Any]:
     """Ensure a deterministic, isolated git worktree exists for `task`, persist
     its identity onto the Task (read back and verified), and return it.

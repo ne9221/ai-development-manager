@@ -387,7 +387,9 @@ class ProjectRegistry:
         return self._raw_entries[project_id]
 
 
-def resolve_authoritative_working_directory(project_id: str, fallback: Optional[str] = None) -> Optional[str]:
+def resolve_authoritative_working_directory_with_project(
+    project_id: str, fallback: Optional[str] = None
+) -> "tuple[Optional[str], Optional[ProjectMetadata]]":
     """Resolve the authoritative, machine-local working_directory for a
     project_id via the Global Project Registry + its configured workspace
     env var (default ADM_WORKSPACE_ROOT) -- never from an unmaintained
@@ -396,20 +398,48 @@ def resolve_authoritative_working_directory(project_id: str, fallback: Optional[
     actual current checkout; see
     fix/direct-dispatch-working-directory-authority-p0-20260822).
 
-    Falls back to `fallback` unchanged whenever the project is not
-    registered, or its configured workspace env var is not set on this
-    machine, so this never regresses a project that hasn't been migrated
-    onto the registry's workspace_root convention yet.
+    R2 correction: a REGISTERED project must never fall back to `fallback`
+    just because its workspace env var isn't set *here* -- that's exactly
+    the real topology this project hits in production: Cloud Run (where
+    Direct Dispatch's cloud ingress and manager.dispatcher.dispatch() run)
+    has no HOME-local ADM_WORKSPACE_ROOT at all, so a naive fallback would
+    let cloud ingress freeze the stale Drive literal onto a brand-new Task
+    forever (manager.execution_runner never re-resolves a Task field that's
+    already non-None). Returning None here instead means the caller either
+    fails closed immediately (if this really is the terminal resolution
+    point) or -- as manager.execution_runner._resolve_working_directory()
+    does -- defers resolution to wherever the workspace *is* configured
+    (the actual HOME execution host), which is where machine-local
+    authority belongs in the first place.
+
+    `fallback` is therefore only ever used for a project that is NOT
+    registered in the Global Project Registry at all -- a deliberate,
+    narrow backward-compatibility allowance for a project that hasn't been
+    migrated onto the registry's workspace_root convention yet, not a
+    general escape hatch for a registered project missing local config.
+
+    Returns (value, project_metadata): `project_metadata` is the resolved
+    ProjectMetadata only when `value` actually came from the registry (so a
+    caller can additionally verify the local checkout's real repo identity
+    against it); it is None whenever `value` is `fallback` or None.
     """
     try:
         project = get_global_registry().get_project(project_id, allow_disabled=True)
     except ProjectRegistryError:
-        return fallback
+        return fallback, None
     env_var_name = project.working_directory_policy.get("env_var", "ADM_WORKSPACE_ROOT")
     workspace_root = os.environ.get(env_var_name)
     if not workspace_root:
-        return fallback
-    return str(project.resolve_runtime_working_directory(workspace_root=workspace_root))
+        return None, None
+    return str(project.resolve_runtime_working_directory(workspace_root=workspace_root)), project
+
+
+def resolve_authoritative_working_directory(project_id: str, fallback: Optional[str] = None) -> Optional[str]:
+    """Convenience wrapper over resolve_authoritative_working_directory_with_
+    project() for callers (e.g. manager.dispatcher.dispatch()) that don't
+    need the resolved ProjectMetadata for a follow-up repo-identity check."""
+    value, _ = resolve_authoritative_working_directory_with_project(project_id, fallback)
+    return value
 
 
 _GLOBAL_REGISTRY: Optional[ProjectRegistry] = None
