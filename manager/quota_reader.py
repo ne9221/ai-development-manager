@@ -87,6 +87,10 @@ def _summarize_item(provider_id, display_name, item, now, max_age_minutes):
         and bool(windows)
         and any(window.get("remaining_percent") is not None for window in windows)
     )
+    exhausted = any(
+        window.get("remaining_percent") == 0.0 or window.get("used_percent") == 100.0
+        for window in windows
+    )
     return {
         "provider": provider_id,
         "display_name": item.get("display_name", display_name),
@@ -104,6 +108,10 @@ def _summarize_item(provider_id, display_name, item, now, max_age_minutes):
         "source_reliable": source_reliable,
         "source_verified": source_verified,
         "has_reliable_quota": reliable,
+        # Reliability establishes that this record is trustworthy; usability
+        # additionally applies the existing launch gate's exhausted-window
+        # rule.  This remains scoped to this one record/account.
+        "has_usable_quota": reliable and not exhausted,
         "nearest_reset_at": nearest_reset,
         # Passed through unmodified (e.g. Codex's metadata.credits) so
         # downstream forecasting (manager.quota_forecast.forecast_account)
@@ -160,6 +168,28 @@ def _legacy_representative(candidates):
     return min(candidates, key=lambda item: str(item.get("account_id")))
 
 
+def _provider_summary(provider_id, display_name, account_summaries, now, max_age_minutes):
+    """Return one provider-level view without combining account quota pools."""
+    named = [item for item in account_summaries if item.get("account_id") is not None]
+    if named:
+        eligible = [item for item in named if item["has_usable_quota"]]
+        # A deterministic eligible account is evidence/scoring only.  R2
+        # remains the authority for the launch account.
+        representative = min(eligible or named, key=lambda item: str(item["account_id"]))
+        result = {key: value for key, value in representative.items() if key != "account_id"}
+        result["has_reliable_quota"] = bool(eligible)
+        result["has_usable_quota"] = bool(eligible)
+        result["availability"] = {
+            "scope": "eligible_named_account",
+            "eligible_account_ids": sorted((item["account_id"] for item in eligible), key=str),
+        }
+        return result
+    legacy = next((item for item in account_summaries if item.get("account_id") is None), None)
+    result = {key: value for key, value in (legacy or unknown_account_summary(provider_id, display_name, None, now, max_age_minutes)).items() if key != "account_id"}
+    result["availability"] = {"scope": "provider_record", "eligible_account_ids": []}
+    return result
+
+
 def summarize(document, max_age_minutes=60, now=None):
     now = now or datetime.now(timezone.utc)
     by_provider = {}
@@ -173,13 +203,14 @@ def summarize(document, max_age_minutes=60, now=None):
     accounts_output = []
     for provider_id, display_name in EXPECTED_PROVIDERS.items():
         candidates = _dedupe_last_wins(by_provider.get(provider_id, []))
+        provider_accounts = []
         for item in candidates:
             account_summary = _summarize_item(provider_id, display_name, item, now, max_age_minutes)
             account_summary["account_id"] = item.get("account_id")
             accounts_output.append(account_summary)
+            provider_accounts.append(account_summary)
 
-        representative = _legacy_representative(candidates)
-        providers_output.append(_summarize_item(provider_id, display_name, representative or {}, now, max_age_minutes))
+        providers_output.append(_provider_summary(provider_id, display_name, provider_accounts, now, max_age_minutes))
 
     return {
         "generated_at": document.get("generated_at"),

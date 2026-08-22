@@ -566,6 +566,14 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertEqual("account-b", kwargs.get("account_id"))
         self.assertEqual("completed", result["status"])
 
+    def test_provisional_account_with_null_requested_account_reaches_r2_selection(self):
+        result, runner = self._run_explicit(command(provider="claude", account_id="account-a", requested_account_id=None))
+        runner.assert_called_once()
+        _, kwargs = runner.call_args
+        self.assertIsNone(kwargs.get("account_id"))
+        self.assertEqual(self.REGISTRY, kwargs.get("claude_accounts"))
+        self.assertEqual("completed", result["status"])
+
     def test_command_account_id_takes_priority_over_task_account_id(self):
         task_record = self.store.get("tasks", "p1", "t1")
         task_record["account_id"] = "account-b"
@@ -679,6 +687,16 @@ class CommandWatcherTests(unittest.TestCase):
         with patch("manager.command_watcher.read_drive_status", return_value={}), \
              patch("manager.command_watcher.summarize", return_value={"providers": []}):
             self.assertFalse(claude_quota_reliable(object()))  # no claude entry at all
+
+    def test_automatic_claude_gate_uses_provider_eligibility_but_explicit_account_stays_scoped(self):
+        summary = {"providers": [{"provider": "claude", "has_usable_quota": True}], "accounts": [
+            {"provider": "claude", "account_id": "account-a", "has_usable_quota": False},
+            {"provider": "claude", "account_id": "account-b", "has_usable_quota": True},
+        ]}
+        with patch("manager.command_watcher.read_drive_status", return_value={}), \
+             patch("manager.command_watcher.summarize", return_value=summary):
+            self.assertTrue(claude_quota_reliable(object()))
+            self.assertFalse(claude_quota_reliable(object(), account_id="account-a"))
 
     # 12: existing allowlist/policy gates still run before launch for Claude too
     def test_claude_command_off_allowlist_means_zero_launch(self):

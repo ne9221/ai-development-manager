@@ -40,7 +40,7 @@ def quota_score(provider, expected_minutes, now):
         "windows": provider["windows"],
         "nearest_reset_at": provider["nearest_reset_at"],
     }
-    if not provider["has_reliable_quota"]:
+    if not provider.get("has_usable_quota", provider["has_reliable_quota"]):
         return -0.5, evidence
     remaining = [window["remaining_percent"] for window in provider["windows"] if window.get("remaining_percent") is not None]
     score = sum(remaining) / len(remaining) / 50
@@ -58,7 +58,7 @@ def decide(task, quota, now=None, estimates=None):
     ranked = []
     warnings = []
     for provider in quota["providers"]:
-        if not provider["has_reliable_quota"]:
+        if not provider.get("has_usable_quota", provider["has_reliable_quota"]):
             warnings.append(f"{provider['display_name']} quota is {provider['status']} or stale")
             continue
         config = CAPABILITIES[provider["provider"]]

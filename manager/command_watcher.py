@@ -119,17 +119,9 @@ def provider_quota_reliable(service, provider, account_id=None):
         return False
     if account_id is not None:
         entry = next((item for item in quota.get("accounts", []) if item.get("provider") == provider and item.get("account_id") == account_id), None)
-        if not entry or not entry.get("has_reliable_quota"):
-            return False
-        if any(w.get("remaining_percent") == 0.0 or w.get("used_percent") == 100.0 for w in entry.get("windows", [])):
-            return False
-        return True
+        return bool(entry and entry.get("has_usable_quota", entry.get("has_reliable_quota")))
     entry = next((item for item in quota.get("providers", []) if item.get("provider") == provider), None)
-    if not entry or not entry.get("has_reliable_quota"):
-        return False
-    if any(w.get("remaining_percent") == 0.0 or w.get("used_percent") == 100.0 for w in entry.get("windows", [])):
-        return False
-    return True
+    return bool(entry and entry.get("has_usable_quota", entry.get("has_reliable_quota")))
 
 
 def codex_quota_reliable(service, account_id=None):
@@ -230,6 +222,11 @@ def _explicit_account_id(command, task):
     standing default. Both are optional/nullable; None means "no explicit
     choice", which is a real, different state from an invalid one and must
     fall through to automatic selection, not be rejected."""
+    # `account_id` can be a dispatch-time provisional scoring representative.
+    # A Command carrying requested_account_id=None must therefore continue to
+    # R2 automatic selection even when its provisional account is populated.
+    if "requested_account_id" in command:
+        return command.get("requested_account_id")
     return command.get("account_id") or task.get("account_id")
 
 

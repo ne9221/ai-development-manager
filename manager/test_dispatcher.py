@@ -165,6 +165,14 @@ class DispatcherTests(unittest.TestCase):
         with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
             self.dispatch_case(request(title="Stale account A", preferred_provider="claude", account_id="claude-a"), doc)
 
+    def test_automatic_claude_uses_provider_eligibility_without_pinning_an_account(self):
+        doc = two_claude_accounts(a_confidence="official", a_remaining=70, a_updated="2020-01-01T00:00:00Z", b_confidence="official", b_remaining=40, b_updated=datetime.now(timezone.utc).isoformat())
+        next(item for item in doc["providers"] if item["provider"] == "codex")["last_updated"] = "2020-01-01T00:00:00Z"
+        result = self.dispatch_case(request(title="Fresh Claude sibling", preferred_provider="claude", task_type="architecture"), doc)
+        self.assertEqual("claude", result["provider"])
+        self.assertEqual("claude-b", result["account_id"])
+        self.assertEqual(["claude-b"], result["provider_availability"]["eligible_account_ids"])
+
     def test_account_id_unknown_defers_to_auth_preflight(self):
         """An explicit account_id with no captured per-account quota data must
         not fail closed at dispatch() -- dispatch() has no way to know whether
