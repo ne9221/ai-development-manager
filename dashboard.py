@@ -547,13 +547,27 @@ _watcher_task_raw = query_scheduled_task_verbose_raw(WATCHER_TASK_NAME)
 _watcher_script_path = parse_task_to_run_path(_watcher_task_raw)
 _watcher_repo_path = discover_repository_root_from_script_path(_watcher_script_path)
 _watcher_branch, _watcher_running_sha = query_git_head_raw(_watcher_repo_path)
+_watcher_task_health = parse_scheduled_task_health(WATCHER_TASK_NAME, query_scheduled_task_raw(WATCHER_TASK_NAME))
+_watcher_running = _watcher_task_health.found and _watcher_task_health.detail.lower().startswith("running")
+
+_provenance_task = _provenance_command = _provenance_execution = None
+for _task in all_tasks:
+    _command = _dispatch_commands_by_task.get((_task.get("project_id"), _task.get("task_id")))
+    _execution = _dispatch_executions_by_id.get(_command.get("execution_id")) if _command else None
+    if _command and _execution and _command.get("status") == "running" and _execution.get("status") == "running":
+        _provenance_task, _provenance_command, _provenance_execution = _task, _command, _execution
+        break
 
 # Production Provenance Contract evidence: only trusted for tested_sha/
 # activated_sha when its own repository_path AND running_sha agree with
 # what we just independently observed above via real git introspection --
 # a stale or mismatched evidence file is never silently trusted.
 _evidence_doc = validate_provenance_evidence_document(read_provenance_evidence_file())
-_evidence = reconcile_watcher_provenance_evidence(_watcher_repo_path, _watcher_running_sha, _evidence_doc)
+_evidence = reconcile_watcher_provenance_evidence(
+    _watcher_repo_path, _watcher_running_sha, _evidence_doc, now=now,
+    watcher_running=_watcher_running, active_task=_provenance_task,
+    active_command=_provenance_command, active_execution=_provenance_execution,
+)
 
 provenance_vm = build_provenance_vm(
     _dashboard_repo_path, _dashboard_branch, _dashboard_sha,

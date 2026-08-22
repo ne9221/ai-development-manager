@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from manager.quota_forecast import (
@@ -20,6 +20,9 @@ from manager.quota_forecast import (
 
 # Terminal execution statuses in ADM
 TERMINAL_EXECUTION_STATUSES = {"completed", "failed", "interrupted", "cancelled"}
+NORMAL_MAX_AGE_SECONDS = 300
+EXTENDED_RUNNING_MAX_AGE_SECONDS = 7800
+FUTURE_CLOCK_SKEW_SECONDS = 15
 
 
 @dataclass
@@ -1061,13 +1064,36 @@ def validate_provenance_evidence_document(doc: Any) -> Optional[Dict[str, str]]:
         value = doc.get(key)
         if not isinstance(value, str) or not value.strip():
             return None
+    if parse_time(doc["captured_at"]) is None:
+        return None
     return {key: doc[key] for key in _PROVENANCE_EVIDENCE_REQUIRED_FIELDS}
+
+
+def _has_extended_running_proof(
+    watcher_running: bool, active_task: Optional[Dict[str, Any]],
+    active_command: Optional[Dict[str, Any]], active_execution: Optional[Dict[str, Any]],
+) -> bool:
+    return bool(
+        watcher_running and isinstance(active_task, dict) and isinstance(active_command, dict)
+        and isinstance(active_execution, dict) and active_execution.get("status") == "running"
+        and isinstance(active_execution.get("provider_session_id"), str)
+        and active_execution["provider_session_id"].strip()
+        and active_command.get("status") == "running"
+        and active_command.get("execution_id") == active_execution.get("execution_id")
+        and active_task.get("project_id") == active_command.get("project_id") == active_execution.get("project_id")
+        and active_task.get("task_id") == active_command.get("task_id") == active_execution.get("task_id")
+    )
 
 
 def reconcile_watcher_provenance_evidence(
     independently_observed_repository_path: Optional[str],
     independently_observed_running_sha: Optional[str],
     evidence_document: Optional[Dict[str, str]],
+    now: Optional[datetime] = None,
+    watcher_running: bool = False,
+    active_task: Optional[Dict[str, Any]] = None,
+    active_command: Optional[Dict[str, Any]] = None,
+    active_execution: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Optional[str]]:
     """Only trust a persisted evidence document's tested_sha/activated_sha
     when its own repository_path AND running_sha agree with what this
@@ -1075,6 +1101,7 @@ def reconcile_watcher_provenance_evidence(
     Watcher's actual on-disk checkout -- a stale or mismatched evidence
     file must never silently override live ground truth. Always returns
     UNKNOWN-safe fallbacks (None) rather than guessing."""
+    now = now or datetime.now(timezone.utc)
     if evidence_document is None:
         return {"tested_sha": None, "activated_sha": None, "captured_at": None,
                 "note": "no persisted Production Provenance Contract evidence file found"}
@@ -1084,6 +1111,17 @@ def reconcile_watcher_provenance_evidence(
     if evidence_document["running_sha"] != independently_observed_running_sha:
         return {"tested_sha": None, "activated_sha": None, "captured_at": None,
                 "note": "evidence file running_sha does not match the live Watcher HEAD -- ignored (stale evidence)"}
+    captured_at = parse_time(evidence_document["captured_at"])
+    if captured_at is None or captured_at > now + timedelta(seconds=FUTURE_CLOCK_SKEW_SECONDS):
+        return {"tested_sha": None, "activated_sha": None, "captured_at": None,
+                "note": "evidence file captured_at is invalid or too far in the future -- ignored"}
+    age = (now - captured_at).total_seconds()
+    if age > NORMAL_MAX_AGE_SECONDS and not (
+        age <= EXTENDED_RUNNING_MAX_AGE_SECONDS and
+        _has_extended_running_proof(watcher_running, active_task, active_command, active_execution)
+    ):
+        return {"tested_sha": None, "activated_sha": None, "captured_at": None,
+                "note": "evidence file freshness is not proven by a live linked provider session -- ignored"}
     return {
         "tested_sha": evidence_document["tested_sha"],
         "activated_sha": evidence_document["activated_sha"],

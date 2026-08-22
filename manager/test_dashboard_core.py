@@ -990,13 +990,32 @@ class ProvenanceEvidenceFileReconciliationTests(unittest.TestCase):
     tested_sha/activated_sha when it agrees with what the Dashboard
     independently observed via real git introspection -- never blindly."""
 
+    def setUp(self):
+        self.now = datetime(2026, 8, 22, 6, 0, tzinfo=timezone.utc)
+
     def _doc(self, **overrides):
         base = {
             "running_sha": "6d41645", "tested_sha": "6d41645", "activated_sha": "6d41645",
-            "repository_path": "C:\\watcher-repo", "branch": "integration/x", "captured_at": "2026-08-21T18:39:03Z",
+            "repository_path": "C:\\watcher-repo", "branch": "integration/x", "captured_at": self.now.isoformat(),
         }
         base.update(overrides)
         return base
+
+    @staticmethod
+    def _active(session_id="provider-session"):
+        return (
+            {"project_id": "p1", "task_id": "t1"},
+            {"project_id": "p1", "task_id": "t1", "status": "running", "execution_id": "e1"},
+            {"project_id": "p1", "task_id": "t1", "status": "running", "execution_id": "e1", "provider_session_id": session_id},
+        )
+
+    def _reconcile(self, age=0, watcher_running=False, active=None, **doc_changes):
+        doc = self._doc(captured_at=(self.now - timedelta(seconds=age)).isoformat(), **doc_changes)
+        task, command, execution = active or (None, None, None)
+        return reconcile_watcher_provenance_evidence(
+            "C:\\watcher-repo", "6d41645", validate_provenance_evidence_document(doc), now=self.now,
+            watcher_running=watcher_running, active_task=task, active_command=command, active_execution=execution,
+        )
 
     def test_valid_document_normalizes_cleanly(self):
         normalized = validate_provenance_evidence_document(self._doc())
@@ -1016,7 +1035,7 @@ class ProvenanceEvidenceFileReconciliationTests(unittest.TestCase):
 
     def test_matching_repository_and_sha_is_trusted(self):
         doc = validate_provenance_evidence_document(self._doc())
-        result = reconcile_watcher_provenance_evidence("C:\\watcher-repo", "6d41645", doc)
+        result = reconcile_watcher_provenance_evidence("C:\\watcher-repo", "6d41645", doc, now=self.now)
         self.assertEqual(result["tested_sha"], "6d41645")
         self.assertEqual(result["activated_sha"], "6d41645")
         self.assertIn("matches", result["note"])
@@ -1039,6 +1058,35 @@ class ProvenanceEvidenceFileReconciliationTests(unittest.TestCase):
         result = reconcile_watcher_provenance_evidence("C:\\watcher-repo", "new-sha", doc)
         self.assertIsNone(result["tested_sha"])
         self.assertIn("stale", result["note"])
+
+    def test_normal_freshness_and_boundary_are_trusted(self):
+        for age in (0, 300):
+            with self.subTest(age=age):
+                self.assertEqual("6d41645", self._reconcile(age=age)["tested_sha"])
+
+    def test_stale_future_and_invalid_captured_at_are_untrusted(self):
+        self.assertIsNone(self._reconcile(age=301)["tested_sha"])
+        future = self._doc(captured_at=(self.now + timedelta(seconds=16)).isoformat())
+        self.assertIsNone(reconcile_watcher_provenance_evidence("C:\\watcher-repo", "6d41645", validate_provenance_evidence_document(future), now=self.now)["tested_sha"])
+        self.assertIsNone(validate_provenance_evidence_document(self._doc(captured_at="not-a-time")))
+        self.assertIsNone(validate_provenance_evidence_document(self._doc(captured_at="")))
+
+    def test_extended_running_grace_requires_all_live_linkage_evidence(self):
+        active = self._active()
+        self.assertEqual("6d41645", self._reconcile(age=1800, watcher_running=True, active=active)["tested_sha"])
+        self.assertIsNone(self._reconcile(age=1800, watcher_running=True)["tested_sha"])
+        self.assertIsNone(self._reconcile(age=1800, watcher_running=True, active=self._active(session_id=""))["tested_sha"])
+        self.assertIsNone(self._reconcile(age=1800, watcher_running=False, active=active)["tested_sha"])
+        task, command, execution = active
+        execution["task_id"] = "other"
+        self.assertIsNone(self._reconcile(age=1800, watcher_running=True, active=(task, command, execution))["tested_sha"])
+
+    def test_extended_running_hard_cap_and_boundaries(self):
+        active = self._active()
+        self.assertEqual("6d41645", self._reconcile(age=7800, watcher_running=True, active=active)["tested_sha"])
+        self.assertIsNone(self._reconcile(age=7801, watcher_running=True, active=active)["tested_sha"])
+        future = self._doc(captured_at=(self.now + timedelta(seconds=15)).isoformat())
+        self.assertEqual("6d41645", reconcile_watcher_provenance_evidence("C:\\watcher-repo", "6d41645", validate_provenance_evidence_document(future), now=self.now)["tested_sha"])
 
 
 if __name__ == "__main__":
