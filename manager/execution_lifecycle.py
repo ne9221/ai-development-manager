@@ -342,7 +342,7 @@ def _retain_terminal_authority(store, execution, status, persisted, error):
     return audit
 
 
-def terminalize_execution(store, service, writer_registry, claim_registry, project_id, task_id, execution_id, provider, status, claim_generation, provider_stopped, lease_token=None, completed_at=None, summary=None):
+def terminalize_execution(store, service, writer_registry, claim_registry, project_id, task_id, execution_id, provider, status, claim_generation, provider_stopped, lease_token=None, completed_at=None, summary=None, repo_write_completion_evidence=None):
     if status not in ("completed", "failed", "interrupted"):
         raise TaskError(f"invalid terminal execution status: {status}")
     if provider_stopped is not True:
@@ -406,6 +406,8 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
     }
     terminal = store.get("executions", project_id, execution_id)
     terminal["cleanup_evidence"] = pre_cleanup
+    if repo_write_completion_evidence is not None:
+        terminal["repo_write_completion_evidence"] = repo_write_completion_evidence
     try:
         validate("execution", terminal)
         store.put("executions", project_id, execution_id, terminal)

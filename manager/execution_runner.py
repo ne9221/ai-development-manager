@@ -7,6 +7,7 @@ backward compatibility); main()'s CLI entry point remains Codex-only.
 import argparse
 import json
 import os
+import shlex
 import socket
 import sys
 import uuid
@@ -22,6 +23,7 @@ from manager.executions import MAX_HARD_TIMEOUT_SECONDS, heartbeat_execution, ha
 from manager.gcs_lock_registry import GCSLockRegistry
 from manager.project_registry import get_global_registry
 from manager.quota_reader import read_drive_status
+from manager.repo_write_completion import complete_repo_write_execution
 from manager.repo_write_enforcement import enforce_allowed_paths, is_bounded_repo_write_snapshot
 from manager.session_identity import manager_session_key
 from manager.task_claims import task_claim_registry
@@ -33,6 +35,22 @@ from manager.worktree_materializer import materialize_worktree
 
 RPC_TIMEOUT_SECONDS = 30.0
 MAX_TURN_TIMEOUT_SECONDS = float(MAX_HARD_TIMEOUT_SECONDS)
+# Global Hands-off Execution Layer, Slice D2: the project-specified tests
+# gate a bounded repo-write execution must pass before its real changes are
+# staged/committed/pushed. ADM_REPO_WRITE_TESTS_COMMAND (shell-split, same
+# override convention as ADM_WORKTREE_WORKSPACE_ROOT above) lets a project
+# override this default without any code change; the default matches this
+# repo's own actual test invocation.
+DEFAULT_REPO_WRITE_TESTS_COMMAND = ("python", "-m", "pytest", "-q")
+
+
+def _repo_write_tests_command():
+    override = os.environ.get("ADM_REPO_WRITE_TESTS_COMMAND")
+    if override:
+        parts = shlex.split(override)
+        if parts:
+            return parts
+    return list(DEFAULT_REPO_WRITE_TESTS_COMMAND)
 
 
 def task_turn_timeout(expected_minutes, override=None):
@@ -418,10 +436,26 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
     # before terminalize_execution() ever persists "completed", so a
     # violation can never reach a successful completion or any future
     # commit/push step gated on that status.
+    # Global Hands-off Execution Layer, Slice D2: once Slice D has proven the
+    # provider's real changes stayed within its admitted allowed_paths, a
+    # bounded repo-write execution still isn't durably "done" -- nothing yet
+    # ran the project's tests gate, committed, or pushed those changes. This
+    # runs the full terminal-completion sequence (tests -> exact stage ->
+    # deterministic commit -> push the execution's own isolated task branch
+    # -> remote SHA readback) against real git/subprocess state; any failure
+    # downgrades status before terminalize_execution() ever persists
+    # "completed", exactly like Slice D's own scope check above it.
     snapshot = execution["task_snapshot"]
+    repo_write_completion_evidence = None
     if status == "completed" and is_bounded_repo_write_snapshot(snapshot):
         try:
-            enforce_allowed_paths(snapshot["working_directory"], snapshot["baseline_head"], snapshot["allowed_paths"])
+            changed_paths = enforce_allowed_paths(snapshot["working_directory"], snapshot["baseline_head"], snapshot["allowed_paths"])
+            repo_write_completion_evidence = complete_repo_write_execution(
+                working_directory=snapshot["working_directory"], changed_paths=changed_paths,
+                baseline_head=snapshot["baseline_head"], branch=execution["lease_evidence"]["branch"],
+                repository=execution["lease_evidence"]["repository"], tests_command=_repo_write_tests_command(),
+                task_id=task_id, execution_id=execution_id,
+            )
         except TaskError as exc:
             status = "failed"
             summary = f"{provider} turn rejected: {exc}"
@@ -430,6 +464,7 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
         store, service, writer_registry, claim_registry, project_id, task_id, execution_id, provider,
         status, gate["task_claim"]["generation"], provider_stopped, lease_token=lease_token,
         completed_at=outcome.completed_at if outcome else None, summary=summary,
+        repo_write_completion_evidence=repo_write_completion_evidence,
     )
     if session is not None:
         session = _terminalize_session(store, session, terminal)

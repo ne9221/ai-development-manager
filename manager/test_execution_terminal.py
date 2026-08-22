@@ -233,6 +233,20 @@ class TerminalLifecycleTests(unittest.TestCase):
         self.assertNotIn(gate["lease"]["lease_token"], repr(store.records))
         self.assertNotIn(gate["lease"]["lease_token"], repr(result))
 
+    def test_repo_write_completion_evidence_is_persisted_when_supplied(self):
+        evidence = {
+            "changed_paths": ["manager/foo.py"], "tests": {"passed": True}, "commit_sha": "c" * 40,
+            "commit_created": True, "remote_sha": "c" * 40, "branch": "refs/heads/feat/p1/t1",
+            "repository": "github:example/project", "baseline_head": "a" * 40,
+        }
+        store, _, _, _, result = self.terminal("completed", repo_write_completion_evidence=evidence)
+        self.assertEqual(evidence, result["execution"]["repo_write_completion_evidence"])
+        self.assertEqual(evidence, store.get("executions", "p1", "exec-a")["repo_write_completion_evidence"])
+
+    def test_repo_write_completion_evidence_absent_by_default(self):
+        _, _, _, _, result = self.terminal("completed")
+        self.assertIsNone(result["execution"].get("repo_write_completion_evidence"))
+
 
 if __name__ == "__main__":
     unittest.main()
