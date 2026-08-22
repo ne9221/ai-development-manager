@@ -27,14 +27,14 @@ VALID_SHA_B = "b" * 40
 
 
 def registry_entry(project_id="proj-a", owner="acme", name="repo-a", default_branch="main",
-                    pinned_ref=None, status="enabled", **overrides):
+                    pinned_ref=None, strategy="origin_default", status="enabled", **overrides):
     entry = {
         "project_id": project_id,
         "display_name": project_id,
         "aliases": [f"{project_id}-alias"],
         "repo": {"canonical_url": f"https://github.com/{owner}/{name}.git", "owner": owner, "name": name},
         "default_branch": default_branch,
-        "baseline_resolution_policy": {"strategy": "origin_default", "pinned_ref": pinned_ref},
+        "baseline_resolution_policy": {"strategy": strategy, "pinned_ref": pinned_ref},
         "common_governance": {"reference": "governance-rules.json", "version": "1.0.0"},
         "project_rules": {"reference": "PROJECT-RULES.md"},
         "status": status,
@@ -109,8 +109,8 @@ class CorrectResolutionTests(unittest.TestCase):
         self.assertEqual("develop", result["canonical_branch"])
         self.assertEqual([("acme", "repo-a", "develop", None)], fetch.calls)
 
-    def test_pinned_ref_overrides_default_branch(self):
-        registry = ProjectRegistry(projects=[registry_entry(default_branch="main", pinned_ref="release/2.0")])
+    def test_pinned_commit_strategy_overrides_default_branch(self):
+        registry = ProjectRegistry(projects=[registry_entry(default_branch="main", strategy="pinned_commit", pinned_ref="release/2.0")])
         fetch = fake_fetch(shas={("acme", "repo-a", "release/2.0"): VALID_SHA_A})
         result = resolve_remote_baseline("proj-a", registry=registry, github_fetch=fetch)
         self.assertEqual("release/2.0", result["canonical_branch"])
@@ -367,6 +367,91 @@ class DefaultGithubFetchTests(unittest.TestCase):
             self.assertEqual("remote_api_unavailable", ctx.exception.code)
         finally:
             mod.requests = original
+
+
+class BaselineStrategyContractTests(unittest.TestCase):
+    """R5: schema/project_registry.schema.json's baseline_resolution_policy
+    strategy enum is exactly ["origin_default", "pinned_commit",
+    "latest_release", "custom"] -- pinned_ref is a sibling FIELD, never a
+    strategy value. The resolver must dispatch strictly on the declared
+    strategy, never on whether pinned_ref happens to be set."""
+
+    def test_origin_default_is_supported(self):
+        registry = ProjectRegistry(projects=[registry_entry(strategy="origin_default", default_branch="main")])
+        fetch = fake_fetch(shas={("acme", "repo-a", "main"): VALID_SHA_A})
+        result = resolve_remote_baseline("proj-a", registry=registry, github_fetch=fetch)
+        self.assertEqual("main", result["canonical_branch"])
+        self.assertEqual(VALID_SHA_A, result["baseline_sha"])
+
+    def test_pinned_commit_with_pinned_ref_is_supported(self):
+        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_commit", pinned_ref="release/2.0")])
+        fetch = fake_fetch(shas={("acme", "repo-a", "release/2.0"): VALID_SHA_A})
+        result = resolve_remote_baseline("proj-a", registry=registry, github_fetch=fetch)
+        self.assertEqual("release/2.0", result["canonical_branch"])
+        self.assertEqual(VALID_SHA_A, result["baseline_sha"])
+
+    def test_strategy_named_pinned_ref_is_rejected(self):
+        """'pinned_ref' is a FIELD, not a strategy -- a registry entry that
+        (incorrectly) declares it as the strategy value must fail closed,
+        never be treated as an alias for pinned_commit."""
+        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_ref", pinned_ref="release/2.0")])
+        with self.assertRaises(RemoteBaselineResolutionError) as ctx:
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fake_fetch())
+        self.assertEqual("unsupported_baseline_strategy", ctx.exception.code)
+
+    def test_pinned_commit_without_pinned_ref_is_rejected(self):
+        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_commit", pinned_ref=None)])
+        with self.assertRaises(RemoteBaselineResolutionError) as ctx:
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fake_fetch())
+        self.assertEqual("pinned_ref_missing", ctx.exception.code)
+
+    def test_pinned_commit_with_empty_string_pinned_ref_is_rejected(self):
+        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_commit", pinned_ref="   ")])
+        with self.assertRaises(RemoteBaselineResolutionError) as ctx:
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fake_fetch())
+        self.assertEqual("pinned_ref_missing", ctx.exception.code)
+
+    def test_origin_default_with_contradictory_pinned_ref_is_rejected(self):
+        """A registry entry declaring strategy=origin_default but also
+        setting a non-empty pinned_ref is self-contradictory -- must fail
+        closed rather than silently picking one field over the other (the
+        real prior bug: pinned_ref was used whenever set, regardless of
+        the declared strategy)."""
+        registry = ProjectRegistry(projects=[registry_entry(strategy="origin_default", pinned_ref="release/2.0")])
+        with self.assertRaises(RemoteBaselineResolutionError) as ctx:
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fake_fetch())
+        self.assertEqual("baseline_policy_contradiction", ctx.exception.code)
+
+    def test_latest_release_strategy_is_unsupported(self):
+        registry = ProjectRegistry(projects=[registry_entry(strategy="latest_release")])
+        with self.assertRaises(RemoteBaselineResolutionError) as ctx:
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fake_fetch())
+        self.assertEqual("unsupported_baseline_strategy", ctx.exception.code)
+
+    def test_custom_strategy_is_unsupported(self):
+        registry = ProjectRegistry(projects=[registry_entry(strategy="custom")])
+        with self.assertRaises(RemoteBaselineResolutionError) as ctx:
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fake_fetch())
+        self.assertEqual("unsupported_baseline_strategy", ctx.exception.code)
+
+    def test_missing_strategy_is_unsupported(self):
+        registry = ProjectRegistry(projects=[registry_entry()])
+        registry.get_raw_entry("proj-a")  # sanity: entry exists
+        # Directly construct a policy with no 'strategy' key at all via a
+        # fresh registry entry override.
+        entry = registry_entry()
+        entry["baseline_resolution_policy"] = {"pinned_ref": None}
+        registry2 = ProjectRegistry(projects=[entry])
+        with self.assertRaises(RemoteBaselineResolutionError) as ctx:
+            resolve_remote_baseline("proj-a", registry=registry2, github_fetch=fake_fetch())
+        self.assertEqual("unsupported_baseline_strategy", ctx.exception.code)
+
+    def test_unsupported_strategy_never_calls_github_fetch(self):
+        registry = ProjectRegistry(projects=[registry_entry(strategy="latest_release")])
+        fetch = fake_fetch()
+        with self.assertRaises(RemoteBaselineResolutionError):
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fetch)
+        self.assertEqual([], fetch.calls)
 
 
 if __name__ == "__main__":

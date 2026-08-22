@@ -54,6 +54,15 @@ GITHUB_API_BASE = "https://api.github.com"
 GITHUB_API_TIMEOUT_SECONDS = 15
 REMOTE_BASELINE_SOURCE = "github_remote_api"
 
+# schema/project_registry.schema.json's baseline_resolution_policy.strategy
+# enum is ["origin_default", "pinned_commit", "latest_release", "custom"].
+# Only the first two are actually implemented below; "pinned_ref" is a
+# sibling FIELD on the policy object, never a strategy value itself, and
+# must never be accepted as one.
+STRATEGY_ORIGIN_DEFAULT = "origin_default"
+STRATEGY_PINNED_COMMIT = "pinned_commit"
+SUPPORTED_BASELINE_STRATEGIES = frozenset({STRATEGY_ORIGIN_DEFAULT, STRATEGY_PINNED_COMMIT})
+
 # Server-side-only credential for reading private registered repos. Never
 # caller-suppliable: read from the process environment (already this
 # codebase's established convention -- see e.g. CLAUDE_ACCOUNTS_CONFIG,
@@ -150,8 +159,31 @@ def resolve_remote_baseline(
         )
 
     policy = project.baseline_resolution_policy if isinstance(project.baseline_resolution_policy, dict) else {}
+    strategy = policy.get("strategy")
     pinned_ref = policy.get("pinned_ref")
-    branch = pinned_ref if pinned_ref else project.default_branch
+
+    if strategy == STRATEGY_ORIGIN_DEFAULT:
+        if pinned_ref:
+            raise RemoteBaselineResolutionError(
+                "baseline_policy_contradiction",
+                f"project {project.project_id!r} declares strategy 'origin_default' but also sets a non-empty "
+                f"pinned_ref {pinned_ref!r}; refusing to guess which one is authoritative",
+            )
+        branch = project.default_branch
+    elif strategy == STRATEGY_PINNED_COMMIT:
+        if not isinstance(pinned_ref, str) or not pinned_ref.strip():
+            raise RemoteBaselineResolutionError(
+                "pinned_ref_missing",
+                f"project {project.project_id!r} declares strategy 'pinned_commit' but has no non-empty pinned_ref",
+            )
+        branch = pinned_ref
+    else:
+        raise RemoteBaselineResolutionError(
+            "unsupported_baseline_strategy",
+            f"project {project.project_id!r} declares baseline_resolution_policy.strategy {strategy!r}, which is "
+            f"not implemented (supported: {sorted(SUPPORTED_BASELINE_STRATEGIES)}); refusing to silently "
+            "reinterpret it as origin_default",
+        )
     if not isinstance(branch, str) or not branch.strip():
         raise RemoteBaselineResolutionError(
             "registry_branch_missing", f"project {project.project_id!r} has no resolvable canonical branch")

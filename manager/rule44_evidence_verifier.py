@@ -141,6 +141,38 @@ found by independent review of R3):
     unset -- the resolution call is skipped entirely and recorded as "not
     performed" with the reason, which evaluate() reports as UNKNOWN.
 
+R5 fixes (two final issues found after R4):
+
+11. SUPPORTED_BASELINE_STRATEGIES was wrong: schema/project_registry.
+    schema.json's baseline_resolution_policy.strategy enum is exactly
+    ["origin_default", "pinned_commit", "latest_release", "custom"] --
+    "pinned_ref" is a sibling FIELD on that policy object, never a
+    strategy value, and R4 had mistakenly accepted it as one. Fixed here,
+    and manager.remote_baseline_resolver.resolve_remote_baseline() itself
+    was hardened to dispatch strictly on the declared strategy (previously
+    it ignored "strategy" entirely and just used pinned_ref whenever set):
+    origin_default requires pinned_ref to be empty and resolves
+    default_branch; pinned_commit requires a non-empty pinned_ref and
+    resolves it directly; any other strategy (including a contradictory
+    origin_default+pinned_ref combination) fails closed with a dedicated
+    error code, never silently reinterpreted as origin_default.
+
+12. Invariant O no longer accepts an arbitrary caller-supplied
+    canonical_checkout_before dict on faith. The new preflight evidence
+    contract (capture_preflight_snapshot(), write_preflight_snapshot(),
+    read_preflight_snapshot() -- a small dedicated read-only JSON file,
+    deliberately never written onto any Task/Command/Execution record)
+    binds the snapshot to the exact project_id/request_id/observed_at of
+    the dispatch it precedes. _evaluate_o() now requires that provenance
+    to match the dispatch under verification: missing/unbound provenance
+    is UNKNOWN; provenance present but bound to a *different*
+    project/request (stale or reused evidence) is a hard FAIL. The CLI
+    (`manager.rule44_evidence_verifier capture-preflight` /
+    `... verify --canonical-checkout-before <path>`) and
+    verify_write_e2e()'s new canonical_checkout_before_path parameter make
+    this the ordinary invocation path, not a design where every real
+    repo-write verification is forced to return O=UNKNOWN.
+
 Two layers, deliberately kept separate:
 
 - `evaluate(...)` is a pure function over an already-assembled evidence
@@ -162,6 +194,7 @@ from __future__ import annotations
 import re
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from manager.tasks import TaskError
@@ -173,12 +206,17 @@ UNKNOWN = "UNKNOWN"
 _SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
 _REPO_IDENTITY_RE = re.compile(r"github(?::|\.com[:/])(?P<owner>[a-z0-9_.-]+)/(?P<repo>[a-z0-9_.-]+?)(?:\.git)?/?$", re.IGNORECASE)
 
-# manager.remote_baseline_resolver.resolve_remote_baseline() only ever
-# implements these two strategies (it dispatches purely on whether
-# baseline_resolution_policy.pinned_ref is set, never on the strategy
-# label). Any other declared strategy must never be silently treated as
-# origin_default -- see collect_evidence()'s baseline-resolution wiring.
-SUPPORTED_BASELINE_STRATEGIES = frozenset({"origin_default", "pinned_ref"})
+# schema/project_registry.schema.json's baseline_resolution_policy.strategy
+# enum is exactly ["origin_default", "pinned_commit", "latest_release",
+# "custom"] -- "pinned_ref" is a sibling FIELD on that policy object, never
+# a strategy value, and must never be accepted as one here.
+# manager.remote_baseline_resolver.resolve_remote_baseline() only actually
+# implements "origin_default" and "pinned_commit" (R5 hardened it to
+# dispatch strictly on the declared strategy, fail closed otherwise). Any
+# other declared strategy must never be silently treated as origin_default
+# -- see collect_evidence()'s baseline-resolution wiring, which mirrors
+# this same set so the guard fires before the resolver is ever called.
+SUPPORTED_BASELINE_STRATEGIES = frozenset({"origin_default", "pinned_commit"})
 
 INVARIANT_ORDER = ("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O")
 
@@ -696,7 +734,17 @@ def _evaluate_n(evidence: Dict[str, Any]) -> InvariantResult:
     return _result("N", PASS, "exactly one execution chain and one Command own this Task's request_id")
 
 
-def _evaluate_o(evidence: Dict[str, Any]) -> InvariantResult:
+def _valid_observed_at(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
+
+
+def _evaluate_o(evidence: Dict[str, Any], expected_project_id: str, expected_request_id: str) -> InvariantResult:
     task = evidence.get("task")
     execution = evidence.get("execution")
     if task is None:
@@ -716,12 +764,28 @@ def _evaluate_o(evidence: Dict[str, Any]) -> InvariantResult:
     # never by comparing either one to Task.baseline_head. If no
     # trustworthy pre-E2E snapshot was supplied, this is UNKNOWN, never
     # PASS -- there is no way to reconstruct "before" after the fact.
+    #
+    # R5 correction: an arbitrary caller-supplied dict is no longer taken
+    # on faith. The pre-E2E snapshot must carry its own provenance --
+    # project_id, request_id, and a valid observed_at -- produced by
+    # capture_preflight_snapshot() and bound to the exact dispatch under
+    # verification. Missing/unbound provenance is UNKNOWN (cannot prove
+    # anything); provenance that is *present but wrong* (a stale snapshot
+    # from a different project or request reused here) is a hard FAIL,
+    # never silently accepted.
     before = evidence.get("canonical_checkout_before")
     after = evidence.get("canonical_checkout_after")
 
-    if not isinstance(before, dict) or not before.get("available"):
-        reason = (before or {}).get("reason") if isinstance(before, dict) else None
-        return _result("O", UNKNOWN, f"no trustworthy pre-E2E canonical-checkout snapshot is available{': ' + reason if reason else ''}; canonical-checkout integrity cannot be proven after the fact")
+    if not isinstance(before, dict) or before.get("project_id") is None or before.get("request_id") is None:
+        return _result("O", UNKNOWN, "no trustworthy pre-E2E canonical-checkout snapshot is bound to this dispatch (missing, or missing project_id/request_id provenance); canonical-checkout integrity cannot be proven after the fact")
+    if before.get("project_id") != expected_project_id or before.get("request_id") != expected_request_id:
+        return _result("O", FAIL, f"pre-E2E snapshot is bound to project_id={before.get('project_id')!r}/request_id={before.get('request_id')!r}, not this verification's project_id={expected_project_id!r}/request_id={expected_request_id!r} -- mismatched or stale evidence")
+    if not _valid_observed_at(before.get("observed_at")):
+        return _result("O", UNKNOWN, "pre-E2E snapshot has no valid observed_at timestamp; its provenance cannot be trusted")
+    if not before.get("available"):
+        reason = before.get("reason")
+        return _result("O", UNKNOWN, f"pre-E2E snapshot recorded the canonical checkout as unavailable{': ' + reason if reason else ''}; canonical-checkout integrity cannot be proven after the fact")
+
     if not isinstance(after, dict) or not after.get("available"):
         reason = (after or {}).get("reason") if isinstance(after, dict) else None
         return _result("O", UNKNOWN, f"canonical checkout could not be independently inspected after the E2E{': ' + reason if reason else ''}")
@@ -776,7 +840,7 @@ _EVALUATORS = {
     "L": lambda e, p, r, repo: _evaluate_l(e),
     "M": lambda e, p, r, repo: _evaluate_m(e),
     "N": lambda e, p, r, repo: _evaluate_n(e),
-    "O": lambda e, p, r, repo: _evaluate_o(e),
+    "O": lambda e, p, r, repo: _evaluate_o(e, p, r),
 }
 
 
@@ -891,6 +955,58 @@ def inspect_canonical_checkout(project_metadata, workspace_root: Optional[str] =
         return {"available": False, "path": path, "reason": "could not read canonical checkout git status"}
 
     return {"available": True, "path": path, "repo_identity_ok": repo_identity_ok, "head_sha": head_sha, "clean": status_output == ""}
+
+
+PREFLIGHT_SNAPSHOT_SCHEMA_VERSION = "1.0.0"
+
+
+def capture_preflight_snapshot(project_metadata, request_id: str, workspace_root: Optional[str] = None,
+                                exists_check=None, git_runner=subprocess.run) -> Dict[str, Any]:
+    """The Rule44 write-E2E preflight evidence contract (R5): a read-only
+    snapshot of the canonical/shared checkout, captured BEFORE a write-E2E
+    is dispatched, and bound to the exact fresh `request_id` that dispatch
+    is about to use.
+
+    This is the only trustworthy source for invariant O's
+    canonical_checkout_before -- an arbitrary caller-supplied dict is never
+    accepted on faith; _evaluate_o() requires this snapshot's own
+    project_id/request_id/observed_at provenance to match the dispatch
+    under verification (see that function's docstring). Reuses
+    inspect_canonical_checkout() verbatim (never duplicates its git
+    subcommands) and never mutates/resets/checks out anything.
+
+    Callers running a real Rule44 write-E2E acceptance must call this
+    immediately before dispatching, then persist the result (see
+    write_preflight_snapshot()/read_preflight_snapshot() below -- a small
+    dedicated read-only evidence file, never Task/Command truth) so it
+    survives until the post-hoc verifier runs.
+    """
+    inspection = inspect_canonical_checkout(project_metadata, workspace_root=workspace_root, exists_check=exists_check, git_runner=git_runner)
+    return {
+        "schema_version": PREFLIGHT_SNAPSHOT_SCHEMA_VERSION,
+        "project_id": project_metadata.project_id,
+        "request_id": request_id,
+        "observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        **inspection,
+    }
+
+
+def write_preflight_snapshot(snapshot: Dict[str, Any], path) -> None:
+    """Persist a capture_preflight_snapshot() result to a small, dedicated,
+    read-only acceptance-evidence file -- deliberately never written onto
+    any Task/Command/Execution record, so Rule44's own preflight provenance
+    can never be confused with (or overload) ADM's actual dispatch truth."""
+    import json as _json
+    from pathlib import Path as _Path
+    _Path(path).write_text(_json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
+
+
+def read_preflight_snapshot(path) -> Dict[str, Any]:
+    """Read back a snapshot written by write_preflight_snapshot(). Read-only;
+    raises if the file is missing or unparseable rather than guessing."""
+    import json as _json
+    from pathlib import Path as _Path
+    return _json.loads(_Path(path).read_text(encoding="utf-8"))
 
 
 def check_repo_file_exists(owner: str, name: str, path: str, ref: str, token: Optional[str] = None, http_get=None) -> Optional[bool]:
@@ -1144,15 +1260,24 @@ def verify_write_e2e(store, project_id: str, request_id: str, expected_repo: Opt
                       final_commit_sha: Optional[str] = None, test_evidence: Optional[Dict[str, Any]] = None,
                       bucket: Optional[str] = None, git_runner=subprocess.run, workspace_root: Optional[str] = None,
                       github_token: Optional[str] = None,
-                      canonical_checkout_before: Optional[Dict[str, Any]] = None) -> VerifierReport:
+                      canonical_checkout_before: Optional[Dict[str, Any]] = None,
+                      canonical_checkout_before_path=None) -> VerifierReport:
     """Top-level convenience: collect real evidence for one finished
     dispatch and evaluate the full Rule44 write-E2E contract against it.
 
-    `canonical_checkout_before` must be a snapshot captured (via
-    inspect_canonical_checkout()) BEFORE the E2E was dispatched -- see
-    collect_evidence()'s own docstring. Omitting it makes invariant O
-    UNKNOWN, never PASS.
+    `canonical_checkout_before` must be a snapshot produced by
+    capture_preflight_snapshot() BEFORE the E2E was dispatched -- see
+    collect_evidence()'s own docstring. `canonical_checkout_before_path` is
+    the usual real-invocation path: the file write_preflight_snapshot()
+    wrote at capture time, read back here via read_preflight_snapshot()
+    (mutually exclusive with passing the dict directly; the path wins if
+    both are given). Omitting both makes invariant O UNKNOWN, never PASS --
+    but a real repo-write acceptance run is never forced into that shape:
+    it only has to call capture_preflight_snapshot() once before
+    dispatching and pass the result (or its persisted path) here.
     """
+    if canonical_checkout_before_path is not None:
+        canonical_checkout_before = read_preflight_snapshot(canonical_checkout_before_path)
     evidence = collect_evidence(store, project_id, request_id, bucket=bucket,
                                  final_commit_sha=final_commit_sha, expected_repo=expected_repo,
                                  git_runner=git_runner, workspace_root=workspace_root, github_token=github_token,
@@ -1162,26 +1287,61 @@ def verify_write_e2e(store, project_id: str, request_id: str, expected_repo: Opt
     return evaluate(evidence, expected_project_id=project_id, expected_request_id=request_id, expected_repo=expected_repo)
 
 
-def main():
-    import argparse
-    import json as _json
+def _capture_preflight_command(args) -> int:
+    from manager.project_registry import get_global_registry
 
-    parser = argparse.ArgumentParser(description="Read-only Rule44 write-E2E evidence verifier")
-    parser.add_argument("--project-id", required=True)
-    parser.add_argument("--request-id", required=True)
-    parser.add_argument("--expected-repo", default=None)
-    parser.add_argument("--final-commit-sha", default=None)
-    parser.add_argument("--bucket", default=None)
-    args = parser.parse_args()
+    project_metadata = get_global_registry().get_project(args.project_id, allow_disabled=True)
+    snapshot = capture_preflight_snapshot(project_metadata, args.request_id, workspace_root=args.workspace_root)
+    write_preflight_snapshot(snapshot, args.out)
+    print(f"wrote preflight snapshot to {args.out}: {snapshot}")
+    return 0
+
+
+def _verify_command(args) -> int:
+    import json as _json
 
     from collectors.publish_drive import build_service
     from manager.tasks import DriveRecords
 
     store = DriveRecords(build_service())
-    report = verify_write_e2e(store, args.project_id, args.request_id, expected_repo=args.expected_repo,
-                               final_commit_sha=args.final_commit_sha, bucket=args.bucket)
+    report = verify_write_e2e(
+        store, args.project_id, args.request_id, expected_repo=args.expected_repo,
+        final_commit_sha=args.final_commit_sha, bucket=args.bucket,
+        workspace_root=args.workspace_root, canonical_checkout_before_path=args.canonical_checkout_before,
+    )
     print(_json.dumps(report.as_dict(), indent=2))
     return 0 if report.overall == PASS else 1
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Read-only Rule44 write-E2E evidence verifier")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    capture = subparsers.add_parser(
+        "capture-preflight",
+        help="Capture a read-only canonical-checkout snapshot BEFORE dispatching a write-E2E, bound to its fresh request_id",
+    )
+    capture.add_argument("--project-id", required=True)
+    capture.add_argument("--request-id", required=True)
+    capture.add_argument("--workspace-root", default=None)
+    capture.add_argument("--out", required=True, help="Path to write the preflight snapshot JSON to")
+    capture.set_defaults(func=_capture_preflight_command)
+
+    verify = subparsers.add_parser("verify", help="Verify a finished dispatch against the full Rule44 write-E2E contract")
+    verify.add_argument("--project-id", required=True)
+    verify.add_argument("--request-id", required=True)
+    verify.add_argument("--expected-repo", default=None)
+    verify.add_argument("--final-commit-sha", default=None)
+    verify.add_argument("--bucket", default=None)
+    verify.add_argument("--workspace-root", default=None)
+    verify.add_argument("--canonical-checkout-before", default=None,
+                         help="Path to the preflight snapshot written by 'capture-preflight' -- without this, invariant O is UNKNOWN")
+    verify.set_defaults(func=_verify_command)
+
+    args = parser.parse_args()
+    return args.func(args)
 
 
 if __name__ == "__main__":

@@ -138,7 +138,12 @@ def complete_evidence():
         # happened to admit as its own baseline. Only the fact that the
         # canonical checkout's HEAD did not change DURING the E2E (before
         # == after) matters for invariant O.
+        # Bound to this exact (project_id, request_id) dispatch, as
+        # capture_preflight_snapshot() would produce -- an unbound or
+        # mismatched snapshot is never accepted (see PreflightSnapshotTest).
         "canonical_checkout_before": {
+            "schema_version": "1.0.0", "project_id": PROJECT_ID, "request_id": REQUEST_ID,
+            "observed_at": "2026-08-23T00:00:00Z",
             "available": True, "path": "C:/canonical/demo-project",
             "repo_identity_ok": True, "head_sha": CANONICAL_HEAD, "clean": True,
         },
@@ -480,6 +485,230 @@ class CanonicalCheckoutIntegrityTest(unittest.TestCase):
         evidence = complete_evidence()
         report = evaluate(evidence)
         self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.PASS)
+
+
+class PreflightSnapshotProvenanceTest(unittest.TestCase):
+    """R5 correction 2: an arbitrary caller-supplied canonical_checkout_before
+    dict is never accepted on faith -- it must carry provenance (project_id,
+    request_id, a valid observed_at) binding it to the exact dispatch under
+    verification. Missing/unbound => UNKNOWN; present but wrong => FAIL."""
+
+    def test_missing_project_id_provenance_is_unknown(self):
+        evidence = complete_evidence()
+        del evidence["canonical_checkout_before"]["project_id"]
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_missing_request_id_provenance_is_unknown(self):
+        evidence = complete_evidence()
+        del evidence["canonical_checkout_before"]["request_id"]
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_mismatched_project_id_fails(self):
+        evidence = complete_evidence()
+        evidence["canonical_checkout_before"]["project_id"] = "some-other-project"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_mismatched_request_id_fails(self):
+        """A stale snapshot reused from an earlier/different dispatch must
+        be rejected, not silently accepted just because it happens to be
+        shaped correctly."""
+        evidence = complete_evidence()
+        evidence["canonical_checkout_before"]["request_id"] = "req-some-other-dispatch"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_invalid_observed_at_is_unknown(self):
+        evidence = complete_evidence()
+        evidence["canonical_checkout_before"]["observed_at"] = "not-a-timestamp"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_missing_observed_at_is_unknown(self):
+        evidence = complete_evidence()
+        del evidence["canonical_checkout_before"]["observed_at"]
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_matching_provenance_and_valid_observed_at_passes(self):
+        evidence = complete_evidence()
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.PASS)
+
+
+class CapturePreflightSnapshotHelperTest(unittest.TestCase):
+    """R5: capture_preflight_snapshot()/write_preflight_snapshot()/
+    read_preflight_snapshot() -- the small, dedicated, read-only
+    acceptance-evidence contract, never overloading Task/Command truth."""
+
+    def _project_metadata(self):
+        from manager.project_registry import ProjectMetadata
+        return ProjectMetadata(
+            project_id=PROJECT_ID, display_name="Demo", aliases=(),
+            repo={"canonical_url": REPO, "owner": "ne9221", "name": "demo-project"},
+            default_branch="main", baseline_resolution_policy={"strategy": "origin_default", "pinned_ref": None},
+            common_governance={"reference": "governance-rules.json"}, project_rules={"reference": "AI-DEVELOPMENT-RULES.md"},
+            validation_policy={}, working_directory_policy={"relative_path": "demo-project", "env_var": "ADM_WORKSPACE_ROOT"},
+            isolation_policy={}, provider_restrictions={}, protected_paths=(), default_write_boundaries=(),
+            pointer_rules={}, status="enabled", resolution_status="verified", unresolved_reason=None,
+        )
+
+    def _fake_git_runner(self):
+        def runner(args, **kwargs):
+            class R:
+                returncode = 0
+                stderr = ""
+                if "remote" in args:
+                    stdout = REPO + "\n"
+                elif "rev-parse" in args:
+                    stdout = CANONICAL_HEAD + "\n"
+                else:
+                    stdout = ""
+            return R()
+        return runner
+
+    def test_capture_binds_project_id_request_id_and_valid_observed_at(self):
+        snapshot = v.capture_preflight_snapshot(
+            self._project_metadata(), REQUEST_ID, workspace_root="C:/workspace",
+            exists_check=lambda p: True, git_runner=self._fake_git_runner(),
+        )
+        self.assertEqual(snapshot["project_id"], PROJECT_ID)
+        self.assertEqual(snapshot["request_id"], REQUEST_ID)
+        self.assertTrue(v._valid_observed_at(snapshot["observed_at"]))
+        self.assertTrue(snapshot["available"])
+        self.assertEqual(snapshot["head_sha"], CANONICAL_HEAD)
+        self.assertTrue(snapshot["clean"])
+
+    def test_write_then_read_round_trips(self, tmp_path=None):
+        import tempfile
+        import os as _os
+        snapshot = v.capture_preflight_snapshot(
+            self._project_metadata(), REQUEST_ID, workspace_root="C:/workspace",
+            exists_check=lambda p: True, git_runner=self._fake_git_runner(),
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _os.path.join(tmp_dir, "preflight.json")
+            v.write_preflight_snapshot(snapshot, path)
+            read_back = v.read_preflight_snapshot(path)
+        self.assertEqual(read_back, snapshot)
+
+    def test_verify_write_e2e_loads_snapshot_from_path(self):
+        """The real invocation path: verify_write_e2e(..., canonical_checkout_before_path=...)
+        must read the file rather than forcing every caller to already
+        hold a live Python dict -- the CLI/API is never designed so that
+        every real repo-write invocation necessarily returns O=UNKNOWN."""
+        import tempfile
+        import os as _os
+
+        fixture = complete_evidence()
+
+        class FakeStore:
+            def get(self, area, project_id, name):
+                mapping = {
+                    "tasks": fixture["task"], "commands": fixture["command"],
+                    "executions": fixture["execution"], "sessions": fixture["session"],
+                    "projects": fixture["project"],
+                }
+                if area in mapping:
+                    return dict(mapping[area])
+                from manager.tasks import TaskError
+                raise TaskError("not found")
+
+            def latest(self, area, project_id, task_id):
+                return dict(fixture["handoff"])
+
+            def list_records(self, area, project_id):
+                if area == "executions":
+                    return [dict(fixture["sibling_executions"][0])]
+                if area == "commands":
+                    return [dict(fixture["sibling_commands"][0])]
+                return []
+
+        class FakeDispatchRegistry:
+            def __init__(self, bucket, project_id, request_id):
+                pass
+
+            def read_if_exists(self):
+                return (dict(fixture["dispatch_request"]), 1, None)
+
+        class FakeClaimRegistry:
+            def __init__(self, bucket, project_id, task_id):
+                pass
+
+            def read_if_exists(self):
+                return None
+
+        def fake_git_runner(args, **kwargs):
+            class R:
+                returncode = 0
+                stderr = ""
+                if "ls-remote" in args:
+                    stdout = f"{FINAL_SHA}\trefs/heads/{BRANCH}\n"
+                elif "remote" in args:
+                    stdout = REPO + "\n"
+                elif "rev-parse" in args:
+                    stdout = CANONICAL_HEAD + "\n"
+                else:
+                    stdout = ""
+            return R()
+
+        def fake_github_fetch(owner, name, branch, token=None):
+            return {"sha": BASELINE_HEAD}
+
+        def fake_repo_file_exists(owner, name, path, ref, token=None):
+            return True
+
+        # A real preflight snapshot for this exact registry/workspace_root
+        # (rather than reusing the shared fixture's canonical_checkout_before,
+        # whose path describes a different, Drive-literal-derived location) --
+        # this is exactly what a caller running a real acceptance would have
+        # produced by calling capture_preflight_snapshot() before dispatch.
+        preflight_snapshot = v.capture_preflight_snapshot(
+            self._fake_registry().get_project(PROJECT_ID), REQUEST_ID, workspace_root="C:/workspace",
+            exists_check=lambda p: True, git_runner=fake_git_runner,
+        )
+
+        original_collect_evidence = v.collect_evidence
+
+        def patched_collect_evidence(store, project_id, request_id, **kwargs):
+            kwargs["git_runner"] = fake_git_runner
+            kwargs.setdefault("task_claim_registry_factory", FakeClaimRegistry)
+            kwargs.setdefault("dispatch_registry_factory", FakeDispatchRegistry)
+            kwargs.setdefault("project_registry", self._fake_registry())
+            kwargs.setdefault("workspace_root", "C:/workspace")
+            kwargs.setdefault("github_fetch", fake_github_fetch)
+            kwargs.setdefault("repo_file_exists_check", fake_repo_file_exists)
+            kwargs.setdefault("canonical_checkout_exists_check", lambda p: True)
+            return original_collect_evidence(store, project_id, request_id, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _os.path.join(tmp_dir, "preflight.json")
+            v.write_preflight_snapshot(preflight_snapshot, path)
+            v.collect_evidence = patched_collect_evidence
+            try:
+                report = v.verify_write_e2e(FakeStore(), PROJECT_ID, REQUEST_ID, expected_repo=REPO,
+                                             canonical_checkout_before_path=path, workspace_root="C:/workspace")
+            finally:
+                v.collect_evidence = original_collect_evidence
+
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.PASS, report.as_dict()["invariants"]["O"])
+
+    def _fake_registry(self):
+        project_metadata = self._project_metadata()
+
+        class FakeRegistry:
+            def get_project(self, query, allow_disabled=False):
+                return project_metadata
+
+        return FakeRegistry()
 
 
 class RegistryGovernanceAuthorityTest(unittest.TestCase):
@@ -1146,7 +1375,12 @@ class CollectEvidenceFakeStoreTest(unittest.TestCase):
         # itself never invents it. Uses the same head_sha as the fresh
         # POST-E2E snapshot fake_git_runner will produce below, so the
         # before/after comparison in invariant O passes.
-        pre_e2e_snapshot = {"available": True, "path": "C:/workspace/demo-project", "repo_identity_ok": True, "head_sha": BASELINE_HEAD, "clean": True}
+        pre_e2e_snapshot = {
+            "schema_version": "1.0.0", "project_id": PROJECT_ID, "request_id": REQUEST_ID,
+            "observed_at": "2026-08-23T00:00:00Z",
+            "available": True, "path": "C:/workspace/demo-project", "repo_identity_ok": True,
+            "head_sha": BASELINE_HEAD, "clean": True,
+        }
 
         store = FakeStore()
         evidence = v.collect_evidence(
