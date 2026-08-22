@@ -20,6 +20,7 @@ from manager.project_registry import (
     normalize_identifier,
     normalize_repo_identity,
     resolve_authoritative_working_directory,
+    resolve_authoritative_working_directory_with_project,
 )
 
 
@@ -369,6 +370,15 @@ def test_project_registry_schema_validation():
 # can resolve the current checkout itself, while never regressing a project
 # that isn't registered or whose workspace env var isn't configured on this
 # machine.
+#
+# R2 correction: a REGISTERED project must return None (never `fallback`)
+# when its workspace env var isn't configured here -- this is the real
+# Cloud Run topology (cloud.dispatch_ingress/manager.dispatcher.dispatch()
+# have no HOME-local ADM_WORKSPACE_ROOT at all), and falling back to the
+# Drive literal there is exactly what let the original P0 reproduce: cloud
+# ingress would freeze the stale literal onto a brand-new Task forever,
+# since manager.execution_runner never re-resolves an already-non-None
+# field. Only a genuinely UNREGISTERED project may still use `fallback`.
 
 def test_registered_project_with_workspace_root_ignores_stale_fallback(monkeypatch, tmp_path):
     monkeypatch.setenv("ADM_WORKSPACE_ROOT", str(tmp_path))
@@ -379,12 +389,32 @@ def test_registered_project_with_workspace_root_ignores_stale_fallback(monkeypat
     assert resolved != "C:/stale/two-days-old/checkout"
 
 
-def test_registered_project_without_workspace_root_falls_back_unchanged(monkeypatch):
+def test_registered_project_without_workspace_root_fails_closed_not_stale_fallback(monkeypatch):
+    """The exact cross-context gap an independent review of R1 found: a
+    registered project whose workspace env var isn't set here (e.g. Cloud
+    Run) must resolve to None -- never silently reuse the Drive Project
+    record's stale literal."""
     monkeypatch.delenv("ADM_WORKSPACE_ROOT", raising=False)
     resolved = resolve_authoritative_working_directory(
         "ai-development-manager", fallback="C:/legacy/literal/checkout"
     )
-    assert resolved == "C:/legacy/literal/checkout"
+    assert resolved is None
+
+
+def test_registered_project_with_project_metadata_returned_only_when_registry_resolved(monkeypatch, tmp_path):
+    monkeypatch.delenv("ADM_WORKSPACE_ROOT", raising=False)
+    value, project = resolve_authoritative_working_directory_with_project("ai-development-manager", fallback="C:/legacy")
+    assert value is None
+    assert project is None
+
+    monkeypatch.setenv("ADM_WORKSPACE_ROOT", str(tmp_path))
+    value, project = resolve_authoritative_working_directory_with_project("ai-development-manager", fallback="C:/legacy")
+    assert value == str(tmp_path / "ai-development-manager")
+    assert project is not None and project.project_id == "ai-development-manager"
+
+    value, project = resolve_authoritative_working_directory_with_project("not-a-registered-project-id", fallback="C:/legacy")
+    assert value == "C:/legacy"
+    assert project is None
 
 
 def test_unregistered_project_falls_back_unchanged(monkeypatch, tmp_path):

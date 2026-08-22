@@ -323,6 +323,29 @@ class DispatcherTests(unittest.TestCase):
         self.assertNotEqual("C:/two-days-stale/scratch-checkout", task["working_directory"])
         self.assertTrue(task["working_directory"].endswith("ai-development-manager"))
 
+    def test_registered_project_in_cloud_context_never_freezes_stale_drive_literal(self):
+        """R2 regression: an independent review of the first fix found that
+        it still reproduced the P0 in the real topology -- cloud.dispatch_
+        ingress/manager.dispatcher.dispatch() run in Cloud Run, which has no
+        HOME-local ADM_WORKSPACE_ROOT at all. A naive resolver would fall
+        back to the Drive Project record's stale literal in exactly that
+        case, freezing it onto the new Task forever (manager.execution_
+        runner never re-resolves an already-non-None field). The correct
+        behavior is that a registered project's Task gets working_directory
+        = None from dispatch() when the workspace isn't configured here --
+        deferring real resolution to the actual HOME execution host."""
+        store = MemoryStore()
+        proj = project(); proj["project_id"] = "ai-development-manager"
+        proj["working_directory"] = "C:/two-days-stale/scratch-checkout"
+        create_project(store, proj)
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os as _os
+            _os.environ.pop("ADM_WORKSPACE_ROOT", None)
+            dispatch(store, object(), request(project_id="ai-development-manager", task_id="cloud-context-task"), quota(), [])
+        task = store.get("tasks", "ai-development-manager", "cloud-context-task")
+        self.assertIsNone(task["working_directory"])
+        self.assertNotEqual("C:/two-days-stale/scratch-checkout", task["working_directory"])
+
     def test_existing_task_working_directory_is_never_overwritten_by_dispatch(self):
         """Retry/re-dispatch of an *existing* task_id must not silently
         re-derive working_directory from the Project's current value -- the

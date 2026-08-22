@@ -756,6 +756,17 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         self._launch(store)
         self.assertEqual(self.valid_dir, store.get("tasks", "p1", "t1")["working_directory"])
 
+    @staticmethod
+    def _init_matching_checkout(path, remote="https://github.com/ne9221/ai-development-manager.git"):
+        """A real, minimal git checkout at `path` whose origin remote
+        matches the real Global Project Registry's registered repo for
+        ai-development-manager -- needed because verify_checkout_repo_
+        identity() (R2) now actually inspects the resolved workspace
+        pointer's git remote, not just a bare directory."""
+        os.makedirs(path, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=path, capture_output=True, text=True, check=True)
+        subprocess.run(["git", "remote", "add", "origin", remote], cwd=path, capture_output=True, text=True, check=True)
+
     def test_legacy_fallback_for_a_registered_project_uses_registry_not_stale_literal(self):
         """P0 regression (fix/direct-dispatch-working-directory-authority-p0-
         20260822): a legacy Task (no working_directory of its own) whose
@@ -771,10 +782,73 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         task = self._legacy_task(project_id="ai-development-manager", read_only=True, needs_repo_edit=False)
         create_task(store, task, assign=False)
         with tempfile.TemporaryDirectory() as workspace_root, patch.dict(os.environ, {"ADM_WORKSPACE_ROOT": workspace_root}):
-            os.makedirs(os.path.join(workspace_root, "ai-development-manager"))
+            checkout = os.path.join(workspace_root, "ai-development-manager")
+            self._init_matching_checkout(checkout)
             resolved = _resolve_working_directory(store, store.get("tasks", "ai-development-manager", "t1"))
         self.assertNotEqual("C:/two-days-stale/scratch-checkout", resolved)
         self.assertEqual(os.path.join(workspace_root, "ai-development-manager"), resolved)
+
+    # -- R2: independent review of the R1 fix found it still reproduced the
+    # P0 in the real topology -- cloud.dispatch_ingress/manager.dispatcher.
+    # dispatch() run in Cloud Run, which has no HOME-local ADM_WORKSPACE_ROOT.
+    # A registered project's Task must therefore reach HOME with
+    # working_directory already None (never the Drive literal -- see
+    # test_dispatcher.py's matching cloud-context test), and HOME must be
+    # the one that actually resolves + verifies it, using its own local
+    # ADM_WORKSPACE_ROOT.
+
+    def test_cloud_then_home_topology_registered_project_never_uses_stale_literal(self):
+        """The exact reproduction the reviewer asked for: a Task exactly as
+        cloud.dispatch_ingress/dispatcher.dispatch() would create it for a
+        registered project when ADM_WORKSPACE_ROOT isn't set (Cloud Run) --
+        working_directory already None -- then resolved on a simulated HOME
+        execution host where ADM_WORKSPACE_ROOT *is* configured."""
+        store = MemoryStore()
+        project = self._project(working_directory="C:/two-days-stale/scratch-checkout")
+        project["project_id"] = "ai-development-manager"
+        create_project(store, project)
+        task = self._legacy_task(project_id="ai-development-manager", read_only=True, needs_repo_edit=False,
+                                  working_directory=None)
+        create_task(store, task, assign=False)
+        with tempfile.TemporaryDirectory() as workspace_root, patch.dict(os.environ, {"ADM_WORKSPACE_ROOT": workspace_root}):
+            self._init_matching_checkout(os.path.join(workspace_root, "ai-development-manager"))
+            resolved = _resolve_working_directory(store, store.get("tasks", "ai-development-manager", "t1"))
+        self.assertEqual(os.path.join(workspace_root, "ai-development-manager"), resolved)
+        self.assertNotEqual("C:/two-days-stale/scratch-checkout", resolved)
+        # Immutable snapshot: a retry/second launch reuses HOME's proven value.
+        self.assertEqual(resolved, store.get("tasks", "ai-development-manager", "t1")["working_directory"])
+
+    def test_registered_project_fails_closed_when_home_workspace_root_also_missing(self):
+        store = MemoryStore()
+        project = self._project(working_directory="C:/two-days-stale/scratch-checkout")
+        project["project_id"] = "ai-development-manager"
+        create_project(store, project)
+        task = self._legacy_task(project_id="ai-development-manager", read_only=True, needs_repo_edit=False,
+                                  working_directory=None)
+        create_task(store, task, assign=False)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ADM_WORKSPACE_ROOT", None)
+            with self.assertRaises(TaskError):
+                _resolve_working_directory(store, store.get("tasks", "ai-development-manager", "t1"))
+
+    def test_registered_project_fails_closed_when_resolved_path_is_wrong_repo(self):
+        """A workspace pointer that resolves to a real, existing directory
+        which is nonetheless a checkout of a *different* repo (a mis-pointed
+        junction, a leftover from another project) must never be trusted."""
+        store = MemoryStore()
+        project = self._project(working_directory="C:/two-days-stale/scratch-checkout")
+        project["project_id"] = "ai-development-manager"
+        create_project(store, project)
+        task = self._legacy_task(project_id="ai-development-manager", read_only=True, needs_repo_edit=False,
+                                  working_directory=None)
+        create_task(store, task, assign=False)
+        with tempfile.TemporaryDirectory() as workspace_root, patch.dict(os.environ, {"ADM_WORKSPACE_ROOT": workspace_root}):
+            self._init_matching_checkout(
+                os.path.join(workspace_root, "ai-development-manager"),
+                remote="https://github.com/example/some-other-project.git",
+            )
+            with self.assertRaises(TaskError):
+                _resolve_working_directory(store, store.get("tasks", "ai-development-manager", "t1"))
 
     def test_task_snapshot_working_directory_takes_priority_over_project(self):
         store = self._store(
