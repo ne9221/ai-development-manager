@@ -1,5 +1,6 @@
 import unittest
 from copy import deepcopy
+from datetime import datetime, timezone
 
 from manager.dispatcher import dispatch
 from manager.governance import MANDATORY_RULE_IDS, validate_completion_report
@@ -44,16 +45,17 @@ def task_input(**changes):
 
 
 def quota():
+    captured_at = datetime.now(timezone.utc).isoformat()
     providers = []
     for name in ("codex", "claude", "antigravity", "gemini_app"):
         providers.append({
             "provider": name, "display_name": name, "collection_mode": "automatic",
             "source": "test", "source_type": "official", "confidence": "official",
-            "last_updated": "2026-08-19T00:00:00Z", "status": "ok",
+            "last_updated": captured_at, "status": "ok",
             "windows": [{"name": "primary", "remaining_percent": 80,
                          "used_percent": 20, "resets_at": None}],
         })
-    return {"schema_version": "0.1.0", "generated_at": "2026-08-19T00:00:00Z", "providers": providers}
+    return {"schema_version": "0.1.0", "generated_at": captured_at, "providers": providers}
 
 
 def completion_report(**changes):

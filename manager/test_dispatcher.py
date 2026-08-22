@@ -1,5 +1,6 @@
 import unittest
 from copy import deepcopy
+from datetime import datetime, timezone
 from unittest import mock
 
 from manager.dispatcher import dispatch, request_ok
@@ -24,7 +25,8 @@ def project(active=None):
     return {"project_id": "p1", "name": "Project One", "repo": "https://github.com/example/project", "default_branch": "main", "working_directory": "C:/work/project", "baseline_commit": "abc123", "runtime_ssot": "Drive", "project_rules": [], "active_tasks": active or [], "current_phase": "Phase 7", "important_constraints": ["Do not touch other repos"]}
 
 
-def quota(codex=80, claude=None, updated="2026-08-09T05:00:00Z"):
+def quota(codex=80, claude=None, updated=None):
+    updated = updated or datetime.now(timezone.utc).isoformat()
     providers = []
     for name, remaining in (("codex", codex), ("claude", claude), ("antigravity", None), ("gemini_app", None)):
         windows = [] if remaining is None else [{"name": "primary", "remaining_percent": remaining, "used_percent": 100-remaining, "resets_at": None}]
@@ -41,7 +43,9 @@ def history(minutes=14):
     return [{"provider": "codex", "mode": "code", "effort": "medium", "status": "completed", "elapsed_minutes": minutes, "task_snapshot": {"task_type": "implementation", "complexity": "medium", "needs_repo_edit": True}, "quota_delta": {"status": "known", "windows": [{"name": "primary", "status": "known", "used_percent_delta": 2}]}}]
 
 
-def two_claude_accounts(a_confidence="official", a_remaining=90, a_updated="2026-08-09T05:00:00Z", b_confidence="unknown", b_remaining=None, b_updated="2026-08-09T05:00:00Z"):
+def two_claude_accounts(a_confidence="official", a_remaining=90, a_updated=None, b_confidence="unknown", b_remaining=None, b_updated=None):
+    a_updated = a_updated or datetime.now(timezone.utc).isoformat()
+    b_updated = b_updated or a_updated
     def entry(account_id, confidence, remaining, updated):
         windows = [] if remaining is None else [{"name": "primary", "remaining_percent": remaining, "used_percent": 100 - remaining, "resets_at": None}]
         return {"provider": "claude", "account_id": account_id, "display_name": "claude", "collection_mode": "automatic", "source": "test", "source_type": "official" if confidence == "official" else "manual", "confidence": confidence, "last_updated": updated, "status": "ok" if windows else "unknown", "windows": windows}
@@ -53,9 +57,11 @@ def two_claude_accounts(a_confidence="official", a_remaining=90, a_updated="2026
     return {"schema_version": "0.1.0", "generated_at": a_updated, "providers": providers}
 
 
-def duplicate_claude_account(first_remaining, second_remaining, updated="2026-08-09T05:00:00Z"):
+def duplicate_claude_account(first_remaining, second_remaining, updated=None):
     """Two source records sharing the same account_id="claude-a" -- the
     upstream data-quality bug this test class guards against."""
+    updated = updated or datetime.now(timezone.utc).isoformat()
+
     def entry(remaining):
         windows = [{"name": "primary", "remaining_percent": remaining, "used_percent": 100 - remaining, "resets_at": None}]
         return {"provider": "claude", "account_id": "claude-a", "display_name": "claude", "collection_mode": "automatic", "source": "test", "source_type": "official", "confidence": "official", "last_updated": updated, "status": "ok", "windows": windows}
@@ -120,9 +126,20 @@ class DispatcherTests(unittest.TestCase):
         self.assertFalse(small["split_recommended"]); self.assertEqual(1, small["phase_count"])
 
     def test_zero_samples_stale_quota_and_secret_redaction(self):
-        stale = self.dispatch_case(request(title="Secret task", constraints=["token=sensitive-value", "credential:private"]), quota(updated="2020-01-01T00:00:00Z"))
-        self.assertNotIn("sensitive-value", stale["generated_prompt"]); self.assertNotIn("private", stale["generated_prompt"]); self.assertTrue(stale["warnings"])
-        self.assertEqual(20, stale["estimated_minutes"])
+        with self.assertRaisesRegex(TaskError, "no eligible provider"):
+            self.dispatch_case(request(title="Secret task", constraints=["token=sensitive-value", "credential:private"]), quota(updated="2020-01-01T00:00:00Z"))
+
+    def test_automatic_routing_selects_only_fresh_reliable_provider(self):
+        document = quota(80, 90)
+        next(item for item in document["providers"] if item["provider"] == "claude")["last_updated"] = "2020-01-01T00:00:00Z"
+        result = self.dispatch_case(request(task_type="architecture", needs_repo_edit=False, needs_research=True), document)
+        self.assertEqual("codex", result["provider"])
+
+    def test_explicit_unreliable_provider_is_not_substituted(self):
+        document = quota(80, 90)
+        next(item for item in document["providers"] if item["provider"] == "claude")["last_updated"] = "2020-01-01T00:00:00Z"
+        with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
+            self.dispatch_case(request(preferred_provider="claude"), document)
 
     def test_account_id_selects_matching_claude_account_quota(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
@@ -140,17 +157,13 @@ class DispatcherTests(unittest.TestCase):
 
     def test_account_id_reliability_not_laundered_across_accounts(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="unknown", b_remaining=None)
-        result_b = self.dispatch_case(request(title="Unreliable account B", preferred_provider="claude", account_id="claude-b"), doc)
-        self.assertIn("claude-b", result_b["quota_summary"]); self.assertIn("quota unknown", result_b["quota_summary"])
-        self.assertIn("confidence unknown", result_b["quota_summary"])
-        self.assertTrue(any("unknown" in item or "stale" in item for item in result_b["warnings"]))
+        with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
+            self.dispatch_case(request(title="Unreliable account B", preferred_provider="claude", account_id="claude-b"), doc)
 
     def test_account_id_does_not_silently_switch_stale_to_fresh(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=70, a_updated="2020-01-01T00:00:00Z", b_confidence="official", b_remaining=40, b_updated="2026-08-09T05:00:00Z")
-        result_a = self.dispatch_case(request(title="Stale account A", preferred_provider="claude", account_id="claude-a"), doc)
-        self.assertIn("claude-a", result_a["quota_summary"]); self.assertNotIn("claude-b", result_a["quota_summary"])
-        self.assertNotIn("40% remaining", result_a["quota_summary"])
-        self.assertTrue(any("stale" in item or "unknown" in item for item in result_a["warnings"]))
+        with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
+            self.dispatch_case(request(title="Stale account A", preferred_provider="claude", account_id="claude-a"), doc)
 
     def test_account_id_unknown_defers_to_auth_preflight(self):
         """An explicit account_id with no captured per-account quota data must
@@ -161,20 +174,8 @@ class DispatcherTests(unittest.TestCase):
         distinct unknown/unavailable entry -- never another account's or the
         legacy representative's real numbers laundered onto it."""
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
-        result = self.dispatch_case(request(title="Missing account", preferred_provider="claude", account_id="claude-does-not-exist"), doc)
-        self.assertEqual("claude-does-not-exist", result["account_id"])
-        self.assertIn("claude-does-not-exist", result["quota_summary"])
-        self.assertIn("quota unknown", result["quota_summary"])
-        self.assertNotIn("90% remaining", result["quota_summary"])
-        self.assertNotIn("40% remaining", result["quota_summary"])
-        self.assertTrue(any("unknown" in item or "stale" in item for item in result["warnings"]))
-        # quota_evidence is persisted onto the Task/Execution/Command records
-        # (execution_runner.reserve_execution, dispatcher.create_task) as the
-        # durable audit trail -- it must never show another account's real
-        # numbers for an account dispatch() could not itself find data for.
-        claude_evidence = result["quota_evidence"]["claude"]
-        self.assertEqual("unknown", claude_evidence["confidence"])
-        self.assertEqual([], claude_evidence["windows"])
+        with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
+            self.dispatch_case(request(title="Missing account", preferred_provider="claude", account_id="claude-does-not-exist"), doc)
 
     def test_account_id_matched_quota_evidence_reflects_that_account_not_legacy_representative(self):
         """Same evidence-integrity property, for the already-matched-account
@@ -204,7 +205,7 @@ class DispatcherTests(unittest.TestCase):
     def test_no_account_id_keeps_legacy_provider_level_behavior(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
         result = self.dispatch_case(request(title="Legacy path", preferred_provider="claude"), doc)
-        self.assertNotIn("claude-a", result["quota_summary"]); self.assertNotIn("claude-b", result["quota_summary"])
+        self.assertIn("claude-a", result["quota_summary"]); self.assertNotIn("claude-b", result["quota_summary"])
         self.assertIn("90% remaining", result["quota_summary"])
 
     def test_codex_dispatch_unaffected_by_account_id(self):
@@ -214,9 +215,8 @@ class DispatcherTests(unittest.TestCase):
 
     def test_all_claude_accounts_unknown_no_fabricated_selection(self):
         doc = two_claude_accounts(a_confidence="unknown", a_remaining=None, b_confidence="unknown", b_remaining=None)
-        result = self.dispatch_case(request(title="All unknown", preferred_provider="claude"), doc)
-        self.assertEqual("claude", result["recommended_provider"]); self.assertIn("quota unknown", result["quota_summary"])
-        self.assertNotIn("claude-a", result["quota_summary"]); self.assertNotIn("claude-b", result["quota_summary"])
+        with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
+            self.dispatch_case(request(title="All unknown", preferred_provider="claude"), doc)
 
     def test_account_identity_shown_without_credentials(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)

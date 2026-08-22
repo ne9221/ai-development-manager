@@ -91,6 +91,26 @@ class DispatchIngressTests(unittest.TestCase):
         self.assertEqual(ADMISSION_VERSION, command["admission_version"])
         self.assertEqual("req-1", command["request_id"])
 
+    def test_automatic_selection_persists_only_the_reliable_provider(self):
+        document = quota_fixture(80, 90)
+        next(item for item in document["providers"] if item["provider"] == "claude")["last_updated"] = "2020-01-01T00:00:00Z"
+        with patch("manager.dispatcher.read_drive_status", return_value=document):
+            result = self.call(payload(request_id="req-reliable"))
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual("codex", command["provider"])
+
+    def test_no_eligible_provider_creates_no_command_or_duplicate_authority(self):
+        document = quota_fixture(updated="2020-01-01T00:00:00Z")
+        request = payload(request_id="req-no-eligible")
+        with patch("manager.dispatcher.read_drive_status", return_value=document):
+            with self.assertRaisesRegex(TaskError, "no eligible provider"):
+                self.call(request)
+            with self.assertRaises(DispatchIngressError):
+                self.call(request)
+        for area in ("tasks", "commands"):
+            with self.assertRaises(TaskError):
+                self.store.get(area, "p1", "dispatch-req-no-eligible")
+
     def test_read_only_constraint_defaults_true_when_omitted(self):
         result = self.call(payload(request_id="req-ro", constraints={}))
         task = self.store.get("tasks", "p1", result["task_id"])
@@ -430,14 +450,15 @@ class ExplicitProviderAccountRoutingTests(unittest.TestCase):
         create_project(self.store, project())
         self.registries = SharedMemoryRegistries()
         fresh = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        # Deliberately no Claude quota entries at all, and Codex quota very
-        # healthy -- this is the real production shape the handoff reported
-        # (Codex trait score wins, Claude evidence stale/unknown), so any
-        # test here that still lands on the exact requested Claude account
-        # proves the explicit route, not a coincidence of quota scoring.
         doc = {
             "schema_version": "0.1.0", "generated_at": fresh,
             "providers": [
+                {"provider": "claude", "account_id": "claude-a", "display_name": "claude", "collection_mode": "automatic",
+                 "source": "test", "source_type": "official", "confidence": "official", "last_updated": fresh,
+                 "status": "ok", "windows": [{"name": "primary", "remaining_percent": 90, "used_percent": 10, "resets_at": None}]},
+                {"provider": "claude", "account_id": "claude-b", "display_name": "claude", "collection_mode": "automatic",
+                 "source": "test", "source_type": "official", "confidence": "official", "last_updated": fresh,
+                 "status": "ok", "windows": [{"name": "primary", "remaining_percent": 40, "used_percent": 60, "resets_at": None}]},
                 {"provider": "codex", "display_name": "codex", "collection_mode": "automatic",
                  "source": "test", "source_type": "official", "confidence": "official", "last_updated": fresh,
                  "status": "ok", "windows": [{"name": "primary", "remaining_percent": 95, "used_percent": 5, "resets_at": None}]},

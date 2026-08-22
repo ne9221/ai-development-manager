@@ -58,6 +58,9 @@ def decide(task, quota, now=None, estimates=None):
     ranked = []
     warnings = []
     for provider in quota["providers"]:
+        if not provider["has_reliable_quota"]:
+            warnings.append(f"{provider['display_name']} quota is {provider['status']} or stale")
+            continue
         config = CAPABILITIES[provider["provider"]]
         score = config["task_types"].get(task.get("task_type", "implementation"), 0)
         for trait, weight in config["traits"].items():
@@ -68,23 +71,21 @@ def decide(task, quota, now=None, estimates=None):
         q_score, evidence = quota_score(provider, expected, now)
         evidence["historical_estimate"] = estimates.get(provider["provider"])
         score += q_score
-        if not provider["has_reliable_quota"]:
-            warnings.append(f"{provider['display_name']} quota is {provider['status']} or stale")
         ranked.append({"provider": provider["provider"], "score": round(score, 3), "evidence": evidence, "mode": config["mode"]})
     ranked.sort(key=lambda item: item["score"], reverse=True)
 
     split = expected > 20
-    winner = ranked[0]
-    historical = estimates.get(winner["provider"])
-    reasons = ([f"Expected duration {expected} minutes exceeds the 20-minute task target; split before assignment"] if split else [
+    winner = ranked[0] if ranked else None
+    historical = estimates.get(winner["provider"]) if winner else None
+    reasons = (["No provider has fresh reliable quota; automatic routing is unavailable"] if winner is None else
+               [f"Expected duration {expected} minutes exceeds the 20-minute task target; split before assignment"] if split else [
         f"Best combined capability and quota evidence score for {task.get('task_type', 'implementation')}",
-        "Unknown quota remained eligible but carried uncertainty",
     ])
     if historical:
         reasons.append(f"History: {historical['estimated_minutes']} minutes from {historical['sample_count']} matching executions ({historical['confidence']} confidence)")
     return {
-        "recommended_provider": None if split else winner["provider"],
-        "recommended_mode": "split_task" if split else winner["mode"],
+        "recommended_provider": None if split or winner is None else winner["provider"],
+        "recommended_mode": "split_task" if split else winner["mode"] if winner else None,
         "recommended_effort": "high" if task.get("complexity") == "high" else "medium",
         "alternatives": [item["provider"] for item in ranked[:3] if split or item is not winner],
         "reasons": reasons,
