@@ -16,6 +16,10 @@ DISPATCH_REQUEST_SCHEMA_VERSION = "0.1.0"
 DEFAULT_AMBIGUOUS_ATTEMPTS = 3
 
 
+class DispatchRequestClaimConflict(TaskError):
+    """The request claim changed while a pre-artifact rollback was pending."""
+
+
 def dispatch_request_object_name(project_id, request_id):
     """Canonical, collision-free object key; safe_id() rejects '/', '..', and
     any character outside [A-Za-z0-9._-], so concatenation cannot let one
@@ -86,12 +90,14 @@ def _resolve_ambiguous(registry, record, attempts):
         if existing is None:
             try:
                 generation = registry.create_if_absent(record)
-                return {**record, "generation": generation, "claimed": True}
+                return {**record, "generation": generation, "claimed": True, "created_by_this_call": True}
             except (RegistryConflict, TaskError):
                 continue
         else:
             current, generation, _ = existing
-            return {**_validate_record(current, record["project_id"], record["request_id"]), "generation": generation, "claimed": True}
+            # A timeout after create is intentionally not rollback-eligible:
+            # the matching record could have been created by another caller.
+            return {**_validate_record(current, record["project_id"], record["request_id"]), "generation": generation, "claimed": True, "created_by_this_call": False}
     raise TaskError("dispatch request ambiguous create outcome did not resolve after retries; failing closed")
 
 
@@ -110,8 +116,41 @@ def claim_dispatch_request(registry, project_id, request_id, task_id, command_id
     record = _new_record(project_id, request_id, task_id, command_id, created_at)
     try:
         generation = registry.create_if_absent(record)
-        return {**record, "generation": generation, "claimed": True}
+        return {**record, "generation": generation, "claimed": True, "created_by_this_call": True}
     except RegistryConflict:
-        return {**_resolve_conflict(registry, project_id, request_id), "claimed": False}
+        return {**_resolve_conflict(registry, project_id, request_id), "claimed": False, "created_by_this_call": False}
     except TaskError:
         return _resolve_ambiguous(registry, record, attempts)
+
+
+def release_dispatch_request_claim(registry, project_id, request_id, task_id, command_id, generation):
+    """Release only this exact generation of a pre-artifact request claim.
+
+    This is deliberately a conditional delete, never a best-effort cleanup:
+    a stale caller cannot remove a newer request claimant's authority.
+    """
+    try:
+        existing = registry.read_if_exists()
+    except Exception as exc:
+        raise TaskError("dispatch request backend unavailable during release") from exc
+    if existing is None:
+        return {"released": False, "reason": "no active claim"}
+    document, current_generation, _ = existing
+    _validate_record(document, project_id, request_id)
+    if document["task_id"] != task_id or document["command_id"] != command_id:
+        return {"released": False, "reason": "claim identity differs"}
+    if current_generation != generation:
+        raise DispatchRequestClaimConflict("dispatch request generation changed; refusing stale release")
+    try:
+        registry.delete_if_generation_matches(current_generation)
+    except RegistryConflict as exc:
+        raise DispatchRequestClaimConflict("dispatch request changed concurrently; release aborted") from exc
+    except Exception as exc:
+        try:
+            confirmed = registry.read_if_exists()
+        except Exception as reread_exc:
+            raise TaskError("dispatch request release outcome is ambiguous") from reread_exc
+        if confirmed is None:
+            return {"released": True, "generation": current_generation, "confirmed_after_ambiguous_delete": True}
+        raise TaskError("dispatch request release outcome is ambiguous") from exc
+    return {"released": True, "generation": current_generation}

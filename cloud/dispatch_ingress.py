@@ -74,9 +74,9 @@ import re
 import time
 
 from manager.claude_account_selector import load_claude_accounts
-from manager.dispatch_requests import claim_dispatch_request
+from manager.dispatch_requests import claim_dispatch_request, release_dispatch_request_claim
 from manager.dispatcher import dispatch as dispatcher_dispatch
-from manager.executions import MAX_RETRY_COUNT, linked_command_for_execution, retry_eligible
+from manager.executions import MAX_RETRY_COUNT, linked_command_for_execution, list_executions, retry_eligible
 from manager.tasks import TaskError, now_iso, update_task, validate
 from manager.trusted_ingress import (
     ADMISSION_VERSION, ADMISSION_VERSION_V2_REPO_WRITE, REQUIRED_REPO_WRITE_TASK_POLICIES,
@@ -310,6 +310,28 @@ def _fetch_if_exists(store, area, project_id, name):
         if "found 0" in message or "not found" in message:
             return None
         raise
+
+
+def _release_pre_artifact_claim(store, registry, project_id, request_id, claim):
+    """Undo only a definitely-owned claim before any durable authority exists."""
+    if not claim.get("created_by_this_call"):
+        return False
+    task_id, command_id = claim["task_id"], claim["command_id"]
+    if _fetch_if_exists(store, "tasks", project_id, task_id) is not None:
+        return False
+    if _fetch_if_exists(store, "commands", project_id, command_id) is not None:
+        return False
+    # Execution records are independent durable authority. list_executions()
+    # treats a missing EXECUTIONS folder as a proven empty set, but any real
+    # backend failure remains an exception and therefore fails closed.
+    if any(item.get("task_id") == task_id or item.get("command_id") == command_id
+           for item in list_executions(store, project_id)):
+        return False
+    released = release_dispatch_request_claim(
+        registry, project_id, request_id, task_id, command_id, claim["generation"])
+    if not released["released"]:
+        raise DispatchIngressError("dispatch_claim_release_unconfirmed", "pre-artifact request claim could not be safely released")
+    return True
 
 
 def _repo_write_replay_matches(task, requested_repo_write):
@@ -549,7 +571,11 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
         internal_request["preferred_provider"] = requested_provider
     if requested_account_id is not None:
         internal_request["account_id"] = requested_account_id
-    result = dispatcher_dispatch(store, service, internal_request)
+    try:
+        result = dispatcher_dispatch(store, service, internal_request)
+    except Exception:
+        _release_pre_artifact_claim(store, registry, project_id, request_id, claim)
+        raise
 
     # Defense in depth: the explicit request was already validated above,
     # but never trust that dispatcher_dispatch() actually honored it --
