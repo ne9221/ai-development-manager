@@ -13,6 +13,7 @@ FOLDER_ID = "1JGc9_QdI3nkapmLt0HfvDyap4Jpn71k7"
 FILE_NAME = "status.json"
 MIME_TYPE = "application/json"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+DRIVE_REQUEST_TIMEOUT_SECONDS = 45
 
 
 class PublisherError(RuntimeError):
@@ -184,8 +185,11 @@ def credentials(allow_interactive=False):
 
 def build_service():
     try:
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
         from googleapiclient.discovery import build
-        return build("drive", "v3", credentials=credentials(), cache_discovery=False)
+        http = AuthorizedHttp(credentials(), http=httplib2.Http(timeout=DRIVE_REQUEST_TIMEOUT_SECONDS))
+        return build("drive", "v3", http=http, cache_discovery=False)
     except PublisherError:
         raise
     except Exception as exc:

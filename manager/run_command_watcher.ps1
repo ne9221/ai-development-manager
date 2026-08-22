@@ -10,13 +10,8 @@ param(
     [Parameter(Mandatory=$true)][string]$GcsObject,
     [string]$IngressFolderId,
     [string]$IngressOwner,
-    [string]$ClaudeAccountsConfig,
-    [ValidateRange(1, 59)][int]$WatcherTickTimeoutSeconds = 45
+    [string]$ClaudeAccountsConfig
 )
-
-# Keep each scheduled 60-second tick bounded.  The provenance refresh above
-# must get another chance even when a Drive/API call inside one watcher poll
-# stalls.  Provider children deliberately break away from this watcher process.
 
 $env:AI_MANAGER_HOME = $ManagerHome
 $env:GOOGLE_DRIVE_TOKEN = Join-Path $ManagerHome "google-drive-token.json"
@@ -58,11 +53,5 @@ $env:ADM_WATCHER_GIT_SHA = $contract.running_sha
 $env:ADM_TESTED_GIT_SHA = $contract.tested_sha
 $env:ADM_ACTIVATED_GIT_SHA = $contract.activated_sha
 
-$watcher = Start-Process -FilePath $PythonPath -ArgumentList @("-m", "manager.command_watcher", "--once") `
-    -WorkingDirectory $RepositoryPath -NoNewWindow -PassThru
-if (-not $watcher.WaitForExit($WatcherTickTimeoutSeconds * 1000)) {
-    Stop-Process -Id $watcher.Id -Force
-    Write-Error "WATCHER_TICK_TIMEOUT: manager.command_watcher --once exceeded $WatcherTickTimeoutSeconds seconds"
-    exit 124
-}
-exit $watcher.ExitCode
+& $PythonPath -m manager.command_watcher --once
+exit $LASTEXITCODE

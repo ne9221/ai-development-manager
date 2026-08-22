@@ -1,8 +1,9 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from collectors.publish_drive import FILE_NAME, MIME_TYPE, PublisherError, sync_drive
+from collectors.publish_drive import DRIVE_REQUEST_TIMEOUT_SECONDS, FILE_NAME, MIME_TYPE, PublisherError, build_service, sync_drive
 
 
 class Request:
@@ -50,6 +51,17 @@ class FakeDrive:
 
 
 class PublisherTest(unittest.TestCase):
+    def test_build_service_bounds_each_drive_request_without_bounding_provider_lifecycle(self):
+        credentials, transport, authorized, service = object(), object(), object(), object()
+        with patch("collectors.publish_drive.credentials", return_value=credentials), \
+             patch("httplib2.Http", return_value=transport) as http_factory, \
+             patch("google_auth_httplib2.AuthorizedHttp", return_value=authorized) as authorized_http, \
+             patch("googleapiclient.discovery.build", return_value=service) as build:
+            self.assertIs(service, build_service())
+        http_factory.assert_called_once_with(timeout=DRIVE_REQUEST_TIMEOUT_SECONDS)
+        authorized_http.assert_called_once_with(credentials, http=transport)
+        build.assert_called_once_with("drive", "v3", http=authorized, cache_discovery=False)
+
     def test_create_and_verify(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / FILE_NAME
