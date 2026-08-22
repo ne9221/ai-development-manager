@@ -507,6 +507,25 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     return {"status": final["status"], "execution_id": claimed["execution_id"]}
 
 
+def _enumerate_project_ids(store, deadline=None):
+    """Cheap project-id enumeration for poll_once()'s pre-launch phase.
+
+    Prefers DriveRecords.list_project_ids() when the store supports it: a
+    project folder's own name is already its project_id, so this needs no
+    per-project Drive get() at all (unlike all_projects()/list_projects(),
+    which fully hydrates every project's JSON document just to find its
+    id) -- for N real projects this is O(1) Drive round trips (one
+    paginated folder listing) instead of O(N). It also forwards `deadline`
+    so pagination itself can stop early rather than running unbounded.
+
+    Falls back to all_projects(store) + extracting project_id for any
+    store that doesn't implement list_project_ids (e.g. test doubles),
+    reproducing prior behavior for those callers unchanged."""
+    if hasattr(store, "list_project_ids"):
+        return store.list_project_ids(deadline=deadline)
+    return [project["project_id"] for project in all_projects(store)]
+
+
 def poll_once(store, service, allowlist=None, deadline=None, **factories):
     """`deadline`, if given, is a `time.monotonic()` value after which this
     call stops STARTING new project/command work and returns whatever it has
@@ -518,17 +537,24 @@ def poll_once(store, service, allowlist=None, deadline=None, **factories):
     list_records() or the next command's process_command(), so a real
     provider lifecycle -- once process_command has been called for that
     command -- always runs to its natural completion regardless of how long
-    it legitimately takes."""
+    it legitimately takes.
+
+    Project enumeration itself (_enumerate_project_ids above) is also
+    deadline-aware and does not hydrate full project documents -- see its
+    docstring for why the earlier all_projects()-based version of this loop
+    could not be bounded by this same deadline check at all: the full
+    listing+hydration ran to completion before the loop's first iteration
+    was ever reached."""
     if allowlist is None:
         allowlist = load_allowlist()
     if deadline is None:
         deadline = time.monotonic() + POLL_TIME_BUDGET_SECONDS
     results = []
-    for project in all_projects(store):
+    for project_id in _enumerate_project_ids(store, deadline=deadline):
         if time.monotonic() >= deadline:
             break
         try:
-            commands = store.list_records("commands", project["project_id"])
+            commands = store.list_records("commands", project_id)
         except TaskError:
             continue
         for command in commands:

@@ -342,4 +342,128 @@ class DriveFolderRaceTests(unittest.TestCase):
         self.assertEqual(1, len(store.children(root, "project-a")))
 
 
+class PaginatedFakeDriveFiles:
+    """A minimal fake supporting real multi-page pagination (unlike
+    FakeDriveFiles above, which always returns everything in one page) --
+    needed to exercise children()'s deadline-between-pages behavior.
+    `get_media` raises if called at all, so any test using this fake that
+    calls it proves a code path fetched a full record it shouldn't have."""
+
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.list_calls = 0
+
+    def list(self, **_kwargs):
+        index = min(self.list_calls, len(self.pages) - 1)
+        self.list_calls += 1
+        return Request(self.pages[index])
+
+    def get_media(self, fileId):
+        raise AssertionError(f"get_media must never be called by list_project_ids (fileId={fileId!r})")
+
+
+class PaginatedFakeDriveService:
+    def __init__(self, pages):
+        self._files = PaginatedFakeDriveFiles(pages)
+
+    def files(self):
+        return self._files
+
+
+def project_folder_item(name, file_id):
+    return {"id": file_id, "name": name, "mimeType": MIME_FOLDER, "parents": [ROOT_FOLDER_ID]}
+
+
+class ProjectIdEnumerationTests(unittest.TestCase):
+    """Covers the Watcher pre-launch enumeration fix: list_project_ids()
+    must be a cheap, deadline-aware, get()-free alternative to
+    list_projects()'s full per-project hydration, and must not change
+    list_projects()/children()'s existing behavior for any other caller."""
+
+    def test_list_project_ids_returns_folder_names_with_no_get_calls(self):
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"])
+        for project_id in ("p1", "p2", "p3"):
+            store.folder(root, project_id)
+
+        original_get_media = service.transport.get_media
+
+        def guarded_get_media(fileId):
+            raise AssertionError("list_project_ids must never call get_media (i.e. never hydrate a project document)")
+
+        service.transport.get_media = guarded_get_media
+        try:
+            ids = store.list_project_ids()
+        finally:
+            service.transport.get_media = original_get_media
+
+        self.assertEqual({"p1", "p2", "p3"}, set(ids))
+
+    def test_list_project_ids_matches_list_projects_project_id_set(self):
+        """N-project scenario: list_project_ids() must find exactly the
+        same projects list_projects() would, just without hydrating any of
+        them -- proving the fast path is a real substitute, not a
+        different/narrower enumeration."""
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"])
+        for project_id in ("alpha", "beta", "gamma", "delta"):
+            store.folder(root, project_id)
+            store.put("projects", project_id, project_id, {
+                "project_id": project_id, "name": project_id, "created_at": "2026-08-22T00:00:00Z", "aliases": [],
+            })
+
+        fast_ids = set(store.list_project_ids())
+        full_ids = {project["project_id"] for project in store.list_projects()}
+        self.assertEqual(full_ids, fast_ids)
+
+    def test_deadline_stops_mid_pagination_and_returns_partial(self):
+        pages = [
+            {"files": [project_folder_item("root", "root-id")], "nextPageToken": None},  # folder() resolving PROJECTS root
+            {"files": [project_folder_item("p1", "f1")], "nextPageToken": "token-2"},     # page 1 of children(root)
+            {"files": [project_folder_item("p2", "f2")], "nextPageToken": None},          # page 2, never reached
+        ]
+        service = PaginatedFakeDriveService(pages)
+        store = DriveRecords(service)
+
+        call_count = {"n": 0}
+
+        def fake_monotonic():
+            call_count["n"] += 1
+            # 1st check: before page 1 of children(root) -- under budget.
+            # 2nd check: before page 2 -- budget now spent, stop.
+            return 0.0 if call_count["n"] <= 1 else 100.0
+
+        with patch("manager.tasks.time.monotonic", side_effect=fake_monotonic):
+            ids = store.list_project_ids(deadline=50.0)
+
+        self.assertEqual(["p1"], ids)
+        # Only 2 list() calls happened: resolving the PROJECTS root folder,
+        # then page 1 of its children -- page 2 was never requested.
+        self.assertEqual(2, service._files.list_calls)
+
+    def test_no_deadline_is_unbounded_like_before(self):
+        pages = [
+            {"files": [project_folder_item("root", "root-id")], "nextPageToken": None},
+            {"files": [project_folder_item("p1", "f1")], "nextPageToken": "token-2"},
+            {"files": [project_folder_item("p2", "f2")], "nextPageToken": None},
+        ]
+        service = PaginatedFakeDriveService(pages)
+        store = DriveRecords(service)
+        ids = store.list_project_ids()
+        self.assertEqual({"p1", "p2"}, set(ids))
+
+    def test_children_default_deadline_none_is_byte_for_byte_unchanged(self):
+        """Every existing caller of children() (folder(), get(),
+        list_records(), list_projects(), put(), etc.) calls it with no
+        deadline argument at all -- this proves that path is completely
+        untouched by the new parameter's default."""
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"])
+        store.folder(root, "p1")
+        self.assertEqual(1, len(store.children(root)))
+
+
 if __name__ == "__main__": unittest.main()

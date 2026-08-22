@@ -8,6 +8,7 @@ import io
 import json
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -79,12 +80,24 @@ class DriveRecords:
     def __init__(self, service):
         self.files = service.files()
 
-    def children(self, parent, name=None):
+    def children(self, parent, name=None, deadline=None):
+        """`deadline`, if given, is a `time.monotonic()` value checked only
+        BETWEEN pages (never mid-single-request -- each individual
+        `files.list().execute()` call remains bound only by the transport's
+        own request timeout). Exceeding it returns whatever pages were
+        already fetched rather than raising, so a caller that only needs a
+        best-effort/bounded listing (see list_project_ids below) degrades
+        gracefully instead of failing the whole poll. Default None
+        preserves this method's exact prior behavior (unbounded, waits for
+        every page) for every other existing caller -- folder(), get(),
+        list_records(), list_projects(), etc. are all unaffected."""
         query = f"'{parent}' in parents and trashed=false"
         if name:
             query += f" and name='{name}'"
         items, token, seen = [], None, set()
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                return items
             options = {"q": query, "spaces": "drive", "fields": "nextPageToken,files(id,name,mimeType,parents,modifiedTime,createdTime)", "pageSize": 100}
             if token:
                 options["pageToken"] = token
@@ -208,6 +221,24 @@ class DriveRecords:
         root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"], create=False)
         return [self.get("projects", item["name"], item["name"])
                 for item in self.children(root) if item.get("mimeType") == MIME_FOLDER]
+
+    def list_project_ids(self, deadline=None):
+        """Cheap enumeration for callers that only need project IDs (e.g. to
+        list each project's commands), not full hydrated project documents.
+        A project folder's own name is already its project_id (see
+        project_folder()/safe_id()), so unlike list_projects() this never
+        calls get() -- no per-project Drive round trip at all, just the one
+        (possibly paginated) folder listing. `deadline`, if given, is
+        forwarded to children() and can stop mid-pagination, returning
+        whatever project IDs were already seen rather than raising -- a
+        caller with a bounded time budget (manager.command_watcher.
+        poll_once) gets a safe partial list instead of an unbounded wait;
+        any project not yet seen is simply picked up on a later call. This
+        does not change list_projects()'s own behavior or any other
+        existing caller of children()/folder() at all."""
+        root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"], create=False)
+        return [item["name"] for item in self.children(root, deadline=deadline)
+                if item.get("mimeType") == MIME_FOLDER]
 
     def latest(self, area, project_id, task_id):
         parent = self.project_folder(area, project_id, create=False)

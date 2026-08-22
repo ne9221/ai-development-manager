@@ -1233,6 +1233,53 @@ class PollOnceTimeBudgetTests(unittest.TestCase):
         self.assertLess(POLL_TIME_BUDGET_SECONDS, 60)
 
 
+class PollOnceUsesCheapProjectEnumerationTests(unittest.TestCase):
+    """Covers the final remaining gap: poll_once() must enumerate projects
+    via DriveRecords.list_project_ids() (no per-project get()), not
+    all_projects()/list_projects()'s full hydration -- otherwise the 40s
+    poll deadline can never even be checked until that full O(N) listing
+    has already returned, exactly as ChatGPT's review confirmed. Uses a
+    real DriveRecords backed by the same FakeDriveService fixture
+    manager/test_tasks.py uses, not the simplified in-memory Store used by
+    the rest of this file, so this exercises the real children()/folder()
+    call graph rather than a test double that bypasses it."""
+
+    def test_multi_project_poll_never_hydrates_any_project_document(self):
+        from manager.tasks import DriveRecords, ROOT_FOLDER_ID, ROOT_FOLDERS
+        from manager.test_tasks import FakeDriveService
+
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"])
+        for project_id in ("p1", "p2", "p3", "p4", "p5"):
+            store.folder(root, project_id)
+            store.put("projects", project_id, project_id, {
+                "project_id": project_id, "name": project_id, "created_at": "2026-08-22T00:00:00Z", "aliases": [],
+            })
+
+        get_media_calls = {"n": 0}
+        original = service.transport.get_media
+
+        def counting_get_media(fileId):
+            get_media_calls["n"] += 1
+            return original(fileId)
+
+        service.transport.get_media = counting_get_media
+        try:
+            results = poll_once(store, object(), allowlist=frozenset(),
+                                 claim_factory=CommandWatcherTests.claim_factory,
+                                 health_check=lambda: True, quota_check=lambda service: True)
+        finally:
+            service.transport.get_media = original
+
+        self.assertEqual([], results)
+        # 5 real projects, zero commands in any of them -- if poll_once were
+        # still hydrating each project's own JSON document (the old
+        # all_projects() path), get_media would be called at least 5 times
+        # here (once per project.json). It must be called zero times.
+        self.assertEqual(0, get_media_calls["n"])
+
+
 class MainOnceFastFailTests(unittest.TestCase):
     """Covers requirement 9: a pre-launch failure (here, a bounded Drive
     HTTP timeout surfacing as any exception out of build_service()) must
