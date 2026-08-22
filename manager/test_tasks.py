@@ -466,4 +466,153 @@ class ProjectIdEnumerationTests(unittest.TestCase):
         self.assertEqual(1, len(store.children(root)))
 
 
+class ListRecordsBoundedTests(unittest.TestCase):
+    """Covers the real HOME E2E blocker: list_records() for one project
+    with a large historical Command backlog took 141.66s in a live
+    reproduction, uninterruptible by any deadline once started (get() per
+    record, no bound). list_records_bounded() must never unbounded-hydrate
+    a project's full history, and must respect the 45s-transport-timeout
+    vs 40s-poll-budget boundary explicitly, not just check the deadline
+    after it has already passed."""
+
+    def _seed_commands(self, store, project_id, count):
+        for index in range(count):
+            command_id = f"cmd-{index:03d}"
+            store.put("commands", project_id, command_id, {
+                "command_id": command_id, "project_id": project_id, "task_id": "t1", "provider": "codex",
+                "model": None, "fallback_model": None, "mode": None, "effort": None,
+                "selection_reason": [], "quota_evidence": None, "created_at": "2026-08-14T00:00:00Z",
+                "status": "completed", "execution_id": None, "claimed_at": None,
+                "completed_at": "2026-08-14T00:05:00Z", "result": {"status": "completed"},
+            })
+
+    # 1. A project with a large historical backlog is not unbounded-hydrated.
+    def test_large_historical_backlog_is_not_unbounded_hydrated(self):
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 20)
+
+        get_media_calls = {"n": 0}
+        original = service.transport.get_media
+
+        def counting_get_media(fileId):
+            get_media_calls["n"] += 1
+            return original(fileId)
+
+        service.transport.get_media = counting_get_media
+        try:
+            # Deadline already exhausted before the very first hydration.
+            records = store.list_records_bounded("commands", "p1", deadline=0.0)
+        finally:
+            service.transport.get_media = original
+
+        self.assertEqual([], records)
+        self.assertEqual(0, get_media_calls["n"])
+
+    # 2. Deadline exhausted mid-hydration -> fully-read records returned, no half JSON.
+    def test_deadline_mid_hydration_returns_only_fully_read_records(self):
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 5)
+
+        call_count = {"n": 0}
+
+        def fake_monotonic():
+            call_count["n"] += 1
+            # Allow the first 2 pre-hydration checks through, then expire.
+            return 0.0 if call_count["n"] <= 2 else 1000.0
+
+        with patch("manager.tasks.time.monotonic", side_effect=fake_monotonic):
+            records = store.list_records_bounded("commands", "p1", deadline=500.0, single_request_worst_case=1.0)
+
+        self.assertLess(len(records), 5)
+        for record in records:
+            # Every returned record is a real, fully-parsed document --
+            # never a partial/truncated JSON fragment.
+            self.assertIn("command_id", record)
+            self.assertIn("status", record)
+
+    # 3. Deadline already past -> zero new get_media calls at all.
+    def test_expired_deadline_yields_zero_get_media_calls(self):
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 10)
+
+        get_media_calls = {"n": 0}
+        original = service.transport.get_media
+
+        def counting_get_media(fileId):
+            get_media_calls["n"] += 1
+            return original(fileId)
+
+        service.transport.get_media = counting_get_media
+        try:
+            records = store.list_records_bounded("commands", "p1", deadline=-1.0)
+        finally:
+            service.transport.get_media = original
+
+        self.assertEqual([], records)
+        self.assertEqual(0, get_media_calls["n"])
+
+    # 4. Timing-boundary contract: a hydration is never started if the
+    #    remaining budget is smaller than one worst-case single request,
+    #    even though the deadline has not technically passed yet -- this is
+    #    exactly what prevents a 40s poll budget + 45s transport timeout
+    #    from silently composing into an 85s tick.
+    def test_hydration_never_starts_inside_the_single_request_worst_case_margin(self):
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 3)
+
+        get_media_calls = {"n": 0}
+        original = service.transport.get_media
+
+        def counting_get_media(fileId):
+            get_media_calls["n"] += 1
+            return original(fileId)
+
+        service.transport.get_media = counting_get_media
+
+        def fake_monotonic():
+            # Remaining budget is exactly 10s, less than the 45s worst-case
+            # single-request bound -- deadline itself has NOT passed.
+            return 40.0
+
+        try:
+            with patch("manager.tasks.time.monotonic", side_effect=fake_monotonic):
+                records = store.list_records_bounded("commands", "p1", deadline=50.0, single_request_worst_case=45)
+        finally:
+            service.transport.get_media = original
+
+        # deadline (50.0) had NOT technically passed at "now" (40.0) --
+        # only the worst-case-margin check should have stopped this.
+        self.assertEqual([], records, "must not start a hydration with insufficient worst-case headroom")
+        self.assertEqual(0, get_media_calls["n"])
+
+    # 5. Malformed individual record is skipped, others still returned --
+    #    unlike list_records(), one bad record must not fail the whole call.
+    def test_malformed_record_is_skipped_not_fatal(self):
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 3)
+        # Corrupt one record's raw bytes directly in the fake backend.
+        for file_id, entry in service.transport.items.items():
+            if entry["meta"]["name"].startswith("cmd-001"):
+                entry["raw"] = b"not valid json{{{"
+                break
+
+        records = store.list_records_bounded("commands", "p1")
+        self.assertEqual(2, len(records))
+
+    # No-deadline call is unbounded, like list_records(), and matches its result set.
+    def test_no_deadline_matches_list_records_result_set(self):
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 6)
+
+        bounded = {record["command_id"] for record in store.list_records_bounded("commands", "p1")}
+        unbounded = {record["command_id"] for record in store.list_records("commands", "p1")}
+        self.assertEqual(unbounded, bounded)
+
+
 if __name__ == "__main__": unittest.main()

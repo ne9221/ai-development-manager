@@ -183,12 +183,23 @@ def credentials(allow_interactive=False):
     return credentials_with_source(allow_interactive=allow_interactive)[0]
 
 
-def build_service():
+def build_service(timeout=None):
+    """`timeout`, if given, overrides DRIVE_REQUEST_TIMEOUT_SECONDS for the
+    service this call returns. Every existing caller passes nothing and
+    gets the exact prior behavior (45s) unchanged -- this exists so a
+    caller that specifically needs a SHORTER per-request bound for a
+    read-only subset of its own work (see
+    manager.command_watcher.main()'s separate short-timeout discovery
+    service, used only for pre-launch project/command enumeration, never
+    for writes or active provider lifecycle) can build one without
+    touching the shared 45s timeout every other Drive call in the process
+    still relies on."""
+    resolved_timeout = timeout if timeout is not None else DRIVE_REQUEST_TIMEOUT_SECONDS
     try:
         import httplib2
         from google_auth_httplib2 import AuthorizedHttp
         from googleapiclient.discovery import build
-        http = AuthorizedHttp(credentials(), http=httplib2.Http(timeout=DRIVE_REQUEST_TIMEOUT_SECONDS))
+        http = AuthorizedHttp(credentials(), http=httplib2.Http(timeout=resolved_timeout))
         return build("drive", "v3", http=http, cache_discovery=False)
     except PublisherError:
         raise

@@ -526,7 +526,74 @@ def _enumerate_project_ids(store, deadline=None):
     return [project["project_id"] for project in all_projects(store)]
 
 
-def poll_once(store, service, allowlist=None, deadline=None, **factories):
+# Real production numbers: DRIVE_REQUEST_TIMEOUT_SECONDS (45s, the shared
+# service's per-request transport timeout used for every write and every
+# active-lifecycle Drive call) is LARGER than POLL_TIME_BUDGET_SECONDS
+# (40s). If pre-launch discovery reads used that same 45s bound as their
+# own "don't start a request with less than this much budget left" margin,
+# the margin alone would exceed the entire budget and discovery could never
+# start a single request at all -- a real, provably self-defeating bug
+# caught by this commit's own tests before it ever reached a real HOME
+# tick. The fix is Option B from the task brief: discovery reads get their
+# own, genuinely SHORTER transport timeout, wired through a separate Drive
+# service+DriveRecords built only for this read-only phase (see main()) --
+# never the 45s service used for writes/active lifecycle. With a 10s
+# discovery timeout and a 40s budget, worst case total is budget(40) +
+# one worst-case discovery request(10) = 50s, with 10s to spare before the
+# next 60s Scheduled Task trigger.
+WATCHER_DISCOVERY_TIMEOUT_SECONDS = 10
+
+
+def _rotated_project_ids(project_ids, now=None):
+    """Deterministic, cross-process round-robin rotation of the project
+    enumeration order, based purely on wall-clock time -- never a
+    process-local counter, since each `--once` invocation is a fresh
+    process with no memory of prior ticks.
+
+    Why this exists: once command hydration itself is bounded per-project
+    (list_records_bounded below), a single project with a very large
+    historical Command backlog can still consume the *entire* remaining
+    poll budget on its own hydration, before the outer loop's deadline
+    check ever gets to look at the next project. Left unrotated, whichever
+    project happens to sort first in Drive's folder listing would be that
+    project on every single tick, forever -- permanently starving every
+    other project's commands from ever being discovered. Rotating the
+    starting point by `int(now // POLL_SECONDS) % len(project_ids)`
+    advances "which project goes first" by one approximately every
+    scheduled tick, which gives a provable bound: every project is first
+    at least once within any len(project_ids)-tick window, so no project
+    can be starved forever, without needing any persisted state at all."""
+    if not project_ids:
+        return project_ids
+    now = now if now is not None else time.time()
+    offset = int(now // POLL_SECONDS) % len(project_ids)
+    return project_ids[offset:] + project_ids[:offset]
+
+
+def _enumerate_commands(store, project_id, deadline=None):
+    """Deadline-aware, bounded-hydration command enumeration for one
+    project. Prefers DriveRecords.list_records_bounded() when the store
+    supports it -- see that method's docstring for why the unbounded
+    list_records() this replaced could itself run for minutes on a project
+    with a large historical Command backlog, uninterruptible by any
+    project-level deadline check once started. Falls back to
+    store.list_records("commands", project_id) for any store that doesn't
+    implement the bounded variant (e.g. test doubles), reproducing prior
+    behavior for those callers unchanged.
+
+    `store` here is expected to be whatever discovery-purposed store the
+    caller passed (see poll_once's `discovery_store` parameter) -- its own
+    per-request transport timeout, not this function's business, is what
+    actually determines the real worst case for each get_media() call.
+    single_request_worst_case is passed through unchanged so callers can
+    match it to that store's actual configured timeout."""
+    if hasattr(store, "list_records_bounded"):
+        return store.list_records_bounded("commands", project_id, deadline=deadline,
+                                           single_request_worst_case=WATCHER_DISCOVERY_TIMEOUT_SECONDS)
+    return store.list_records("commands", project_id)
+
+
+def poll_once(store, service, allowlist=None, deadline=None, discovery_store=None, **factories):
     """`deadline`, if given, is a `time.monotonic()` value after which this
     call stops STARTING new project/command work and returns whatever it has
     so far -- any project/command not yet reached this tick is picked up on
@@ -539,22 +606,47 @@ def poll_once(store, service, allowlist=None, deadline=None, **factories):
     command -- always runs to its natural completion regardless of how long
     it legitimately takes.
 
+    `discovery_store`, if given, is used ONLY for the read-only
+    project/command enumeration below -- `store` (and `service`) remain
+    exactly what process_command()/launch_task() use for every claim,
+    write, and active-lifecycle Drive call, completely unaffected. This
+    matters because a real DriveRecords's configured per-request transport
+    timeout is a property of the *service* it was built from, not
+    something this function can override per-call -- main() builds
+    discovery_store from a separate, genuinely-shorter-timeout Drive
+    service (see WATCHER_DISCOVERY_TIMEOUT_SECONDS) specifically so the
+    margin checks in list_project_ids()/list_records_bounded() are checking
+    against a timeout that is actually smaller than the poll budget, not
+    just a smaller number used for bookkeeping while the real transport
+    could still block for the shared 45s. Defaults to `store` when omitted
+    (every existing caller/test), reproducing prior behavior exactly.
+
     Project enumeration itself (_enumerate_project_ids above) is also
     deadline-aware and does not hydrate full project documents -- see its
     docstring for why the earlier all_projects()-based version of this loop
     could not be bounded by this same deadline check at all: the full
     listing+hydration ran to completion before the loop's first iteration
-    was ever reached."""
+    was ever reached. Command enumeration within each project
+    (_enumerate_commands) is likewise deadline-aware and never starts a new
+    per-record Drive hydration that could itself finish after the deadline
+    -- see its docstring and list_records_bounded()'s for the full
+    reasoning. Project order is rotated deterministically by wall-clock
+    time (_rotated_project_ids) so a project with a very large historical
+    Command backlog cannot permanently starve every other project's
+    commands from ever being reached."""
     if allowlist is None:
         allowlist = load_allowlist()
     if deadline is None:
         deadline = time.monotonic() + POLL_TIME_BUDGET_SECONDS
+    if discovery_store is None:
+        discovery_store = store
     results = []
-    for project_id in _enumerate_project_ids(store, deadline=deadline):
+    project_ids = _rotated_project_ids(_enumerate_project_ids(discovery_store, deadline=deadline))
+    for project_id in project_ids:
         if time.monotonic() >= deadline:
             break
         try:
-            commands = store.list_records("commands", project_id)
+            commands = _enumerate_commands(discovery_store, project_id, deadline=deadline)
         except TaskError:
             continue
         for command in commands:
@@ -579,11 +671,20 @@ def main(argv=None):
         try:
             service = build_service()
             store = DriveRecords(service)
+            # Separate, shorter-timeout service+store used ONLY for
+            # poll_once()'s own read-only project/command discovery -- see
+            # WATCHER_DISCOVERY_TIMEOUT_SECONDS and poll_once()'s
+            # `discovery_store` docstring for why this must be a genuinely
+            # different transport, not just a smaller number checked
+            # against the same 45s-timeout `service` used for writes and
+            # active provider lifecycle below.
+            discovery_service = build_service(timeout=WATCHER_DISCOVERY_TIMEOUT_SECONDS)
+            discovery_store = DriveRecords(discovery_service)
             ingress = []
             if os.environ.get("ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID"):
                 from manager.drive_dispatch_ingress import poll_drive_dispatch_requests
                 ingress = poll_drive_dispatch_requests(store, service, os.environ.get("ADM_LOCK_GCS_BUCKET"))
-            result = poll_once(store, service)
+            result = poll_once(store, service, discovery_store=discovery_store)
             print(json.dumps({"status": "ok", "host": socket.gethostname()[:100], "ingress": ingress,
                               "commands": result}, separators=(",", ":")))
         except Exception:

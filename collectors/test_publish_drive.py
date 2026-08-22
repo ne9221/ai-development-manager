@@ -62,6 +62,19 @@ class PublisherTest(unittest.TestCase):
         authorized_http.assert_called_once_with(credentials, http=transport)
         build.assert_called_once_with("drive", "v3", http=authorized, cache_discovery=False)
 
+    def test_build_service_timeout_override_uses_a_genuinely_different_transport_timeout(self):
+        """manager.command_watcher.main() relies on this: a caller that
+        needs a shorter per-request bound than DRIVE_REQUEST_TIMEOUT_SECONDS
+        for a specific read-only subset of its own work must get a real,
+        differently-configured transport, not the shared 45s one."""
+        credentials, transport, authorized, service = object(), object(), object(), object()
+        with patch("collectors.publish_drive.credentials", return_value=credentials), \
+             patch("httplib2.Http", return_value=transport) as http_factory, \
+             patch("google_auth_httplib2.AuthorizedHttp", return_value=authorized), \
+             patch("googleapiclient.discovery.build", return_value=service):
+            self.assertIs(service, build_service(timeout=10))
+        http_factory.assert_called_once_with(timeout=10)
+
     def test_create_and_verify(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / FILE_NAME
