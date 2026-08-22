@@ -998,7 +998,9 @@ class WorkingDirectoryContractTests(unittest.TestCase):
 
         fake_project = ProjectMetadata(
             project_id="p1", display_name="Project", aliases=(), repo={"canonical_url": REPO},
-            default_branch="main", baseline_resolution_policy={}, common_governance={}, project_rules={},
+            default_branch="main", baseline_resolution_policy={},
+            common_governance={"reference": "governance-rules.json"}, project_rules={"reference": "PROJECT-RULES.md"},
+            validation_policy={"required_checks": [{"id": "smoke", "command": [sys.executable, "-c", "pass"]}]},
             working_directory_policy={}, isolation_policy={"mode": "worktree_per_task"}, provider_restrictions={},
             protected_paths=(), default_write_boundaries=("*",), pointer_rules={},
             status="enabled", resolution_status="verified",
@@ -1040,7 +1042,12 @@ class WorkingDirectoryContractTests(unittest.TestCase):
             get_registry.return_value.get_project.return_value = fake_project
             result, launcher = self._launch(store)
 
-        get_registry.return_value.get_project.assert_called_once_with("p1")
+        # Called twice with the same project_id: once to resolve worktree
+        # materialization (Slice C), once more (P0-B) to resolve this
+        # project's authoritative repo-write validation_policy -- both reads
+        # go through the same registry, never a second independent source.
+        get_registry.return_value.get_project.assert_called_with("p1")
+        self.assertEqual(2, get_registry.return_value.get_project.call_count)
         materialize.assert_called_once()
         enforce.assert_called_once_with(materialized, HEAD, ["manager/executions.py"])
         complete.assert_called_once()
@@ -1244,15 +1251,29 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         create_task(store, self._repo_write_task(**(task_overrides or {})), assign=False)
         return store
 
+    def _fake_project_with_validation_checks(self, tests_command):
+        from manager.project_registry import ProjectMetadata
+        return ProjectMetadata(
+            project_id="p1", display_name="Project", aliases=(), repo={"canonical_url": REPO},
+            default_branch="main", baseline_resolution_policy={},
+            common_governance={"reference": "governance-rules.json"}, project_rules={"reference": "PROJECT-RULES.md"},
+            validation_policy={"required_checks": [{"id": "tests", "command": list(tests_command)}]},
+            working_directory_policy={}, isolation_policy={"mode": "worktree_per_task"}, provider_restrictions={},
+            protected_paths=(), default_write_boundaries=("*",), pointer_rules={},
+            status="enabled", resolution_status="verified",
+        )
+
     def _launch(self, store, launcher, tests_command=None):
         tests_command = tests_command or [sys.executable, "-c", "pass"]
+        fake_project = self._fake_project_with_validation_checks(tests_command)
         with patch("manager.execution_runner.dispatch", return_value={
             "recommended_provider": "codex", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
             "generated_prompt": "bounded task",
         }), patch("manager.execution_lifecycle.validate_local_preflight"), \
              patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
              patch("manager.executions.read_drive_status", return_value=quota_document()), \
-             patch("manager.execution_runner._repo_write_tests_command", return_value=tests_command):
+             patch("manager.execution_runner.get_global_registry") as get_registry:
+            get_registry.return_value.get_project.return_value = fake_project
             return launch_task(store, object(), MemoryRegistry(), MemoryClaimRegistry(), launcher,
                                "p1", "t1", "exec-a", provider="codex")
 
@@ -1311,7 +1332,7 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
 
         evidence = result["terminal"]["execution"]["repo_write_completion_evidence"]
         self.assertEqual(["manager/foo.py"], evidence["changed_paths"])
-        self.assertTrue(evidence["tests"]["passed"])
+        self.assertTrue(all(check["passed"] for check in evidence["tests"]))
         self.assertEqual(evidence["commit_sha"], evidence["remote_sha"])
         self.assertEqual(self.branch, evidence["branch"])
         self.assertEqual(self.baseline_head, evidence["baseline_head"])
@@ -1332,6 +1353,38 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         self.assertEqual(self.baseline_head, _git(self.worktree, "rev-parse", "HEAD"))
         self.assertNotEqual("", _git(self.worktree, "status", "--porcelain"))
 
+    def test_absent_authoritative_validation_policy_fails_closed_at_runner_level(self):
+        """Global Hands-off D2 P0-B: a project with no registered
+        validation_policy must never fall back to any generic/default
+        command -- the execution fails closed before anything is committed
+        or pushed, exactly like a real tests-gate failure does."""
+        from manager.project_registry import ProjectMetadata
+
+        store = self._store()
+        no_policy_project = ProjectMetadata(
+            project_id="p1", display_name="Project", aliases=(), repo={"canonical_url": REPO},
+            default_branch="main", baseline_resolution_policy={},
+            common_governance={"reference": "governance-rules.json"}, project_rules={"reference": "PROJECT-RULES.md"},
+            validation_policy={}, working_directory_policy={}, isolation_policy={"mode": "worktree_per_task"},
+            provider_restrictions={}, protected_paths=(), default_write_boundaries=("*",), pointer_rules={},
+            status="enabled", resolution_status="verified",
+        )
+        with patch("manager.execution_runner.dispatch", return_value={
+            "recommended_provider": "codex", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
+            "generated_prompt": "bounded task",
+        }), patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()), \
+             patch("manager.execution_runner.get_global_registry") as get_registry:
+            get_registry.return_value.get_project.return_value = no_policy_project
+            result = launch_task(store, object(), MemoryRegistry(), MemoryClaimRegistry(), self._in_scope_launcher(),
+                                 "p1", "t1", "exec-a", provider="codex")
+
+        self.assertEqual("failed", result["terminal"]["execution"]["status"])
+        self.assertNotEqual("completed", store.get("tasks", "p1", "t1")["status"])
+        self.assertIsNone(self._remote_head(self.branch))
+        self.assertEqual(self.baseline_head, _git(self.worktree, "rev-parse", "HEAD"))
+
     def test_retry_after_full_completion_creates_no_duplicate_commit(self):
         store = self._store()
         first = self._launch(store, self._in_scope_launcher())
@@ -1348,7 +1401,8 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         second_evidence = complete_repo_write_execution(
             working_directory=str(self.worktree), changed_paths=changed, baseline_head=self.baseline_head,
             branch=self.branch, repository=first_evidence["repository"],
-            tests_command=[sys.executable, "-c", "pass"], task_id="t1", execution_id="exec-a-retry",
+            validation_checks=[{"id": "tests", "command": [sys.executable, "-c", "pass"]}],
+            task_id="t1", execution_id="exec-a-retry",
         )
         self.assertFalse(second_evidence["commit_created"])
         self.assertEqual(first_evidence["commit_sha"], second_evidence["commit_sha"])

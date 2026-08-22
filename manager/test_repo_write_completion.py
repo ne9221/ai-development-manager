@@ -8,12 +8,15 @@ import sys
 import pytest
 
 from manager.repo_write_completion import (
+    CommitLineageMismatchError,
     CommitStageMismatchError,
+    EmptyChangesError,
     PushVerificationError,
     TestsGateFailedError,
     complete_repo_write_execution,
     push_and_verify,
     run_tests_gate,
+    run_validation_gate,
     stage_and_commit,
 )
 from manager.tasks import TaskError
@@ -23,6 +26,7 @@ PASS_COMMAND = [sys.executable, "-c", "pass"]
 FAIL_COMMAND = [sys.executable, "-c", "import sys; sys.exit(1)"]
 BRANCH = "refs/heads/feat/p1/t1"
 REPOSITORY = "github:example/project"
+VALIDATION_CHECKS = [{"id": "tests", "command": PASS_COMMAND}]
 
 
 def _git(cwd, *args):
@@ -56,7 +60,7 @@ def repo(tmp_path):
 def _complete(repo, **overrides):
     kwargs = dict(
         working_directory=repo["path"], changed_paths=["manager/foo.py"], baseline_head=repo["baseline"],
-        branch=BRANCH, repository=REPOSITORY, tests_command=PASS_COMMAND, task_id="t1", execution_id="e1",
+        branch=BRANCH, repository=REPOSITORY, validation_checks=VALIDATION_CHECKS, task_id="t1", execution_id="e1",
     )
     kwargs.update(overrides)
     return complete_repo_write_execution(**kwargs)
@@ -74,7 +78,8 @@ def test_happy_path_stages_commits_pushes_and_reads_back_remote(repo):
     assert evidence["branch"] == BRANCH
     assert evidence["repository"] == REPOSITORY
     assert evidence["baseline_head"] == repo["baseline"]
-    assert evidence["tests"]["passed"] is True
+    assert all(check["passed"] for check in evidence["tests"])
+    assert evidence["commit_identity"] == {"task_id": "t1", "execution_id": "e1", "branch": BRANCH}
 
     remote_line = _git(repo["path"], "ls-remote", "origin", BRANCH)
     assert remote_line.split("\t")[0] == evidence["commit_sha"]
@@ -88,7 +93,7 @@ def test_happy_path_stages_commits_pushes_and_reads_back_remote(repo):
 def test_tests_gate_failure_blocks_commit_and_push(repo):
     (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
     with pytest.raises(TestsGateFailedError):
-        _complete(repo, tests_command=FAIL_COMMAND)
+        _complete(repo, validation_checks=[{"id": "tests", "command": FAIL_COMMAND}])
 
     assert _git(repo["path"], "rev-parse", "HEAD") == repo["baseline"]
     assert _git(repo["path"], "status", "--porcelain") != ""
@@ -209,7 +214,7 @@ def test_run_tests_gate_rejects_empty_command(repo):
 
 def test_stage_and_commit_rejects_empty_changed_paths(repo):
     with pytest.raises(TaskError):
-        stage_and_commit(repo["path"], [], "t1", "e1", BRANCH)
+        stage_and_commit(repo["path"], [], "t1", "e1", BRANCH, repo["baseline"])
 
 
 def test_stage_and_commit_mismatch_resets_index(repo):
@@ -223,20 +228,139 @@ def test_stage_and_commit_mismatch_resets_index(repo):
         return result
 
     with pytest.raises(CommitStageMismatchError):
-        stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, runner=over_staging_runner)
+        stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, repo["baseline"], runner=over_staging_runner)
     assert _git(repo["path"], "diff", "--cached", "--name-only") == ""
 
 
 def test_deterministic_commit_message_contains_identity(repo):
     (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
-    stage_and_commit(repo["path"], ["manager/foo.py"], "task-42", "exec-99", BRANCH)
+    stage_and_commit(repo["path"], ["manager/foo.py"], "task-42", "exec-99", BRANCH, repo["baseline"])
     message = _git(repo["path"], "log", "-1", "--format=%B")
     assert "task-42" in message and "exec-99" in message and "manager/foo.py" in message
 
 
 def test_push_and_verify_no_op_when_remote_already_up_to_date(repo):
     (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
-    commit = stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH)
+    commit = stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, repo["baseline"])
     first_sha = push_and_verify(repo["path"], BRANCH, commit["commit_sha"])
     second_sha = push_and_verify(repo["path"], BRANCH, commit["commit_sha"])
     assert first_sha == second_sha == commit["commit_sha"]
+
+
+# --- P0-A: clean-worktree fake completion can never be inferred from ------
+# --- clean/dirty status alone -- it must be proven from real git lineage --
+
+def test_clean_worktree_with_head_equal_to_baseline_is_empty_changes_not_success(repo):
+    # No edit was ever made: the worktree is clean and HEAD is still exactly
+    # baseline_head. The old logic treated "clean" alone as proof of a
+    # completed repo-write; this must terminalize as a genuine no-op.
+    with pytest.raises(EmptyChangesError):
+        stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, repo["baseline"])
+
+
+def test_clean_worktree_with_a_valid_prior_task_commit_is_eligible_for_reuse(repo):
+    (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    first = stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, repo["baseline"])
+    assert first["created"] is True
+
+    second = stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e2", BRANCH, repo["baseline"])
+    assert second["created"] is False
+    assert second["commit_sha"] == first["commit_sha"]
+
+
+def test_dirty_worktree_whose_head_already_diverged_from_baseline_fails_closed(repo):
+    # Something else committed on top of baseline_head (simulated here by
+    # committing directly) before this call ever ran; the worktree is also
+    # left dirty with an in-scope edit on top of that unexpected commit.
+    # Building a completion commit on unproven lineage must be refused.
+    _git(repo["path"], "commit", "--allow-empty", "-m", "unexpected commit")
+    (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    with pytest.raises(CommitLineageMismatchError):
+        stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, repo["baseline"])
+
+
+def test_clean_worktree_with_an_unrelated_commit_is_rejected(repo):
+    # HEAD advanced past baseline_head, but via a commit that carries none of
+    # this module's own completion-commit identity -- an unrelated commit
+    # must never be silently accepted as this execution's completion.
+    _git(repo["path"], "commit", "--allow-empty", "-m", "totally unrelated commit")
+    with pytest.raises(CommitLineageMismatchError):
+        stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, repo["baseline"])
+
+
+def test_clean_worktree_with_wrong_task_identity_is_rejected(repo):
+    (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    stage_and_commit(repo["path"], ["manager/foo.py"], "other-task", "e1", BRANCH, repo["baseline"])
+    with pytest.raises(CommitLineageMismatchError):
+        stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, repo["baseline"])
+
+
+def test_clean_worktree_with_wrong_branch_identity_is_rejected(repo):
+    (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", "refs/heads/feat/p1/other-task", repo["baseline"])
+    with pytest.raises(CommitLineageMismatchError):
+        stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, repo["baseline"])
+
+
+def test_reused_prior_task_commit_from_a_different_task_is_rejected(repo):
+    # A different task's already-completed commit sits at HEAD (e.g. from a
+    # shared/contaminated worktree); this task's own baseline_head is the
+    # same starting point, so worktree-clean-with-advanced-HEAD alone must
+    # not be treated as *this* task's own completion.
+    (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    stage_and_commit(repo["path"], ["manager/foo.py"], "t2-prior-task", "e-prior", BRANCH, repo["baseline"])
+    with pytest.raises(CommitLineageMismatchError):
+        stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, repo["baseline"])
+
+
+def test_lineage_identity_persists_onto_completion_evidence(repo):
+    (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    evidence = _complete(repo)
+    assert evidence["commit_identity"] == {"task_id": "t1", "execution_id": "e1", "branch": BRANCH}
+
+    # A genuine retry with a fresh execution_id reuses the same commit and
+    # the evidence still correctly attributes it to the originating
+    # execution_id "e1", never falsely restamped as newly created by "e2".
+    reused = complete_repo_write_execution(
+        working_directory=repo["path"], changed_paths=["manager/foo.py"], baseline_head=repo["baseline"],
+        branch=BRANCH, repository=REPOSITORY, validation_checks=VALIDATION_CHECKS, task_id="t1", execution_id="e2",
+    )
+    assert reused["commit_created"] is False
+    assert reused["commit_identity"] == {"task_id": "t1", "execution_id": "e1", "branch": BRANCH}
+
+
+def test_retry_reconciliation_never_converts_a_prior_tests_failure_into_fake_success(repo):
+    (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    with pytest.raises(TestsGateFailedError):
+        _complete(repo, validation_checks=[{"id": "tests", "command": FAIL_COMMAND}])
+    # The failed attempt committed nothing and pushed nothing.
+    assert _git(repo["path"], "rev-parse", "HEAD") == repo["baseline"]
+    assert _git(repo["path"], "ls-remote", "origin", BRANCH) == ""
+
+    # A genuine retry must run the real validation gate again -- it can
+    # never reconcile the prior failure into a fake success just because a
+    # later attempt is made.
+    retried = _complete(repo)
+    assert retried["commit_created"] is True
+    assert all(check["passed"] for check in retried["tests"])
+
+
+def test_run_validation_gate_enforces_every_required_check_in_order(repo):
+    evidence = run_validation_gate(repo["path"], [
+        {"id": "first", "command": PASS_COMMAND}, {"id": "second", "command": PASS_COMMAND},
+    ])
+    assert [item["id"] for item in evidence] == ["first", "second"]
+    assert all(item["passed"] for item in evidence)
+
+
+def test_run_validation_gate_fails_on_first_failing_required_check(repo):
+    with pytest.raises(TestsGateFailedError) as exc_info:
+        run_validation_gate(repo["path"], [
+            {"id": "first", "command": PASS_COMMAND}, {"id": "second", "command": FAIL_COMMAND},
+        ])
+    assert exc_info.value.evidence["id"] == "second"
+
+
+def test_run_validation_gate_rejects_empty_check_list(repo):
+    with pytest.raises(TaskError):
+        run_validation_gate(repo["path"], [])
