@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Manager Autonomous Continuation Chain",
+  "description": "Foundation-only state/data contract for the hands-off dispatch -> evidence -> validate -> next-task loop. Records here are decision-engine bookkeeping; they never represent a provider launch by themselves.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "chain_id", "request_id", "project_id", "state",
+    "task_id", "execution_id", "session_id", "handoff_id",
+    "depth", "max_depth", "retry_count", "max_retries",
+    "created_at", "updated_at", "last_reason", "history"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "chain_id": {"type": "string", "minLength": 1, "description": "Stable identity for one autonomous continuation lineage; carried across every task/execution the chain dispatches."},
+    "request_id": {"type": "string", "minLength": 1, "description": "Originating dispatch request id; used for duplicate-authority detection."},
+    "project_id": {"type": "string", "minLength": 1},
+    "state": {
+      "enum": [
+        "idle", "task_planned", "dispatching", "queued", "running",
+        "awaiting_evidence", "validating", "pass", "fail", "blocked",
+        "next_task_ready", "stop_requires_user"
+      ]
+    },
+    "task_id": {"type": ["string", "null"], "minLength": 1},
+    "execution_id": {"type": ["string", "null"], "minLength": 1},
+    "session_id": {"type": ["string", "null"], "minLength": 1},
+    "handoff_id": {"type": ["string", "null"], "minLength": 1},
+    "depth": {"type": "integer", "minimum": 0, "description": "Number of automatic continuations already taken in this chain."},
+    "max_depth": {"type": "integer", "minimum": 1, "description": "Configurable ceiling on automatic continuation depth."},
+    "retry_count": {"type": "integer", "minimum": 0, "description": "Bounded retry counter for the current task slice."},
+    "max_retries": {"type": "integer", "minimum": 0, "description": "Configurable ceiling on bounded automatic retries per slice."},
+    "is_production_mutating": {"type": "boolean", "description": "Whether the current/candidate slice writes to production; drives the single-writer mutual-exclusion gate."},
+    "action_kind": {
+      "type": ["string", "null"],
+      "enum": ["prework", "read_only", "implementation", "production_deploy", "auth", "payment", "irreversible", null],
+      "description": "Classifies the current/candidate slice for the irreversible-action stop gate."
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "last_reason": {"type": ["string", "null"], "maxLength": 500},
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["at", "event", "from_state", "to_state", "reason"],
+        "properties": {
+          "at": {"type": "string", "format": "date-time"},
+          "event": {"type": "string", "minLength": 1},
+          "from_state": {"type": "string", "minLength": 1},
+          "to_state": {"type": "string", "minLength": 1},
+          "reason": {"type": "string", "maxLength": 500}
+        }
+      }
+    }
+  }
+}
