@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -1019,20 +1020,31 @@ class WorkingDirectoryContractTests(unittest.TestCase):
             update_task(store_arg, "p1", "t1", **materialized_result)
             return dict(materialized_result)
 
+        completion_evidence = {
+            "changed_paths": ["manager/executions.py"], "tests": {"passed": True}, "commit_sha": "c" * 40,
+            "commit_created": True, "remote_sha": "c" * 40, "branch": "refs/heads/adm-worktree/p1/t1",
+            "repository": "github:example/project", "baseline_head": HEAD,
+        }
         with patch("manager.execution_runner.get_global_registry") as get_registry, \
              patch("manager.execution_runner.materialize_worktree", side_effect=fake_materialize) as materialize, \
-             patch("manager.execution_runner.enforce_allowed_paths", return_value=[]) as enforce:
+             patch("manager.execution_runner.enforce_allowed_paths", return_value=["manager/executions.py"]) as enforce, \
+             patch("manager.execution_runner.complete_repo_write_execution", return_value=completion_evidence) as complete:
             # Slice D's actual allowed_paths enforcement (real git diff
             # against an isolated worktree) is covered end-to-end in
-            # manager.test_repo_write_enforcement; this test's own concern is
-            # purely the working_directory wiring, so it stubs enforcement
-            # to a clean no-op rather than needing a real git repo here too.
+            # manager.test_repo_write_enforcement, and D2's real tests/
+            # commit/push sequence is covered end-to-end in
+            # manager.test_repo_write_completion and
+            # RealGitAllowedPathsEnforcementIntegrationTests below; this
+            # test's own concern is purely the working_directory wiring, so
+            # both are stubbed rather than needing a real git repo here too.
             get_registry.return_value.get_project.return_value = fake_project
             result, launcher = self._launch(store)
 
         get_registry.return_value.get_project.assert_called_once_with("p1")
         materialize.assert_called_once()
         enforce.assert_called_once_with(materialized, HEAD, ["manager/executions.py"])
+        complete.assert_called_once()
+        self.assertEqual(completion_evidence, result["terminal"]["execution"]["repo_write_completion_evidence"])
         self.assertEqual(materialized, launcher.request.working_directory)
         self.assertNotEqual(self.valid_dir, launcher.request.working_directory)
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
@@ -1171,9 +1183,11 @@ def _git(cwd, *args):
 
 class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
     """End-to-end proof (real git, real launch_task() pipeline, no mocked
-    enforcement) of Slice D: a provider that actually writes outside its
+    enforcement) of Slice D + D2: a provider that actually writes outside its
     Task's allowed_paths inside its isolated worktree can never have that
-    execution -- or its Task -- persisted as successfully completed."""
+    execution -- or its Task -- persisted as successfully completed, and a
+    provider that stays in scope is genuinely tested, committed, pushed, and
+    remote-verified before it is."""
 
     def setUp(self):
         self.repo_dir = tempfile.TemporaryDirectory()
@@ -1191,6 +1205,14 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         _git(root, "commit", "-m", "init")
         self.worktree = root
         self.baseline_head = _git(root, "rev-parse", "HEAD")
+        self.branch = "refs/heads/feat/p1/t1"
+
+        self.origin_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.origin_dir.cleanup)
+        self.origin = Path(self.origin_dir.name).resolve()
+        subprocess.run(["git", "init", "--bare", str(self.origin)], check=True, capture_output=True)
+        _git(root, "remote", "add", "origin", str(self.origin))
+        _git(root, "push", "origin", "main")
 
         self.lock_home = tempfile.TemporaryDirectory()
         self.addCleanup(self.lock_home.cleanup)
@@ -1198,37 +1220,46 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         self._lock_home_patch.start()
         self.addCleanup(self._lock_home_patch.stop)
 
-    def _repo_write_task(self):
-        return {
+    def _repo_write_task(self, **overrides):
+        document = {
             "task_id": "t1", "project_id": "p1", "title": "Bounded write task", "task_type": "implementation",
             "complexity": "medium", "expected_minutes": 20, "needs_repo_edit": True,
             "needs_research": False, "needs_browser": False, "parallelizable": False,
             "read_only": False, "scope": ["manager/foo.py"], "constraints": [],
-            "acceptance_criteria": ["gate"], "branch": "refs/heads/main", "baseline_head": self.baseline_head,
+            "acceptance_criteria": ["gate"], "branch": self.branch, "baseline_head": self.baseline_head,
             "working_directory": str(self.worktree), "worktree_id": "p1--t1",
             "allowed_paths": ["manager/foo.py"],
             "execution_policies": ["disposable", "bounded_repo_write", "no_external_writes"],
         }
+        document.update(overrides)
+        return document
 
-    def _store(self):
+    def _store(self, task_overrides=None):
         store = MemoryStore()
         create_project(store, {
             "project_id": "p1", "name": "Project", "repo": REPO, "default_branch": "main",
             "runtime_ssot": "Drive", "project_rules": [], "active_tasks": ["t1"],
             "current_phase": "Phase 3C", "important_constraints": [],
         })
-        create_task(store, self._repo_write_task(), assign=False)
+        create_task(store, self._repo_write_task(**(task_overrides or {})), assign=False)
         return store
 
-    def _launch(self, store, launcher):
+    def _launch(self, store, launcher, tests_command=None):
+        tests_command = tests_command or [sys.executable, "-c", "pass"]
         with patch("manager.execution_runner.dispatch", return_value={
             "recommended_provider": "codex", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
             "generated_prompt": "bounded task",
         }), patch("manager.execution_lifecycle.validate_local_preflight"), \
              patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
-             patch("manager.executions.read_drive_status", return_value=quota_document()):
+             patch("manager.executions.read_drive_status", return_value=quota_document()), \
+             patch("manager.execution_runner._repo_write_tests_command", return_value=tests_command):
             return launch_task(store, object(), MemoryRegistry(), MemoryClaimRegistry(), launcher,
                                "p1", "t1", "exec-a", provider="codex")
+
+    def _remote_head(self, branch):
+        result = subprocess.run(["git", "ls-remote", str(self.origin), branch], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip().split("\t")[0] if result.stdout.strip() else None
 
     def test_out_of_scope_write_is_rejected_and_never_completes(self):
         class OutOfScopeLauncher(Launcher):
@@ -1244,11 +1275,15 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         self.assertIn("other/bar.py", result["terminal"]["execution"]["notes"][-1])
         # The Task itself must not be persisted as completed either.
         self.assertNotEqual("completed", store.get("tasks", "p1", "t1")["status"])
+        # No commit was ever created and nothing was ever pushed -- D2's
+        # tests/stage/commit/push sequence never even started.
+        self.assertEqual(self.baseline_head, _git(self.worktree, "rev-parse", "HEAD"))
+        self.assertIsNone(self._remote_head(self.branch))
+        self.assertIsNone(result["terminal"]["execution"].get("repo_write_completion_evidence"))
 
     def test_out_of_scope_write_blocks_downstream_success_style_hook(self):
-        """No future commit/push step -- represented here by a stub only a
-        genuinely successful launch_task() call would be free to invoke --
-        can ever run after an out-of-scope write."""
+        """D2's real tests/commit/push sequence -- exercised for real by the
+        sibling test below -- can never run after an out-of-scope write."""
         class OutOfScopeLauncher(Launcher):
             def wait(self, running):
                 (Path(self.request.working_directory) / "escaped.py").write_text("hacked\n", encoding="utf-8")
@@ -1257,22 +1292,82 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         store = self._store()
         result = self._launch(store, OutOfScopeLauncher())
 
-        commit_and_push_calls = []
-        if result["terminal"]["execution"]["status"] == "completed":
-            commit_and_push_calls.append("called")  # would be the real future hook
-        self.assertEqual([], commit_and_push_calls)
+        self.assertNotEqual("completed", result["terminal"]["execution"]["status"])
+        self.assertIsNone(self._remote_head(self.branch))
 
-    def test_in_scope_write_completes_normally(self):
+    def _in_scope_launcher(self):
         class InScopeLauncher(Launcher):
             def wait(self, running):
                 (Path(self.request.working_directory) / "manager" / "foo.py").write_text("edited\n", encoding="utf-8")
                 return super().wait(running)
+        return InScopeLauncher()
 
+    def test_in_scope_write_completes_normally(self):
         store = self._store()
-        result = self._launch(store, InScopeLauncher())
+        result = self._launch(store, self._in_scope_launcher())
 
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
         self.assertEqual("completed", store.get("tasks", "p1", "t1")["status"])
+
+        evidence = result["terminal"]["execution"]["repo_write_completion_evidence"]
+        self.assertEqual(["manager/foo.py"], evidence["changed_paths"])
+        self.assertTrue(evidence["tests"]["passed"])
+        self.assertEqual(evidence["commit_sha"], evidence["remote_sha"])
+        self.assertEqual(self.branch, evidence["branch"])
+        self.assertEqual(self.baseline_head, evidence["baseline_head"])
+        # Genuinely landed on the real bare remote, not just claimed locally.
+        self.assertEqual(evidence["commit_sha"], self._remote_head(self.branch))
+        self.assertNotEqual(self.baseline_head, evidence["commit_sha"])
+        # main is untouched -- only the task's own isolated branch moved.
+        self.assertEqual(self.baseline_head, self._remote_head("refs/heads/main"))
+
+    def test_tests_gate_failure_blocks_completion_and_push(self):
+        store = self._store()
+        result = self._launch(store, self._in_scope_launcher(), tests_command=[sys.executable, "-c", "import sys; sys.exit(1)"])
+
+        self.assertEqual("failed", result["terminal"]["execution"]["status"])
+        self.assertNotEqual("completed", store.get("tasks", "p1", "t1")["status"])
+        self.assertIsNone(self._remote_head(self.branch))
+        # A real change was made and left uncommitted, in scope but untested.
+        self.assertEqual(self.baseline_head, _git(self.worktree, "rev-parse", "HEAD"))
+        self.assertNotEqual("", _git(self.worktree, "status", "--porcelain"))
+
+    def test_retry_after_full_completion_creates_no_duplicate_commit(self):
+        store = self._store()
+        first = self._launch(store, self._in_scope_launcher())
+        first_evidence = first["terminal"]["execution"]["repo_write_completion_evidence"]
+        commit_count_before = _git(self.worktree, "rev-list", "--count", "HEAD")
+
+        # A second real run_execution() over the same reserved/isolated
+        # worktree (as a retry against the same task branch would be) must
+        # reuse the exact same commit rather than creating a second one.
+        from manager.execution_runner import complete_repo_write_execution
+        from manager.repo_write_enforcement import enforce_allowed_paths
+
+        changed = enforce_allowed_paths(self.worktree, self.baseline_head, ["manager/foo.py"])
+        second_evidence = complete_repo_write_execution(
+            working_directory=str(self.worktree), changed_paths=changed, baseline_head=self.baseline_head,
+            branch=self.branch, repository=first_evidence["repository"],
+            tests_command=[sys.executable, "-c", "pass"], task_id="t1", execution_id="exec-a-retry",
+        )
+        self.assertFalse(second_evidence["commit_created"])
+        self.assertEqual(first_evidence["commit_sha"], second_evidence["commit_sha"])
+        self.assertEqual(first_evidence["remote_sha"], second_evidence["remote_sha"])
+        self.assertEqual(commit_count_before, _git(self.worktree, "rev-list", "--count", "HEAD"))
+
+    def test_legacy_non_bounded_task_never_runs_commit_or_push(self):
+        # A Task without genuine v2-repo-write admission evidence (here:
+        # missing execution_policies, mirroring a pre-Slice-A/legacy record)
+        # must complete exactly as before -- no tests gate, no commit, no
+        # push -- even though it is production_write and even though the
+        # provider legitimately edited a file in its working_directory.
+        store = self._store(task_overrides={"execution_policies": []})
+        result = self._launch(store, self._in_scope_launcher())
+
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+        self.assertIsNone(result["terminal"]["execution"].get("repo_write_completion_evidence"))
+        self.assertIsNone(self._remote_head(self.branch))
+        self.assertEqual(self.baseline_head, _git(self.worktree, "rev-parse", "HEAD"))
 
 
 if __name__ == "__main__":

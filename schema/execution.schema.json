@@ -131,6 +131,10 @@
       "type": ["object", "null"],
       "description": "Bounded terminal cleanup audit; never contains a lease token."
     },
+    "repo_write_completion_evidence": {
+      "type": ["object", "null"],
+      "description": "D2 terminal-completion evidence for a bounded repo-write execution: changed_paths, tests, commit_sha, remote_sha, branch, repository, baseline_head. Null for read-only/legacy executions."
+    },
     "notes": {"type": "array", "items": {"type": "string"}},
     "task_snapshot": {"type": "object"}
   }
