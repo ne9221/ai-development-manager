@@ -19,6 +19,7 @@ from manager.project_registry import (
     load_project_registry,
     normalize_identifier,
     normalize_repo_identity,
+    resolve_authoritative_working_directory,
 )
 
 
@@ -359,4 +360,40 @@ def test_project_registry_schema_validation():
     
     # jsonschema.validate raises ValidationError if invalid
     jsonschema.validate(instance=registry_data, schema=schema)
+
+
+# -- P0: fix/direct-dispatch-working-directory-authority-p0-20260822 --
+# resolve_authoritative_working_directory() must never let a stale literal
+# path (e.g. a Drive Project record's own unmaintained working_directory
+# field) survive as production authority once the Global Project Registry
+# can resolve the current checkout itself, while never regressing a project
+# that isn't registered or whose workspace env var isn't configured on this
+# machine.
+
+def test_registered_project_with_workspace_root_ignores_stale_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("ADM_WORKSPACE_ROOT", str(tmp_path))
+    resolved = resolve_authoritative_working_directory(
+        "ai-development-manager", fallback="C:/stale/two-days-old/checkout"
+    )
+    assert resolved == str(tmp_path / "ai-development-manager")
+    assert resolved != "C:/stale/two-days-old/checkout"
+
+
+def test_registered_project_without_workspace_root_falls_back_unchanged(monkeypatch):
+    monkeypatch.delenv("ADM_WORKSPACE_ROOT", raising=False)
+    resolved = resolve_authoritative_working_directory(
+        "ai-development-manager", fallback="C:/legacy/literal/checkout"
+    )
+    assert resolved == "C:/legacy/literal/checkout"
+
+
+def test_unregistered_project_falls_back_unchanged(monkeypatch, tmp_path):
+    monkeypatch.setenv("ADM_WORKSPACE_ROOT", str(tmp_path))
+    resolved = resolve_authoritative_working_directory("not-a-registered-project-id", fallback="C:/whatever")
+    assert resolved == "C:/whatever"
+
+
+def test_no_fallback_and_unregistered_returns_none(monkeypatch):
+    monkeypatch.delenv("ADM_WORKSPACE_ROOT", raising=False)
+    assert resolve_authoritative_working_directory("not-a-registered-project-id") is None
 

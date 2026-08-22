@@ -109,6 +109,20 @@ class TaskTests(unittest.TestCase):
         task = update_task(self.store, task["project_id"], task["task_id"], status="blocked", blocked_reason="Needs handoff")
         self.assertEqual("Needs handoff", task["blocked_reason"])
 
+    def test_update_task_ignores_none_by_default(self):
+        task = self.create()
+        task = update_task(self.store, task["project_id"], task["task_id"], working_directory="C:/checkout")
+        self.assertEqual("C:/checkout", task["working_directory"])
+        task = update_task(self.store, task["project_id"], task["task_id"], working_directory=None, current_progress="still going")
+        self.assertEqual("C:/checkout", task["working_directory"])
+
+    def test_update_task_clear_explicitly_resets_a_field_to_none(self):
+        task = self.create()
+        task = update_task(self.store, task["project_id"], task["task_id"], working_directory="C:/checkout")
+        self.assertEqual("C:/checkout", task["working_directory"])
+        task = update_task(self.store, task["project_id"], task["task_id"], clear=("working_directory",), current_progress="reset for worktree materialization")
+        self.assertIsNone(task["working_directory"])
+
     def test_provider_and_session_handoffs_are_minimal(self):
         first_data = handoff_input(); first_data["created_at"] = "2026-08-09T00:00:00Z"
         first = create_handoff(self.store, first_data)

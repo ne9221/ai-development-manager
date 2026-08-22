@@ -12,6 +12,7 @@ from manager.assignment import CAPABILITIES, decide
 from manager.estimator import estimate
 from manager.executions import list_executions
 from manager.governance import MANDATORY_STATUS_FIELDS, STATUS_FIELD_LABELS, rendered_rules, validate_task_enforcement
+from manager.project_registry import resolve_authoritative_working_directory
 from manager.quota_reader import EXPECTED_PROVIDERS, read_drive_status, summarize, unknown_account_summary
 from manager.rules_manifest import injection_lines, mandatory_rules, validate_prompt_injection, validate_research_gate
 from manager.tasks import DriveRecords, TaskError, create_task, safe_id, validate
@@ -178,15 +179,23 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
         "task_id": safe_id(request.get("task_id") or re.sub(r"[^a-z0-9]+", "-", request["title"].lower()).strip("-")),
         "project_id": request["project_id"], "title": request["title"], "task_type": request["task_type"], "complexity": request["complexity"],
         "expected_minutes": request.get("expected_minutes") or 20, "needs_repo_edit": request.get("needs_repo_edit", True), "needs_research": request.get("needs_research", False), "needs_browser": request.get("needs_browser", False), "parallelizable": request.get("parallelizable", False),
-        # Resolved from the already-loaded, server-side Project record only --
-        # never from `request` (Direct Dispatch's own payload allowlist has no
+        # Resolved via the Global Project Registry's machine-local workspace
+        # convention (ADM_WORKSPACE_ROOT + the project's registered
+        # relative_path) when available -- never taken at face value from
+        # `request` (Direct Dispatch's own payload allowlist has no
         # working_directory field, and this must stay true even if that ever
-        # changes). This is a one-time, dispatch-time snapshot: once a Task
-        # exists, this branch never runs again for it, so a later edit to
-        # Project.working_directory cannot silently drift an already-dispatched
-        # or retried Task (manager.execution_runner.launch_task() relies on
-        # this immutability for its own legacy-fallback backfill).
-        "working_directory": project.get("working_directory"),
+        # changes). The Drive Project record's own `working_directory`
+        # literal is only used as a fallback for a project that isn't
+        # registered yet: nothing keeps that literal synchronized with the
+        # actual current checkout, so it must never be trusted as
+        # authoritative once the registry can resolve the path itself (see
+        # fix/direct-dispatch-working-directory-authority-p0-20260822).
+        # This is a one-time, dispatch-time snapshot: once a Task exists,
+        # this branch never runs again for it, so a later change to either
+        # source cannot silently drift an already-dispatched or retried Task
+        # (manager.execution_runner.launch_task() relies on this immutability
+        # for its own legacy-fallback backfill).
+        "working_directory": resolve_authoritative_working_directory(request["project_id"], project.get("working_directory")),
         "scope": request.get("scope", []), "constraints": request.get("constraints", []), "acceptance_criteria": request.get("acceptance_criteria", []), "source_context": request.get("source_context", {}),
         "current_progress": "Not started", "next_action": "Confirm dispatch recommendation",
     }

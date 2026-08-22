@@ -82,6 +82,69 @@ function Test-AdmWatcherTaskIdentity {
     return $runnerExact -and $repositoryExact
 }
 
+function Set-AdmPersistentUserEnvironmentVariable {
+    # Thin wrapper around the static [Environment]::SetEnvironmentVariable
+    # call so Pester (which can only mock cmdlets/functions, never a static
+    # .NET method invocation) can intercept this in tests instead of a test
+    # run silently persisting a real registry-level User environment
+    # variable on whatever machine runs the test suite.
+    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Value)
+    [Environment]::SetEnvironmentVariable($Name, $Value, "User")
+}
+
+function Set-AdmWorkspacePointer {
+    # Establishes the stable, machine-local pointer that
+    # manager.project_registry.resolve_authoritative_working_directory()
+    # resolves against (ADM_WORKSPACE_ROOT + the project's registered
+    # relative_path -- see project-registry.json). Without this, dispatch
+    # falls back to whatever literal path is stored in the Drive Project
+    # record, which nothing else keeps in sync with the checkout actually in
+    # use -- the root cause behind
+    # fix/direct-dispatch-working-directory-authority-p0-20260822 (a Task
+    # was launched inside a two-day-stale scratch checkout because the
+    # Drive record was never updated after this repository moved).
+    #
+    # Persists ADM_WORKSPACE_ROOT as a durable User environment variable (so
+    # it's inherited by the Scheduled Tasks' own future process launches,
+    # not just this interactive session) and refreshes a directory junction
+    # at <workspace root>\<ProjectId> to point at the repository this
+    # launcher is actually running from. Only ever repoints a junction this
+    # function itself created (or an already-correct one) -- fails closed if
+    # that path exists as anything else, exactly like
+    # manager.worktree_materializer's own ownership-marker fail-closed
+    # pattern, so this can never silently delete or hijack a real directory.
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryPath,
+        [Parameter(Mandatory = $true)][string]$ProjectId
+    )
+    $repository = [IO.Path]::GetFullPath($RepositoryPath).TrimEnd('\')
+    $workspaceRoot = if ($env:ADM_WORKSPACE_ROOT) {
+        [IO.Path]::GetFullPath($env:ADM_WORKSPACE_ROOT).TrimEnd('\')
+    } else {
+        (Split-Path -Path $repository -Parent).TrimEnd('\')
+    }
+
+    if ($env:ADM_WORKSPACE_ROOT -ne $workspaceRoot) {
+        Set-AdmPersistentUserEnvironmentVariable -Name "ADM_WORKSPACE_ROOT" -Value $workspaceRoot
+        $env:ADM_WORKSPACE_ROOT = $workspaceRoot
+    }
+
+    $pointerPath = Join-Path $workspaceRoot $ProjectId
+    $existing = Get-Item -LiteralPath $pointerPath -ErrorAction SilentlyContinue
+    if ($existing) {
+        if ($existing.LinkType -ne "Junction") {
+            throw "Refusing to manage workspace pointer at $pointerPath -- it already exists and is not an ADM-managed junction (found: $($existing.GetType().Name), LinkType=$($existing.LinkType))"
+        }
+        $currentTarget = [IO.Path]::GetFullPath(@($existing.Target)[0]).TrimEnd('\')
+        if ($currentTarget -eq $repository) {
+            return $pointerPath
+        }
+        Remove-Item -LiteralPath $pointerPath -Force
+    }
+    New-Item -ItemType Junction -Path $pointerPath -Target $repository -ErrorAction Stop | Out-Null
+    return $pointerPath
+}
+
 function Confirm-AdmWatcherTaskIdentity {
     param([Parameter(Mandatory = $true)][string]$RepositoryPath)
     $task = Get-ScheduledTask -TaskName $AdmWatcherTask -ErrorAction SilentlyContinue

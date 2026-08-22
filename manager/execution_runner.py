@@ -20,7 +20,7 @@ from manager.dispatcher import dispatch
 from manager.execution_lifecycle import enter_running_gate, terminalize_execution
 from manager.executions import MAX_HARD_TIMEOUT_SECONDS, heartbeat_execution, hard_timeout_seconds, link_execution_session, reserve_execution
 from manager.gcs_lock_registry import GCSLockRegistry
-from manager.project_registry import get_global_registry
+from manager.project_registry import get_global_registry, resolve_authoritative_working_directory
 from manager.quota_reader import read_drive_status
 from manager.repo_write_enforcement import enforce_allowed_paths, is_bounded_repo_write_snapshot
 from manager.session_identity import manager_session_key
@@ -193,17 +193,22 @@ def _resolve_working_directory(store, task):
     manager.dispatcher.dispatch() snapshots working_directory onto every Task
     it creates going forward, so this is normally a pass-through read of the
     Task's own value. A Task persisted before that contract existed has no
-    such field; only then does this fall back to reading the Task's Project
-    (never any caller-supplied value -- there is none available here) --
-    except for a Task carrying genuine v2-repo-write admission evidence,
-    which is never allowed to fall back to the shared canonical checkout and
-    instead materializes (or reuses) its own isolated worktree (Slice C). The
+    such field; only then does this fall back to the same
+    resolve_authoritative_working_directory() the dispatcher itself uses --
+    never any caller-supplied value (there is none available here), and
+    never the Drive Project record's raw `working_directory` literal taken
+    at face value, since nothing keeps that literal synchronized with the
+    actual current checkout (see
+    fix/direct-dispatch-working-directory-authority-p0-20260822) -- except
+    for a Task carrying genuine v2-repo-write admission evidence, which is
+    never allowed to fall back to the shared canonical checkout and instead
+    materializes (or reuses) its own isolated worktree (Slice C). The
     resolved value is validated (string, absolute, existing directory) before
     it is trusted, and only *then* backfilled onto the Task record itself, so
-    a bad Project value is never persisted, and every later launch/retry of
-    this same Task reuses this Task's own snapshot instead of re-reading
-    Project again (matching the immutable-snapshot guarantee dispatch()
-    already provides for a Task that had the field from creation).
+    a bad value is never persisted, and every later launch/retry of this
+    same Task reuses this Task's own snapshot instead of re-resolving it
+    again (matching the immutable-snapshot guarantee dispatch() already
+    provides for a Task that had the field from creation).
     """
     value = task.get("working_directory")
     from_project = False
@@ -211,7 +216,7 @@ def _resolve_working_directory(store, task):
         value = _materialize_repo_write_working_directory(store, task)
     if value is None:
         project = store.get("projects", task["project_id"], task["project_id"])
-        value = project.get("working_directory")
+        value = resolve_authoritative_working_directory(task["project_id"], project.get("working_directory"))
         from_project = True
     if not isinstance(value, str) or not value.strip():
         raise TaskError(f"no working_directory is configured for task {task['task_id']!r} or its project")
