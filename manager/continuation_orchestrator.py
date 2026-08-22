@@ -86,12 +86,20 @@ def load_chain(store, project_id, chain_id):
 def _new_slice(record, request_id, timestamp):
     if request_id is None:
         raise ContinuationError("a new slice requires its own dispatch request_id")
-    if request_id == record["root_request_id"]:
-        raise ContinuationError("a new slice must not reuse the root/origin request_id as its idempotency key")
+    slice_index = len(record["slices"])
+    # Slice 0 is the chain's original dispatch: it MAY use root_request_id
+    # as its own request_id (the common case -- the chain's first slice IS
+    # that originating dispatch, not a distinct idempotency key). Every
+    # automatic continuation (slice_index >= 1) is a NEW dispatch decision
+    # the user never manually requested, so it MUST mint its own distinct
+    # request_id and may never fall back to the root id or any earlier
+    # slice's id.
+    if slice_index >= 1 and request_id == record["root_request_id"]:
+        raise ContinuationError("an automatic continuation slice must not reuse the root/origin request_id as its idempotency key")
     if any(existing["request_id"] == request_id for existing in record["slices"]):
         raise ContinuationError(f"dispatch request_id already used by an earlier slice in this chain: {request_id}")
     return {
-        "slice_index": len(record["slices"]), "request_id": request_id, "task_id": None,
+        "slice_index": slice_index, "request_id": request_id, "task_id": None,
         "execution_ids": [], "session_id": None, "handoff_id": None, "outcome": None,
         "retry_count": 0, "started_at": timestamp, "terminal_at": None,
     }
@@ -106,11 +114,13 @@ def apply(store, project_id, chain_id, decision, request_id=None, task_id=None, 
 
     `request_id` is required exactly when this Decision starts a new slice
     (the chain's first task_planned, or a next_dispatch_check that actually
-    proceeds) and must be distinct from the root request_id and from every
-    prior slice's request_id -- the same mutual-exclusion/duplicate-authority
-    contract that governs dispatch also governs slice identity, so a caller
-    cannot accidentally collapse two slices' evidence into one idempotency
-    key.
+    proceeds). Slice 0 -- the chain's original dispatch -- MAY reuse
+    root_request_id (it IS that dispatch, not a new decision); every
+    automatic continuation slice (slice_index >= 1) is a dispatch decision
+    nobody manually requested and MUST mint its own request_id, distinct
+    from root_request_id and from every prior slice's request_id, so a
+    caller cannot accidentally collapse two slices' evidence into one
+    idempotency key.
     """
     record = load_chain(store, project_id, chain_id)
     if decision.from_state != record["state"]:

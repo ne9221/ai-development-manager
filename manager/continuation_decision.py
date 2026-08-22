@@ -3,6 +3,22 @@
 No I/O, no provider calls, no dispatch. Every function here takes plain data
 in and returns a Decision out; manager/continuation_orchestrator.py is the
 only caller allowed to persist a Decision's outcome or act on it.
+
+IMPORTANT -- `active_production_mutating_count` (decide_dispatch,
+decide_next_dispatch) is an OBSERVATION INPUT ONLY. This pure engine cannot
+do I/O, so it has no way to atomically verify that count against real
+runtime state, and a caller that mis-reports it (stale read, race, or a bug)
+gets whatever outcome that wrong number implies. This module supplies the
+*policy* (never let two production-mutating actors run at once); it does
+NOT supply the *enforcement*. Real atomic single-writer enforcement --
+actually preventing two production-mutating actors from starting
+concurrently, not just deciding they shouldn't -- belongs to the future
+dispatch-wiring layer (out of scope for this foundation: see
+manager.execution_lifecycle.enter_running_gate / manager.worktree_locks for
+the existing authoritative lease mechanism a real wiring layer would need to
+read active_production_mutating_count FROM), and that count must always be
+derived from authoritative runtime/claim state at decision time -- never
+accepted as untrusted caller input at the eventual call site.
 """
 
 from manager.continuation_states import ContinuationError, validate_transition
@@ -51,7 +67,13 @@ def _dispatch_gate(action_kind, duplicate_authority, is_production_mutating, act
     outcome is one of "proceed", "hold", "stop". Read-only/prework
     candidates (is_production_mutating=False) are exempt from the
     single-production-writer mutual-exclusion check and may proceed in
-    parallel with any number of active actors."""
+    parallel with any number of active actors.
+
+    `active_production_mutating_count` is trusted as given -- see the
+    module docstring: this function enforces the mutual-exclusion POLICY,
+    not the atomicity. The caller (eventually the dispatch-wiring layer,
+    not this foundation) is responsible for sourcing that count from
+    authoritative runtime/claim state."""
     if duplicate_authority:
         return "stop", "duplicate request/task authority detected; requires user"
     if action_kind in IRREVERSIBLE_ACTION_KINDS:

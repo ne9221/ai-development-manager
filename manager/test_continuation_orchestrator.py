@@ -83,9 +83,13 @@ class ApplyTests(unittest.TestCase):
         with self.assertRaises(ContinuationError):
             apply(self.store, "proj", "chain-1", plan_task())
 
-    def test_new_slice_cannot_reuse_root_request_id(self):
-        with self.assertRaises(ContinuationError):
-            apply(self.store, "proj", "chain-1", plan_task(), request_id="req-1")
+    def test_slice_0_may_reuse_root_request_id(self):
+        # Slice 0 IS the chain's original dispatch, not a distinct
+        # continuation, so it may legitimately carry the same request_id
+        # as root_request_id.
+        record = apply(self.store, "proj", "chain-1", plan_task(), request_id="req-1")
+        self.assertEqual(record["slices"][0]["request_id"], "req-1")
+        self.assertEqual(record["slices"][0]["request_id"], record["root_request_id"])
 
     def test_request_id_rejected_when_not_starting_a_new_slice(self):
         apply(self.store, "proj", "chain-1", plan_task(), request_id="req-1-slice-0")
@@ -180,6 +184,45 @@ class PerSliceLineageTests(unittest.TestCase):
         apply(self.store, "proj", "chain-lineage", dispatch_accepted(), execution_id="exec-attempt-1")
         record = apply(self.store, "proj", "chain-lineage", provider_started())
         self.assertEqual(record["slices"][0]["execution_ids"], ["exec-attempt-1"])
+
+
+class RootRequestIdReuseTests(unittest.TestCase):
+    """Regression for the slice 0 / continuation request_id contract:
+    slice 0 (the chain's original dispatch) may equal root_request_id;
+    every automatic continuation (slice_index >= 1) must mint its own
+    distinct request_id and may never fall back to root_request_id or any
+    earlier slice's request_id."""
+
+    def setUp(self):
+        self.store = InMemoryStore()
+        self.chain_id = "chain-root-reuse"
+        create_chain(self.store, "proj", self.chain_id, "root-req", max_depth=5, max_retries=1)
+
+    def _advance_to_next_slice(self, next_request_id):
+        record = apply(self.store, "proj", self.chain_id, decide_continuation("pass", depth=0, max_depth=5))
+        d = decide_next_dispatch("next_task_ready", action_kind="implementation", duplicate_authority=False,
+                                  is_production_mutating=False, active_production_mutating_count=0)
+        return apply(self.store, "proj", self.chain_id, d, request_id=next_request_id)
+
+    def test_slice0_request_id_equal_to_root_request_id_passes(self):
+        record = _run_slice_to_pass(self.store, "proj", self.chain_id, request_id="root-req")
+        self.assertEqual(record["slices"][0]["request_id"], "root-req")
+
+    def test_slice1_request_id_equal_to_root_request_id_fails(self):
+        _run_slice_to_pass(self.store, "proj", self.chain_id, request_id="root-req")
+        with self.assertRaises(ContinuationError):
+            self._advance_to_next_slice("root-req")
+
+    def test_slice1_reusing_slice0_request_id_fails(self):
+        _run_slice_to_pass(self.store, "proj", self.chain_id, request_id="slice-0-req")
+        with self.assertRaises(ContinuationError):
+            self._advance_to_next_slice("slice-0-req")
+
+    def test_slice1_with_a_genuinely_new_request_id_passes(self):
+        _run_slice_to_pass(self.store, "proj", self.chain_id, request_id="slice-0-req")
+        record = self._advance_to_next_slice("slice-1-req")
+        self.assertEqual(record["slices"][1]["request_id"], "slice-1-req")
+        self.assertEqual(record["slices"][1]["slice_index"], 1)
 
 
 class RetryResetPerSliceTests(unittest.TestCase):

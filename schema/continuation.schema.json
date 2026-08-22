@@ -13,7 +13,7 @@
   "properties": {
     "schema_version": {"const": 1},
     "chain_id": {"type": "string", "minLength": 1, "description": "Stable identity for one autonomous continuation lineage; carried across every task/execution the chain dispatches."},
-    "root_request_id": {"type": "string", "minLength": 1, "description": "Originating dispatch request id for the chain as a whole. Immutable for the life of the chain; never reused as a later slice's own dispatch request_id."},
+    "root_request_id": {"type": "string", "minLength": 1, "description": "Originating dispatch request id for the chain as a whole. Immutable for the life of the chain. Slice 0 (the chain's original dispatch) may equal this value -- it IS that dispatch. Every automatic continuation slice (slice_index >= 1) must use its own distinct request_id and may never reuse this value or any earlier slice's request_id."},
     "project_id": {"type": "string", "minLength": 1},
     "state": {
       "enum": [
@@ -66,7 +66,7 @@
         ],
         "properties": {
           "slice_index": {"type": "integer", "minimum": 0},
-          "request_id": {"type": "string", "minLength": 1, "description": "This slice's own dispatch request_id/idempotency key -- always distinct from root_request_id and from every other slice's request_id."},
+          "request_id": {"type": "string", "minLength": 1, "description": "This slice's own dispatch request_id/idempotency key. Slice 0 may equal root_request_id (it IS the chain's original dispatch); every slice with slice_index >= 1 is an automatic continuation and must be distinct from root_request_id and from every other slice's request_id."},
           "task_id": {"type": ["string", "null"], "minLength": 1},
           "execution_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Every execution attempt for this slice, in order, including retries."},
           "session_id": {"type": ["string", "null"], "minLength": 1},
