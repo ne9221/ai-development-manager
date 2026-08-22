@@ -161,16 +161,13 @@ def _parse_completion_commit_message(message: str) -> Optional[Dict[str, str]]:
 
 
 def _verify_reusable_completion_commit(working_directory, commit_sha: str, baseline_head: str, task_id: str,
-                                       branch: str, runner) -> Dict[str, str]:
+                                       execution_id: str, branch: str, authorized_predecessor_execution_ids, runner) -> Dict[str, str]:
     """Prove that a clean worktree's current HEAD is a genuine repo-write
-    completion commit for this exact baseline/task/branch before it is ever
+    completion commit for this exact baseline/task/execution/branch before it is ever
     reused as "already done" -- never inferred from clean/dirty status
-    alone. `execution_id` is deliberately NOT gated here: a real retry of
-    the same task legitimately mints a fresh execution_id per attempt (see
-    manager.executions.prepare_task_retry), so the identity that must match
-    for safe reuse is (task_id, branch), not execution_id -- the parsed
-    execution_id is still returned so callers can record which execution
-    actually produced the commit."""
+    alone. A prior execution's commit is eligible only when the execution
+    runner derived that exact id from persisted retry lineage; task/branch
+    equality and a deterministic message are never enough on their own."""
     ancestor = _run(working_directory, "merge-base", "--is-ancestor", baseline_head, commit_sha, runner=runner)
     if ancestor.returncode != 0:
         raise CommitLineageMismatchError(
@@ -192,11 +189,16 @@ def _verify_reusable_completion_commit(working_directory, commit_sha: str, basel
         raise CommitLineageMismatchError(
             f"HEAD {commit_sha} was recorded for branch {identity['branch']!r}, not the expected branch {branch!r}"
         )
+    if identity["execution_id"] != execution_id and identity["execution_id"] not in authorized_predecessor_execution_ids:
+        raise CommitLineageMismatchError(
+            f"HEAD {commit_sha} belongs to execution {identity['execution_id']!r}, not current execution "
+            f"{execution_id!r} or its authoritative retry lineage"
+        )
     return identity
 
 
 def stage_and_commit(working_directory, changed_paths: Sequence[str], task_id: str, execution_id: str, branch: str,
-                     baseline_head: str, runner=subprocess.run) -> Dict[str, Any]:
+                     baseline_head: str, authorized_predecessor_execution_ids=(), runner=subprocess.run) -> Dict[str, Any]:
     """Stage exactly `changed_paths` (never `git add .`) and commit them with
     a deterministic message.
 
@@ -226,7 +228,10 @@ def stage_and_commit(working_directory, changed_paths: Sequence[str], task_id: s
                 f"worktree is clean and HEAD ({head}) still equals baseline_head -- no repo-write completion "
                 "commit exists for this execution; this is a genuine no-op, not a completed repo-write"
             )
-        identity = _verify_reusable_completion_commit(working_directory, head, baseline_head, task_id, branch, runner)
+        identity = _verify_reusable_completion_commit(
+            working_directory, head, baseline_head, task_id, execution_id, branch,
+            frozenset(authorized_predecessor_execution_ids), runner,
+        )
         return {"commit_sha": head, "created": False, "commit_identity": identity}
 
     pre_commit_head = _git_ok(working_directory, "rev-parse", "HEAD", runner=runner, label="rev-parse HEAD")
@@ -301,7 +306,8 @@ def run_validation_gate(working_directory, validation_checks: Sequence[Dict[str,
 
 def complete_repo_write_execution(*, working_directory, changed_paths: List[str], baseline_head: str, branch: str,
                                   repository: str, validation_checks: Sequence[Dict[str, Any]], task_id: str,
-                                  execution_id: str, remote: str = "origin", runner=subprocess.run) -> Dict[str, Any]:
+                                  execution_id: str, authorized_predecessor_execution_ids=(), remote: str = "origin",
+                                  runner=subprocess.run) -> Dict[str, Any]:
     """Orchestrate the full D2 terminal-completion sequence for one bounded
     repo-write execution whose provider already stopped and reported
     success, and whose actual changed paths were already re-verified
@@ -315,7 +321,10 @@ def complete_repo_write_execution(*, working_directory, changed_paths: List[str]
     happened past that point.
     """
     validation_evidence = run_validation_gate(working_directory, validation_checks, runner=runner)
-    commit = stage_and_commit(working_directory, changed_paths, task_id, execution_id, branch, baseline_head, runner=runner)
+    commit = stage_and_commit(
+        working_directory, changed_paths, task_id, execution_id, branch, baseline_head,
+        authorized_predecessor_execution_ids=authorized_predecessor_execution_ids, runner=runner,
+    )
     remote_sha = push_and_verify(working_directory, branch, commit["commit_sha"], remote=remote, runner=runner)
     return {
         "changed_paths": list(changed_paths),

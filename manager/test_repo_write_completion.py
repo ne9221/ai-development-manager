@@ -258,14 +258,24 @@ def test_clean_worktree_with_head_equal_to_baseline_is_empty_changes_not_success
         stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, repo["baseline"])
 
 
-def test_clean_worktree_with_a_valid_prior_task_commit_is_eligible_for_reuse(repo):
+def test_clean_worktree_with_same_task_branch_wrong_execution_is_rejected(repo):
     (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
     first = stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, repo["baseline"])
     assert first["created"] is True
 
-    second = stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e2", BRANCH, repo["baseline"])
-    assert second["created"] is False
-    assert second["commit_sha"] == first["commit_sha"]
+    with pytest.raises(CommitLineageMismatchError):
+        stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e2", BRANCH, repo["baseline"])
+
+
+def test_direct_retry_reuses_only_the_authorized_predecessor_commit(repo):
+    (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    first = stage_and_commit(repo["path"], ["manager/foo.py"], "t1", "e1", BRANCH, repo["baseline"])
+    retry = stage_and_commit(
+        repo["path"], ["manager/foo.py"], "t1", "e2", BRANCH, repo["baseline"],
+        authorized_predecessor_execution_ids={"e1"},
+    )
+    assert retry["created"] is False
+    assert retry["commit_sha"] == first["commit_sha"]
 
 
 def test_dirty_worktree_whose_head_already_diverged_from_baseline_fails_closed(repo):
@@ -324,6 +334,7 @@ def test_lineage_identity_persists_onto_completion_evidence(repo):
     reused = complete_repo_write_execution(
         working_directory=repo["path"], changed_paths=["manager/foo.py"], baseline_head=repo["baseline"],
         branch=BRANCH, repository=REPOSITORY, validation_checks=VALIDATION_CHECKS, task_id="t1", execution_id="e2",
+        authorized_predecessor_execution_ids={"e1"},
     )
     assert reused["commit_created"] is False
     assert reused["commit_identity"] == {"task_id": "t1", "execution_id": "e1", "branch": BRANCH}

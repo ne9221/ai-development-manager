@@ -52,6 +52,39 @@ def _repo_write_validation_checks(project_id):
     return get_global_registry().get_project(project_id).required_validation_checks()
 
 
+def _authorized_retry_predecessor_execution_ids(store, execution):
+    """Derive reusable completion identities from persisted retry records only."""
+    current_id = execution["execution_id"]
+    current_task_id = execution["task_id"]
+    project_id = execution["project_id"]
+    current_branch = (execution.get("lease_evidence") or {}).get("branch")
+    retry_count = execution.get("retry_count", 0)
+    prior_id = execution.get("retry_of_execution_id")
+    if not retry_count:
+        return frozenset()
+    allowed = set()
+    while retry_count:
+        if not isinstance(prior_id, str) or not prior_id or prior_id in allowed or prior_id == current_id:
+            raise TaskError("retry lineage is missing or cyclic")
+        try:
+            prior = store.get("executions", project_id, prior_id)
+            validate("execution", prior)
+        except (KeyError, TaskError) as exc:
+            raise TaskError("retry lineage execution record is unavailable") from exc
+        if (prior.get("execution_id") != prior_id or prior.get("task_id") != current_task_id
+                or prior.get("project_id") != project_id
+                or prior.get("retry_count") != retry_count - 1
+                or prior.get("status") not in ("failed", "interrupted")
+                or (prior.get("lease_evidence") or {}).get("branch") != current_branch):
+            raise TaskError("retry lineage does not match task, branch, or retry count")
+        allowed.add(prior_id)
+        retry_count = prior["retry_count"]
+        prior_id = prior.get("retry_of_execution_id")
+    if prior_id is not None:
+        raise TaskError("retry lineage root has an unexpected predecessor")
+    return frozenset(allowed)
+
+
 def task_turn_timeout(expected_minutes, override=None):
     if override is not None:
         if isinstance(override, bool) or not isinstance(override, (int, float)) or not 0 < override <= MAX_TURN_TIMEOUT_SECONDS:
@@ -455,6 +488,7 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
                 repository=execution["lease_evidence"]["repository"],
                 validation_checks=_repo_write_validation_checks(project_id),
                 task_id=task_id, execution_id=execution_id,
+                authorized_predecessor_execution_ids=_authorized_retry_predecessor_execution_ids(store, execution),
             )
         except (TaskError, ProjectRegistryError) as exc:
             status = "failed"
