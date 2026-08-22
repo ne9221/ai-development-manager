@@ -34,6 +34,23 @@ MAX_POLL_SECONDS = 900
 CLAIM_TIMEOUT_SECONDS = 20 * 60
 MAX_COMMANDS_PER_POLL = 4
 
+# How much of one scheduled --once tick's PRE_LAUNCH/POLLING phase (listing
+# projects and commands, before any command is claimed) is allowed to
+# consume, leaving headroom under the 60-second Scheduled Task cadence for
+# manager.provenance verify-running plus process startup overhead. This is
+# a cooperative budget checked only between projects/commands in
+# poll_once() -- it never applies once a command has been claimed and
+# process_command() -> launch_task() has actually started; that call always
+# runs to its natural completion (minutes to a couple of hours for a real
+# provider), governed only by the Scheduled Task's own 125-minute
+# ExecutionTimeLimit, same as before this existed. Real HOME evidence: a
+# live reproduction of all_projects()+list_records() alone (zero commands
+# admitted, every individual Drive call succeeding) took several minutes --
+# collectors.publish_drive.build_service()'s per-request timeout bounds any
+# single stalled call, but does not bound cumulative volume across many
+# projects, which is what this budget addresses instead.
+POLL_TIME_BUDGET_SECONDS = 40
+
 
 def execution_id(command):
     return f"command-{command['command_id']}"
@@ -490,11 +507,26 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     return {"status": final["status"], "execution_id": claimed["execution_id"]}
 
 
-def poll_once(store, service, allowlist=None, **factories):
+def poll_once(store, service, allowlist=None, deadline=None, **factories):
+    """`deadline`, if given, is a `time.monotonic()` value after which this
+    call stops STARTING new project/command work and returns whatever it has
+    so far -- any project/command not yet reached this tick is picked up on
+    a later poll, with no state lost (nothing here writes anything before a
+    command is actually claimed inside process_command). This never
+    interrupts a process_command() call already in progress: the deadline is
+    only ever checked between iterations, before the next project's
+    list_records() or the next command's process_command(), so a real
+    provider lifecycle -- once process_command has been called for that
+    command -- always runs to its natural completion regardless of how long
+    it legitimately takes."""
     if allowlist is None:
         allowlist = load_allowlist()
+    if deadline is None:
+        deadline = time.monotonic() + POLL_TIME_BUDGET_SECONDS
     results = []
     for project in all_projects(store):
+        if time.monotonic() >= deadline:
+            break
         try:
             commands = store.list_records("commands", project["project_id"])
         except TaskError:
@@ -503,6 +535,8 @@ def poll_once(store, service, allowlist=None, **factories):
             if command.get("status") in ("completed", "failed"):
                 continue
             if len(results) == MAX_COMMANDS_PER_POLL:
+                return results
+            if time.monotonic() >= deadline:
                 return results
             results.append(process_command(store, service, command, allowlist=allowlist, **factories))
     return results
