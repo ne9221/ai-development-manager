@@ -12,7 +12,8 @@ from unittest.mock import Mock, patch
 from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_creation_identity
 from manager.command_watcher import (
-    CLAIM_TIMEOUT_SECONDS, PROVIDER_RUNTIMES, REQUIRED_TASK_POLICIES, _provider_state,
+    CLAIM_TIMEOUT_SECONDS, PROVIDER_RUNTIMES, RECONCILE_BATCH_SIZE, RECONCILE_CURSOR_NAME,
+    RECONCILE_STATE_AREA, REQUIRED_TASK_POLICIES, _provider_state,
     claude_quota_reliable, codex_quota_reliable, load_allowlist, poll_once, process_command,
     provider_quota_reliable, resolve_provider_runtime,
 )
@@ -45,6 +46,21 @@ class BoundedCommandStore(Store):
     def list_actionable_commands(self, project_id, limit):
         self.limits.append(limit)
         return self.list_records("commands", project_id)[:limit]
+
+
+class FairBoundedCommandStore(BoundedCommandStore):
+    """Adds the fullText-independent reconcile backstop on top of the plain
+    bounded fast path, using the same generic (area, project_id, name) store
+    so the persisted cursor round-trips through store.get/store.put exactly
+    like production's DriveRecords does via the watcher_state area."""
+    def __init__(self): super().__init__(); self.reconcile_calls = []
+    def reconcile_actionable_commands(self, project_id, after_created_time, limit):
+        self.reconcile_calls.append((project_id, after_created_time, limit))
+        all_records = sorted(self.list_records("commands", project_id), key=lambda c: c["created_at"])
+        candidates = [c for c in all_records if after_created_time is None or c["created_at"] > after_created_time]
+        page = candidates[:limit]
+        next_cursor = page[-1]["created_at"] if page else after_created_time
+        return {"records": page, "next_cursor": next_cursor}
 
 
 def command(**changes):
@@ -140,6 +156,92 @@ class CommandWatcherTests(unittest.TestCase):
             result = poll_once(store, object(), allowlist=self.ALLOWLIST)
         self.assertEqual([("broken", 4), ("healthy", 4)], store.limits)
         self.assertEqual([{"status": "completed"}], result); process.assert_called_once()
+
+    def test_busy_project_never_starves_another_projects_queued_command(self):
+        """Regression for the cross-project starvation blocker: a project
+        with a persistent backlog >= MAX_COMMANDS_PER_POLL must not exhaust
+        a shared global budget and leave a later project's queued command
+        unprocessed. Each project now gets its own independent budget, so B
+        is processed in this very poll, not merely "eventually"."""
+        class MultiProjectStore(FairBoundedCommandStore):
+            def list_projects(self): return [{"project_id": "busy"}, {"project_id": "quiet"}]
+        store = MultiProjectStore()
+        for index in range(10):
+            store.put("commands", "busy", f"busy-{index}", command(project_id="busy", command_id=f"busy-{index}", created_at=f"2026-08-{index+1:02d}T00:00:00Z"))
+        store.put("commands", "quiet", "quiet-cmd", command(project_id="quiet", command_id="quiet-cmd", created_at="2026-08-20T00:00:00Z"))
+        with patch("manager.command_watcher.process_command", side_effect=lambda store, service, cmd, **kw: {"status": "completed", "command_id": cmd["command_id"]}):
+            result = poll_once(store, object(), allowlist=self.ALLOWLIST)
+        processed_ids = {r["command_id"] for r in result}
+        self.assertIn("quiet-cmd", processed_ids)
+        self.assertEqual([4, 4], store.limits)  # each project gets its own independent budget, not a shared/decrementing one
+
+    def test_reconcile_backstop_finds_command_fulltext_fast_path_missed(self):
+        """Simulates a fullText false negative: the fast path never returns
+        the queued command (as could happen from indexing lag or an
+        unverified tokenization assumption), but the createdTime-ordered
+        reconcile backstop is independent of fullText and finds it anyway."""
+        class MissingFastPathStore(FairBoundedCommandStore):
+            def list_actionable_commands(self, project_id, limit):
+                self.limits.append(limit)
+                return []
+        store = MissingFastPathStore()
+        create_project(store, project()); create_task(store, task(read_only=True), assign=False)
+        compliant = store.get("tasks", "p1", "t1"); compliant["execution_policies"] = sorted(REQUIRED_TASK_POLICIES); store.put("tasks", "p1", "t1", compliant)
+        store.put("commands", "p1", "cmd-1", command())
+        with patch("manager.command_watcher.process_command", return_value={"status": "completed"}) as process:
+            result = poll_once(store, object(), allowlist=self.ALLOWLIST)
+        self.assertEqual(1, len(result)); process.assert_called_once()
+        self.assertEqual([("p1", None, RECONCILE_BATCH_SIZE)], store.reconcile_calls)
+
+    def test_false_positive_does_not_permanently_displace_genuine_actionable_command(self):
+        """A fast-path false positive (an unrelated completed command that
+        happened to fullText-match) filling the bounded page must not
+        permanently hide the real queued command -- the independent
+        reconcile backstop still finds it in the same poll."""
+        class FalsePositiveStore(FairBoundedCommandStore):
+            def list_actionable_commands(self, project_id, limit):
+                self.limits.append(limit)
+                return [command(command_id="false-positive-completed", status="completed", created_at="2026-08-01T00:00:00Z")]
+        store = FalsePositiveStore()
+        create_project(store, project()); create_task(store, task(read_only=True), assign=False)
+        compliant = store.get("tasks", "p1", "t1"); compliant["execution_policies"] = sorted(REQUIRED_TASK_POLICIES); store.put("tasks", "p1", "t1", compliant)
+        store.put("commands", "p1", "real-queued", command(command_id="real-queued", created_at="2026-08-15T00:00:00Z"))
+        with patch("manager.command_watcher.process_command", side_effect=lambda store, service, cmd, **kw: {"status": "completed", "command_id": cmd["command_id"]}) as process:
+            result = poll_once(store, object(), allowlist=self.ALLOWLIST)
+        processed_ids = {r["command_id"] for r in result}
+        self.assertIn("real-queued", processed_ids)
+        self.assertNotIn("false-positive-completed", processed_ids)  # terminal status still filtered out downstream
+
+    def test_reconcile_cursor_persists_across_polls_and_advances(self):
+        store = FairBoundedCommandStore()
+        create_project(store, project()); create_task(store, task(read_only=True), assign=False)
+        compliant = store.get("tasks", "p1", "t1"); compliant["execution_policies"] = sorted(REQUIRED_TASK_POLICIES); store.put("tasks", "p1", "t1", compliant)
+        store.put("commands", "p1", "cmd-1", command(command_id="cmd-1", status="completed", created_at="2026-08-10T00:00:00Z"))
+        with patch("manager.command_watcher.process_command", return_value={"status": "completed"}):
+            poll_once(store, object(), allowlist=self.ALLOWLIST)
+        cursor = store.get(RECONCILE_STATE_AREA, "p1", RECONCILE_CURSOR_NAME)
+        self.assertEqual("2026-08-10T00:00:00Z", cursor["after_created_time"])
+        store.put("commands", "p1", "cmd-2", command(command_id="cmd-2", created_at="2026-08-16T00:00:00Z"))
+        with patch("manager.command_watcher.process_command", return_value={"status": "completed"}):
+            poll_once(store, object(), allowlist=self.ALLOWLIST)
+        self.assertEqual(("p1", "2026-08-10T00:00:00Z", RECONCILE_BATCH_SIZE), store.reconcile_calls[-1])
+
+    def test_lost_reconcile_cursor_after_restart_still_eventually_finds_command(self):
+        """A restart that loses the persisted cursor (store.get raises
+        TaskError, as it would for a never-written or corrupted record) must
+        degrade to walking from the beginning again, not permanently skip
+        commands the fast path also misses."""
+        class MissingFastPathStore(FairBoundedCommandStore):
+            def list_actionable_commands(self, project_id, limit):
+                return []
+        store = MissingFastPathStore()
+        create_project(store, project()); create_task(store, task(read_only=True), assign=False)
+        compliant = store.get("tasks", "p1", "t1"); compliant["execution_policies"] = sorted(REQUIRED_TASK_POLICIES); store.put("tasks", "p1", "t1", compliant)
+        store.put("commands", "p1", "cmd-1", command())
+        store.records.pop((RECONCILE_STATE_AREA, "p1", RECONCILE_CURSOR_NAME), None)  # simulate restart with no persisted cursor
+        with patch("manager.command_watcher.process_command", return_value={"status": "completed"}) as process:
+            result = poll_once(store, object(), allowlist=self.ALLOWLIST)
+        self.assertEqual(1, len(result)); process.assert_called_once()
 
     def test_restart_never_relaunches_claimed_or_running_command(self):
         claimed = command(status="claimed", execution_id="command-cmd-1", claimed_at=now_iso())

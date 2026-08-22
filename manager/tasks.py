@@ -18,7 +18,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 
 ROOT_FOLDER_ID = "1pXvl8BglU05ZrXMHIVIDyK-lOWNShXSO"
-ROOT_FOLDERS = {"tasks": "TASKS", "handoffs": "HANDOFFS", "history": "TASK-HISTORY", "projects": "PROJECTS", "executions": "EXECUTIONS", "sessions": "SESSIONS", "session_reviews": "SESSION-REVIEWS", "overviews": "OVERVIEWS", "worktree_locks": "WORKTREE-LOCKS", "commands": "COMMANDS"}
+ROOT_FOLDERS = {"tasks": "TASKS", "handoffs": "HANDOFFS", "history": "TASK-HISTORY", "projects": "PROJECTS", "executions": "EXECUTIONS", "sessions": "SESSIONS", "session_reviews": "SESSION-REVIEWS", "overviews": "OVERVIEWS", "worktree_locks": "WORKTREE-LOCKS", "commands": "COMMANDS", "watcher_state": "WATCHER-STATE"}
 SCHEMAS = {name: Path(__file__).parents[1] / "schema" / f"{name}.schema.json" for name in ("project", "project_preview", "task", "handoff", "execution", "session", "session_review", "overview", "worktree_lock", "worktree_lock_registry", "command", "dispatch_request")}
 MIME_JSON = "application/json"
 MIME_FOLDER = "application/vnd.google-apps.folder"
@@ -207,9 +207,18 @@ class DriveRecords:
     def list_actionable_commands(self, project_id, limit):
         """Read one bounded Drive page of non-terminal command records.
 
-        Drive indexes JSON content for ``fullText`` queries, so this avoids
-        listing/downloading historical completed command files on every poll.
-        A command remains discoverable until its status becomes terminal.
+        Best-effort fast path only: Drive's ``fullText`` content index is not
+        a guaranteed-complete or guaranteed-immediate selector (indexing lag,
+        unverified JSON-content tokenization, possible false-positive phrase
+        matches on unrelated text). It exists purely to avoid downloading
+        historical completed command bodies on every poll -- it must never be
+        the sole correctness mechanism. ``reconcile_actionable_commands``
+        below is the independent, non-fullText backstop that guarantees
+        eventual reachability. Ordered oldest-created-first (not by
+        modifiedTime) so that under sustained backlog neither an
+        old queued command nor an old claimed/running command awaiting
+        reconciliation can be pushed out by newer arrivals -- old records
+        keep sorting first every poll until their status turns terminal.
         """
         if not isinstance(limit, int) or limit < 1:
             raise TaskError("command limit must be positive")
@@ -219,7 +228,7 @@ class DriveRecords:
             f"fullText contains '\"status {status}\"'" for status in statuses
         ) + ")"
         response = self.files.list(
-            q=query, spaces="drive", orderBy="modifiedTime desc", pageSize=limit,
+            q=query, spaces="drive", orderBy="createdTime asc", pageSize=limit,
             fields="files(id,name,mimeType)",
         ).execute()
         if not isinstance(response, dict) or not isinstance(response.get("files", []), list):
@@ -233,6 +242,47 @@ class DriveRecords:
             except Exception as exc:
                 raise TaskError(f"could not read Drive command record: {item['name']}") from exc
         return records
+
+    def reconcile_actionable_commands(self, project_id, after_created_time, limit):
+        """Bounded, fullText-independent backstop: walk command files strictly
+        forward by Drive's own immutable ``createdTime`` metadata.
+
+        Every command file is created exactly once and only ever updated in
+        place (see ``put``), so ``createdTime`` never changes across a
+        command's whole status lifecycle. Advancing a persisted watermark
+        past each file's ``createdTime`` guarantees every command is
+        eventually observed by this walk exactly once, regardless of whether
+        ``list_actionable_commands``'s fullText query ever matched it -- this
+        is what makes a fullText false-negative (indexing lag, an unverified
+        tokenization assumption) or a false-positive displacing a genuine hit
+        out of that bounded page self-healing within a bounded number of
+        polls, without ever downloading more than ``limit`` bodies per call.
+        A lost/corrupt watermark degrades to walking from the beginning again
+        -- slower, never a permanent miss.
+        """
+        if not isinstance(limit, int) or limit < 1:
+            raise TaskError("reconcile limit must be positive")
+        parent = self.project_folder("commands", project_id, create=False)
+        query = f"'{parent}' in parents and trashed=false and mimeType='{MIME_JSON}'"
+        if after_created_time:
+            query += f" and createdTime > '{after_created_time}'"
+        response = self.files.list(
+            q=query, spaces="drive", orderBy="createdTime asc", pageSize=limit,
+            fields="files(id,name,mimeType,createdTime)",
+        ).execute()
+        if not isinstance(response, dict) or not isinstance(response.get("files", []), list):
+            raise TaskError("malformed Drive command listing response")
+        records, next_cursor = [], after_created_time
+        for item in response["files"]:
+            if item.get("mimeType") != MIME_JSON or not item.get("name", "").endswith(".json") or not isinstance(item.get("id"), str):
+                continue
+            try:
+                records.append(json.loads(self.files.get_media(fileId=item["id"]).execute().decode("utf-8")))
+            except Exception as exc:
+                raise TaskError(f"could not read Drive command record: {item['name']}") from exc
+            if isinstance(item.get("createdTime"), str):
+                next_cursor = item["createdTime"]
+        return {"records": records, "next_cursor": next_cursor}
 
     def list_projects(self):
         root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"], create=False)

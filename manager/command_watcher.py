@@ -32,7 +32,10 @@ from manager.dispatch_requests import dispatch_request_registry
 POLL_SECONDS = 60
 MAX_POLL_SECONDS = 900
 CLAIM_TIMEOUT_SECONDS = 20 * 60
-MAX_COMMANDS_PER_POLL = 4
+MAX_COMMANDS_PER_POLL = 4  # per-project bound; each project gets its own budget, never a global one shared across all_projects()
+RECONCILE_BATCH_SIZE = 4  # per-project, per-poll bound on the fullText-independent createdTime backstop walk
+RECONCILE_STATE_AREA = "watcher_state"
+RECONCILE_CURSOR_NAME = "commands_reconcile_cursor"
 
 
 def execution_id(command):
@@ -490,25 +493,51 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     return {"status": final["status"], "execution_id": claimed["execution_id"]}
 
 
+def _reconcile_cursor(store, project_id):
+    try:
+        return store.get(RECONCILE_STATE_AREA, project_id, RECONCILE_CURSOR_NAME).get("after_created_time")
+    except TaskError:
+        return None
+
+
+def _reconcile_batch(store, project_id, exclude_ids):
+    """Bounded, fullText-independent backstop pass for one project.
+
+    Advances a persisted createdTime watermark forward past every command
+    file exactly once over the project's lifetime, so a fullText false
+    negative (indexing lag, unverified tokenization) or a false positive
+    that displaced a genuine hit out of list_actionable_commands's bounded
+    page is caught within a bounded number of polls. Losing the cursor
+    (never written yet, or a read failure) safely restarts the walk from
+    the beginning -- slower, never a permanent miss.
+    """
+    cursor = _reconcile_cursor(store, project_id)
+    batch = store.reconcile_actionable_commands(project_id, cursor, RECONCILE_BATCH_SIZE)
+    if batch["next_cursor"] != cursor:
+        store.put(RECONCILE_STATE_AREA, project_id, RECONCILE_CURSOR_NAME, {"after_created_time": batch["next_cursor"]})
+    return [record for record in batch["records"] if record.get("command_id") not in exclude_ids]
+
+
 def poll_once(store, service, allowlist=None, **factories):
     if allowlist is None:
         allowlist = load_allowlist()
     results = []
     for project in all_projects(store):
+        project_id = project["project_id"]
         try:
-            remaining = MAX_COMMANDS_PER_POLL - len(results)
-            if remaining == 0:
-                return results
-            commands = (store.list_actionable_commands(project["project_id"], remaining)
+            commands = (store.list_actionable_commands(project_id, MAX_COMMANDS_PER_POLL)
                         if hasattr(store, "list_actionable_commands")
-                        else store.list_records("commands", project["project_id"]))
+                        else store.list_records("commands", project_id))
         except TaskError:
             continue
+        if hasattr(store, "reconcile_actionable_commands"):
+            try:
+                commands = commands + _reconcile_batch(store, project_id, {c.get("command_id") for c in commands})
+            except TaskError:
+                pass
         for command in commands:
             if command.get("status") in ("completed", "failed"):
                 continue
-            if len(results) == MAX_COMMANDS_PER_POLL:
-                return results
             results.append(process_command(store, service, command, allowlist=allowlist, **factories))
     return results
 
