@@ -13,6 +13,11 @@ REPO = "https://github.com/ne9221/demo-project.git"
 BRANCH = "adm-worktree/demo-project--dispatch-req-abc123"
 BASELINE_HEAD = "a" * 40
 FINAL_SHA = "b" * 40
+# The canonical/shared checkout's HEAD is a different authority from
+# Task.baseline_head (real ADM topology: the checkout can legitimately sit
+# ahead of whatever SHA a Task happened to admit) -- deliberately distinct
+# from BASELINE_HEAD everywhere in these fixtures.
+CANONICAL_HEAD = "e" * 40
 
 
 def _governance():
@@ -127,9 +132,19 @@ def complete_evidence():
             "repo": {"canonical_url": REPO, "owner": "ne9221", "name": "demo-project"},
         },
         "registry_reference_file_check": {"common_governance_exists": True, "project_rules_exists": True},
-        "canonical_checkout": {
+        # Real ADM topology: the canonical/shared checkout's HEAD is a
+        # DIFFERENT authority from Task.baseline_head -- it can legitimately
+        # sit ahead of (or otherwise differ from) whatever SHA this Task
+        # happened to admit as its own baseline. Only the fact that the
+        # canonical checkout's HEAD did not change DURING the E2E (before
+        # == after) matters for invariant O.
+        "canonical_checkout_before": {
             "available": True, "path": "C:/canonical/demo-project",
-            "repo_identity_ok": True, "head_sha": BASELINE_HEAD, "clean": True,
+            "repo_identity_ok": True, "head_sha": CANONICAL_HEAD, "clean": True,
+        },
+        "canonical_checkout_after": {
+            "available": True, "path": "C:/canonical/demo-project",
+            "repo_identity_ok": True, "head_sha": CANONICAL_HEAD, "clean": True,
         },
         "remote_baseline_resolution": {"performed": True, "baseline_sha": BASELINE_HEAD, "error": None},
     }
@@ -177,7 +192,7 @@ class RegressionB_SharedCanonicalCheckoutTest(unittest.TestCase):
 
     def test_runtime_working_directory_equals_canonical_checkout_fails(self):
         evidence = complete_evidence()
-        evidence["execution"]["task_snapshot"]["working_directory"] = evidence["project"]["working_directory"]
+        evidence["execution"]["task_snapshot"]["working_directory"] = evidence["canonical_checkout_after"]["path"]
         report = evaluate(evidence)
         self.assertEqual(report.overall, v.FAIL)
         self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
@@ -374,41 +389,89 @@ class TerminalIdentityTruthTest(unittest.TestCase):
 
 
 class CanonicalCheckoutIntegrityTest(unittest.TestCase):
-    """R3 correction 2: invariant O independently inspects the real
-    canonical checkout (repo identity, clean status, HEAD == admitted
-    baseline) rather than only comparing paths."""
+    """R4 correction 1: invariant O no longer requires the canonical
+    checkout's HEAD to equal Task.baseline_head (that assumption is false
+    in live ADM topology -- e.g. the real ai-development-manager registry
+    declares default_branch=main/origin_default, whose remote main tip
+    (fbe01c5...) sits 123 commits BEHIND the real formal/production
+    checkout's HEAD (ee5000e...); Task.baseline_head and the canonical
+    checkout's HEAD are simply different authorities). Instead it compares
+    an independent PRE-E2E snapshot against a fresh POST-E2E snapshot."""
 
-    def test_canonical_checkout_dirty_fails(self):
+    def _real_topology_evidence(self):
+        """Models the actual reviewed ADM topology: Task.baseline_head is
+        the real origin/main tip, while the canonical/shared checkout's
+        HEAD sits on a materially different (here: far ahead) commit --
+        and that is fine, because invariant O never compares the two."""
         evidence = complete_evidence()
-        evidence["canonical_checkout"]["clean"] = False
+        real_main_tip = "f" * 39 + "5"  # stand-in for fbe01c5...
+        formal_checkout_head = "e" * 39 + "0"  # stand-in for ee5000e...
+        evidence["task"]["baseline_head"] = real_main_tip
+        evidence["execution"]["lease_evidence"]["baseline_head"] = real_main_tip
+        evidence["execution"]["repo_write_completion_evidence"]["baseline_head"] = real_main_tip
+        evidence["remote_baseline_resolution"] = {"performed": True, "baseline_sha": real_main_tip, "error": None}
+        evidence["canonical_checkout_before"]["head_sha"] = formal_checkout_head
+        evidence["canonical_checkout_after"]["head_sha"] = formal_checkout_head
+        return evidence
+
+    def test_canonical_head_differs_from_task_baseline_but_unchanged_before_after_passes(self):
+        evidence = self._real_topology_evidence()
+        self.assertNotEqual(evidence["task"]["baseline_head"], evidence["canonical_checkout_before"]["head_sha"])
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.PASS, report.as_dict()["invariants"]["O"])
+        self.assertEqual(report.overall, v.PASS)
+
+    def test_canonical_head_changes_during_e2e_fails(self):
+        evidence = self._real_topology_evidence()
+        evidence["canonical_checkout_after"]["head_sha"] = "9" * 40
         report = evaluate(evidence)
         self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
         self.assertEqual(report.overall, v.FAIL)
+
+    def test_canonical_checkout_dirty_after_fails(self):
+        evidence = self._real_topology_evidence()
+        evidence["canonical_checkout_after"]["clean"] = False
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_canonical_checkout_dirty_before_fails(self):
+        evidence = self._real_topology_evidence()
+        evidence["canonical_checkout_before"]["clean"] = False
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
 
     def test_canonical_checkout_repo_identity_mismatch_fails(self):
-        evidence = complete_evidence()
-        evidence["canonical_checkout"]["repo_identity_ok"] = False
+        evidence = self._real_topology_evidence()
+        evidence["canonical_checkout_after"]["repo_identity_ok"] = False
         report = evaluate(evidence)
         self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
         self.assertEqual(report.overall, v.FAIL)
 
-    def test_canonical_checkout_head_disagrees_with_baseline_fails(self):
-        evidence = complete_evidence()
-        evidence["canonical_checkout"]["head_sha"] = "9" * 40
+    def test_no_pre_e2e_canonical_snapshot_is_unknown_never_pass(self):
+        evidence = self._real_topology_evidence()
+        evidence["canonical_checkout_before"] = None
         report = evaluate(evidence)
-        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
-        self.assertEqual(report.overall, v.FAIL)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
 
-    def test_canonical_checkout_unavailable_is_unknown_never_pass(self):
-        evidence = complete_evidence()
-        evidence["canonical_checkout"] = {"available": False, "reason": "ADM_WORKSPACE_ROOT is not set"}
+    def test_pre_e2e_snapshot_unavailable_is_unknown_never_pass(self):
+        evidence = self._real_topology_evidence()
+        evidence["canonical_checkout_before"] = {"available": False, "reason": "ADM_WORKSPACE_ROOT is not set"}
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_post_e2e_snapshot_unavailable_is_unknown_never_pass(self):
+        evidence = self._real_topology_evidence()
+        evidence["canonical_checkout_after"] = {"available": False, "reason": "checkout path vanished"}
         report = evaluate(evidence)
         self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.UNKNOWN)
         self.assertNotEqual(report.overall, v.PASS)
 
     def test_runtime_working_directory_equals_independently_inspected_canonical_path_fails(self):
-        evidence = complete_evidence()
-        evidence["execution"]["task_snapshot"]["working_directory"] = evidence["canonical_checkout"]["path"]
+        evidence = self._real_topology_evidence()
+        evidence["execution"]["task_snapshot"]["working_directory"] = evidence["canonical_checkout_after"]["path"]
         report = evaluate(evidence)
         self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
         self.assertEqual(report.overall, v.FAIL)
@@ -457,13 +520,36 @@ class RegistryGovernanceAuthorityTest(unittest.TestCase):
         report = evaluate(evidence)
         self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.FAIL)
 
-    def test_reference_file_check_not_performed_still_passes_structurally(self):
-        """'Where technically practical' -- an unperformed file-existence
-        check is noted in the detail but never blocks PASS on its own."""
+    def test_reference_file_check_not_performed_is_unknown_never_pass(self):
+        """R4 correction 2: fail closed -- an unperformed/ambiguous
+        file-existence check must never be folded into PASS as a
+        best-effort note."""
         evidence = complete_evidence()
         evidence["registry_reference_file_check"] = {"common_governance_exists": None, "project_rules_exists": None}
         report = evaluate(evidence)
-        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.PASS)
+        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_common_governance_file_check_unavailable_is_unknown(self):
+        evidence = complete_evidence()
+        evidence["registry_reference_file_check"]["common_governance_exists"] = None
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_project_rules_file_check_unavailable_is_unknown(self):
+        evidence = complete_evidence()
+        evidence["registry_reference_file_check"]["project_rules_exists"] = None
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_confirmed_missing_project_rules_fails_even_with_governance_confirmed(self):
+        evidence = complete_evidence()
+        evidence["registry_reference_file_check"] = {"common_governance_exists": True, "project_rules_exists": False}
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
 
     def test_no_registry_entry_resolved_is_unknown(self):
         evidence = complete_evidence()
@@ -516,6 +602,108 @@ class IndependentBaselineProofTest(unittest.TestCase):
         evidence = complete_evidence()
         report = evaluate(evidence)
         self.assertEqual(report.as_dict()["invariants"]["D"]["verdict"], v.PASS)
+
+    def test_unsupported_baseline_strategy_recorded_as_not_performed_is_unknown_never_pass(self):
+        """R4 correction 3: an unsupported baseline_resolution_policy.strategy
+        (e.g. 'latest_release') must never be silently reinterpreted as
+        origin_default -- collect_evidence() records it as 'not performed'
+        with the reason, which evaluate() reports as UNKNOWN, never PASS."""
+        evidence = complete_evidence()
+        evidence["registry_project"]["baseline_resolution_policy"] = {"strategy": "latest_release"}
+        evidence["remote_baseline_resolution"] = {
+            "performed": False, "baseline_sha": None,
+            "error": "registry baseline_resolution_policy.strategy 'latest_release' is not implemented by remote_baseline_resolver",
+        }
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["D"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+        self.assertIn("latest_release", report.as_dict()["invariants"]["D"]["detail"])
+
+
+class BaselineStrategyFailClosedWiringTest(unittest.TestCase):
+    """R4 correction 3, exercised through collect_evidence() itself: an
+    unsupported strategy must never reach resolve_remote_baseline() at
+    all, so a caller cannot even accidentally receive a false PASS/FAIL
+    built on the wrong baseline semantics."""
+
+    def _base_fake_registry(self, strategy):
+        from manager.project_registry import ProjectMetadata
+
+        project_metadata = ProjectMetadata(
+            project_id=PROJECT_ID, display_name="Demo", aliases=(),
+            repo={"canonical_url": REPO, "owner": "ne9221", "name": "demo-project"},
+            default_branch="main", baseline_resolution_policy={"strategy": strategy},
+            common_governance={"reference": "governance-rules.json"}, project_rules={"reference": "AI-DEVELOPMENT-RULES.md"},
+            validation_policy={}, working_directory_policy={"relative_path": "demo-project", "env_var": "ADM_WORKSPACE_ROOT"},
+            isolation_policy={}, provider_restrictions={}, protected_paths=(), default_write_boundaries=(),
+            pointer_rules={}, status="enabled", resolution_status="verified", unresolved_reason=None,
+        )
+
+        class FakeRegistry:
+            def get_project(self, query, allow_disabled=False):
+                return project_metadata
+
+        return FakeRegistry()
+
+    def test_unsupported_strategy_never_calls_the_resolver(self):
+        fixture = complete_evidence()
+
+        class FakeStore:
+            def get(self, area, project_id, name):
+                mapping = {
+                    "tasks": fixture["task"], "commands": fixture["command"],
+                    "executions": fixture["execution"], "sessions": fixture["session"],
+                    "projects": fixture["project"],
+                }
+                if area in mapping:
+                    return dict(mapping[area])
+                from manager.tasks import TaskError
+                raise TaskError("not found")
+
+            def latest(self, area, project_id, task_id):
+                return dict(fixture["handoff"])
+
+            def list_records(self, area, project_id):
+                return []
+
+        class FakeDispatchRegistry:
+            def __init__(self, bucket, project_id, request_id):
+                pass
+
+            def read_if_exists(self):
+                return (dict(fixture["dispatch_request"]), 1, None)
+
+        class FakeClaimRegistry:
+            def __init__(self, bucket, project_id, task_id):
+                pass
+
+            def read_if_exists(self):
+                return None
+
+        resolver_calls = []
+
+        def resolver_should_never_be_called(*args, **kwargs):
+            resolver_calls.append((args, kwargs))
+            return {"sha": BASELINE_HEAD}
+
+        evidence = v.collect_evidence(
+            FakeStore(), PROJECT_ID, REQUEST_ID,
+            task_claim_registry_factory=FakeClaimRegistry,
+            dispatch_registry_factory=FakeDispatchRegistry,
+            expected_repo=REPO,
+            git_runner=lambda args, **kw: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+            project_registry=self._base_fake_registry("latest_release"),
+            workspace_root="C:/workspace",
+            github_fetch=resolver_should_never_be_called,
+            canonical_checkout_exists_check=lambda p: True,
+        )
+
+        self.assertEqual(resolver_calls, [])
+        self.assertFalse(evidence["remote_baseline_resolution"]["performed"])
+        self.assertIn("latest_release", evidence["remote_baseline_resolution"]["error"])
+        report = v.evaluate(evidence, expected_project_id=PROJECT_ID, expected_request_id=REQUEST_ID, expected_repo=REPO)
+        self.assertEqual(report.as_dict()["invariants"]["D"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
 
 
 class InspectCanonicalCheckoutHelperTest(unittest.TestCase):
@@ -582,25 +770,63 @@ class InspectCanonicalCheckoutHelperTest(unittest.TestCase):
 
 
 class CheckRepoFileExistsHelperTest(unittest.TestCase):
-    def test_returns_true_on_200(self):
+    """R4 correction 2: a bare Contents-API 404 must never be trusted as
+    confirmed-missing on its own -- GitHub returns 404 (never 403) for a
+    private/inaccessible repo too, so this is only trusted once a
+    follow-up GET on the bare repo resource independently confirms (200)
+    that the repo itself is actually visible."""
+
+    def test_returns_true_on_contents_200(self):
         class R:
             status_code = 200
         result = v.check_repo_file_exists("ne9221", "demo-project", "governance-rules.json", BASELINE_HEAD,
                                            http_get=lambda url, **kw: R())
         self.assertTrue(result)
 
-    def test_returns_false_on_404(self):
-        class R:
-            status_code = 404
+    def test_confirmed_missing_when_repo_itself_is_accessible(self):
+        def fake_http_get(url, **kw):
+            class R:
+                status_code = 404 if "/contents/" in url else 200
+            return R()
         result = v.check_repo_file_exists("ne9221", "demo-project", "governance-rules.json", BASELINE_HEAD,
-                                           http_get=lambda url, **kw: R())
+                                           http_get=fake_http_get)
         self.assertFalse(result)
 
-    def test_returns_none_on_error(self):
+    def test_ambiguous_404_when_repo_itself_is_also_inaccessible(self):
+        """An unauthenticated/under-privileged 404 on a private repo:
+        both the contents GET and the bare repo GET 404 -- must be
+        UNKNOWN (None), never a confirmed-missing FAIL."""
+        def fake_http_get(url, **kw):
+            class R:
+                status_code = 404
+            return R()
+        result = v.check_repo_file_exists("ne9221", "demo-project", "governance-rules.json", BASELINE_HEAD,
+                                           http_get=fake_http_get)
+        self.assertIsNone(result)
+
+    def test_returns_none_on_transport_error(self):
         def raiser(*a, **k):
             raise RuntimeError("network down")
         result = v.check_repo_file_exists("ne9221", "demo-project", "governance-rules.json", BASELINE_HEAD,
                                            http_get=raiser)
+        self.assertIsNone(result)
+
+    def test_returns_none_on_error_during_repo_accessibility_followup(self):
+        def fake_http_get(url, **kw):
+            if "/contents/" in url:
+                class R:
+                    status_code = 404
+                return R()
+            raise RuntimeError("network down during follow-up")
+        result = v.check_repo_file_exists("ne9221", "demo-project", "governance-rules.json", BASELINE_HEAD,
+                                           http_get=fake_http_get)
+        self.assertIsNone(result)
+
+    def test_returns_none_on_unexpected_status(self):
+        class R:
+            status_code = 500
+        result = v.check_repo_file_exists("ne9221", "demo-project", "governance-rules.json", BASELINE_HEAD,
+                                           http_get=lambda url, **kw: R())
         self.assertIsNone(result)
 
 
@@ -915,6 +1141,13 @@ class CollectEvidenceFakeStoreTest(unittest.TestCase):
         def fake_repo_file_exists(owner, name, path, ref, token=None):
             return True
 
+        # A caller running a real acceptance would have captured this via
+        # inspect_canonical_checkout() BEFORE dispatching -- collect_evidence()
+        # itself never invents it. Uses the same head_sha as the fresh
+        # POST-E2E snapshot fake_git_runner will produce below, so the
+        # before/after comparison in invariant O passes.
+        pre_e2e_snapshot = {"available": True, "path": "C:/workspace/demo-project", "repo_identity_ok": True, "head_sha": BASELINE_HEAD, "clean": True}
+
         store = FakeStore()
         evidence = v.collect_evidence(
             store, PROJECT_ID, REQUEST_ID,
@@ -927,6 +1160,7 @@ class CollectEvidenceFakeStoreTest(unittest.TestCase):
             github_fetch=fake_github_fetch,
             repo_file_exists_check=fake_repo_file_exists,
             canonical_checkout_exists_check=lambda p: True,
+            canonical_checkout_before=pre_e2e_snapshot,
         )
 
         self.assertIsNotNone(evidence["registry_project"])
@@ -934,10 +1168,12 @@ class CollectEvidenceFakeStoreTest(unittest.TestCase):
         self.assertEqual(evidence["registry_project"]["status"], "enabled")
         self.assertTrue(evidence["registry_reference_file_check"]["common_governance_exists"])
         self.assertTrue(evidence["registry_reference_file_check"]["project_rules_exists"])
-        self.assertTrue(evidence["canonical_checkout"]["available"])
-        self.assertTrue(evidence["canonical_checkout"]["repo_identity_ok"])
-        self.assertEqual(evidence["canonical_checkout"]["head_sha"], BASELINE_HEAD)
-        self.assertTrue(evidence["canonical_checkout"]["clean"])
+        # canonical_checkout_before is passed straight through, unmodified.
+        self.assertEqual(evidence["canonical_checkout_before"], pre_e2e_snapshot)
+        self.assertTrue(evidence["canonical_checkout_after"]["available"])
+        self.assertTrue(evidence["canonical_checkout_after"]["repo_identity_ok"])
+        self.assertEqual(evidence["canonical_checkout_after"]["head_sha"], BASELINE_HEAD)
+        self.assertTrue(evidence["canonical_checkout_after"]["clean"])
         self.assertTrue(evidence["remote_baseline_resolution"]["performed"])
         self.assertEqual(evidence["remote_baseline_resolution"]["baseline_sha"], BASELINE_HEAD)
         self.assertIsNone(evidence["remote_baseline_resolution"]["error"])
