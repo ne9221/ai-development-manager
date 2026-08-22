@@ -57,6 +57,50 @@ this baseline:
    either one being explicitly set fails Rule44's automatic-selection
    acceptance outright.
 
+R3 changes (evidence gaps found after R2 was structurally accepted):
+
+4. Invariant E's terminal-identity check no longer treats Command.provider/
+   account_id as authoritative for the *final launched* identity -- current
+   runtime permits automatic sibling-account substitution, so Command's own
+   provider/account fields are provisional routing evidence only.
+   Execution and Session are the terminal actual-identity authority: PASS
+   now additionally requires Execution.provider == Session.provider, and
+   for provider "claude", Execution.account_id == Session.account_id with
+   both non-empty. Command's requested_provider/requested_account_id being
+   both None is still required for "automatic" in the first place.
+
+5. Invariant O now independently inspects the real canonical/shared
+   checkout read-only (manager.project_registry's Global Project Registry +
+   its configured ADM_WORKSPACE_ROOT-style env var -- never the Drive
+   Project record's unmaintained `working_directory` literal): resolves
+   the canonical path, and reads (never mutates) its origin remote
+   identity, `git rev-parse HEAD`, and `git status --porcelain`. PASS now
+   additionally requires: the canonical checkout is reachable and its repo
+   identity matches the registered project, its working tree is clean, and
+   its HEAD still equals Task.baseline_head (proof this execution's
+   isolated worktree never touched it). Unreachable/uninspectable is
+   UNKNOWN, never PASS.
+
+6. Invariant C now also resolves the Global Project Registry entry (not
+   just Task.governance) and requires resolution_status=="verified",
+   status=="enabled", a registered repo identity consistent with the
+   Task/lease/D2 repo, and non-empty common_governance.reference /
+   project_rules.reference -- Task.governance alone no longer proves
+   PROJECT-RULES authority. Where a read-only GitHub contents check of
+   both referenced files at the admitted baseline was actually performed,
+   a confirmed-missing file is a hard FAIL; otherwise this remains a
+   best-effort addition to the detail, never blocking PASS on its own
+   (matching "where technically practical").
+
+7. Invariant D now additionally requires one fresh, independent resolution
+   of the canonical remote baseline (manager.remote_baseline_resolver,
+   itself GitHub-API-only, honoring the registry's own
+   baseline_resolution_policy for origin_default vs. pinned_ref) and
+   requires Task.baseline_head to equal that freshly-resolved SHA -- so
+   Task/lease/D2 can no longer all agree on a baseline that is not
+   actually the true canonical one. Not performed => UNKNOWN; performed
+   and mismatched => FAIL.
+
 Two layers, deliberately kept separate:
 
 - `evaluate(...)` is a pure function over an already-assembled evidence
@@ -237,13 +281,55 @@ def _evaluate_b(evidence: Dict[str, Any], expected_project_id: str) -> Invariant
     return _result("B", PASS, "every present record agrees on project_id")
 
 
-def _evaluate_c(evidence: Dict[str, Any]) -> InvariantResult:
+def _evaluate_c(evidence: Dict[str, Any], expected_repo: Optional[str]) -> InvariantResult:
     task = evidence.get("task")
     if task is None:
         return _result("C", UNKNOWN, "no Task record; governance resolution cannot be checked")
     if not _governance_ok(task.get("governance")):
-        return _result("C", FAIL, "Task.governance is missing or incomplete (rules_version/rules_digest/mandatory_rule_ids/mandatory_status_fields)")
-    return _result("C", PASS, "Task carries a complete governance stamp")
+        return _result("C", FAIL, "Task.governance is missing or incomplete (rules_version/rules_digest/mandatory_rule_ids/mandatory_status_fields) -- this is only the Common Governance stamp, never PROJECT-RULES authority by itself")
+
+    # Task.governance alone never proves PROJECT-RULES authority -- that
+    # authority lives in the Global Project Registry entry itself (R3
+    # point 6), which the Task's governance stamp is merely a per-task
+    # digest of.
+    registry_project = evidence.get("registry_project")
+    if not isinstance(registry_project, dict):
+        return _result("C", UNKNOWN, "Task carries a Common Governance stamp, but no Global Project Registry entry was resolved; project-specific PROJECT-RULES authority cannot be proven")
+
+    if registry_project.get("resolution_status") != "verified":
+        return _result("C", FAIL, f"registry resolution_status is {registry_project.get('resolution_status')!r}, not 'verified'")
+    if registry_project.get("status") != "enabled":
+        return _result("C", FAIL, f"registry status is {registry_project.get('status')!r}, not 'enabled'")
+
+    common_governance = registry_project.get("common_governance") or {}
+    if not common_governance.get("reference"):
+        return _result("C", FAIL, "registry common_governance.reference is missing")
+    project_rules = registry_project.get("project_rules") or {}
+    if not project_rules.get("reference"):
+        return _result("C", FAIL, "registry project_rules.reference is missing")
+
+    if expected_repo:
+        registry_identity = _repo_identity((registry_project.get("repo") or {}).get("canonical_url"))
+        expected_identity = _repo_identity(expected_repo)
+        if registry_identity and expected_identity and registry_identity != expected_identity:
+            return _result("C", FAIL, f"registry repo canonical_url does not match expected repo {expected_repo!r}")
+
+    baseline_policy = registry_project.get("baseline_resolution_policy")
+    if not isinstance(baseline_policy, dict) or not baseline_policy.get("strategy"):
+        return _result("C", FAIL, "registry baseline_resolution_policy is missing or has no 'strategy'")
+
+    file_check = evidence.get("registry_reference_file_check") or {}
+    governance_exists = file_check.get("common_governance_exists")
+    rules_exists = file_check.get("project_rules_exists")
+    if governance_exists is False:
+        return _result("C", FAIL, f"common_governance reference {common_governance.get('reference')!r} does not exist at the admitted baseline")
+    if rules_exists is False:
+        return _result("C", FAIL, f"project_rules reference {project_rules.get('reference')!r} does not exist at the admitted baseline")
+    file_note = ("both reference files independently confirmed to exist at the admitted baseline"
+                 if governance_exists is True and rules_exists is True
+                 else "reference file existence not independently checked this run (best-effort)")
+
+    return _result("C", PASS, f"Common Governance stamp present on Task; registry verified+enabled with common_governance.reference={common_governance.get('reference')!r} and project_rules.reference={project_rules.get('reference')!r} as the project-specific rules authority; {file_note}")
 
 
 def _evaluate_d(evidence: Dict[str, Any], expected_repo: Optional[str]) -> InvariantResult:
@@ -287,7 +373,21 @@ def _evaluate_d(evidence: Dict[str, Any], expected_repo: Optional[str]) -> Invar
             if d2_identity and expected_identity and d2_identity != expected_identity:
                 return _result("D", FAIL, f"D2 repo_write_completion_evidence.repository {d2.get('repository')!r} does not match expected repo {expected_repo!r}")
 
-    return _result("D", PASS, "branch/baseline_head resolved and consistent across Task/lease/D2 evidence")
+    # Task/lease/D2 agreeing with each other still doesn't prove the
+    # baseline they all agree on is the *true* canonical one (R3 point 7):
+    # require one fresh, independent resolution of the canonical remote
+    # baseline (manager.remote_baseline_resolver, itself GitHub-API-only,
+    # honoring the registry's own baseline_resolution_policy).
+    resolution = evidence.get("remote_baseline_resolution")
+    if not isinstance(resolution, dict) or not resolution.get("performed"):
+        return _result("D", UNKNOWN, "branch/baseline_head resolved and consistent across Task/lease/D2 evidence, but no independent canonical-baseline resolution was performed; Task.baseline_head cannot be proven to match true canonical authority")
+    if resolution.get("error"):
+        return _result("D", FAIL, f"independent canonical baseline resolution failed: {resolution['error']}")
+    resolved_sha = resolution.get("baseline_sha")
+    if resolved_sha != baseline_head:
+        return _result("D", FAIL, f"Task.baseline_head {baseline_head!r} does not match the independently-resolved canonical baseline {resolved_sha!r}")
+
+    return _result("D", PASS, f"branch/baseline_head resolved and consistent across Task/lease/D2 evidence, and independently confirmed to equal the true canonical remote baseline {resolved_sha}")
 
 
 def _evaluate_e(evidence: Dict[str, Any]) -> InvariantResult:
@@ -298,16 +398,32 @@ def _evaluate_e(evidence: Dict[str, Any]) -> InvariantResult:
         return _result("E", FAIL, f"Command.requested_provider={command.get('requested_provider')!r} was explicitly supplied; not automatic selection")
     if command.get("requested_account_id") is not None:
         return _result("E", FAIL, f"Command.requested_account_id={command.get('requested_account_id')!r} was explicitly supplied; not automatic selection")
-    provider = command.get("provider")
-    if not provider:
-        return _result("E", FAIL, "Command.provider is empty; no terminal provider attribution")
-    if provider == "claude":
-        execution = evidence.get("execution") or {}
-        session = evidence.get("session") or {}
-        account_id = command.get("account_id") or execution.get("account_id") or session.get("account_id")
-        if not account_id:
-            return _result("E", FAIL, "provider is claude but no account_id was recorded on Command/Execution/Session")
-    return _result("E", PASS, f"requested_provider/requested_account_id both absent; provider {provider!r} routed automatically with terminal attribution present")
+
+    # Command.provider/account_id are provisional routing evidence only --
+    # current runtime permits automatic sibling-account substitution, so
+    # the *final launched* identity is never assumed to equal Command's.
+    # Execution + Session are the terminal actual-identity authority.
+    execution = evidence.get("execution")
+    session = evidence.get("session")
+    if execution is None or session is None:
+        missing = [name for name, record in (("execution", execution), ("session", session)) if record is None]
+        return _result("E", UNKNOWN, f"requested_provider/requested_account_id both absent, but terminal identity cannot be verified; missing: {', '.join(missing)}")
+
+    terminal_provider = execution.get("provider")
+    if not terminal_provider:
+        return _result("E", FAIL, "Execution.provider is empty; no terminal provider attribution")
+    if execution.get("provider") != session.get("provider"):
+        return _result("E", FAIL, f"Execution.provider {execution.get('provider')!r} != Session.provider {session.get('provider')!r}; terminal identity disagrees")
+
+    if terminal_provider == "claude":
+        exec_account_id = execution.get("account_id")
+        session_account_id = session.get("account_id")
+        if not exec_account_id or not session_account_id:
+            return _result("E", FAIL, "provider is claude but Execution.account_id/Session.account_id is missing; terminal account attribution cannot be proven")
+        if exec_account_id != session_account_id:
+            return _result("E", FAIL, f"Execution.account_id {exec_account_id!r} != Session.account_id {session_account_id!r}; terminal account identity disagrees")
+
+    return _result("E", PASS, f"requested_provider/requested_account_id both absent; terminal provider {terminal_provider!r} (Execution == Session) routed automatically with consistent account attribution")
 
 
 def _evaluate_f(evidence: Dict[str, Any]) -> InvariantResult:
@@ -528,12 +644,28 @@ def _evaluate_n(evidence: Dict[str, Any]) -> InvariantResult:
 
 def _evaluate_o(evidence: Dict[str, Any]) -> InvariantResult:
     task = evidence.get("task")
-    project = evidence.get("project")
     execution = evidence.get("execution")
-    if task is None or project is None:
-        return _result("O", UNKNOWN, "no Task or Project record; canonical-checkout isolation cannot be checked")
+    if task is None:
+        return _result("O", UNKNOWN, "no Task record; canonical-checkout isolation cannot be checked")
     if task.get("read_only") is True:
         return _result("O", PASS, "Task is read_only; no repo write to check against the canonical checkout")
+
+    # Independent, read-only inspection of the real canonical/shared
+    # checkout (manager.project_registry + its configured workspace env
+    # var) -- never the Drive Project record's unmaintained
+    # `working_directory` literal. See module docstring, R3 point 5.
+    canonical_checkout = evidence.get("canonical_checkout")
+    if not isinstance(canonical_checkout, dict) or not canonical_checkout.get("available"):
+        reason = (canonical_checkout or {}).get("reason") if isinstance(canonical_checkout, dict) else None
+        return _result("O", UNKNOWN, f"canonical checkout could not be independently inspected{': ' + reason if reason else ''}")
+    if canonical_checkout.get("repo_identity_ok") is not True:
+        return _result("O", FAIL, "canonical checkout's origin remote does not match the registered project repo identity")
+    if canonical_checkout.get("clean") is not True:
+        return _result("O", FAIL, "canonical checkout has uncommitted changes (git status --porcelain is not empty)")
+    baseline_head = task.get("baseline_head")
+    canonical_head = canonical_checkout.get("head_sha")
+    if not baseline_head or canonical_head != baseline_head:
+        return _result("O", FAIL, f"canonical checkout HEAD {canonical_head!r} does not equal Task.baseline_head {baseline_head!r}; the admitted pre-E2E authority cannot be proven")
 
     # Task.working_directory is deliberately None for repo-write ingress
     # (module docstring point 2); the actual runtime checkout location is
@@ -544,25 +676,25 @@ def _evaluate_o(evidence: Dict[str, Any]) -> InvariantResult:
     # itself still reads None.
     snapshot = (execution or {}).get("task_snapshot") or {}
     runtime_working_directory = snapshot.get("working_directory") or task.get("working_directory")
-    canonical_dir = _norm_path(project.get("working_directory"))
 
     if runtime_working_directory is None:
         d2 = _d2(execution)
         lease = (execution or {}).get("lease_evidence")
         if d2 is not None or isinstance(lease, dict):
-            return _result("O", UNKNOWN, "no runtime working_directory recorded on Execution.task_snapshot, but lease/D2 evidence exists -- isolation is proven elsewhere (see invariant F) though this specific path comparison cannot be made")
+            return _result("O", UNKNOWN, "canonical checkout independently confirmed clean/correct/at-baseline, but no runtime working_directory was recorded on Execution.task_snapshot to prove the isolated worktree path itself differs from it")
         return _result("O", UNKNOWN, "no runtime working_directory available on Task or Execution.task_snapshot; canonical-checkout isolation cannot be checked")
 
     task_dir = _norm_path(runtime_working_directory)
+    canonical_dir = _norm_path(canonical_checkout.get("path"))
     if task_dir and canonical_dir and task_dir == canonical_dir:
-        return _result("O", FAIL, "the runtime working_directory is the same path as the project's canonical/shared checkout")
-    return _result("O", PASS, "the runtime working_directory is isolated from the canonical/shared checkout")
+        return _result("O", FAIL, "the runtime working_directory is the same path as the independently-inspected canonical/shared checkout")
+    return _result("O", PASS, "canonical checkout independently confirmed reachable, correct repo identity, clean, at the admitted baseline_head, and distinct from the runtime working_directory")
 
 
 _EVALUATORS = {
     "A": lambda e, p, r, repo: _evaluate_a(e, r),
     "B": lambda e, p, r, repo: _evaluate_b(e, p),
-    "C": lambda e, p, r, repo: _evaluate_c(e),
+    "C": lambda e, p, r, repo: _evaluate_c(e, repo),
     "D": lambda e, p, r, repo: _evaluate_d(e, repo),
     "E": lambda e, p, r, repo: _evaluate_e(e),
     "F": lambda e, p, r, repo: _evaluate_f(e),
@@ -630,10 +762,99 @@ def check_remote_ref(repo_url: str, branch: str, expected_sha: Optional[str], ru
     return {"performed": True, "ref": ref, "remote_sha": remote_sha, "matches": remote_sha == expected_sha, "error": None}
 
 
+def _run_git_readonly(cwd: str, *args: str, runner=subprocess.run) -> Optional[str]:
+    """Run one read-only `git` command against `cwd` and return its trimmed
+    stdout, or None if it failed. Only ever invoked (see
+    inspect_canonical_checkout below) with read-only subcommands
+    (remote get-url / rev-parse / status --porcelain) -- this module never
+    mutates, resets, or checks out the canonical repo."""
+    try:
+        completed = runner(["git", "-C", cwd, *args], text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=30)
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    return (completed.stdout or "").strip()
+
+
+def inspect_canonical_checkout(project_metadata, workspace_root: Optional[str] = None,
+                                exists_check=None, git_runner=subprocess.run) -> Dict[str, Any]:
+    """Independently, read-only, locate and inspect the real canonical/
+    shared checkout for `project_metadata` (a manager.project_registry.
+    ProjectMetadata) -- resolved via the Global Project Registry's own
+    workspace-root convention, never the Drive Project record's
+    unmaintained `working_directory` literal. Only ever runs read-only git
+    subcommands (remote get-url / rev-parse HEAD / status --porcelain);
+    never fetches, resets, or checks out anything. Returns
+    {"available": False, "reason": ...} whenever the checkout cannot be
+    located or fully inspected -- callers must treat that as UNKNOWN, never
+    PASS."""
+    import os as _os
+
+    if exists_check is None:
+        exists_check = _os.path.isdir
+
+    env_var = "ADM_WORKSPACE_ROOT"
+    policy = getattr(project_metadata, "working_directory_policy", None)
+    if isinstance(policy, dict):
+        env_var = policy.get("env_var", env_var)
+    root = workspace_root if workspace_root is not None else _os.environ.get(env_var)
+    if not root:
+        return {"available": False, "reason": f"{env_var} is not set; canonical checkout cannot be independently located"}
+
+    path = str(project_metadata.resolve_runtime_working_directory(workspace_root=root))
+    if not exists_check(path):
+        return {"available": False, "path": path, "reason": "canonical checkout path does not exist"}
+
+    remote_url = _run_git_readonly(path, "remote", "get-url", "origin", runner=git_runner)
+    if remote_url is None:
+        return {"available": False, "path": path, "reason": "could not read canonical checkout's origin remote"}
+    from manager.project_registry import normalize_repo_identity
+    repo_identity_ok = bool(normalize_repo_identity(remote_url)) and normalize_repo_identity(remote_url) == getattr(project_metadata, "repo_identity", None)
+
+    head_sha = _run_git_readonly(path, "rev-parse", "HEAD", runner=git_runner)
+    if head_sha is None:
+        return {"available": False, "path": path, "reason": "could not read canonical checkout HEAD"}
+
+    status_output = _run_git_readonly(path, "status", "--porcelain", runner=git_runner)
+    if status_output is None:
+        return {"available": False, "path": path, "reason": "could not read canonical checkout git status"}
+
+    return {"available": True, "path": path, "repo_identity_ok": repo_identity_ok, "head_sha": head_sha, "clean": status_output == ""}
+
+
+def check_repo_file_exists(owner: str, name: str, path: str, ref: str, token: Optional[str] = None, http_get=None) -> Optional[bool]:
+    """Best-effort, read-only proof that `path` exists in owner/name at
+    commit/ref `ref`, via one GitHub Contents API GET. Returns True/False
+    only when the API gave an unambiguous 200/404; returns None (not
+    proven either way -- never treated as a positive result) for any
+    transport error, rate limit, or unexpected status, so a caller can
+    distinguish 'confirmed missing' (a hard FAIL) from 'could not check'
+    (never blocks PASS on its own)."""
+    if http_get is None:
+        import requests as _requests
+        http_get = _requests.get
+    url = f"https://api.github.com/repos/{owner}/{name}/contents/{path}"
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        response = http_get(url, headers=headers, params={"ref": ref}, timeout=15)
+    except Exception:
+        return None
+    if response.status_code == 200:
+        return True
+    if response.status_code == 404:
+        return False
+    return None
+
+
 def collect_evidence(store, project_id: str, request_id: str, task_claim_registry_factory=None,
                       dispatch_registry_factory=None, bucket: Optional[str] = None,
                       final_commit_sha: Optional[str] = None, expected_repo: Optional[str] = None,
-                      git_runner=subprocess.run) -> Dict[str, Any]:
+                      git_runner=subprocess.run, project_registry=None, workspace_root: Optional[str] = None,
+                      github_fetch=None, github_token: Optional[str] = None,
+                      repo_file_exists_check=None, canonical_checkout_exists_check=None) -> Dict[str, Any]:
     """Assemble one evidence dict for (project_id, request_id) using only
     existing read APIs. Never raises for a merely-missing record -- every
     field is None (or []) if it cannot be found, and `evaluate()` reports
@@ -644,6 +865,14 @@ def collect_evidence(store, project_id: str, request_id: str, task_claim_registr
     exists, its own commit_sha/branch/repository drive the independent
     `git ls-remote` readback directly; a caller-supplied final_commit_sha is
     never required (and never substituted) in that case.
+
+    `project_registry` (a manager.project_registry.ProjectRegistry, default
+    manager.project_registry.get_global_registry()), `workspace_root` (a
+    forced canonical-checkout root, default the registry entry's own
+    configured env var), `github_fetch`/`github_token` (forwarded to
+    manager.remote_baseline_resolver.resolve_remote_baseline), and
+    `repo_file_exists_check` (forwarded to check_repo_file_exists) are all
+    injectable so tests never need live Drive/GCS/git/GitHub access.
     """
     if task_claim_registry_factory is None:
         from manager.task_claims import task_claim_registry as task_claim_registry_factory
@@ -655,7 +884,9 @@ def collect_evidence(store, project_id: str, request_id: str, task_claim_registr
         "dispatch_request": None, "task": None, "command": None, "execution": None,
         "session": None, "handoff": None, "project": None, "task_claim": None,
         "sibling_executions": None, "sibling_commands": None, "remote_ref_check": None,
-        "final_commit_sha": final_commit_sha,
+        "final_commit_sha": final_commit_sha, "registry_project": None,
+        "registry_reference_file_check": None, "canonical_checkout": None,
+        "remote_baseline_resolution": None,
     }
 
     dispatch_request = None
@@ -722,17 +953,79 @@ def collect_evidence(store, project_id: str, request_id: str, task_claim_registr
         if repo and branch and final_commit_sha:
             evidence["remote_ref_check"] = check_remote_ref(repo, branch, final_commit_sha, runner=git_runner)
 
+    # Global Project Registry entry (R3 points 5-7): resolved read-only,
+    # never mutated. A resolution failure (unregistered/ambiguous/disabled
+    # project) leaves every dependent evidence field None -- evaluate()
+    # reports UNKNOWN, never guesses.
+    registry_metadata = None
+    try:
+        registry = project_registry
+        if registry is None:
+            from manager.project_registry import get_global_registry
+            registry = get_global_registry()
+        registry_metadata = registry.get_project(project_id, allow_disabled=True)
+    except Exception:
+        registry_metadata = None
+
+    if registry_metadata is not None:
+        raw_repo = registry_metadata.repo if isinstance(registry_metadata.repo, dict) else None
+        evidence["registry_project"] = {
+            "resolution_status": registry_metadata.resolution_status,
+            "status": registry_metadata.status,
+            "common_governance": dict(registry_metadata.common_governance) if isinstance(registry_metadata.common_governance, dict) else registry_metadata.common_governance,
+            "project_rules": dict(registry_metadata.project_rules) if isinstance(registry_metadata.project_rules, dict) else registry_metadata.project_rules,
+            "baseline_resolution_policy": dict(registry_metadata.baseline_resolution_policy) if isinstance(registry_metadata.baseline_resolution_policy, dict) else registry_metadata.baseline_resolution_policy,
+            "repo": dict(raw_repo) if raw_repo else None,
+        }
+
+        # Best-effort, read-only proof the referenced governance/rules
+        # files actually exist at the admitted baseline (R3 point 6). Never
+        # required for this function to succeed; a transport failure just
+        # leaves both as None (evaluate() treats that as "not independently
+        # checked", not a failure).
+        owner = raw_repo.get("owner") if raw_repo else None
+        name = raw_repo.get("name") if raw_repo else None
+        baseline_head = task.get("baseline_head") if task else None
+        if owner and name and baseline_head:
+            file_check = repo_file_exists_check or check_repo_file_exists
+            gov_ref = (registry_metadata.common_governance or {}).get("reference") if isinstance(registry_metadata.common_governance, dict) else None
+            rules_ref = (registry_metadata.project_rules or {}).get("reference") if isinstance(registry_metadata.project_rules, dict) else None
+            token = github_token
+            evidence["registry_reference_file_check"] = {
+                "common_governance_exists": file_check(owner, name, gov_ref, baseline_head, token=token) if gov_ref else None,
+                "project_rules_exists": file_check(owner, name, rules_ref, baseline_head, token=token) if rules_ref else None,
+            }
+
+        # Independent, read-only canonical-checkout inspection (R3 point 5).
+        evidence["canonical_checkout"] = inspect_canonical_checkout(
+            registry_metadata, workspace_root=workspace_root, exists_check=canonical_checkout_exists_check, git_runner=git_runner)
+
+        # Independent, fresh canonical-baseline resolution (R3 point 7).
+        if task is not None and task.get("baseline_head"):
+            try:
+                from manager.remote_baseline_resolver import RemoteBaselineResolutionError, resolve_remote_baseline
+                kwargs = {"registry": registry}
+                if github_fetch is not None:
+                    kwargs["github_fetch"] = github_fetch
+                if github_token is not None:
+                    kwargs["github_token"] = github_token
+                resolved = resolve_remote_baseline(project_id, **kwargs)
+                evidence["remote_baseline_resolution"] = {"performed": True, "baseline_sha": resolved.get("baseline_sha"), "error": None}
+            except Exception as exc:
+                evidence["remote_baseline_resolution"] = {"performed": True, "baseline_sha": None, "error": str(exc)}
+
     return evidence
 
 
 def verify_write_e2e(store, project_id: str, request_id: str, expected_repo: Optional[str] = None,
                       final_commit_sha: Optional[str] = None, test_evidence: Optional[Dict[str, Any]] = None,
-                      bucket: Optional[str] = None, git_runner=subprocess.run) -> VerifierReport:
+                      bucket: Optional[str] = None, git_runner=subprocess.run, workspace_root: Optional[str] = None,
+                      github_token: Optional[str] = None) -> VerifierReport:
     """Top-level convenience: collect real evidence for one finished
     dispatch and evaluate the full Rule44 write-E2E contract against it."""
     evidence = collect_evidence(store, project_id, request_id, bucket=bucket,
                                  final_commit_sha=final_commit_sha, expected_repo=expected_repo,
-                                 git_runner=git_runner)
+                                 git_runner=git_runner, workspace_root=workspace_root, github_token=github_token)
     if test_evidence is not None:
         evidence["test_evidence"] = test_evidence
     return evaluate(evidence, expected_project_id=project_id, expected_request_id=request_id, expected_repo=expected_repo)

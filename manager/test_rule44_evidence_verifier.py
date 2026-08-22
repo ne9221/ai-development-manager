@@ -119,6 +119,19 @@ def complete_evidence():
             "performed": True, "ref": f"refs/heads/{BRANCH}", "remote_sha": FINAL_SHA,
             "matches": True, "error": None,
         },
+        "registry_project": {
+            "resolution_status": "verified", "status": "enabled",
+            "common_governance": {"reference": "governance-rules.json", "version": "1.0.0"},
+            "project_rules": {"reference": "AI-DEVELOPMENT-RULES.md", "mandatory_rule_ids": ["rule-1"]},
+            "baseline_resolution_policy": {"strategy": "origin_default", "pinned_ref": None},
+            "repo": {"canonical_url": REPO, "owner": "ne9221", "name": "demo-project"},
+        },
+        "registry_reference_file_check": {"common_governance_exists": True, "project_rules_exists": True},
+        "canonical_checkout": {
+            "available": True, "path": "C:/canonical/demo-project",
+            "repo_identity_ok": True, "head_sha": BASELINE_HEAD, "clean": True,
+        },
+        "remote_baseline_resolution": {"performed": True, "baseline_sha": BASELINE_HEAD, "error": None},
     }
 
 
@@ -304,6 +317,291 @@ class RegressionI_MissingD2ForRepoWriteTest(unittest.TestCase):
         self.assertNotEqual(report.overall, v.PASS)
         for code in ("G", "H", "I", "J"):
             self.assertIn(report.as_dict()["invariants"][code]["verdict"], (v.FAIL, v.UNKNOWN), code)
+
+
+# --- R3 regressions ----------------------------------------------------------
+
+class TerminalIdentityTruthTest(unittest.TestCase):
+    """R3 correction 1: automatic-routing PASS requires Execution.provider
+    == Session.provider, and for Claude, Execution.account_id ==
+    Session.account_id (both non-empty). Command.provider/account_id are
+    provisional routing evidence only -- current runtime permits automatic
+    sibling-account substitution."""
+
+    def test_command_provisional_account_differs_from_terminal_but_execution_session_agree_passes(self):
+        """Command Claude A / Execution Claude B / Session Claude B: allowed
+        because Command's account is only provisional and
+        requested_account_id is None."""
+        evidence = complete_evidence()
+        evidence["command"]["account_id"] = "acct-A"
+        evidence["command"]["requested_account_id"] = None
+        evidence["execution"]["account_id"] = "acct-B"
+        evidence["session"]["account_id"] = "acct-B"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["E"]["verdict"], v.PASS, report.as_dict()["invariants"]["E"])
+        self.assertEqual(report.overall, v.PASS)
+
+    def test_execution_and_session_account_disagree_fails(self):
+        """Execution Claude A / Session Claude B => FAIL."""
+        evidence = complete_evidence()
+        evidence["execution"]["account_id"] = "acct-A"
+        evidence["session"]["account_id"] = "acct-B"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["E"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_execution_and_session_provider_disagree_fails(self):
+        evidence = complete_evidence()
+        evidence["execution"]["provider"] = "claude"
+        evidence["session"]["provider"] = "codex"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["E"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_claude_terminal_account_missing_fails(self):
+        evidence = complete_evidence()
+        evidence["execution"]["account_id"] = None
+        evidence["session"]["account_id"] = None
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["E"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_missing_execution_or_session_is_unknown(self):
+        evidence = complete_evidence()
+        evidence["session"] = None
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["E"]["verdict"], v.UNKNOWN)
+
+
+class CanonicalCheckoutIntegrityTest(unittest.TestCase):
+    """R3 correction 2: invariant O independently inspects the real
+    canonical checkout (repo identity, clean status, HEAD == admitted
+    baseline) rather than only comparing paths."""
+
+    def test_canonical_checkout_dirty_fails(self):
+        evidence = complete_evidence()
+        evidence["canonical_checkout"]["clean"] = False
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_canonical_checkout_repo_identity_mismatch_fails(self):
+        evidence = complete_evidence()
+        evidence["canonical_checkout"]["repo_identity_ok"] = False
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_canonical_checkout_head_disagrees_with_baseline_fails(self):
+        evidence = complete_evidence()
+        evidence["canonical_checkout"]["head_sha"] = "9" * 40
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_canonical_checkout_unavailable_is_unknown_never_pass(self):
+        evidence = complete_evidence()
+        evidence["canonical_checkout"] = {"available": False, "reason": "ADM_WORKSPACE_ROOT is not set"}
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_runtime_working_directory_equals_independently_inspected_canonical_path_fails(self):
+        evidence = complete_evidence()
+        evidence["execution"]["task_snapshot"]["working_directory"] = evidence["canonical_checkout"]["path"]
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_fully_confirmed_canonical_checkout_passes(self):
+        evidence = complete_evidence()
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.PASS)
+
+
+class RegistryGovernanceAuthorityTest(unittest.TestCase):
+    """R3 correction 3: invariant C now also requires the Global Project
+    Registry entry itself to be verified+enabled with non-empty
+    common_governance/project_rules references -- Task.governance alone
+    never proves PROJECT-RULES authority."""
+
+    def test_registry_unresolved_fails(self):
+        evidence = complete_evidence()
+        evidence["registry_project"]["resolution_status"] = "unresolved"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_registry_disabled_fails(self):
+        evidence = complete_evidence()
+        evidence["registry_project"]["status"] = "disabled"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_missing_common_governance_reference_fails(self):
+        evidence = complete_evidence()
+        evidence["registry_project"]["common_governance"] = {}
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.FAIL)
+
+    def test_missing_project_rules_reference_fails(self):
+        evidence = complete_evidence()
+        evidence["registry_project"]["project_rules"] = {}
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.FAIL)
+
+    def test_confirmed_missing_reference_file_fails(self):
+        evidence = complete_evidence()
+        evidence["registry_reference_file_check"]["project_rules_exists"] = False
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.FAIL)
+
+    def test_reference_file_check_not_performed_still_passes_structurally(self):
+        """'Where technically practical' -- an unperformed file-existence
+        check is noted in the detail but never blocks PASS on its own."""
+        evidence = complete_evidence()
+        evidence["registry_reference_file_check"] = {"common_governance_exists": None, "project_rules_exists": None}
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.PASS)
+
+    def test_no_registry_entry_resolved_is_unknown(self):
+        evidence = complete_evidence()
+        evidence["registry_project"] = None
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_registry_repo_mismatch_fails(self):
+        evidence = complete_evidence()
+        evidence["registry_project"]["repo"]["canonical_url"] = "https://github.com/someone-else/other-repo.git"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["C"]["verdict"], v.FAIL)
+
+    def test_detail_distinguishes_common_governance_stamp_from_project_rules_authority(self):
+        evidence = complete_evidence()
+        report = evaluate(evidence)
+        detail = report.as_dict()["invariants"]["C"]["detail"]
+        self.assertIn("Common Governance", detail)
+        self.assertIn("project_rules", detail)
+
+
+class IndependentBaselineProofTest(unittest.TestCase):
+    """R3 correction 4: invariant D requires Task.baseline_head to equal
+    one fresh, independently-resolved canonical remote baseline -- Task/
+    lease/D2 agreeing with each other is no longer sufficient by itself."""
+
+    def test_baseline_resolution_not_performed_is_unknown(self):
+        evidence = complete_evidence()
+        evidence["remote_baseline_resolution"] = None
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["D"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_baseline_resolution_error_fails(self):
+        evidence = complete_evidence()
+        evidence["remote_baseline_resolution"] = {"performed": True, "baseline_sha": None, "error": "remote_api_unavailable"}
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["D"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_baseline_resolution_mismatch_fails(self):
+        evidence = complete_evidence()
+        evidence["remote_baseline_resolution"] = {"performed": True, "baseline_sha": "9" * 40, "error": None}
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["D"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_baseline_resolution_match_passes(self):
+        evidence = complete_evidence()
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["D"]["verdict"], v.PASS)
+
+
+class InspectCanonicalCheckoutHelperTest(unittest.TestCase):
+    def _project_metadata(self):
+        from manager.project_registry import ProjectMetadata
+        return ProjectMetadata(
+            project_id=PROJECT_ID, display_name="Demo", aliases=(),
+            repo={"canonical_url": REPO, "owner": "ne9221", "name": "demo-project"},
+            default_branch="main", baseline_resolution_policy={"strategy": "origin_default", "pinned_ref": None},
+            common_governance={"reference": "governance-rules.json"}, project_rules={"reference": "AI-DEVELOPMENT-RULES.md"},
+            validation_policy={}, working_directory_policy={"relative_path": "demo-project", "env_var": "ADM_WORKSPACE_ROOT"},
+            isolation_policy={}, provider_restrictions={}, protected_paths=(), default_write_boundaries=(),
+            pointer_rules={}, status="enabled", resolution_status="verified", unresolved_reason=None,
+        )
+
+    def test_workspace_root_not_set_is_unavailable(self):
+        result = v.inspect_canonical_checkout(self._project_metadata(), workspace_root=None, exists_check=lambda p: True)
+        # workspace_root=None with no env var set should be unavailable unless ADM_WORKSPACE_ROOT happens to be set
+        import os
+        if "ADM_WORKSPACE_ROOT" not in os.environ:
+            self.assertFalse(result["available"])
+
+    def test_path_does_not_exist_is_unavailable(self):
+        result = v.inspect_canonical_checkout(self._project_metadata(), workspace_root="C:/workspace", exists_check=lambda p: False)
+        self.assertFalse(result["available"])
+
+    def test_available_and_clean(self):
+        def fake_runner(args, **kwargs):
+            class R:
+                returncode = 0
+                stderr = ""
+                if "remote" in args:
+                    stdout = REPO + "\n"
+                elif "rev-parse" in args:
+                    stdout = BASELINE_HEAD + "\n"
+                else:
+                    stdout = ""
+            return R()
+
+        result = v.inspect_canonical_checkout(self._project_metadata(), workspace_root="C:/workspace",
+                                               exists_check=lambda p: True, git_runner=fake_runner)
+        self.assertTrue(result["available"])
+        self.assertTrue(result["repo_identity_ok"])
+        self.assertEqual(result["head_sha"], BASELINE_HEAD)
+        self.assertTrue(result["clean"])
+
+    def test_dirty_status(self):
+        def fake_runner(args, **kwargs):
+            class R:
+                returncode = 0
+                stderr = ""
+                if "remote" in args:
+                    stdout = REPO + "\n"
+                elif "rev-parse" in args:
+                    stdout = BASELINE_HEAD + "\n"
+                else:
+                    stdout = " M manager/foo.py\n"
+            return R()
+
+        result = v.inspect_canonical_checkout(self._project_metadata(), workspace_root="C:/workspace",
+                                               exists_check=lambda p: True, git_runner=fake_runner)
+        self.assertTrue(result["available"])
+        self.assertFalse(result["clean"])
+
+
+class CheckRepoFileExistsHelperTest(unittest.TestCase):
+    def test_returns_true_on_200(self):
+        class R:
+            status_code = 200
+        result = v.check_repo_file_exists("ne9221", "demo-project", "governance-rules.json", BASELINE_HEAD,
+                                           http_get=lambda url, **kw: R())
+        self.assertTrue(result)
+
+    def test_returns_false_on_404(self):
+        class R:
+            status_code = 404
+        result = v.check_repo_file_exists("ne9221", "demo-project", "governance-rules.json", BASELINE_HEAD,
+                                           http_get=lambda url, **kw: R())
+        self.assertFalse(result)
+
+    def test_returns_none_on_error(self):
+        def raiser(*a, **k):
+            raise RuntimeError("network down")
+        result = v.check_repo_file_exists("ne9221", "demo-project", "governance-rules.json", BASELINE_HEAD,
+                                           http_get=raiser)
+        self.assertIsNone(result)
 
 
 # --- Other invariants / prior-generation coverage kept for regression -------
@@ -532,6 +830,120 @@ class CollectEvidenceFakeStoreTest(unittest.TestCase):
         self.assertTrue(evidence["remote_ref_check"]["matches"])
         self.assertEqual(len(seen_calls), 1)
         self.assertIn(f"refs/heads/{BRANCH}", seen_calls[0])
+
+    def test_collect_evidence_wires_registry_canonical_checkout_and_baseline_resolution(self):
+        """R3: collect_evidence() must resolve the Global Project Registry
+        entry, independently inspect the canonical checkout, and perform a
+        fresh canonical-baseline resolution -- all read-only, all via
+        injected fakes here (never live Drive/GCS/git/GitHub)."""
+        fixture = complete_evidence()
+
+        class FakeStore:
+            def __init__(self):
+                self.data = {
+                    ("tasks", PROJECT_ID, TASK_ID): dict(fixture["task"]),
+                    ("commands", PROJECT_ID, COMMAND_ID): dict(fixture["command"]),
+                    ("executions", PROJECT_ID, EXECUTION_ID): dict(fixture["execution"]),
+                    ("sessions", PROJECT_ID, SESSION_ID): dict(fixture["session"]),
+                    ("projects", PROJECT_ID, PROJECT_ID): dict(fixture["project"]),
+                }
+
+            def get(self, area, project_id, name):
+                key = (area, project_id, name)
+                if key not in self.data:
+                    from manager.tasks import TaskError
+                    raise TaskError("not found")
+                return self.data[key]
+
+            def latest(self, area, project_id, task_id):
+                return dict(fixture["handoff"])
+
+            def list_records(self, area, project_id):
+                if area == "executions":
+                    return [dict(fixture["sibling_executions"][0])]
+                if area == "commands":
+                    return [dict(fixture["sibling_commands"][0])]
+                return []
+
+        class FakeDispatchRegistry:
+            def __init__(self, bucket, project_id, request_id):
+                pass
+
+            def read_if_exists(self):
+                return (dict(fixture["dispatch_request"]), 1, None)
+
+        class FakeClaimRegistry:
+            def __init__(self, bucket, project_id, task_id):
+                pass
+
+            def read_if_exists(self):
+                return None
+
+        from manager.project_registry import ProjectMetadata, ProjectRegistry
+
+        project_metadata = ProjectMetadata(
+            project_id=PROJECT_ID, display_name="Demo", aliases=(),
+            repo={"canonical_url": REPO, "owner": "ne9221", "name": "demo-project"},
+            default_branch="main", baseline_resolution_policy={"strategy": "origin_default", "pinned_ref": None},
+            common_governance={"reference": "governance-rules.json"}, project_rules={"reference": "AI-DEVELOPMENT-RULES.md"},
+            validation_policy={}, working_directory_policy={"relative_path": "demo-project", "env_var": "ADM_WORKSPACE_ROOT"},
+            isolation_policy={}, provider_restrictions={}, protected_paths=(), default_write_boundaries=(),
+            pointer_rules={}, status="enabled", resolution_status="verified", unresolved_reason=None,
+        )
+
+        class FakeRegistry:
+            def get_project(self, query, allow_disabled=False):
+                return project_metadata
+
+        def fake_git_runner(args, **kwargs):
+            class R:
+                returncode = 0
+                stderr = ""
+                if "ls-remote" in args:
+                    stdout = f"{FINAL_SHA}\trefs/heads/{BRANCH}\n"
+                elif "remote" in args:
+                    stdout = REPO + "\n"
+                elif "rev-parse" in args:
+                    stdout = BASELINE_HEAD + "\n"
+                else:
+                    stdout = ""
+            return R()
+
+        def fake_github_fetch(owner, name, branch, token=None):
+            return {"sha": BASELINE_HEAD}
+
+        def fake_repo_file_exists(owner, name, path, ref, token=None):
+            return True
+
+        store = FakeStore()
+        evidence = v.collect_evidence(
+            store, PROJECT_ID, REQUEST_ID,
+            task_claim_registry_factory=FakeClaimRegistry,
+            dispatch_registry_factory=FakeDispatchRegistry,
+            expected_repo=REPO,
+            git_runner=fake_git_runner,
+            project_registry=FakeRegistry(),
+            workspace_root="C:/workspace",
+            github_fetch=fake_github_fetch,
+            repo_file_exists_check=fake_repo_file_exists,
+            canonical_checkout_exists_check=lambda p: True,
+        )
+
+        self.assertIsNotNone(evidence["registry_project"])
+        self.assertEqual(evidence["registry_project"]["resolution_status"], "verified")
+        self.assertEqual(evidence["registry_project"]["status"], "enabled")
+        self.assertTrue(evidence["registry_reference_file_check"]["common_governance_exists"])
+        self.assertTrue(evidence["registry_reference_file_check"]["project_rules_exists"])
+        self.assertTrue(evidence["canonical_checkout"]["available"])
+        self.assertTrue(evidence["canonical_checkout"]["repo_identity_ok"])
+        self.assertEqual(evidence["canonical_checkout"]["head_sha"], BASELINE_HEAD)
+        self.assertTrue(evidence["canonical_checkout"]["clean"])
+        self.assertTrue(evidence["remote_baseline_resolution"]["performed"])
+        self.assertEqual(evidence["remote_baseline_resolution"]["baseline_sha"], BASELINE_HEAD)
+        self.assertIsNone(evidence["remote_baseline_resolution"]["error"])
+
+        report = v.evaluate(evidence, expected_project_id=PROJECT_ID, expected_request_id=REQUEST_ID, expected_repo=REPO)
+        self.assertEqual(report.overall, v.PASS, report.as_dict())
 
 
 if __name__ == "__main__":
