@@ -574,7 +574,18 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
     # ever launching it. v2-repo-write additionally stamps allowed_paths/
     # baseline_head -- the Task's own bounded-write evidence.
     if is_repo_write:
-        update_task(store, project_id, task_id, priority=clean["priority"],
+        # working_directory=None here is deliberate and load-bearing: dispatcher_
+        # dispatch() above already snapshotted *some* working_directory onto
+        # this Task (from the Global Project Registry when configured,
+        # otherwise the Drive Project record's literal) before this ingress
+        # ever knew the request was v2-repo-write. manager.execution_runner.
+        # _resolve_working_directory() only materializes an isolated worktree
+        # (Slice C) when a Task's working_directory is still None -- so
+        # without this reset, a bounded repo-write Task would silently run
+        # directly in the shared canonical checkout instead of its own
+        # isolated worktree, defeating this project's own registered
+        # isolation_policy (worktree_per_task).
+        update_task(store, project_id, task_id, clear=("working_directory",), priority=clean["priority"],
                     read_only=False, execution_policies=sorted(REQUIRED_REPO_WRITE_TASK_POLICIES),
                     allowed_paths=clean["repo_write"]["allowed_paths"], baseline_head=clean["repo_write"]["baseline_head"])
     else:

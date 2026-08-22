@@ -336,9 +336,19 @@ def create_task(store, document, service=None, assign=True, persist=True):
     return store.put("tasks", document["project_id"], document["task_id"], document) if persist else document
 
 
-def update_task(store, project_id, task_id, **changes):
+def update_task(store, project_id, task_id, clear=(), **changes):
+    """`changes` follows the existing merge-only contract (a None value is
+    ignored, never persisted, so callers can't accidentally null out a field
+    just by omitting it from a partial update). `clear` is the deliberate,
+    explicit opt-in for a caller that actually needs to reset a field to
+    None -- e.g. cloud.dispatch_ingress.handle_dispatch() resetting
+    working_directory so manager.execution_runner's Slice C worktree
+    materialization engages for a v2-repo-write Task instead of reusing
+    whatever manager.dispatcher.dispatch() already snapshotted onto it."""
     task = store.get("tasks", project_id, task_id)
     task.update({key: value for key, value in changes.items() if value is not None})
+    for key in clear:
+        task[key] = None
     task["updated_at"] = now_iso()
     if task["status"] == "blocked" and not task.get("blocked_reason"):
         raise TaskError("blocked task requires blocked_reason")

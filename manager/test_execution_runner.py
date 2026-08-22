@@ -10,7 +10,7 @@ from manager.claude_account_selector import AccountSelectionError
 from manager.claude_config_locks import ConfigLockBusyError, acquire_claude_config_lock, canonical_config_dir
 from manager.claude_launcher import ClaudeLaunchError
 from manager.codex_launcher import CodexLaunchError, LaunchOutcome, LaunchRequest
-from manager.execution_runner import _stopped, launch_task, run_execution
+from manager.execution_runner import _resolve_working_directory, _stopped, launch_task, run_execution
 from manager.task_claims import check_task_execution_claim
 from manager.tasks import TaskError, create_project, create_task, now_iso, update_task
 from manager.test_execution_lifecycle import MemoryStore, build_store, quota_document
@@ -861,6 +861,26 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         store = self._store(project_working_directory=self.valid_dir)
         self._launch(store)
         self.assertEqual(self.valid_dir, store.get("tasks", "p1", "t1")["working_directory"])
+
+    def test_legacy_fallback_for_a_registered_project_uses_registry_not_stale_literal(self):
+        """P0 regression (fix/direct-dispatch-working-directory-authority-p0-
+        20260822): a legacy Task (no working_directory of its own) whose
+        project_id IS registered in the Global Project Registry, with the
+        registry's workspace env var configured on this machine, must
+        resolve via the registry -- never via the Project record's own
+        working_directory literal, which is exactly what let a Task launch
+        inside a two-day-stale scratch checkout in production."""
+        store = MemoryStore()
+        project = self._project(working_directory="C:/two-days-stale/scratch-checkout")
+        project["project_id"] = "ai-development-manager"
+        create_project(store, project)
+        task = self._legacy_task(project_id="ai-development-manager", read_only=True, needs_repo_edit=False)
+        create_task(store, task, assign=False)
+        with tempfile.TemporaryDirectory() as workspace_root, patch.dict(os.environ, {"ADM_WORKSPACE_ROOT": workspace_root}):
+            os.makedirs(os.path.join(workspace_root, "ai-development-manager"))
+            resolved = _resolve_working_directory(store, store.get("tasks", "ai-development-manager", "t1"))
+        self.assertNotEqual("C:/two-days-stale/scratch-checkout", resolved)
+        self.assertEqual(os.path.join(workspace_root, "ai-development-manager"), resolved)
 
     def test_task_snapshot_working_directory_takes_priority_over_project(self):
         store = self._store(

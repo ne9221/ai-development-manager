@@ -903,6 +903,21 @@ class RepoWriteAdmissionIngressTests(unittest.TestCase):
         self.assertEqual(ADMISSION_VERSION_V2_REPO_WRITE, command["admission_version"])
         self.assertEqual(TRUSTED_INGRESS_ORIGIN, command["created_via"])
 
+    def test_repo_write_task_never_inherits_a_stale_project_working_directory(self):
+        """P0 regression (fix/direct-dispatch-working-directory-authority-p0-
+        20260822): manager.dispatcher.dispatch() may already have snapshotted
+        *some* working_directory onto this Task before handle_dispatch() even
+        knew the request was v2-repo-write (e.g. the Project record's own
+        literal, stale or not). A genuine bounded repo-write Task must always
+        end up with working_directory reset to None so manager.execution_
+        runner's Slice C worktree materialization actually engages -- never
+        silently reusing the shared canonical checkout, which would defeat
+        this project's own worktree_per_task isolation policy."""
+        self.store.put("projects", "p1", "p1", {**project(), "working_directory": "C:/shared/canonical-checkout"})
+        result = self.call()
+        task = self.store.get("tasks", "p1", result["task_id"])
+        self.assertIsNone(task["working_directory"])
+
     def test_read_only_false_without_repo_write_still_rejected_as_before(self):
         with self.assertRaises(DispatchIngressError) as ctx:
             self.call(payload(request_id="req-w-noop", constraints={"read_only": False}))

@@ -387,6 +387,31 @@ class ProjectRegistry:
         return self._raw_entries[project_id]
 
 
+def resolve_authoritative_working_directory(project_id: str, fallback: Optional[str] = None) -> Optional[str]:
+    """Resolve the authoritative, machine-local working_directory for a
+    project_id via the Global Project Registry + its configured workspace
+    env var (default ADM_WORKSPACE_ROOT) -- never from an unmaintained
+    literal path stored elsewhere (e.g. a cloud Project record's own
+    `working_directory` field, which nothing keeps synchronized with the
+    actual current checkout; see
+    fix/direct-dispatch-working-directory-authority-p0-20260822).
+
+    Falls back to `fallback` unchanged whenever the project is not
+    registered, or its configured workspace env var is not set on this
+    machine, so this never regresses a project that hasn't been migrated
+    onto the registry's workspace_root convention yet.
+    """
+    try:
+        project = get_global_registry().get_project(project_id, allow_disabled=True)
+    except ProjectRegistryError:
+        return fallback
+    env_var_name = project.working_directory_policy.get("env_var", "ADM_WORKSPACE_ROOT")
+    workspace_root = os.environ.get(env_var_name)
+    if not workspace_root:
+        return fallback
+    return str(project.resolve_runtime_working_directory(workspace_root=workspace_root))
+
+
 _GLOBAL_REGISTRY: Optional[ProjectRegistry] = None
 
 

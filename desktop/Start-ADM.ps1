@@ -15,6 +15,7 @@ $repository = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
 try {
     Confirm-AdmWatcherTaskIdentity -RepositoryPath $repository | Out-Null
+    Set-AdmWorkspacePointer -RepositoryPath $repository -ProjectId "ai-development-manager" | Out-Null
     Confirm-AdmTaskEnabled -TaskName $AdmSupervisorTask
     Confirm-AdmTaskEnabled -TaskName $AdmWatcherTask
     $restoredWatcher = Get-ScheduledTask -TaskName $AdmWatcherTask -ErrorAction Stop

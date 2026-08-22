@@ -302,6 +302,27 @@ class DispatcherTests(unittest.TestCase):
         task = store.get("tasks", "p1", "no-wd-task")
         self.assertIsNone(task.get("working_directory"))
 
+    def test_registered_project_snapshot_uses_registry_not_stale_drive_literal(self):
+        """P0 regression (fix/direct-dispatch-working-directory-authority-p0-
+        20260822): for a project that IS registered in the Global Project
+        Registry, with its workspace env var configured on this machine, the
+        Task's working_directory snapshot must come from the registry's
+        resolved, current-checkout path -- never from the Drive Project
+        record's own working_directory literal, which nothing keeps in sync
+        and which is exactly what let a Task launch inside a two-day-stale
+        scratch checkout in production."""
+        import tempfile
+        store = MemoryStore()
+        proj = project(); proj["project_id"] = "ai-development-manager"
+        proj["working_directory"] = "C:/two-days-stale/scratch-checkout"
+        create_project(store, proj)
+        with tempfile.TemporaryDirectory() as workspace_root:
+            with mock.patch.dict("os.environ", {"ADM_WORKSPACE_ROOT": workspace_root}):
+                dispatch(store, object(), request(project_id="ai-development-manager", task_id="registry-wd-task"), quota(), [])
+        task = store.get("tasks", "ai-development-manager", "registry-wd-task")
+        self.assertNotEqual("C:/two-days-stale/scratch-checkout", task["working_directory"])
+        self.assertTrue(task["working_directory"].endswith("ai-development-manager"))
+
     def test_existing_task_working_directory_is_never_overwritten_by_dispatch(self):
         """Retry/re-dispatch of an *existing* task_id must not silently
         re-derive working_directory from the Project's current value -- the
