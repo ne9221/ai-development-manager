@@ -17,6 +17,7 @@ from mcp.types import ToolAnnotations
 
 from cloud.app import default_lock_registry_factory, default_service_factory, default_write_service_factory
 from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
+from manager.global_invoke import GlobalInvokeError, global_invoke
 from manager.runtime_bridge import redact, runtime_bridge
 from manager.runtime_quota_tool import runtime_quota_status
 from manager.tasks import DriveRecords, TaskError, validate
@@ -80,6 +81,31 @@ def invoke_dispatch(payload, write_service_factory=None, lock_registry_factory=N
         raise
     except Exception:
         raise TaskError("dispatch ingress failed") from None
+
+
+def invoke_global_invoke(payload, write_service_factory=None, lock_registry_factory=None, global_invoke_func=None):
+    """Call manager.global_invoke.global_invoke -- the stable, project-
+    identity/alias-driven entry point. `payload` must already be the exact
+    shape adm_global_invoke builds (manager.global_invoke.ALLOWED_GLOBAL_INVOKE_FIELDS
+    is the sole authority on what is accepted); this function adds no
+    fields and removes no validation. GlobalInvokeError/DispatchIngressError/
+    TaskError messages are already bounded-safe and are re-raised verbatim;
+    anything else (backend/transport failure) is sanitized before it can
+    propagate."""
+    write_service_factory = write_service_factory or LOCAL_WRITE_SERVICE_FACTORY or default_write_service_factory
+    lock_registry_factory = lock_registry_factory or default_lock_registry_factory
+    global_invoke_func = global_invoke_func or global_invoke
+    try:
+        service = write_service_factory()
+        store = DriveRecords(service)
+    except Exception:
+        raise TaskError("runtime data is unavailable") from None
+    try:
+        return global_invoke_func(store, service, lock_registry_factory, payload)
+    except (GlobalInvokeError, DispatchIngressError, TaskError):
+        raise
+    except Exception:
+        raise TaskError("global invoke failed") from None
 
 
 def invoke_task_status(project_id, task_id, command_id, service_factory=None):
@@ -168,6 +194,35 @@ def adm_create_task(project_id: str, title: str, goal: str, request_id: str) -> 
     under its own rules. Idempotent: replaying the same request_id returns
     the identity already created, never a second Task/Command."""
     return invoke_dispatch({"project_id": project_id, "title": title, "goal": goal, "request_id": request_id})
+
+
+@server.tool(annotations=IDEMPOTENT_WRITE, structured_output=True)
+def adm_global_invoke(project: str, title: str, goal: str, idempotency_key: str,
+                       repo_write: bool = False, allowed_paths: list[str] | None = None,
+                       preferred_provider: str | None = None, account_id: str | None = None) -> dict[str, Any]:
+    """Dispatch work to any registered project by canonical project_id or
+    alias, without ever supplying (or being able to forge) that project's
+    repo, baseline commit, or governance/PROJECT-RULES identity -- those
+    are always resolved server-side from the Global Project Registry.
+    `project` is resolved deterministically; an ambiguous alias or an
+    unknown/disabled project is rejected. `repo_write=True` additionally
+    requires `allowed_paths` (repo-relative, shape-validated by the
+    existing Direct Dispatch ingress) and requires the resolved project to
+    be enabled, verified, and carry both a common-governance and a
+    PROJECT-RULES reference -- otherwise repo-write is rejected outright,
+    never silently downgraded to read-only. Idempotent: replaying the same
+    idempotency_key returns the identity already created, never a second
+    Task/Command. Never launches a provider; the created Command sits
+    `queued` for the existing pipeline to pick up under its own rules."""
+    payload = {"project": project, "title": title, "goal": goal, "idempotency_key": idempotency_key,
+               "repo_write": repo_write}
+    if allowed_paths is not None:
+        payload["allowed_paths"] = allowed_paths
+    if preferred_provider is not None:
+        payload["preferred_provider"] = preferred_provider
+    if account_id is not None:
+        payload["account_id"] = account_id
+    return invoke_global_invoke(payload)
 
 
 @server.tool(annotations=READ_ONLY, structured_output=True)

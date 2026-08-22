@@ -470,12 +470,24 @@ def _handle_retry_dispatch(store, lock_registry_factory, project_id, request_id,
     return {"accepted": True, "request_id": request_id, "task_id": task_id, "command_id": command_id, "status": "queued"}
 
 
-def handle_dispatch(store, service, lock_registry_factory, payload):
+def handle_dispatch(store, service, lock_registry_factory, payload, extra_source_context=None):
     """Idempotently create a queued Task+Command for one external request and
     return its identity. Never launches a provider.
 
     `lock_registry_factory(project_id, request_id)` must return a
     GCSLockRegistry-compatible object (create_if_absent/read/read_if_exists).
+
+    `extra_source_context` is a trusted-caller-only extension point -- it is
+    never populated from `payload` (the untrusted external request body) and
+    has no corresponding field in ALLOWED_FIELDS. Only in-process Python
+    callers (e.g. manager.global_invoke, which resolves governance/
+    PROJECT-RULES/repo identity through the Global Project Registry before
+    ever reaching this function) may pass it, to stamp additional
+    provenance onto the created Task's source_context. It can never
+    override this function's own protected keys (origin,
+    external_request_id, goal, admission_version, repo) -- those are always
+    applied after it, so even a caller that mistakenly included one of
+    those keys cannot widen or change what this ingress itself asserts.
     """
     clean = validate_dispatch_payload(payload)
     project_id, request_id = clean["project_id"], clean["request_id"]
@@ -536,6 +548,7 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
         # from the moment it is first persisted.
         "needs_repo_edit": is_repo_write,
         "source_context": {
+            **(extra_source_context or {}),
             "origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": request_id,
             "goal": clean["goal"], "admission_version": admission_version,
             **({"repo": clean["repo_write"]["repo"]} if is_repo_write else {}),

@@ -9,7 +9,11 @@ from unittest.mock import patch
 from mcp import Client
 
 from cloud.dispatch_ingress import DispatchIngressError
-from manager.mcp_adapter import MAX_REQUEST_LENGTH, MAX_RESPONSE_BYTES, invoke_bridge, invoke_dispatch, invoke_task_status, server
+from manager.global_invoke import GlobalInvokeError
+from manager.mcp_adapter import (
+    MAX_REQUEST_LENGTH, MAX_RESPONSE_BYTES, invoke_bridge, invoke_dispatch, invoke_global_invoke,
+    invoke_task_status, server,
+)
 from manager.runtime_quota_tool import read_runtime_status
 from manager.tasks import DriveRecords, TaskError, create_project, validate
 from manager.test_dispatcher import quota as quota_fixture
@@ -59,11 +63,11 @@ class MCPAdapterTests(unittest.TestCase):
                 tools = (await client.list_tools()).tools
                 self.assertEqual(
                     {"adm_dispatch", "adm_status", "adm_runtime_quota_status", "adm_health",
-                     "adm_create_task", "adm_task_status"},
+                     "adm_create_task", "adm_task_status", "adm_global_invoke"},
                     {item.name for item in tools},
                 )
                 self.assertTrue(all(item.annotations.destructive_hint is False for item in tools))
-                write_tools = {"adm_create_task"}
+                write_tools = {"adm_create_task", "adm_global_invoke"}
                 for item in tools:
                     self.assertEqual(item.name not in write_tools, item.annotations.read_only_hint)
                 quota_tool = next(item for item in tools if item.name == "adm_runtime_quota_status")
@@ -321,6 +325,101 @@ class MCPCreateTaskToolTests(unittest.TestCase):
     def test_create_task_tool_missing_field_is_error(self):
         result = asyncio.run(tool("adm_create_task", {"project_id": "p1", "title": "t", "goal": "g"}))
         self.assertTrue(result.is_error)
+
+
+def registry_entry(project_id="p1", aliases=("Alias One",), repo="https://github.com/example/project"):
+    return {
+        "project_id": project_id, "display_name": project_id, "aliases": list(aliases),
+        "repo": {"canonical_url": repo}, "default_branch": "main",
+        "baseline_resolution_policy": {"strategy": "origin_default", "pinned_ref": None},
+        "common_governance": {"reference": "governance-rules.json"}, "project_rules": {"reference": "PROJECT-RULES.md"},
+        "working_directory_policy": {"relative_path": project_id}, "isolation_policy": {"mode": "worktree_per_task"},
+        "status": "enabled", "resolution_status": "verified",
+    }
+
+
+class MCPGlobalInvokeToolTests(unittest.TestCase):
+    """adm_global_invoke: the project-identity/alias-driven write surface,
+    restricted to exactly the fields manager.global_invoke.global_invoke
+    accepts and wired only through it (never a provider/execution
+    machinery directly)."""
+
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+        create_project(self.store, project())
+        self.registries = SharedMemoryRegistries()
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=quota_fixture())
+        self.quota_patch.start()
+        from manager.project_registry import ProjectRegistry
+        self.registry_patch = patch("manager.global_invoke.get_global_registry",
+                                     return_value=ProjectRegistry(projects=[registry_entry()]))
+        self.registry_patch.start()
+
+    def tearDown(self):
+        self.quota_patch.stop()
+        self.registry_patch.stop()
+
+    def test_invoke_global_invoke_resolves_alias_and_creates_task(self):
+        result = invoke_global_invoke(
+            {"project": "alias one", "title": "Fix the parser", "goal": "Fix the regression", "idempotency_key": "gi-1"},
+            write_service_factory=lambda: self.service, lock_registry_factory=self.registries.factory,
+        )
+        self.assertEqual({"accepted": True, "request_id": "gi-1", "task_id": "dispatch-gi-1",
+                           "command_id": "dispatch-gi-1", "status": "queued"}, result)
+        task = self.store.get("tasks", "p1", "dispatch-gi-1")
+        validate("task", task)
+        self.assertTrue(task["read_only"])
+        self.assertEqual("global_invoke", task["source_context"]["resolved_via"])
+
+    def test_invoke_global_invoke_is_idempotent_on_replay(self):
+        payload = {"project": "p1", "title": "t", "goal": "g", "idempotency_key": "gi-dup"}
+        first = invoke_global_invoke(payload, write_service_factory=lambda: self.service, lock_registry_factory=self.registries.factory)
+        second = invoke_global_invoke(payload, write_service_factory=lambda: self.service, lock_registry_factory=self.registries.factory)
+        self.assertEqual(first["task_id"], second["task_id"])
+
+    def test_unknown_project_error_propagates_with_safe_message(self):
+        with self.assertRaises(GlobalInvokeError) as ctx:
+            invoke_global_invoke({"project": "does-not-exist", "title": "t", "goal": "g", "idempotency_key": "gi-2"},
+                                  write_service_factory=lambda: self.service, lock_registry_factory=self.registries.factory)
+        self.assertEqual("project_not_found", ctx.exception.code)
+
+    def test_write_service_unavailable_is_sanitized(self):
+        def broken():
+            raise RuntimeError("credential=super-secret")
+        with self.assertRaises(TaskError) as ctx:
+            invoke_global_invoke({"project": "p1", "title": "t", "goal": "g", "idempotency_key": "gi-3"},
+                                  write_service_factory=broken, lock_registry_factory=self.registries.factory)
+        self.assertNotIn("super-secret", str(ctx.exception))
+
+    def test_tool_only_accepts_the_documented_fields(self):
+        """The tool's own function signature is the enforcement point: an
+        MCP client cannot pass repo/baseline_head/governance/constraints/
+        etc. through it at all -- extra properties are dropped before they
+        ever reach invoke_global_invoke."""
+        captured = []
+        def fake(payload, **_kwargs):
+            captured.append(payload)
+            return {"accepted": True, "request_id": payload["idempotency_key"], "task_id": "t", "command_id": "c", "status": "queued"}
+        with patch("manager.mcp_adapter.invoke_global_invoke", side_effect=fake):
+            result = asyncio.run(tool("adm_global_invoke", {
+                "project": "p1", "title": "t", "goal": "g", "idempotency_key": "gi-4",
+                "repo": "https://evil.example/repo", "baseline_head": "f" * 40,
+                "constraints": {"read_only": False}, "governance_snapshot": {"reference": "fake.json"},
+            }))
+        self.assertFalse(result.is_error)
+        self.assertEqual({"project", "title", "goal", "idempotency_key", "repo_write"}, set(captured[0]))
+
+    def test_global_invoke_tool_missing_field_is_error(self):
+        result = asyncio.run(tool("adm_global_invoke", {"project": "p1", "title": "t", "goal": "g"}))
+        self.assertTrue(result.is_error)
+
+    def test_no_direct_provider_spawn_from_global_invoke_module(self):
+        import manager.global_invoke as module
+        with open(module.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        for forbidden in ("execution_runner", "claude_launcher", "codex_launcher", "subprocess.Popen", "os.system"):
+            self.assertNotIn(forbidden, source)
 
 
 class MCPTaskStatusToolTests(unittest.TestCase):

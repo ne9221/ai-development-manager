@@ -14,6 +14,7 @@ from wsgiref.simple_server import make_server
 from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
 from cloud.drive_credentials import user_oauth_write_credentials
 from manager.dispatch_requests import dispatch_request_registry
+from manager.global_invoke import GlobalInvokeError, global_invoke
 from manager.runtime_bridge import redact, runtime_bridge
 from manager.tasks import DriveRecords, TaskError
 
@@ -21,6 +22,7 @@ from manager.tasks import DriveRecords, TaskError
 CONTRACT_VERSION = "1.0"
 ALLOWED_INPUTS = {"project_id", "user_request", "task_id", "task_type", "complexity", "preferred_provider", "excluded_provider", "multi_task"}
 DISPATCH_INGRESS_PATH = "/api/v1/tasks/dispatch"
+GLOBAL_INVOKE_PATH = "/api/v1/tasks/global-invoke"
 DISPATCH_INGRESS_ERROR_STATUS = {
     "malformed_request": "400 Bad Request",
     "unknown_project": "404 Not Found",
@@ -30,6 +32,19 @@ DISPATCH_INGRESS_ERROR_STATUS = {
     "idempotency_backend_unavailable": "503 Service Unavailable",
     "read_only_required": "422 Unprocessable Entity",
     "dispatch_state_inconsistent": "409 Conflict",
+}
+GLOBAL_INVOKE_ERROR_STATUS = {
+    "malformed_request": "400 Bad Request",
+    "project_not_found": "404 Not Found",
+    "project_ambiguous": "409 Conflict",
+    "project_disabled": "409 Conflict",
+    "repo_write_not_eligible": "409 Conflict",
+    "governance_missing": "409 Conflict",
+    "unknown_project": "404 Not Found",
+    "repo_identity_mismatch": "409 Conflict",
+    "empty_allowed_paths": "400 Bad Request",
+    "baseline_resolution_failed": "503 Service Unavailable",
+    **DISPATCH_INGRESS_ERROR_STATUS,
 }
 logger = logging.getLogger("runtime_bridge_cloud")
 logger.addHandler(logging.StreamHandler())
@@ -102,7 +117,8 @@ def error(code, message, request_id):
 def create_app(service_factory=default_service_factory, bridge_func=runtime_bridge,
                 write_service_factory=default_write_service_factory,
                 lock_registry_factory=default_lock_registry_factory,
-                dispatch_ingress_func=handle_dispatch):
+                dispatch_ingress_func=handle_dispatch,
+                global_invoke_func=global_invoke):
     def app(environ, start_response):
         started = time.perf_counter()
         request_id = environ.get("HTTP_X_REQUEST_ID") or uuid.uuid4().hex
@@ -111,7 +127,7 @@ def create_app(service_factory=default_service_factory, bridge_func=runtime_brid
         try:
             if method == "GET" and path == "/health":
                 return json_response(start_response, status, health_document(), request_id)
-            if method != "POST" or path not in ("/dispatch", DISPATCH_INGRESS_PATH):
+            if method != "POST" or path not in ("/dispatch", DISPATCH_INGRESS_PATH, GLOBAL_INVOKE_PATH):
                 status, category = "404 Not Found", "not_found"
                 return json_response(start_response, status, error(category, "endpoint not found", request_id), request_id)
             expected = os.environ.get("ADM_API_KEY")
@@ -122,7 +138,7 @@ def create_app(service_factory=default_service_factory, bridge_func=runtime_brid
             if not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:], expected):
                 status, category = "401 Unauthorized", "auth_failure"
                 return json_response(start_response, status, error(category, "invalid bearer credential", request_id), request_id)
-            if path == DISPATCH_INGRESS_PATH:
+            if path in (DISPATCH_INGRESS_PATH, GLOBAL_INVOKE_PATH):
                 try:
                     length = int(environ.get("CONTENT_LENGTH") or 0)
                     payload = json.loads(environ["wsgi.input"].read(length).decode("utf-8"))
@@ -135,6 +151,23 @@ def create_app(service_factory=default_service_factory, bridge_func=runtime_brid
                 except Exception:
                     status, category = "503 Service Unavailable", "drive_unavailable"
                     return json_response(start_response, status, error(category, "runtime data is unavailable", request_id), request_id)
+                if path == GLOBAL_INVOKE_PATH:
+                    project_id = payload.get("project") if isinstance(payload, dict) else None
+                    try:
+                        result = global_invoke_func(DriveRecords(write_service), write_service, lock_registry_factory, payload)
+                    except GlobalInvokeError as exc:
+                        status, category = GLOBAL_INVOKE_ERROR_STATUS.get(exc.code, "422 Unprocessable Entity"), exc.code
+                        return json_response(start_response, status, error(exc.code, str(exc), request_id), request_id)
+                    except DispatchIngressError as exc:
+                        status, category = DISPATCH_INGRESS_ERROR_STATUS.get(exc.code, "422 Unprocessable Entity"), exc.code
+                        return json_response(start_response, status, error(exc.code, str(exc), request_id), request_id)
+                    except TaskError as exc:
+                        status, category = "422 Unprocessable Entity", "global_invoke_error"
+                        return json_response(start_response, status, error(category, str(exc), request_id), request_id)
+                    except Exception:
+                        status, category = "500 Internal Server Error", "global_invoke_exception"
+                        return json_response(start_response, status, error(category, "global invoke failed", request_id), request_id)
+                    return json_response(start_response, status, result, request_id)
                 try:
                     result = dispatch_ingress_func(DriveRecords(write_service), write_service, lock_registry_factory, payload)
                 except DispatchIngressError as exc:
