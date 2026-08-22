@@ -8,11 +8,14 @@ the only inputs are an in-memory ProjectRegistry and a fake
 GitHub REST API.
 """
 
+import os
 import unittest
+from unittest.mock import patch
 
 from manager.project_registry import ProjectRegistry
 from manager.remote_baseline_resolver import (
     BASELINE_HEAD_PATTERN,
+    GITHUB_TOKEN_ENV_VAR,
     RemoteBaselineResolutionError,
     REMOTE_BASELINE_SOURCE,
     resolve_remote_baseline,
@@ -234,6 +237,61 @@ class FailClosedTests(unittest.TestCase):
         with self.assertRaises(RemoteBaselineResolutionError) as ctx:
             resolve_remote_baseline("", registry=registry, github_fetch=fake_fetch())
         self.assertEqual("malformed_request", ctx.exception.code)
+
+
+class PrivateRepoTokenTests(unittest.TestCase):
+    """A registered repo can be private -- the resolver must be able to
+    authenticate to GitHub for it without a caller ever supplying (or being
+    able to supply) a credential. The only source is the server's own
+    process environment, exactly like every other server-side credential
+    already read this way in this codebase (manager.command_watcher)."""
+
+    def test_github_token_env_var_reaches_github_fetch_when_caller_omits_it(self):
+        registry = ProjectRegistry(projects=[registry_entry()])
+        fetch = fake_fetch(shas={("acme", "repo-a", "main"): VALID_SHA_A})
+        with patch.dict(os.environ, {GITHUB_TOKEN_ENV_VAR: "server-side-secret"}):
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fetch)
+        self.assertEqual([("acme", "repo-a", "main", "server-side-secret")], fetch.calls)
+
+    def test_no_env_token_resolves_with_none_token_unchanged(self):
+        registry = ProjectRegistry(projects=[registry_entry()])
+        fetch = fake_fetch(shas={("acme", "repo-a", "main"): VALID_SHA_A})
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(GITHUB_TOKEN_ENV_VAR, None)
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fetch)
+        self.assertEqual([("acme", "repo-a", "main", None)], fetch.calls)
+
+    def test_explicit_github_token_argument_overrides_environment(self):
+        registry = ProjectRegistry(projects=[registry_entry()])
+        fetch = fake_fetch(shas={("acme", "repo-a", "main"): VALID_SHA_A})
+        with patch.dict(os.environ, {GITHUB_TOKEN_ENV_VAR: "env-token"}):
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fetch, github_token="explicit-token")
+        self.assertEqual([("acme", "repo-a", "main", "explicit-token")], fetch.calls)
+
+    def test_default_fetch_sends_bearer_header_when_token_present(self):
+        from manager.remote_baseline_resolver import default_github_fetch
+
+        captured = {}
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"sha": VALID_SHA_A}
+
+        class FakeSession:
+            def get(self, url, headers=None, timeout=None):
+                captured["headers"] = headers
+                return FakeResponse()
+
+        import manager.remote_baseline_resolver as mod
+        original = mod.requests
+        mod.requests = FakeSession()
+        try:
+            default_github_fetch("acme", "repo-a", "main", token="a-real-token")
+        finally:
+            mod.requests = original
+        self.assertEqual("Bearer a-real-token", captured["headers"]["Authorization"])
 
 
 class DeterminismTests(unittest.TestCase):

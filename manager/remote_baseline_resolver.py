@@ -28,6 +28,7 @@ single call, or falls back to a caller-suggested value.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
@@ -52,6 +53,13 @@ from cloud.dispatch_ingress import BASELINE_HEAD_PATTERN
 GITHUB_API_BASE = "https://api.github.com"
 GITHUB_API_TIMEOUT_SECONDS = 15
 REMOTE_BASELINE_SOURCE = "github_remote_api"
+
+# Server-side-only credential for reading private registered repos. Never
+# caller-suppliable: read from the process environment (already this
+# codebase's established convention -- see e.g. CLAUDE_ACCOUNTS_CONFIG,
+# ADM_LOCK_GCS_BUCKET in manager.command_watcher), not from any request
+# field. Public repos resolve identically with or without it.
+GITHUB_TOKEN_ENV_VAR = "GITHUB_TOKEN"
 
 
 class RemoteBaselineResolutionError(TaskError):
@@ -128,6 +136,9 @@ def resolve_remote_baseline(
     """
     registry = registry or get_global_registry()
     project = _resolve_project(registry, project_reference)
+
+    if github_token is None:
+        github_token = os.environ.get(GITHUB_TOKEN_ENV_VAR) or None
 
     repo = project.repo if isinstance(project.repo, dict) else None
     owner = repo.get("owner") if repo else None
