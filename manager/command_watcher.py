@@ -496,7 +496,12 @@ def poll_once(store, service, allowlist=None, **factories):
     results = []
     for project in all_projects(store):
         try:
-            commands = store.list_records("commands", project["project_id"])
+            remaining = MAX_COMMANDS_PER_POLL - len(results)
+            if remaining == 0:
+                return results
+            commands = (store.list_actionable_commands(project["project_id"], remaining)
+                        if hasattr(store, "list_actionable_commands")
+                        else store.list_records("commands", project["project_id"]))
         except TaskError:
             continue
         for command in commands:

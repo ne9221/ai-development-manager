@@ -204,6 +204,36 @@ class DriveRecords:
         names = [logical_record_id(item["name"][:-5]) for item in self.children(parent) if item.get("name", "").endswith(".json")]
         return [self.get(area, project_id, name) for name in names]
 
+    def list_actionable_commands(self, project_id, limit):
+        """Read one bounded Drive page of non-terminal command records.
+
+        Drive indexes JSON content for ``fullText`` queries, so this avoids
+        listing/downloading historical completed command files on every poll.
+        A command remains discoverable until its status becomes terminal.
+        """
+        if not isinstance(limit, int) or limit < 1:
+            raise TaskError("command limit must be positive")
+        parent = self.project_folder("commands", project_id, create=False)
+        statuses = ("queued", "claimed", "running")
+        query = f"'{parent}' in parents and trashed=false and (" + " or ".join(
+            f"fullText contains '\"status {status}\"'" for status in statuses
+        ) + ")"
+        response = self.files.list(
+            q=query, spaces="drive", orderBy="modifiedTime desc", pageSize=limit,
+            fields="files(id,name,mimeType)",
+        ).execute()
+        if not isinstance(response, dict) or not isinstance(response.get("files", []), list):
+            raise TaskError("malformed Drive command listing response")
+        records = []
+        for item in response["files"]:
+            if item.get("mimeType") != MIME_JSON or not item.get("name", "").endswith(".json") or not isinstance(item.get("id"), str):
+                continue
+            try:
+                records.append(json.loads(self.files.get_media(fileId=item["id"]).execute().decode("utf-8")))
+            except Exception as exc:
+                raise TaskError(f"could not read Drive command record: {item['name']}") from exc
+        return records
+
     def list_projects(self):
         root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"], create=False)
         return [self.get("projects", item["name"], item["name"])

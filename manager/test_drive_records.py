@@ -15,6 +15,16 @@ class PagedFiles:
         return Request(self.responses[options.get("pageToken")])
 
 
+class CommandFiles:
+    def __init__(self, commands): self.commands = commands; self.calls = []
+    def list(self, **options):
+        self.calls.append(options)
+        if "fullText contains" in options["q"]:
+            return Request({"files": [{"id": "queued", "name": "queued.json", "mimeType": "application/json"}]})
+        return Request({"files": [{"id": "commands", "name": "COMMANDS", "mimeType": "application/vnd.google-apps.folder"}]})
+    def get_media(self, fileId): return Request(self.commands[fileId])
+
+
 class Service:
     def __init__(self, files): self._files = files
     def files(self): return self._files
@@ -41,5 +51,16 @@ class DriveRecordTests(unittest.TestCase):
         for response in (None, {"files": None}, {"files": {}, "nextPageToken": "x"}, {"files": [], "nextPageToken": 3}):
             with self.assertRaises(TaskError):
                 DriveRecords(Service(PagedFiles({None: response}))).children("parent")
+
+    def test_actionable_commands_use_one_bounded_server_side_listing(self):
+        commands = {f"historic-{index}": b'{"status":"completed"}' for index in range(1000)}
+        commands.update({"queued": b'{"command_id":"queued", "status":"queued"}'})
+        files = CommandFiles(commands)
+        records = DriveRecords(Service(files)).list_actionable_commands("project-a", 4)
+        self.assertEqual(["queued"], [record["command_id"] for record in records])
+        query = next(call for call in files.calls if "fullText contains" in call["q"])
+        self.assertEqual(4, query["pageSize"])
+        self.assertIn("fullText contains", query["q"])
+        self.assertEqual(1, sum("fullText contains" in call["q"] for call in files.calls))
 
 if __name__ == "__main__": unittest.main()

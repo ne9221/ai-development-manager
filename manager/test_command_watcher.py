@@ -40,6 +40,13 @@ class Store:
         return [deepcopy(value) for (record_area, project, _), value in self.records.items() if record_area == area and project == project_id]
 
 
+class BoundedCommandStore(Store):
+    def __init__(self): super().__init__(); self.limits = []
+    def list_actionable_commands(self, project_id, limit):
+        self.limits.append(limit)
+        return self.list_records("commands", project_id)[:limit]
+
+
 def command(**changes):
     value = {
         "command_id": "cmd-1", "project_id": "p1", "task_id": "t1", "provider": "codex",
@@ -111,6 +118,28 @@ class CommandWatcherTests(unittest.TestCase):
         stored = self.store.get("commands", "p1", "cmd-1")
         self.assertEqual("command-cmd-1", stored["execution_id"]); self.assertEqual("completed", stored["result"]["status"])
         self.assertEqual("code", stored["mode"]); self.assertEqual(["fresh quota"], stored["selection_reason"])
+
+    def test_poll_limits_command_reads_before_processing(self):
+        store = BoundedCommandStore(); create_project(store, project()); create_task(store, task(read_only=True), assign=False)
+        compliant = store.get("tasks", "p1", "t1"); compliant["execution_policies"] = sorted(REQUIRED_TASK_POLICIES); store.put("tasks", "p1", "t1", compliant)
+        for index in range(1000): store.put("commands", "p1", f"cmd-{index}", command(command_id=f"cmd-{index}"))
+        with patch("manager.command_watcher.process_command", return_value={"status": "completed"}) as process:
+            result = poll_once(store, object(), allowlist=self.ALLOWLIST)
+        self.assertEqual([4], store.limits)
+        self.assertEqual(4, len(result)); self.assertEqual(4, process.call_count)
+
+    def test_broken_commands_folder_isolated_from_other_projects(self):
+        class MultiProjectStore(BoundedCommandStore):
+            def list_projects(self): return [{"project_id": "broken"}, {"project_id": "healthy"}]
+            def list_actionable_commands(self, project_id, limit):
+                self.limits.append((project_id, limit))
+                if project_id == "broken": raise TaskError("duplicate Drive folder: Commands")
+                return [command(project_id="healthy", command_id="healthy-command")]
+        store = MultiProjectStore()
+        with patch("manager.command_watcher.process_command", return_value={"status": "completed"}) as process:
+            result = poll_once(store, object(), allowlist=self.ALLOWLIST)
+        self.assertEqual([("broken", 4), ("healthy", 4)], store.limits)
+        self.assertEqual([{"status": "completed"}], result); process.assert_called_once()
 
     def test_restart_never_relaunches_claimed_or_running_command(self):
         claimed = command(status="claimed", execution_id="command-cmd-1", claimed_at=now_iso())
