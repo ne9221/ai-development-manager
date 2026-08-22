@@ -21,6 +21,7 @@ from manager.execution_lifecycle import enter_running_gate, terminalize_executio
 from manager.executions import MAX_HARD_TIMEOUT_SECONDS, heartbeat_execution, hard_timeout_seconds, link_execution_session, reserve_execution
 from manager.gcs_lock_registry import GCSLockRegistry
 from manager.project_registry import get_global_registry
+from manager.quota_forecast import DEFAULT_MAX_AGE_MINUTES
 from manager.quota_reader import read_drive_status
 from manager.repo_write_enforcement import enforce_allowed_paths, is_bounded_repo_write_snapshot
 from manager.session_identity import manager_session_key
@@ -297,7 +298,14 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     turn_timeout = task_turn_timeout(task["expected_minutes"], timeout_seconds)
     if provider == "claude" and claude_accounts is not None:
         quota_document = quota_document or read_drive_status(service=service)
+        # max_age_seconds uses the same canonical quota-freshness window every
+        # other quota-reliability gate in this codebase already enforces
+        # (quota_reader.summarize()'s default, quota_forecast's
+        # DEFAULT_MAX_AGE_MINUTES) -- a frozen "last-known-good" quota
+        # confidence must not count as reliable forever just because nothing
+        # has recomputed it since collection started failing.
         resolved = resolve_claude_account(claude_accounts, quota_document, explicit_account_id=account_id,
+                                          max_age_seconds=DEFAULT_MAX_AGE_MINUTES * 60,
                                           check_auth_ready=_claude_account_auth_ready if account_id is None else None)
         account_id, config_dir = resolved["account_id"], resolved["config_dir"]
     elif provider == "claude" and account_id is not None:

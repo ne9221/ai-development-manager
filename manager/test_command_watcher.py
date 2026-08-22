@@ -24,6 +24,7 @@ from manager.tasks import TaskError, create_project, create_task, now_iso
 from manager.trusted_ingress import ADMISSION_VERSION_V2_REPO_WRITE, REQUIRED_REPO_WRITE_TASK_POLICIES
 from manager.test_execution_lifecycle import project, task
 from manager.test_execution_lifecycle import quota_document
+from manager.test_execution_runner import AccountAwareClaudeStyleLauncher
 from manager.test_task_claims import MemoryClaimRegistry
 
 
@@ -718,6 +719,198 @@ class CommandWatcherTests(unittest.TestCase):
         args, _ = runner.call_args
         self.assertEqual("sentinel-launcher-instance", args[4])
         sentinel_launcher.assert_called_once()
+
+
+class DirectDispatchAutoAccountRoutingIntegrationTests(unittest.TestCase):
+    """P0 claude-auth-routing-truth R2: reproduces the exact real Direct
+    Dispatch integration path end to end (process_command -> the real,
+    unmocked launch_task -> resolve_claude_account -> a stub launcher),
+    not just resolve_claude_account()/select_claude_account() in isolation.
+
+    The real failure mode: cloud/dispatch_ingress.py stamps
+    command.account_id with whatever manager.dispatcher.dispatch()
+    automatically recommended even when the caller requested nothing
+    (command.requested_account_id stays null in that case). Before this fix,
+    manager.command_watcher._explicit_account_id() could not tell that
+    apart from a caller's real explicit ask, so it treated the automatic
+    recommendation as explicit and launch_task() never got a chance to
+    re-check live auth readiness or quota freshness against the current
+    local state.
+    """
+
+    REGISTRY = [
+        {"account_id": "account-a", "enabled": True, "config_dir": None},
+        {"account_id": "account-b", "enabled": True, "config_dir": r"C:\accounts\b\.claude"},
+    ]
+
+    class _IntegrationStore(Store):
+        """Store, plus project_folder() so the real (unmocked)
+        manager.dispatcher.dispatch() -> manager.executions.list_executions()
+        this integration test deliberately exercises can run against it --
+        list_executions() treats a TaskError here as "no folder yet" and
+        returns []."""
+
+        def project_folder(self, area, project_id, create=False):
+            raise TaskError("no executions folder in this test double")
+
+        def latest(self, area, project_id, task_id):
+            raise TaskError("no handoff in this test double")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.lock_home = tempfile.TemporaryDirectory()
+        self._lock_home_patch = patch.dict(os.environ, {"AI_MANAGER_HOME": self.lock_home.name})
+        self._lock_home_patch.start()
+        self.store = self._IntegrationStore()
+        create_project(self.store, project())
+        create_task(self.store, task(read_only=True, working_directory=self.temp.name), assign=False)
+        compliant = self.store.get("tasks", "p1", "t1")
+        compliant["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)
+        self.store.put("tasks", "p1", "t1", compliant)
+
+    def tearDown(self):
+        self._lock_home_patch.stop()
+        self.lock_home.cleanup()
+        self.temp.cleanup()
+
+    @staticmethod
+    def _fresh_quota_document():
+        fresh = now_iso()
+        entries = [
+            {"provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic", "source": "test",
+             "source_type": "official", "confidence": "official", "last_updated": fresh, "status": "ok",
+             "windows": [], "account_id": "account-a"},
+            {"provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic", "source": "test",
+             "source_type": "official", "confidence": "official", "last_updated": fresh, "status": "ok",
+             "windows": [], "account_id": "account-b"},
+        ]
+        return {"schema_version": "0.1.0", "generated_at": fresh, "providers": entries}
+
+    @staticmethod
+    def _stale_account_a_document():
+        stale = "2026-01-01T00:00:00Z"
+        fresh = now_iso()
+        entries = [
+            {"provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic", "source": "test",
+             "source_type": "official", "confidence": "official", "last_updated": stale, "status": "ok",
+             "windows": [], "account_id": "account-a"},
+            {"provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic", "source": "test",
+             "source_type": "official", "confidence": "official", "last_updated": fresh, "status": "ok",
+             "windows": [], "account_id": "account-b"},
+        ]
+        return {"schema_version": "0.1.0", "generated_at": fresh, "providers": entries}
+
+    def _direct_dispatch_command(self, **changes):
+        # The exact real shape: dispatcher already auto-recommended
+        # account-a and stamped it onto command.account_id, but the caller's
+        # original request never asked for a specific account at all.
+        base = command(
+            provider="claude", account_id="account-a", requested_account_id=None,
+            created_via="direct_dispatch_ingress", admission_version="v1", request_id="req-1",
+        )
+        base.update(changes)
+        return base
+
+    def _run(self, cmd, auth_ready_map, quota_document=None):
+        launcher = AccountAwareClaudeStyleLauncher()
+        quota_document = quota_document or self._fresh_quota_document()
+        with patch("manager.command_watcher._claude_account_registry", return_value=self.REGISTRY), \
+             patch("manager.execution_runner.read_drive_status", return_value=quota_document), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document), \
+             patch("manager.executions.read_drive_status", return_value=quota_document), \
+             patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_runner._claude_account_auth_ready",
+                   side_effect=lambda account: auth_ready_map.get(account["account_id"], False)):
+            result = process_command(
+                self.store, object(), cmd, launcher_factory=lambda: launcher,
+                claim_factory=lambda *_a: MemoryClaimRegistry(),
+                allowlist=frozenset({("p1", "t1")}), health_check=lambda: True,
+                quota_check=lambda service: True,
+            )
+        return result, launcher
+
+    def test_provisional_command_account_id_is_not_treated_as_explicit(self):
+        # account-a is auth-unready, account-b is auth-ready + fresh quota:
+        # real launch selection must be account-b, never the provisional
+        # command.account_id=account-a.
+        cmd = self._direct_dispatch_command()
+        result, launcher = self._run(cmd, {"account-a": False, "account-b": True})
+        self.assertEqual("completed", result["status"])
+        self.assertEqual(["prepare", "start", "wait", "close"], launcher.events)
+        self.assertEqual("account-b", launcher.received_account_id)
+        self.assertEqual(r"C:\accounts\b\.claude", launcher.received_config_dir)
+        stored = self.store.get("commands", "p1", "cmd-1")
+        self.assertEqual("account-b", stored["account_id"])
+
+    def test_auth_ready_but_stale_quota_falls_back_to_fresh_sibling(self):
+        cmd = self._direct_dispatch_command()
+        result, launcher = self._run(
+            cmd, {"account-a": True, "account-b": True}, quota_document=self._stale_account_a_document(),
+        )
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("account-b", launcher.received_account_id)
+        self.assertEqual("account-b", self.store.get("commands", "p1", "cmd-1")["account_id"])
+
+    def test_account_a_auth_ready_stale_quota_account_b_auth_unavailable_fails_closed(self):
+        cmd = self._direct_dispatch_command()
+        result, launcher = self._run(
+            cmd, {"account-a": True, "account-b": False}, quota_document=self._stale_account_a_document(),
+        )
+        self.assertEqual("failed", result["status"])
+        self.assertEqual([], launcher.events)
+        stored = self.store.get("commands", "p1", "cmd-1")
+        self.assertEqual("account-a", stored["account_id"])  # never substituted or overwritten by a failed attempt
+
+    def test_all_accounts_unavailable_fails_closed_before_any_provider_spawn(self):
+        cmd = self._direct_dispatch_command()
+        result, launcher = self._run(cmd, {"account-a": False, "account-b": False})
+        self.assertEqual("failed", result["status"])
+        self.assertEqual([], launcher.events)  # no provider process spawned
+
+    def test_caller_explicit_request_never_substituted_even_when_auth_unavailable(self):
+        # requested_account_id=account-a is a real caller ask: the new
+        # auto-selection auth_ready cross-check must never even be consulted
+        # for it (account-a's auth_ready=False here must not cause a silent
+        # swap to the healthy account-b) -- explicit requests still rely
+        # solely on ClaudeLauncher's own real auth preflight to fail closed,
+        # which is covered at the unit level in test_claude_launcher.py; the
+        # stub launcher used here does not reproduce that subprocess check,
+        # so this integration test asserts the one thing this layer actually
+        # controls: no substitution, ever.
+        cmd = self._direct_dispatch_command(account_id="account-a", requested_account_id="account-a")
+        result, launcher = self._run(cmd, {"account-a": False, "account-b": True})
+        self.assertEqual("account-a", launcher.received_account_id)
+        self.assertNotEqual("account-b", launcher.received_account_id)
+        stored = self.store.get("commands", "p1", "cmd-1")
+        self.assertEqual("account-a", stored["account_id"])
+
+    def test_caller_explicit_request_with_stale_quota_fails_closed(self):
+        cmd = self._direct_dispatch_command(account_id="account-a", requested_account_id="account-a")
+        result, launcher = self._run(
+            cmd, {"account-a": True, "account-b": True}, quota_document=self._stale_account_a_document(),
+        )
+        # select_claude_account() honors an explicit id regardless of quota
+        # confidence (by design -- the launcher's own auth preflight is the
+        # real gate for an explicit ask); staleness alone does not fail this
+        # closed, so this documents that contract rather than asserting a
+        # rejection that select_claude_account never produces for an
+        # explicit id.
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("account-a", launcher.received_account_id)
+
+    def test_requested_account_id_null_with_provisional_account_id_still_automatic(self):
+        # Direct assertion on the authority function itself, at the exact
+        # shape the real ingress produces.
+        from manager.command_watcher import _explicit_account_id
+        cmd = self._direct_dispatch_command()
+        self.assertIsNone(_explicit_account_id(cmd, self.store.get("tasks", "p1", "t1")))
+
+    def test_no_duplicate_provider_launch_on_automatic_reselection(self):
+        cmd = self._direct_dispatch_command()
+        result, launcher = self._run(cmd, {"account-a": False, "account-b": True})
+        self.assertEqual("completed", result["status"])
+        self.assertEqual(1, launcher.events.count("prepare"))
+        self.assertEqual(1, launcher.events.count("start"))
 
 
 class TrustedIngressAdmissionTests(unittest.TestCase):

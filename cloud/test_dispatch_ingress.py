@@ -290,16 +290,13 @@ class DispatchIngressTests(unittest.TestCase):
 
 
 class DirectDispatchClaudeAccountIdentityTests(unittest.TestCase):
-    """M0: manager.dispatcher.dispatch() already resolves a specific
-    account_id when it auto-selects among named Claude accounts by quota
-    forecast, and manager.command_watcher already treats a command's own
-    account_id as launch authority (bypassing the fail-closed automatic-quota
-    gate for Claude, per P0.0). The only missing wire was this ingress
-    dropping that resolved account_id on the floor when it persisted the
-    Command record -- silently forcing every Direct Dispatch Claude command
-    onto the auto-selection path, which is unconditionally rejected as
-    quota_unreliable. Without this, provider=claude could never actually
-    launch through Direct Dispatch."""
+    """M0: manager.dispatcher.dispatch() resolves a specific account_id when
+    it auto-selects among named Claude accounts by quota forecast, and this
+    ingress persists both that resolved account_id and (P0
+    claude-auth-routing-truth) the caller's actual requested_account_id
+    (null for automatic selection) on the Command record, so a later,
+    genuinely explicit request is never confused with the dispatcher's own
+    provisional pick -- see manager.command_watcher._explicit_account_id."""
 
     REGISTRY = [
         {"account_id": "claude-a", "enabled": True, "config_dir": r"C:\accounts\a\.claude"},
@@ -345,13 +342,23 @@ class DirectDispatchClaudeAccountIdentityTests(unittest.TestCase):
         self.assertEqual("claude", command["provider"])
         self.assertEqual("claude-a", command["account_id"])
 
-    def test_command_account_id_lets_command_watcher_bypass_auto_quota_gate(self):
-        """Proves the account_id isn't just stored but actually usable: the
-        Command Watcher must route this command through the explicit-account
-        launch path and must launch it with the exact account_id the dispatcher chose."""
+    def test_command_account_id_is_not_launch_authority_for_automatic_selection(self):
+        """P0 claude-auth-routing-truth: dispatcher's own auto-pick (stamped
+        onto command.account_id here as "claude-a") is a provisional
+        recommendation, not caller intent -- this request never asked for a
+        specific account (command.requested_account_id stays null). The
+        Command Watcher must route it through the AUTOMATIC path
+        (account_id=None, claude_accounts=REGISTRY forwarded so launch_task
+        can re-resolve against live auth/fresh quota at launch time), never
+        treat command.account_id as if it were an explicit ask -- that was
+        the exact real-production bug this fix closes: an account picked
+        from a frozen/stale snapshot at dispatch time could otherwise reach
+        the provider launch unchecked, skipping the live auth-ready and
+        quota-freshness re-check automatic routing is supposed to get."""
         result = self.call(payload(request_id="req-acct2"))
         command = self.store.get("commands", "p1", result["command_id"])
         self.assertEqual("claude-a", command["account_id"])
+        self.assertIsNone(command["requested_account_id"])
         runner = Mock(return_value=CommandWatcherTests.complete("exec-1"))
         with patch("manager.command_watcher.launch_task", runner), \
              patch("manager.command_watcher._claude_account_registry", return_value=self.REGISTRY), \
@@ -364,7 +371,32 @@ class DirectDispatchClaudeAccountIdentityTests(unittest.TestCase):
             )
         runner.assert_called_once()
         _, kwargs = runner.call_args
-        self.assertEqual("claude-a", kwargs.get("account_id"))
+        self.assertIsNone(kwargs.get("account_id"))
+        self.assertEqual(self.REGISTRY, kwargs.get("claude_accounts"))
+        self.assertEqual("completed", outcome["status"])
+
+    def test_command_requested_account_id_is_launch_authority_for_explicit_selection(self):
+        # A genuine caller-explicit request (requested_account_id set) is
+        # the one case that must still reach launch_task's explicit-account
+        # path unchanged -- proving the distinction cuts both ways.
+        with _registry_env(self.REGISTRY):
+            result = self.call(payload(request_id="req-acct3", provider="claude", account_id="claude-b"))
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual("claude-b", command["account_id"])
+        self.assertEqual("claude-b", command["requested_account_id"])
+        runner = Mock(return_value=CommandWatcherTests.complete("exec-1"))
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher._claude_account_registry", return_value=self.REGISTRY), \
+             patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}):
+            outcome = process_command(
+                self.store, self.service, command, claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), health_check=lambda: True,
+                quota_check=lambda service: True,
+                ingress_registry_factory=lambda bucket, project_id, request_id: self.registries.factory(project_id, request_id),
+            )
+        runner.assert_called_once()
+        _, kwargs = runner.call_args
+        self.assertEqual("claude-b", kwargs.get("account_id"))
         self.assertEqual("completed", outcome["status"])
 
 

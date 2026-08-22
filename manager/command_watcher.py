@@ -23,7 +23,7 @@ from manager.runtime_bridge import all_projects
 from manager.task_claims import check_task_execution_claim, task_claim_registry
 from manager.tasks import DriveRecords, TaskError, now_iso, validate
 from manager.trusted_ingress import (
-    ADMISSION_VERSION_V1, REQUIRED_TASK_POLICIES, task_policy_satisfied,
+    ADMISSION_VERSION_V1, REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN, task_policy_satisfied,
     task_policy_satisfied_for_admission, verify_trusted_ingress_admission,
 )
 from manager.dispatch_requests import dispatch_request_registry
@@ -225,12 +225,37 @@ def _provider_state(execution):
 
 
 def _explicit_account_id(command, task):
-    """Command's own account_id wins over Task's -- Command is the concrete
-    per-launch intent (closer to "what should run right now"), Task is a
-    standing default. Both are optional/nullable; None means "no explicit
-    choice", which is a real, different state from an invalid one and must
-    fall through to automatic selection, not be rejected."""
-    return command.get("account_id") or task.get("account_id")
+    """P0 claude-auth-routing-truth: for a command created via the Direct
+    Dispatch trusted ingress (`created_via == TRUSTED_INGRESS_ORIGIN`),
+    `command.account_id` is NOT proof of caller intent -- cloud/dispatch_ingress.py
+    stamps it with whatever manager.dispatcher.dispatch() automatically
+    resolved even when the caller asked for nothing (`account_id` in the
+    original request was omitted/null). Only `command.requested_account_id`
+    (preserved verbatim from the caller's own payload, null when they left
+    account selection to automatic routing) proves a real explicit ask for
+    that ingress path. Treating the dispatcher's automatic recommendation as
+    "explicit" here would route it straight to launch_task(account_id=...)
+    and skip the live auth-ready/quota-freshness re-check automatic
+    selection is supposed to get at launch time -- see
+    execution_runner.launch_task's account_id=None branch.
+
+    Every other command origin (no Direct Dispatch ingress stamp -- e.g. a
+    manually/allowlist-created Command) predates that distinction and never
+    populates requested_account_id at all; for those, command.account_id
+    itself is still the real, hand-set explicit choice, exactly as before
+    this fix -- unaffected here.
+
+    Command's own (requested-or-plain) account_id wins over Task's -- Command
+    is the concrete per-launch intent (closer to "what should run right
+    now"), Task is a standing default. Both are optional/nullable; None
+    means "no explicit choice", which is a real, different state from an
+    invalid one and must fall through to automatic selection, not be
+    rejected."""
+    if command.get("created_via") == TRUSTED_INGRESS_ORIGIN:
+        command_account_id = command.get("requested_account_id")
+    else:
+        command_account_id = command.get("account_id")
+    return command_account_id or task.get("account_id")
 
 
 def _explicit_account_is_valid(registry, account_id):
@@ -484,7 +509,19 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
                               claude_accounts=claude_accounts, account_id=explicit_account_id, **retry)
         terminal = outcome["terminal"]["execution"]
         dispatch = outcome["dispatch"]
-        selected = {**running, "provider": dispatch["provider"], "model": dispatch["model"] or claimed["model"],
+        # P0 claude-auth-routing-truth: `running` was captured before
+        # launch_task() resolved which Claude account actually launched
+        # (explicit_account_id, for a Direct Dispatch command, may only be
+        # the dispatcher's provisional automatic recommendation -- see
+        # _explicit_account_id). dispatch["account_id"] is that launch's
+        # real, resolved identity (None for a non-Claude provider or the
+        # single/legacy-account path, unchanged from before); the terminal
+        # Command record must reflect it truthfully rather than silently
+        # keeping whatever account_id the Command happened to carry before
+        # this launch, so a dashboard/audit never sees "account-a" for a
+        # launch that actually ran under account-b.
+        selected = {**running, "provider": dispatch["provider"], "account_id": dispatch.get("account_id"),
+                    "model": dispatch["model"] or claimed["model"],
                     "fallback_model": dispatch["fallback_model"] or claimed["fallback_model"], "mode": dispatch["mode"],
                     "effort": dispatch["effort"], "selection_reason": dispatch["selection_reason"],
                     "quota_evidence": dispatch["quota_evidence"]}
