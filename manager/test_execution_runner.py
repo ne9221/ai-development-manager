@@ -1403,6 +1403,7 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
             branch=self.branch, repository=first_evidence["repository"],
             validation_checks=[{"id": "tests", "command": [sys.executable, "-c", "pass"]}],
             task_id="t1", execution_id="exec-a-retry",
+            authorized_predecessor_execution_ids={"exec-a"},
         )
         self.assertFalse(second_evidence["commit_created"])
         self.assertEqual(first_evidence["commit_sha"], second_evidence["commit_sha"])
