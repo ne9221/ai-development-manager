@@ -220,3 +220,9 @@ class CommandWatcherRunnerClaudeAccountsConfigTest(unittest.TestCase):
         res = self._run_watcher(f'-ClaudeAccountsConfig "{unicode_config}"')
         self.assertEqual(0, res.returncode, f"stderr: {res.stderr}")
         self.assertIn(f"CLAUDE_CONFIG={unicode_config}", res.stdout)
+
+    def test_runner_leaves_active_provider_lifecycle_to_the_125_minute_task_limit(self):
+        runner = (MANAGER_DIR / "run_command_watcher.ps1").read_text(encoding="utf-8")
+        self.assertIn('& $PythonPath -m manager.command_watcher --once', runner)
+        self.assertNotIn('Start-Process -FilePath $PythonPath', runner)
+        self.assertNotIn('WatcherTickTimeoutSeconds', runner)

@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 import os
 import socket
@@ -1161,6 +1162,325 @@ class WatcherSessionCenterBootstrapIntegrationTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class PollOnceTimeBudgetTests(unittest.TestCase):
+    """Covers the P0 fix: a real HOME Watcher tick could get stuck for
+    several minutes enumerating Drive projects/commands before any command
+    was ever claimed, freezing runtime_evidence.json refresh under
+    MultipleInstances=IgnoreNew. poll_once()'s deadline is the lifecycle-
+    safe half of the fix (the other half, a bounded Drive HTTP timeout, is
+    covered by collectors/test_publish_drive.py): it only ever stops the
+    watcher from STARTING new project/command work once a budget is spent,
+    and never interrupts a process_command() call already under way."""
+
+    ALLOWLIST = frozenset({("p1", "t1")})
+
+    def setUp(self):
+        self.store = CommandWatcherTests.allowlist_compliant_store()
+
+    def test_normal_idle_poll_with_no_commands_returns_immediately(self):
+        results = poll_once(self.store, object(), allowlist=self.ALLOWLIST,
+                             claim_factory=CommandWatcherTests.claim_factory,
+                             health_check=lambda: True, quota_check=lambda service: True)
+        self.assertEqual([], results)
+
+    def test_already_expired_deadline_stops_before_starting_any_work(self):
+        self.store.put("commands", "p1", "cmd-1", command())
+        runner = Mock()
+        with patch("manager.command_watcher.launch_task", runner):
+            results = poll_once(self.store, object(), allowlist=self.ALLOWLIST,
+                                 deadline=time.monotonic() - 1,
+                                 claim_factory=CommandWatcherTests.claim_factory,
+                                 health_check=lambda: True, quota_check=lambda service: True)
+        self.assertEqual([], results)
+        runner.assert_not_called()
+        # Nothing was written -- the command is exactly as queued as before
+        # this tick ran, so the next tick can process it normally.
+        self.assertEqual("queued", self.store.get("commands", "p1", "cmd-1")["status"])
+
+    def test_deadline_never_interrupts_a_command_already_started(self):
+        self.store.put("commands", "p1", "cmd-1", command())
+        self.store.put("commands", "p1", "cmd-2", command(command_id="cmd-2"))
+        calls = {"n": 0}
+
+        def fake_monotonic():
+            calls["n"] += 1
+            # Call 1: project-level check (before cmd-1 is even looked at) -- under budget.
+            # Call 2: command-level check, before cmd-1 -- still under budget, cmd-1 starts.
+            # Call 3+: command-level check, before cmd-2 -- budget now spent.
+            return 0.0 if calls["n"] <= 2 else 100.0
+
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher.time.monotonic", side_effect=fake_monotonic):
+            results = poll_once(self.store, object(), allowlist=self.ALLOWLIST, deadline=50.0,
+                                 claim_factory=CommandWatcherTests.claim_factory,
+                                 health_check=lambda: True, quota_check=lambda service: True)
+
+        # cmd-1's process_command() call ran to completion, uninterrupted --
+        # this is the real provider-lifecycle-safety guarantee.
+        self.assertEqual(1, len(results))
+        self.assertEqual("completed", results[0]["status"])
+        runner.assert_called_once()
+        # cmd-2 was never started at all (not partially processed, not
+        # claimed) -- it is exactly as queued as before this tick, so a
+        # later tick can pick it up with no state lost.
+        self.assertEqual("queued", self.store.get("commands", "p1", "cmd-2")["status"])
+
+    def test_default_deadline_is_well_under_the_scheduled_task_cadence(self):
+        from manager.command_watcher import POLL_TIME_BUDGET_SECONDS
+        self.assertLess(POLL_TIME_BUDGET_SECONDS, 60)
+
+
+class RotatedProjectIdsTests(unittest.TestCase):
+    """Covers the deterministic fairness repair: a project with a large
+    historical Command backlog can consume the whole remaining poll budget
+    on its own bounded hydration, so whichever project is enumerated first
+    matters. Rotation is a pure function of wall-clock time -- never a
+    process-local counter, since every `--once` invocation is a fresh
+    process with no memory of prior ticks."""
+
+    def test_rotation_is_a_pure_function_of_time_not_process_state(self):
+        from manager.command_watcher import _rotated_project_ids
+        ids = ["p1", "p2", "p3", "p4"]
+        first = _rotated_project_ids(ids, now=0.0)
+        second = _rotated_project_ids(ids, now=0.0)
+        self.assertEqual(first, second)
+
+    def test_every_project_becomes_first_within_one_full_rotation(self):
+        from manager.command_watcher import POLL_SECONDS, _rotated_project_ids
+        ids = ["p1", "p2", "p3", "p4"]
+        seen_first = {_rotated_project_ids(ids, now=tick * POLL_SECONDS)[0] for tick in range(len(ids))}
+        self.assertEqual(set(ids), seen_first, "every project must be first at least once per full rotation")
+
+    def test_empty_and_single_project_lists_are_unaffected(self):
+        from manager.command_watcher import _rotated_project_ids
+        self.assertEqual([], _rotated_project_ids([], now=12345))
+        self.assertEqual(["only"], _rotated_project_ids(["only"], now=12345))
+
+    def test_rotation_preserves_the_full_set_and_relative_cycle_order(self):
+        from manager.command_watcher import _rotated_project_ids
+        ids = ["p1", "p2", "p3"]
+        rotated = _rotated_project_ids(ids, now=1 * 60)  # POLL_SECONDS default = 60
+        self.assertEqual(set(ids), set(rotated))
+        self.assertEqual(3, len(rotated))
+
+
+class BoundedCommandEnumerationLifecycleSafetyTests(unittest.TestCase):
+    """Covers the P0 fix using a real DriveRecords + fake Drive backend
+    (not the simplified in-memory Store), so this exercises the real
+    list_records_bounded() call graph poll_once() now goes through."""
+
+    ALLOWLIST = frozenset({("p1", "t1")})
+
+    def _real_store(self):
+        from manager.tasks import DriveRecords, ROOT_FOLDER_ID, ROOT_FOLDERS, create_project, create_task
+        from manager.test_tasks import FakeDriveService
+        from manager.test_execution_lifecycle import project, task
+
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        create_project(store, project())
+        create_task(store, task(read_only=True), assign=False)
+        compliant = store.get("tasks", "p1", "t1")
+        compliant["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)
+        store.put("tasks", "p1", "t1", compliant)
+        return store, service
+
+    def test_large_backlog_in_one_project_does_not_prevent_a_queued_command_from_running(self):
+        """A project with many historical terminal commands plus one real
+        queued command: the queued command must still be found and
+        launched -- bounded hydration must not silently drop it just
+        because it comes after a lot of terminal noise."""
+        store, service = self._real_store()
+        for index in range(15):
+            command_id = f"old-{index:03d}"
+            store.put("commands", "p1", command_id, command(
+                command_id=command_id, status="completed", completed_at="2026-08-14T00:05:00Z",
+                result={"status": "completed"},
+            ))
+        store.put("commands", "p1", "cmd-1", command())
+
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        with patch("manager.command_watcher.launch_task", runner):
+            results = poll_once(store, object(), allowlist=self.ALLOWLIST,
+                                 claim_factory=CommandWatcherTests.claim_factory,
+                                 health_check=lambda: True, quota_check=lambda service: True)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("completed", results[0]["status"])
+        runner.assert_called_once()
+
+    def test_deadline_expiring_during_command_hydration_never_interrupts_a_started_process_command(self):
+        """The deadline can legitimately run out WHILE list_records_bounded
+        is still hydrating a project's backlog -- process_command for a
+        command already found and started must still complete."""
+        store, service = self._real_store()
+        store.put("commands", "p1", "cmd-1", command())
+
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        with patch("manager.command_watcher.launch_task", runner):
+            results = poll_once(store, object(), allowlist=self.ALLOWLIST,
+                                 deadline=time.monotonic() + 30,
+                                 claim_factory=CommandWatcherTests.claim_factory,
+                                 health_check=lambda: True, quota_check=lambda service: True)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("completed", results[0]["status"])
+
+    def test_expired_deadline_leaves_queued_command_untouched_for_next_tick(self):
+        store, service = self._real_store()
+        store.put("commands", "p1", "cmd-1", command())
+
+        runner = Mock()
+        with patch("manager.command_watcher.launch_task", runner):
+            results = poll_once(store, object(), allowlist=self.ALLOWLIST,
+                                 deadline=time.monotonic() - 1,
+                                 claim_factory=CommandWatcherTests.claim_factory,
+                                 health_check=lambda: True, quota_check=lambda service: True)
+
+        self.assertEqual([], results)
+        runner.assert_not_called()
+        self.assertEqual("queued", store.get("commands", "p1", "cmd-1")["status"])
+
+    def test_no_duplicate_launch_across_two_polls_with_a_large_backlog(self):
+        store, service = self._real_store()
+        for index in range(10):
+            command_id = f"old-{index:03d}"
+            store.put("commands", "p1", command_id, command(
+                command_id=command_id, status="completed", completed_at="2026-08-14T00:05:00Z",
+                result={"status": "completed"},
+            ))
+        store.put("commands", "p1", "cmd-1", command())
+
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        with patch("manager.command_watcher.launch_task", runner):
+            first = poll_once(store, object(), allowlist=self.ALLOWLIST,
+                               claim_factory=CommandWatcherTests.claim_factory,
+                               health_check=lambda: True, quota_check=lambda service: True)
+            second = poll_once(store, object(), allowlist=self.ALLOWLIST,
+                                claim_factory=CommandWatcherTests.claim_factory,
+                                health_check=lambda: True, quota_check=lambda service: True)
+
+        self.assertEqual(1, len(first))
+        self.assertEqual([], second)
+        runner.assert_called_once()
+
+
+class PollOnceUsesCheapProjectEnumerationTests(unittest.TestCase):
+    """Covers the final remaining gap: poll_once() must enumerate projects
+    via DriveRecords.list_project_ids() (no per-project get()), not
+    all_projects()/list_projects()'s full hydration -- otherwise the 40s
+    poll deadline can never even be checked until that full O(N) listing
+    has already returned, exactly as ChatGPT's review confirmed. Uses a
+    real DriveRecords backed by the same FakeDriveService fixture
+    manager/test_tasks.py uses, not the simplified in-memory Store used by
+    the rest of this file, so this exercises the real children()/folder()
+    call graph rather than a test double that bypasses it."""
+
+    def test_multi_project_poll_never_hydrates_any_project_document(self):
+        from manager.tasks import DriveRecords, ROOT_FOLDER_ID, ROOT_FOLDERS
+        from manager.test_tasks import FakeDriveService
+
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        root = store.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"])
+        for project_id in ("p1", "p2", "p3", "p4", "p5"):
+            store.folder(root, project_id)
+            store.put("projects", project_id, project_id, {
+                "project_id": project_id, "name": project_id, "created_at": "2026-08-22T00:00:00Z", "aliases": [],
+            })
+
+        get_media_calls = {"n": 0}
+        original = service.transport.get_media
+
+        def counting_get_media(fileId):
+            get_media_calls["n"] += 1
+            return original(fileId)
+
+        service.transport.get_media = counting_get_media
+        try:
+            results = poll_once(store, object(), allowlist=frozenset(),
+                                 claim_factory=CommandWatcherTests.claim_factory,
+                                 health_check=lambda: True, quota_check=lambda service: True)
+        finally:
+            service.transport.get_media = original
+
+        self.assertEqual([], results)
+        # 5 real projects, zero commands in any of them -- if poll_once were
+        # still hydrating each project's own JSON document (the old
+        # all_projects() path), get_media would be called at least 5 times
+        # here (once per project.json). It must be called zero times.
+        self.assertEqual(0, get_media_calls["n"])
+
+
+class MainOnceFastFailTests(unittest.TestCase):
+    """Covers requirement 9: a pre-launch failure (here, a bounded Drive
+    HTTP timeout surfacing as any exception out of build_service()) must
+    make one `--once` invocation return quickly with status "unavailable"
+    rather than hang or crash -- proving the next scheduled tick is free to
+    run normally, which is the actual mechanism that keeps
+    runtime_evidence.json refreshing every cadence."""
+
+    def test_build_service_failure_yields_fast_unavailable_tick(self):
+        import io
+        from contextlib import redirect_stdout
+        from manager.command_watcher import main
+
+        output = io.StringIO()
+        with patch("manager.command_watcher.build_service", side_effect=TimeoutError("simulated bounded Drive timeout")), \
+             redirect_stdout(output):
+            exit_code = main(["--once"])
+
+        self.assertEqual(0, exit_code)
+        printed = json.loads(output.getvalue().strip())
+        self.assertEqual("unavailable", printed["status"])
+
+    def test_main_builds_a_genuinely_separate_short_timeout_discovery_service(self):
+        """The critical timing-boundary fix: main() must build discovery_store
+        from a SEPARATE build_service(timeout=WATCHER_DISCOVERY_TIMEOUT_SECONDS)
+        call, not just pass a smaller bookkeeping number against the same
+        45s-timeout service every write/active-lifecycle call uses -- a
+        margin check against a timeout the transport doesn't actually have
+        would not really bound anything."""
+        import io
+        from contextlib import redirect_stdout
+        from manager.command_watcher import WATCHER_DISCOVERY_TIMEOUT_SECONDS, main
+
+        build_calls = []
+
+        def fake_build_service(timeout=None):
+            build_calls.append(timeout)
+            return object()
+
+        with patch("manager.command_watcher.build_service", side_effect=fake_build_service), \
+             patch("manager.command_watcher.DriveRecords", return_value=Mock(list_project_ids=Mock(return_value=[]))), \
+             redirect_stdout(io.StringIO()):
+            main(["--once"])
+
+        # First call: the normal, full-timeout service (default -> None
+        # means "use DRIVE_REQUEST_TIMEOUT_SECONDS", untouched by this fix).
+        # Second call: the discovery-only service, with an explicit,
+        # strictly shorter timeout than POLL_TIME_BUDGET_SECONDS.
+        self.assertEqual([None, WATCHER_DISCOVERY_TIMEOUT_SECONDS], build_calls)
+
+    def test_discovery_timeout_leaves_real_margin_under_the_poll_budget(self):
+        """Documents the actual math this fix depends on: with the real
+        POLL_TIME_BUDGET_SECONDS and WATCHER_DISCOVERY_TIMEOUT_SECONDS
+        constants, a hydration that starts at the last safe moment still
+        finishes with time to spare before the next 60s Scheduled Task
+        trigger -- and, just as important, the discovery timeout is
+        strictly smaller than the poll budget (the inverse was a real bug
+        this task's own tests caught: with the old 45s DRIVE_REQUEST_
+        TIMEOUT_SECONDS used as the margin against a 40s budget, no
+        hydration could ever start at all)."""
+        from manager.command_watcher import POLL_SECONDS, POLL_TIME_BUDGET_SECONDS, WATCHER_DISCOVERY_TIMEOUT_SECONDS
+
+        self.assertLess(WATCHER_DISCOVERY_TIMEOUT_SECONDS, POLL_TIME_BUDGET_SECONDS)
+        worst_case_total = POLL_TIME_BUDGET_SECONDS + WATCHER_DISCOVERY_TIMEOUT_SECONDS
+        self.assertLess(worst_case_total, POLL_SECONDS,
+                         "budget + one worst-case discovery request must still fit before the next scheduled trigger")
 
 
 def argparse_namespace(**overrides):

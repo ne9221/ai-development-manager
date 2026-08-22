@@ -8,6 +8,7 @@ import io
 import json
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -79,12 +80,24 @@ class DriveRecords:
     def __init__(self, service):
         self.files = service.files()
 
-    def children(self, parent, name=None):
+    def children(self, parent, name=None, deadline=None):
+        """`deadline`, if given, is a `time.monotonic()` value checked only
+        BETWEEN pages (never mid-single-request -- each individual
+        `files.list().execute()` call remains bound only by the transport's
+        own request timeout). Exceeding it returns whatever pages were
+        already fetched rather than raising, so a caller that only needs a
+        best-effort/bounded listing (see list_project_ids below) degrades
+        gracefully instead of failing the whole poll. Default None
+        preserves this method's exact prior behavior (unbounded, waits for
+        every page) for every other existing caller -- folder(), get(),
+        list_records(), list_projects(), etc. are all unaffected."""
         query = f"'{parent}' in parents and trashed=false"
         if name:
             query += f" and name='{name}'"
         items, token, seen = [], None, set()
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                return items
             options = {"q": query, "spaces": "drive", "fields": "nextPageToken,files(id,name,mimeType,parents,modifiedTime,createdTime)", "pageSize": 100}
             if token:
                 options["pageToken"] = token
@@ -204,10 +217,79 @@ class DriveRecords:
         names = [logical_record_id(item["name"][:-5]) for item in self.children(parent) if item.get("name", "").endswith(".json")]
         return [self.get(area, project_id, name) for name in names]
 
+    def list_records_bounded(self, area, project_id, deadline=None, single_request_worst_case=None):
+        """Deadline-aware, bounded-hydration alternative to list_records()
+        for callers (manager.command_watcher.poll_once) that cannot afford
+        to hydrate an unbounded number of historical JSON records in one
+        call -- a real HOME project's Command history alone took 141.66s to
+        fully hydrate via list_records() in a live reproduction.
+
+        Contract:
+        - The filename+id metadata listing is fetched via children(),
+          itself deadline-aware -- if the deadline is already exhausted
+          just listing filenames, returns [] with nothing hydrated.
+        - Before hydrating EACH record, requires enough remaining budget
+          for one worst-case-length Drive request (`single_request_worst_case`,
+          defaulting to collectors.publish_drive.DRIVE_REQUEST_TIMEOUT_SECONDS,
+          the same bound every Drive HTTP request already carries) --
+          never starts a hydration whose own worst case could run past the
+          deadline. This is why a 40s poll budget and a 45s per-request
+          transport timeout do not silently compose into an 85s tick: no
+          new request starts inside the last single_request_worst_case
+          seconds of the budget at all.
+        - Hydrates directly via files.get_media(fileId=...) using the file
+          id already known from the metadata listing -- one Drive request
+          per record, not list_records()'s two (its get() re-resolves the
+          file by name via another children() call first).
+        - Returns only fully-parsed records. A record whose hydration
+          would exceed budget is left completely untouched -- not
+          attempted, not partially read -- and is available on a later
+          call with no partial state written anywhere (this method never
+          writes anything at all). A record that fails to parse once
+          actually fetched is skipped, not raised -- one malformed record
+          must not block every other record in the same project the way
+          list_records() raising TaskError for the whole call would.
+        """
+        if single_request_worst_case is None:
+            from collectors.publish_drive import DRIVE_REQUEST_TIMEOUT_SECONDS
+            single_request_worst_case = DRIVE_REQUEST_TIMEOUT_SECONDS
+        parent = self.project_folder(area, project_id, create=False)
+        items = self.children(parent, deadline=deadline)
+        records = []
+        for item in items:
+            if not item.get("name", "").endswith(".json"):
+                continue
+            if deadline is not None and time.monotonic() + single_request_worst_case >= deadline:
+                break
+            try:
+                raw = self.files.get_media(fileId=item["id"]).execute()
+                records.append(json.loads(raw.decode("utf-8")))
+            except Exception:
+                continue
+        return records
+
     def list_projects(self):
         root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"], create=False)
         return [self.get("projects", item["name"], item["name"])
                 for item in self.children(root) if item.get("mimeType") == MIME_FOLDER]
+
+    def list_project_ids(self, deadline=None):
+        """Cheap enumeration for callers that only need project IDs (e.g. to
+        list each project's commands), not full hydrated project documents.
+        A project folder's own name is already its project_id (see
+        project_folder()/safe_id()), so unlike list_projects() this never
+        calls get() -- no per-project Drive round trip at all, just the one
+        (possibly paginated) folder listing. `deadline`, if given, is
+        forwarded to children() and can stop mid-pagination, returning
+        whatever project IDs were already seen rather than raising -- a
+        caller with a bounded time budget (manager.command_watcher.
+        poll_once) gets a safe partial list instead of an unbounded wait;
+        any project not yet seen is simply picked up on a later call. This
+        does not change list_projects()'s own behavior or any other
+        existing caller of children()/folder() at all."""
+        root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"], create=False)
+        return [item["name"] for item in self.children(root, deadline=deadline)
+                if item.get("mimeType") == MIME_FOLDER]
 
     def latest(self, area, project_id, task_id):
         parent = self.project_folder(area, project_id, create=False)
