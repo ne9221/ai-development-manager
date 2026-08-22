@@ -58,7 +58,8 @@ def _is_stale(entry, now, max_age_seconds):
     return (now - parsed).total_seconds() > max_age_seconds
 
 
-def select_claude_account(accounts, *, explicit_account_id=None, max_age_seconds=None, now=None, history=None):
+def select_claude_account(accounts, *, explicit_account_id=None, max_age_seconds=None, now=None,
+                           history=None, auth_ready=None):
     """Select exactly one Claude account_id from a list of account quota
     entries, or raise AccountSelectionError.
 
@@ -68,10 +69,22 @@ def select_claude_account(accounts, *, explicit_account_id=None, max_age_seconds
     - explicit_account_id, if given, is honored as long as that account is
       present and enabled -- this is the escape hatch for a caller that
       already knows which account to use; it is not validated against
-      quota confidence, since an explicit human/caller choice overrides
-      automatic reliability heuristics by design.
+      quota confidence or auth_ready, since an explicit human/caller choice
+      overrides automatic reliability heuristics by design (the launcher's
+      own auth preflight still fails closed on it independently -- this
+      function never substitutes a different account for an explicit ask).
     - Otherwise: accounts with confidence in (None, "unknown"), or older
       than max_age_seconds when that is given, are excluded as unreliable.
+      When `auth_ready` is given (a {account_id: bool} mapping of live
+      authentication readiness, e.g. from a real `claude auth status`
+      check), an account is additionally excluded unless
+      `auth_ready.get(account_id) is True` -- an account missing from the
+      mapping, or whose check came back False/ambiguous, is treated as not
+      ready, never as "unknown but let's try anyway". This keeps a
+      known-auth-stale or auth-unknown account from ever being the
+      automatic pick while quota confidence alone still looks reliable
+      (stale quota confidence can outlive a token going bad, since nothing
+      recomputes it once collection stops succeeding).
       If exactly one reliable candidate remains, it is returned.
       If multiple reliable candidates remain, they are evaluated and ranked
       via quota forecast evidence. If still completely ambiguous (e.g. no quota
@@ -95,10 +108,12 @@ def select_claude_account(accounts, *, explicit_account_id=None, max_age_seconds
         a for a in enabled
         if a.get("confidence") not in _UNRELIABLE_CONFIDENCE and not _is_stale(a, now, max_age_seconds)
     ]
+    if auth_ready is not None:
+        reliable = [a for a in reliable if auth_ready.get(a.get("account_id")) is True]
     if not reliable:
         raise AccountSelectionError(
-            "every Claude account has unknown, missing, or stale quota confidence; "
-            "refusing to guess -- pass an explicit account_id instead"
+            "every Claude account has unknown/missing/stale quota confidence, or failed live "
+            "authentication readiness; refusing to guess -- pass an explicit account_id instead"
         )
     if len(reliable) == 1:
         return reliable[0]["account_id"]
@@ -185,13 +200,30 @@ def load_claude_accounts(path):
 
 
 def resolve_claude_account(accounts, quota_document=None, *, explicit_account_id=None,
-                            max_age_seconds=None, now=None, history=None):
+                            max_age_seconds=None, now=None, history=None, check_auth_ready=None):
     """Combine a loaded account registry with a runtime status document's
     per-account claude quota entries to pick exactly one launch-ready
     account, or raise. Returns {"account_id": ..., "config_dir": ...} --
     config_dir may legitimately be None (the single/legacy-account entry,
     meaning: do not override CLAUDE_CONFIG_DIR, use whatever is already
     logged in, unchanged from pre-P0.1 behavior).
+
+    check_auth_ready, if given, is a callable(account) -> bool run once per
+    enabled account (each account dict has at least "account_id" and
+    "config_dir") to prove live authentication readiness -- e.g. a real
+    `claude auth status --json` preflight against that account's exact
+    config_dir, the same signal `manager.claude_launcher.ClaudeLauncher`
+    gates a spawn on. Only consulted for automatic selection
+    (explicit_account_id=None): an explicit caller-supplied account_id is
+    still honored as-is and relies on the launcher's own preflight to fail
+    closed, exactly as before -- this parameter never causes one account to
+    be silently substituted for another that was explicitly requested. When
+    given, quota confidence alone is no longer sufficient for an account to
+    be auto-selected: quota can stay "reliable" (last-known-good, unchanged)
+    long after a token has actually gone stale, since nothing recomputes
+    confidence once background collection starts failing -- this closes
+    that gap by cross-checking live auth truth at the moment of selection,
+    before any account_id becomes this launch's committed choice.
 
     quota_document: the schema/status.schema.json-shaped document (e.g. from
     manager.quota_reader.read_drive_status()); its provider=="claude"
@@ -222,9 +254,15 @@ def resolve_claude_account(accounts, quota_document=None, *, explicit_account_id
         }
         for account in accounts
     ]
+    auth_ready = None
+    if check_auth_ready is not None and explicit_account_id is None:
+        auth_ready = {
+            account["account_id"]: bool(check_auth_ready(account))
+            for account in accounts if account.get("enabled", True)
+        }
     selected_id = select_claude_account(
         selection_input, explicit_account_id=explicit_account_id,
-        max_age_seconds=max_age_seconds, now=now, history=history,
+        max_age_seconds=max_age_seconds, now=now, history=history, auth_ready=auth_ready,
     )
     selected = next(account for account in accounts if account["account_id"] == selected_id)
     return {"account_id": selected["account_id"], "config_dir": selected["config_dir"]}

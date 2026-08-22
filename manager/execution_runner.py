@@ -224,6 +224,33 @@ def _resolve_working_directory(store, task):
     return value
 
 
+def _claude_account_auth_ready(account):
+    """P0 auth-routing-truth check: proves one Claude account is actually
+    launchable right now (a real `claude auth status --json` preflight
+    against its exact config_dir), for use as automatic account-selection
+    eligibility rather than as the launcher's own post-selection gate.
+
+    Fails closed on every ambiguous outcome, not just a confirmed
+    not-logged-in: any exception from resolving the CLI executable or from
+    check_claude_auth_ready (including ClaudeLaunchError's own
+    "authentication_check_failed" classification for a timeout/unparseable
+    result) is treated as not-ready, same as a confirmed
+    "authentication_unavailable" -- an account this uncertain about must
+    never win automatic selection over one that checked out clean.
+    """
+    from manager.claude_launcher import check_claude_auth_ready, resolve_claude_executable
+    env = None
+    config_dir = account.get("config_dir")
+    if config_dir is not None:
+        env = dict(os.environ)
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    try:
+        executable = resolve_claude_executable()
+        return check_claude_auth_ready(executable, env)
+    except Exception:
+        return False
+
+
 def launch_task(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                 execution_id=None, model=None, timeout_seconds=None, quota_document=None, executions=None,
                 retry_count=0, retry_of_execution_id=None, on_running=None, provider="codex",
@@ -270,7 +297,8 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     turn_timeout = task_turn_timeout(task["expected_minutes"], timeout_seconds)
     if provider == "claude" and claude_accounts is not None:
         quota_document = quota_document or read_drive_status(service=service)
-        resolved = resolve_claude_account(claude_accounts, quota_document, explicit_account_id=account_id)
+        resolved = resolve_claude_account(claude_accounts, quota_document, explicit_account_id=account_id,
+                                          check_auth_ready=_claude_account_auth_ready if account_id is None else None)
         account_id, config_dir = resolved["account_id"], resolved["config_dir"]
     elif provider == "claude" and account_id is not None:
         raise AccountSelectionError(
