@@ -16,7 +16,8 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
 from cloud.app import default_lock_registry_factory, default_service_factory, default_write_service_factory
-from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
+from cloud.dispatch_ingress import DispatchIngressError, MAX_GOAL_LENGTH, MAX_TITLE_LENGTH, handle_dispatch
+from manager.global_invoke import GlobalInvokeError, global_invoke
 from manager.runtime_bridge import redact, runtime_bridge
 from manager.runtime_quota_tool import runtime_quota_status
 from manager.tasks import DriveRecords, TaskError, validate
@@ -32,6 +33,19 @@ TASK_STATUS_FIELDS = ("status", "current_progress", "next_action", "blocked_reas
                       "completed_at", "assigned_provider", "account_id", "read_only")
 COMMAND_STATUS_FIELDS = ("status", "provider", "account_id", "execution_id", "claimed_at",
                          "completed_at", "result", "recovery_reason")
+EXECUTION_STATUS_FIELDS = ("execution_id", "status", "session_id", "provider", "account_id",
+                           "started_at", "completed_at", "terminal_reason", "recovery_reason")
+SESSION_STATUS_FIELDS = ("session_id", "status", "provider", "started_at", "updated_at", "summary")
+HANDOFF_STATUS_FIELDS = ("handoff_id", "created_at", "from_provider", "to_provider", "reason", "next_action")
+# Normalizes each record area's own richer status enum (see schema/*.schema.json)
+# down to the five caller-facing states the invocation contract promises
+# (queued/running/completed/failed/blocked). Command status wins whenever a
+# Command exists (it is the more current record); Task status is only the
+# fallback for a request_id that has not been claimed into a Command yet.
+COMMAND_STATE_MAP = {"queued": "queued", "claimed": "running", "running": "running",
+                     "attention": "blocked", "completed": "completed", "failed": "failed"}
+TASK_STATE_MAP = {"queued": "queued", "ready": "queued", "in_progress": "running",
+                  "blocked": "blocked", "completed": "completed", "cancelled": "failed"}
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 IDEMPOTENT_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 server = MCPServer(
@@ -108,6 +122,98 @@ def invoke_task_status(project_id, task_id, command_id, service_factory=None):
     if response["task"] is None and response["command"] is None:
         raise TaskError("no matching task or command found")
     return response
+
+
+def invoke_status_chain(project_id, task_id, command_id, service_factory=None):
+    """Full Task -> Command -> Execution -> Session -> Handoff lookup
+    chain for one invocation, plus a normalized `state` (queued/running/
+    completed/failed/blocked), read-only. Builds on invoke_task_status
+    (unchanged) for the Task/Command edge and only adds the edges that
+    module does not expose: Command.execution_id -> Execution,
+    Execution.session_id -> Session, and the Task's own latest Handoff (a
+    Task may have zero, one, or several Handoffs over its lifetime; only
+    the most recent is returned here, matching manager.tasks.DriveRecords.
+    latest()'s existing single-record convention used elsewhere). Any
+    record that legitimately does not exist yet (no Command claimed, no
+    Execution reserved, no Session linked, no Handoff written) is reported
+    as None rather than raised -- only a genuine backend failure raises."""
+    service_factory = service_factory or LOCAL_SERVICE_FACTORY or default_service_factory
+    base = invoke_task_status(project_id, task_id, command_id, service_factory=service_factory)
+    try:
+        service = service_factory()
+        store = DriveRecords(service)
+    except Exception:
+        raise TaskError("runtime data is unavailable") from None
+
+    command = base.get("command")
+    execution = None
+    session = None
+    execution_id = command.get("execution_id") if command else None
+    if execution_id:
+        try:
+            record = store.get("executions", project_id, execution_id)
+            validate("execution", record)
+            execution = {key: record.get(key) for key in EXECUTION_STATUS_FIELDS}
+            session_id = record.get("session_id")
+            if session_id:
+                try:
+                    session_record = store.get("sessions", project_id, session_id)
+                    validate("session", session_record)
+                    session = {key: session_record.get(key) for key in SESSION_STATUS_FIELDS}
+                except TaskError:
+                    pass
+        except TaskError:
+            pass
+
+    handoff = None
+    try:
+        handoff_record = store.latest("handoffs", project_id, task_id)
+        handoff = {key: handoff_record.get(key) for key in HANDOFF_STATUS_FIELDS}
+    except TaskError:
+        pass
+
+    if command is not None:
+        state = COMMAND_STATE_MAP.get(command.get("status"), "blocked")
+    elif base.get("task") is not None:
+        state = TASK_STATE_MAP.get(base["task"].get("status"), "blocked")
+    else:
+        state = "blocked"
+
+    base["execution"] = execution
+    base["session"] = session
+    base["handoff"] = handoff
+    base["state"] = state
+    return base
+
+
+def invoke_global(request, write_service_factory=None, lock_registry_factory=None,
+                  registry=None, baseline_resolver=None):
+    """Call manager.global_invoke.global_invoke -- the same server-side
+    project-alias-resolving, no-caller-working_directory, automatic-
+    provider-by-default facade that already exists for this contract --
+    through the exact write-service/store construction convention
+    invoke_dispatch already uses. Adds no fields, removes no validation:
+    global_invoke() and, beneath it, cloud.dispatch_ingress.
+    validate_dispatch_payload() remain the sole authorities on what is
+    accepted."""
+    write_service_factory = write_service_factory or LOCAL_WRITE_SERVICE_FACTORY or default_write_service_factory
+    lock_registry_factory = lock_registry_factory or default_lock_registry_factory
+    try:
+        service = write_service_factory()
+        store = DriveRecords(service)
+    except Exception:
+        raise TaskError("runtime data is unavailable") from None
+    kwargs = {}
+    if registry is not None:
+        kwargs["registry"] = registry
+    if baseline_resolver is not None:
+        kwargs["baseline_resolver"] = baseline_resolver
+    try:
+        return global_invoke(store, service, lock_registry_factory, request, **kwargs)
+    except (GlobalInvokeError, TaskError):
+        raise
+    except Exception:
+        raise TaskError("global invoke failed") from None
 
 
 def bounded_text(name, value, maximum, required=False):
@@ -189,6 +295,69 @@ def adm_task_status(project_id: str, request_id: str | None = None, task_id: str
     if not resolved_task_id and not resolved_command_id:
         raise TaskError("one of request_id, task_id, or command_id is required")
     return invoke_task_status(project_id, resolved_task_id, resolved_command_id)
+
+
+@server.tool(annotations=IDEMPOTENT_WRITE, structured_output=True)
+def adm_invoke(project: str, title: str, goal: str, idempotency_key: str,
+               priority: str | None = None, repo_write: bool = False,
+               allowed_paths: list[str] | None = None,
+               preferred_provider: str | None = None, account_id: str | None = None) -> dict[str, Any]:
+    """The one stable, backend-neutral invocation entry point: submit one
+    task by project identity/alias alone -- no repo, branch, baseline, or
+    working_directory field exists here for a caller to supply, override,
+    or forge one; `project` is resolved server-side through the Global
+    Project Registry (manager.global_invoke.resolve_project), and a
+    repo_write invocation's baseline is resolved server-side through
+    manager.remote_baseline_resolver (GitHub-remote-API, never a local
+    checkout). Provider/account selection is automatic (quota-aware) by
+    default; an explicit preferred_provider/account_id is honored and
+    recorded on the Command, never silently overridden. Idempotent on
+    idempotency_key: replaying the same key never double-dispatches, and
+    returns the identity already created. Never launches a provider --
+    creates a queued Task+Command for the existing Command Watcher
+    pipeline to pick up under its own rules, exactly like adm_create_task,
+    but covering the full external contract (project alias, optional
+    bounded repo-write, explicit provider/account override) rather than
+    adm_create_task's narrower disposable-read-only-task shape."""
+    request: dict[str, Any] = {
+        "idempotency_key": bounded_text("idempotency_key", idempotency_key, MAX_REFERENCE_LENGTH, required=True),
+        "project": bounded_text("project", project, MAX_REFERENCE_LENGTH, required=True),
+        "title": bounded_text("title", title, MAX_TITLE_LENGTH, required=True),
+        "goal": bounded_text("goal", goal, MAX_GOAL_LENGTH, required=True),
+    }
+    if priority is not None:
+        request["priority"] = bounded_text("priority", priority, MAX_REFERENCE_LENGTH)
+    if repo_write:
+        request["repo_write"] = True
+        request["allowed_paths"] = list(allowed_paths) if allowed_paths else []
+    if preferred_provider is not None:
+        request["preferred_provider"] = bounded_text("preferred_provider", preferred_provider, MAX_REFERENCE_LENGTH)
+    if account_id is not None:
+        request["account_id"] = bounded_text("account_id", account_id, MAX_REFERENCE_LENGTH)
+    return invoke_global(request)
+
+
+@server.tool(annotations=READ_ONLY, structured_output=True)
+def adm_invoke_status(project_id: str, request_id: str | None = None, task_id: str | None = None,
+                      command_id: str | None = None) -> dict[str, Any]:
+    """Full Task->Command->Execution->Session->Handoff lookup chain for one
+    invocation (by request_id -- the idempotency_key adm_invoke or
+    adm_create_task was called with, resolved via the shared "dispatch-
+    <request_id>" convention -- or by an explicit task_id/command_id), plus
+    a normalized `state` (queued/running/completed/failed/blocked). At
+    least one of request_id, task_id, or command_id is required. Any
+    record that legitimately does not exist yet is reported as null, never
+    fabricated; a genuinely unknown identity (neither Task nor Command
+    found) is an error, not an empty success."""
+    project_id = bounded_text("project_id", project_id, MAX_REFERENCE_LENGTH, required=True)
+    request_id = bounded_text("request_id", request_id, MAX_REFERENCE_LENGTH)
+    task_id = bounded_text("task_id", task_id, MAX_REFERENCE_LENGTH)
+    command_id = bounded_text("command_id", command_id, MAX_REFERENCE_LENGTH)
+    resolved_task_id = task_id or (f"dispatch-{request_id}" if request_id else None)
+    resolved_command_id = command_id or (f"dispatch-{request_id}" if request_id else None)
+    if not resolved_task_id and not resolved_command_id:
+        raise TaskError("one of request_id, task_id, or command_id is required")
+    return invoke_status_chain(project_id, resolved_task_id, resolved_command_id)
 
 
 server.tool(name="adm_runtime_quota_status", annotations=READ_ONLY, structured_output=True)(runtime_quota_status)

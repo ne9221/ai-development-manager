@@ -9,9 +9,14 @@ from unittest.mock import patch
 from mcp import Client
 
 from cloud.dispatch_ingress import DispatchIngressError
-from manager.mcp_adapter import MAX_REQUEST_LENGTH, MAX_RESPONSE_BYTES, invoke_bridge, invoke_dispatch, invoke_task_status, server
+from manager.global_invoke import GlobalInvokeError
+from manager.mcp_adapter import (
+    MAX_REQUEST_LENGTH, MAX_RESPONSE_BYTES, invoke_bridge, invoke_dispatch, invoke_global,
+    invoke_status_chain, invoke_task_status, server,
+)
+from manager.project_registry import ProjectRegistry
 from manager.runtime_quota_tool import read_runtime_status
-from manager.tasks import DriveRecords, TaskError, create_project, validate
+from manager.tasks import DriveRecords, TaskError, create_handoff, create_project, validate
 from manager.test_dispatcher import quota as quota_fixture
 from manager.test_task_claims import MemoryClaimRegistry
 from manager.test_tasks import FakeDriveService
@@ -59,11 +64,11 @@ class MCPAdapterTests(unittest.TestCase):
                 tools = (await client.list_tools()).tools
                 self.assertEqual(
                     {"adm_dispatch", "adm_status", "adm_runtime_quota_status", "adm_health",
-                     "adm_create_task", "adm_task_status"},
+                     "adm_create_task", "adm_task_status", "adm_invoke", "adm_invoke_status"},
                     {item.name for item in tools},
                 )
                 self.assertTrue(all(item.annotations.destructive_hint is False for item in tools))
-                write_tools = {"adm_create_task"}
+                write_tools = {"adm_create_task", "adm_invoke"}
                 for item in tools:
                     self.assertEqual(item.name not in write_tools, item.annotations.read_only_hint)
                 quota_tool = next(item for item in tools if item.name == "adm_runtime_quota_status")
@@ -375,6 +380,209 @@ class MCPTaskStatusToolTests(unittest.TestCase):
     def test_status_tool_unknown_identity_is_error_not_empty_success(self):
         result = asyncio.run(tool("adm_task_status", {"project_id": "p1", "request_id": "never-created"}))
         self.assertTrue(result.is_error)
+
+
+REPO_URL = "https://github.com/example/project"
+
+
+def registry_entry(project_id="p1", **overrides):
+    entry = {
+        "project_id": project_id,
+        "display_name": "Project One",
+        "aliases": ["proj-one"],
+        "repo": {"canonical_url": REPO_URL, "owner": "example", "name": "project"},
+        "default_branch": "main",
+        "baseline_resolution_policy": {"strategy": "origin_default", "pinned_ref": None},
+        "common_governance": {"reference": "governance-rules.json", "version": "1.0.0"},
+        "project_rules": {"reference": "PROJECT-RULES.md"},
+        "status": "enabled",
+        "resolution_status": "verified",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def invoke_request(**changes):
+    value = {"idempotency_key": "inv-1", "project": "p1", "title": "Fix parser", "goal": "Fix the parser regression"}
+    value.update(changes)
+    return value
+
+
+class MCPGlobalInvokeToolTests(unittest.TestCase):
+    """adm_invoke / invoke_global: the full backend-neutral contract
+    (project alias resolution, no caller-working_directory authority,
+    automatic-provider-by-default, auditable explicit override,
+    idempotency) layered over manager.global_invoke.global_invoke, which
+    this module reuses unmodified rather than re-implementing."""
+
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+        create_project(self.store, project())
+        self.registry = ProjectRegistry(projects=[registry_entry()])
+        self.registries = SharedMemoryRegistries()
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=quota_fixture())
+        self.quota_patch.start()
+
+    def tearDown(self):
+        self.quota_patch.stop()
+
+    def call(self, req=None):
+        return invoke_global(req if req is not None else invoke_request(),
+                             write_service_factory=lambda: self.service,
+                             lock_registry_factory=self.registries.factory, registry=self.registry)
+
+    def test_project_alias_resolves_to_canonical_project_id(self):
+        result = self.call(invoke_request(project="proj-one", idempotency_key="inv-alias"))
+        self.assertTrue(result["accepted"])
+        task = self.store.get("tasks", "p1", result["task_id"])
+        self.assertEqual("p1", task["project_id"])
+
+    def test_unresolved_project_fails_closed(self):
+        with self.assertRaises(GlobalInvokeError) as ctx:
+            self.call(invoke_request(project="no-such-project", idempotency_key="inv-missing"))
+        self.assertEqual("project_not_found", ctx.exception.code)
+        # Nothing was written for a project that could not be resolved.
+        with self.assertRaises(TaskError):
+            self.store.get("tasks", "p1", "dispatch-inv-missing")
+
+    def test_omitted_provider_uses_automatic_selection(self):
+        result = self.call(invoke_request(idempotency_key="inv-auto"))
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertIsNone(command["requested_provider"])
+        self.assertIn(command["provider"], ("codex", "claude", "antigravity"))
+
+    def test_explicit_provider_is_recorded_and_auditable(self):
+        result = self.call(invoke_request(idempotency_key="inv-explicit", preferred_provider="codex"))
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual("codex", command["requested_provider"])
+        self.assertEqual("codex", command["provider"])
+
+    def test_same_idempotency_key_replay_does_not_double_dispatch(self):
+        first = self.call(invoke_request(idempotency_key="inv-dup"))
+        second = self.call(invoke_request(idempotency_key="inv-dup"))
+        self.assertEqual(first["task_id"], second["task_id"])
+        self.assertEqual(1, len([r for r in self.store.list_records("tasks", "p1") if r["task_id"] == first["task_id"]]))
+
+    def test_no_working_directory_field_accepted_request_or_task(self):
+        """There is no field in the invocation contract for a caller to
+        supply, override, or forge working_directory -- supplying one is
+        rejected as an unsupported field, never silently accepted or used."""
+        req = invoke_request(idempotency_key="inv-cwd", working_directory="C:/attacker/evil")
+        with self.assertRaises(GlobalInvokeError) as ctx:
+            self.call(req)
+        self.assertEqual("malformed_request", ctx.exception.code)
+        self.assertIn("working_directory", str(ctx.exception))
+
+    def test_tool_wiring_round_trip(self):
+        """Proves adm_invoke actually calls invoke_global with the caller's
+        fields (never touching a real Drive credential in this test --
+        that is invoke_global's own, separately-tested responsibility)."""
+        captured = []
+        def fake(request, **_kwargs):
+            captured.append(request)
+            return {"accepted": True, "request_id": request["idempotency_key"], "task_id": "t", "command_id": "c", "status": "queued"}
+        with patch("manager.mcp_adapter.invoke_global", side_effect=fake):
+            result = structured(asyncio.run(tool("adm_invoke", {
+                "project": "p1", "title": "t", "goal": "g", "idempotency_key": "inv-tool-1",
+            })))
+        self.assertTrue(result["accepted"])
+        self.assertEqual({"idempotency_key": "inv-tool-1", "project": "p1", "title": "t", "goal": "g"}, captured[0])
+
+
+class MCPInvokeStatusChainTests(unittest.TestCase):
+    """adm_invoke_status / invoke_status_chain: the full Task->Command->
+    Execution->Session->Handoff readback the contract requires, on top of
+    the existing (unmodified) invoke_task_status Task/Command lookup."""
+
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+        create_project(self.store, project())
+        self.registries = SharedMemoryRegistries()
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=quota_fixture())
+        self.quota_patch.start()
+        self.result = invoke_dispatch(
+            {"project_id": "p1", "title": "t", "goal": "g", "request_id": "req-chain"},
+            write_service_factory=lambda: self.service, lock_registry_factory=self.registries.factory)
+        self.task_id = self.result["task_id"]
+        self.command_id = self.result["command_id"]
+
+    def tearDown(self):
+        self.quota_patch.stop()
+
+    def test_queued_state_with_no_execution_session_or_handoff_yet(self):
+        result = invoke_status_chain("p1", self.task_id, self.command_id, service_factory=lambda: self.service)
+        self.assertEqual("queued", result["state"])
+        self.assertIsNone(result["execution"])
+        self.assertIsNone(result["session"])
+        self.assertIsNone(result["handoff"])
+
+    def test_full_chain_resolves_execution_session_and_handoff(self):
+        session_record = {
+            "session_id": "sess-1", "provider": "codex", "provider_session_id": "raw-1", "account_id": None,
+            "project_id": "p1", "task_id": self.task_id, "conversation_label": "c1", "title": "Session",
+            "summary": "did work", "started_at": "2026-08-23T00:00:00Z", "updated_at": "2026-08-23T00:05:00Z",
+            "working_directory": None, "repository": None, "source_identifier": "codex:raw-1",
+            "source_path": None, "parent_session_id": None, "usage_ref": None, "resume_ref": None,
+            "mapping_source": None, "content_hash": None, "classification_method": "unclassified",
+            "classification_confidence": None, "classification_status": "needs_review",
+            "status": "completed", "message_count": 3, "model": "gpt-5", "first_user_prompt": "go",
+        }
+        self.store.put("sessions", "p1", "sess-1", session_record)
+        execution_record = {
+            "execution_id": "exec-1", "task_id": self.task_id, "project_id": "p1", "provider": "codex",
+            "mode": "code", "effort": "medium", "reserved_at": None, "started_at": "2026-08-23T00:00:00Z",
+            "completed_at": "2026-08-23T00:05:00Z", "finished_at": None, "session_id": "sess-1",
+            "provider_session_id": "raw-1", "account_id": None, "elapsed_minutes": 5, "status": "completed",
+            "retry_count": 0, "retry_of_execution_id": None, "heartbeat_at": None, "progress_updated_at": None,
+            "hard_timeout_at": None, "last_provider_event": None, "provider_evidence": None, "stale_at": None,
+            "recovery_reason": None, "terminal_reason": None, "quota_evidence": None, "quota_before": {},
+            "quota_after": {}, "quota_delta": {}, "source_confidence": "official", "access": "read_only",
+            "lease_evidence": None, "cleanup_evidence": None, "repo_write_completion_evidence": None,
+            "notes": [], "task_snapshot": {"task_type": "general", "complexity": "medium", "needs_repo_edit": False},
+        }
+        self.store.put("executions", "p1", "exec-1", execution_record)
+        command = self.store.get("commands", "p1", self.command_id)
+        command["execution_id"] = "exec-1"
+        command["status"] = "completed"
+        self.store.put("commands", "p1", self.command_id, command)
+        create_handoff(self.store, {
+            "handoff_id": "ho-1", "task_id": self.task_id, "project_id": "p1", "from_provider": "codex",
+            "to_provider": "claude", "from_session": "sess-1", "reason": "provider switch",
+            "current_state": "done", "next_action": "review", "acceptance_criteria": ["done"],
+            "minimal_context": "context",
+        })
+
+        result = invoke_status_chain("p1", self.task_id, self.command_id, service_factory=lambda: self.service)
+        self.assertEqual("completed", result["state"])
+        self.assertEqual("exec-1", result["execution"]["execution_id"])
+        self.assertEqual("sess-1", result["execution"]["session_id"])
+        self.assertEqual("sess-1", result["session"]["session_id"])
+        self.assertEqual("ho-1", result["handoff"]["handoff_id"])
+
+    def test_missing_execution_is_reported_as_none_not_fabricated(self):
+        command = self.store.get("commands", "p1", self.command_id)
+        command["execution_id"] = "no-such-execution"
+        self.store.put("commands", "p1", self.command_id, command)
+        result = invoke_status_chain("p1", self.task_id, self.command_id, service_factory=lambda: self.service)
+        self.assertIsNone(result["execution"])
+        self.assertIsNone(result["session"])
+
+    def test_unknown_identity_is_error_not_empty_success(self):
+        with self.assertRaises(TaskError):
+            invoke_status_chain("p1", "no-such-task", "no-such-command", service_factory=lambda: self.service)
+
+    def test_tool_wiring_resolves_via_request_id_convention(self):
+        captured = []
+        def fake(project_id, task_id, command_id, **_kwargs):
+            captured.append((project_id, task_id, command_id))
+            return {"project_id": project_id, "task_id": task_id, "command_id": command_id,
+                    "task": {}, "command": {}, "execution": None, "session": None, "handoff": None, "state": "queued"}
+        with patch("manager.mcp_adapter.invoke_status_chain", side_effect=fake):
+            result = structured(asyncio.run(tool("adm_invoke_status", {"project_id": "p1", "request_id": "req-chain"})))
+        self.assertEqual("queued", result["state"])
+        self.assertEqual(("p1", "dispatch-req-chain", "dispatch-req-chain"), captured[0])
 
 
 if __name__ == "__main__": unittest.main()
