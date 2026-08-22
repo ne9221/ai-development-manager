@@ -211,10 +211,19 @@ def global_invoke(store, service, lock_registry_factory, request: Dict[str, Any]
         payload["account_id"] = account_id
 
     try:
-        return handle_dispatch(store, service, lock_registry_factory, payload)
+        result = handle_dispatch(store, service, lock_registry_factory, payload)
     except DispatchIngressError:
         # Already bounded-safe (no credentials/tracebacks); re-raised
         # verbatim so the caller gets the actionable underlying admission
         # reason, matching manager.mcp_adapter.invoke_dispatch's existing
         # re-raise-verbatim convention.
         raise
+    # handle_dispatch()'s own return shape has no project_id field (it is
+    # only ever called with an already-canonical project_id, so it has no
+    # alias to resolve). This module is the one place in the chain that
+    # actually resolved project_reference -> project.project_id -- stamping
+    # it onto the result here means a caller that named a project by alias
+    # never has to independently re-resolve that alias just to keep working
+    # with the canonical id the rest of the record chain (Task/Command/
+    # Execution/Session/Handoff) is keyed by.
+    return {**result, "project_id": project.project_id}

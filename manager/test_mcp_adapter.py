@@ -402,6 +402,14 @@ def registry_entry(project_id="p1", **overrides):
     return entry
 
 
+class ResolvedProjectStub:
+    """Minimal stand-in for a manager.project_registry.ProjectMetadata --
+    adm_invoke_status only ever reads .project_id off whatever
+    resolve_project() returns."""
+    def __init__(self, project_id):
+        self.project_id = project_id
+
+
 def invoke_request(**changes):
     value = {"idempotency_key": "inv-1", "project": "p1", "title": "Fix parser", "goal": "Fix the parser regression"}
     value.update(changes)
@@ -437,6 +445,14 @@ class MCPGlobalInvokeToolTests(unittest.TestCase):
         self.assertTrue(result["accepted"])
         task = self.store.get("tasks", "p1", result["task_id"])
         self.assertEqual("p1", task["project_id"])
+        # The result itself carries the resolved canonical id -- a caller
+        # that named the project by alias never has to re-resolve it.
+        self.assertEqual("p1", result["project_id"])
+
+    def test_result_shape_has_the_minimum_required_submit_fields(self):
+        result = self.call(invoke_request(idempotency_key="inv-shape"))
+        for field in ("accepted", "project_id", "request_id", "task_id", "command_id", "status"):
+            self.assertIn(field, result)
 
     def test_unresolved_project_fails_closed(self):
         with self.assertRaises(GlobalInvokeError) as ctx:
@@ -457,6 +473,24 @@ class MCPGlobalInvokeToolTests(unittest.TestCase):
         command = self.store.get("commands", "p1", result["command_id"])
         self.assertEqual("codex", command["requested_provider"])
         self.assertEqual("codex", command["provider"])
+
+    def test_routing_truth_readable_back_through_invoke_status_chain(self):
+        """A caller must be able to prove requested_provider/
+        requested_account_id are null on the automatic path while still
+        seeing the actual routed provider/account and why -- never
+        fabricated at read time, always the values the Command record
+        already persisted at submit time."""
+        auto = self.call(invoke_request(idempotency_key="inv-route-auto"))
+        auto_status = invoke_status_chain("p1", auto["task_id"], auto["command_id"], service_factory=lambda: self.service)
+        self.assertIsNone(auto_status["command"]["requested_provider"])
+        self.assertIsNone(auto_status["command"]["requested_account_id"])
+        self.assertIn(auto_status["command"]["provider"], ("codex", "claude", "antigravity"))
+        self.assertIsInstance(auto_status["command"]["selection_reason"], list)
+
+        explicit = self.call(invoke_request(idempotency_key="inv-route-explicit", preferred_provider="codex"))
+        explicit_status = invoke_status_chain("p1", explicit["task_id"], explicit["command_id"], service_factory=lambda: self.service)
+        self.assertEqual("codex", explicit_status["command"]["requested_provider"])
+        self.assertEqual("codex", explicit_status["command"]["provider"])
 
     def test_same_idempotency_key_replay_does_not_double_dispatch(self):
         first = self.call(invoke_request(idempotency_key="inv-dup"))
@@ -517,6 +551,9 @@ class MCPInvokeStatusChainTests(unittest.TestCase):
         self.assertIsNone(result["execution"])
         self.assertIsNone(result["session"])
         self.assertIsNone(result["handoff"])
+        # No linkage id exists yet on a freshly-queued Command -- this is
+        # the legitimate "not created yet" case, never a broken linkage.
+        self.assertEqual({"execution_unreadable": False, "session_unreadable": False}, result["chain_integrity"])
 
     def test_full_chain_resolves_execution_session_and_handoff(self):
         session_record = {
@@ -561,13 +598,49 @@ class MCPInvokeStatusChainTests(unittest.TestCase):
         self.assertEqual("sess-1", result["session"]["session_id"])
         self.assertEqual("ho-1", result["handoff"]["handoff_id"])
 
-    def test_missing_execution_is_reported_as_none_not_fabricated(self):
+    def test_broken_execution_linkage_fails_closed_not_reported_as_absent(self):
+        """execution_id is non-empty but points at a record that does not
+        exist -- this must never be reported the same way as "no Execution
+        created yet"; chain_integrity must flag it and state must go to
+        blocked even though the Command itself may still read as queued."""
         command = self.store.get("commands", "p1", self.command_id)
         command["execution_id"] = "no-such-execution"
         self.store.put("commands", "p1", self.command_id, command)
         result = invoke_status_chain("p1", self.task_id, self.command_id, service_factory=lambda: self.service)
         self.assertIsNone(result["execution"])
         self.assertIsNone(result["session"])
+        self.assertTrue(result["chain_integrity"]["execution_unreadable"])
+        self.assertFalse(result["chain_integrity"]["session_unreadable"])
+        self.assertEqual("blocked", result["state"])
+
+    def test_broken_session_linkage_fails_closed_not_reported_as_absent(self):
+        """Execution resolves fine and names a session_id, but that
+        Session record does not exist -- same fail-closed requirement one
+        edge further down the chain."""
+        execution_record = {
+            "execution_id": "exec-2", "task_id": self.task_id, "project_id": "p1", "provider": "codex",
+            "mode": "code", "effort": "medium", "reserved_at": None, "started_at": "2026-08-23T00:00:00Z",
+            "completed_at": "2026-08-23T00:05:00Z", "finished_at": None, "session_id": "no-such-session",
+            "provider_session_id": "raw-2", "account_id": None, "elapsed_minutes": 5, "status": "completed",
+            "retry_count": 0, "retry_of_execution_id": None, "heartbeat_at": None, "progress_updated_at": None,
+            "hard_timeout_at": None, "last_provider_event": None, "provider_evidence": None, "stale_at": None,
+            "recovery_reason": None, "terminal_reason": None, "quota_evidence": None, "quota_before": {},
+            "quota_after": {}, "quota_delta": {}, "source_confidence": "official", "access": "read_only",
+            "lease_evidence": None, "cleanup_evidence": None, "repo_write_completion_evidence": None,
+            "notes": [], "task_snapshot": {"task_type": "general", "complexity": "medium", "needs_repo_edit": False},
+        }
+        self.store.put("executions", "p1", "exec-2", execution_record)
+        command = self.store.get("commands", "p1", self.command_id)
+        command["execution_id"] = "exec-2"
+        command["status"] = "completed"
+        self.store.put("commands", "p1", self.command_id, command)
+
+        result = invoke_status_chain("p1", self.task_id, self.command_id, service_factory=lambda: self.service)
+        self.assertIsNotNone(result["execution"])
+        self.assertIsNone(result["session"])
+        self.assertFalse(result["chain_integrity"]["execution_unreadable"])
+        self.assertTrue(result["chain_integrity"]["session_unreadable"])
+        self.assertEqual("blocked", result["state"])
 
     def test_unknown_identity_is_error_not_empty_success(self):
         with self.assertRaises(TaskError):
@@ -578,11 +651,32 @@ class MCPInvokeStatusChainTests(unittest.TestCase):
         def fake(project_id, task_id, command_id, **_kwargs):
             captured.append((project_id, task_id, command_id))
             return {"project_id": project_id, "task_id": task_id, "command_id": command_id,
-                    "task": {}, "command": {}, "execution": None, "session": None, "handoff": None, "state": "queued"}
-        with patch("manager.mcp_adapter.invoke_status_chain", side_effect=fake):
-            result = structured(asyncio.run(tool("adm_invoke_status", {"project_id": "p1", "request_id": "req-chain"})))
+                    "task": {}, "command": {}, "execution": None, "session": None, "handoff": None,
+                    "state": "queued", "chain_integrity": {"execution_unreadable": False, "session_unreadable": False}}
+        with patch("manager.mcp_adapter.invoke_status_chain", side_effect=fake), \
+             patch("manager.mcp_adapter.resolve_project", return_value=ResolvedProjectStub("p1")):
+            result = structured(asyncio.run(tool("adm_invoke_status", {"project": "p1", "request_id": "req-chain"})))
         self.assertEqual("queued", result["state"])
         self.assertEqual(("p1", "dispatch-req-chain", "dispatch-req-chain"), captured[0])
+
+    def test_tool_project_alias_resolves_to_canonical_id(self):
+        captured = []
+        def fake(project_id, task_id, command_id, **_kwargs):
+            captured.append(project_id)
+            return {"project_id": project_id, "task_id": task_id, "command_id": command_id,
+                    "task": {}, "command": {}, "execution": None, "session": None, "handoff": None,
+                    "state": "queued", "chain_integrity": {"execution_unreadable": False, "session_unreadable": False}}
+        with patch("manager.mcp_adapter.invoke_status_chain", side_effect=fake), \
+             patch("manager.mcp_adapter.resolve_project", return_value=ResolvedProjectStub("p1")) as resolver:
+            asyncio.run(tool("adm_invoke_status", {"project": "proj-one", "request_id": "req-chain"}))
+        resolver.assert_called_once()
+        self.assertEqual("proj-one", resolver.call_args.args[1])
+        self.assertEqual(["p1"], captured)
+
+    def test_unresolvable_project_reference_fails_closed(self):
+        with patch("manager.mcp_adapter.resolve_project", side_effect=GlobalInvokeError("project_not_found", "unknown")):
+            result = asyncio.run(tool("adm_invoke_status", {"project": "no-such-project", "request_id": "req-chain"}))
+        self.assertTrue(result.is_error)
 
 
 if __name__ == "__main__": unittest.main()

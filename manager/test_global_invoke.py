@@ -139,9 +139,16 @@ class GlobalInvokeBaselineAuthorityTests(unittest.TestCase):
     def test_existing_read_only_invoke_behavior_unaffected(self):
         result = self.call(request())
         self.assertEqual({"accepted": True, "request_id": "gi-1", "task_id": "dispatch-gi-1",
-                           "command_id": "dispatch-gi-1", "status": "queued"}, result)
+                           "command_id": "dispatch-gi-1", "status": "queued", "project_id": "p1"}, result)
         task = self.store.get("tasks", "p1", "dispatch-gi-1")
         self.assertTrue(task["read_only"])
+
+    def test_result_carries_resolved_canonical_project_id(self):
+        """A caller that named the project by alias must get the canonical
+        project_id back -- it must never have to independently re-resolve
+        the alias just to keep working with the rest of the record chain."""
+        result = self.call(request(project="proj-one", idempotency_key="gi-alias"))
+        self.assertEqual("p1", result["project_id"])
 
 
 if __name__ == "__main__":

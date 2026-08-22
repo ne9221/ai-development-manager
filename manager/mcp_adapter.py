@@ -1,12 +1,15 @@
 """MCP adapter and local stdio transport for the runtime bridge.
 
-Every tool here except adm_create_task is read-only. adm_create_task is
-the one narrow write surface: it only ever calls
-cloud.dispatch_ingress.handle_dispatch() (the same authenticated Direct
-Dispatch ingress the REST route uses) and never launches a provider or
-touches execution/launcher machinery directly -- see
-manager/trusted_ingress.py for the Safe Auto-Admission contract that
-governs what happens to the Task/Command it creates.
+Every tool here except adm_create_task and adm_invoke is read-only.
+adm_create_task and adm_invoke are the two write surfaces: adm_create_task
+only ever calls cloud.dispatch_ingress.handle_dispatch() directly (the
+same authenticated Direct Dispatch ingress the REST route uses) for its
+narrower disposable-read-only-task shape; adm_invoke calls
+manager.global_invoke.global_invoke(), which itself only ever reaches
+handle_dispatch() -- neither tool launches a provider or touches
+execution/launcher machinery directly. See manager/trusted_ingress.py for
+the Safe Auto-Admission contract that governs what happens to the
+Task/Command either tool creates.
 """
 
 import json
@@ -17,7 +20,8 @@ from mcp.types import ToolAnnotations
 
 from cloud.app import default_lock_registry_factory, default_service_factory, default_write_service_factory
 from cloud.dispatch_ingress import DispatchIngressError, MAX_GOAL_LENGTH, MAX_TITLE_LENGTH, handle_dispatch
-from manager.global_invoke import GlobalInvokeError, global_invoke
+from manager.global_invoke import GlobalInvokeError, global_invoke, resolve_project
+from manager.project_registry import get_global_registry
 from manager.runtime_bridge import redact, runtime_bridge
 from manager.runtime_quota_tool import runtime_quota_status
 from manager.tasks import DriveRecords, TaskError, validate
@@ -31,8 +35,8 @@ LOCAL_SERVICE_FACTORY = None
 LOCAL_WRITE_SERVICE_FACTORY = None
 TASK_STATUS_FIELDS = ("status", "current_progress", "next_action", "blocked_reason", "updated_at",
                       "completed_at", "assigned_provider", "account_id", "read_only")
-COMMAND_STATUS_FIELDS = ("status", "provider", "account_id", "execution_id", "claimed_at",
-                         "completed_at", "result", "recovery_reason")
+COMMAND_STATUS_FIELDS = ("status", "provider", "account_id", "requested_provider", "requested_account_id",
+                         "selection_reason", "execution_id", "claimed_at", "completed_at", "result", "recovery_reason")
 EXECUTION_STATUS_FIELDS = ("execution_id", "status", "session_id", "provider", "account_id",
                            "started_at", "completed_at", "terminal_reason", "recovery_reason")
 SESSION_STATUS_FIELDS = ("session_id", "status", "provider", "started_at", "updated_at", "summary")
@@ -124,6 +128,25 @@ def invoke_task_status(project_id, task_id, command_id, service_factory=None):
     return response
 
 
+def _resolve_linked_record(store, area, project_id, record_id, kind, fields):
+    """One edge of the chain: `record_id` is None only when there is
+    genuinely no linkage yet (e.g. no Command has claimed an execution_id
+    yet) -- that, and only that, is reported as (None, False). Once a
+    linkage id exists, its target must actually be readable and valid; a
+    fetch/validation failure at that point is a real inconsistency (a
+    dangling id, a corrupted record) and must never be reported the same
+    way as "not created yet" -- callers use the second element to tell the
+    two apart and must not silently swallow it."""
+    if not record_id:
+        return None, False
+    try:
+        record = store.get(area, project_id, record_id)
+        validate(kind, record)
+    except TaskError:
+        return None, True
+    return {key: record.get(key) for key in fields}, False
+
+
 def invoke_status_chain(project_id, task_id, command_id, service_factory=None):
     """Full Task -> Command -> Execution -> Session -> Handoff lookup
     chain for one invocation, plus a normalized `state` (queued/running/
@@ -133,10 +156,24 @@ def invoke_status_chain(project_id, task_id, command_id, service_factory=None):
     Execution.session_id -> Session, and the Task's own latest Handoff (a
     Task may have zero, one, or several Handoffs over its lifetime; only
     the most recent is returned here, matching manager.tasks.DriveRecords.
-    latest()'s existing single-record convention used elsewhere). Any
-    record that legitimately does not exist yet (no Command claimed, no
-    Execution reserved, no Session linked, no Handoff written) is reported
-    as None rather than raised -- only a genuine backend failure raises."""
+    latest()'s existing single-record convention used elsewhere).
+
+    A record with no linkage id yet (no Command claimed, no Execution
+    reserved, no Session linked) is null -- that is a legitimate, expected
+    "not created yet" state. A Handoff is likewise legitimately absent
+    before terminal completion; there is no handoff_id field on Task or
+    Command to prove a broken linkage against, so a missing Handoff is
+    always reported as null, never as inconsistent.
+
+    A record whose linkage id DOES exist but cannot be read or fails
+    schema validation is a different, more serious case -- a dangling or
+    corrupted reference -- and is never silently reported as the null
+    "not created yet" case. `chain_integrity` names exactly which edge (if
+    any) is broken, and `state` is forced to "blocked" whenever any edge
+    is broken, even if the Command/Task's own status would otherwise read
+    as further along (e.g. "completed") -- a caller must not be told a
+    chain finished successfully when part of it could not actually be
+    verified."""
     service_factory = service_factory or LOCAL_SERVICE_FACTORY or default_service_factory
     base = invoke_task_status(project_id, task_id, command_id, service_factory=service_factory)
     try:
@@ -146,24 +183,13 @@ def invoke_status_chain(project_id, task_id, command_id, service_factory=None):
         raise TaskError("runtime data is unavailable") from None
 
     command = base.get("command")
-    execution = None
-    session = None
     execution_id = command.get("execution_id") if command else None
-    if execution_id:
-        try:
-            record = store.get("executions", project_id, execution_id)
-            validate("execution", record)
-            execution = {key: record.get(key) for key in EXECUTION_STATUS_FIELDS}
-            session_id = record.get("session_id")
-            if session_id:
-                try:
-                    session_record = store.get("sessions", project_id, session_id)
-                    validate("session", session_record)
-                    session = {key: session_record.get(key) for key in SESSION_STATUS_FIELDS}
-                except TaskError:
-                    pass
-        except TaskError:
-            pass
+    execution, execution_broken = _resolve_linked_record(
+        store, "executions", project_id, execution_id, "execution", EXECUTION_STATUS_FIELDS)
+
+    session_id = execution.get("session_id") if execution else None
+    session, session_broken = _resolve_linked_record(
+        store, "sessions", project_id, session_id, "session", SESSION_STATUS_FIELDS)
 
     handoff = None
     try:
@@ -178,11 +204,18 @@ def invoke_status_chain(project_id, task_id, command_id, service_factory=None):
         state = TASK_STATE_MAP.get(base["task"].get("status"), "blocked")
     else:
         state = "blocked"
+    chain_broken = execution_broken or session_broken
+    if chain_broken:
+        state = "blocked"
 
     base["execution"] = execution
     base["session"] = session
     base["handoff"] = handoff
     base["state"] = state
+    base["chain_integrity"] = {
+        "execution_unreadable": execution_broken,
+        "session_unreadable": session_broken,
+    }
     return base
 
 
@@ -318,7 +351,11 @@ def adm_invoke(project: str, title: str, goal: str, idempotency_key: str,
     pipeline to pick up under its own rules, exactly like adm_create_task,
     but covering the full external contract (project alias, optional
     bounded repo-write, explicit provider/account override) rather than
-    adm_create_task's narrower disposable-read-only-task shape."""
+    adm_create_task's narrower disposable-read-only-task shape. The
+    result always includes the resolved canonical project_id (never just
+    the caller's raw alias) alongside request_id/task_id/command_id/
+    status -- pass that same project_id straight to adm_invoke_status, or
+    pass the original alias again; both resolve to the identical project."""
     request: dict[str, Any] = {
         "idempotency_key": bounded_text("idempotency_key", idempotency_key, MAX_REFERENCE_LENGTH, required=True),
         "project": bounded_text("project", project, MAX_REFERENCE_LENGTH, required=True),
@@ -338,18 +375,27 @@ def adm_invoke(project: str, title: str, goal: str, idempotency_key: str,
 
 
 @server.tool(annotations=READ_ONLY, structured_output=True)
-def adm_invoke_status(project_id: str, request_id: str | None = None, task_id: str | None = None,
+def adm_invoke_status(project: str, request_id: str | None = None, task_id: str | None = None,
                       command_id: str | None = None) -> dict[str, Any]:
     """Full Task->Command->Execution->Session->Handoff lookup chain for one
     invocation (by request_id -- the idempotency_key adm_invoke or
     adm_create_task was called with, resolved via the shared "dispatch-
     <request_id>" convention -- or by an explicit task_id/command_id), plus
-    a normalized `state` (queued/running/completed/failed/blocked). At
-    least one of request_id, task_id, or command_id is required. Any
-    record that legitimately does not exist yet is reported as null, never
-    fabricated; a genuinely unknown identity (neither Task nor Command
-    found) is an error, not an empty success."""
-    project_id = bounded_text("project_id", project_id, MAX_REFERENCE_LENGTH, required=True)
+    a normalized `state` (queued/running/completed/failed/blocked) and
+    `chain_integrity` (whether the Execution/Session edges, if linked at
+    all, actually resolved). `project` is resolved through the same
+    Global Project Registry resolver adm_invoke uses
+    (manager.global_invoke.resolve_project) -- pass either the original
+    project alias or the canonical project_id adm_invoke already
+    returned; both resolve to the identical project, so a caller never
+    has to maintain two different project-reference conventions across
+    submit and status. At least one of request_id, task_id, or command_id
+    is required. A record with no linkage id yet is reported as null; a
+    record whose linkage id exists but could not be read/validated is
+    never reported the same way -- see chain_integrity. A genuinely
+    unknown identity (neither Task nor Command found) is an error, not an
+    empty success."""
+    project_reference_value = bounded_text("project", project, MAX_REFERENCE_LENGTH, required=True)
     request_id = bounded_text("request_id", request_id, MAX_REFERENCE_LENGTH)
     task_id = bounded_text("task_id", task_id, MAX_REFERENCE_LENGTH)
     command_id = bounded_text("command_id", command_id, MAX_REFERENCE_LENGTH)
@@ -357,7 +403,8 @@ def adm_invoke_status(project_id: str, request_id: str | None = None, task_id: s
     resolved_command_id = command_id or (f"dispatch-{request_id}" if request_id else None)
     if not resolved_task_id and not resolved_command_id:
         raise TaskError("one of request_id, task_id, or command_id is required")
-    return invoke_status_chain(project_id, resolved_task_id, resolved_command_id)
+    resolved_project = resolve_project(get_global_registry(), project_reference_value)
+    return invoke_status_chain(resolved_project.project_id, resolved_task_id, resolved_command_id)
 
 
 server.tool(name="adm_runtime_quota_status", annotations=READ_ONLY, structured_output=True)(runtime_quota_status)
