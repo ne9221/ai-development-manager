@@ -44,6 +44,8 @@ def request_ok(request):
         raise TaskError("invalid dispatcher input: expected_minutes")
     if request.get("preferred_provider") and request.get("preferred_provider") == request.get("excluded_provider"):
         raise TaskError("preferred_provider cannot also be excluded")
+    if request.get("provider_is_assigned") is not None and request.get("provider_is_assigned") is not True:
+        raise TaskError("invalid dispatcher input: provider_is_assigned")
     for key in ("model", "fallback_model", "account_id"):
         if request.get(key) is not None and (not isinstance(request[key], str) or not request[key].strip() or len(request[key]) > 200):
             raise TaskError(f"invalid dispatcher input: {key}")
@@ -261,7 +263,10 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
     else:
         selected_quota = next(item for item in quota["providers"] if item["provider"] == selected)
 
-    if request.get("preferred_provider") == "claude" and not selected_quota["has_reliable_quota"]:
+    # Only a caller override is rejected here. A queued Command's assigned
+    # provider is separately quota-gated before launch and may have just
+    # reselected its actual Claude account using live local auth evidence.
+    if request.get("preferred_provider") == "claude" and not request.get("provider_is_assigned") and not selected_quota["has_reliable_quota"]:
         raise TaskError("preferred Claude provider has no reliable quota")
 
     # Scoped quota and forecast evidence for selected provider/account

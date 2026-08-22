@@ -160,7 +160,10 @@ def _dispatch_request(task, provider, account_id=None):
         "constraints": task.get("constraints", []), "acceptance_criteria": task.get("acceptance_criteria", []),
         "needs_repo_edit": task.get("needs_repo_edit", True),
         "needs_research": task.get("needs_research", False), "needs_browser": task.get("needs_browser", False),
-        "preferred_provider": provider, "account_id": account_id,
+        # The watcher is replaying a queued Command's provider authority, not
+        # accepting a fresh caller override. Its resolved Claude account is
+        # therefore never reclassified as caller-explicit at this stage.
+        "preferred_provider": provider, "provider_is_assigned": True, "account_id": account_id,
     }
 
 
