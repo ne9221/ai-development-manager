@@ -35,7 +35,7 @@ function New-RealHiddenWatcherVbs([string]$Repo) {
     # generated wrapper shape, not a hand-rolled stand-in.
     . (Join-Path $here "..\manager\AdmHiddenLaunch.ps1")
     $runner = Join-Path $Repo "manager\run_command_watcher.ps1"
-    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -RepositoryPath `"$Repo`""
+    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"python.exe`" -RepositoryPath `"$Repo`" -ManagerHome `"$AdmManagerHome`" -CodexBin `"codex.exe`" -CodexHome `"codex-home`" -PythonDeps `"python-deps`" -AllowlistPath `"allowlist`" -GcsBucket `"bucket`" -GcsObject `"object`" -IngressFolderId `"folder`" -IngressOwner `"owner`" -ClaudeAccountsConfig `"accounts.json`""
     $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $Repo -WrapperName "command-watcher" -PowerShellArguments $arguments
     return $action.Arguments.Trim('"')
 }
@@ -47,13 +47,16 @@ Describe "ADM watcher maintenance sentinel" {
         $global:admTestSupervisor = $supervisorName
         $global:admTestRepository = $repository
         $env:AI_MANAGER_HOME = $global:admTestHome
+        . (Join-Path $here "AdmCommon.ps1")
+        Mock New-ScheduledTaskAction { param($Execute, $Argument) [pscustomobject]@{ Execute = $Execute; Arguments = $Argument } }
+        $global:admTestWatcherVbs = New-RealHiddenWatcherVbs -Repo $global:admTestRepository
         $global:admTestWatcherState = "Ready"
         Mock Start-Sleep {}
         Mock Start-ScheduledTask {}
         Mock Start-Process {}
         Mock Get-ScheduledTask {
             param($TaskName)
-            if ($TaskName -eq $global:admTestWatcher) { return New-TestTask $global:admTestWatcher $global:admTestWatcherState $global:admTestRepository }
+            if ($TaskName -eq $global:admTestWatcher) { return New-TestWscriptTask $global:admTestWatcher $global:admTestWatcherVbs $global:admTestWatcherState }
             return New-TestTask $global:admTestSupervisor "Ready" $global:admTestRepository
         }
         Mock Get-ScheduledTaskInfo { [pscustomobject]@{ LastTaskResult = 0; LastRunTime = Get-Date } }
@@ -93,6 +96,7 @@ Describe "ADM watcher maintenance sentinel" {
 Describe "Watcher hidden-VBS (wscript.exe) identity guard" {
     BeforeEach {
         . (Join-Path $here "AdmCommon.ps1")
+        Mock New-ScheduledTaskAction { param($Execute, $Argument) [pscustomobject]@{ Execute = $Execute; Arguments = $Argument } }
         $script:testRoot = Join-Path $TestDrive "wscript-identity"
         New-Item -ItemType Directory -Force -Path $script:testRoot | Out-Null
         $script:repoA = Join-Path $script:testRoot "repo-a"
@@ -129,6 +133,26 @@ Describe "Watcher hidden-VBS (wscript.exe) identity guard" {
         Test-AdmWatcherTaskIdentity -Task $task -RepositoryPath $script:repoA | Should Be $false
     }
 
+    It "rejects an otherwise valid wrapper with an appended hidden command" {
+        Add-Content -LiteralPath $script:realVbsPath -Value 'shell.Run "cmd.exe /c calc.exe", 0, False' -Encoding ASCII
+        $task = New-TestWscriptTask $watcherName $script:realVbsPath
+        Test-AdmWatcherTaskIdentity -Task $task -RepositoryPath $script:repoA | Should Be $false
+    }
+
+    It "rejects a wrapper whose ManagerHome is not this desktop's production binding" {
+        $wrongHome = Join-Path $script:testRoot "wrong-manager-home"
+        $wrongVbs = New-RealHiddenWatcherVbs -Repo $script:repoA
+        (Get-Content -LiteralPath $wrongVbs -Raw).Replace($AdmManagerHome, $wrongHome) | Set-Content -LiteralPath $wrongVbs -Encoding ASCII
+        $task = New-TestWscriptTask $watcherName $wrongVbs
+        Test-AdmWatcherTaskIdentity -Task $task -RepositoryPath $script:repoA | Should Be $false
+    }
+
+    It "rejects a wrapper that prepends a PowerShell command before the correct binding" {
+        (Get-Content -LiteralPath $script:realVbsPath -Raw).Replace('powershell.exe -NoProfile', 'powershell.exe -Command calc.exe -NoProfile') | Set-Content -LiteralPath $script:realVbsPath -Encoding ASCII
+        $task = New-TestWscriptTask $watcherName $script:realVbsPath
+        Test-AdmWatcherTaskIdentity -Task $task -RepositoryPath $script:repoA | Should Be $false
+    }
+
     It "rejects a stale scratch checkout's own generated VBS as if it were production" {
         $staleRepo = Join-Path $script:testRoot "stale-scratch-checkout"
         New-Item -ItemType Directory -Force -Path (Join-Path $staleRepo "manager") | Out-Null
@@ -158,9 +182,9 @@ Describe "Watcher hidden-VBS (wscript.exe) identity guard" {
         Test-AdmWatcherTaskIdentity -Task $task -RepositoryPath $script:repoA | Should Be $false
     }
 
-    It "still accepts a fully-proven legacy powershell.exe production task" {
+    It "rejects a legacy powershell.exe task because it can flash a console" {
         $task = New-TestTask $watcherName "Ready" $script:repoA
-        Test-AdmWatcherTaskIdentity -Task $task -RepositoryPath $script:repoA | Should Be $true
+        Test-AdmWatcherTaskIdentity -Task $task -RepositoryPath $script:repoA | Should Be $false
     }
 
     It "rejects an unrecognized action executable" {
