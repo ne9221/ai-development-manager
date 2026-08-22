@@ -543,6 +543,73 @@ class PreflightSnapshotProvenanceTest(unittest.TestCase):
         report = evaluate(evidence)
         self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.PASS)
 
+    def test_wrong_schema_version_fails(self):
+        evidence = complete_evidence()
+        evidence["canonical_checkout_before"]["schema_version"] = "0.9.0"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+
+class PreflightSnapshotChronologyTest(unittest.TestCase):
+    """R5.1: invariant O must prove the preflight snapshot was actually
+    captured BEFORE dispatch -- snapshot.observed_at <= dispatch_request.
+    created_at -- not merely that it carries the right project_id/
+    request_id."""
+
+    def test_snapshot_observed_after_dispatch_created_fails(self):
+        evidence = complete_evidence()
+        evidence["dispatch_request"]["created_at"] = "2026-08-22T23:00:00Z"
+        evidence["canonical_checkout_before"]["observed_at"] = "2026-08-23T00:00:00Z"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.FAIL)
+        self.assertEqual(report.overall, v.FAIL)
+
+    def test_snapshot_observed_before_dispatch_created_passes(self):
+        evidence = complete_evidence()
+        evidence["dispatch_request"]["created_at"] = "2026-08-23T00:05:00Z"
+        evidence["canonical_checkout_before"]["observed_at"] = "2026-08-23T00:00:00Z"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.PASS)
+        self.assertEqual(report.overall, v.PASS)
+
+    def test_snapshot_observed_exactly_equal_to_dispatch_created_passes(self):
+        evidence = complete_evidence()
+        evidence["dispatch_request"]["created_at"] = evidence["canonical_checkout_before"]["observed_at"]
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.PASS)
+
+    def test_missing_dispatch_request_created_at_is_unknown(self):
+        evidence = complete_evidence()
+        del evidence["dispatch_request"]["created_at"]
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_unparseable_dispatch_request_created_at_is_unknown(self):
+        evidence = complete_evidence()
+        evidence["dispatch_request"]["created_at"] = "not-a-timestamp"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_missing_dispatch_request_entirely_is_unknown(self):
+        evidence = complete_evidence()
+        evidence["dispatch_request"] = None
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.UNKNOWN)
+        self.assertNotEqual(report.overall, v.PASS)
+
+    def test_dispatch_request_created_at_with_microseconds_still_compares(self):
+        """manager.tasks.now_iso() stamps dispatch_request.created_at with
+        microsecond precision, unlike capture_preflight_snapshot()'s whole-
+        second observed_at -- both formats must compare correctly."""
+        evidence = complete_evidence()
+        evidence["dispatch_request"]["created_at"] = "2026-08-23T00:00:00.500123Z"
+        evidence["canonical_checkout_before"]["observed_at"] = "2026-08-23T00:00:00Z"
+        report = evaluate(evidence)
+        self.assertEqual(report.as_dict()["invariants"]["O"]["verdict"], v.PASS)
+
 
 class CapturePreflightSnapshotHelperTest(unittest.TestCase):
     """R5: capture_preflight_snapshot()/write_preflight_snapshot()/

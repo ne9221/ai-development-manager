@@ -110,10 +110,10 @@ class CorrectResolutionTests(unittest.TestCase):
         self.assertEqual([("acme", "repo-a", "develop", None)], fetch.calls)
 
     def test_pinned_commit_strategy_overrides_default_branch(self):
-        registry = ProjectRegistry(projects=[registry_entry(default_branch="main", strategy="pinned_commit", pinned_ref="release/2.0")])
-        fetch = fake_fetch(shas={("acme", "repo-a", "release/2.0"): VALID_SHA_A})
+        registry = ProjectRegistry(projects=[registry_entry(default_branch="main", strategy="pinned_commit", pinned_ref=VALID_SHA_A)])
+        fetch = fake_fetch(shas={("acme", "repo-a", VALID_SHA_A): VALID_SHA_A})
         result = resolve_remote_baseline("proj-a", registry=registry, github_fetch=fetch)
-        self.assertEqual("release/2.0", result["canonical_branch"])
+        self.assertEqual(VALID_SHA_A, result["canonical_branch"])
 
     def test_alias_resolves_to_same_project(self):
         registry = ProjectRegistry(projects=[registry_entry()])
@@ -384,11 +384,66 @@ class BaselineStrategyContractTests(unittest.TestCase):
         self.assertEqual(VALID_SHA_A, result["baseline_sha"])
 
     def test_pinned_commit_with_pinned_ref_is_supported(self):
-        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_commit", pinned_ref="release/2.0")])
-        fetch = fake_fetch(shas={("acme", "repo-a", "release/2.0"): VALID_SHA_A})
+        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_commit", pinned_ref=VALID_SHA_A)])
+        fetch = fake_fetch(shas={("acme", "repo-a", VALID_SHA_A): VALID_SHA_A})
         result = resolve_remote_baseline("proj-a", registry=registry, github_fetch=fetch)
-        self.assertEqual("release/2.0", result["canonical_branch"])
+        self.assertEqual(VALID_SHA_A, result["canonical_branch"])
         self.assertEqual(VALID_SHA_A, result["baseline_sha"])
+
+    def test_pinned_commit_with_full_sha256_pinned_ref_is_supported(self):
+        sha256 = "c" * 64
+        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_commit", pinned_ref=sha256)])
+        fetch = fake_fetch(shas={("acme", "repo-a", sha256): VALID_SHA_A})
+        result = resolve_remote_baseline("proj-a", registry=registry, github_fetch=fetch)
+        self.assertEqual(sha256, result["canonical_branch"])
+
+    def test_pinned_commit_with_branch_name_is_rejected(self):
+        """Immutability: pinned_commit must pin one exact, durable commit --
+        never a mutable branch name."""
+        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_commit", pinned_ref="release/2.0")])
+        with self.assertRaises(RemoteBaselineResolutionError) as ctx:
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fake_fetch())
+        self.assertEqual("pinned_ref_not_immutable", ctx.exception.code)
+
+    def test_pinned_commit_with_tag_name_is_rejected(self):
+        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_commit", pinned_ref="v2.0.0")])
+        with self.assertRaises(RemoteBaselineResolutionError) as ctx:
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fake_fetch())
+        self.assertEqual("pinned_ref_not_immutable", ctx.exception.code)
+
+    def test_pinned_commit_with_short_sha_is_rejected(self):
+        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_commit", pinned_ref=VALID_SHA_A[:7])])
+        with self.assertRaises(RemoteBaselineResolutionError) as ctx:
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fake_fetch())
+        self.assertEqual("pinned_ref_not_immutable", ctx.exception.code)
+
+    def test_pinned_commit_with_arbitrary_string_is_rejected(self):
+        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_commit", pinned_ref="HEAD~3")])
+        with self.assertRaises(RemoteBaselineResolutionError) as ctx:
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fake_fetch())
+        self.assertEqual("pinned_ref_not_immutable", ctx.exception.code)
+
+    def test_pinned_commit_with_non_hex_full_length_string_is_rejected(self):
+        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_commit", pinned_ref="z" * 40)])
+        with self.assertRaises(RemoteBaselineResolutionError) as ctx:
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fake_fetch())
+        self.assertEqual("pinned_ref_not_immutable", ctx.exception.code)
+
+    def test_pinned_commit_immutability_check_never_calls_github_fetch(self):
+        registry = ProjectRegistry(projects=[registry_entry(strategy="pinned_commit", pinned_ref="release/2.0")])
+        fetch = fake_fetch()
+        with self.assertRaises(RemoteBaselineResolutionError):
+            resolve_remote_baseline("proj-a", registry=registry, github_fetch=fetch)
+        self.assertEqual([], fetch.calls)
+
+    def test_origin_default_behavior_unchanged_by_immutability_check(self):
+        """The pinned_commit immutability check must never apply to
+        origin_default -- a plain branch name must still resolve fine."""
+        registry = ProjectRegistry(projects=[registry_entry(strategy="origin_default", default_branch="develop")])
+        fetch = fake_fetch(shas={("acme", "repo-a", "develop"): VALID_SHA_B})
+        result = resolve_remote_baseline("proj-a", registry=registry, github_fetch=fetch)
+        self.assertEqual("develop", result["canonical_branch"])
+        self.assertEqual(VALID_SHA_B, result["baseline_sha"])
 
     def test_strategy_named_pinned_ref_is_rejected(self):
         """'pinned_ref' is a FIELD, not a strategy -- a registry entry that

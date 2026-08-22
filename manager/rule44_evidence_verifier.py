@@ -744,6 +744,21 @@ def _valid_observed_at(value: Any) -> bool:
     return True
 
 
+def _parse_iso_z(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 UTC timestamp ending in 'Z' -- tolerant of the
+    fractional-seconds precision difference between capture_preflight_
+    snapshot()'s observed_at (whole seconds) and manager.tasks.now_iso()'s
+    dispatch_request.created_at (microseconds). Returns None (never
+    raises) for anything that doesn't parse, so callers can fail closed
+    rather than trust a malformed timestamp."""
+    if not isinstance(value, str) or not value or not value.endswith("Z"):
+        return None
+    try:
+        return datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return None
+
+
 def _evaluate_o(evidence: Dict[str, Any], expected_project_id: str, expected_request_id: str) -> InvariantResult:
     task = evidence.get("task")
     execution = evidence.get("execution")
@@ -780,8 +795,29 @@ def _evaluate_o(evidence: Dict[str, Any], expected_project_id: str, expected_req
         return _result("O", UNKNOWN, "no trustworthy pre-E2E canonical-checkout snapshot is bound to this dispatch (missing, or missing project_id/request_id provenance); canonical-checkout integrity cannot be proven after the fact")
     if before.get("project_id") != expected_project_id or before.get("request_id") != expected_request_id:
         return _result("O", FAIL, f"pre-E2E snapshot is bound to project_id={before.get('project_id')!r}/request_id={before.get('request_id')!r}, not this verification's project_id={expected_project_id!r}/request_id={expected_request_id!r} -- mismatched or stale evidence")
+    if before.get("schema_version") != PREFLIGHT_SNAPSHOT_SCHEMA_VERSION:
+        return _result("O", FAIL, f"pre-E2E snapshot schema_version {before.get('schema_version')!r} != expected {PREFLIGHT_SNAPSHOT_SCHEMA_VERSION!r}")
     if not _valid_observed_at(before.get("observed_at")):
         return _result("O", UNKNOWN, "pre-E2E snapshot has no valid observed_at timestamp; its provenance cannot be trusted")
+
+    # R5.1 correction: prove the snapshot was actually captured BEFORE
+    # dispatch, not merely that it carries the right project_id/request_id
+    # -- a snapshot bound to the right identity but taken too late (e.g.
+    # after the E2E already started mutating the isolated worktree, or
+    # after a race) would otherwise slip through. dispatch_request.
+    # created_at (manager.dispatch_requests, stamped by manager.tasks.
+    # now_iso() at claim time) is the authoritative "dispatch happened at"
+    # timestamp; the preflight snapshot's own observed_at must be no later
+    # than it.
+    dispatch_request = evidence.get("dispatch_request")
+    created_at = dispatch_request.get("created_at") if isinstance(dispatch_request, dict) else None
+    created_dt = _parse_iso_z(created_at)
+    if created_dt is None:
+        return _result("O", UNKNOWN, f"dispatch_request.created_at ({created_at!r}) is missing or unparseable; pre-E2E snapshot chronology cannot be proven")
+    observed_dt = _parse_iso_z(before.get("observed_at"))
+    if observed_dt is None or observed_dt > created_dt:
+        return _result("O", FAIL, f"pre-E2E snapshot observed_at ({before.get('observed_at')!r}) is not <= dispatch_request.created_at ({created_at!r}); the snapshot was not proven to precede dispatch")
+
     if not before.get("available"):
         reason = before.get("reason")
         return _result("O", UNKNOWN, f"pre-E2E snapshot recorded the canonical checkout as unavailable{': ' + reason if reason else ''}; canonical-checkout integrity cannot be proven after the fact")

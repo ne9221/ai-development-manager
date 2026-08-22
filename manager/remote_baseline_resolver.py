@@ -176,6 +176,20 @@ def resolve_remote_baseline(
                 "pinned_ref_missing",
                 f"project {project.project_id!r} declares strategy 'pinned_commit' but has no non-empty pinned_ref",
             )
+        # Immutability: "pinned_commit" means pinned to one exact, durable
+        # commit identity -- never a mutable ref (a branch or tag name can
+        # move; a short SHA is ambiguous and can even stop resolving as
+        # more objects are packed). pinned_ref must match the same
+        # BASELINE_HEAD_PATTERN contract every other baseline_head in this
+        # codebase is already held to (schema/task.schema.json), i.e. a
+        # full 40-hex (SHA-1) or 64-hex (SHA-256) commit id.
+        if not BASELINE_HEAD_PATTERN.match(pinned_ref.strip()):
+            raise RemoteBaselineResolutionError(
+                "pinned_ref_not_immutable",
+                f"project {project.project_id!r} declares strategy 'pinned_commit' with pinned_ref {pinned_ref!r}, "
+                "which is not a full commit SHA (40 or 64 hex characters) -- branch names, tag names, short SHAs, "
+                "and other mutable/ambiguous refs are not accepted as an immutable pin",
+            )
         branch = pinned_ref
     else:
         raise RemoteBaselineResolutionError(
