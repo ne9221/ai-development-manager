@@ -63,6 +63,96 @@ function Confirm-AdmTaskEnabled {
     }
 }
 
+function Test-AdmWatcherPowerShellCommandLine {
+    # Shared identity check on the actual PowerShell command line, regardless
+    # of whether it arrived directly as a Scheduled Task action's Arguments
+    # (legacy powershell.exe shape) or embedded inside a generated hidden VBS
+    # wrapper's WshShell.Run call (current production shape). Requires the
+    # exact runner script AND the exact -RepositoryPath value to appear as
+    # single-quoted or double-quoted whole tokens -- a substring match alone
+    # would let a wrong/stale repository path that merely contains the real
+    # one as a prefix/suffix slip through.
+    param(
+        [Parameter(Mandatory = $true)][string]$CommandLine,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$Runner
+    )
+    $singleQuote = [char]39
+    $doubleQuote = [char]34
+    $runnerExact = $CommandLine.Contains($singleQuote + $Runner + $singleQuote) -or $CommandLine.Contains($doubleQuote + $Runner + $doubleQuote)
+    $repositoryFlag = "-RepositoryPath "
+    $repositoryExact = $CommandLine.Contains($repositoryFlag + $singleQuote + $Repository + $singleQuote) -or $CommandLine.Contains($repositoryFlag + $doubleQuote + $Repository + $doubleQuote)
+    return $runnerExact -and $repositoryExact
+}
+
+function Test-AdmWatcherLegacyPowerShellIdentity {
+    # Legacy shape: Scheduled Task Action directly registers powershell.exe.
+    # Kept only for backward compatibility with checkouts/tasks installed
+    # before the hidden-VBS launcher existed -- it is held to exactly the
+    # same identity bar as the current shape, never a looser one.
+    param(
+        [Parameter(Mandatory = $true)]$Action,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$Runner
+    )
+    $arguments = [string]$Action.Arguments
+    return Test-AdmWatcherPowerShellCommandLine -CommandLine $arguments -Repository $Repository -Runner $Runner
+}
+
+function Test-AdmWatcherHiddenVbsIdentity {
+    # Current production shape: Scheduled Task Action registers wscript.exe
+    # against a generated VBS wrapper (see manager\AdmHiddenLaunch.ps1). Must
+    # verify every link in that chain, not just that wscript.exe was used:
+    # the exact expected VBS path under this repository, that the VBS file
+    # actually exists there, that its content is the known-good generated
+    # shape (not an arbitrary/hand-edited .vbs), and that the PowerShell
+    # command line it wraps binds to the expected runner + repository, the
+    # same as the legacy check.
+    param(
+        [Parameter(Mandatory = $true)]$Action,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$Runner
+    )
+    $doubleQuote = [char]34
+    $rawArguments = ([string]$Action.Arguments).Trim()
+
+    # Task Argument must be exactly one double-quoted absolute path -- no
+    # extra text before/after/inside, no unquoted or single-quoted form.
+    # This is what New-AdmHiddenScheduledTaskAction actually emits
+    # (`"$vbsPath"`); anything else is malformed.
+    if ($rawArguments.Length -lt 2 -or $rawArguments[0] -ne $doubleQuote -or $rawArguments[-1] -ne $doubleQuote) { return $false }
+    $vbsPath = $rawArguments.Substring(1, $rawArguments.Length - 2)
+    if ($vbsPath.Length -eq 0 -or $vbsPath.Contains($doubleQuote)) { return $false }
+
+    $expectedVbsPath = Join-Path $Repository "manager\generated\command-watcher.vbs"
+    $resolvedVbsPath = [IO.Path]::GetFullPath($vbsPath)
+    if ($resolvedVbsPath -ne [IO.Path]::GetFullPath($expectedVbsPath)) { return $false }
+    if (-not (Test-Path -LiteralPath $resolvedVbsPath -PathType Leaf)) { return $false }
+
+    $content = Get-Content -LiteralPath $resolvedVbsPath -Raw -ErrorAction SilentlyContinue
+    if (-not $content) { return $false }
+
+    # Must be the exact generated shape: a single WshShell.Run("powershell.exe
+    # <args>", 0, True) call whose exit code is propagated. Anything else --
+    # extra commands, a different executable, a non-zero/non-waiting Run --
+    # is not the wrapper this repository generates and must be rejected.
+    if ($content -notmatch 'CreateObject\(\s*"WScript\.Shell"\s*\)') { return $false }
+    if ($content -notmatch 'shell\.Run\("powershell\.exe (.*)",\s*0,\s*True\)') { return $false }
+    # Capture the command line before any further -match/-notmatch calls --
+    # each one overwrites the shared $Matches automatic variable, even on a
+    # non-capturing pattern, which would otherwise silently null this out.
+    $escapedCommandLine = $Matches[1]
+    if ($content -notmatch 'WScript\.Quit exitCode') { return $false }
+
+    # Undo the VBS string-literal escaping New-AdmHiddenScheduledTaskAction
+    # applies (" -> "") to recover the real PowerShell argument string.
+    $commandLine = $escapedCommandLine.Replace(([string]$doubleQuote) + $doubleQuote, [string]$doubleQuote)
+    if ($commandLine -notmatch '-WindowStyle\s+Hidden') { return $false }
+    if ($commandLine -notmatch ('-File\s+["' + [char]39 + ']' + [regex]::Escape($Runner) + '["' + [char]39 + ']')) { return $false }
+
+    return Test-AdmWatcherPowerShellCommandLine -CommandLine $commandLine -Repository $Repository -Runner $Runner
+}
+
 function Test-AdmWatcherTaskIdentity {
     param(
         [Parameter(Mandatory = $true)]$Task,
@@ -70,16 +160,17 @@ function Test-AdmWatcherTaskIdentity {
     )
     if ($Task.TaskName -ne $AdmWatcherTask -or $Task.TaskPath -ne "\" -or @($Task.Actions).Count -ne 1) { return $false }
     $action = @($Task.Actions)[0]
-    if ([IO.Path]::GetFileName([string]$action.Execute) -ne "powershell.exe") { return $false }
     $repository = [IO.Path]::GetFullPath($RepositoryPath).TrimEnd('\')
     $runner = Join-Path $repository "manager\run_command_watcher.ps1"
-    $arguments = [string]$action.Arguments
-    $singleQuote = [char]39
-    $doubleQuote = [char]34
-    $runnerExact = $arguments.Contains($singleQuote + $runner + $singleQuote) -or $arguments.Contains($doubleQuote + $runner + $doubleQuote)
-    $repositoryFlag = "-RepositoryPath "
-    $repositoryExact = $arguments.Contains($repositoryFlag + $singleQuote + $repository + $singleQuote) -or $arguments.Contains($repositoryFlag + $doubleQuote + $repository + $doubleQuote)
-    return $runnerExact -and $repositoryExact
+    $execName = [IO.Path]::GetFileName([string]$action.Execute)
+
+    if ($execName -eq "wscript.exe") {
+        return Test-AdmWatcherHiddenVbsIdentity -Action $action -Repository $repository -Runner $runner
+    }
+    if ($execName -eq "powershell.exe") {
+        return Test-AdmWatcherLegacyPowerShellIdentity -Action $action -Repository $repository -Runner $runner
+    }
+    return $false
 }
 
 function Confirm-AdmWatcherTaskIdentity {
