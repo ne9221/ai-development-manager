@@ -121,6 +121,34 @@
             }
           }
         },
+        "validation_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "required_checks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "command"],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "command": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         "working_directory_policy": {
           "type": "object",
           "additionalProperties": false,

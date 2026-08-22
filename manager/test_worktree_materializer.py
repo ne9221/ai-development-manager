@@ -71,6 +71,7 @@ def project():
         repo={"canonical_url": "https://github.com/example/project-a"},
         default_branch="main", baseline_resolution_policy={"strategy": "origin_default"},
         common_governance={"reference": "AI-DEVELOPMENT-RULES.md"}, project_rules={"reference": "PROJECT-RULES.md"},
+        validation_policy={},
         working_directory_policy={"relative_path": "proj-a"}, isolation_policy={"mode": "worktree_per_task"},
         provider_restrictions={}, protected_paths=(), default_write_boundaries=("*",),
         pointer_rules={}, status="enabled", resolution_status="verified",

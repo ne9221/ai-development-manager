@@ -15,6 +15,7 @@ from manager.project_registry import (
     ProjectRegistry,
     ProjectRegistryError,
     UnresolvedProjectError,
+    ValidationPolicyMissingError,
     get_global_registry,
     load_project_registry,
     normalize_identifier,
@@ -189,6 +190,106 @@ def test_missing_repo_metadata_fail_closed_for_write_dispatch():
     with pytest.raises(GovernanceRuleMissingError) as exc_info:
         registry.resolve_for_dispatch("no-repo-proj", write=True)
     assert "repository metadata" in str(exc_info.value).lower()
+
+
+# --- Global Hands-off D2 P0-B: repo-write validation policy authority ----
+
+def _validation_policy_entry(**overrides):
+    entry = {
+        "project_id": "vp-proj",
+        "display_name": "Validation Policy Project",
+        "aliases": ["vp"],
+        "repo": {"canonical_url": "https://github.com/example/vp-proj.git"},
+        "default_branch": "main",
+        "project_rules": {"reference": "PROJECT-RULES.md"},
+        "common_governance": {"reference": "governance-rules.json"},
+        "status": "enabled",
+        "resolution_status": "verified",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_registry_validation_policy_correctly_enforced():
+    """A project's own registered validation_policy is what
+    required_validation_checks() returns -- real authority, not a guess."""
+    sample_data = {
+        "schema_version": "1.0.0", "updated_at": "2026-08-22T00:00:00Z",
+        "projects": [_validation_policy_entry(validation_policy={
+            "required_checks": [
+                {"id": "unit", "command": ["python", "-m", "unittest", "-q"]},
+                {"id": "lint", "command": ["python", "-m", "flake8"]},
+            ]
+        })],
+    }
+    registry = ProjectRegistry.from_dict(sample_data)
+    checks = registry.get_project("vp-proj").required_validation_checks()
+    assert checks == [
+        {"id": "unit", "command": ["python", "-m", "unittest", "-q"]},
+        {"id": "lint", "command": ["python", "-m", "flake8"]},
+    ]
+
+
+def test_project_rules_requirement_correctly_enforced_for_validation_policy():
+    """A project missing its PROJECT-RULES reference cannot resolve a
+    validation policy either -- required_validation_checks() must enforce
+    the same governance preconditions as write dispatch, never skip them."""
+    sample_data = {
+        "schema_version": "1.0.0", "updated_at": "2026-08-22T00:00:00Z",
+        "projects": [_validation_policy_entry(
+            project_rules={},
+            validation_policy={"required_checks": [{"id": "unit", "command": ["true"]}]},
+        )],
+    }
+    registry = ProjectRegistry.from_dict(sample_data)
+    with pytest.raises(GovernanceRuleMissingError):
+        registry.get_project("vp-proj").required_validation_checks()
+
+
+def test_caller_cannot_weaken_validation_policy_by_supplying_a_different_command():
+    """required_validation_checks() takes no caller-supplied override
+    parameter of any kind -- a provider/caller has no channel to weaken or
+    replace the project's own registered checks."""
+    import inspect
+    from manager.project_registry import ProjectMetadata
+    signature = inspect.signature(ProjectMetadata.required_validation_checks)
+    assert list(signature.parameters) == ["self"]
+
+
+def test_absent_authoritative_validation_policy_fails_closed():
+    """A project with no validation_policy configured at all must fail
+    closed -- never fall back to a generic/default command."""
+    sample_data = {
+        "schema_version": "1.0.0", "updated_at": "2026-08-22T00:00:00Z",
+        "projects": [_validation_policy_entry()],
+    }
+    registry = ProjectRegistry.from_dict(sample_data)
+    with pytest.raises(ValidationPolicyMissingError) as exc_info:
+        registry.get_project("vp-proj").required_validation_checks()
+    assert issubclass(ValidationPolicyMissingError, ProjectRegistryError)
+    assert "vp-proj" in str(exc_info.value)
+
+
+def test_malformed_validation_policy_entry_fails_closed():
+    sample_data = {
+        "schema_version": "1.0.0", "updated_at": "2026-08-22T00:00:00Z",
+        "projects": [_validation_policy_entry(validation_policy={
+            "required_checks": [{"id": "unit"}]  # missing 'command'
+        })],
+    }
+    registry = ProjectRegistry.from_dict(sample_data)
+    with pytest.raises(ValidationPolicyMissingError):
+        registry.get_project("vp-proj").required_validation_checks()
+
+
+def test_ai_development_manager_has_a_real_registered_validation_policy():
+    """The actual project this D2 P0 fix ships for must itself resolve a
+    real, non-empty validation policy -- proving the registry authority
+    path is genuinely wired end-to-end, not just unit-tested in isolation."""
+    registry = get_global_registry(reload=True)
+    checks = registry.get_project("ai-development-manager").required_validation_checks()
+    assert checks
+    assert {c["id"] for c in checks} == {"unittest_discover", "pytest_manager", "diff_whitespace_check"}
 
 
 def test_disabled_project_fail_closed():

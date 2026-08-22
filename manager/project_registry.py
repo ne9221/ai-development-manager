@@ -56,6 +56,13 @@ class GovernanceRuleMissingError(ProjectRegistryError):
     """Raised when required PROJECT-RULES or repository metadata are missing for write dispatch."""
 
 
+class ValidationPolicyMissingError(ProjectRegistryError):
+    """Raised when a project has no authoritative, well-formed validation
+    policy configured (Global Hands-off D2 P0-B) -- a repo-write completion
+    can never fall back to a provider-chosen or generic default command in
+    this case; an unknown validation policy must fail closed, never guess."""
+
+
 def normalize_identifier(ident: str) -> str:
     """Normalize project identifier or alias for case-insensitive lookup."""
     if not isinstance(ident, str):
@@ -121,6 +128,7 @@ class ProjectMetadata:
     baseline_resolution_policy: Dict[str, Any]
     common_governance: Dict[str, Any]
     project_rules: Dict[str, Any]
+    validation_policy: Dict[str, Any]
     working_directory_policy: Dict[str, Any]
     isolation_policy: Dict[str, Any]
     provider_restrictions: Dict[str, Any]
@@ -194,6 +202,59 @@ class ProjectMetadata:
                 f"project {self.project_id!r} is missing common governance reference; write dispatch rejected"
             )
 
+    def required_validation_checks(self) -> List[Dict[str, Any]]:
+        """Resolve this project's authoritative repo-write validation policy
+        (Global Hands-off D2 P0-B) -- the list of required checks a bounded
+        repo-write execution must pass before it can ever be committed and
+        pushed as "completed". This is read only from this project's own
+        registered `validation_policy.required_checks`, which in turn can
+        only come from the canonical project registry file (backed by
+        PROJECT-RULES/governance references already enforced by
+        `validate_write_dispatch_preconditions()`, called here too) -- a
+        provider's own claims about what it ran are never this policy's
+        source, and a missing or malformed policy fails closed rather than
+        falling back to any generic/default command.
+        """
+        self.validate_write_dispatch_preconditions()
+
+        if not isinstance(self.validation_policy, dict) or not self.validation_policy:
+            raise ValidationPolicyMissingError(
+                f"project {self.project_id!r} has no validation_policy configured in the project registry; "
+                "refusing to guess a repo-write validation command"
+            )
+        raw_checks = self.validation_policy.get("required_checks")
+        if not isinstance(raw_checks, list) or not raw_checks:
+            raise ValidationPolicyMissingError(
+                f"project {self.project_id!r} validation_policy has no non-empty 'required_checks' list; "
+                "refusing to guess a repo-write validation command"
+            )
+
+        resolved: List[Dict[str, Any]] = []
+        seen_ids = set()
+        for entry in raw_checks:
+            if not isinstance(entry, dict):
+                raise ValidationPolicyMissingError(
+                    f"project {self.project_id!r} validation_policy required_checks entry {entry!r} is not an object"
+                )
+            check_id = entry.get("id")
+            command = entry.get("command")
+            if not isinstance(check_id, str) or not check_id:
+                raise ValidationPolicyMissingError(
+                    f"project {self.project_id!r} validation_policy required_checks entry {entry!r} is missing a non-empty 'id'"
+                )
+            if check_id in seen_ids:
+                raise ValidationPolicyMissingError(
+                    f"project {self.project_id!r} validation_policy required_checks has a duplicate id {check_id!r}"
+                )
+            if not isinstance(command, list) or not command or not all(isinstance(part, str) and part for part in command):
+                raise ValidationPolicyMissingError(
+                    f"project {self.project_id!r} validation_policy required_checks entry {check_id!r} has no "
+                    "non-empty list of string 'command' arguments"
+                )
+            seen_ids.add(check_id)
+            resolved.append({"id": check_id, "command": list(command)})
+        return resolved
+
 
 class ProjectRegistry:
     """Project-agnostic Global Project Registry and Resolver."""
@@ -250,6 +311,7 @@ class ProjectRegistry:
         baseline_policy = raw_entry.get("baseline_resolution_policy", {"strategy": "origin_default"})
         common_governance = raw_entry.get("common_governance", {})
         project_rules = raw_entry.get("project_rules", {})
+        validation_policy = raw_entry.get("validation_policy", {})
         working_directory_policy = raw_entry.get("working_directory_policy", {
             "relative_path": canonical_id,
             "resolver_strategy": "workspace_relative",
@@ -275,6 +337,7 @@ class ProjectRegistry:
             baseline_resolution_policy=baseline_policy,
             common_governance=common_governance,
             project_rules=project_rules,
+            validation_policy=validation_policy,
             working_directory_policy=working_directory_policy,
             isolation_policy=isolation_policy,
             provider_restrictions=provider_restrictions,

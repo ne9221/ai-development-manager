@@ -7,7 +7,6 @@ backward compatibility); main()'s CLI entry point remains Codex-only.
 import argparse
 import json
 import os
-import shlex
 import socket
 import sys
 import uuid
@@ -21,7 +20,7 @@ from manager.dispatcher import dispatch
 from manager.execution_lifecycle import enter_running_gate, terminalize_execution
 from manager.executions import MAX_HARD_TIMEOUT_SECONDS, heartbeat_execution, hard_timeout_seconds, link_execution_session, reserve_execution
 from manager.gcs_lock_registry import GCSLockRegistry
-from manager.project_registry import get_global_registry
+from manager.project_registry import ProjectRegistryError, get_global_registry
 from manager.quota_reader import read_drive_status
 from manager.repo_write_completion import complete_repo_write_execution
 from manager.repo_write_enforcement import enforce_allowed_paths, is_bounded_repo_write_snapshot
@@ -35,22 +34,22 @@ from manager.worktree_materializer import materialize_worktree
 
 RPC_TIMEOUT_SECONDS = 30.0
 MAX_TURN_TIMEOUT_SECONDS = float(MAX_HARD_TIMEOUT_SECONDS)
-# Global Hands-off Execution Layer, Slice D2: the project-specified tests
-# gate a bounded repo-write execution must pass before its real changes are
-# staged/committed/pushed. ADM_REPO_WRITE_TESTS_COMMAND (shell-split, same
-# override convention as ADM_WORKTREE_WORKSPACE_ROOT above) lets a project
-# override this default without any code change; the default matches this
-# repo's own actual test invocation.
-DEFAULT_REPO_WRITE_TESTS_COMMAND = ("python", "-m", "pytest", "-q")
 
 
-def _repo_write_tests_command():
-    override = os.environ.get("ADM_REPO_WRITE_TESTS_COMMAND")
-    if override:
-        parts = shlex.split(override)
-        if parts:
-            return parts
-    return list(DEFAULT_REPO_WRITE_TESTS_COMMAND)
+def _repo_write_validation_checks(project_id):
+    """Global Hands-off Execution Layer, Slice D2 (P0-B fix): the required
+    validation checks a bounded repo-write execution must pass before its
+    real changes are staged/committed/pushed are resolved exclusively from
+    this project's own authoritative registry entry
+    (`ProjectMetadata.required_validation_checks()`, backed by
+    PROJECT-RULES/governance references) -- never from an environment
+    variable, a provider's own claim, or any other caller-suppliable input.
+    A project with no registered validation_policy fails closed (raises
+    ValidationPolicyMissingError, a ProjectRegistryError, before any tests
+    run) rather than guessing a generic default command; this is a
+    deliberate removal of the prior ADM_REPO_WRITE_TESTS_COMMAND override,
+    which let anything in the process environment weaken the policy."""
+    return get_global_registry().get_project(project_id).required_validation_checks()
 
 
 def task_turn_timeout(expected_minutes, override=None):
@@ -453,10 +452,11 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
             repo_write_completion_evidence = complete_repo_write_execution(
                 working_directory=snapshot["working_directory"], changed_paths=changed_paths,
                 baseline_head=snapshot["baseline_head"], branch=execution["lease_evidence"]["branch"],
-                repository=execution["lease_evidence"]["repository"], tests_command=_repo_write_tests_command(),
+                repository=execution["lease_evidence"]["repository"],
+                validation_checks=_repo_write_validation_checks(project_id),
                 task_id=task_id, execution_id=execution_id,
             )
-        except TaskError as exc:
+        except (TaskError, ProjectRegistryError) as exc:
             status = "failed"
             summary = f"{provider} turn rejected: {exc}"
 

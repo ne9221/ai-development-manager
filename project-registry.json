@@ -40,6 +40,22 @@
           "task_identity"
         ]
       },
+      "validation_policy": {
+        "required_checks": [
+          {
+            "id": "unittest_discover",
+            "command": ["python", "-m", "unittest", "discover", "-s", "manager", "-p", "test_*.py", "-q"]
+          },
+          {
+            "id": "pytest_manager",
+            "command": ["python", "-m", "pytest", "manager", "-q"]
+          },
+          {
+            "id": "diff_whitespace_check",
+            "command": ["git", "diff", "--check"]
+          }
+        ]
+      },
       "working_directory_policy": {
         "relative_path": "ai-development-manager",
         "resolver_strategy": "workspace_relative",
