@@ -80,6 +80,49 @@ class SelectClaudeAccountTests(unittest.TestCase):
         with self.assertRaises(AccountSelectionError):
             select_claude_account(accounts, explicit_account_id="account-a", now=NOW)
 
+    # -- P0 claude-auth-routing-truth: auth_ready cross-check --
+
+    def test_auth_unready_account_excluded_even_with_reliable_quota(self):
+        accounts = [account("account-a"), account("account-b")]
+        self.assertEqual(
+            "account-b",
+            select_claude_account(accounts, auth_ready={"account-a": False, "account-b": True}, now=NOW),
+        )
+
+    def test_account_missing_from_auth_ready_mapping_treated_as_not_ready(self):
+        # A candidate the auth check never got to (or errored on) must not
+        # win by omission -- only an explicit True counts as ready.
+        accounts = [account("account-a"), account("account-b")]
+        self.assertEqual(
+            "account-b",
+            select_claude_account(accounts, auth_ready={"account-b": True}, now=NOW),
+        )
+
+    def test_all_accounts_auth_unready_fails_closed(self):
+        accounts = [account("account-a"), account("account-b")]
+        with self.assertRaises(AccountSelectionError):
+            select_claude_account(accounts, auth_ready={"account-a": False, "account-b": False}, now=NOW)
+
+    def test_explicit_account_id_bypasses_auth_ready_check(self):
+        # Explicit choice is honored as-is (no substitution); the launcher's
+        # own preflight is what fails closed on it, not this selector.
+        accounts = [account("account-a"), account("account-b")]
+        self.assertEqual(
+            "account-a",
+            select_claude_account(
+                accounts, explicit_account_id="account-a",
+                auth_ready={"account-a": False, "account-b": True}, now=NOW,
+            ),
+        )
+
+    def test_auth_ready_none_preserves_pre_fix_behavior(self):
+        # Omitting auth_ready entirely (the default) must behave exactly as
+        # before this parameter existed.
+        self.assertEqual(
+            "account-a",
+            select_claude_account([account("account-a")], now=NOW),
+        )
+
 
 def quota_doc(*claude_entries):
     return {"schema_version": "0.1.0", "generated_at": "2026-08-15T02:00:00Z", "providers": list(claude_entries)}
@@ -195,6 +238,36 @@ class ResolveClaudeAccountTests(unittest.TestCase):
         entry_b = {**claude_entry("account-b"), "windows": w_b}
         document = quota_doc(entry_a, entry_b)
         result = resolve_claude_account(self.registry, document, now=NOW)
+        self.assertEqual("account-a", result["account_id"])
+
+    # -- P0 claude-auth-routing-truth: check_auth_ready cross-check --
+
+    def test_check_auth_ready_excludes_stale_account_despite_equal_quota_confidence(self):
+        document = quota_doc(claude_entry("account-a"), claude_entry("account-b"))
+        calls = []
+
+        def check_auth_ready(candidate):
+            calls.append(candidate["account_id"])
+            return candidate["account_id"] == "account-b"
+
+        result = resolve_claude_account(self.registry, document, now=NOW, check_auth_ready=check_auth_ready)
+        self.assertEqual("account-b", result["account_id"])
+        self.assertEqual(r"C:\accounts\b\.claude", result["config_dir"])
+        self.assertEqual({"account-a", "account-b"}, set(calls))
+
+    def test_check_auth_ready_both_unready_fails_closed(self):
+        document = quota_doc(claude_entry("account-a"), claude_entry("account-b"))
+        with self.assertRaises(AccountSelectionError):
+            resolve_claude_account(self.registry, document, now=NOW, check_auth_ready=lambda candidate: False)
+
+    def test_check_auth_ready_not_consulted_for_explicit_account_id(self):
+        document = quota_doc(claude_entry("account-a"))
+
+        def check_auth_ready(candidate):
+            raise AssertionError("must not be called for an explicit account_id request")
+
+        result = resolve_claude_account(self.registry, document, explicit_account_id="account-a", now=NOW,
+                                        check_auth_ready=check_auth_ready)
         self.assertEqual("account-a", result["account_id"])
 
     def test_two_reliable_accounts_reset_waste_risk_priority(self):
