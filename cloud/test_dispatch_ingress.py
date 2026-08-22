@@ -392,13 +392,43 @@ class DirectDispatchClaudeAccountIdentityTests(unittest.TestCase):
         self.assertEqual("claude", command["provider"])
         self.assertEqual("claude-a", command["account_id"])
 
-    def test_command_account_id_lets_command_watcher_bypass_auto_quota_gate(self):
-        """Proves the account_id isn't just stored but actually usable: the
-        Command Watcher must route this command through the explicit-account
-        launch path and must launch it with the exact account_id the dispatcher chose."""
+    def test_provisional_account_id_does_not_pin_launch_without_explicit_request(self):
+        """A provisional dispatcher-time account_id (no explicit provider/account
+        in the original request, so requested_account_id is None) must NOT pin
+        the Command Watcher's launch: it has to fall through to R2's own
+        automatic sibling-aware selection at launch time, not the dispatch-time
+        snapshot. Pinning to the provisional pick is exactly the bug the fleet
+        eligibility fix (account-aware Claude sibling selection) corrects --
+        see manager.command_watcher._explicit_account_id."""
         result = self.call(payload(request_id="req-acct2"))
         command = self.store.get("commands", "p1", result["command_id"])
         self.assertEqual("claude-a", command["account_id"])
+        self.assertIsNone(command["requested_account_id"])
+        runner = Mock(return_value=CommandWatcherTests.complete("exec-1"))
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher._claude_account_registry", return_value=self.REGISTRY), \
+             patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}):
+            outcome = process_command(
+                self.store, self.service, command, claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), health_check=lambda: True,
+                quota_check=lambda service: True,
+                ingress_registry_factory=lambda bucket, project_id, request_id: self.registries.factory(project_id, request_id),
+            )
+        runner.assert_called_once()
+        _, kwargs = runner.call_args
+        self.assertIsNone(kwargs.get("account_id"))
+        self.assertEqual("completed", outcome["status"])
+
+    def test_explicit_account_id_still_bypasses_auto_quota_gate(self):
+        """The explicit-account launch path this test class exists to protect
+        is still real: when the original request explicitly named the account
+        (requested_account_id set), Command Watcher must launch with that
+        exact account_id."""
+        with _registry_env(self.REGISTRY):
+            result = self.call(payload(request_id="req-acct3", provider="claude", account_id="claude-a"))
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual("claude-a", command["account_id"])
+        self.assertEqual("claude-a", command["requested_account_id"])
         runner = Mock(return_value=CommandWatcherTests.complete("exec-1"))
         with patch("manager.command_watcher.launch_task", runner), \
              patch("manager.command_watcher._claude_account_registry", return_value=self.REGISTRY), \
