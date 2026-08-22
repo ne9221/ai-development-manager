@@ -119,17 +119,9 @@ def provider_quota_reliable(service, provider, account_id=None):
         return False
     if account_id is not None:
         entry = next((item for item in quota.get("accounts", []) if item.get("provider") == provider and item.get("account_id") == account_id), None)
-        if not entry or not entry.get("has_reliable_quota"):
-            return False
-        if any(w.get("remaining_percent") == 0.0 or w.get("used_percent") == 100.0 for w in entry.get("windows", [])):
-            return False
-        return True
+        return bool(entry and entry.get("has_usable_quota", entry.get("has_reliable_quota")))
     entry = next((item for item in quota.get("providers", []) if item.get("provider") == provider), None)
-    if not entry or not entry.get("has_reliable_quota"):
-        return False
-    if any(w.get("remaining_percent") == 0.0 or w.get("used_percent") == 100.0 for w in entry.get("windows", [])):
-        return False
-    return True
+    return bool(entry and entry.get("has_usable_quota", entry.get("has_reliable_quota")))
 
 
 def codex_quota_reliable(service, account_id=None):
@@ -237,13 +229,19 @@ def _explicit_account_id(command, task):
     "explicit" here would route it straight to launch_task(account_id=...)
     and skip the live auth-ready/quota-freshness re-check automatic
     selection is supposed to get at launch time -- see
-    execution_runner.launch_task's account_id=None branch.
+    execution_runner.launch_task's account_id=None branch. The same signal
+    also applies whenever `requested_account_id` is present on the command
+    dict at all (even set to None) -- that key is only ever populated by
+    something that understands the provisional-vs-explicit distinction, so
+    its presence is as reliable a signal as the origin stamp, and covers
+    non-ingress test/production doubles that carry the field without
+    stamping `created_via`.
 
-    Every other command origin (no Direct Dispatch ingress stamp -- e.g. a
-    manually/allowlist-created Command) predates that distinction and never
-    populates requested_account_id at all; for those, command.account_id
-    itself is still the real, hand-set explicit choice, exactly as before
-    this fix -- unaffected here.
+    Every other command origin (no Direct Dispatch ingress stamp and no
+    `requested_account_id` key at all -- e.g. a manually/allowlist-created
+    Command) predates that distinction; for those, command.account_id itself
+    is still the real, hand-set explicit choice, exactly as before this fix
+    -- unaffected here.
 
     Command's own (requested-or-plain) account_id wins over Task's -- Command
     is the concrete per-launch intent (closer to "what should run right
@@ -251,7 +249,7 @@ def _explicit_account_id(command, task):
     means "no explicit choice", which is a real, different state from an
     invalid one and must fall through to automatic selection, not be
     rejected."""
-    if command.get("created_via") == TRUSTED_INGRESS_ORIGIN:
+    if command.get("created_via") == TRUSTED_INGRESS_ORIGIN or "requested_account_id" in command:
         command_account_id = command.get("requested_account_id")
     else:
         command_account_id = command.get("account_id")

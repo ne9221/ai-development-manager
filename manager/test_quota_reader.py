@@ -75,20 +75,32 @@ class LegacySingleClaudeBehaviorPreserved(unittest.TestCase):
         self.assertFalse(claude["stale"])
 
 
-class LegacyNoneAccountCompatPriority(unittest.TestCase):
-    """When account_id=None coexists with a named account, the None entry
-    -- not the named one -- must be the provider-level compatibility
-    source, per spec."""
+class NamedAccountProviderEligibility(unittest.TestCase):
+    """Named accounts define automatic provider eligibility independently."""
 
-    def test_none_account_wins_over_named_account_for_provider_summary(self):
+    def test_fresh_named_account_makes_provider_eligible_even_with_stale_sibling(self):
+        stale = NOW.replace(hour=0)
         result = summarize(
-            doc(claude_item(None, remaining=99), claude_item("B", remaining=1)), now=NOW,
+            doc(claude_item("A", remaining=99, updated=stale), claude_item("B", remaining=1)), now=NOW,
         )
         claude = next(p for p in result["providers"] if p["provider"] == "claude")
-        self.assertEqual(claude["windows"][0]["remaining_percent"], 99)
-        # Both accounts still individually visible.
-        self.assertEqual(find_account(result, "claude", None)["windows"][0]["remaining_percent"], 99)
-        self.assertEqual(find_account(result, "claude", "B")["windows"][0]["remaining_percent"], 1)
+        self.assertTrue(claude["has_usable_quota"])
+        self.assertEqual({"scope": "eligible_named_account", "eligible_account_ids": ["B"]}, claude["availability"])
+        self.assertEqual(99, find_account(result, "claude", "A")["windows"][0]["remaining_percent"])
+        self.assertEqual(1, find_account(result, "claude", "B")["windows"][0]["remaining_percent"])
+
+    def test_fresh_exhausted_named_account_is_not_provider_eligible(self):
+        result = summarize(doc(claude_item("A", remaining=0)), now=NOW)
+        claude = next(p for p in result["providers"] if p["provider"] == "claude")
+        self.assertFalse(claude["has_usable_quota"])
+        self.assertEqual([], claude["availability"]["eligible_account_ids"])
+
+    def test_all_stale_named_accounts_leave_provider_ineligible(self):
+        stale = NOW.replace(hour=0)
+        result = summarize(doc(claude_item("A", updated=stale), claude_item("B", updated=stale)), now=NOW)
+        claude = next(p for p in result["providers"] if p["provider"] == "claude")
+        self.assertFalse(claude["has_usable_quota"])
+        self.assertEqual([], claude["availability"]["eligible_account_ids"])
 
     def test_no_none_account_falls_back_to_deterministic_named_representative(self):
         forward = summarize(doc(claude_item("B", remaining=1), claude_item("A", remaining=99)), now=NOW)

@@ -235,7 +235,6 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
             # the launch can actually proceed.
             selected_quota = unknown_account_summary("claude", EXPECTED_PROVIDERS["claude"], account_id)
     elif selected == "claude":
-        # Check if multiple named accounts exist in quota["accounts"]
         named_claude_accounts = [
             item for item in quota.get("accounts", [])
             if item.get("provider") == "claude" and item.get("account_id") is not None
@@ -246,27 +245,26 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
                 scored = []
                 for acc_item in named_claude_accounts:
                     fc = forecast_account(acc_item, history=quota_history, now=None)
-                    score = score_account_forecast(fc)
-                    scored.append((score, acc_item, fc))
-                eligible = [c for c in scored if c[0][0]]
+                    scored.append((score_account_forecast(fc), acc_item))
+                eligible = [item for score, item in scored if score[0]]
                 if eligible:
-                    eligible.sort(key=lambda x: x[0], reverse=True)
-                    best_score, best_item, best_fc = eligible[0]
-                    selected_quota = best_item
-                    account_id = best_item.get("account_id")
+                    selected_quota = max(eligible, key=lambda item: next(
+                        score for score, candidate in scored if candidate is item))
                 else:
-                    selected_quota = next((item for item in quota["providers"] if item["provider"] == "claude"), named_claude_accounts[0])
+                    selected_quota = next(item for item in quota["providers"] if item["provider"] == "claude")
             except Exception:
-                selected_quota = next((item for item in quota["providers"] if item["provider"] == "claude"), named_claude_accounts[0])
+                selected_quota = next(item for item in quota["providers"] if item["provider"] == "claude")
         else:
             selected_quota = next(item for item in quota["providers"] if item["provider"] == selected)
     else:
         selected_quota = next(item for item in quota["providers"] if item["provider"] == selected)
 
+    provider_quota = next(item for item in quota["providers"] if item["provider"] == selected)
+    eligibility_quota = selected_quota if account_id else provider_quota
     # Only a caller override is rejected here. A queued Command's assigned
     # provider is separately quota-gated before launch and may have just
     # reselected its actual Claude account using live local auth evidence.
-    if request.get("preferred_provider") == "claude" and not request.get("provider_is_assigned") and not selected_quota["has_reliable_quota"]:
+    if request.get("preferred_provider") == "claude" and not request.get("provider_is_assigned") and not eligibility_quota.get("has_usable_quota", eligibility_quota["has_reliable_quota"]):
         raise TaskError("preferred Claude provider has no reliable quota")
 
     # Scoped quota and forecast evidence for selected provider/account
@@ -299,7 +297,7 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
     warnings = [item for item in [decision.get("warning")] if item]
     if request.get("preferred_provider"):
         warnings.append(f"Preferred provider override selected: {selected}")
-    if selected_quota["stale"] or not selected_quota["has_reliable_quota"]:
+    if selected_quota["stale"] or not selected_quota.get("has_usable_quota", selected_quota["has_reliable_quota"]):
         warnings.append(f"{selected_quota['display_name']} quota is stale or unknown")
     handoff = None
     if task:
@@ -324,6 +322,7 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
         "mode": CAPABILITIES[selected]["mode"], "effort": decision["recommended_effort"],
         "selection_reason": decision["reasons"],
         "quota_evidence": decision["quota_evidence"],
+        "provider_availability": provider_quota.get("availability"),
         "estimated_minutes": selected_estimate["estimated_minutes"], "split_recommended": selected_estimate["split_recommended"], "phase_count": selected_estimate["suggested_phases"],
         "alternatives": alternatives, "quota_summary": summary, "warnings": warnings, "generated_prompt": generated,
     }

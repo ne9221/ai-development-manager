@@ -401,11 +401,28 @@ class DirectDispatchClaudeAccountIdentityTests(unittest.TestCase):
         the exact real-production bug this fix closes: an account picked
         from a frozen/stale snapshot at dispatch time could otherwise reach
         the provider launch unchecked, skipping the live auth-ready and
-        quota-freshness re-check automatic routing is supposed to get."""
+        quota-freshness re-check automatic routing is supposed to get.
+        (Also the exact bug the Claude fleet eligibility fix's sibling-aware
+        selection assumes is closed -- see manager.command_watcher._explicit_account_id.)"""
         result = self.call(payload(request_id="req-acct2"))
         command = self.store.get("commands", "p1", result["command_id"])
         self.assertEqual("claude-a", command["account_id"])
         self.assertIsNone(command["requested_account_id"])
+        runner = Mock(return_value=CommandWatcherTests.complete("exec-1"))
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher._claude_account_registry", return_value=self.REGISTRY), \
+             patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"}):
+            outcome = process_command(
+                self.store, self.service, command, claim_factory=lambda *_: MemoryClaimRegistry(),
+                allowlist=frozenset(), health_check=lambda: True,
+                quota_check=lambda service: True,
+                ingress_registry_factory=lambda bucket, project_id, request_id: self.registries.factory(project_id, request_id),
+            )
+        runner.assert_called_once()
+        _, kwargs = runner.call_args
+        self.assertIsNone(kwargs.get("account_id"))
+        self.assertEqual(self.REGISTRY, kwargs.get("claude_accounts"))
+        self.assertEqual("completed", outcome["status"])
         runner = Mock(return_value=CommandWatcherTests.complete("exec-1"))
         with patch("manager.command_watcher.launch_task", runner), \
              patch("manager.command_watcher._claude_account_registry", return_value=self.REGISTRY), \
