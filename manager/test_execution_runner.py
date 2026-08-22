@@ -12,11 +12,20 @@ from manager.claude_launcher import ClaudeLaunchError
 from manager.codex_launcher import CodexLaunchError, LaunchOutcome, LaunchRequest
 from manager.execution_runner import _stopped, launch_task, run_execution
 from manager.task_claims import check_task_execution_claim
-from manager.tasks import TaskError, create_project, create_task, update_task
+from manager.tasks import TaskError, create_project, create_task, now_iso, update_task
 from manager.test_execution_lifecycle import MemoryStore, build_store, quota_document
 from manager.test_task_claims import MemoryClaimRegistry
 from manager.test_worktree_locks import HEAD, REPO, MemoryRegistry
 from manager.worktree_locks import link_session
+
+
+# Frozen at import time, always "now" as of test collection -- these tests
+# exercise claude_accounts registry resolution, which (as of the P0
+# claude-auth-routing-truth fix) enforces the same quota-freshness window
+# every other reliability gate in this codebase uses, so a stale, years-old
+# fixture timestamp would fail closed instead of reaching the scenario the
+# test actually means to exercise.
+FRESH_QUOTA_TIMESTAMP = now_iso()
 
 
 class Process:
@@ -284,7 +293,7 @@ class RunnerTests(unittest.TestCase):
         document = {"schema_version": "0.1.0", "generated_at": "2026-08-15T02:00:00Z", "providers": [{
             "provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic",
             "source": "test", "source_type": "official", "confidence": "official",
-            "last_updated": "2026-08-15T02:00:00Z", "status": "ok", "windows": [],
+            "last_updated": FRESH_QUOTA_TIMESTAMP, "status": "ok", "windows": [],
             "account_id": "account-b",
         }]}
         with patch("manager.execution_runner.dispatch", return_value={
@@ -314,7 +323,7 @@ class RunnerTests(unittest.TestCase):
         document = {"schema_version": "0.1.0", "generated_at": "2026-08-15T02:00:00Z", "providers": [{
             "provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic",
             "source": "test", "source_type": "official", "confidence": "official",
-            "last_updated": "2026-08-15T02:00:00Z", "status": "ok", "windows": [],
+            "last_updated": FRESH_QUOTA_TIMESTAMP, "status": "ok", "windows": [],
             "account_id": "account-b",
         }]}
         captured = {}
@@ -344,10 +353,10 @@ class RunnerTests(unittest.TestCase):
         ]
         document = {"schema_version": "0.1.0", "generated_at": "2026-08-15T02:00:00Z", "providers": [
             {"provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic", "source": "test",
-             "source_type": "official", "confidence": "official", "last_updated": "2026-08-15T02:00:00Z",
+             "source_type": "official", "confidence": "official", "last_updated": FRESH_QUOTA_TIMESTAMP,
              "status": "ok", "windows": [], "account_id": "account-a"},
             {"provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic", "source": "test",
-             "source_type": "official", "confidence": "official", "last_updated": "2026-08-15T02:00:00Z",
+             "source_type": "official", "confidence": "official", "last_updated": FRESH_QUOTA_TIMESTAMP,
              "status": "ok", "windows": [], "account_id": "account-b"},
         ]}
         with patch("manager.execution_runner.dispatch", return_value={
@@ -375,10 +384,10 @@ class RunnerTests(unittest.TestCase):
         ]
         document = {"schema_version": "0.1.0", "generated_at": "2026-08-15T02:00:00Z", "providers": [
             {"provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic", "source": "test",
-             "source_type": "official", "confidence": "official", "last_updated": "2026-08-15T02:00:00Z",
+             "source_type": "official", "confidence": "official", "last_updated": FRESH_QUOTA_TIMESTAMP,
              "status": "ok", "windows": [], "account_id": "account-a"},
             {"provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic", "source": "test",
-             "source_type": "official", "confidence": "official", "last_updated": "2026-08-15T02:00:00Z",
+             "source_type": "official", "confidence": "official", "last_updated": FRESH_QUOTA_TIMESTAMP,
              "status": "ok", "windows": [], "account_id": "account-b"},
         ]}
 
@@ -409,10 +418,10 @@ class RunnerTests(unittest.TestCase):
         ]
         document = {"schema_version": "0.1.0", "generated_at": "2026-08-15T02:00:00Z", "providers": [
             {"provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic", "source": "test",
-             "source_type": "official", "confidence": "official", "last_updated": "2026-08-15T02:00:00Z",
+             "source_type": "official", "confidence": "official", "last_updated": FRESH_QUOTA_TIMESTAMP,
              "status": "ok", "windows": [], "account_id": "account-a"},
             {"provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic", "source": "test",
-             "source_type": "official", "confidence": "official", "last_updated": "2026-08-15T02:00:00Z",
+             "source_type": "official", "confidence": "official", "last_updated": FRESH_QUOTA_TIMESTAMP,
              "status": "ok", "windows": [], "account_id": "account-b"},
         ]}
         with patch("manager.execution_runner.dispatch", return_value={
@@ -441,7 +450,7 @@ class RunnerTests(unittest.TestCase):
         document = {"schema_version": "0.1.0", "generated_at": "2026-08-15T02:00:00Z", "providers": [{
             "provider": "claude", "display_name": "Claude Code", "collection_mode": "automatic",
             "source": "test", "source_type": "official", "confidence": "official",
-            "last_updated": "2026-08-15T02:00:00Z", "status": "ok", "windows": [],
+            "last_updated": FRESH_QUOTA_TIMESTAMP, "status": "ok", "windows": [],
             "account_id": "account-a",
         }]}
         with patch("manager.execution_runner.dispatch", return_value={
