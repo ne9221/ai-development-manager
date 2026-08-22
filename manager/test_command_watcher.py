@@ -449,6 +449,14 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertIn('-ClaudeAccountsConfig `"$ClaudeAccountsConfig`"', installer)
         self.assertIn('$env:CLAUDE_ACCOUNTS_CONFIG = $ClaudeAccountsConfig', runner)
 
+    def test_windows_watcher_runner_bounds_each_scheduled_tick(self):
+        runner = (Path(__file__).parent / "run_command_watcher.ps1").read_text(encoding="utf-8")
+        self.assertIn('[ValidateRange(1, 59)][int]$WatcherTickTimeoutSeconds = 45', runner)
+        self.assertIn('Start-Process -FilePath $PythonPath', runner)
+        self.assertIn('$watcher.WaitForExit($WatcherTickTimeoutSeconds * 1000)', runner)
+        self.assertIn('Stop-Process -Id $watcher.Id -Force', runner)
+        self.assertIn('WATCHER_TICK_TIMEOUT', runner)
+
     # -- Phase 4C: provider routing + Claude quota fail-closed wiring --
 
     # 1 & 2: provider resolves the correct launcher/quota-gate pairing

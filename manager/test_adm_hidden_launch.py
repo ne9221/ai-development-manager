@@ -27,6 +27,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -176,7 +177,9 @@ class CommandWatcherRunnerClaudeAccountsConfigTest(unittest.TestCase):
             '@echo off\n'
             'if "%1"=="-m" if "%2"=="-c" ( echo {"running_sha":"sha1","tested_sha":"sha1","activated_sha":"sha1"} & exit /b 0 )\n'
             'if "%1"=="-m" if "%2"=="manager.provenance" ( echo {"running_sha":"sha1","tested_sha":"sha1","activated_sha":"sha1"} & exit /b 0 )\n'
-            'if "%1"=="-m" if "%2"=="manager.command_watcher" ( echo CLAUDE_CONFIG=%CLAUDE_ACCOUNTS_CONFIG% & exit /b 0 )\n'
+            'if "%1"=="-m" if "%2"=="manager.command_watcher" echo CLAUDE_CONFIG=%CLAUDE_ACCOUNTS_CONFIG% > "%CLAUDE_ACCOUNTS_CONFIG%.observed"\n'
+            'if "%1"=="-m" if "%2"=="manager.command_watcher" if "%ADM_TEST_WATCHER_HANG%"=="1" ping 127.0.0.1 -n 10 >nul\n'
+            'if "%1"=="-m" if "%2"=="manager.command_watcher" exit /b 0\n'
             'exit /b 0\n'
         )
         self.fake_python.write_text(bat_content, encoding="utf-8")
@@ -184,7 +187,7 @@ class CommandWatcherRunnerClaudeAccountsConfigTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run_watcher(self, extra_args=""):
+    def _run_watcher(self, extra_args="", extra_env=None):
         runner = self.fake_repo / "manager" / "run_command_watcher.ps1"
         allowlist = self.tmp_path / "allowlist.json"
         allowlist.write_text("{}", encoding="utf-8")
@@ -192,19 +195,20 @@ class CommandWatcherRunnerClaudeAccountsConfigTest(unittest.TestCase):
         return subprocess.run(
             [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd],
             capture_output=True, text=True, timeout=20,
+            env={**os.environ, **(extra_env or {})},
         )
 
     def test_default_config_path_exported_when_present(self):
         res = self._run_watcher()
         self.assertEqual(0, res.returncode, f"stderr: {res.stderr}")
-        self.assertIn(f"CLAUDE_CONFIG={self.default_config}", res.stdout)
+        self.assertIn(f"CLAUDE_CONFIG={self.default_config}", Path(f"{self.default_config}.observed").read_text(encoding="utf-8"))
 
     def test_explicit_config_path_exported(self):
         custom_config = self.tmp_path / "custom_accounts.json"
         custom_config.write_text('{"accounts":[]}', encoding="utf-8")
         res = self._run_watcher(f'-ClaudeAccountsConfig "{custom_config}"')
         self.assertEqual(0, res.returncode, f"stderr: {res.stderr}")
-        self.assertIn(f"CLAUDE_CONFIG={custom_config}", res.stdout)
+        self.assertIn(f"CLAUDE_CONFIG={custom_config}", Path(f"{custom_config}.observed").read_text(encoding="utf-8"))
 
     def test_missing_config_fails_closed(self):
         self.default_config.unlink()
@@ -219,4 +223,14 @@ class CommandWatcherRunnerClaudeAccountsConfigTest(unittest.TestCase):
         unicode_config.write_text('{"accounts":[]}', encoding="utf-8")
         res = self._run_watcher(f'-ClaudeAccountsConfig "{unicode_config}"')
         self.assertEqual(0, res.returncode, f"stderr: {res.stderr}")
-        self.assertIn(f"CLAUDE_CONFIG={unicode_config}", res.stdout)
+        self.assertIn(f"CLAUDE_CONFIG={unicode_config}", Path(f"{unicode_config}.observed").read_text(encoding="utf-8"))
+
+    def test_stalled_watcher_is_terminated_before_the_next_tick(self):
+        started = time.monotonic()
+        res = self._run_watcher('-WatcherTickTimeoutSeconds 1', {"ADM_TEST_WATCHER_HANG": "1"})
+        self.assertNotEqual(0, res.returncode, f"stderr: {res.stderr}")
+        self.assertIn("WATCHER_TICK_TIMEOUT", res.stderr)
+        # cmd.exe leaves the test-only ping helper alive briefly after its
+        # parent is stopped; this still proves the scheduled tick returns
+        # comfortably before the following 60-second trigger.
+        self.assertLess(time.monotonic() - started, 15)
