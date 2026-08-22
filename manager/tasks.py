@@ -162,11 +162,20 @@ class DriveRecords:
             raise TaskError(f"duplicate Drive record: {filename}")
         raw = (json.dumps(document, indent=2) + "\n").encode("utf-8")
         media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=MIME_JSON, resumable=False)
+        # Command records get their status stamped as an exact-match Drive
+        # custom property on every write. list_actionable_commands() reads
+        # this instead of fullText: a real Drive probe confirmed Drive's
+        # fullText tokenizer strips JSON punctuation, so a *completed*
+        # command whose free-text fields happen to contain the words
+        # "status queued" is indistinguishable from a real queued command
+        # under fullText alone -- properties are exact key/value matches and
+        # closed to that false-positive class.
+        body_extra = {"properties": {"status": document["status"]}} if area == "commands" and isinstance(document.get("status"), str) else {}
         if matches:
             file_id = matches[0]["id"]
-            self.files.update(fileId=file_id, body={"name": filename}, media_body=media, fields="id").execute()
+            self.files.update(fileId=file_id, body={"name": filename, **body_extra}, media_body=media, fields="id").execute()
         else:
-            file_id = self.files.create(body={"name": filename, "parents": [parent], "mimeType": MIME_JSON}, media_body=media, fields="id").execute()["id"]
+            file_id = self.files.create(body={"name": filename, "parents": [parent], "mimeType": MIME_JSON, **body_extra}, media_body=media, fields="id").execute()["id"]
         remote = self.files.get_media(fileId=file_id).execute()
         final = self.children(parent, filename)
         if remote != raw or len(final) != 1 or final[0]["id"] != file_id:
@@ -207,19 +216,32 @@ class DriveRecords:
     def list_actionable_commands(self, project_id, limit):
         """Read one bounded Drive page of non-terminal command records.
 
-        Drive indexes JSON content for ``fullText`` queries, so this avoids
-        listing/downloading historical completed command files on every poll.
-        A command remains discoverable until its status becomes terminal.
+        Selector is the exact-match Drive custom property ``status`` that
+        put() stamps on every command write -- not fullText content search.
+        A real Drive probe confirmed fullText's JSON-punctuation stripping
+        makes a phrase like '"status queued"' match on token-adjacency alone,
+        so a *completed* command whose free-text fields happen to contain the
+        words "status queued" would be indistinguishable from a real queued
+        command and could permanently occupy a bounded page slot. properties
+        queries are exact key/value equality, closed to that false-positive
+        class. orderBy=createdTime asc (Drive's immutable file-creation
+        timestamp, never touched by later status-update writes) means the
+        oldest actionable command is always the first one read, however many
+        newer commands exist -- no starvation from sustained new arrivals.
+
+        Commands written before this property existed are invisible to this
+        query; reconcile_legacy_command_properties() is the bounded,
+        cadence-driven backfill that heals them.
         """
         if not isinstance(limit, int) or limit < 1:
             raise TaskError("command limit must be positive")
         parent = self.project_folder("commands", project_id, create=False)
         statuses = ("queued", "claimed", "running")
         query = f"'{parent}' in parents and trashed=false and (" + " or ".join(
-            f"fullText contains '\"status {status}\"'" for status in statuses
+            f"properties has {{ key='status' and value='{status}' }}" for status in statuses
         ) + ")"
         response = self.files.list(
-            q=query, spaces="drive", orderBy="modifiedTime desc", pageSize=limit,
+            q=query, spaces="drive", orderBy="createdTime asc", pageSize=limit,
             fields="files(id,name,mimeType)",
         ).execute()
         if not isinstance(response, dict) or not isinstance(response.get("files", []), list):
@@ -233,6 +255,42 @@ class DriveRecords:
             except Exception as exc:
                 raise TaskError(f"could not read Drive command record: {item['name']}") from exc
         return records
+
+    def reconcile_legacy_command_properties(self, project_id, page_size=50, max_pages=5):
+        """Bounded, cadence-driven backfill for command files written before
+        the ``status`` Drive property existed (see put()).
+
+        Hard-capped at ``max_pages`` metadata-only list calls regardless of
+        total history size -- this can never degenerate into re-downloading
+        every historical command on every poll. Only files actually missing
+        the property are re-read and re-written (put() re-stamps the
+        property as a side effect); already-migrated or genuinely terminal
+        records cost nothing beyond the metadata scan. Safe to call
+        repeatedly and after a restart: a fully-migrated project's first
+        page has zero matches and this returns immediately.
+        """
+        parent = self.project_folder("commands", project_id, create=False)
+        query = f"'{parent}' in parents and trashed=false and not properties has {{ key='status' }}"
+        migrated, token = 0, None
+        for _ in range(max_pages):
+            options = {"q": query, "spaces": "drive", "fields": "nextPageToken,files(id,name,mimeType)", "pageSize": page_size}
+            if token:
+                options["pageToken"] = token
+            response = self.files.list(**options).execute()
+            files = response.get("files", []) if isinstance(response, dict) else []
+            for item in files:
+                if item.get("mimeType") != MIME_JSON or not item.get("name", "").endswith(".json") or not isinstance(item.get("id"), str):
+                    continue
+                try:
+                    document = json.loads(self.files.get_media(fileId=item["id"]).execute().decode("utf-8"))
+                    self.put("commands", project_id, logical_record_id(item["name"][:-5]), document)
+                    migrated += 1
+                except Exception:
+                    continue
+            token = response.get("nextPageToken") if isinstance(response, dict) else None
+            if not token:
+                break
+        return migrated
 
     def list_projects(self):
         root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"], create=False)

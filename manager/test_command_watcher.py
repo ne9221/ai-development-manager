@@ -141,6 +141,79 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertEqual([("broken", 4), ("healthy", 4)], store.limits)
         self.assertEqual([{"status": "completed"}], result); process.assert_called_once()
 
+    def test_busy_project_never_permanently_starves_another_projects_queued_command(self):
+        """Required multi-project fairness test: project A has a backlog far
+        larger than the per-project quota, project B has one queued command.
+        With a shared global budget, A (iterated first) could consume every
+        slot every single poll and B would never be reached. With a
+        per-project quota, B's command is guaranteed processed within the
+        very first poll, not just "eventually"."""
+        class MultiProjectStore(BoundedCommandStore):
+            def list_projects(self):
+                return [{"project_id": "project-a"}, {"project_id": "project-b"}]
+
+            def list_actionable_commands(self, project_id, limit):
+                self.limits.append((project_id, limit))
+                return self.list_records("commands", project_id)[:limit]
+
+        store = MultiProjectStore()
+        for index in range(50):
+            store.put("commands", "project-a", f"cmd-{index}", command(project_id="project-a", command_id=f"cmd-{index}"))
+        store.put("commands", "project-b", "cmd-b1", command(project_id="project-b", command_id="cmd-b1"))
+
+        with patch("manager.command_watcher.process_command", side_effect=lambda store, service, cmd, **kw: {"status": "completed", "project_id": cmd["project_id"]}):
+            result = poll_once(store, object(), allowlist=frozenset({("project-a", "t1"), ("project-b", "t1")}))
+
+        self.assertEqual(4, sum(1 for r in result if r["project_id"] == "project-a"))
+        self.assertEqual(1, sum(1 for r in result if r["project_id"] == "project-b"))
+        self.assertIn(("project-a", 4), store.limits)
+        self.assertIn(("project-b", 4), store.limits)
+
+    def test_reconcile_legacy_commands_aggregates_across_projects_and_isolates_failures(self):
+        from manager.command_watcher import reconcile_legacy_commands
+
+        class LegacyBackfillStore(Store):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def list_projects(self):
+                return [{"project_id": "broken"}, {"project_id": "healthy-1"}, {"project_id": "healthy-2"}]
+
+            def reconcile_legacy_command_properties(self, project_id):
+                self.calls.append(project_id)
+                if project_id == "broken":
+                    raise TaskError("Commands folder missing")
+                return 3
+
+        store = LegacyBackfillStore()
+        migrated = reconcile_legacy_commands(store)
+        self.assertEqual(6, migrated)
+        self.assertEqual(["broken", "healthy-1", "healthy-2"], store.calls)
+
+    def test_reconcile_legacy_commands_noop_when_store_lacks_method(self):
+        from manager.command_watcher import reconcile_legacy_commands
+        self.assertEqual(0, reconcile_legacy_commands(Store()))
+
+    def test_queued_command_reachable_after_simulated_restart_with_no_local_cursor(self):
+        """poll_once()/process_command() take the store as their only durable
+        input and hold no local cursor/cache of their own -- a fresh process
+        (a brand-new Store instance built from the same underlying Drive
+        data, standing in for a restart) must reach a queued command exactly
+        as a long-running process would, with no warm-up/backfill step."""
+        first_process_store = BoundedCommandStore()
+        create_project(first_process_store, project()); create_task(first_process_store, task(read_only=True), assign=False)
+        compliant = first_process_store.get("tasks", "p1", "t1"); compliant["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)
+        first_process_store.put("tasks", "p1", "t1", compliant)
+        first_process_store.put("commands", "p1", "cmd-1", command())
+        persisted_records = deepcopy(first_process_store.records)
+
+        restarted_store = BoundedCommandStore()
+        restarted_store.records = deepcopy(persisted_records)
+        with patch("manager.command_watcher.process_command", return_value={"status": "completed"}) as process:
+            result = poll_once(restarted_store, object(), allowlist=self.ALLOWLIST)
+        self.assertEqual(1, len(result)); process.assert_called_once()
+
     def test_restart_never_relaunches_claimed_or_running_command(self):
         claimed = command(status="claimed", execution_id="command-cmd-1", claimed_at=now_iso())
         runner = Mock()

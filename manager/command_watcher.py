@@ -32,7 +32,17 @@ from manager.dispatch_requests import dispatch_request_registry
 POLL_SECONDS = 60
 MAX_POLL_SECONDS = 900
 CLAIM_TIMEOUT_SECONDS = 20 * 60
-MAX_COMMANDS_PER_POLL = 4
+# Per-project quota, not a shared global budget: a global budget lets one
+# busy project's backlog permanently consume every slot before later
+# projects are ever iterated, starving them forever. Each project gets its
+# own MAX_COMMANDS_PER_PROJECT_PER_POLL every poll regardless of any other
+# project's backlog. Total reads per poll are still bounded (by
+# project_count * this constant), not by historical Command growth.
+MAX_COMMANDS_PER_PROJECT_PER_POLL = 4
+# Cadence for the bounded legacy-property backfill safety net (see
+# manager.tasks.DriveRecords.reconcile_legacy_command_properties): every
+# 20th poll, not every poll, so it never becomes a per-poll cost.
+RECONCILE_EVERY_N_POLLS = 20
 
 
 def execution_id(command):
@@ -496,21 +506,44 @@ def poll_once(store, service, allowlist=None, **factories):
     results = []
     for project in all_projects(store):
         try:
-            remaining = MAX_COMMANDS_PER_POLL - len(results)
-            if remaining == 0:
-                return results
-            commands = (store.list_actionable_commands(project["project_id"], remaining)
+            # Each project's read is bounded by its own quota, independent of
+            # every other project's backlog or how many commands earlier
+            # projects in this same poll already produced.
+            commands = (store.list_actionable_commands(project["project_id"], MAX_COMMANDS_PER_PROJECT_PER_POLL)
                         if hasattr(store, "list_actionable_commands")
                         else store.list_records("commands", project["project_id"]))
         except TaskError:
             continue
+        processed_for_project = 0
         for command in commands:
             if command.get("status") in ("completed", "failed"):
                 continue
-            if len(results) == MAX_COMMANDS_PER_POLL:
-                return results
+            if processed_for_project == MAX_COMMANDS_PER_PROJECT_PER_POLL:
+                break
             results.append(process_command(store, service, command, allowlist=allowlist, **factories))
+            processed_for_project += 1
     return results
+
+
+def reconcile_legacy_commands(store):
+    """Bounded, cadence-driven safety net: heal command files written before
+    the Drive `properties.status` selector existed (see
+    manager.tasks.DriveRecords.put/reconcile_legacy_command_properties), so
+    they eventually become reachable by list_actionable_commands() too.
+    Never called from poll_once() itself -- only on RECONCILE_EVERY_N_POLLS
+    cadence in main() -- so it never adds cost to the normal bounded poll.
+    A project without the reconciliation method (older test doubles) or one
+    whose Commands folder does not exist yet is skipped, not fatal.
+    """
+    if not hasattr(store, "reconcile_legacy_command_properties"):
+        return 0
+    migrated = 0
+    for project in all_projects(store):
+        try:
+            migrated += store.reconcile_legacy_command_properties(project["project_id"])
+        except TaskError:
+            continue
+    return migrated
 
 
 def main(argv=None):
@@ -520,6 +553,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not 10 <= args.interval_seconds <= MAX_POLL_SECONDS:
         raise SystemExit("interval-seconds must be from 10 to 900")
+    poll_count = 0
     while True:
         try:
             service = build_service()
@@ -529,8 +563,10 @@ def main(argv=None):
                 from manager.drive_dispatch_ingress import poll_drive_dispatch_requests
                 ingress = poll_drive_dispatch_requests(store, service, os.environ.get("ADM_LOCK_GCS_BUCKET"))
             result = poll_once(store, service)
+            poll_count += 1
+            legacy_reconciled = reconcile_legacy_commands(store) if poll_count % RECONCILE_EVERY_N_POLLS == 0 else 0
             print(json.dumps({"status": "ok", "host": socket.gethostname()[:100], "ingress": ingress,
-                              "commands": result}, separators=(",", ":")))
+                              "commands": result, "legacy_reconciled": legacy_reconciled}, separators=(",", ":")))
         except Exception:
             print(json.dumps({"status": "unavailable"}, separators=(",", ":")))
         if args.once:
