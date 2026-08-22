@@ -99,17 +99,44 @@ class DispatchIngressTests(unittest.TestCase):
         command = self.store.get("commands", "p1", result["command_id"])
         self.assertEqual("codex", command["provider"])
 
-    def test_no_eligible_provider_creates_no_command_or_duplicate_authority(self):
-        document = quota_fixture(updated="2020-01-01T00:00:00Z")
+    def test_no_eligible_provider_releases_claim_for_same_request_id_retry(self):
+        stale = quota_fixture(updated="2020-01-01T00:00:00Z")
         request = payload(request_id="req-no-eligible")
-        with patch("manager.dispatcher.read_drive_status", return_value=document):
+        with patch("manager.dispatcher.read_drive_status", return_value=stale):
             with self.assertRaisesRegex(TaskError, "no eligible provider"):
-                self.call(request)
-            with self.assertRaises(DispatchIngressError):
                 self.call(request)
         for area in ("tasks", "commands"):
             with self.assertRaises(TaskError):
                 self.store.get(area, "p1", "dispatch-req-no-eligible")
+        fresh_codex = quota_fixture(80, 90)
+        next(item for item in fresh_codex["providers"] if item["provider"] == "claude")["last_updated"] = "2020-01-01T00:00:00Z"
+        with patch("manager.dispatcher.read_drive_status", return_value=fresh_codex):
+            result = self.call(request)
+        self.assertEqual("dispatch-req-no-eligible", result["task_id"])
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertEqual("codex", command["provider"])
+
+    def test_failure_before_task_creation_releases_only_our_definite_claim(self):
+        request = payload(request_id="req-pre-artifact-failure")
+        with patch("cloud.dispatch_ingress.dispatcher_dispatch", side_effect=TaskError("simulated pre-task failure")):
+            with self.assertRaisesRegex(TaskError, "pre-task failure"):
+                self.call(request)
+        self.assertIsNone(self.registries.factory("p1", "req-pre-artifact-failure").document)
+        result = self.call(request)
+        self.assertEqual("dispatch-req-pre-artifact-failure", result["task_id"])
+
+    def test_ambiguous_claim_is_never_rolled_back(self):
+        request = payload(request_id="req-ambiguous-no-provider")
+        registry = self.registries.factory("p1", "req-ambiguous-no-provider")
+        registry.ambiguous_queue.append(ConnectionError("timeout after create"))
+        stale = quota_fixture(updated="2020-01-01T00:00:00Z")
+        with patch("manager.dispatcher.read_drive_status", return_value=stale):
+            with self.assertRaisesRegex(TaskError, "no eligible provider"):
+                self.call(request)
+        self.assertIsNotNone(registry.document)
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(request)
+        self.assertEqual("dispatch_incomplete", ctx.exception.code)
 
     def test_read_only_constraint_defaults_true_when_omitted(self):
         result = self.call(payload(request_id="req-ro", constraints={}))

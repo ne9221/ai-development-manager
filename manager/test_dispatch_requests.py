@@ -5,7 +5,10 @@ proven approach against an in-memory double of the GCS transport."""
 import threading
 import unittest
 
-from manager.dispatch_requests import claim_dispatch_request, dispatch_request_object_name
+from manager.dispatch_requests import (
+    DispatchRequestClaimConflict, claim_dispatch_request, dispatch_request_object_name,
+    release_dispatch_request_claim,
+)
 from manager.tasks import TaskError
 from manager.test_task_claims import AmbiguousThenUnreadableRegistry, MemoryClaimRegistry
 
@@ -18,6 +21,7 @@ class DispatchRequestClaimTests(unittest.TestCase):
         self.assertEqual("dispatch-req-1", result["task_id"])
         self.assertEqual("dispatch-req-1", result["command_id"])
         self.assertEqual(1, result["generation"])
+        self.assertTrue(result["created_by_this_call"])
 
     def test_same_request_id_retry_is_idempotent_no_second_claim(self):
         registry = MemoryClaimRegistry()
@@ -58,6 +62,26 @@ class DispatchRequestClaimTests(unittest.TestCase):
         result = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-17T00:00:00Z")
         self.assertTrue(result["claimed"])
         self.assertEqual(1, result["generation"])
+        self.assertFalse(result["created_by_this_call"])
+
+    def test_generation_matched_release_makes_pre_artifact_claim_retryable(self):
+        registry = MemoryClaimRegistry()
+        claim = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-17T00:00:00Z")
+        released = release_dispatch_request_claim(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", claim["generation"])
+        self.assertTrue(released["released"])
+        retry = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-17T00:01:00Z")
+        self.assertTrue(retry["claimed"])
+        self.assertTrue(retry["created_by_this_call"])
+
+    def test_stale_release_never_deletes_newer_claim(self):
+        registry = MemoryClaimRegistry()
+        first = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-17T00:00:00Z")
+        release_dispatch_request_claim(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", first["generation"])
+        newer = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-17T00:01:00Z")
+        with self.assertRaises(DispatchRequestClaimConflict):
+            release_dispatch_request_claim(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", first["generation"])
+        self.assertEqual(newer["generation"], registry.generation)
+        self.assertIsNotNone(registry.document)
 
     def test_ambiguous_create_and_reread_failure_fails_closed(self):
         registry = AmbiguousThenUnreadableRegistry()
