@@ -6,6 +6,7 @@ from pathlib import Path
 
 from manager.claude_oauth_cooldown import (
     CORRUPT_STATE_COOLDOWN_SECONDS,
+    GLOBAL_QUARANTINE_KEY,
     CooldownStore,
     FALLBACK_COOLDOWN_SECONDS,
     MAX_COOLDOWN_SECONDS,
@@ -139,10 +140,12 @@ class CooldownStoreTests(unittest.TestCase):
         result = self.store.get("<default>", now=NOW)
         self.assertIsNotNone(result)
         # The file must no longer be the original corrupt bytes -- it was
-        # atomically replaced with clean, parseable, bounded state.
+        # atomically replaced with clean, parseable, bounded state, under
+        # the single global sentinel (not a per-key entry: a corrupt read
+        # can't be trusted to have been "only about <default>").
         raw = self.path.read_text(encoding="utf-8")
         parsed = json.loads(raw)  # must not raise
-        self.assertIn("<default>", parsed)
+        self.assertEqual([GLOBAL_QUARANTINE_KEY], list(parsed.keys()))
 
     def test_new_store_before_quarantine_expiry_still_blocks(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,18 +187,84 @@ class CooldownStoreTests(unittest.TestCase):
         self.store.clear("<default>")
         self.assertIsNone(self.store.get("<default>", now=after_expiry))
 
-    def test_quarantine_does_not_fabricate_cooldown_for_unrelated_credential(self):
+    # A corrupt file could have held a still-active Retry-After for *any*
+    # credential -- once corruption is detected, a per-key quarantine that
+    # only blocks the key someone happened to check first is fail-open for
+    # every other credential. The quarantine must be global: every
+    # credential blocks until the single bounded window expires.
+
+    def test_global_quarantine_blocks_a_different_key_in_the_same_process(self):
+        # A: corrupt file, checking key-a starts the global quarantine.
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("{not valid json", encoding="utf-8")
-        self.store.get("key-a", now=NOW)  # quarantines the file for key-a only
-        # key-b was never checked against the corrupt file -- it must not
-        # inherit a trusted cooldown (nor a fabricated absence-of-one) from
-        # key-a's quarantine; the corrupt file never said anything true
-        # about key-b, so it must not appear in the quarantined state at
-        # all, and a check for it proceeds on its own merits.
-        raw = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertNotIn("key-b", raw)
-        self.assertIsNone(self.store.get("key-b", now=NOW))
+        self.assertIsNotNone(self.store.get("key-a", now=NOW))
+        # B: key-b, in the very same process/store, is blocked too -- not
+        # because key-b has its own recorded cooldown, but because the
+        # global quarantine covers every credential.
+        self.assertIsNotNone(self.store.get("key-b", now=NOW))
+
+    def test_global_quarantine_persists_across_new_process_for_both_keys(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json", encoding="utf-8")
+        self.store.get("key-a", now=NOW)
+        before_expiry = NOW + timedelta(seconds=1)
+        # C: new process, key-a, still before expiry -> blocked.
+        self.assertIsNotNone(CooldownStore(self.path).get("key-a", now=before_expiry))
+        # D: new process, key-b, still before expiry -> blocked.
+        self.assertIsNotNone(CooldownStore(self.path).get("key-b", now=before_expiry))
+
+    def test_quarantine_does_not_fabricate_per_key_cooldown_entries(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json", encoding="utf-8")
+        self.store.get("key-a", now=NOW)
+        parsed = json.loads(self.path.read_text(encoding="utf-8"))
+        # Only the global sentinel is written -- no invented per-account
+        # 429 history for key-a, key-b, or anything else.
+        self.assertEqual({GLOBAL_QUARANTINE_KEY}, set(parsed.keys()))
+
+    def test_after_global_quarantine_expiry_each_key_resumes_independently(self):
+        # E: once the global quarantine window has passed, keys go back to
+        # behaving on their own per-key state -- an untouched key has none
+        # (proceeds), while a key with its own genuine recorded cooldown
+        # still honors it.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json", encoding="utf-8")
+        self.store.get("key-a", now=NOW)  # arms the global quarantine
+        after_expiry = NOW + timedelta(seconds=CORRUPT_STATE_COOLDOWN_SECONDS + 1)
+        self.assertIsNone(self.store.get("key-a", now=after_expiry))
+        self.assertIsNone(self.store.get("key-b", now=after_expiry))
+        self.store.set_retry_until("key-b", after_expiry + timedelta(seconds=300))
+        self.assertIsNone(self.store.get("key-a", now=after_expiry))
+        self.assertIsNotNone(self.store.get("key-b", now=after_expiry))
+
+    def test_no_permanent_lockout_after_global_quarantine_expiry(self):
+        # I: the global quarantine window itself is bounded and expires --
+        # it does not compound into an unbounded lock-out for any key.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json", encoding="utf-8")
+        self.store.get("key-a", now=NOW)
+        after_expiry = NOW + timedelta(seconds=CORRUPT_STATE_COOLDOWN_SECONDS + 1)
+        self.assertIsNone(CooldownStore(self.path).get("key-a", now=after_expiry))
+        self.assertIsNone(CooldownStore(self.path).get("key-b", now=after_expiry))
+
+    def test_real_429_after_recovery_persists_only_that_credential(self):
+        # F: after the global quarantine has expired, a genuine 429 for
+        # key-b persists a cooldown for key-b alone -- key-a is unaffected.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json", encoding="utf-8")
+        self.store.get("key-a", now=NOW)
+        after_expiry = NOW + timedelta(seconds=CORRUPT_STATE_COOLDOWN_SECONDS + 1)
+        self.store.set_retry_until("key-b", after_expiry + timedelta(seconds=120))
+        self.assertIsNone(self.store.get("key-a", now=after_expiry))
+        self.assertIsNotNone(self.store.get("key-b", now=after_expiry))
+
+    def test_successful_key_a_does_not_clear_key_b_cooldown(self):
+        # G
+        self.store.set_retry_until("key-a", NOW + timedelta(seconds=300))
+        self.store.set_retry_until("key-b", NOW + timedelta(seconds=300))
+        self.store.clear("key-a")
+        self.assertIsNone(self.store.get("key-a", now=NOW))
+        self.assertIsNotNone(self.store.get("key-b", now=NOW))
 
     def test_quarantine_persists_no_token_or_credential_content(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)

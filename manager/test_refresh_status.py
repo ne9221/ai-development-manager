@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from collectors.claude_oauth import AuthStaleError, RateLimitedError
-from manager.claude_oauth_cooldown import CORRUPT_STATE_COOLDOWN_SECONDS, CooldownStore
+from manager.claude_oauth_cooldown import CORRUPT_STATE_COOLDOWN_SECONDS, GLOBAL_QUARANTINE_KEY, CooldownStore
 from manager.refresh_status import RefreshError, refresh, runtime_lock
 
 
@@ -241,6 +241,10 @@ class ClaudeOauthCooldownIntegrationTests(unittest.TestCase):
     def cooldown_path(self):
         return self.base / "claude_oauth_cooldown.json"
 
+    def write_cooldown_state(self, data):
+        self.cooldown_path().parent.mkdir(parents=True, exist_ok=True)
+        self.cooldown_path().write_text(json.dumps(data), encoding="utf-8")
+
     def test_429_persists_cooldown(self):
         collector = ScriptedOauthCollector({"<default>": [RateLimitedError("120")]})
         store = CooldownStore(self.cooldown_path())
@@ -339,9 +343,10 @@ class ClaudeOauthCooldownIntegrationTests(unittest.TestCase):
         self.assertEqual("rate_limited", result["providers"]["claude"])
         self.assertEqual([], collector.calls)
         # A: the corrupt file must have been quarantined into a clean,
-        # parseable file rather than left untouched.
+        # parseable file under the single global sentinel, not left
+        # untouched and not turned into a per-key entry.
         parsed = json.loads(self.cooldown_path().read_text(encoding="utf-8"))
-        self.assertIn("<default>", parsed)
+        self.assertEqual([GLOBAL_QUARANTINE_KEY], list(parsed.keys()))
 
     def test_corrupt_state_self_heals_full_lifecycle(self):
         # A: first refresh against a corrupt file makes zero calls and
@@ -368,11 +373,12 @@ class ClaudeOauthCooldownIntegrationTests(unittest.TestCase):
         self.assertEqual([], second_collector.calls)
 
         # C: once the quarantine cooldown has actually expired, a new
-        # process is allowed exactly one real request.
-        expired_store = CooldownStore(self.cooldown_path())
-        expired_store.set_retry_until(
-            "<default>", datetime.now(timezone.utc) - timedelta(seconds=1),
-        )
+        # process is allowed exactly one real request. (Simulated directly
+        # via the state file, since real wall-clock time won't have
+        # advanced CORRUPT_STATE_COOLDOWN_SECONDS within a fast test run.)
+        self.write_cooldown_state({GLOBAL_QUARANTINE_KEY: {
+            "retry_until": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }})
         third_collector = ScriptedOauthCollector({"<default>": [oauth_provider()]})
         third_result, _, _ = self.run_refresh(
             claude_config_dirs={None: None}, claude_oauth_collector=third_collector,
@@ -385,18 +391,17 @@ class ClaudeOauthCooldownIntegrationTests(unittest.TestCase):
         # behind for this credential.
         self.assertIsNone(CooldownStore(self.cooldown_path()).get("<default>"))
 
-    def test_corrupt_state_recovery_does_not_affect_unrelated_credential(self):
-        # E: a globally corrupt file, recovered while checking the default
-        # credential, must not fabricate a trusted (or falsely-clear)
-        # cooldown for a different, unrelated credential -- account-b's own
-        # real request still happens normally in the same cycle.
+    def test_corrupt_state_blocks_every_credential_in_the_same_cycle(self):
+        # A corrupt file could have held a still-active Retry-After for
+        # *any* credential -- a per-key quarantine that only blocks the
+        # credential checked first is fail-open for every other one. Both
+        # the default account and account-b must make zero HTTP calls in
+        # the same refresh() cycle that discovers the corruption.
         payload_b = self.base / "account-b.json"
         payload_b.write_text("{}", encoding="utf-8")
         self.cooldown_path().parent.mkdir(parents=True, exist_ok=True)
         self.cooldown_path().write_text("{corrupt for everyone", encoding="utf-8")
-        collector = ScriptedOauthCollector({
-            "/config/account-b": [oauth_provider(account_id="account-b")],
-        })
+        collector = ScriptedOauthCollector({})  # any call fails the test
         store = CooldownStore(self.cooldown_path())
         result, _, _ = self.run_refresh(
             claude_accounts={"account-b": payload_b},
@@ -404,10 +409,121 @@ class ClaudeOauthCooldownIntegrationTests(unittest.TestCase):
             claude_oauth_collector=collector, cooldown_store=store,
         )
         self.assertEqual("rate_limited", result["providers"]["claude"])
-        self.assertEqual("success", result["providers"]["claude:account-b"])
-        self.assertEqual(["/config/account-b"], collector.calls)
+        self.assertEqual("rate_limited", result["providers"]["claude:account-b"])
+        self.assertEqual([], collector.calls)
         parsed = json.loads(self.cooldown_path().read_text(encoding="utf-8"))
-        self.assertNotIn("/config/account-b", parsed)
+        self.assertEqual([GLOBAL_QUARANTINE_KEY], list(parsed.keys()))
+
+    def test_corrupt_state_blocks_second_credential_in_a_new_process(self):
+        # B/C/D: the default account's refresh discovers the corruption and
+        # arms the global quarantine; a *separate*, later refresh() call
+        # (standing in for a fresh Scheduled Task process) checking only
+        # account-b -- which was never checked the first time -- is still
+        # blocked, because the quarantine is global, not per-key.
+        self.cooldown_path().parent.mkdir(parents=True, exist_ok=True)
+        self.cooldown_path().write_text("{corrupt for everyone", encoding="utf-8")
+        first_collector = ScriptedOauthCollector({})
+        first_result, _, _ = self.run_refresh(
+            claude_config_dirs={None: None}, claude_oauth_collector=first_collector,
+            cooldown_store=CooldownStore(self.cooldown_path()),
+        )
+        self.assertEqual("rate_limited", first_result["providers"]["claude"])
+        self.assertEqual([], first_collector.calls)
+
+        payload_b = self.base / "account-b.json"
+        payload_b.write_text("{}", encoding="utf-8")
+        second_collector = ScriptedOauthCollector({})
+        second_result, _, _ = self.run_refresh(
+            claude_accounts={"account-b": payload_b},
+            claude_config_dirs={"account-b": "/config/account-b"},
+            claude_oauth_collector=second_collector,
+            cooldown_store=CooldownStore(self.cooldown_path()),
+        )
+        self.assertEqual("rate_limited", second_result["providers"]["claude:account-b"])
+        self.assertEqual([], second_collector.calls)
+
+    def test_after_global_quarantine_expiry_credentials_resume_independently(self):
+        # E: once the global quarantine has expired, each credential goes
+        # back to behaving on its own per-key state.
+        self.cooldown_path().parent.mkdir(parents=True, exist_ok=True)
+        self.cooldown_path().write_text("{corrupt for everyone", encoding="utf-8")
+        CooldownStore(self.cooldown_path()).get("<default>")  # arms quarantine
+        self.write_cooldown_state({GLOBAL_QUARANTINE_KEY: {
+            "retry_until": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }})
+
+        payload_b = self.base / "account-b.json"
+        payload_b.write_text("{}", encoding="utf-8")
+        collector = ScriptedOauthCollector({
+            "<default>": [oauth_provider()],
+            "/config/account-b": [oauth_provider(account_id="account-b")],
+        })
+        result, _, _ = self.run_refresh(
+            claude_accounts={"account-b": payload_b},
+            claude_config_dirs={None: None, "account-b": "/config/account-b"},
+            claude_oauth_collector=collector, cooldown_store=CooldownStore(self.cooldown_path()),
+        )
+        self.assertEqual("success", result["providers"]["claude"])
+        self.assertEqual("success", result["providers"]["claude:account-b"])
+        self.assertEqual(2, len(collector.calls))
+
+    def test_real_429_after_quarantine_recovery_persists_only_that_credential(self):
+        # F: a genuine 429 that happens after the global quarantine has
+        # expired still only affects the credential it was for.
+        self.cooldown_path().parent.mkdir(parents=True, exist_ok=True)
+        self.cooldown_path().write_text("{corrupt for everyone", encoding="utf-8")
+        CooldownStore(self.cooldown_path()).get("<default>")
+        self.write_cooldown_state({GLOBAL_QUARANTINE_KEY: {
+            "retry_until": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }})
+
+        payload_b = self.base / "account-b.json"
+        payload_b.write_text("{}", encoding="utf-8")
+        collector = ScriptedOauthCollector({
+            "<default>": [oauth_provider()],
+            "/config/account-b": [RateLimitedError("300")],
+        })
+        store = CooldownStore(self.cooldown_path())
+        result, _, _ = self.run_refresh(
+            claude_accounts={"account-b": payload_b},
+            claude_config_dirs={None: None, "account-b": "/config/account-b"},
+            claude_oauth_collector=collector, cooldown_store=store,
+        )
+        self.assertEqual("success", result["providers"]["claude"])
+        self.assertEqual("rate_limited", result["providers"]["claude:account-b"])
+        self.assertIsNone(store.get("<default>"))
+        self.assertIsNotNone(store.get("/config/account-b"))
+
+    def test_successful_account_a_does_not_clear_account_b_genuine_cooldown(self):
+        # G
+        payload_a = self.base / "account-a.json"
+        payload_a.write_text("{}", encoding="utf-8")
+        store = CooldownStore(self.cooldown_path())
+        store.set_retry_until("/config/account-b", datetime.now(timezone.utc) + timedelta(seconds=300))
+        collector = ScriptedOauthCollector({"/config/account-a": [oauth_provider(account_id="account-a")]})
+        result, _, _ = self.run_refresh(
+            claude_accounts={"account-a": payload_a},
+            claude_config_dirs={"account-a": "/config/account-a"},
+            claude_oauth_collector=collector, cooldown_store=store,
+        )
+        self.assertEqual("success", result["providers"]["claude:account-a"])
+        self.assertIsNotNone(store.get("/config/account-b"))
+
+    def test_global_quarantine_state_contains_no_credential_material(self):
+        # H
+        self.cooldown_path().parent.mkdir(parents=True, exist_ok=True)
+        self.cooldown_path().write_text(
+            "{corrupt, accessToken=Bearer sk-ant-fake-leaked-secret", encoding="utf-8",
+        )
+        store = CooldownStore(self.cooldown_path())
+        collector = ScriptedOauthCollector({})
+        self.run_refresh(
+            claude_config_dirs={None: None}, claude_oauth_collector=collector, cooldown_store=store,
+        )
+        raw = self.cooldown_path().read_text(encoding="utf-8")
+        self.assertNotIn("accessToken", raw)
+        self.assertNotIn("Bearer", raw)
+        self.assertNotIn("sk-ant-fake-leaked-secret", raw)
 
     def test_last_good_last_updated_unchanged_during_cooldown(self):
         old = status()

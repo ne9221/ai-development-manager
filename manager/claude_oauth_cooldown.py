@@ -32,6 +32,12 @@ from typing import Optional
 
 DEFAULT_CREDENTIAL_KEY = "<default>"
 
+# Sentinel key for a *global* quarantine, distinct from any real
+# credential_key (those are always a config_dir path string or
+# DEFAULT_CREDENTIAL_KEY, never this literal). See CooldownStore.get()'s
+# corrupt-file handling.
+GLOBAL_QUARANTINE_KEY = "__global_corrupt_quarantine__"
+
 # Bounds applied to every Retry-After value, valid or not: never trust a
 # provider-supplied delay of zero (would defeat the cooldown) or of more
 # than a day (a transient outage shouldn't lock a credential out for good).
@@ -108,11 +114,16 @@ class CooldownStore:
     """Atomic JSON-file-backed cooldown state:
         {"<default>": {"retry_until": "<iso8601>"}, "/path/to/config": {...}}
 
-    A corrupt or malformed file is never trusted at face value -- reads
-    fail closed and immediately quarantine the untrusted content (see
-    get()), so corruption cannot cause a permanent lock-out by being
-    silently rediscovered by every future process. Every write (a 429, a
-    successful clear, or a quarantine) replaces the whole file atomically."""
+    A corrupt or malformed file is never trusted at face value. Its
+    per-key contents could have included a still-active Retry-After for
+    *any* credential, so a corrupt read can't be narrowed to "only the key
+    someone happened to check" -- it fails closed for every credential at
+    once, via one bounded GLOBAL_QUARANTINE_KEY entry (see get()), rather
+    than by fabricating individual cooldowns for every known credential.
+    Corruption cannot cause a permanent lock-out by being silently
+    rediscovered by every future process: quarantining is a single write,
+    and it self-expires. Every write (a 429, a successful clear, or a
+    quarantine) replaces the whole file atomically."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -143,30 +154,37 @@ class CooldownStore:
         future, else None (no recorded cooldown, an expired one, or an
         unknown key).
 
-        On a corrupt file, fails closed for *this* call -- returns
-        `now + CORRUPT_STATE_COOLDOWN_SECONDS` -- and, in the same step,
-        atomically quarantines the untrusted file: the whole corrupt
-        content is discarded (never silently preserved, since none of it
-        can be trusted) and replaced with a clean file containing only a
-        fresh bounded cooldown entry for `key`. This is what makes the
-        fail-closed window self-heal: a brand new process (e.g. the next
-        Scheduled Task invocation) reads a *valid* file, not the same
-        corruption, so it stops re-discovering corruption and re-arming a
-        fresh cooldown forever -- it sees an ordinary, expiring cooldown
-        for `key` and, once that expires, resumes normally. Any other
-        credential's entry that happened to be in the corrupt file is
-        dropped, not "recovered" -- it was never trustworthy, and reviving
-        it would fabricate a cooldown (or its absence) for a credential
-        this call never actually checked."""
+        On a corrupt file, fails closed for *every* credential, not just
+        `key`: the whole corrupt content is discarded (never silently
+        preserved -- none of it can be trusted, and any of it could have
+        been a still-active Retry-After for some other credential) and
+        replaced with a clean file containing exactly one entry, under
+        GLOBAL_QUARANTINE_KEY, recording a fresh bounded
+        `now + CORRUPT_STATE_COOLDOWN_SECONDS`. This call returns that same
+        timestamp regardless of which `key` triggered it. A subsequent
+        call for any key, in this process or a brand new one reading the
+        same now-valid file, sees the still-active global entry and blocks
+        too -- until it expires, at which point normal per-credential
+        state (which the global quarantine never touches or fabricates)
+        resumes on its own. This is what makes the fail-closed window
+        self-heal instead of compounding into a permanent lock-out: it is
+        one bounded write, not one rediscovery of corruption per process."""
         now = now or now_utc()
         data, corrupt = self._read_raw()
         if corrupt:
             retry_until = now + timedelta(seconds=CORRUPT_STATE_COOLDOWN_SECONDS)
             try:
-                self._write({key: {"retry_until": _iso(retry_until)}})
+                self._write({GLOBAL_QUARANTINE_KEY: {"retry_until": _iso(retry_until)}})
             except OSError:
                 pass
             return retry_until
+        global_retry_until = self._entry_retry_until(data, GLOBAL_QUARANTINE_KEY, now)
+        if global_retry_until is not None:
+            return global_retry_until
+        return self._entry_retry_until(data, key, now)
+
+    @staticmethod
+    def _entry_retry_until(data: dict, key: str, now: datetime) -> Optional[datetime]:
         entry = data.get(key)
         if not isinstance(entry, dict):
             return None
@@ -176,11 +194,13 @@ class CooldownStore:
         return retry_until
 
     def set_retry_until(self, key: str, retry_until: datetime) -> None:
+        assert key != GLOBAL_QUARANTINE_KEY, "real credential keys must never collide with the quarantine sentinel"
         data, _ = self._read_raw()
         data[key] = {"retry_until": _iso(retry_until)}
         self._write(data)
 
     def clear(self, key: str) -> None:
+        assert key != GLOBAL_QUARANTINE_KEY, "real credential keys must never collide with the quarantine sentinel"
         data, corrupt = self._read_raw()
         if corrupt or key not in data:
             return
