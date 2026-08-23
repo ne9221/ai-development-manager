@@ -45,10 +45,11 @@ function New-FakePython([string]$Dir, [bool]$ProvenanceFails = $false, [string]$
         "if %ERRORLEVEL%==0 (",
         # Logged unconditionally on the actual ingress-poll invocation, not
         # just its args, so a test can prove the specific env vars this
-        # script is required to carry (ingress folder/owner, idempotency
-        # bucket/object, WorkspaceRoot) actually reached the child process
-        # environment rather than merely existing in the caller's $env:.
-        "  echo ENV FOLDER=%ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID% OWNER=%ADM_DRIVE_DISPATCH_INGRESS_OWNER% BUCKET=%ADM_DRIVE_INGRESS_IDEMPOTENCY_BUCKET% OBJECT=%ADM_DRIVE_INGRESS_IDEMPOTENCY_OBJECT% WORKSPACE=%ADM_WORKSPACE_ROOT% >> `"%FAKE_PYTHON_LOG%`"",
+        # script is required to carry (ingress folder/owner, the canonical
+        # ADM_LOCK_GCS_BUCKET idempotency bucket, WorkspaceRoot) actually
+        # reached the child process environment rather than merely existing
+        # in the caller's $env:.
+        "  echo ENV FOLDER=%ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID% OWNER=%ADM_DRIVE_DISPATCH_INGRESS_OWNER% BUCKET=%ADM_LOCK_GCS_BUCKET% WORKSPACE=%ADM_WORKSPACE_ROOT% >> `"%FAKE_PYTHON_LOG%`"",
         "  exit /b 0",
         ")",
         "exit /b 1"
@@ -113,8 +114,7 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
             -PythonDeps "deps" `
             -IngressFolderId "folder-id" `
             -IngressOwner "owner@example.com" `
-            -IdempotencyBucket "idem-bucket" `
-            -IdempotencyObject "idem-object.json" `
+            -GcsBucket "idem-bucket" `
             -WorkspaceRoot $global:admWorkspaceRoot
     }
 
@@ -143,7 +143,7 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
         $vbsContent | Should Match ([regex]::Escape("-WorkspaceRoot `"`"$global:admWorkspaceRoot`"`""))
     }
 
-    It "carries required ingress folder/owner and idempotency bucket/object config into the wrapped command line" {
+    It "carries required ingress folder/owner and the canonical GCS bucket config into the wrapped command line" {
         Invoke-Install | Out-Null
         $vbsPath = $global:admCapturedAction.Arguments.Trim('"')
         $vbsContent = Get-Content -Raw -LiteralPath $vbsPath
@@ -151,10 +151,13 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
         $vbsContent | Should Match ([regex]::Escape('folder-id'))
         $vbsContent | Should Match ([regex]::Escape('-IngressOwner'))
         $vbsContent | Should Match ([regex]::Escape('owner@example.com'))
-        $vbsContent | Should Match ([regex]::Escape('-IdempotencyBucket'))
+        $vbsContent | Should Match ([regex]::Escape('-GcsBucket'))
         $vbsContent | Should Match ([regex]::Escape('idem-bucket'))
-        $vbsContent | Should Match ([regex]::Escape('-IdempotencyObject'))
-        $vbsContent | Should Match ([regex]::Escape('idem-object.json'))
+        # No separate static idempotency-object parameter: dispatch request
+        # idempotency object names are generated dynamically by
+        # manager.dispatch_requests.dispatch_request_registry(), not a
+        # static per-install value.
+        $vbsContent | Should Not Match ([regex]::Escape('-IdempotencyObject'))
     }
 
     It "runs every 1 minute with no overlapping instances" {
@@ -178,8 +181,7 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
             -ManagerHome $global:admManagerHome `
             -IngressFolderId "folder-id" `
             -IngressOwner "owner@example.com" `
-            -IdempotencyBucket "idem-bucket" `
-            -IdempotencyObject "idem-object.json" `
+            -GcsBucket "idem-bucket" `
             -WorkspaceRoot $global:admWorkspaceRoot `
             -ExecutionTimeLimitMinutes 2 | Out-Null
         $global:admCapturedSettings.ExecutionTimeLimit | Should Be "PT2M"
@@ -196,8 +198,7 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
                 -ManagerHome $global:admManagerHome `
                 -IngressFolderId "folder-id" `
                 -IngressOwner "owner@example.com" `
-                -IdempotencyBucket "idem-bucket" `
-                -IdempotencyObject "idem-object.json" `
+                -GcsBucket "idem-bucket" `
                 -WorkspaceRoot $case.Value 2>$null
             $LASTEXITCODE | Should Not Be 0
             Assert-MockCalled Register-ScheduledTask -Times 0 -Exactly -Scope It
@@ -218,8 +219,7 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
                 -ManagerHome $global:admManagerHome `
                 -IngressFolderId "folder-id" `
                 -IngressOwner "owner@example.com" `
-                -IdempotencyBucket "idem-bucket" `
-                -IdempotencyObject "idem-object.json" `
+                -GcsBucket "idem-bucket" `
                 -WorkspaceRoot "" 2>$null
         } catch {
             $threw = $true
@@ -235,8 +235,7 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
             -ManagerHome $global:admManagerHome `
             -IngressFolderId "folder-id" `
             -IngressOwner "owner@example.com" `
-            -IdempotencyBucket "idem-bucket" `
-            -IdempotencyObject "idem-object.json" `
+            -GcsBucket "idem-bucket" `
             -WorkspaceRoot ([IO.Path]::GetTempPath()) 2>$null
         $LASTEXITCODE | Should Not Be 0
         Assert-MockCalled Register-ScheduledTask -Times 0 -Exactly -Scope It
@@ -267,8 +266,7 @@ Describe "run_drive_dispatch_ingress.ps1 -- runtime behavior" {
         Remove-Item Env:FAKE_PYTHON_LOG -ErrorAction SilentlyContinue
         Remove-Item Env:ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID -ErrorAction SilentlyContinue
         Remove-Item Env:ADM_DRIVE_DISPATCH_INGRESS_OWNER -ErrorAction SilentlyContinue
-        Remove-Item Env:ADM_DRIVE_INGRESS_IDEMPOTENCY_BUCKET -ErrorAction SilentlyContinue
-        Remove-Item Env:ADM_DRIVE_INGRESS_IDEMPOTENCY_OBJECT -ErrorAction SilentlyContinue
+        Remove-Item Env:ADM_LOCK_GCS_BUCKET -ErrorAction SilentlyContinue
         Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $global:admOutsideCase) {
             Remove-Item -LiteralPath $global:admOutsideCase -Recurse -Force -ErrorAction SilentlyContinue
@@ -282,8 +280,7 @@ Describe "run_drive_dispatch_ingress.ps1 -- runtime behavior" {
             -ManagerHome $global:admManagerHome `
             -IngressFolderId "folder-id" `
             -IngressOwner "owner@example.com" `
-            -IdempotencyBucket "idem-bucket" `
-            -IdempotencyObject "idem-object.json" `
+            -GcsBucket "idem-bucket" `
             -WorkspaceRoot $global:admWorkspaceRoot
     }
 
@@ -307,17 +304,18 @@ Describe "run_drive_dispatch_ingress.ps1 -- runtime behavior" {
         ($argLines -join "`n") | Should Match ([regex]::Escape('-m manager.drive_dispatch_watcher --once'))
     }
 
-    It "carries required ingress folder/owner and idempotency bucket/object env vars" {
+    It "carries required ingress folder/owner env vars and the canonical ADM_LOCK_GCS_BUCKET" {
         # ADM_* env vars are asserted from inside the fake python stub's own
         # process (via cmd.exe %ADM_...% expansion into the ENV log line),
         # since the values must survive into the child process environment,
-        # not merely exist in this test's own $env: scope.
+        # not merely exist in this test's own $env: scope. ADM_LOCK_GCS_BUCKET
+        # is the exact name manager.gcs_lock_registry.BUCKET_ENV expects
+        # (see the cross-lane contract Describe block below).
         Invoke-Run -PythonPath $global:admFakePython | Out-Null
         $log = Get-Content -Raw -LiteralPath $global:admLog
         $log | Should Match "FOLDER=folder-id"
         $log | Should Match "OWNER=owner@example.com"
         $log | Should Match "BUCKET=idem-bucket"
-        $log | Should Match "OBJECT=idem-object.json"
         $log | Should Match ([regex]::Escape("WORKSPACE=$global:admWorkspaceRoot"))
     }
 
@@ -339,8 +337,7 @@ Describe "run_drive_dispatch_ingress.ps1 -- runtime behavior" {
                 -ManagerHome $global:admManagerHome `
                 -IngressFolderId "folder-id" `
                 -IngressOwner "owner@example.com" `
-                -IdempotencyBucket "idem-bucket" `
-                -IdempotencyObject "idem-object.json" `
+                -GcsBucket "idem-bucket" `
                 -WorkspaceRoot $case.Value 2>$null
             $LASTEXITCODE | Should Not Be 0
             (Test-Path -LiteralPath $global:admLog) | Should Be $false
@@ -359,8 +356,7 @@ Describe "run_drive_dispatch_ingress.ps1 -- runtime behavior" {
                 -ManagerHome $global:admManagerHome `
                 -IngressFolderId "folder-id" `
                 -IngressOwner "owner@example.com" `
-                -IdempotencyBucket "idem-bucket" `
-                -IdempotencyObject "idem-object.json" `
+                -GcsBucket "idem-bucket" `
                 -WorkspaceRoot "" 2>$null
         } catch {
             $threw = $true
@@ -376,10 +372,108 @@ Describe "run_drive_dispatch_ingress.ps1 -- runtime behavior" {
             -ManagerHome $global:admManagerHome `
             -IngressFolderId "folder-id" `
             -IngressOwner "owner@example.com" `
-            -IdempotencyBucket "idem-bucket" `
-            -IdempotencyObject "idem-object.json" `
+            -GcsBucket "idem-bucket" `
             -WorkspaceRoot ([IO.Path]::GetTempPath()) 2>$null
         $LASTEXITCODE | Should Not Be 0
         (Test-Path -LiteralPath $global:admLog) | Should Be $false
+    }
+}
+
+Describe "cross-lane contract -- ADM_LOCK_GCS_BUCKET resolves in the frozen Python runner" {
+    # This is the one Describe block in this suite that touches a real
+    # python.exe rather than the fake stub -- it proves the *other* half
+    # of the contract the fake-stub tests above can't: not just that this
+    # Windows wrapper exports ADM_LOCK_GCS_BUCKET, but that the actual
+    # frozen manager.drive_dispatch_watcher.run_once() (from
+    # fix/home-drive-auto-ingress-runner-20260823 @
+    # 6a7f0df28f27f2f77edcc5ce224353174197d7ee, a separate lane's branch,
+    # never merged into this one) reads that exact env var name via
+    # manager.gcs_lock_registry.BUCKET_ENV and resolves it correctly.
+    #
+    # It never calls the real `--once` CLI entry point (that would build a
+    # real Drive service and hit real GCS/Drive) -- instead it calls the
+    # frozen module's own run_once(build_service_fn=..., store_factory=...,
+    # poll=...) with fakes injected for exactly those three parameters,
+    # the same dependency-injection seam the frozen lane's own
+    # test_drive_dispatch_watcher.py test suite uses. No real Drive/GCS
+    # call is made in either direction.
+    $frozenRunnerSha = "6a7f0df28f27f2f77edcc5ce224353174197d7ee"
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonCmd) { $pythonCmd = Get-Command python3 -ErrorAction SilentlyContinue }
+
+    BeforeEach {
+        $global:admCrossLaneCase = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Force -Path $global:admCrossLaneCase | Out-Null
+        $global:admFrozenWatcherPath = Join-Path $global:admCrossLaneCase "drive_dispatch_watcher.py"
+        # Extracted fresh from the frozen lane's commit on every run -- never
+        # written into this repo/branch's own working tree or committed.
+        & git -C $repository show "${frozenRunnerSha}:manager/drive_dispatch_watcher.py" | Out-File -LiteralPath $global:admFrozenWatcherPath -Encoding utf8
+        $global:admHarnessPath = Join-Path $global:admCrossLaneCase "cross_lane_harness.py"
+        $harness = @'
+import importlib.util
+import json
+import sys
+
+repo_root, frozen_watcher_path = sys.argv[1], sys.argv[2]
+sys.path.insert(0, repo_root)
+
+spec = importlib.util.spec_from_file_location("manager.drive_dispatch_watcher", frozen_watcher_path)
+mod = importlib.util.module_from_spec(spec)
+sys.modules["manager.drive_dispatch_watcher"] = mod
+spec.loader.exec_module(mod)
+
+captured = {}
+
+
+def fake_build_service():
+    captured["build_service_called"] = True
+    return "FAKE_SERVICE"
+
+
+def fake_store_factory(service):
+    return "FAKE_STORE"
+
+
+def fake_poll(store, service, bucket):
+    captured["bucket"] = bucket
+    return {"polled": True}
+
+
+try:
+    mod.run_once(build_service_fn=fake_build_service, store_factory=fake_store_factory, poll=fake_poll)
+    print(json.dumps({"outcome": "resolved", "bucket_env_name": mod.BUCKET_ENV, "bucket": captured.get("bucket")}))
+except mod.TaskError as exc:
+    print(json.dumps({"outcome": "fail_closed", "bucket_env_name": mod.BUCKET_ENV, "error": str(exc)}))
+'@
+        Set-Content -LiteralPath $global:admHarnessPath -Value $harness -Encoding utf8
+    }
+
+    It "resolves ADM_LOCK_GCS_BUCKET when the Windows wrapper's env var is set" {
+        if (-not $pythonCmd) { Set-TestInconclusive "no python.exe/python3.exe found on PATH in this environment" }
+        # Mirrors exactly what run_drive_dispatch_ingress.ps1 line
+        # `$env:ADM_LOCK_GCS_BUCKET = $GcsBucket` does before invoking
+        # `python -m manager.drive_dispatch_watcher --once`.
+        $env:ADM_LOCK_GCS_BUCKET = "bucket-from-windows-wrapper"
+        try {
+            $output = & $pythonCmd.Source $global:admHarnessPath $repository $global:admFrozenWatcherPath
+        } finally {
+            Remove-Item Env:ADM_LOCK_GCS_BUCKET -ErrorAction SilentlyContinue
+        }
+        $LASTEXITCODE | Should Be 0
+        $result = $output | ConvertFrom-Json
+        $result.bucket_env_name | Should Be "ADM_LOCK_GCS_BUCKET"
+        $result.outcome | Should Be "resolved"
+        $result.bucket | Should Be "bucket-from-windows-wrapper"
+    }
+
+    It "fails closed in the frozen runner when ADM_LOCK_GCS_BUCKET is absent, proving no silent env mismatch" {
+        if (-not $pythonCmd) { Set-TestInconclusive "no python.exe/python3.exe found on PATH in this environment" }
+        Remove-Item Env:ADM_LOCK_GCS_BUCKET -ErrorAction SilentlyContinue
+        $output = & $pythonCmd.Source $global:admHarnessPath $repository $global:admFrozenWatcherPath
+        $LASTEXITCODE | Should Be 0
+        $result = $output | ConvertFrom-Json
+        $result.bucket_env_name | Should Be "ADM_LOCK_GCS_BUCKET"
+        $result.outcome | Should Be "fail_closed"
+        $result.error | Should Match "ADM_LOCK_GCS_BUCKET"
     }
 }

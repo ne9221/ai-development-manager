@@ -5,8 +5,14 @@ param(
     [string]$PythonDeps,
     [Parameter(Mandatory=$true)][string]$IngressFolderId,
     [Parameter(Mandatory=$true)][string]$IngressOwner,
-    [Parameter(Mandatory=$true)][string]$IdempotencyBucket,
-    [Parameter(Mandatory=$true)][string]$IdempotencyObject,
+    # The canonical idempotency bucket -- manager.gcs_lock_registry.
+    # BUCKET_ENV ("ADM_LOCK_GCS_BUCKET"), the same bucket env
+    # manager.command_watcher and cloud.app already use. There is no
+    # separate ingress-specific idempotency object env: dispatch request
+    # idempotency object names are generated dynamically by
+    # manager.dispatch_requests.dispatch_request_registry() as
+    # dispatch-requests/{project_id}/{request_id}.json.
+    [Parameter(Mandatory=$true)][string]$GcsBucket,
     [string]$GoogleDriveToken,
     [Parameter(Mandatory=$true)][string]$WorkspaceRoot
 )
@@ -58,12 +64,13 @@ if ($PythonDeps) { $env:PYTHONPATH = $PythonDeps }
 $env:ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID = $IngressFolderId
 $env:ADM_DRIVE_DISPATCH_INGRESS_OWNER = $IngressOwner
 
-# Required idempotency bucket/object config -- distinct from the Command
-# Watcher's own leader-election lock (ADM_LOCK_GCS_BUCKET/OBJECT); this is
-# the ingress task's own dedupe ledger so a Drive request already turned
-# into a Task/Command is never re-ingested on the next 1-minute tick.
-$env:ADM_DRIVE_INGRESS_IDEMPOTENCY_BUCKET = $IdempotencyBucket
-$env:ADM_DRIVE_INGRESS_IDEMPOTENCY_OBJECT = $IdempotencyObject
+# Required idempotency bucket config, exported under the canonical env
+# name manager.gcs_lock_registry.BUCKET_ENV already defines
+# ("ADM_LOCK_GCS_BUCKET") -- the same variable manager.command_watcher and
+# cloud.app read. manager.drive_dispatch_watcher.run_once() requires this
+# exact name (os.environ.get(BUCKET_ENV)) and fails closed (TaskError) if
+# it is unset; there is no separate ingress-specific bucket/object pair.
+$env:ADM_LOCK_GCS_BUCKET = $GcsBucket
 
 # CWD must be $RepositoryPath before any `python -m manager.*` invocation so
 # the manager package resolves regardless of the caller's own working
