@@ -17,7 +17,7 @@
 # when run against a real production checkout (where $repository below
 # resolves to that checkout, not a throwaway clone).
 #
-# Three independent layers enforce that:
+# Four independent layers enforce that:
 #   1. Every install invocation below uses a unique test-only -TaskName,
 #      never one of the two canonical production names.
 #   2. Every install invocation passes an isolated -GeneratedWrapperDir
@@ -26,17 +26,26 @@
 #   3. $env:ADM_PESTER_TEST_ACTIVE is set for the lifetime of this file's
 #      test execution: install_drive_dispatch_ingress.ps1 itself refuses
 #      (exit 1, before any provenance activation or file write) to run
-#      with a production -TaskName or without an explicit
-#      -GeneratedWrapperDir while that sentinel is set -- so even a future
-#      regression in this file that forgets (1)/(2) fails closed inside
-#      the script under test, not silently.
+#      with a production -TaskName while that sentinel is set.
+#   4. New-AdmHiddenScheduledTaskAction itself (the shared helper both this
+#      installer AND install_command_watcher.ps1 route their wrapper write
+#      through -- see AdmHiddenLaunch.ps1 and AdmHiddenLaunch.Tests.ps1)
+#      refuses, before any file write, to run under that same sentinel
+#      without an explicit -GeneratedWrapperDir that is neither equal to
+#      nor a descendant of $RepositoryPath\manager\generated. This is the
+#      system-level backstop: it protects every installer that calls the
+#      shared helper, not just this one, so even a future regression in
+#      this file (or in a Command Watcher test suite) that forgets (1)/(2)
+#      fails closed inside the shared helper, not silently.
 # On top of that, Register-ScheduledTask/Get-ScheduledTask/
 # Unregister-ScheduledTask/Start-ScheduledTask/Stop-ScheduledTask are all
 # mocked below to either capture (Register-ScheduledTask only) or throw
 # (the other four, which neither installer script ever legitimately calls)
-# -- and a read-only Get-ScheduledTask snapshot of the two production task
-# names is taken before and after this file's Describe blocks run, outside
-# any Mock scope, to prove production state is unchanged.
+# -- and a read-only snapshot (task Action identity AND the SHA-256 of the
+# .vbs wrapper file that Action points at) of the two production task names
+# is taken before and after this file's Describe blocks run, outside any
+# Mock scope, to prove production state -- including the wrapper's actual
+# file content, not just its registered path -- is unchanged.
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repository = (Resolve-Path (Join-Path $here "..")).Path
 $installScript = Join-Path $here "install_drive_dispatch_ingress.ps1"
@@ -52,18 +61,54 @@ function Get-AdmProductionTaskSnapshot {
     # Deliberately does NOT capture .State: these are live, running
     # production tasks polling on their own 1-minute triggers, so State
     # legitimately flips between Ready/Running/Queued from one snapshot to
-    # the next with zero relation to this test file. Registration identity
-    # (Exists) and the actual wrapper the task launches (Actions -- exe +
-    # full argument string, which is exactly what a contaminated
-    # regenerated .vbs would change) are what a test run must never alter.
+    # the next with zero relation to this test file -- comparing it produced
+    # a false positive during earlier verification of this suite and has
+    # been removed.
+    #
+    # What this DOES capture, and what the before/after assertion below
+    # requires unchanged, is everything the historical contamination
+    # incident actually touched: the registered task's Action (Execute +
+    # Arguments -- unchanged even in that incident, since Register-
+    # ScheduledTask was mocked and never re-registered) AND, separately,
+    # the SHA-256 of the .vbs wrapper file that Action's Arguments point at
+    # on disk. That file's *content* -- not its path or the task
+    # registration -- is what a contaminated Pester run silently rewrote:
+    # the task kept pointing at the same real .vbs path the whole time,
+    # while New-AdmHiddenScheduledTaskAction (called with the real
+    # checkout's own path as -RepositoryPath) regenerated that exact file
+    # with test values. A snapshot that only compared Actions (as an
+    # earlier revision of this function did) cannot detect that -- the
+    # Arguments string is unchanged because it's still the same path; only
+    # the bytes at that path differ. Hashing the wrapper file closes that
+    # gap.
     $admProductionTaskNames | ForEach-Object {
         $task = $null
         try { $task = Get-ScheduledTask -TaskName $_ -ErrorAction Stop } catch { $task = $null }
         if ($task) {
-            $actionSummary = ($task.Actions | ForEach-Object { "$($_.Execute)|$($_.Arguments)" }) -join ";"
-            [PSCustomObject]@{ TaskName = $_; Exists = $true; Actions = $actionSummary }
+            $execute = $task.Actions[0].Execute
+            $arguments = $task.Actions[0].Arguments
+            $vbsPath = $null
+            if ($arguments -match '"([^"]+\.vbs)"') { $vbsPath = $Matches[1] }
+            $vbsExists = $false
+            $vbsHash = $null
+            if ($vbsPath -and (Test-Path -LiteralPath $vbsPath -PathType Leaf)) {
+                $vbsExists = $true
+                $vbsHash = (Get-FileHash -LiteralPath $vbsPath -Algorithm SHA256).Hash
+            }
+            [PSCustomObject]@{
+                TaskName  = $_
+                Exists    = $true
+                Execute   = $execute
+                Arguments = $arguments
+                VbsPath   = $vbsPath
+                VbsExists = $vbsExists
+                VbsHash   = $vbsHash
+            }
         } else {
-            [PSCustomObject]@{ TaskName = $_; Exists = $false; Actions = $null }
+            [PSCustomObject]@{
+                TaskName = $_; Exists = $false; Execute = $null; Arguments = $null
+                VbsPath = $null; VbsExists = $false; VbsHash = $null
+            }
         }
     }
 }
@@ -696,7 +741,15 @@ $admAfterSnapshot = @(Get-AdmProductionTaskSnapshot)
 for ($admI = 0; $admI -lt $admProductionTaskNames.Count; $admI++) {
     $admBefore = $admBeforeSnapshot[$admI]
     $admAfter = $admAfterSnapshot[$admI]
-    if ($admBefore.Exists -ne $admAfter.Exists -or $admBefore.State -ne $admAfter.State -or $admBefore.Actions -ne $admAfter.Actions) {
-        Write-Error "PRODUCTION_SCHEDULED_TASK_MUTATED: '$($admBefore.TaskName)' changed during this Pester file's execution.`nBefore: Exists=$($admBefore.Exists) State=$($admBefore.State) Actions=$($admBefore.Actions)`nAfter:  Exists=$($admAfter.Exists) State=$($admAfter.State) Actions=$($admAfter.Actions)"
+    # Intentionally excludes .State (see the comment on
+    # Get-AdmProductionTaskSnapshot above) -- everything else, including
+    # VbsHash, must be byte-for-byte identical.
+    if ($admBefore.Exists -ne $admAfter.Exists `
+        -or $admBefore.Execute -ne $admAfter.Execute `
+        -or $admBefore.Arguments -ne $admAfter.Arguments `
+        -or $admBefore.VbsPath -ne $admAfter.VbsPath `
+        -or $admBefore.VbsExists -ne $admAfter.VbsExists `
+        -or $admBefore.VbsHash -ne $admAfter.VbsHash) {
+        Write-Error "PRODUCTION_SCHEDULED_TASK_MUTATED: '$($admBefore.TaskName)' changed during this Pester file's execution.`nBefore: Exists=$($admBefore.Exists) Execute=$($admBefore.Execute) Arguments=$($admBefore.Arguments) VbsPath=$($admBefore.VbsPath) VbsExists=$($admBefore.VbsExists) VbsHash=$($admBefore.VbsHash)`nAfter:  Exists=$($admAfter.Exists) Execute=$($admAfter.Execute) Arguments=$($admAfter.Arguments) VbsPath=$($admAfter.VbsPath) VbsExists=$($admAfter.VbsExists) VbsHash=$($admAfter.VbsHash)"
     }
 }

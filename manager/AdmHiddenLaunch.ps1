@@ -25,6 +25,33 @@ function New-AdmHiddenScheduledTaskAction {
         [string]$GeneratedWrapperDir
     )
 
+    # System-level fail-closed guard: every hidden Scheduled Task installer
+    # (install_command_watcher.ps1, install_drive_dispatch_ingress.ps1, and
+    # any future one) routes its wrapper write through this one function,
+    # so this is the one place that can protect all of them regardless of
+    # whether a given installer script itself remembers to isolate its own
+    # test invocations. When $env:ADM_PESTER_TEST_ACTIVE is set (a Pester
+    # run sets it for the duration of its own It blocks -- see
+    # DriveDispatchIngress.Tests.ps1), refuse -- before any New-Item or
+    # Set-Content below -- to write into the real repository tree's
+    # manager\generated\ directory or anything under it, whether that's
+    # because -GeneratedWrapperDir was left at its production default or
+    # was itself (accidentally or maliciously) pointed there. Comparison is
+    # done on fully-resolved paths so a relative/trailing-slash/case
+    # variation of the same real directory cannot slip through. Production
+    # behavior when the sentinel is absent is completely unchanged: no
+    # caller is required to pass -GeneratedWrapperDir.
+    if (-not [string]::IsNullOrEmpty($env:ADM_PESTER_TEST_ACTIVE)) {
+        $admProductionGeneratedDir = [IO.Path]::GetFullPath((Join-Path $RepositoryPath "manager\generated")).TrimEnd('\')
+        if ([string]::IsNullOrWhiteSpace($GeneratedWrapperDir)) {
+            throw "GENERATED_WRAPPER_DIR_REQUIRED_UNDER_TEST: `$env:ADM_PESTER_TEST_ACTIVE is set; New-AdmHiddenScheduledTaskAction requires an explicit -GeneratedWrapperDir so the generated .vbs wrapper (for WrapperName '$WrapperName') is never written into the real repository tree ('$admProductionGeneratedDir')."
+        }
+        $admResolvedWrapperDir = [IO.Path]::GetFullPath($GeneratedWrapperDir).TrimEnd('\')
+        if ($admResolvedWrapperDir -eq $admProductionGeneratedDir -or $admResolvedWrapperDir.StartsWith($admProductionGeneratedDir + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "GENERATED_WRAPPER_DIR_FORBIDDEN_UNDER_TEST: -GeneratedWrapperDir ('$admResolvedWrapperDir') resolves to or under the real repository's generated-wrapper directory ('$admProductionGeneratedDir') while `$env:ADM_PESTER_TEST_ACTIVE is set; refusing to write a test-generated wrapper (for WrapperName '$WrapperName') there."
+        }
+    }
+
     $escapedArgs = $PowerShellArguments.Replace('"', '""')
     $vbsDir = if ($GeneratedWrapperDir) { $GeneratedWrapperDir } else { Join-Path $RepositoryPath "manager\generated" }
     New-Item -ItemType Directory -Force -Path $vbsDir | Out-Null
