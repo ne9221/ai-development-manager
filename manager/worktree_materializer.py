@@ -31,6 +31,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from manager.production_guard import ProductionPathGuardError, assert_not_production_path
 from manager.project_registry import normalize_repo_identity
 from manager.tasks import TaskError, update_task
 from manager.trusted_ingress import repo_write_policy_satisfied
@@ -221,6 +222,17 @@ def _verify_existing_worktree_owner(worktree_path, branch, baseline_head, owner)
 
 def _ensure_physical_worktree(canonical_checkout, worktree_path: Path, branch: str, branch_short: str,
                                baseline_head: str, owner, runner) -> None:
+    # Defense in depth: the deterministic worktrees/<project_id>/<task_id>
+    # naming already keeps this path away from any real checkout, but never
+    # trust that by construction alone -- if a workspace_root were ever
+    # misconfigured to point at (or under) a marked production runtime
+    # checkout, this must still fail closed rather than materialize a
+    # "worktree" that is actually the protected production path.
+    try:
+        assert_not_production_path(worktree_path, "materialize an isolated worktree")
+    except ProductionPathGuardError as exc:
+        raise WorktreeMaterializationError("production_path_protected", str(exc)) from exc
+
     entries = _list_worktrees(canonical_checkout, runner)
     match = next((entry for entry in entries if _same_path(entry.get("path"), worktree_path)), None)
     if match is not None:

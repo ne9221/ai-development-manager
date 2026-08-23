@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from manager import provenance
+from manager.production_guard import PRODUCTION_MARKER_FILENAME, is_marked_production_path
 
 MANAGER_DIR = Path(__file__).parent
 GIT = shutil.which("git")
@@ -147,6 +148,33 @@ class ProvenanceContractTests(unittest.TestCase):
         activated_path.write_text(json.dumps(data), encoding="utf-8")
         with self.assertRaisesRegex(provenance.ProvenanceError, "stale"):
             provenance.verify_running(self.repo, self.home, max_age_seconds=30 * 24 * 60 * 60)
+
+    # 11b. dirty production checkout -> FAIL, even when the SHA itself matches
+    def test_verify_running_fails_closed_on_dirty_working_tree(self):
+        provenance.capture_tested(self.repo, self.home)
+        provenance.activate(self.repo, self.home)
+        (self.repo / "file.txt").write_text("uncommitted edit", encoding="utf-8")
+        with self.assertRaisesRegex(provenance.ProvenanceError, "PROVENANCE_MISMATCH"):
+            provenance.verify_running(self.repo, self.home)
+
+    def test_verify_running_fails_closed_on_untracked_file(self):
+        provenance.capture_tested(self.repo, self.home)
+        provenance.activate(self.repo, self.home)
+        (self.repo / "untracked.txt").write_text("new file", encoding="utf-8")
+        with self.assertRaisesRegex(provenance.ProvenanceError, "PROVENANCE_MISMATCH"):
+            provenance.verify_running(self.repo, self.home)
+
+    # 11c. activation marks the checkout as a protected production path
+    def test_activate_marks_repository_path_as_production(self):
+        self.assertFalse(is_marked_production_path(self.repo))
+        provenance.capture_tested(self.repo, self.home)
+        provenance.activate(self.repo, self.home)
+        self.assertTrue(is_marked_production_path(self.repo))
+        self.assertTrue((self.repo / PRODUCTION_MARKER_FILENAME).exists())
+
+    def test_unactivated_checkout_is_never_marked_production(self):
+        provenance.capture_tested(self.repo, self.home)
+        self.assertFalse(is_marked_production_path(self.repo))
 
     # 11. Unicode/space path regression
     def test_full_cycle_succeeds_with_unicode_and_space_in_paths(self):
