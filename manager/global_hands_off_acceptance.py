@@ -135,47 +135,47 @@ def _check_freshness(name: str, evidence: Dict[str, Any], ts_field: str, now: da
 # ---------------------------------------------------------------------------
 
 
-def _check_formal_identity(evidence: Dict[str, Any]) -> CheckResult:
-    name = "formal_target_identity"
-    section = evidence.get("formal_identity")
-    if not isinstance(section, dict):
-        return _missing(name)
-    expected, actual = section.get("expected"), section.get("actual")
-    if not expected or not actual:
-        return CheckResult(name, STATUS_UNKNOWN, f"{name}: expected/actual identity not both supplied")
-    if expected != actual:
-        return CheckResult(name, STATUS_FAIL, f"{name}: expected {expected!r} but actual is {actual!r}")
-    return CheckResult(name, STATUS_PASS, f"{name}: {actual!r} confirmed")
+def _check_home_target_identity(evidence: Dict[str, Any]) -> CheckResult:
+    """A single authoritative identity check: FORMAL_REMOTE, TESTED,
+    ACTIVATED, RUNNING, and the REMOTE/CLOUD runtime SHA must all equal
+    one top-level `expected_target_sha` -- not merely equal each other
+    pairwise within their own sections. Three independently-PASSing
+    sections (formal=AAA, TESTED/ACTIVATED/RUNNING=BBB, remote=CCC) must
+    never combine into an overall PASS; cross-checking against one
+    externally supplied target is what rules that out. A missing
+    expected_target_sha, or any missing component identity, is UNKNOWN
+    (truth unavailable) -- any supplied identity that disagrees with the
+    expected target, or with any other supplied identity, is FAIL."""
+    name = "home_target_identity"
+    expected = evidence.get("expected_target_sha")
 
-
-def _check_runtime_state(evidence: Dict[str, Any]) -> CheckResult:
-    name = "tested_activated_running_equal"
-    section = evidence.get("runtime_state")
-    if not isinstance(section, dict):
+    formal = evidence.get("formal_identity")
+    runtime = evidence.get("runtime_state")
+    remote = evidence.get("remote_runtime_identity")
+    if not isinstance(formal, dict) or not isinstance(runtime, dict) or not isinstance(remote, dict):
         return _missing(name)
-    tested, activated, running = section.get("tested"), section.get("activated"), section.get("running")
-    if not tested or not activated or not running:
-        return CheckResult(name, STATUS_UNKNOWN, f"{name}: TESTED/ACTIVATED/RUNNING not all supplied")
-    if not (tested == activated == running):
+
+    values = {
+        "formal_remote": formal.get("actual"),
+        "tested": runtime.get("tested"),
+        "activated": runtime.get("activated"),
+        "running": runtime.get("running"),
+        "remote_cloud_runtime": remote.get("actual_sha"),
+    }
+
+    if not expected:
+        return CheckResult(name, STATUS_UNKNOWN, f"{name}: expected_target_sha not supplied")
+    missing = sorted(k for k, v in values.items() if not v)
+    if missing:
+        return CheckResult(name, STATUS_UNKNOWN, f"{name}: missing identity value(s) for {missing}")
+
+    if any(v != expected for v in values.values()):
+        detail = ", ".join(f"{k}={v!r}" for k, v in values.items())
         return CheckResult(
             name, STATUS_FAIL,
-            f"{name}: mismatch TESTED={tested!r} ACTIVATED={activated!r} RUNNING={running!r}",
+            f"{name}: identities diverge from expected_target_sha={expected!r} ({detail})",
         )
-    return CheckResult(name, STATUS_PASS, f"{name}: all equal to {tested!r}")
-
-
-def _check_remote_runtime_identity(evidence: Dict[str, Any]) -> CheckResult:
-    name = "remote_runtime_identity"
-    section = evidence.get("remote_runtime_identity")
-    if not isinstance(section, dict):
-        return _missing(name)
-    expected, actual = section.get("expected_sha"), section.get("actual_sha")
-    if not expected or not actual:
-        return CheckResult(name, STATUS_UNKNOWN, f"{name}: expected_sha/actual_sha not both supplied")
-    if expected != actual:
-        return CheckResult(name, STATUS_FAIL,
-                            f"{name}: remote/cloud runtime is on {actual!r}, expected {expected!r}")
-    return CheckResult(name, STATUS_PASS, f"{name}: remote runtime matches expected {expected!r}")
+    return CheckResult(name, STATUS_PASS, f"{name}: FORMAL_REMOTE=TESTED=ACTIVATED=RUNNING=REMOTE/CLOUD_RUNTIME={expected!r}")
 
 
 def _check_bool_section(evidence: Dict[str, Any], key: str, flag: str, name: str) -> CheckResult:
@@ -283,9 +283,7 @@ def evaluate_home_visible(evidence: Dict[str, Any], *, now: Optional[datetime] =
                                  (CheckResult("evidence", STATUS_UNKNOWN, "evidence must be a dict"),))
 
     checks = [
-        _check_formal_identity(evidence),
-        _check_runtime_state(evidence),
-        _check_remote_runtime_identity(evidence),
+        _check_home_target_identity(evidence),
         _check_bool_section(evidence, "workspace_root_authority", "valid", "workspace_root_authority"),
         _check_bool_section(evidence, "watcher_identity", "valid", "watcher_identity"),
         _check_bool_section(evidence, "dashboard_health", "healthy", "dashboard_health"),
@@ -304,17 +302,32 @@ def evaluate_home_visible(evidence: Dict[str, Any], *, now: Optional[datetime] =
 # ---------------------------------------------------------------------------
 
 
+# Known upstream status vocabulary that doesn't match this module's own
+# PASS/NOT_READY/FAIL/UNKNOWN spelling, mapped at this adapter boundary
+# only -- this is not a redefinition of what UNKNOWN means globally, it is
+# a translation of one specific real upstream value (manager.
+# canonical_baseline_guard.STATUS_CONVERGENCE_REQUIRED) into the vocabulary
+# this evaluator already uses for "known incomplete, not yet passable".
+_UPSTREAM_STATUS_ALIASES = {
+    "CONVERGENCE_REQUIRED": STATUS_NOT_READY,
+}
+
+
 def _check_upstream_status(evidence: Dict[str, Any], key: str, name: str) -> CheckResult:
     """For sub-gates that already produce their own bounded status (Rule44's
     promotion gate, etc.) -- propagate that status verbatim rather than
-    re-deriving it, per 'consume existing evidence contracts'."""
+    re-deriving it, per 'consume existing evidence contracts'. Known upstream
+    aliases (see _UPSTREAM_STATUS_ALIASES) are normalized to this module's
+    vocabulary first; anything else unrecognized is still UNKNOWN, never
+    silently coerced."""
     section = evidence.get(key)
     if not isinstance(section, dict):
         return _missing(name)
-    status = section.get("status")
+    raw_status = section.get("status")
+    status = _UPSTREAM_STATUS_ALIASES.get(raw_status, raw_status)
     if status not in _VALID_STATUSES:
-        return CheckResult(name, STATUS_UNKNOWN, f"{name}: no recognized status supplied ({status!r})")
-    reason = section.get("reason") or f"{name} reported {status}"
+        return CheckResult(name, STATUS_UNKNOWN, f"{name}: no recognized status supplied ({raw_status!r})")
+    reason = section.get("reason") or f"{name} reported {raw_status}"
     return CheckResult(name, status, f"{name}: {reason}")
 
 
@@ -370,6 +383,60 @@ def _check_write_e2e(evidence: Dict[str, Any], key: str, name: str, now: datetim
             return CheckResult(name, STATUS_FAIL, f"{name}: lifecycle component {component!r} is missing/false")
 
     return CheckResult(name, STATUS_PASS, f"{name}: complete write E2E")
+
+
+# The canonical ADM project id, used only as a default -- a caller may
+# override it via evidence["expected_adm_project_id"] with another
+# explicitly trusted canonical id. Project identity is always read from
+# the E2E evidence's own `project_id` field; the "adm_write_e2e" /
+# "non_adm_write_e2e" *dict key names* are never treated as proof of which
+# project an E2E actually ran against.
+DEFAULT_ADM_PROJECT_ID = "ai-development-manager"
+
+
+def _check_distinct_write_e2e_projects(evidence: Dict[str, Any]) -> CheckResult:
+    """Two write E2Es that are structurally identical (same project, same
+    request) prove nothing about cross-project isolation -- both slots
+    passing `_check_write_e2e` independently is not sufficient. This check
+    additionally proves the two E2Es are genuinely distinct: the ADM slot's
+    own `project_id` field (never the dict key name) must equal the
+    canonical ADM project, the non-ADM slot's `project_id` must be present
+    and different from it, and both slots' request/E2E identities must be
+    present and different from each other."""
+    name = "distinct_adm_nonadm_write_e2e"
+    adm = evidence.get("adm_write_e2e")
+    non_adm = evidence.get("non_adm_write_e2e")
+    if not isinstance(adm, dict) or not isinstance(non_adm, dict):
+        return _missing(name)
+
+    expected_adm_project = evidence.get("expected_adm_project_id") or DEFAULT_ADM_PROJECT_ID
+    adm_project, non_adm_project = adm.get("project_id"), non_adm.get("project_id")
+    adm_request, non_adm_request = adm.get("request_id"), non_adm.get("request_id")
+
+    if not adm_project or not non_adm_project:
+        return CheckResult(name, STATUS_UNKNOWN, f"{name}: project_id not supplied for both write E2Es")
+    if not adm_request or not non_adm_request:
+        return CheckResult(name, STATUS_UNKNOWN, f"{name}: request_id not supplied for both write E2Es")
+
+    if adm_project != expected_adm_project:
+        return CheckResult(
+            name, STATUS_FAIL,
+            f"{name}: adm_write_e2e project_id {adm_project!r} is not the canonical ADM project {expected_adm_project!r}",
+        )
+    if non_adm_project == adm_project:
+        return CheckResult(
+            name, STATUS_FAIL,
+            f"{name}: non_adm_write_e2e project_id {non_adm_project!r} is the same as the ADM project (not a distinct project)",
+        )
+    if adm_request == non_adm_request:
+        return CheckResult(
+            name, STATUS_FAIL,
+            f"{name}: adm_write_e2e and non_adm_write_e2e share request_id {adm_request!r} (not distinct E2Es)",
+        )
+    return CheckResult(
+        name, STATUS_PASS,
+        f"{name}: ADM={adm_project!r}/{adm_request!r} distinct from non-ADM={non_adm_project!r}/{non_adm_request!r}",
+    )
 
 
 def _check_autonomous_continuation(evidence: Dict[str, Any]) -> CheckResult:
@@ -431,6 +498,7 @@ def evaluate_global_hands_off_complete(
         _check_upstream_status(evidence, "rule44", "rule44_evidence_verifier"),
         _check_write_e2e(evidence, "adm_write_e2e", "adm_repo_write_e2e", now),
         _check_write_e2e(evidence, "non_adm_write_e2e", "non_adm_repo_write_e2e", now),
+        _check_distinct_write_e2e_projects(evidence),
         _check_autonomous_continuation(evidence),
     ]
     overall = _combine(c.status for c in checks)

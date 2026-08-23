@@ -56,9 +56,10 @@ def _complete_smoke():
 
 def _complete_home_visible_evidence():
     return {
-        "formal_identity": {"expected": SHA_A, "actual": SHA_A},
+        "expected_target_sha": SHA_A,
+        "formal_identity": {"actual": SHA_A},
         "runtime_state": {"tested": SHA_A, "activated": SHA_A, "running": SHA_A},
-        "remote_runtime_identity": {"expected_sha": SHA_A, "actual_sha": SHA_A},
+        "remote_runtime_identity": {"actual_sha": SHA_A},
         "workspace_root_authority": {"valid": True},
         "watcher_identity": {"valid": True},
         "dashboard_health": {"healthy": True, "session_center_healthy": True},
@@ -77,11 +78,13 @@ def _complete_home_visible_evidence():
     }
 
 
-def _complete_write_e2e():
+def _complete_write_e2e(project_id, request_id):
     return {
         "kind": "write",
         "generated_at": FRESH,
         "max_age_seconds": 3600,
+        "project_id": project_id,
+        "request_id": request_id,
         "project_correct": True,
         "governance_valid": True,
         "baseline_valid": True,
@@ -95,6 +98,14 @@ def _complete_write_e2e():
     }
 
 
+def _complete_adm_write_e2e():
+    return _complete_write_e2e("ai-development-manager", "adm-e2e-req-0001")
+
+
+def _complete_non_adm_write_e2e():
+    return _complete_write_e2e("other-project", "non-adm-e2e-req-0001")
+
+
 def _complete_global_evidence():
     return {
         "home_visible": _complete_home_visible_evidence(),
@@ -102,8 +113,8 @@ def _complete_global_evidence():
         "direct_invoke": {"accepted": True, "frozen": True},
         "continuation": {"accepted": True, "frozen": True},
         "rule44": {"status": STATUS_PASS, "reason": "promotion gate passed"},
-        "adm_write_e2e": _complete_write_e2e(),
-        "non_adm_write_e2e": _complete_write_e2e(),
+        "adm_write_e2e": _complete_adm_write_e2e(),
+        "non_adm_write_e2e": _complete_non_adm_write_e2e(),
         "autonomous_continuation": {
             "proven": True,
             "manual_continue_required": False,
@@ -239,6 +250,58 @@ class HomeVisibleAntiFakeTest(unittest.TestCase):
         self.assertNotEqual(result.status, STATUS_PASS)
 
 
+class HomeTargetIdentityTest(unittest.TestCase):
+    """Blocker 1: formal/tested-activated-running/remote must never be able
+    to each internally agree while referring to *different* SHAs -- every
+    section, plus the top-level expected_target_sha, must resolve to one
+    single identity."""
+
+    def _mutated(self, mutate):
+        evidence = _complete_home_visible_evidence()
+        mutate(evidence)
+        return evaluate_home_visible(evidence, now=NOW)
+
+    def test_three_internally_consistent_sections_different_shas_fails(self):
+        # formal=AAA, TESTED/ACTIVATED/RUNNING=BBB, remote=CCC: each
+        # section is internally self-consistent, but they must not combine
+        # into a PASS just because no single section contradicts itself.
+        def mutate(e):
+            sha_c = "c" * 40
+            e["formal_identity"] = {"actual": SHA_A}
+            e["runtime_state"] = {"tested": SHA_B, "activated": SHA_B, "running": SHA_B}
+            e["remote_runtime_identity"] = {"actual_sha": sha_c}
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_FAIL)
+
+    def test_formal_disagrees_with_expected_target_only(self):
+        def mutate(e):
+            e["formal_identity"] = {"actual": SHA_B}
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_FAIL)
+
+    def test_missing_expected_target_sha_is_unknown_not_pass(self):
+        def mutate(e):
+            del e["expected_target_sha"]
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_UNKNOWN)
+
+    def test_missing_expected_target_sha_blocks_pass_even_if_all_sections_agree(self):
+        # All three sections agree with each other -- but with no
+        # authoritative expected_target_sha to cross-check against, that
+        # agreement alone must not be trusted as PASS.
+        def mutate(e):
+            del e["expected_target_sha"]
+            e["formal_identity"] = {"actual": SHA_A}
+            e["runtime_state"] = {"tested": SHA_A, "activated": SHA_A, "running": SHA_A}
+            e["remote_runtime_identity"] = {"actual_sha": SHA_A}
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_UNKNOWN)
+
+    def test_all_identities_equal_expected_target_passes(self):
+        result = evaluate_home_visible(_complete_home_visible_evidence(), now=NOW)
+        self.assertEqual(result.status, STATUS_PASS)
+
+
 class GlobalHandsOffPositiveTest(unittest.TestCase):
     def test_complete_evidence_passes(self):
         result = evaluate_global_hands_off_complete(_complete_global_evidence(), now=NOW)
@@ -340,6 +403,107 @@ class GlobalHandsOffAntiFakeTest(unittest.TestCase):
             e["direct_invoke"]["frozen"] = False
         result = self._mutated(mutate)
         self.assertEqual(result.status, STATUS_NOT_READY)
+
+    def test_rule44_convergence_required_normalizes_to_not_ready(self):
+        # Issue 3: real upstream vocabulary from
+        # manager.canonical_baseline_guard.STATUS_CONVERGENCE_REQUIRED must
+        # be recognized (normalized), not fall through to UNKNOWN as an
+        # unrecognized status.
+        def mutate(e):
+            e["rule44"] = {"status": "CONVERGENCE_REQUIRED", "reason": "upstream convergence required"}
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_NOT_READY)
+        rule44_check = next(c for c in result.checks if c.name == "rule44_evidence_verifier")
+        self.assertEqual(rule44_check.status, STATUS_NOT_READY)
+
+    def test_canonical_baseline_convergence_required_normalizes_to_not_ready(self):
+        def mutate(e):
+            e["canonical_baseline"] = {"status": "CONVERGENCE_REQUIRED", "reason": "main not yet fast-forwarded"}
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_NOT_READY)
+
+    def test_truly_unrecognized_upstream_status_stays_unknown(self):
+        # Normalizing one known alias must not turn into a blanket
+        # "accept anything" -- a genuinely unrecognized status is still
+        # UNKNOWN, not silently coerced to NOT_READY or PASS.
+        def mutate(e):
+            e["rule44"] = {"status": "SOME_FUTURE_STATUS_NOT_YET_KNOWN", "reason": "?"}
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_UNKNOWN)
+
+
+class DistinctWriteE2EProjectsTest(unittest.TestCase):
+    """Blocker 2: the ADM and non-ADM write E2Es must be provably distinct
+    projects/requests, never inferred from the 'adm_write_e2e' /
+    'non_adm_write_e2e' dict key names alone."""
+
+    def _mutated(self, mutate):
+        evidence = _complete_global_evidence()
+        mutate(evidence)
+        return evaluate_global_hands_off_complete(evidence, now=NOW)
+
+    def test_fresh_distinct_adm_and_non_adm_write_e2es_pass(self):
+        result = evaluate_global_hands_off_complete(_complete_global_evidence(), now=NOW)
+        self.assertEqual(result.status, STATUS_PASS)
+        check = next(c for c in result.checks if c.name == "distinct_adm_nonadm_write_e2e")
+        self.assertEqual(check.status, STATUS_PASS)
+
+    def test_same_adm_e2e_copied_into_both_slots_fails(self):
+        def mutate(e):
+            e["non_adm_write_e2e"] = copy.deepcopy(e["adm_write_e2e"])
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_FAIL)
+
+    def test_same_project_id_different_request_id_fails(self):
+        def mutate(e):
+            e["non_adm_write_e2e"]["project_id"] = e["adm_write_e2e"]["project_id"]
+            e["non_adm_write_e2e"]["request_id"] = "a-different-request-id"
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_FAIL)
+
+    def test_different_project_id_same_request_id_fails(self):
+        def mutate(e):
+            e["non_adm_write_e2e"]["request_id"] = e["adm_write_e2e"]["request_id"]
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_FAIL)
+
+    def test_missing_project_identity_is_unknown(self):
+        def mutate(e):
+            del e["adm_write_e2e"]["project_id"]
+        result = self._mutated(mutate)
+        check = next(c for c in result.checks if c.name == "distinct_adm_nonadm_write_e2e")
+        self.assertEqual(check.status, STATUS_UNKNOWN)
+
+    def test_missing_request_identity_is_unknown(self):
+        def mutate(e):
+            del e["non_adm_write_e2e"]["request_id"]
+        result = self._mutated(mutate)
+        check = next(c for c in result.checks if c.name == "distinct_adm_nonadm_write_e2e")
+        self.assertEqual(check.status, STATUS_UNKNOWN)
+
+    def test_adm_project_id_not_canonical_fails(self):
+        def mutate(e):
+            e["adm_write_e2e"]["project_id"] = "some-other-project"
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_FAIL)
+
+    def test_explicitly_supplied_canonical_adm_project_id_is_honored(self):
+        def mutate(e):
+            e["expected_adm_project_id"] = "adm-trusted-alias"
+            e["adm_write_e2e"]["project_id"] = "adm-trusted-alias"
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_PASS)
+
+    def test_duplicate_e2e_does_not_slip_past_via_dict_key_name_alone(self):
+        # Both slots claim to be "the ADM ones" and "the non-ADM ones" by
+        # key name, but carry identical project_id/request_id content --
+        # the key names alone must never be trusted as proof of identity.
+        def mutate(e):
+            shared = _complete_adm_write_e2e()
+            e["adm_write_e2e"] = copy.deepcopy(shared)
+            e["non_adm_write_e2e"] = copy.deepcopy(shared)
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_FAIL)
 
 
 class StatusVocabularyTest(unittest.TestCase):
