@@ -51,6 +51,50 @@ MAX_COMMANDS_PER_POLL = 4
 # projects, which is what this budget addresses instead.
 POLL_TIME_BUDGET_SECONDS = 40
 
+# Explicit true strings recognized by embedded_ingress_enabled() below;
+# everything else (including recognized false strings and malformed input)
+# resolves to disabled -- see that function's docstring.
+_TRUE_STRINGS = frozenset({"1", "true", "yes"})
+
+
+def embedded_ingress_enabled(raw=None):
+    """Explicit switch gating Command Watcher's own embedded Drive dispatch
+    ingress poll (poll_drive_dispatch_requests()), independent of whether
+    ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID happens to be set.
+
+    Migration contract (see fix/command-watcher-embedded-ingress-decouple-
+    20260823): once the dedicated Drive Dispatch Ingress Scheduled Task
+    (manager/run_drive_dispatch_ingress.ps1, frozen at 6a7f0df) is the sole
+    polling authority for a given install, that install's Command Watcher
+    must set ADM_COMMAND_WATCHER_EMBEDDED_INGRESS=0 so it never also calls
+    poll_drive_dispatch_requests() in parallel -- a stray leftover folder-id
+    env var must not silently re-enable duplicate polling.
+
+    Unset (raw is None, i.e. the env var itself is not present) defaults to
+    enabled, reproducing exactly the pre-migration behavior of every
+    existing install: embedded ingress runs whenever
+    ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID is present, same as before this
+    switch existed. This default is itself an explicit, tested choice
+    (test_embedded_ingress_enabled_defaults_to_enabled_when_unset), not an
+    accidental fallthrough.
+
+    Any recognized false string ("0"/"false"/"no", case-insensitive,
+    surrounding whitespace ignored) disables embedded ingress
+    unconditionally, regardless of the folder-id env var. Any value that is
+    neither a recognized true string nor a recognized false string --
+    including empty string, garbage text, or "2" -- fails closed to
+    disabled: an ambiguous config must never be interpreted as "keep the
+    duplicate-ingress poll alive."
+    """
+    if raw is None:
+        raw = os.environ.get("ADM_COMMAND_WATCHER_EMBEDDED_INGRESS")
+    if raw is None:
+        return True
+    normalized = raw.strip().lower()
+    if normalized in _TRUE_STRINGS:
+        return True
+    return False
+
 
 def execution_id(command):
     return f"command-{command['command_id']}"
@@ -734,7 +778,10 @@ def main(argv=None):
             discovery_service = build_service(timeout=WATCHER_DISCOVERY_TIMEOUT_SECONDS)
             discovery_store = DriveRecords(discovery_service)
             ingress = []
-            if os.environ.get("ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID"):
+            # embedded_ingress_enabled() gates this independent of the
+            # folder-id env var below -- see its docstring for the
+            # dedicated-Scheduled-Task migration contract this enforces.
+            if embedded_ingress_enabled() and os.environ.get("ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID"):
                 from manager.drive_dispatch_ingress import poll_drive_dispatch_requests
                 ingress = poll_drive_dispatch_requests(store, service, os.environ.get("ADM_LOCK_GCS_BUCKET"))
             result = poll_once(store, service, discovery_store=discovery_store)

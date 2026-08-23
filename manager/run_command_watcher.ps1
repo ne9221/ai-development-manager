@@ -10,6 +10,7 @@ param(
     [Parameter(Mandatory=$true)][string]$GcsObject,
     [string]$IngressFolderId,
     [string]$IngressOwner,
+    [string]$EmbeddedIngress,
     [string]$ClaudeAccountsConfig,
     [Parameter(Mandatory=$true)][string]$WorkspaceRoot
 )
@@ -56,6 +57,12 @@ $env:ADM_LOCK_GCS_BUCKET = $GcsBucket
 $env:ADM_LOCK_GCS_OBJECT = $GcsObject
 if ($IngressFolderId) { $env:ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID = $IngressFolderId }
 if ($IngressOwner) { $env:ADM_DRIVE_DISPATCH_INGRESS_OWNER = $IngressOwner }
+# Explicit embedded-ingress switch (see manager/command_watcher.py's
+# embedded_ingress_enabled()). Only exported when the installer was given a
+# value at all -- unset leaves the env var absent, which
+# embedded_ingress_enabled() itself treats as "enabled" (pre-migration
+# default), not this script silently choosing a default of its own.
+if ($EmbeddedIngress) { $env:ADM_COMMAND_WATCHER_EMBEDDED_INGRESS = $EmbeddedIngress }
 
 if (-not $ClaudeAccountsConfig) {
     $ClaudeAccountsConfig = Join-Path $ManagerHome "config\claude_accounts.json"
