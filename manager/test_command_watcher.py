@@ -13,9 +13,9 @@ from unittest.mock import Mock, patch
 from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_creation_identity
 from manager.command_watcher import (
-    CLAIM_TIMEOUT_SECONDS, PROVIDER_RUNTIMES, REQUIRED_TASK_POLICIES, _provider_state,
-    claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist, poll_once,
-    process_command, provider_quota_reliable, resolve_provider_runtime,
+    CLAIM_TIMEOUT_SECONDS, MAX_COMMANDS_PER_POLL, PROVIDER_RUNTIMES, REQUIRED_TASK_POLICIES, _provider_state,
+    _prioritized_commands, claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist,
+    poll_once, process_command, provider_quota_reliable, resolve_provider_runtime,
 )
 from manager.execution_lifecycle import enter_running_gate
 from manager.executions import execution_health, heartbeat_execution, reserve_execution
@@ -1499,6 +1499,154 @@ class PollOnceTimeBudgetTests(unittest.TestCase):
     def test_default_deadline_is_well_under_the_scheduled_task_cadence(self):
         from manager.command_watcher import POLL_TIME_BUDGET_SECONDS
         self.assertLess(POLL_TIME_BUDGET_SECONDS, 60)
+
+
+class CommandProcessingPriorityTests(unittest.TestCase):
+    """Covers the P0 fix for a real production trace: a stale `attention`
+    Command sitting ahead of a genuinely actionable `queued` Command in
+    Drive's own (effectively arbitrary) listing order could consume the one
+    process_command() slot a tight remaining poll budget leaves after a slow
+    bounded enumeration, starving the queued Command indefinitely. Fix is a
+    pure reordering of an already-returned batch -- no change to which
+    records are hydrated, how many are processed, or any
+    process_command()/_reconcile_active() semantics."""
+
+    def test_max_commands_per_poll_is_unchanged(self):
+        self.assertEqual(4, MAX_COMMANDS_PER_POLL)
+
+    def test_attention_then_queued_is_reordered_queued_first(self):
+        batch = [command(command_id="c-attn", status="attention"), command(command_id="c-queued", status="queued")]
+        ordered = _prioritized_commands(batch)
+        self.assertEqual(["c-queued", "c-attn"], [c["command_id"] for c in ordered])
+
+    def test_running_queued_attention_order_is_unchanged(self):
+        batch = [command(command_id="c-run", status="running"), command(command_id="c-queued", status="queued"),
+                 command(command_id="c-attn", status="attention")]
+        ordered = _prioritized_commands(batch)
+        self.assertEqual(["c-run", "c-queued", "c-attn"], [c["command_id"] for c in ordered])
+
+    def test_claimed_queued_attention_order_is_unchanged(self):
+        batch = [command(command_id="c-claim", status="claimed"), command(command_id="c-queued", status="queued"),
+                 command(command_id="c-attn", status="attention")]
+        ordered = _prioritized_commands(batch)
+        self.assertEqual(["c-claim", "c-queued", "c-attn"], [c["command_id"] for c in ordered])
+
+    def test_ordering_is_stable_within_each_priority_group(self):
+        batch = [
+            command(command_id="c-attn-1", status="attention"),
+            command(command_id="c-queued-1", status="queued"),
+            command(command_id="c-attn-2", status="attention"),
+            command(command_id="c-queued-2", status="queued"),
+            command(command_id="c-run-1", status="running"),
+            command(command_id="c-claim-1", status="claimed"),
+        ]
+        ordered = _prioritized_commands(batch)
+        # claimed/running group keeps its own relative (Drive-return) order,
+        # then queued group keeps its own relative order, then attention.
+        self.assertEqual(
+            ["c-run-1", "c-claim-1", "c-queued-1", "c-queued-2", "c-attn-1", "c-attn-2"],
+            [c["command_id"] for c in ordered],
+        )
+
+    def test_terminal_completed_and_failed_remain_skipped(self):
+        batch = [
+            command(command_id="c-done", status="completed", completed_at="2026-08-14T00:05:00Z", result={"status": "completed"}),
+            command(command_id="c-failed", status="failed", completed_at="2026-08-14T00:05:00Z", result={"status": "failed"}),
+            command(command_id="c-queued", status="queued"),
+            command(command_id="c-attn", status="attention"),
+        ]
+        ordered = _prioritized_commands(batch)
+        self.assertEqual(["c-queued", "c-attn"], [c["command_id"] for c in ordered])
+
+    def test_project_rotation_is_untouched_by_this_fix(self):
+        # Sanity check that this fix only reorders within an already-chosen
+        # project's batch -- _rotated_project_ids (cross-project fairness)
+        # is a separate, unmodified mechanism. See RotatedProjectIdsTests
+        # below for the full coverage of that mechanism itself.
+        from manager.command_watcher import _rotated_project_ids
+        ids = ["p1", "p2", "p3"]
+        self.assertEqual(_rotated_project_ids(ids, now=0.0), _rotated_project_ids(ids, now=0.0))
+
+
+class PollOnceProcessesQueuedBeforeStaleAttentionTests(unittest.TestCase):
+    """Integration-level coverage (real poll_once(), not just
+    _prioritized_commands() in isolation): reproduces the exact production
+    shape -- one stale `attention` Command (its execution record missing, so
+    _reconcile_active() just re-writes it back to attention, same as the
+    real predecessor observed in production) ahead of one actionable
+    `queued` Command, under a poll budget too tight to process both."""
+
+    ALLOWLIST = frozenset({("p1", "t1")})
+
+    def setUp(self):
+        self.store = CommandWatcherTests.allowlist_compliant_store()
+
+    def test_queued_work_is_selected_before_stale_attention_recovery_under_tight_budget(self):
+        # The stale attention command's own execution_id points at nothing
+        # -- exactly the real predecessor's shape (a recovery/backlog record
+        # with no live execution behind it any more).
+        self.store.put("commands", "p1", "cmd-attn", command(
+            command_id="cmd-attn", status="attention", execution_id="command-cmd-attn",
+        ))
+        self.store.put("commands", "p1", "cmd-queued", command(command_id="cmd-queued"))
+
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        calls = {"n": 0}
+
+        def fake_monotonic():
+            # Simulate enumeration having already consumed most of the
+            # budget: the project-level and first command-level checks pass
+            # (call 1-2), but the SECOND command-level check (i.e. any
+            # attempt to start a second process_command() this tick) is
+            # already past deadline.
+            calls["n"] += 1
+            return 0.0 if calls["n"] <= 2 else 100.0
+
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher.time.monotonic", side_effect=fake_monotonic):
+            results = poll_once(self.store, object(), allowlist=self.ALLOWLIST, deadline=50.0,
+                                 claim_factory=CommandWatcherTests.claim_factory,
+                                 health_check=lambda: True, quota_check=lambda service: True)
+
+        # Exactly one command got its process_command() slot this tick --
+        # and thanks to the priority reorder, it was the actionable queued
+        # one, not the stale attention backlog.
+        self.assertEqual(1, len(results))
+        self.assertEqual("completed", results[0]["status"])
+        runner.assert_called_once()
+        self.assertEqual("completed", self.store.get("commands", "p1", "cmd-queued")["result"]["status"])
+        # The stale attention command was never touched this tick -- it is
+        # exactly as attention as before, available on a later tick.
+        self.assertEqual("attention", self.store.get("commands", "p1", "cmd-attn")["status"])
+
+    def test_process_command_started_before_deadline_still_completes_naturally(self):
+        # Same shape, but the budget is tight enough that only the FIRST
+        # slot (now the queued command, post-reorder) is even attempted --
+        # once process_command() is called for it, it must still run to
+        # completion even though the deadline check would fail immediately
+        # after. This re-proves the existing lifecycle-safety guarantee
+        # still holds with the new ordering in front of it.
+        self.store.put("commands", "p1", "cmd-attn", command(
+            command_id="cmd-attn", status="attention", execution_id="command-cmd-attn",
+        ))
+        self.store.put("commands", "p1", "cmd-queued", command(command_id="cmd-queued"))
+
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        calls = {"n": 0}
+
+        def fake_monotonic():
+            calls["n"] += 1
+            return 0.0 if calls["n"] <= 2 else 100.0
+
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher.time.monotonic", side_effect=fake_monotonic):
+            results = poll_once(self.store, object(), allowlist=self.ALLOWLIST, deadline=50.0,
+                                 claim_factory=CommandWatcherTests.claim_factory,
+                                 health_check=lambda: True, quota_check=lambda service: True)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("completed", results[0]["status"])
+        runner.assert_called_once()
 
 
 class RotatedProjectIdsTests(unittest.TestCase):

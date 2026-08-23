@@ -690,6 +690,35 @@ def _enumerate_commands(store, project_id, deadline=None):
     return store.list_records("commands", project_id)
 
 
+_COMMAND_PRIORITY = {"claimed": 0, "running": 0, "queued": 1, "attention": 2}
+
+
+def _prioritized_commands(commands):
+    """Stable-reorder one project's already-hydrated, already-hydration-bounded
+    Command batch so active-lifecycle authority (claimed/running) is always
+    considered first, actionable new work (queued) second, and stale/recovery
+    backlog (attention) last -- terminal completed/failed records are dropped
+    here exactly as poll_once's own inline filter did before this function
+    existed. This changes only the ORDER process_command() is called in for
+    an already-returned batch; it does not change which records are in the
+    batch (list_records_bounded's own deadline-bounded hydration is
+    untouched), how many get processed (MAX_COMMANDS_PER_POLL is still
+    enforced by the caller), or any process_command()/_reconcile_active()
+    semantics.
+
+    Why: a stale `attention` Command sitting ahead of a `queued` one in
+    Drive's own (unspecified, effectively arbitrary) listing order could
+    consume the one process_command() slot a tight poll budget leaves after
+    discovery, starving genuinely actionable queued work behind old recovery
+    backlog indefinitely -- see the real production trace this fixes.
+    Sorting is stable (Python's sorted()), so relative order within each
+    priority group is preserved unchanged from Drive's own return order."""
+    return sorted(
+        (c for c in commands if c.get("status") not in ("completed", "failed")),
+        key=lambda c: _COMMAND_PRIORITY.get(c.get("status"), len(_COMMAND_PRIORITY)),
+    )
+
+
 def poll_once(store, service, allowlist=None, deadline=None, discovery_store=None, **factories):
     """`deadline`, if given, is a `time.monotonic()` value after which this
     call stops STARTING new project/command work and returns whatever it has
@@ -730,7 +759,16 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     reasoning. Project order is rotated deterministically by wall-clock
     time (_rotated_project_ids) so a project with a very large historical
     Command backlog cannot permanently starve every other project's
-    commands from ever being reached."""
+    commands from ever being reached.
+
+    Within one project's already-returned bounded batch, commands are
+    processed in _prioritized_commands() order (claimed/running, then
+    queued, then attention -- stable within each group), not Drive's own
+    return order, so a tight remaining budget after discovery spends its one
+    available process_command() slot on active-lifecycle authority or new
+    actionable work before stale attention/recovery backlog. See
+    _prioritized_commands()'s docstring for the production trace that
+    motivated this."""
     if allowlist is None:
         allowlist = load_allowlist()
     if deadline is None:
@@ -746,9 +784,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             commands = _enumerate_commands(discovery_store, project_id, deadline=deadline)
         except TaskError:
             continue
-        for command in commands:
-            if command.get("status") in ("completed", "failed"):
-                continue
+        for command in _prioritized_commands(commands):
             if len(results) == MAX_COMMANDS_PER_POLL:
                 return results
             if time.monotonic() >= deadline:
