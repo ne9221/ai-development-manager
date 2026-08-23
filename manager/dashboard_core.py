@@ -881,6 +881,137 @@ _REQUIRED_DISPATCH_TRUTH_FIELDS = (
 )
 
 
+def select_task_command(
+    commands: Sequence[Dict[str, Any]],
+    project_id: str,
+    task_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Select the exact task-scoped command record.
+
+    Matches strictly on (project_id, task_id). If multiple commands exist
+    for the exact task, deterministically chooses the latest by
+    (updated_at/created_at, command_id). Never falls back to unrelated
+    tasks or a provider-wide latest -- this is what makes "cannot confirm
+    running task" provably false when a task-scoped command record does
+    exist but a naive dict keyed only by task_id (rebuilt without a stable
+    tie-break, or capped to a small recent window) missed it.
+    """
+    matched = [
+        c for c in commands
+        if isinstance(c, dict)
+        and c.get("project_id") == project_id
+        and c.get("task_id") == task_id
+    ]
+    if not matched:
+        return None
+    return max(
+        matched,
+        key=lambda c: (
+            c.get("updated_at") or c.get("created_at") or "",
+            c.get("created_at") or "",
+            c.get("command_id") or "",
+        ),
+    )
+
+
+def select_task_execution(
+    executions: Sequence[Dict[str, Any]],
+    project_id: str,
+    task_id: str,
+    command: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Select the exact execution record for a task.
+
+    If command specifies an execution_id, retrieves that exact execution and
+    validates that its (project_id, task_id) matches. Otherwise, searches for
+    executions matching (project_id, task_id) and deterministically chooses
+    the latest. Never borrows executions from other tasks or projects.
+    """
+    if isinstance(command, dict) and command.get("execution_id"):
+        target_id = command.get("execution_id")
+        for exe in executions:
+            if isinstance(exe, dict) and exe.get("execution_id") == target_id:
+                if exe.get("project_id") == project_id and exe.get("task_id") == task_id:
+                    return exe
+                return None  # Linkage mismatch: execution does not belong to this task
+
+    matched = [
+        e for e in executions
+        if isinstance(e, dict)
+        and e.get("project_id") == project_id
+        and e.get("task_id") == task_id
+    ]
+    if not matched:
+        return None
+    return max(
+        matched,
+        key=lambda e: (
+            e.get("heartbeat_at")
+            or e.get("completed_at")
+            or e.get("started_at")
+            or e.get("reserved_at")
+            or "",
+            e.get("started_at") or "",
+            e.get("execution_id") or "",
+        ),
+    )
+
+
+def select_task_handoff(
+    handoffs: Sequence[Dict[str, Any]],
+    project_id: str,
+    task_id: str,
+    execution: Optional[Dict[str, Any]] = None,
+    command: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Select the exact task-scoped handoff record.
+
+    Matches strictly on (project_id, task_id). If an execution/command session
+    is available, prioritizes handoffs matching from_session. If multiple
+    handoffs exist for the same task, deterministically chooses the latest by
+    (created_at, handoff_id). Never borrows handoffs across tasks or projects.
+    """
+    matched = [
+        h for h in handoffs
+        if isinstance(h, dict)
+        and h.get("project_id") == project_id
+        and h.get("task_id") == task_id
+    ]
+    if not matched:
+        return None
+
+    # If session context is present, check for exact session correlation
+    target_session = None
+    if isinstance(execution, dict):
+        target_session = execution.get("provider_session_id") or execution.get("session_id")
+    if not target_session and isinstance(command, dict):
+        res = command.get("result")
+        if isinstance(res, dict):
+            target_session = res.get("session_id")
+
+    if target_session:
+        session_matched = [
+            h for h in matched
+            if h.get("from_session") == target_session
+        ]
+        if session_matched:
+            return max(
+                session_matched,
+                key=lambda h: (
+                    h.get("created_at") or "",
+                    h.get("handoff_id") or "",
+                ),
+            )
+
+    return max(
+        matched,
+        key=lambda h: (
+            h.get("created_at") or "",
+            h.get("handoff_id") or "",
+        ),
+    )
+
+
 def compute_visible_dispatch_gate(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """PASS/FAIL for the Visible Dispatch Gate banner.
 

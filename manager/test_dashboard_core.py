@@ -39,6 +39,9 @@ from manager.dashboard_core import (
     compute_overall_visible_dispatch_gate,
     validate_provenance_evidence_document,
     reconcile_watcher_provenance_evidence,
+    select_task_command,
+    select_task_execution,
+    select_task_handoff,
 )
 from manager.quota_forecast import (
     AccountQuotaForecast,
@@ -1087,6 +1090,184 @@ class ProvenanceEvidenceFileReconciliationTests(unittest.TestCase):
         self.assertIsNone(self._reconcile(age=7801, watcher_running=True, active=active)["tested_sha"])
         future = self._doc(captured_at=(self.now + timedelta(seconds=15)).isoformat())
         self.assertEqual("6d41645", reconcile_watcher_provenance_evidence("C:\\watcher-repo", "6d41645", validate_provenance_evidence_document(future), now=self.now)["tested_sha"])
+
+
+class TaskScopedLinkageContractTests(unittest.TestCase):
+    """Regression coverage for the P0 dashboard-quota-canonical-truth-20260824
+    fix: a task's Command/Execution/Handoff must be found by exact
+    (project_id, task_id) scoping, never borrowed from another task and
+    never silently reported as absent when it truly exists. This is what
+    "cannot confirm running task" / "canonical project/task data
+    unavailable" collapsed to before this fix (dashboard.py's
+    active_executions_dict only covered non-terminal executions, and
+    handoffs_dict was hardcoded permanently empty)."""
+
+    def setUp(self):
+        self.project_id = "ai-development-manager"
+        self.task_id = "task-alpha"
+
+    def test_exact_task_gets_its_own_handoff(self):
+        handoffs = [
+            {
+                "handoff_id": "task-alpha-final-1",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T10:00:00Z",
+                "reason": "completed",
+                "completed_work": ["Alpha work done"],
+            }
+        ]
+        selected = select_task_handoff(handoffs, self.project_id, self.task_id)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["handoff_id"], "task-alpha-final-1")
+        self.assertEqual(selected["completed_work"], ["Alpha work done"])
+
+    def test_cross_task_or_project_handoff_never_borrowed(self):
+        handoffs = [
+            {
+                "handoff_id": "task-beta-final-1",
+                "task_id": "task-beta",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T10:00:00Z",
+                "reason": "completed",
+            },
+            {
+                "handoff_id": "task-alpha-other-proj",
+                "task_id": "task-alpha",
+                "project_id": "other-project",
+                "created_at": "2026-08-23T10:00:00Z",
+                "reason": "completed",
+            }
+        ]
+        self.assertIsNone(select_task_handoff(handoffs, self.project_id, self.task_id))
+
+    def test_multiple_handoffs_deterministically_scoped(self):
+        handoffs = [
+            {
+                "handoff_id": "task-alpha-h1",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T10:00:00Z",
+                "from_session": "sess-1",
+            },
+            {
+                "handoff_id": "task-alpha-h2",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T11:00:00Z",
+                "from_session": "sess-2",
+            }
+        ]
+        latest = select_task_handoff(handoffs, self.project_id, self.task_id)
+        self.assertEqual(latest["handoff_id"], "task-alpha-h2")
+
+        session_matched = select_task_handoff(
+            handoffs, self.project_id, self.task_id,
+            execution={"provider_session_id": "sess-1"}
+        )
+        self.assertEqual(session_matched["handoff_id"], "task-alpha-h1")
+
+    def test_missing_handoff_returns_none_not_fabricated(self):
+        self.assertIsNone(select_task_handoff([], self.project_id, self.task_id))
+
+    def test_select_task_command_exact_scoping_and_latest(self):
+        commands = [
+            {
+                "command_id": "cmd-old",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T08:00:00Z",
+                "status": "completed",
+            },
+            {
+                "command_id": "cmd-new",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T09:00:00Z",
+                "status": "running",
+                "result": {"outcome": "success", "session_id": "sess-alpha-live"},
+            },
+            {
+                "command_id": "cmd-other",
+                "task_id": "task-other",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T10:00:00Z",
+                "status": "running",
+            }
+        ]
+        cmd = select_task_command(commands, self.project_id, self.task_id)
+        self.assertIsNotNone(cmd)
+        self.assertEqual(cmd["command_id"], "cmd-new")
+        self.assertEqual(cmd["status"], "running")
+        self.assertEqual(cmd["result"]["outcome"], "success")
+
+        # Unrelated / non-existent task must never borrow another task's command
+        self.assertIsNone(select_task_command(commands, self.project_id, "non-existent-task"))
+
+    def test_select_task_execution_prioritizes_command_linkage(self):
+        executions = [
+            {
+                "execution_id": "exec-1",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "provider_session_id": "sess-1",
+            },
+            {
+                "execution_id": "exec-2",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "provider_session_id": "sess-2",
+            }
+        ]
+        cmd = {"execution_id": "exec-1"}
+        exe = select_task_execution(executions, self.project_id, self.task_id, command=cmd)
+        self.assertEqual(exe["execution_id"], "exec-1")
+
+    def test_select_task_execution_mismatch_linkage_returns_none(self):
+        executions = [
+            {
+                "execution_id": "exec-cross-project",
+                "task_id": "task-alpha",
+                "project_id": "other-project",
+            }
+        ]
+        cmd = {"execution_id": "exec-cross-project"}
+        exe = select_task_execution(executions, self.project_id, self.task_id, command=cmd)
+        self.assertIsNone(exe)
+
+    def test_task_a_execution_never_borrows_task_b_data(self):
+        """Direct proof of the invariant: task execution must be task-scoped,
+        no cross-task borrowing, even when both tasks share a project and
+        one execution record was written slightly later."""
+        executions = [
+            {
+                "execution_id": "exec-task-a",
+                "task_id": "task-a",
+                "project_id": self.project_id,
+                "provider_session_id": "sess-a",
+                "heartbeat_at": "2026-08-24T09:00:00Z",
+            },
+            {
+                "execution_id": "exec-task-b",
+                "task_id": "task-b",
+                "project_id": self.project_id,
+                "provider_session_id": "sess-b",
+                "heartbeat_at": "2026-08-24T09:05:00Z",
+            },
+        ]
+        exe_a = select_task_execution(executions, self.project_id, "task-a")
+        exe_b = select_task_execution(executions, self.project_id, "task-b")
+        self.assertEqual(exe_a["execution_id"], "exec-task-a")
+        self.assertEqual(exe_b["execution_id"], "exec-task-b")
+        self.assertNotEqual(exe_a["execution_id"], exe_b["execution_id"])
+
+    def test_no_task_confirmed_returns_none_not_unknown_or_fabricated(self):
+        """When a task genuinely has no command/execution/handoff, selection
+        must positively return None (the caller renders NONE), never a
+        borrowed record and never a crash."""
+        self.assertIsNone(select_task_command([], self.project_id, self.task_id))
+        self.assertIsNone(select_task_execution([], self.project_id, self.task_id))
+        self.assertIsNone(select_task_handoff([], self.project_id, self.task_id))
 
 
 if __name__ == "__main__":
