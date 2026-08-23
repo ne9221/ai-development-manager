@@ -10,7 +10,7 @@ import sys
 from collectors.publish_drive import build_service
 from manager.assignment import CAPABILITIES, decide
 from manager.estimator import estimate
-from manager.executions import list_executions
+from manager.executions import list_executions, list_executions_bounded
 from manager.governance import MANDATORY_STATUS_FIELDS, STATUS_FIELD_LABELS, rendered_rules, validate_task_enforcement
 from manager.project_registry import resolve_authoritative_working_directory
 from manager.quota_reader import EXPECTED_PROVIDERS, read_drive_status, summarize, unknown_account_summary
@@ -140,13 +140,27 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
     return clean("\n".join(lines))
 
 
-def dispatch(store, service, request, quota_document=None, executions=None, history_store=None):
+def dispatch(store, service, request, quota_document=None, executions=None, history_store=None, history_deadline=None):
+    """`history_deadline`, if given, is a `time.monotonic()` value forwarded to
+    manager.executions.list_executions_bounded() for the historical-estimate
+    lookup below, instead of the unbounded list_executions() -- see that
+    function's docstring for the real HOME production trace (~4.5 minute
+    claimed->reserved gap, growing with total project execution history) this
+    exists to bound. Ignored whenever `executions` is explicitly supplied
+    (every existing test/caller that passes its own history list). Defaults
+    to None, reproducing this function's exact unbounded behavior for every
+    existing caller that does not pass it."""
     request_ok(request)
     if request.get("research_gate_required"):
         validate_research_gate(request.get("research_evidence"))
     project = store.get("projects", request["project_id"], request["project_id"]); validate("project", project)
     quota = summarize(quota_document or read_drive_status(service=service), 60)
-    history = executions if executions is not None else list_executions(store, request["project_id"])
+    if executions is not None:
+        history = executions
+    elif history_deadline is not None:
+        history = list_executions_bounded(store, request["project_id"], deadline=history_deadline)
+    else:
+        history = list_executions(store, request["project_id"])
 
     # Resolve quota telemetry history for quota forecasting
     quota_history = []

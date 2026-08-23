@@ -390,6 +390,55 @@ class DispatcherTests(unittest.TestCase):
         ))
         self.assertIn("generated_prompt", ok)
 
+    def test_dispatch_uses_bounded_history_lookup_when_history_deadline_given(self):
+        """P0 dispatch-two-tick-observability: manager.execution_runner.
+        launch_task() runs dispatch() AFTER a Command is already written
+        "claimed" but BEFORE reserve_execution() runs -- a real HOME
+        production trace showed a ~4.5 minute claimed->reserved gap driven by
+        the unbounded list_executions() call below re-downloading every
+        historical execution record on every dispatch. When history_deadline
+        is given and no explicit `executions` list is supplied, dispatch()
+        must use list_executions_bounded() (never the unbounded call) with
+        that exact deadline forwarded through."""
+        captured = {}
+
+        def fake_bounded(store, project_id, deadline=None):
+            captured["project_id"] = project_id
+            captured["deadline"] = deadline
+            return []
+
+        with mock.patch("manager.dispatcher.list_executions_bounded", side_effect=fake_bounded) as bounded, \
+             mock.patch("manager.dispatcher.list_executions") as unbounded:
+            dispatch(self.store, object(), request(task_id="bounded-history-task"), quota(),
+                    executions=None, history_deadline=42.5)
+        bounded.assert_called_once()
+        unbounded.assert_not_called()
+        self.assertEqual("p1", captured["project_id"])
+        self.assertEqual(42.5, captured["deadline"])
+
+    def test_dispatch_explicit_executions_bypasses_bounded_lookup_even_with_deadline(self):
+        """An explicitly supplied `executions` list (every existing test/
+        caller that already precomputes its own history) must always win
+        over history_deadline -- neither the bounded nor the unbounded
+        lookup is ever called in that case."""
+        with mock.patch("manager.dispatcher.list_executions_bounded") as bounded, \
+             mock.patch("manager.dispatcher.list_executions") as unbounded:
+            dispatch(self.store, object(), request(task_id="explicit-history-task"), quota(),
+                    executions=[], history_deadline=42.5)
+        bounded.assert_not_called()
+        unbounded.assert_not_called()
+
+    def test_dispatch_omits_bounded_lookup_when_no_deadline_given(self):
+        """No history_deadline (every existing caller that does not pass it,
+        e.g. manager.scheduler/manager.runtime_bridge) must keep calling the
+        original unbounded list_executions() -- this fix must not silently
+        change behavior for callers that never opted into bounding."""
+        with mock.patch("manager.dispatcher.list_executions_bounded") as bounded, \
+             mock.patch("manager.dispatcher.list_executions", return_value=[]) as unbounded:
+            dispatch(self.store, object(), request(task_id="unbounded-history-task"), quota(), executions=None)
+        bounded.assert_not_called()
+        unbounded.assert_called_once_with(self.store, "p1")
+
 
 class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
     """Regression test suite for M1 Slice 2: Forecast Evidence -> Account-aware Quota Routing."""

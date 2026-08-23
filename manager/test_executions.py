@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from manager import executions as executions_module
 from manager.estimator import estimate
-from manager.executions import cancel_reserved_execution, finish_execution, link_execution_session, list_executions, main as executions_main, prepare_task_retry, quota_delta, quota_snapshot, read_execution, read_session_for_link, reserve_execution, start_execution, task_snapshot
+from manager.executions import cancel_reserved_execution, finish_execution, link_execution_session, list_executions, list_executions_bounded, main as executions_main, prepare_task_retry, quota_delta, quota_snapshot, read_execution, read_session_for_link, reserve_execution, start_execution, task_snapshot
 from manager.task_claims import claim_task_execution
 from manager.test_task_claims import MemoryClaimRegistry
 from manager.sessions import manager_session_key
@@ -545,6 +545,92 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual("low", one["confidence"]); self.assertEqual(2, one["estimated_quota_delta"]["windows"][0]["used_percent_delta"])
         many = estimate(query, [execution(18, 1), execution(22, 2), execution(30, 3)])
         self.assertEqual(22, many["estimated_minutes"]); self.assertEqual("medium", many["confidence"]); self.assertTrue(many["split_recommended"]); self.assertEqual(2, many["suggested_phases"])
+
+
+class ListExecutionsBoundedTests(unittest.TestCase):
+    """Covers the real HOME production trace this exists to bound: a
+    ~4.5 minute claimed->reserved gap (adm-chatgpt-direct-final-acceptance-
+    20260824-0020, adm-claude-fresh-handsoff-final-acceptance-20260824-0021)
+    driven by manager.dispatcher.dispatch()'s historical-estimate lookup
+    unbounded-hydrating every execution record ever created for the project
+    on every single dispatch -- the same class of problem
+    manager.tasks.DriveRecords.list_records_bounded() already fixes for
+    Command enumeration (see ListRecordsBoundedTests in test_tasks.py)."""
+
+    def _seed_reserved(self, store, project_id, count):
+        for index in range(count):
+            reserve_execution(store, project_id, "t1", f"exec-{index:03d}", "codex", decision(),
+                              "code", "medium", "2026-08-09T00:00:00Z")
+
+    def setUp(self):
+        self.drive_store = DriveRecords(FakeDriveService())
+        create_task(self.drive_store, task(), assign=False)
+
+    # 1. Expired deadline -> zero get_media calls, empty result, never blocks.
+    def test_expired_deadline_yields_no_get_media_calls(self):
+        self._seed_reserved(self.drive_store, "p1", 10)
+        get_media_calls = {"n": 0}
+        original = self.drive_store.files.get_media
+
+        def counting_get_media(fileId):
+            get_media_calls["n"] += 1
+            return original(fileId)
+
+        self.drive_store.files.get_media = counting_get_media
+        try:
+            records = list_executions_bounded(self.drive_store, "p1", deadline=-1.0)
+        finally:
+            self.drive_store.files.get_media = original
+        self.assertEqual([], records)
+        self.assertEqual(0, get_media_calls["n"])
+
+    # 2. No deadline given -> identical result set to the unbounded call
+    #    (matches list_records_bounded()'s own no-deadline contract).
+    def test_no_deadline_matches_list_executions_result_set(self):
+        self._seed_reserved(self.drive_store, "p1", 6)
+        bounded = {record["execution_id"] for record in list_executions_bounded(self.drive_store, "p1")}
+        unbounded = {record["execution_id"] for record in list_executions(self.drive_store, "p1")}
+        self.assertEqual(unbounded, bounded)
+
+    # 3. "No executions folder yet" contract preserved (never raises).
+    def test_missing_executions_folder_returns_empty_list(self):
+        self.assertEqual([], list_executions_bounded(self.drive_store, "p1", deadline=1e9))
+
+    # 4. A store without list_records_bounded (e.g. a Direct-Dispatch-style
+    #    test double, or any store predating that method) falls back to the
+    #    exact unbounded list_executions() behavior, reproducing every
+    #    existing caller's semantics unchanged.
+    def test_store_without_bounded_support_falls_back_to_unbounded(self):
+        class _NoBoundedSupport:
+            """Delegates everything to the real DriveRecords store except
+            list_records_bounded, so hasattr(store, "list_records_bounded")
+            is False -- exercises list_executions_bounded()'s documented
+            fallback path for a store that predates that method."""
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                if name == "list_records_bounded":
+                    raise AttributeError(name)
+                return getattr(self._inner, name)
+
+        self._seed_reserved(self.drive_store, "p1", 3)
+        wrapped = _NoBoundedSupport(self.drive_store)
+        self.assertFalse(hasattr(wrapped, "list_records_bounded"))
+        self.assertEqual({record["execution_id"] for record in list_executions(self.drive_store, "p1")},
+                         {record["execution_id"] for record in list_executions_bounded(wrapped, "p1", deadline=1e9)})
+
+    # 5. A partial/degraded result (some samples lost to the deadline) still
+    #    feeds manager.estimator.estimate() safely -- never a correctness
+    #    violation, only a lower-confidence estimate, exactly like an empty
+    #    history already does.
+    def test_partial_history_still_estimates_safely(self):
+        partial = [execution(18), execution(22)]
+        query = {"task_type": "implementation", "provider": "codex", "mode": "code", "effort": "medium",
+                 "complexity": "medium", "needs_repo_edit": True, "expected_minutes": 25}
+        result = estimate(query, partial)
+        self.assertEqual(2, result["sample_count"])
+        self.assertIn(result["confidence"], ("low", "medium"))
 
 
 if __name__ == "__main__": unittest.main()

@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -34,6 +35,22 @@ from manager.worktree_materializer import materialize_worktree, verify_checkout_
 
 RPC_TIMEOUT_SECONDS = 30.0
 MAX_TURN_TIMEOUT_SECONDS = float(MAX_HARD_TIMEOUT_SECONDS)
+
+# Bounds how long dispatch()'s historical-estimate lookup (list_executions())
+# is allowed to spend inside launch_task(), which runs AFTER a Command is
+# already written "claimed" but BEFORE reserve_execution() runs -- i.e. this
+# sits directly on the claimed -> reserved -> running visibility path a fresh
+# dispatch's Task/Command already show a "claimed" state for. A live HOME
+# production trace (adm-chatgpt-direct-final-acceptance-20260824-0020,
+# adm-claude-fresh-handsoff-final-acceptance-20260824-0021) showed a ~4.5
+# minute claimed->reserved gap driven by list_executions() re-downloading and
+# re-validating every historical execution record for the project on every
+# single dispatch -- unbounded, and growing with total project history,
+# independent of the one request actually being launched right now. This is
+# the same class of problem manager.tasks.DriveRecords.list_records_bounded()
+# already fixes for Command enumeration (see its own docstring: a real HOME
+# project's Command history alone took 141.66s to hydrate unbounded).
+DISPATCH_HISTORY_BUDGET_SECONDS = 15.0
 
 
 def task_turn_timeout(expected_minutes, override=None):
@@ -330,7 +347,9 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
             "(claude_accounts=None); refusing to launch against an unvalidated account instead of "
             "falling back to ambient/default Claude config"
         )
-    dispatched = dispatch(store, service, _dispatch_request(task, provider, account_id), quota_document, executions)
+    dispatched = dispatch(store, service, _dispatch_request(task, provider, account_id), quota_document, executions,
+                          history_deadline=(time.monotonic() + DISPATCH_HISTORY_BUDGET_SECONDS)
+                          if executions is None else None)
     if dispatched["recommended_provider"] != provider:
         raise TaskError(f"dispatch did not select {provider}")
     execution_id = execution_id or f"{task_id}-{uuid.uuid4().hex[:12]}"

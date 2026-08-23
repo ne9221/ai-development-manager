@@ -457,6 +457,55 @@ def list_executions(store, project_id):
     return records
 
 
+def list_executions_bounded(store, project_id, deadline=None, single_request_worst_case=None):
+    """Deadline-aware alternative to list_executions() for callers on the
+    claim -> reserve -> running critical path (manager.dispatcher.dispatch()'s
+    historical-estimate lookup, invoked from manager.execution_runner.launch_task()
+    AFTER a Command is already written "claimed" but BEFORE reserve_execution()
+    runs) -- see manager.tasks.DriveRecords.list_records_bounded()'s docstring
+    for the identical unbounded-hydration problem already fixed for Command
+    enumeration (a real HOME project's history took 141.66s to fully hydrate).
+    A live production trace (adm-chatgpt-direct-final-acceptance-20260824-0020,
+    adm-claude-fresh-handsoff-final-acceptance-20260824-0021) showed the same
+    ~4.5 minute claimed->reserved gap driven by this exact unbounded
+    list_executions() call growing with total project execution history,
+    independent of the ~1 request being dispatched right now.
+
+    Falls back to list_executions(store, project_id) whenever the store does
+    not implement list_records_bounded (e.g. test doubles) or `deadline` is
+    None, reproducing that function's exact behavior unchanged for every
+    caller that does not opt into bounding -- including its "no folder yet"
+    -> [] contract and its validate("execution", record) contract for each
+    returned record (list_records_bounded() already drops any record that
+    fails to parse; the remaining ones are still validated here so a
+    malformed-but-parseable record cannot reach manager.estimator.estimate()
+    unvalidated).
+
+    Only ever LOSES potential historical samples under a tight deadline --
+    manager.estimator.estimate() already degrades gracefully to
+    confidence="none"/"low" with fewer or zero samples (falling back to the
+    task's own expected_minutes), so a partial or empty result here is a
+    real, already-handled degraded-confidence state, never a correctness
+    violation.
+    """
+    if deadline is None or not hasattr(store, "list_records_bounded"):
+        return list_executions(store, project_id)
+    try:
+        store.project_folder("executions", project_id, create=False)
+    except TaskError:
+        return []
+    records = store.list_records_bounded("executions", project_id, deadline=deadline,
+                                         single_request_worst_case=single_request_worst_case)
+    validated = []
+    for record in records:
+        try:
+            validate("execution", record)
+        except TaskError:
+            continue
+        validated.append(record)
+    return validated
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
