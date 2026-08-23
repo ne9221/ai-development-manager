@@ -64,7 +64,7 @@ def embedded_ingress_enabled(raw=None):
 
     Migration contract (see fix/command-watcher-embedded-ingress-decouple-
     20260823): once the dedicated Drive Dispatch Ingress Scheduled Task
-    (manager/run_drive_dispatch_ingress.ps1, frozen at 6a7f0df) is the sole
+    (manager/run_drive_dispatch_ingress.ps1, frozen at 6d62cea) is the sole
     polling authority for a given install, that install's Command Watcher
     must set ADM_COMMAND_WATCHER_EMBEDDED_INGRESS=0 so it never also calls
     poll_drive_dispatch_requests() in parallel -- a stray leftover folder-id

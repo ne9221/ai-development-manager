@@ -16,7 +16,7 @@ param(
     # Watcher install polls Drive dispatch requests itself. Empty/unset
     # (the default) preserves pre-migration folder-id-gated behavior; "0"
     # disables embedded ingress unconditionally for installs where the
-    # dedicated Drive Dispatch Ingress Scheduled Task (6a7f0df, installed
+    # dedicated Drive Dispatch Ingress Scheduled Task (6d62cea, installed
     # separately via install_drive_dispatch_ingress.ps1) is the sole
     # polling authority.
     [string]$EmbeddedIngress,

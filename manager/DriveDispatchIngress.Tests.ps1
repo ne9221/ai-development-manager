@@ -241,10 +241,28 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
         Assert-MockCalled Register-ScheduledTask -Times 0 -Exactly -Scope It
     }
 
-    It "leaves the existing Command Watcher Scheduled Task installer untouched" {
-        $baseline = & git -C $repository show cb3870ef3e72bed214cdd89086f86e0eb02f4ced:manager/install_command_watcher.ps1
+    It "leaves the existing Command Watcher Scheduled Task installer functionally untouched (comment-provenance fix excepted)" {
+        # install_command_watcher.ps1 legitimately differs from the
+        # cb3870e base by more than this merge: the embedded-ingress
+        # decoupling commit (0faee84, already part of this branch's history
+        # by the time this Describe block runs) added the -EmbeddedIngress
+        # parameter and its surrounding comment block. This merge's only
+        # *additional* intended change on top of that is the documentation-
+        # correction hardening (spec item B): a stale comment misattributed
+        # the dedicated Drive Dispatch Ingress Scheduled Task to 6a7f0df
+        # (the standalone Python runner commit) instead of 6d62cea (the
+        # actual Windows dedicated trigger commit). Compare against this
+        # branch's own pre-hardening HEAD revision (with that one
+        # substitution applied) rather than the cb3870e base, so this test
+        # still catches any *other*, unintended drift in this other lane's
+        # installer without re-litigating 0faee84's already-merged content.
+        # Pinned to that commit's exact SHA (not HEAD) so this assertion
+        # stays meaningful once the hardening-B fix itself is committed on
+        # top and HEAD moves past it.
+        $preHardening = & git -C $repository show 0faee84962e40192aecb252af273552755d5f90f:manager/install_command_watcher.ps1
+        $expectedText = (($preHardening -join "`n") -replace "`r`n", "`n") -replace "6a7f0df", "6d62cea"
         $current = Get-Content -Raw -LiteralPath (Join-Path $repository "manager\install_command_watcher.ps1")
-        ($current -replace "`r`n", "`n").Trim() | Should Be (($baseline -join "`n") -replace "`r`n", "`n").Trim()
+        ($current -replace "`r`n", "`n").Trim() | Should Be $expectedText.Trim()
     }
 }
 

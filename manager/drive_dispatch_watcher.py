@@ -73,13 +73,27 @@ def main(argv=None):
         # DriveRecords in tests takes effect.
         result = run_once(build_service_fn=build_service, store_factory=DriveRecords)
     except TaskError as exc:
-        print(json.dumps({"status": "error", "error": str(exc)}, separators=(",", ":")), file=sys.stderr)
+        _print_safe_failure(exc, "Drive dispatch ingress configuration or validation error")
         return 1
     except Exception as exc:
-        print(json.dumps({"status": "error", "error": str(exc)}, separators=(",", ":")), file=sys.stderr)
+        _print_safe_failure(exc, "Drive dispatch ingress poll failed")
         return 1
     print(json.dumps(result, separators=(",", ":")))
     return 0
+
+
+def _print_safe_failure(exc, message):
+    """Write a deterministic, secret-safe failure report to stderr.
+
+    Never includes the raw exception message (str(exc)) -- an arbitrary
+    exception can carry a file path, an Authorization header, a token, or a
+    raw Drive API response body baked into its message. Only a bounded
+    exception *class name* (error_kind) and a fixed, generic `message`
+    string are ever emitted. The caller still returns a nonzero exit code
+    on top of this -- this function changes stderr content only, never the
+    failure/exit-code contract."""
+    print(json.dumps({"status": "error", "error_kind": type(exc).__name__, "message": message},
+                      separators=(",", ":")), file=sys.stderr)
 
 
 if __name__ == "__main__":
