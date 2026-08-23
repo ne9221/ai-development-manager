@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from collectors.claude_oauth import AuthStaleError, RateLimitedError
-from manager.claude_oauth_cooldown import CooldownStore
+from manager.claude_oauth_cooldown import CORRUPT_STATE_COOLDOWN_SECONDS, CooldownStore
 from manager.refresh_status import RefreshError, refresh, runtime_lock
 
 
@@ -338,6 +338,76 @@ class ClaudeOauthCooldownIntegrationTests(unittest.TestCase):
         )
         self.assertEqual("rate_limited", result["providers"]["claude"])
         self.assertEqual([], collector.calls)
+        # A: the corrupt file must have been quarantined into a clean,
+        # parseable file rather than left untouched.
+        parsed = json.loads(self.cooldown_path().read_text(encoding="utf-8"))
+        self.assertIn("<default>", parsed)
+
+    def test_corrupt_state_self_heals_full_lifecycle(self):
+        # A: first refresh against a corrupt file makes zero calls and
+        # persists a clean, bounded quarantine cooldown.
+        self.cooldown_path().parent.mkdir(parents=True, exist_ok=True)
+        self.cooldown_path().write_text("{definitely not json", encoding="utf-8")
+        first_collector = ScriptedOauthCollector({})
+        first_result, _, _ = self.run_refresh(
+            claude_config_dirs={None: None}, claude_oauth_collector=first_collector,
+            cooldown_store=CooldownStore(self.cooldown_path()),
+        )
+        self.assertEqual("rate_limited", first_result["providers"]["claude"])
+        self.assertEqual([], first_collector.calls)
+
+        # B: a brand new process (new CooldownStore instance, same file)
+        # checking again before the quarantine cooldown expires still makes
+        # zero calls -- no permanent lock-out re-arming, but also no spam.
+        second_collector = ScriptedOauthCollector({})
+        second_result, _, _ = self.run_refresh(
+            claude_config_dirs={None: None}, claude_oauth_collector=second_collector,
+            cooldown_store=CooldownStore(self.cooldown_path()),
+        )
+        self.assertEqual("rate_limited", second_result["providers"]["claude"])
+        self.assertEqual([], second_collector.calls)
+
+        # C: once the quarantine cooldown has actually expired, a new
+        # process is allowed exactly one real request.
+        expired_store = CooldownStore(self.cooldown_path())
+        expired_store.set_retry_until(
+            "<default>", datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+        third_collector = ScriptedOauthCollector({"<default>": [oauth_provider()]})
+        third_result, _, _ = self.run_refresh(
+            claude_config_dirs={None: None}, claude_oauth_collector=third_collector,
+            cooldown_store=CooldownStore(self.cooldown_path()),
+        )
+        self.assertEqual("success", third_result["providers"]["claude"])
+        self.assertEqual(["<default>"], third_collector.calls)
+
+        # D: the successful request (post-recovery) leaves no cooldown
+        # behind for this credential.
+        self.assertIsNone(CooldownStore(self.cooldown_path()).get("<default>"))
+
+    def test_corrupt_state_recovery_does_not_affect_unrelated_credential(self):
+        # E: a globally corrupt file, recovered while checking the default
+        # credential, must not fabricate a trusted (or falsely-clear)
+        # cooldown for a different, unrelated credential -- account-b's own
+        # real request still happens normally in the same cycle.
+        payload_b = self.base / "account-b.json"
+        payload_b.write_text("{}", encoding="utf-8")
+        self.cooldown_path().parent.mkdir(parents=True, exist_ok=True)
+        self.cooldown_path().write_text("{corrupt for everyone", encoding="utf-8")
+        collector = ScriptedOauthCollector({
+            "/config/account-b": [oauth_provider(account_id="account-b")],
+        })
+        store = CooldownStore(self.cooldown_path())
+        result, _, _ = self.run_refresh(
+            claude_accounts={"account-b": payload_b},
+            claude_config_dirs={None: None, "account-b": "/config/account-b"},
+            claude_oauth_collector=collector, cooldown_store=store,
+        )
+        self.assertEqual("rate_limited", result["providers"]["claude"])
+        self.assertEqual("success", result["providers"]["claude:account-b"])
+        self.assertEqual(["/config/account-b"], collector.calls)
+        parsed = json.loads(self.cooldown_path().read_text(encoding="utf-8"))
+        self.assertNotIn("/config/account-b", parsed)
 
     def test_last_good_last_updated_unchanged_during_cooldown(self):
         old = status()

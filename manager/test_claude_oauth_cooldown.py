@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -127,6 +128,83 @@ class CooldownStoreTests(unittest.TestCase):
         self.assertNotIn("token", raw.lower())
         self.assertNotIn("credential", raw.lower())
         self.assertNotIn("Bearer", raw)
+
+    # -- Corrupt-state self-heal (fail closed once, then recover, never a
+    #    permanent lock-out from the same corruption being rediscovered by
+    #    every future process) --
+
+    def test_corrupt_state_quarantines_itself_on_first_get(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json", encoding="utf-8")
+        result = self.store.get("<default>", now=NOW)
+        self.assertIsNotNone(result)
+        # The file must no longer be the original corrupt bytes -- it was
+        # atomically replaced with clean, parseable, bounded state.
+        raw = self.path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)  # must not raise
+        self.assertIn("<default>", parsed)
+
+    def test_new_store_before_quarantine_expiry_still_blocks(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json", encoding="utf-8")
+        first_retry_until = self.store.get("<default>", now=NOW)
+        # A brand new CooldownStore instance over the same (now quarantined,
+        # no-longer-corrupt) file stands in for a fresh process.
+        reopened = CooldownStore(self.path)
+        second = reopened.get("<default>", now=NOW + timedelta(seconds=1))
+        self.assertEqual(first_retry_until, second)
+
+    def test_new_store_after_quarantine_expiry_allows_one_request(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json", encoding="utf-8")
+        self.store.get("<default>", now=NOW)
+        reopened = CooldownStore(self.path)
+        after_expiry = NOW + timedelta(seconds=CORRUPT_STATE_COOLDOWN_SECONDS + 1)
+        self.assertIsNone(reopened.get("<default>", now=after_expiry))
+
+    def test_repeated_corruption_does_not_permanently_lock_out(self):
+        # Even if a fresh process re-corrupts the file (e.g. a torn write
+        # from an unrelated crash) the quarantine window is still bounded
+        # and still expires -- corruption never compounds into forever.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json", encoding="utf-8")
+        first = self.store.get("<default>", now=NOW)
+        self.path.write_text("also not valid json {{{", encoding="utf-8")
+        second_now = NOW + timedelta(seconds=CORRUPT_STATE_COOLDOWN_SECONDS + 1)
+        second = CooldownStore(self.path).get("<default>", now=second_now)
+        self.assertIsNotNone(second)
+        self.assertLessEqual((second - second_now).total_seconds(), CORRUPT_STATE_COOLDOWN_SECONDS)
+
+    def test_successful_clear_after_corrupt_state_recovery(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json", encoding="utf-8")
+        self.store.get("<default>", now=NOW)  # quarantines, arms cooldown
+        after_expiry = NOW + timedelta(seconds=CORRUPT_STATE_COOLDOWN_SECONDS + 1)
+        self.assertIsNone(self.store.get("<default>", now=after_expiry))  # expired -> caller may proceed
+        self.store.clear("<default>")
+        self.assertIsNone(self.store.get("<default>", now=after_expiry))
+
+    def test_quarantine_does_not_fabricate_cooldown_for_unrelated_credential(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json", encoding="utf-8")
+        self.store.get("key-a", now=NOW)  # quarantines the file for key-a only
+        # key-b was never checked against the corrupt file -- it must not
+        # inherit a trusted cooldown (nor a fabricated absence-of-one) from
+        # key-a's quarantine; the corrupt file never said anything true
+        # about key-b, so it must not appear in the quarantined state at
+        # all, and a check for it proceeds on its own merits.
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertNotIn("key-b", raw)
+        self.assertIsNone(self.store.get("key-b", now=NOW))
+
+    def test_quarantine_persists_no_token_or_credential_content(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not valid json, leaked accessToken=Bearer sk-ant-fake", encoding="utf-8")
+        self.store.get("<default>", now=NOW)
+        raw = self.path.read_text(encoding="utf-8")
+        self.assertNotIn("accessToken", raw)
+        self.assertNotIn("Bearer", raw)
+        self.assertNotIn("sk-ant-fake", raw)
 
 
 if __name__ == "__main__":

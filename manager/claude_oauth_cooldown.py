@@ -109,9 +109,10 @@ class CooldownStore:
         {"<default>": {"retry_until": "<iso8601>"}, "/path/to/config": {...}}
 
     A corrupt or malformed file is never trusted at face value -- reads
-    fail closed (see get()) -- and every write replaces the whole file
-    atomically, which self-heals any prior corruption as soon as the next
-    429 or successful clear happens for any key."""
+    fail closed and immediately quarantine the untrusted content (see
+    get()), so corruption cannot cause a permanent lock-out by being
+    silently rediscovered by every future process. Every write (a 429, a
+    successful clear, or a quarantine) replaces the whole file atomically."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -140,14 +141,32 @@ class CooldownStore:
     def get(self, key: str, now: Optional[datetime] = None) -> Optional[datetime]:
         """Returns the retry_until datetime for `key` if it is still in the
         future, else None (no recorded cooldown, an expired one, or an
-        unknown key). On a corrupt file, fails closed: returns
-        `now + CORRUPT_STATE_COOLDOWN_SECONDS` instead of either silently
-        treating every credential as clear (would spam the endpoint on
-        every affected key) or blocking forever."""
+        unknown key).
+
+        On a corrupt file, fails closed for *this* call -- returns
+        `now + CORRUPT_STATE_COOLDOWN_SECONDS` -- and, in the same step,
+        atomically quarantines the untrusted file: the whole corrupt
+        content is discarded (never silently preserved, since none of it
+        can be trusted) and replaced with a clean file containing only a
+        fresh bounded cooldown entry for `key`. This is what makes the
+        fail-closed window self-heal: a brand new process (e.g. the next
+        Scheduled Task invocation) reads a *valid* file, not the same
+        corruption, so it stops re-discovering corruption and re-arming a
+        fresh cooldown forever -- it sees an ordinary, expiring cooldown
+        for `key` and, once that expires, resumes normally. Any other
+        credential's entry that happened to be in the corrupt file is
+        dropped, not "recovered" -- it was never trustworthy, and reviving
+        it would fabricate a cooldown (or its absence) for a credential
+        this call never actually checked."""
         now = now or now_utc()
         data, corrupt = self._read_raw()
         if corrupt:
-            return now + timedelta(seconds=CORRUPT_STATE_COOLDOWN_SECONDS)
+            retry_until = now + timedelta(seconds=CORRUPT_STATE_COOLDOWN_SECONDS)
+            try:
+                self._write({key: {"retry_until": _iso(retry_until)}})
+            except OSError:
+                pass
+            return retry_until
         entry = data.get(key)
         if not isinstance(entry, dict):
             return None
