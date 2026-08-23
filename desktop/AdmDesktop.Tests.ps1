@@ -41,7 +41,7 @@ function New-RealHiddenWatcherVbs([string]$Repo) {
     # generated wrapper shape, not a hand-rolled stand-in.
     . (Join-Path $here "..\manager\AdmHiddenLaunch.ps1")
     $runner = Join-Path $Repo "manager\run_command_watcher.ps1"
-    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"python.exe`" -RepositoryPath `"$Repo`" -ManagerHome `"$AdmManagerHome`" -CodexBin `"codex.exe`" -CodexHome `"codex-home`" -PythonDeps `"python-deps`" -AllowlistPath `"allowlist`" -GcsBucket `"bucket`" -GcsObject `"object`" -IngressFolderId `"folder`" -IngressOwner `"owner`" -ClaudeAccountsConfig `"accounts.json`""
+    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"python.exe`" -RepositoryPath `"$Repo`" -ManagerHome `"$AdmManagerHome`" -CodexBin `"codex.exe`" -CodexHome `"codex-home`" -PythonDeps `"python-deps`" -AllowlistPath `"allowlist`" -GcsBucket `"bucket`" -GcsObject `"object`" -IngressFolderId `"folder`" -IngressOwner `"owner`" -ClaudeAccountsConfig `"accounts.json`" -WorkspaceRoot `"workspace-root`""
     $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $Repo -WrapperName "command-watcher" -PowerShellArguments $arguments
     return $action.Arguments.Trim('"')
 }
@@ -122,6 +122,14 @@ Describe "Set-AdmWorkspacePointer" {
         New-Item -ItemType Directory -Force -Path $global:admWorkspaceRoot, $global:admRepoA, $global:admRepoB | Out-Null
         Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue
         Mock Set-AdmPersistentUserEnvironmentVariable {}
+        # This suite's own fixtures live under $TestDrive, which Pester
+        # itself creates under the real OS temp directory -- a pure test-
+        # isolation artifact, not a real contaminated ADM_WORKSPACE_ROOT.
+        # The contamination gate has its own dedicated, unmocked coverage
+        # below ("Set-AdmWorkspacePointer workspace-root contamination
+        # guard"); mocked out here so it never confuses $TestDrive itself
+        # for real TEMP contamination.
+        Mock Test-AdmWorkspaceRootContaminated { $false }
     }
     AfterEach { Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue }
 
@@ -167,6 +175,56 @@ Describe "Set-AdmWorkspacePointer" {
         $pointer = Set-AdmWorkspacePointer -RepositoryPath $global:admRepoA -ProjectId "ai-development-manager"
         $pointer | Should Be (Join-Path (Split-Path $global:admRepoA -Parent) "ai-development-manager")
     }
+}
+
+Describe "Set-AdmWorkspacePointer workspace-root contamination guard" {
+    # Real-world root cause (fix/home-watcher-workspace-truth-bootstrap-
+    # 20260823): an inherited ADM_WORKSPACE_ROOT that happened to resolve
+    # under %TEMP% was trusted as canonical authority, so a real Task
+    # ended up materializing working_directory under
+    # %TEMP%\ai-development-manager. Test-AdmWorkspaceRootContaminated is
+    # exercised for real here (unmocked), against the real
+    # [IO.Path]::GetTempPath() -- deliberately not $TestDrive (see the
+    # Describe block above for why that would be a false positive).
+    BeforeEach {
+        Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue
+        Mock Set-AdmPersistentUserEnvironmentVariable {}
+        $global:admContamCaseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
+        $global:admContamRepo = Join-Path $global:admContamCaseRoot "checkout"
+        New-Item -ItemType Directory -Force -Path $global:admContamRepo | Out-Null
+    }
+    AfterEach { Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue }
+
+    It "flags the exact temp root and any subpath of it as contaminated" {
+        $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+        Test-AdmWorkspaceRootContaminated -CandidateRoot $temp | Should Be $true
+        Test-AdmWorkspaceRootContaminated -CandidateRoot (Join-Path $temp "ai-development-manager") | Should Be $true
+    }
+
+    It "does not flag a legitimate root that merely shares a prefix with the temp path" {
+        $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+        $lookalike = $temp.Substring(0, $temp.Length - 1) + "-not-actually-temp"
+        Test-AdmWorkspaceRootContaminated -CandidateRoot $lookalike | Should Be $false
+    }
+
+    It "refuses to trust an inherited ADM_WORKSPACE_ROOT that resolves under the real temp directory" {
+        $contaminated = Join-Path ([IO.Path]::GetTempPath()) "ai-development-manager-workspace-root-contamination-test"
+        $env:ADM_WORKSPACE_ROOT = $contaminated
+        $pointer = Set-AdmWorkspacePointer -RepositoryPath $global:admContamRepo -ProjectId "ai-development-manager"
+        $expectedRoot = Split-Path $global:admContamRepo -Parent
+        $pointer | Should Be (Join-Path $expectedRoot "ai-development-manager")
+        $env:ADM_WORKSPACE_ROOT | Should Be $expectedRoot
+        Assert-MockCalled Set-AdmPersistentUserEnvironmentVariable -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq "ADM_WORKSPACE_ROOT" -and $Value -eq $expectedRoot }
+    }
+
+    # "A legitimate, non-temp inherited ADM_WORKSPACE_ROOT is still trusted"
+    # is covered by the main "Set-AdmWorkspacePointer" Describe block above
+    # (Test-AdmWorkspaceRootContaminated mocked $false there) rather than
+    # here: every path available inside this sandboxed test run -- including
+    # $TestDrive -- is itself a real subdirectory of the OS temp folder, so
+    # exercising the real (unmocked) gate end-to-end here could only ever
+    # legitimately return "contaminated" for any fixture this suite is
+    # allowed to create.
 }
 
 Describe "Watcher hidden-VBS (wscript.exe) identity guard" {

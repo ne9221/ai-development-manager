@@ -11,8 +11,22 @@ param(
     [Parameter(Mandatory=$true)][string]$GcsObject,
     [string]$IngressFolderId,
     [string]$IngressOwner,
-    [string]$ClaudeAccountsConfig
+    [string]$ClaudeAccountsConfig,
+    # Trusted authority for manager.project_registry's ADM_WORKSPACE_ROOT
+    # resolution -- explicitly serialized into the Scheduled Task action
+    # (below) and re-exported by run_command_watcher.ps1 on every tick,
+    # rather than relying on whatever ADM_WORKSPACE_ROOT the Scheduled
+    # Task's process happens to inherit. Mandatory + fail-closed: an
+    # install with no real workspace authority must never silently produce
+    # a Task that falls back to an ambient/TEMP value at launch time (see
+    # fix/home-watcher-workspace-truth-bootstrap-20260823).
+    [Parameter(Mandatory=$true)][string]$WorkspaceRoot
 )
+
+if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
+    Write-Error "WORKSPACE_ROOT_REQUIRED: -WorkspaceRoot must be a non-empty trusted workspace path; refusing to install the Command Watcher without one"
+    exit 1
+}
 
 . (Join-Path $PSScriptRoot "AdmHiddenLaunch.ps1")
 
@@ -40,7 +54,7 @@ if (-not $ClaudeAccountsConfig) {
 }
 
 $runner = Join-Path $RepositoryPath "manager\run_command_watcher.ps1"
-$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -CodexBin `"$CodexBin`" -CodexHome `"$CodexHome`" -PythonDeps `"$PythonDeps`" -AllowlistPath `"$AllowlistPath`" -GcsBucket `"$GcsBucket`" -GcsObject `"$GcsObject`" -IngressFolderId `"$IngressFolderId`" -IngressOwner `"$IngressOwner`" -ClaudeAccountsConfig `"$ClaudeAccountsConfig`""
+$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -CodexBin `"$CodexBin`" -CodexHome `"$CodexHome`" -PythonDeps `"$PythonDeps`" -AllowlistPath `"$AllowlistPath`" -GcsBucket `"$GcsBucket`" -GcsObject `"$GcsObject`" -IngressFolderId `"$IngressFolderId`" -IngressOwner `"$IngressOwner`" -ClaudeAccountsConfig `"$ClaudeAccountsConfig`" -WorkspaceRoot `"$WorkspaceRoot`""
 $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $RepositoryPath -WrapperName "command-watcher" -PowerShellArguments $arguments
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)

@@ -176,6 +176,15 @@ class CommandWatcherTests(unittest.TestCase):
         with patch("manager.command_watcher.launch_task", failed):
             result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
         self.assertEqual("failed", result["status"])
+        # Truth-contract: launch_task() raised before any Execution record was
+        # ever created (no reserve_execution() call happened), so the Task
+        # must never be silently left "ready"/"Not started" while its Command
+        # is terminal "failed" -- same blocked contract _block_prelaunch_task
+        # already enforces for a reserved-then-cancelled Execution.
+        self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+        self.assertIn("Execution did not start", self.store.get("tasks", "p1", "t1")["current_progress"])
+        self.assertEqual("TaskError", self.store.get("commands", "p1", "cmd-1")["result"]["error_kind"])
+        self.assertNotIn("executions", {area for area, project_id, name in self.store.records})
 
         self.store = self.allowlist_compliant_store()
         self.store.fail_command_terminal = True
@@ -183,6 +192,54 @@ class CommandWatcherTests(unittest.TestCase):
             with self.assertRaisesRegex(TaskError, "Drive unavailable"):
                 process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
         self.assertEqual("running", self.store.get("commands", "p1", "cmd-1")["status"])
+
+    def test_prelaunch_working_directory_failure_blocks_task_without_leaking_raw_text(self):
+        # Real-world reproduction: launch_task() -> execution_runner.
+        # _resolve_working_directory() raises before reserve_execution() is
+        # ever reached, so no Execution record exists at all -- distinct
+        # from test_prelaunch_reservation_is_cancelled_and_not_left_running
+        # (which reserves one first). error_kind classification is
+        # unchanged from before this fix (bare exception class name) --
+        # never the raw exception message, which could carry an absolute
+        # filesystem path.
+        failed = Mock(side_effect=TaskError("working_directory does not exist or is not a directory: 'X'"))
+        with patch("manager.command_watcher.launch_task", failed):
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
+        self.assertEqual("failed", result["status"])
+        stored_command = self.store.get("commands", "p1", "cmd-1")
+        self.assertEqual("TaskError", stored_command["result"]["error_kind"])
+        stored_task = self.store.get("tasks", "p1", "t1")
+        self.assertEqual("blocked", stored_task["status"])
+        self.assertNotIn("'X'", stored_task["blocked_reason"])
+        self.assertNotIn("executions", {area for area, project_id, name in self.store.records})
+
+    def test_prelaunch_generic_exception_still_blocks_task_truthfully(self):
+        # Not a TaskError at all -- must still block the Task (contract
+        # requirement 2) with the same bounded classification, never raw
+        # exception text.
+        failed = Mock(side_effect=RuntimeError("unexpected boom"))
+        with patch("manager.command_watcher.launch_task", failed):
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("RuntimeError", self.store.get("commands", "p1", "cmd-1")["result"]["error_kind"])
+        self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+
+    def test_reserved_execution_prelaunch_failure_is_not_reclassified_as_no_execution(self):
+        # AG adversarial review constraint: the no-Execution _block_prelaunch_
+        # task() branch must never fire when an Execution record actually
+        # exists (reserved/running) -- that authority belongs entirely to
+        # the existing _reconcile_active()/cancel_reserved_execution()
+        # contract (see test_prelaunch_reservation_is_cancelled_and_not_
+        # left_running), which this test proves is untouched by this fix.
+        def reserve_then_fail(*args, **kwargs):
+            reserve_execution(self.store, "p1", "t1", args[7], "codex", {"decision": "fresh"})
+            raise TaskError("preflight failed")
+        with patch("manager.command_watcher.launch_task", side_effect=reserve_then_fail):
+            result = process_command(self.store, object(), command(), claim_factory=lambda *_: MemoryClaimRegistry(), allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("cancelled", self.store.get("executions", "p1", "command-cmd-1")["status"])
+        self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+        self.assertEqual("prelaunch_failed", self.store.get("commands", "p1", "cmd-1")["result"]["error_kind"])
 
     def test_health_contract_distinguishes_healthy_stale_and_over_expected(self):
         _, _, healthy = self.running_command()

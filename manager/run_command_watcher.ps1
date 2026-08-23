@@ -10,8 +10,22 @@ param(
     [Parameter(Mandatory=$true)][string]$GcsObject,
     [string]$IngressFolderId,
     [string]$IngressOwner,
-    [string]$ClaudeAccountsConfig
+    [string]$ClaudeAccountsConfig,
+    [Parameter(Mandatory=$true)][string]$WorkspaceRoot
 )
+
+if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
+    Write-Error "WORKSPACE_ROOT_REQUIRED: -WorkspaceRoot must be a non-empty trusted workspace path; refusing to launch without explicit workspace authority"
+    exit 1
+}
+# Explicit trusted authority for manager.project_registry's
+# ADM_WORKSPACE_ROOT resolution (resolve_authoritative_working_directory_
+# with_project() in manager/project_registry.py) -- set here, on every
+# tick, rather than relying on this Scheduled Task process inheriting
+# whatever ADM_WORKSPACE_ROOT happens to be ambient. That ambient-inheritance
+# gap is what let a Task materialize working_directory under %TEMP% (see
+# fix/home-watcher-workspace-truth-bootstrap-20260823).
+$env:ADM_WORKSPACE_ROOT = $WorkspaceRoot
 
 $env:AI_MANAGER_HOME = $ManagerHome
 $env:GOOGLE_DRIVE_TOKEN = Join-Path $ManagerHome "google-drive-token.json"
