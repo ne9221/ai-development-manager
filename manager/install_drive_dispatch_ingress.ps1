@@ -25,8 +25,15 @@ param(
     [string]$PythonDeps,
     [Parameter(Mandatory=$true)][string]$IngressFolderId,
     [Parameter(Mandatory=$true)][string]$IngressOwner,
-    [Parameter(Mandatory=$true)][string]$IdempotencyBucket,
-    [Parameter(Mandatory=$true)][string]$IdempotencyObject,
+    # The canonical idempotency bucket -- manager.gcs_lock_registry.
+    # BUCKET_ENV ("ADM_LOCK_GCS_BUCKET"), the same bucket env
+    # manager.command_watcher and cloud.app already use, resolved by
+    # manager.drive_dispatch_watcher via os.environ.get(BUCKET_ENV).
+    # There is no separate ingress-specific idempotency object: dispatch
+    # request idempotency object names are generated dynamically by
+    # manager.dispatch_requests.dispatch_request_registry() as
+    # dispatch-requests/{project_id}/{request_id}.json, not a static path.
+    [Parameter(Mandatory=$true)][string]$GcsBucket,
     [string]$GoogleDriveToken,
     # Trusted authority for manager.project_registry's ADM_WORKSPACE_ROOT
     # resolution -- explicitly serialized into the Scheduled Task action
@@ -99,7 +106,7 @@ if (-not $GoogleDriveToken) {
 }
 
 $runner = Join-Path $RepositoryPath "manager\run_drive_dispatch_ingress.ps1"
-$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -PythonDeps `"$PythonDeps`" -IngressFolderId `"$IngressFolderId`" -IngressOwner `"$IngressOwner`" -IdempotencyBucket `"$IdempotencyBucket`" -IdempotencyObject `"$IdempotencyObject`" -GoogleDriveToken `"$GoogleDriveToken`" -WorkspaceRoot `"$WorkspaceRoot`""
+$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -PythonDeps `"$PythonDeps`" -IngressFolderId `"$IngressFolderId`" -IngressOwner `"$IngressOwner`" -GcsBucket `"$GcsBucket`" -GoogleDriveToken `"$GoogleDriveToken`" -WorkspaceRoot `"$WorkspaceRoot`""
 # Same "route through a generated hidden VBS wrapper" mechanism as the
 # Command Watcher -- WshShell.Run(cmd, 0, True) sets the window style to
 # hidden before the process is even created, which is what actually
