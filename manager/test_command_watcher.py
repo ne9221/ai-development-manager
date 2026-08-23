@@ -14,8 +14,8 @@ from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_creation_identity
 from manager.command_watcher import (
     CLAIM_TIMEOUT_SECONDS, PROVIDER_RUNTIMES, REQUIRED_TASK_POLICIES, _provider_state,
-    claude_quota_reliable, codex_quota_reliable, load_allowlist, poll_once, process_command,
-    provider_quota_reliable, resolve_provider_runtime,
+    claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist, poll_once,
+    process_command, provider_quota_reliable, resolve_provider_runtime,
 )
 from manager.execution_lifecycle import enter_running_gate
 from manager.executions import execution_health, heartbeat_execution, reserve_execution
@@ -1760,6 +1760,138 @@ def argparse_namespace(**overrides):
     }
     base.update(overrides)
     return argparse.Namespace(**base)
+
+
+class EmbeddedIngressSwitchTests(unittest.TestCase):
+    """Covers fix/command-watcher-embedded-ingress-decouple-20260823: an
+    explicit ADM_COMMAND_WATCHER_EMBEDDED_INGRESS switch that lets the
+    dedicated Drive Dispatch Ingress Scheduled Task become the sole polling
+    authority, without deleting the embedded path pre-migration installs
+    still rely on."""
+
+    # 1: embedded ingress enabled (unset, default) -> current behavior preserved
+    def test_unset_env_var_defaults_to_enabled(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(embedded_ingress_enabled())
+
+    def test_explicit_true_strings_enable(self):
+        for value in ("1", "true", "TRUE", "  yes  ", "Yes"):
+            self.assertTrue(embedded_ingress_enabled(value), value)
+
+    # 2 & 5: disabled -> poll_drive_dispatch_requests never invoked, and
+    # folder/owner env presence cannot override an explicit disable
+    def test_explicit_false_strings_disable(self):
+        for value in ("0", "false", "FALSE", "  no  ", "No"):
+            self.assertFalse(embedded_ingress_enabled(value), value)
+
+    # 6: malformed/ambiguous config fails closed to disabled
+    def test_malformed_value_fails_closed_to_disabled(self):
+        for value in ("", "garbage", "2", "yesplease", "None"):
+            self.assertFalse(embedded_ingress_enabled(value), value)
+
+    def test_reads_env_var_when_no_raw_argument_given(self):
+        with patch.dict(os.environ, {"ADM_COMMAND_WATCHER_EMBEDDED_INGRESS": "0"}, clear=True):
+            self.assertFalse(embedded_ingress_enabled())
+        with patch.dict(os.environ, {"ADM_COMMAND_WATCHER_EMBEDDED_INGRESS": "1"}, clear=True):
+            self.assertTrue(embedded_ingress_enabled())
+
+
+class EmbeddedIngressMainWiringTests(unittest.TestCase):
+    """Exercises the actual poll_drive_dispatch_requests() call site inside
+    main() -- the unit-level embedded_ingress_enabled() tests above prove the
+    switch's own truth table, these prove main() actually obeys it."""
+
+    def _run_once(self, env):
+        import io
+        from contextlib import redirect_stdout
+        from manager.command_watcher import main
+
+        ingress_calls = []
+
+        def fake_poll(store, service, bucket):
+            ingress_calls.append((store, service, bucket))
+            return []
+
+        with patch.dict(os.environ, env, clear=True), \
+             patch("manager.command_watcher.build_service", return_value=object()), \
+             patch("manager.command_watcher.DriveRecords", return_value=Mock(list_project_ids=Mock(return_value=[]))), \
+             patch("manager.drive_dispatch_ingress.poll_drive_dispatch_requests", side_effect=fake_poll), \
+             redirect_stdout(io.StringIO()):
+            main(["--once"])
+        return ingress_calls
+
+    # 1: folder id present, switch unset (default enabled) -> ingress polled, current behavior preserved
+    def test_unset_switch_with_folder_id_polls_ingress(self):
+        calls = self._run_once({"ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID": "folder-1"})
+        self.assertEqual(1, len(calls))
+
+    # 2: switch explicitly disabled, folder id still present -> never polled
+    def test_disabled_switch_with_folder_id_never_polls_ingress(self):
+        calls = self._run_once({
+            "ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID": "folder-1",
+            "ADM_COMMAND_WATCHER_EMBEDDED_INGRESS": "0",
+        })
+        self.assertEqual(0, len(calls))
+
+    # 5: folder id alone (no switch value at all disabling it) cannot
+    # accidentally re-enable ingress once explicitly disabled
+    def test_disabled_switch_ignores_owner_env_too(self):
+        calls = self._run_once({
+            "ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID": "folder-1",
+            "ADM_DRIVE_DISPATCH_INGRESS_OWNER": "someone@example.com",
+            "ADM_COMMAND_WATCHER_EMBEDDED_INGRESS": "false",
+        })
+        self.assertEqual(0, len(calls))
+
+    # No folder id at all -> never polls regardless of switch (unchanged prior contract)
+    def test_no_folder_id_never_polls_even_if_switch_enabled(self):
+        calls = self._run_once({"ADM_COMMAND_WATCHER_EMBEDDED_INGRESS": "1"})
+        self.assertEqual(0, len(calls))
+
+    # 3: disabled mode still proceeds to poll_once() (command polling unaffected)
+    def test_disabled_switch_still_runs_poll_once(self):
+        import io
+        from contextlib import redirect_stdout
+        from manager.command_watcher import main
+
+        with patch.dict(os.environ, {
+            "ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID": "folder-1",
+            "ADM_COMMAND_WATCHER_EMBEDDED_INGRESS": "0",
+        }, clear=True), \
+             patch("manager.command_watcher.build_service", return_value=object()), \
+             patch("manager.command_watcher.DriveRecords", return_value=Mock(list_project_ids=Mock(return_value=[]))), \
+             patch("manager.command_watcher.poll_once", return_value=["sentinel"]) as poll_once_mock, \
+             redirect_stdout(output := io.StringIO()):
+            exit_code = main(["--once"])
+
+        self.assertEqual(0, exit_code)
+        poll_once_mock.assert_called_once()
+        printed = json.loads(output.getvalue().strip())
+        self.assertEqual(["sentinel"], printed["commands"])
+        self.assertEqual([], printed["ingress"])
+
+
+class WindowsWatcherEmbeddedIngressWiringTests(unittest.TestCase):
+    """7 & 8: the Windows installer/runner carry an explicit switch through
+    to the runtime env var, same wiring style as the existing allowlist/
+    ingress-folder-id/claude-accounts params this test class sits next to
+    (see test_windows_watcher_task_wires_allowlist_path_to_runtime above)."""
+
+    def test_installer_and_runner_wire_embedded_ingress_switch(self):
+        manager = Path(__file__).parent
+        installer = (manager / "install_command_watcher.ps1").read_text(encoding="utf-8")
+        runner = (manager / "run_command_watcher.ps1").read_text(encoding="utf-8")
+        self.assertIn("[string]$EmbeddedIngress", installer)
+        self.assertIn('-EmbeddedIngress `"$EmbeddedIngress`"', installer)
+        self.assertIn("[string]$EmbeddedIngress", runner)
+        self.assertIn("$env:ADM_COMMAND_WATCHER_EMBEDDED_INGRESS = $EmbeddedIngress", runner)
+
+    def test_installer_does_not_touch_dedicated_ingress_scripts(self):
+        manager = Path(__file__).parent
+        for name in ("install_drive_dispatch_ingress.ps1", "run_drive_dispatch_ingress.ps1"):
+            path = manager / name
+            if path.exists():
+                self.assertNotIn("EmbeddedIngress", path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__": unittest.main()

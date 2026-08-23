@@ -11,6 +11,15 @@ param(
     [Parameter(Mandatory=$true)][string]$GcsObject,
     [string]$IngressFolderId,
     [string]$IngressOwner,
+    # Explicit switch (passed through verbatim as
+    # ADM_COMMAND_WATCHER_EMBEDDED_INGRESS) gating whether this Command
+    # Watcher install polls Drive dispatch requests itself. Empty/unset
+    # (the default) preserves pre-migration folder-id-gated behavior; "0"
+    # disables embedded ingress unconditionally for installs where the
+    # dedicated Drive Dispatch Ingress Scheduled Task (6a7f0df, installed
+    # separately via install_drive_dispatch_ingress.ps1) is the sole
+    # polling authority.
+    [string]$EmbeddedIngress,
     [string]$ClaudeAccountsConfig,
     # Trusted authority for manager.project_registry's ADM_WORKSPACE_ROOT
     # resolution -- explicitly serialized into the Scheduled Task action
@@ -73,7 +82,7 @@ if (-not $ClaudeAccountsConfig) {
 }
 
 $runner = Join-Path $RepositoryPath "manager\run_command_watcher.ps1"
-$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -CodexBin `"$CodexBin`" -CodexHome `"$CodexHome`" -PythonDeps `"$PythonDeps`" -AllowlistPath `"$AllowlistPath`" -GcsBucket `"$GcsBucket`" -GcsObject `"$GcsObject`" -IngressFolderId `"$IngressFolderId`" -IngressOwner `"$IngressOwner`" -ClaudeAccountsConfig `"$ClaudeAccountsConfig`" -WorkspaceRoot `"$WorkspaceRoot`""
+$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -CodexBin `"$CodexBin`" -CodexHome `"$CodexHome`" -PythonDeps `"$PythonDeps`" -AllowlistPath `"$AllowlistPath`" -GcsBucket `"$GcsBucket`" -GcsObject `"$GcsObject`" -IngressFolderId `"$IngressFolderId`" -IngressOwner `"$IngressOwner`" -EmbeddedIngress `"$EmbeddedIngress`" -ClaudeAccountsConfig `"$ClaudeAccountsConfig`" -WorkspaceRoot `"$WorkspaceRoot`""
 $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $RepositoryPath -WrapperName "command-watcher" -PowerShellArguments $arguments
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
