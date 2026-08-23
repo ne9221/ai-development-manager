@@ -275,6 +275,77 @@ class CooldownStoreTests(unittest.TestCase):
         self.assertNotIn("Bearer", raw)
         self.assertNotIn("sk-ant-fake", raw)
 
+    # -- Structurally malformed *valid* JSON: the file parses and is a
+    #    top-level dict, but an entry's shape or retry_until can't be
+    #    trusted. This must fail closed exactly like unparseable JSON, not
+    #    silently read as "no cooldown" for the malformed key. --
+
+    def _write_json(self, data: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_malformed_retry_until_string_fails_closed_globally(self):
+        self._write_json({"<default>": {"retry_until": "not-an-iso-time"}})
+        result = self.store.get("<default>", now=NOW)
+        self.assertIsNotNone(result)
+        self.assertLessEqual((result - NOW).total_seconds(), CORRUPT_STATE_COOLDOWN_SECONDS)
+        parsed = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual([GLOBAL_QUARANTINE_KEY], list(parsed.keys()))
+        # Zero HTTP: even an unrelated key is blocked, not just <default>.
+        self.assertIsNotNone(self.store.get("other-key", now=NOW))
+
+    def test_malformed_retry_until_type_fails_closed(self):
+        self._write_json({"<default>": {"retry_until": 12345}})
+        self.assertIsNotNone(self.store.get("<default>", now=NOW))
+
+    def test_entry_not_an_object_fails_closed(self):
+        self._write_json({"<default>": "not-an-object"})
+        self.assertIsNotNone(self.store.get("<default>", now=NOW))
+
+    def test_malformed_global_sentinel_retry_until_fails_closed(self):
+        self._write_json({GLOBAL_QUARANTINE_KEY: {"retry_until": 12345}})
+        result = self.store.get("<default>", now=NOW)
+        self.assertIsNotNone(result)
+        # A fresh bounded quarantine window is armed, not the untrusted one.
+        self.assertLessEqual((result - NOW).total_seconds(), CORRUPT_STATE_COOLDOWN_SECONDS)
+
+    def test_valid_expired_iso_retry_until_is_not_treated_as_corrupt(self):
+        expired = NOW - timedelta(seconds=1)
+        self._write_json({"<default>": {"retry_until": expired.isoformat().replace("+00:00", "Z")}})
+        # Expired but structurally valid -> normal expiry, no quarantine.
+        self.assertIsNone(self.store.get("<default>", now=NOW))
+        parsed = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertNotIn(GLOBAL_QUARANTINE_KEY, parsed)
+
+    def test_valid_multiple_entries_remain_independent(self):
+        future = NOW + timedelta(seconds=300)
+        self._write_json({
+            "key-a": {"retry_until": future.isoformat().replace("+00:00", "Z")},
+            "key-b": {"retry_until": (NOW - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")},
+        })
+        self.assertIsNotNone(self.store.get("key-a", now=NOW))
+        self.assertIsNone(self.store.get("key-b", now=NOW))
+
+    def test_new_process_honors_quarantine_from_structurally_malformed_state(self):
+        self._write_json({"<default>": {"retry_until": "garbage"}})
+        first = self.store.get("<default>", now=NOW)
+        second = CooldownStore(self.path).get("some-other-key", now=NOW + timedelta(seconds=1))
+        self.assertEqual(first, second)
+
+    def test_post_expiry_exactly_one_request_allowed_after_structural_malformation(self):
+        self._write_json({"<default>": {"retry_until": "garbage"}})
+        self.store.get("<default>", now=NOW)
+        after_expiry = NOW + timedelta(seconds=CORRUPT_STATE_COOLDOWN_SECONDS + 1)
+        self.assertIsNone(CooldownStore(self.path).get("<default>", now=after_expiry))
+
+    def test_malformed_state_quarantine_persists_no_secret_content(self):
+        self._write_json({"<default>": {"retry_until": "garbage", "accessToken": "Bearer sk-ant-fake"}})
+        self.store.get("<default>", now=NOW)
+        raw = self.path.read_text(encoding="utf-8")
+        self.assertNotIn("accessToken", raw)
+        self.assertNotIn("Bearer", raw)
+        self.assertNotIn("sk-ant-fake", raw)
+
 
 if __name__ == "__main__":
     unittest.main()

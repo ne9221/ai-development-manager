@@ -132,7 +132,19 @@ class CooldownStore:
         """Returns (data, corrupt). data is always a dict. corrupt is True
         only when the file exists and its content could not be trusted
         as-is -- a missing or empty file is not corrupt, just "no state
-        recorded yet"."""
+        recorded yet".
+
+        Validates the *complete* shape, not just "is it a dict": every
+        top-level key must be a string, and every entry (both real
+        credential entries and a GLOBAL_QUARANTINE_KEY entry, if present)
+        must match the one supported shape -- {"retry_until": <ISO-8601
+        string>} -- with a retry_until that actually parses. Valid JSON
+        with a malformed entry (a non-object entry, a non-string
+        retry_until, or an unparseable retry_until string) is exactly as
+        untrustworthy as unparseable JSON: some entry's persisted cooldown
+        truth can't be verified, so the whole file is treated as corrupt
+        rather than letting the unverifiable entry silently read as "no
+        cooldown"."""
         if not self.path.is_file():
             return {}, False
         try:
@@ -147,7 +159,21 @@ class CooldownStore:
             return {}, True
         if not isinstance(data, dict):
             return {}, True
+        for key, entry in data.items():
+            if not isinstance(key, str) or not self._valid_entry(entry):
+                return {}, True
         return data, False
+
+    @staticmethod
+    def _valid_entry(entry) -> bool:
+        """The one supported entry shape: a dict with exactly one key,
+        retry_until, whose value is a string that parses as ISO-8601. An
+        entry that is expired is still valid -- expiry is a value judgment
+        made later against `now`, not a shape defect."""
+        if not isinstance(entry, dict) or set(entry.keys()) != {"retry_until"}:
+            return False
+        retry_until = entry.get("retry_until")
+        return isinstance(retry_until, str) and _parse_iso(retry_until) is not None
 
     def get(self, key: str, now: Optional[datetime] = None) -> Optional[datetime]:
         """Returns the retry_until datetime for `key` if it is still in the
