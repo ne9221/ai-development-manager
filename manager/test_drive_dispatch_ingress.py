@@ -11,9 +11,9 @@ from unittest.mock import Mock
 
 import manager.drive_dispatch_ingress as drive_dispatch_ingress
 from manager.drive_dispatch_ingress import (
-    DEFAULT_MAX_METADATA_PAGES, FOLDER_NAME, METADATA_FIELDS,
-    _fairness_slice_bounds, _modified_time_indicates_stale, _request_files,
-    poll_drive_dispatch_requests, read_request, verify_ingress_folder,
+    DEFAULT_FAIRNESS_SLICES, DEFAULT_MAX_METADATA_PAGES, FOLDER_NAME, METADATA_FIELDS,
+    _fairness_bucket_bounds, _fairness_rotation_slot, _modified_time_indicates_stale,
+    _request_files, poll_drive_dispatch_requests, read_request, verify_ingress_folder,
 )
 from manager.tasks import MIME_FOLDER, MIME_JSON, TaskError
 
@@ -299,7 +299,7 @@ def make_item(file_id, request_id, created_time, created_at=None, extra=None, mo
     return metadata, raw
 
 
-_CREATED_TIME_RANGE_RE = re.compile(r"createdTime > '([^']+)' and createdTime < '([^']+)'")
+_MODIFIED_TIME_RANGE_RE = re.compile(r"modifiedTime >= '([^']+)' and modifiedTime < '([^']+)'")
 
 
 class MultiFiles:
@@ -308,10 +308,10 @@ class MultiFiles:
     `orderBy="createdTime desc"` listing would for pre-sorted fixtures),
     recording every list()/get_media() call so tests can assert on
     ordering, pagination bounds, and which files were ever downloaded. A
-    `q` carrying a `createdTime > '...' and createdTime < '...'` range (as
-    `_fairness_slice_metadata` builds) is honored by filtering to that
+    `q` carrying a `modifiedTime >= '...' and modifiedTime < '...'` range
+    (as `_fairness_bucket_metadata` builds) is honored by filtering to that
     range, exactly like the real Drive API would -- letting the fairness-
-    slice query's own targeting be exercised realistically even in tests
+    bucket query's own targeting be exercised realistically even in tests
     that otherwise don't care about it."""
 
     def __init__(self, items=None, folder=None):
@@ -334,10 +334,10 @@ class MultiFiles:
     def list(self, **kwargs):
         self.list_calls.append(kwargs)
         candidates = [metadata for metadata, _raw in self.items]
-        match = _CREATED_TIME_RANGE_RE.search(kwargs.get("q", ""))
+        match = _MODIFIED_TIME_RANGE_RE.search(kwargs.get("q", ""))
         if match:
             start, end = match.groups()
-            candidates = [m for m in candidates if start < m.get("createdTime", "") < end]
+            candidates = [m for m in candidates if start <= m.get("modifiedTime", "") < end]
             candidates = candidates[:kwargs.get("pageSize", 100)]
         return Call({"files": candidates})
 
@@ -365,13 +365,13 @@ class DeepFolderFiles:
     first, exactly like a real `orderBy="createdTime desc"` listing would
     return; the plain newest-first `list()` call is paginated by
     `pageSize`/`pageToken` exactly like the real API; and a `list()` call
-    whose `q` carries a `createdTime > '...' and createdTime < '...'`
-    range (as `_fairness_slice_metadata` builds) is answered by filtering
+    whose `q` carries a `modifiedTime >= '...' and modifiedTime < '...'`
+    range (as `_fairness_bucket_metadata` builds) is answered by filtering
     server-side on that range instead of by page position -- letting a
     test prove a deep item unreachable via pagination is reachable via the
     range query."""
 
-    _RANGE_RE = re.compile(r"createdTime > '([^']+)' and createdTime < '([^']+)'")
+    _RANGE_RE = re.compile(r"modifiedTime >= '([^']+)' and modifiedTime < '([^']+)'")
 
     def __init__(self, items, folder=None):
         self.items = items
@@ -396,7 +396,7 @@ class DeepFolderFiles:
         match = self._RANGE_RE.search(kwargs.get("q", ""))
         if match:
             start, end = match.groups()
-            filtered = [m for m in candidates if start < m["createdTime"] < end]
+            filtered = [m for m in candidates if start <= m["modifiedTime"] < end]
             page_size = kwargs.get("pageSize", 100)
             return Call({"files": filtered[:page_size]})
         page_size = kwargs.get("pageSize", 100)
@@ -534,12 +534,16 @@ class DriveDispatchIngressBoundedTests(unittest.TestCase):
         # recent_candidates=2 keeps only the two newest in the "recent"
         # window every tick; 4 more still-valid (<24h) requests sit just
         # behind it and would be starved forever by continuous new
-        # arrivals without the rotating fairness pass.
+        # arrivals without the rotating fairness pass. Their absolute
+        # modifiedTime hour buckets are fixed (NOW - 1h/-2h/-3h/-4h) and
+        # never move; only the wall-clock-driven rotation slot changes as
+        # `tick_now` advances one poll (one simulated minute) at a time, so
+        # this must reach all 4 within DEFAULT_FAIRNESS_SLICES polls.
         older_valid = [make_item(f"older-{i}", f"older-req-{i}", NOW - timedelta(hours=i + 1))
                        for i in range(4)]
         handler, _ = self._accepting_handler()
         serviced = set()
-        for minute_offset in range(6):
+        for minute_offset in range(DEFAULT_FAIRNESS_SLICES):
             tick_now = NOW + timedelta(minutes=minute_offset)
             newest = [make_item(f"new-{minute_offset}-{i}", f"new-req-{minute_offset}-{i}",
                                 tick_now - timedelta(seconds=i)) for i in range(2)]
@@ -551,21 +555,118 @@ class DriveDispatchIngressBoundedTests(unittest.TestCase):
             serviced.update(fid for fid in service._files.get_media_calls if fid.startswith("older-"))
         self.assertEqual({"older-0", "older-1", "older-2", "older-3"}, serviced)
 
-    def test_fairness_slice_query_reaches_request_beyond_metadata_page_bound(self):
+    def test_fixed_request_absolute_bucket_reachable_within_bounded_poll_slots(self):
+        # Required test A: a FIXED target's absolute modifiedTime bucket
+        # never moves as `now` advances -- only which bucket gets selected
+        # each poll rotates. Drive a mocked clock across
+        # DEFAULT_FAIRNESS_SLICES distinct poll slots (never touching the
+        # target's own modifiedTime) and prove the fairness query targets
+        # the target's bucket, and returns it, within that bound.
+        base_now = datetime(2026, 8, 21, 0, 0, 0, tzinfo=timezone.utc)
+        target_modified = base_now - timedelta(hours=5, minutes=30)
+        target, target_raw = make_item("deep-file", "deep-req", target_modified)
+        target_bucket = int(target_modified.timestamp() // 3600)
+        # 300+ filler entries newer than the target so it sits deeper than
+        # the bounded newest-first listing (DEFAULT_MAX_METADATA_PAGES * 100
+        # == 300) and is unreachable by the recent-first/tail passes alone.
+        filler = [make_item(f"filler-{i}", f"filler-req-{i}", base_now - timedelta(seconds=i + 1))
+                 for i in range(305)]
+        items = filler + [(target, target_raw)]
+        seen_target_bucket_query = False
+        target_found_at_slot = None
+        for minute_offset in range(DEFAULT_FAIRNESS_SLICES):
+            tick_now = base_now + timedelta(minutes=minute_offset)
+            bucket_start, bucket_end = _fairness_bucket_bounds(tick_now)
+            selected_bucket = int(bucket_start.timestamp() // 3600)
+            service = DeepFolderService(items)
+            handler, order = self._accepting_handler()
+            with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+                poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, tick_now,
+                                             registry_factory=lambda *_a: object(),
+                                             max_candidates=12, recent_candidates=8)
+            if selected_bucket == target_bucket:
+                seen_target_bucket_query = True
+                if "deep-file" in service._files.get_media_calls:
+                    target_found_at_slot = minute_offset
+                    break
+        self.assertTrue(seen_target_bucket_query,
+                        "target's fixed absolute bucket was never selected within the bound")
+        self.assertIsNotNone(target_found_at_slot,
+                             "target was never downloaded even when its bucket was selected")
+        self.assertLess(target_found_at_slot, DEFAULT_FAIRNESS_SLICES)
+
+    def test_deep_old_created_time_fresh_modified_time_reaches_full_pipeline(self):
+        # Required test B: createdTime >24h old, modifiedTime and body
+        # created_at fresh, metadata position deeper than the newest ~300
+        # entries -- prove the fairness rotation eventually downloads AND
+        # accepts it end-to-end (not just a bucket-math unit test).
+        tick_now = datetime(2026, 8, 21, 0, 0, 0, tzinfo=timezone.utc)
+        old_created_time = tick_now - timedelta(hours=30)
+        # Fresh, but deliberately in a different absolute hour bucket than
+        # the filler below (which all sit in the tick_now-1h..tick_now
+        # bucket) -- otherwise the filler would legitimately outrank the
+        # target within its own bucket's DEFAULT_FAIRNESS_SLICE_CANDIDATES
+        # cap, which is a real (documented, conditional) limit of this
+        # mechanism, not what this test is checking.
+        fresh_modified_time = tick_now - timedelta(hours=1, minutes=5)
+        target, target_raw = make_item(
+            "deep-file", "deep-req", created_time=old_created_time,
+            created_at=fresh_modified_time, modified_time=fresh_modified_time)
+        filler = [make_item(f"filler-{i}", f"filler-req-{i}", tick_now - timedelta(seconds=i + 1))
+                 for i in range(305)]
+        items = filler + [(target, target_raw)]
+        handler, order = self._accepting_handler()
+        found = False
+        for minute_offset in range(DEFAULT_FAIRNESS_SLICES):
+            poll_now = tick_now + timedelta(minutes=minute_offset)
+            service = DeepFolderService(items)
+            with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+                results = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, poll_now,
+                                                        registry_factory=lambda *_a: object(),
+                                                        max_candidates=12, recent_candidates=8)
+            by_id = {r.get("file_id"): r for r in results}
+            if by_id.get("deep-file", {}).get("accepted"):
+                found = True
+                self.assertIn("deep-req", order)
+                break
+        self.assertTrue(found, "deep request with old createdTime/fresh modifiedTime was never accepted")
+
+    def test_fairness_query_filters_on_modified_time_not_created_time(self):
+        # Required test D: directly assert the fairness `files.list()`
+        # call's `q` filters by modifiedTime, never createdTime.
+        tick_now = datetime(2026, 8, 21, 0, 0, 0, tzinfo=timezone.utc)
+        filler = [make_item(f"filler-{i}", f"filler-req-{i}", tick_now - timedelta(seconds=i + 1))
+                 for i in range(305)]
+        service = DeepFolderService(filler)
+        handler, _ = self._accepting_handler()
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, tick_now,
+                                         registry_factory=lambda *_a: object(),
+                                         max_candidates=12, recent_candidates=8)
+        fairness_calls = [call for call in service._files.list_calls if "modifiedTime" in call.get("q", "")
+                         or "createdTime >" in call.get("q", "") or "createdTime >=" in call.get("q", "")]
+        self.assertTrue(fairness_calls, "expected at least one range-filtered fairness query")
+        for call in fairness_calls:
+            self.assertIn("modifiedTime", call["q"])
+            self.assertNotIn("createdTime >", call["q"])
+            self.assertNotIn("createdTime >=", call["q"])
+
+    def test_fairness_bucket_query_reaches_request_beyond_metadata_page_bound(self):
         # ISSUE 2 regression: a still-valid (<24h) request sitting deeper
         # than the bounded newest-first metadata listing
         # (DEFAULT_MAX_METADATA_PAGES * 100 == 300 entries) can never be
         # covered by the recent-first + in-listing-tail fairness passes
         # alone -- it never even appears in that listing. Prove the new
-        # deep-slice fairness query actually reaches it regardless.
-        tick_now = datetime(2026, 8, 21, 0, 0, 0, tzinfo=timezone.utc)
+        # absolute-bucket fairness query actually reaches it regardless.
+        tick_now = datetime(2026, 8, 21, 2, 0, 0, tzinfo=timezone.utc)
         self.assertEqual(3, DEFAULT_MAX_METADATA_PAGES)  # this test's math assumes the real bound
-        slice_start, slice_end = _fairness_slice_bounds(tick_now)
-        # This is the OLDEST hour of the 24h window at this tick_now (see
-        # _fairness_slice_bounds: at an exact-midnight tick_now, slice
-        # index 0 lands at window_start), far from the 305 recent filler
-        # items below -- so there is no accidental overlap.
-        target_time = slice_start + timedelta(seconds=1800)
+        bucket_start, bucket_end = _fairness_bucket_bounds(tick_now)
+        # At this tick_now the selected bucket is 2026-08-21T00:00-01:00,
+        # two hours behind tick_now -- see _fairness_bucket_bounds -- far
+        # from the 305 recent filler items below (all within the last ~5
+        # minutes before tick_now), so there is no accidental overlap and
+        # the target is safely in the past (not future-dated).
+        target_time = bucket_start + timedelta(seconds=1800)
         filler = [make_item(f"filler-{i}", f"filler-req-{i}", tick_now - timedelta(seconds=i + 1))
                  for i in range(300 + 5)]  # 305 > DEFAULT_MAX_METADATA_PAGES * 100 (300)
         target = make_item("deep-file", "deep-req", target_time)
@@ -580,7 +681,7 @@ class DriveDispatchIngressBoundedTests(unittest.TestCase):
 
         # The bounded newest-first listing (3 pages of 100) never reaches
         # index 305 -- confirm the fixture actually exercises that bound.
-        self.assertEqual(3, sum(1 for call in service._files.list_calls if "createdTime >" not in call.get("q", "")))
+        self.assertEqual(3, sum(1 for call in service._files.list_calls if "modifiedTime >=" not in call.get("q", "")))
         self.assertIn("deep-file", service._files.get_media_calls)
         self.assertIn("deep-req", order)
         by_id = {r.get("file_id"): r for r in results}

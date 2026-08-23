@@ -33,12 +33,26 @@ DEFAULT_MAX_CANDIDATES_PER_POLL = 12
 # this optimization can never skip something the authoritative body check
 # would have accepted.
 STALE_METADATA_SKIP_MARGIN_SECONDS = 300
-# Bounded, stateless fairness slice (see poll_drive_dispatch_requests
-# docstring): the ~24h acceptance window (MAX_AGE_SECONDS) is divided into
-# this many equal wall-clock-rotated slices, each covered by its own small,
-# separately bounded Drive query.
+# Bounded, stateless fairness bucket rotation (see poll_drive_dispatch_requests
+# docstring): time is divided into fixed ABSOLUTE UTC 1-hour buckets
+# (bucket_number = floor(unix_seconds / DEFAULT_FAIRNESS_BUCKET_SECONDS), an
+# absolute hour index since the epoch -- never relative to `now`). Each poll
+# selects exactly one of DEFAULT_FAIRNESS_SLICES possible bucket residues
+# (bucket_number % DEFAULT_FAIRNESS_SLICES) to query, rotated by wall clock,
+# each covered by its own small, separately bounded Drive query.
 DEFAULT_FAIRNESS_SLICES = 24
+DEFAULT_FAIRNESS_BUCKET_SECONDS = 3600
 DEFAULT_FAIRNESS_SLICE_CANDIDATES = 5
+# Assumed poll cadence used only to pick how often the rotation advances to
+# a new slot (see _fairness_rotation_slot). The real cadence is
+# manager.command_watcher's own POLL_SECONDS (default 60s, configurable
+# 10-900s) -- this constant does not need to match it exactly: a faster
+# real cadence just revisits some slots more than once before the bucket
+# they'd match changes, a slower one advances the slot less than once per
+# poll. Either way this is a rotation-speed tuning knob only, never a
+# correctness assumption -- see the "conditional bounded-load guarantee"
+# note in poll_drive_dispatch_requests's docstring.
+ASSUMED_POLL_INTERVAL_SECONDS = 60
 
 
 def _identity_matches(identity, expected):
@@ -142,46 +156,77 @@ def _modified_time_indicates_stale(metadata, now, margin_seconds=STALE_METADATA_
     return age > (MAX_AGE_SECONDS + margin_seconds)
 
 
-def _fairness_slice_bounds(now, max_age_seconds=MAX_AGE_SECONDS, slices=DEFAULT_FAIRNESS_SLICES):
-    """Pick one deterministic, wall-clock-rotated time slice of the ~24h
-    acceptance window (now - max_age_seconds, now]. No cursor or other
-    state is persisted anywhere: the slice index is derived solely from
+def _fairness_rotation_slot(now, slices=DEFAULT_FAIRNESS_SLICES,
+                            poll_interval_seconds=ASSUMED_POLL_INTERVAL_SECONDS):
+    """Deterministic wall-clock rotation slot in `[0, slices)`. No cursor or
+    other state is persisted anywhere: the slot is derived solely from
     `now`, so a fresh process picks up exactly where the wall clock says it
-    should, and the same instant always yields the same slice. Because the
-    slice index only changes once per `max_age_seconds / slices` seconds
-    (1 hour by default), a single slice stays selected across many
-    consecutive polls, giving each slice a real window in which its
-    dedicated bounded query can find and admit an eligible request."""
-    slice_seconds = max_age_seconds / slices
-    window_start = now - timedelta(seconds=max_age_seconds)
-    slice_index = int(now.timestamp() // slice_seconds) % slices
-    slice_start = window_start + timedelta(seconds=slice_index * slice_seconds)
-    slice_end = slice_start + timedelta(seconds=slice_seconds)
-    return slice_start, slice_end
+    should, and the same instant always yields the same slot. With the
+    default 60s `poll_interval_seconds` and `slices=24` this advances to a
+    new slot roughly once per minute, cycling through all 24 residues every
+    24 minutes -- i.e. within a bounded number of polls, any one residue
+    (and therefore any one absolute bucket matching it) gets its turn."""
+    return int(now.timestamp() // poll_interval_seconds) % slices
 
 
-def _fairness_slice_metadata(service, folder_id, slice_start, slice_end,
-                             candidates=DEFAULT_FAIRNESS_SLICE_CANDIDATES, deadline=None):
+def _fairness_bucket_bounds(now, bucket_seconds=DEFAULT_FAIRNESS_BUCKET_SECONDS,
+                            slices=DEFAULT_FAIRNESS_SLICES,
+                            poll_interval_seconds=ASSUMED_POLL_INTERVAL_SECONDS):
+    """Pick ONE fixed ABSOLUTE UTC time bucket to query this poll.
+
+    `bucket_number = floor(unix_seconds / bucket_seconds)` is an absolute
+    hour index since the epoch -- it depends only on a file's own
+    `modifiedTime`, NEVER on `now`. This is the key property that fixes the
+    prior moving-age-window slice mechanism: a FIXED request's bucket
+    number can never change as `now` advances, so it does not matter how
+    much wall-clock time passes -- only WHICH bucket gets selected each
+    poll rotates, a request's own bucket membership never does.
+
+    Each poll first derives a rotation `slot` from the wall clock (see
+    `_fairness_rotation_slot`), then selects the most recent absolute
+    bucket `<= now`'s own bucket whose `bucket_number % slices == slot`.
+    Since bucket numbers increase by exactly 1 every `bucket_seconds`,
+    exactly one of the last `slices` consecutive buckets satisfies this for
+    any slot, so this always resolves within `slices` buckets back from the
+    current one -- i.e. within a bounded lookback of `slices * bucket_seconds`
+    seconds (24 hours with the defaults), matching the overall ~24h
+    acceptance window (MAX_AGE_SECONDS)."""
+    slot = _fairness_rotation_slot(now, slices=slices, poll_interval_seconds=poll_interval_seconds)
+    current_bucket = int(now.timestamp() // bucket_seconds)
+    back = (current_bucket - slot) % slices
+    bucket_number = current_bucket - back
+    bucket_start = datetime.fromtimestamp(bucket_number * bucket_seconds, tz=timezone.utc)
+    bucket_end = bucket_start + timedelta(seconds=bucket_seconds)
+    return bucket_start, bucket_end
+
+
+def _fairness_bucket_metadata(service, folder_id, bucket_start, bucket_end,
+                              candidates=DEFAULT_FAIRNESS_SLICE_CANDIDATES, deadline=None):
     """One separate, small, server-side-filtered Drive `files.list()` call
-    scoped to a single deterministic age slice (see `_fairness_slice_bounds`)
-    inside the accepted ~24h window. This is deliberately independent of
-    the main newest-first metadata listing and its `max_metadata_pages`
-    bound -- a request old enough to have scrolled past that bounded
-    listing can still be found here, because this query is filtered by
-    Drive itself (`createdTime` range in `q`) rather than by paging through
-    everything newer first. Bounded to `candidates` results and never more
-    than a single page, so it costs the same regardless of how much history
+    scoped to a single deterministic absolute UTC time bucket (see
+    `_fairness_bucket_bounds`). This is deliberately independent of the
+    main newest-first metadata listing and its `max_metadata_pages` bound
+    -- a request old enough to have scrolled past that bounded listing can
+    still be found here, because this query is filtered by Drive itself
+    (a `modifiedTime` range in `q` -- NOT `createdTime`, so this stays
+    consistent with `_modified_time_indicates_stale`'s own metadata-only
+    staleness signal: a `createdTime` range would let a file's bucket
+    membership be pinned forever at creation even if its body is later
+    rewritten, and would also disagree with the metadata-skip check right
+    above it in this module) rather than by paging through everything
+    newer first. Bounded to `candidates` results and never more than a
+    single page, so it costs the same regardless of how much history
     exists in the folder."""
     if deadline is not None and time.monotonic() >= deadline:
         return []
-    start_str = slice_start.strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_str = slice_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_str = bucket_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = bucket_end.strftime("%Y-%m-%dT%H:%M:%SZ")
     query = (f"'{folder_id}' in parents and trashed=false and "
-             f"createdTime > '{start_str}' and createdTime < '{end_str}'")
+             f"modifiedTime >= '{start_str}' and modifiedTime < '{end_str}'")
     params = {
         "q": query, "spaces": "drive",
         "fields": f"nextPageToken,files({METADATA_FIELDS})",
-        "pageSize": candidates, "orderBy": "createdTime desc",
+        "pageSize": candidates, "orderBy": "modifiedTime desc",
     }
     response = service.files().list(**params).execute()
     page = response.get("files") if isinstance(response, dict) else None
@@ -260,39 +305,62 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
       sole authority whenever metadata alone does not conclusively prove
       staleness, and is never weakened or bypassed.
     - Between the recent pass and the in-listing tail pass below, a second,
-      independent, small bounded fairness query (`_fairness_slice_metadata`)
-      covers one deterministic age slice of the full ~24h acceptance window
-      on every poll (see `_fairness_slice_bounds`; `DEFAULT_FAIRNESS_SLICES`
-      slices, rotated by wall clock, up to `DEFAULT_FAIRNESS_SLICE_CANDIDATES`
-      results per slice). This is what makes a still-valid request deeper
-      than `max_metadata_pages` * 100 (i.e. never present in the bounded
-      newest-first listing at all) reachable in the first place: the slice
-      query is filtered server-side by Drive on a `createdTime` range in
-      `q`, rather than by paging through everything newer first. It shares
-      the same overall `max_candidates` ceiling as every other pass in this
-      function -- that bound is never exceeded -- but is deliberately run
-      *before* the tail pass below so it is not starved by it: the tail
-      pass routinely has ample same-listing candidates and will spend its
-      entire remaining budget every poll once it runs, which is exactly
-      when a deep request needs this query's turn most. Because this query
-      only actually consumes budget when its slice genuinely contains an
-      eligible candidate (an empty slice, the common case, costs nothing),
-      the tail pass keeps its full ordinary budget on every poll where this
-      query finds nothing. Guarantee actually provided: any request inside
-      the accepted window falls into exactly one of `DEFAULT_FAIRNESS_SLICES`
-      deterministic slices, and that slice is queried at least once per full
-      rotation (i.e. within a bounded number of poll cycles determined by
-      the trigger interval), PROVIDED the volume of still-eligible
-      candidates within that one slice does not exceed
-      `DEFAULT_FAIRNESS_SLICE_CANDIDATES` and the recent/tail passes above
-      have not already exhausted `max_candidates` for that poll (Drive
-      returns that slice's own newest-first, so more candidates than the
-      bound in a single slice can still push an older one out for as long
-      as that slice remains oversubscribed). This is a bounded-load
-      guarantee, not an unconditional no-starvation guarantee -- an
-      unconditional guarantee is not achievable without persistent cursor
-      state or an explicit bound on new-arrival rate, neither of which this
-      function has.
+      independent, small bounded fairness query (`_fairness_bucket_metadata`)
+      covers one deterministic ABSOLUTE UTC time bucket on every poll (see
+      `_fairness_bucket_bounds`; `DEFAULT_FAIRNESS_SLICES` possible bucket
+      residues, rotated by wall clock, up to
+      `DEFAULT_FAIRNESS_SLICE_CANDIDATES` results per bucket). This is what
+      makes a still-valid request deeper than `max_metadata_pages` * 100
+      (i.e. never present in the bounded newest-first listing at all)
+      reachable in the first place: the bucket query is filtered server-side
+      by Drive on a `modifiedTime` range in `q` (never `createdTime` -- for
+      the same reason `_modified_time_indicates_stale` never uses it: a
+      file's `createdTime` cannot prove anything about when its current
+      body was written), rather than by paging through everything newer
+      first. It shares the same overall `max_candidates` ceiling as every
+      other pass in this function -- that bound is never exceeded -- but is
+      deliberately run *before* the tail pass below so it is not starved by
+      it: the tail pass routinely has ample same-listing candidates and
+      will spend its entire remaining budget every poll once it runs, which
+      is exactly when a deep request needs this query's turn most. Because
+      this query only actually consumes budget when its bucket genuinely
+      contains an eligible candidate (an empty bucket, the common case,
+      costs nothing), the tail pass keeps its full ordinary budget on every
+      poll where this query finds nothing.
+
+      Bucket selection is a STATELESS, ABSOLUTE rotation, not a window
+      relative to `now`: `bucket_number = floor(unix_seconds / 3600)` is an
+      absolute hour index since the epoch, derived only from a candidate's
+      own `modifiedTime` -- it never moves as `now` advances. Each poll
+      derives a rotation slot from the wall clock
+      (`_fairness_rotation_slot`, cycling through all `DEFAULT_FAIRNESS_SLICES`
+      residues roughly once per minute by default) and queries the most
+      recent absolute bucket `<= now` whose `bucket_number % DEFAULT_FAIRNESS_SLICES`
+      equals that slot. This fixes a real flaw in the prior relative
+      moving-window slice mechanism: there, a fixed request's slice index
+      was computed relative to `now`, so its own slice assignment could
+      drift or be skipped as time passed. Here, a fixed request's bucket
+      number is fixed forever (as long as its `modifiedTime` does not
+      change), so it is guaranteed to be selected within `DEFAULT_FAIRNESS_SLICES`
+      poll slots of rotation, not merely "eventually, maybe."
+
+      Guarantee actually provided -- CONDITIONAL bounded load, NOT
+      unconditional no-starvation: any request's `modifiedTime` falls into
+      exactly one fixed absolute UTC hour bucket, and that bucket's residue
+      is queried at least once every `DEFAULT_FAIRNESS_SLICES` poll slots
+      (a bounded number of poll cycles, not "eventually" in an open-ended
+      sense), PROVIDED (a) the request remains body-valid per
+      `read_request()`'s own `created_at` check, (b) its `modifiedTime`
+      still lies within the overall ~24h acceptance window enforced
+      elsewhere, (c) the volume of still-eligible candidates within its one
+      bucket does not exceed `DEFAULT_FAIRNESS_SLICE_CANDIDATES` (Drive
+      returns that bucket's own newest-first, so more candidates than the
+      bound in a single bucket can still push an older one out for as long
+      as that bucket remains oversubscribed), and (d) the recent/tail
+      passes above have not already exhausted `max_candidates` for that
+      poll. An unconditional guarantee is not achievable without persistent
+      cursor state or an explicit bound on new-arrival rate, neither of
+      which this function has.
     - After that, remaining budget (`max_candidates` total downloads per
       poll, shared across every pass above) is spent on the *rest* of the
       same bounded newest-first listing -- the candidates recency pushed
@@ -373,7 +441,7 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
                                     max_pages=max_metadata_pages, deadline=deadline)
     _scan(metadata_list[:recent_candidates], recent_candidates)
 
-    # Deep-slice fairness query: runs between the recent pass and the
+    # Absolute-bucket fairness query: runs between the recent pass and the
     # in-listing tail pass below, sharing the same hard `max_candidates`
     # ceiling for the whole poll (that bound is never exceeded). It is
     # placed here, ahead of the tail pass, specifically so it is not
@@ -383,16 +451,16 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
     # than the bounded newest-first listing (`max_metadata_pages` * 100
     # entries -- where this query, and only this query, can still reach)
     # needs a turn. Because it only actually consumes budget when its
-    # slice genuinely contains an eligible candidate (the common case is an
-    # empty slice, costing nothing), the tail pass keeps its full original
-    # budget on every poll where this query finds nothing.
+    # bucket genuinely contains an eligible candidate (the common case is
+    # an empty bucket, costing nothing), the tail pass keeps its full
+    # original budget on every poll where this query finds nothing.
     remaining_after_recent = max_candidates - downloads_used
     if remaining_after_recent > 0 and time.monotonic() < deadline:
-        slice_start, slice_end = _fairness_slice_bounds(current)
-        fairness_slice_metadata = _fairness_slice_metadata(
-            service, folder_id, slice_start, slice_end,
+        bucket_start, bucket_end = _fairness_bucket_bounds(current)
+        fairness_bucket_metadata = _fairness_bucket_metadata(
+            service, folder_id, bucket_start, bucket_end,
             candidates=DEFAULT_FAIRNESS_SLICE_CANDIDATES, deadline=deadline)
-        _scan(fairness_slice_metadata, min(DEFAULT_FAIRNESS_SLICE_CANDIDATES, remaining_after_recent))
+        _scan(fairness_bucket_metadata, min(DEFAULT_FAIRNESS_SLICE_CANDIDATES, remaining_after_recent))
 
     tail = metadata_list[recent_candidates:]
     fairness_budget = max_candidates - downloads_used
