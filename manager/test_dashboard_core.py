@@ -39,6 +39,9 @@ from manager.dashboard_core import (
     compute_overall_visible_dispatch_gate,
     validate_provenance_evidence_document,
     reconcile_watcher_provenance_evidence,
+    select_task_command,
+    select_task_execution,
+    select_task_handoff,
 )
 from manager.quota_forecast import (
     AccountQuotaForecast,
@@ -1087,6 +1090,154 @@ class ProvenanceEvidenceFileReconciliationTests(unittest.TestCase):
         self.assertIsNone(self._reconcile(age=7801, watcher_running=True, active=active)["tested_sha"])
         future = self._doc(captured_at=(self.now + timedelta(seconds=15)).isoformat())
         self.assertEqual("6d41645", reconcile_watcher_provenance_evidence("C:\\watcher-repo", "6d41645", validate_provenance_evidence_document(future), now=self.now)["tested_sha"])
+
+
+
+
+class TaskScopedLinkageContractTests(unittest.TestCase):
+    """Tests proving exact task-scoped linkage for Commands, Executions, and Handoffs."""
+
+    def setUp(self):
+        self.project_id = "ai-development-manager"
+        self.task_id = "task-alpha"
+
+    def test_exact_task_gets_its_own_handoff(self):
+        handoffs = [
+            {
+                "handoff_id": "task-alpha-final-1",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T10:00:00Z",
+                "reason": "completed",
+                "completed_work": ["Alpha work done"],
+            }
+        ]
+        selected = select_task_handoff(handoffs, self.project_id, self.task_id)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["handoff_id"], "task-alpha-final-1")
+        self.assertEqual(selected["completed_work"], ["Alpha work done"])
+
+    def test_cross_task_or_project_handoff_never_borrowed(self):
+        handoffs = [
+            {
+                "handoff_id": "task-beta-final-1",
+                "task_id": "task-beta",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T10:00:00Z",
+                "reason": "completed",
+            },
+            {
+                "handoff_id": "task-alpha-other-proj",
+                "task_id": "task-alpha",
+                "project_id": "other-project",
+                "created_at": "2026-08-23T10:00:00Z",
+                "reason": "completed",
+            }
+        ]
+        self.assertIsNone(select_task_handoff(handoffs, self.project_id, self.task_id))
+
+    def test_multiple_handoffs_deterministically_scoped(self):
+        handoffs = [
+            {
+                "handoff_id": "task-alpha-h1",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T10:00:00Z",
+                "from_session": "sess-1",
+            },
+            {
+                "handoff_id": "task-alpha-h2",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T11:00:00Z",
+                "from_session": "sess-2",
+            }
+        ]
+        # Without session priority, picks latest created_at
+        latest = select_task_handoff(handoffs, self.project_id, self.task_id)
+        self.assertEqual(latest["handoff_id"], "task-alpha-h2")
+
+        # With matching session, prioritizes exact session
+        session_matched = select_task_handoff(
+            handoffs, self.project_id, self.task_id,
+            execution={"provider_session_id": "sess-1"}
+        )
+        self.assertEqual(session_matched["handoff_id"], "task-alpha-h1")
+
+    def test_missing_handoff_returns_none(self):
+        self.assertIsNone(select_task_handoff([], self.project_id, self.task_id))
+
+    def test_select_task_command_exact_scoping_and_latest(self):
+        commands = [
+            {
+                "command_id": "cmd-old",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T08:00:00Z",
+                "status": "completed",
+            },
+            {
+                "command_id": "cmd-new",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T09:00:00Z",
+                "status": "running",
+                "result": {"outcome": "success", "session_id": "sess-alpha-live"},
+            },
+            {
+                "command_id": "cmd-other",
+                "task_id": "task-other",
+                "project_id": "ai-development-manager",
+                "created_at": "2026-08-23T10:00:00Z",
+                "status": "running",
+            }
+        ]
+        cmd = select_task_command(commands, self.project_id, self.task_id)
+        self.assertIsNotNone(cmd)
+        self.assertEqual(cmd["command_id"], "cmd-new")
+        self.assertEqual(cmd["status"], "running")
+        self.assertEqual(cmd["result"]["outcome"], "success")
+
+        # Unrelated task
+        self.assertIsNone(select_task_command(commands, self.project_id, "non-existent-task"))
+
+    def test_select_task_execution_prioritizes_command_linkage(self):
+        executions = [
+            {
+                "execution_id": "exec-1",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "provider_session_id": "sess-1",
+            },
+            {
+                "execution_id": "exec-2",
+                "task_id": "task-alpha",
+                "project_id": "ai-development-manager",
+                "provider_session_id": "sess-2",
+            }
+        ]
+        cmd = {"execution_id": "exec-1"}
+        exe = select_task_execution(executions, self.project_id, self.task_id, command=cmd)
+        self.assertEqual(exe["execution_id"], "exec-1")
+
+    def test_select_task_execution_mismatch_linkage_returns_none(self):
+        executions = [
+            {
+                "execution_id": "exec-cross-project",
+                "task_id": "task-alpha",
+                "project_id": "other-project",
+            }
+        ]
+        cmd = {"execution_id": "exec-cross-project"}
+        exe = select_task_execution(executions, self.project_id, self.task_id, command=cmd)
+        self.assertIsNone(exe)
+
+    def test_dispatch_truth_row_includes_exact_command_id(self):
+        task = {"project_id": "p1", "task_id": "t1", "title": "Task 1", "status": "ready"}
+        cmd = {"command_id": "cmd-exact-123", "task_id": "t1", "project_id": "p1", "provider": "claude", "account_id": "account-a", "status": "queued"}
+        row = build_dispatch_truth_row(None, task, cmd, None, [], datetime(2026, 8, 23, 12, 0, 0, tzinfo=timezone.utc))
+        self.assertEqual(row["command_id"], "cmd-exact-123")
+        self.assertEqual(row["task_id"], "t1")
 
 
 if __name__ == "__main__":

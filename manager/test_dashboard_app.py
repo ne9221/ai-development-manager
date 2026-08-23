@@ -316,5 +316,88 @@ class TestDashboardAppRender(unittest.TestCase):
         self.assertEqual(df.iloc[0]["Account"], "account-a")
 
 
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_app_render_task_inspector_with_exact_command_execution_and_handoff(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+        mock_read_drive_status.return_value = {"providers": []}
+        mock_store = mock_drive_records.return_value
+        mock_store.list_projects.return_value = [{"project_id": "test-project", "title": "Test Project"}]
+
+        def mock_children(parent, name=None, deadline=None):
+            if "tasks" in parent:
+                return [{"name": "test-task-1.json", "mimeType": "application/json"}]
+            elif "commands" in parent:
+                return [{"name": "cmd-task-1.json", "mimeType": "application/json"}]
+            elif "executions" in parent:
+                return [{"name": "exec-task-1.json", "mimeType": "application/json"}]
+            elif "handoffs" in parent:
+                return [{"name": "test-task-1-final-20260823.json", "mimeType": "application/json"}]
+            return []
+
+        mock_store.project_folder.side_effect = lambda area, project_id, create=False: f"folder-{area}"
+        mock_store.children.side_effect = mock_children
+
+        def mock_get(area, project_id, name):
+            if area == "tasks":
+                return {
+                    "project_id": "test-project",
+                    "task_id": "test-task-1",
+                    "title": "Task 1",
+                    "status": "completed",
+                    "assigned_provider": "claude",
+                }
+            elif area == "commands":
+                return {
+                    "project_id": "test-project",
+                    "task_id": "test-task-1",
+                    "command_id": "cmd-task-1",
+                    "execution_id": "exec-task-1",
+                    "provider": "claude",
+                    "account_id": "account-a",
+                    "status": "completed",
+                    "result": {"outcome": "success", "session_id": "sess-claude-alpha"}
+                }
+            elif area == "executions":
+                return {
+                    "project_id": "test-project",
+                    "task_id": "test-task-1",
+                    "execution_id": "exec-task-1",
+                    "provider": "claude",
+                    "account_id": "account-a",
+                    "status": "completed",
+                    "provider_session_id": "sess-claude-alpha",
+                    "completed_at": "2026-08-23T15:00:00Z"
+                }
+            elif area == "handoffs":
+                return {
+                    "project_id": "test-project",
+                    "task_id": "test-task-1",
+                    "handoff_id": "test-task-1-final-20260823",
+                    "created_at": "2026-08-23T15:00:00Z",
+                    "from_provider": "claude",
+                    "from_session": "sess-claude-alpha",
+                    "reason": "completed",
+                    "current_state": "completed",
+                    "completed_work": ["Full E2E suite executed successfully", "All assertions verified"],
+                    "files_changed": ["manager/command_watcher.py"],
+                    "commits": ["cb62ac1"],
+                    "completion_report": {"ai": "Claude", "task": "test-task-1"}
+                }
+            return {}
+        mock_store.get.side_effect = mock_get
+
+        at = AppTest.from_file("../dashboard.py")
+        at.run(timeout=30)
+
+        self.assertFalse(at.exception, f"App crashed during inspector render: {at.exception}")
+
+        # Verify Command truth is surfaced
+        text_dump = " ".join([el.value for el in at.markdown] + [str(w) for w in at.json])
+        self.assertTrue("cmd-task-1" in text_dump or any("cmd-task-1" in str(el.value) for el in at.markdown))
+        self.assertTrue("test-task-1-final-20260823" in text_dump or any("test-task-1-final-20260823" in str(el.value) for el in at.markdown))
+        self.assertTrue(any("Full E2E suite executed successfully" in str(el.value) for el in at.markdown))
+
+
 if __name__ == "__main__":
     unittest.main()

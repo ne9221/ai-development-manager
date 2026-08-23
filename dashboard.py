@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from collectors.publish_drive import build_service
-from manager.tasks import DriveRecords, logical_record_id
+from manager.tasks import DriveRecords, logical_record_id, safe_id
 from manager.quota_reader import read_drive_status, summarize
 from manager.quota_history import get_default_quota_history_store
 from manager.dashboard_core import (
@@ -34,6 +34,9 @@ from manager.dashboard_core import (
     compute_overall_visible_dispatch_gate,
     validate_provenance_evidence_document,
     reconcile_watcher_provenance_evidence,
+    select_task_command,
+    select_task_execution,
+    select_task_handoff,
 )
 
 WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
@@ -285,6 +288,47 @@ def list_records_isolated(store, area, project_id, limit=RECENT_RECORD_LIMIT, in
     return records, warnings
 
 
+@st.cache_data(ttl=30)
+def load_task_handoff_from_store(project_id: str, task_id: str):
+    """Targeted, on-demand read of handoff records for one specific task.
+
+    Avoids hydrating the historical handoff backlog during HOME first paint.
+    Only queries the project's HANDOFFS folder when a task is inspected.
+    """
+    if not project_id or not task_id:
+        return []
+    try:
+        service = build_service()
+        store = DriveRecords(service)
+        parent = store.project_folder("handoffs", project_id, create=False)
+        items = store.children(parent)
+        candidates = [item for item in items if item.get("name", "").endswith(".json")]
+        if not candidates:
+            return []
+
+        prefix = safe_id(task_id)
+        matching_items = [item for item in candidates if item.get("name", "").startswith(prefix)]
+        search_items = matching_items if matching_items else candidates[:20]
+
+        records = []
+        for item in search_items:
+            name = item.get("name", "")
+            storage_id = name[:-5]
+            try:
+                if item.get("id") and hasattr(store, "files") and hasattr(store.files, "get_media"):
+                    raw = store.files.get_media(fileId=item["id"]).execute()
+                    doc = json.loads(raw.decode("utf-8"))
+                else:
+                    doc = store.get("handoffs", project_id, logical_record_id(storage_id))
+                if isinstance(doc, dict) and doc.get("project_id") == project_id and doc.get("task_id") == task_id:
+                    records.append(doc)
+            except Exception:
+                pass
+        return records
+    except Exception:
+        return []
+
+
 # Recent-first reads keep the HOME view bounded; the manual sync button clears
 # this short cache immediately when the user needs a fresh lifecycle state.
 @st.cache_data(ttl=60)
@@ -485,6 +529,7 @@ for task_id in dict.fromkeys([*tasks_by_id, *commands_by_task, *executions_by_ta
         "Task status": task.get("status") or "—",
         "Command status": command_status or "—",
         "Execution status": execution_status or "—",
+        "Command ID": command.get("command_id") or "—",
         "Session ID": execution.get("provider_session_id") or execution.get("session_id") or (command.get("result") or {}).get("session_id") or "—",
         "Task ID": task_id or "—",
         "Model / mode": f"{execution.get('model') or command.get('model') or snapshot.get('model') or '—'} / {execution.get('mode') or command.get('mode') or snapshot.get('mode') or task.get('mode') or '—'}",
@@ -623,7 +668,7 @@ else:
                 </div>""", unsafe_allow_html=True)
             with st.expander("Technical IDs"):
                 st.write(f"project_id=`{_row['project_id']}` · task_id=`{_row['task_id']}`")
-                st.write(f"execution_id=`{_row['execution_id']}` · session_id=`{_row['session_id']}`")
+                st.write(f"command_id=`{_row.get('command_id', 'UNKNOWN')}` · execution_id=`{_row['execution_id']}` · session_id=`{_row['session_id']}`")
 
 st.markdown("---")
 
@@ -988,42 +1033,74 @@ else:
     if selected_option:
         p_id, t_id, _ = selected_option
 
-        # Find the task
+        # Find the task and exact task-scoped command, execution, and handoff
         task = next((t for t in all_tasks if t.get("project_id") == p_id and t.get("task_id") == t_id), {})
+        cmd = select_task_command(all_commands, p_id, t_id)
+        exe = select_task_execution(all_executions, p_id, t_id, command=cmd)
+        task_handoffs = load_task_handoff_from_store(p_id, t_id)
+        ho = select_task_handoff(task_handoffs, p_id, t_id, execution=exe, command=cmd)
 
         col1, col2 = st.columns(2)
 
         with col1:
-            st.subheader("Task Details")
-            st.write(f"**Status**: `{task.get('status')}`")
-            st.write(f"**Recommended Provider**: `{task.get('recommended_provider')}`")
-            st.write(f"**Assigned Provider**: `{task.get('assigned_provider')}`")
-            st.write(f"**Next Action**: {task.get('next_action')}")
-            st.write(f"**CWD**: `{task.get('working_directory')}`")
-            st.write(f"**Branch**: `{task.get('branch')}`")
+            st.subheader("Task & Execution Details")
+            st.write(f"**Status**: `{task.get('status') or 'UNKNOWN'}`")
+            st.write(f"**Recommended Provider**: `{task.get('recommended_provider') or '—'}`")
+            st.write(f"**Assigned Provider**: `{task.get('assigned_provider') or '—'}`")
+            st.write(f"**Next Action**: {task.get('next_action') or '—'}")
+            st.write(f"**CWD**: `{task.get('working_directory') or '—'}`")
+            st.write(f"**Branch**: `{task.get('branch') or '—'}`")
 
-            # Check for linked execution
-            linked_exe = active_executions_dict.get((p_id, t_id))
-            if linked_exe:
-                st.info("There is an active running execution for this task.")
-                st.write(f"Execution ID: `{linked_exe.get('execution_id')}`")
-                st.write(f"Provider Session ID: `{linked_exe.get('provider_session_id')}`")
-                st.write(f"Heartbeat: `{linked_exe.get('heartbeat_at')}`")
+            st.markdown("---")
+            st.markdown("**Command**")
+            if cmd:
+                st.write(f"Command ID: `{cmd.get('command_id') or 'UNKNOWN'}`")
+                st.write(f"Command Status: `{cmd.get('status') or 'UNKNOWN'}`")
+                if cmd.get("provider") or cmd.get("account_id"):
+                    st.write(f"Provider / Account: `{cmd.get('provider') or '—'}` / `{cmd.get('account_id') or '—'}`")
+                if cmd.get("result"):
+                    with st.expander("Command Result", expanded=True):
+                        st.json(cmd.get("result"))
             else:
-                st.write("No active execution.")
+                st.write("No command record found.")
+
+            st.markdown("---")
+            st.markdown("**Execution**")
+            if exe:
+                exec_state = determine_execution_state(exe, now)
+                st.write(f"Execution ID: `{exe.get('execution_id') or 'UNKNOWN'}`")
+                st.write(f"Execution Status: `{exe.get('status') or 'UNKNOWN'}` (Lifecycle State: `{exec_state.upper()}`)")
+                st.write(f"Provider Session ID: `{exe.get('provider_session_id') or exe.get('session_id') or '—'}`")
+                if exe.get("account_id"):
+                    st.write(f"Account ID: `{exe.get('account_id')}`")
+                if exe.get("started_at") or exe.get("reserved_at"):
+                    st.write(f"Started At: `{exe.get('started_at') or exe.get('reserved_at')}`")
+                if exe.get("heartbeat_at") or exe.get("completed_at"):
+                    st.write(f"Heartbeat / Updated: `{exe.get('heartbeat_at') or exe.get('completed_at')}`")
+                if exe.get("last_provider_event"):
+                    st.write(f"Last Event: `{exe.get('last_provider_event')}`")
+            else:
+                st.write("No execution record found.")
 
         with col2:
-            st.subheader("Latest Handoff")
-            ho = handoffs_dict.get((p_id, t_id))
+            st.subheader("Linked Handoff & Result")
             if ho:
-                st.write(f"Handoff ID: `{ho.get('handoff_id')}`")
-                st.write(f"Created At: `{ho.get('created_at')}`")
-                st.write(f"Reason: `{ho.get('reason')}`")
-                st.write(f"Next Action: {ho.get('next_action')}")
+                st.write(f"**Handoff ID**: `{ho.get('handoff_id')}`")
+                st.write(f"**Created At**: `{ho.get('created_at')}`")
+                st.write(f"**From Provider**: `{ho.get('from_provider') or '—'}`")
+                st.write(f"**From Session**: `{ho.get('from_session') or '—'}`")
+                st.write(f"**Reason**: `{ho.get('reason')}`")
+                st.write(f"**Current State**: `{ho.get('current_state')}`")
+                st.write(f"**Next Action**: {ho.get('next_action') or '—'}")
 
-                # Expand completed work & changes
-                with st.expander("Completed Work"):
-                    st.write(ho.get("completed_work", []))
+                completed_work = ho.get("completed_work", [])
+                if completed_work:
+                    with st.expander("Completed Work", expanded=True):
+                        if isinstance(completed_work, list):
+                            for item in completed_work:
+                                st.write(f"- {item}")
+                        else:
+                            st.write(completed_work)
 
                 files_changed = ho.get("files_changed", [])
                 if files_changed:
@@ -1034,6 +1111,11 @@ else:
                 if commits:
                     with st.expander("Commits"):
                         st.write(commits)
+
+                completion_report = ho.get("completion_report")
+                if completion_report:
+                    with st.expander("Completion Report"):
+                        st.json(completion_report)
             else:
                 st.write("No handoff records found for this task.")
 
