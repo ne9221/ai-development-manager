@@ -184,16 +184,34 @@ class CommandWatcherRunnerClaudeAccountsConfigTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run_watcher(self, extra_args="", include_workspace_root=True):
+    # This test session's own scratch checkout lives under the real OS temp
+    # directory, so self.tmp_path (and any workspace_root fixture nested
+    # under it) IS a genuine subpath of the real %TEMP% -- the runner's new
+    # WorkspaceRoot validation would (correctly) reject it. Every "happy
+    # path" call below overrides the subprocess's own TEMP/TMP env vars to
+    # an unrelated, fixed, non-existent path (existence is never checked by
+    # [IO.Path]::GetTempPath()) so the real, unmocked validation logic in
+    # run_command_watcher.ps1 sees a "temp" that workspace_root does not
+    # fall under -- exactly like the real HOME/scratch-checkout distinction
+    # this fix defends, without needing a genuinely different disk location.
+    _UNRELATED_FAKE_TEMP = "C:\\adm-test-fake-temp-root-unrelated"
+
+    def _run_watcher(self, extra_args="", include_workspace_root=True, workspace_root=None, temp_env=_UNRELATED_FAKE_TEMP):
         runner = self.fake_repo / "manager" / "run_command_watcher.ps1"
         allowlist = self.tmp_path / "allowlist.json"
         allowlist.write_text("{}", encoding="utf-8")
-        workspace_root = self.tmp_path / "workspace-root"
+        if workspace_root is None:
+            workspace_root = self.tmp_path / "workspace-root"
+            workspace_root.mkdir(parents=True, exist_ok=True)
         workspace_arg = f'-WorkspaceRoot "{workspace_root}"' if include_workspace_root else ""
         cmd = f'& "{runner}" -PythonPath "{self.fake_python}" -RepositoryPath "{self.fake_repo}" -ManagerHome "{self.manager_home}" -AllowlistPath "{allowlist}" -GcsBucket "b" -GcsObject "o" {workspace_arg} {extra_args}'
+        env = os.environ.copy()
+        if temp_env is not None:
+            env["TEMP"] = temp_env
+            env["TMP"] = temp_env
         return subprocess.run(
             [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True, text=True, timeout=20, env=env,
         )
 
     def test_default_config_path_exported_when_present(self):
@@ -251,3 +269,107 @@ class CommandWatcherRunnerClaudeAccountsConfigTest(unittest.TestCase):
     def test_runner_fails_closed_when_workspace_root_is_omitted(self):
         res = self._run_watcher(include_workspace_root=False)
         self.assertNotEqual(0, res.returncode)
+
+    def test_runner_fails_closed_on_relative_workspace_root(self):
+        res = self._run_watcher(workspace_root="relative\\path")
+        self.assertNotEqual(0, res.returncode)
+        self.assertIn("WORKSPACE_ROOT_INVALID", res.stderr)
+        self.assertNotIn("WORKSPACE_ROOT=", res.stdout)
+
+    def test_runner_fails_closed_on_nonexistent_workspace_root(self):
+        nonexistent = self.tmp_path / "does-not-exist"
+        res = self._run_watcher(workspace_root=nonexistent)
+        self.assertNotEqual(0, res.returncode)
+        self.assertIn("WORKSPACE_ROOT_INVALID", res.stderr)
+        self.assertNotIn("WORKSPACE_ROOT=", res.stdout)
+
+    def test_runner_fails_closed_when_workspace_root_resolves_under_temp(self):
+        # Real-world reproduction: a Claude scratch checkout's own
+        # RepositoryPath parent (or a directly-inherited stray
+        # ADM_WORKSPACE_ROOT) can resolve under the OS temp directory --
+        # the runner must refuse before ADM_WORKSPACE_ROOT is ever exported
+        # or Python/provenance ever runs, never just relaunch under it.
+        fake_temp = self.tmp_path / "fake-temp-root"
+        contaminated = fake_temp / "claude" / "scratchpad" / "ai-development-manager"
+        contaminated.mkdir(parents=True, exist_ok=True)
+        res = self._run_watcher(workspace_root=contaminated, temp_env=str(fake_temp))
+        self.assertNotEqual(0, res.returncode)
+        self.assertIn("WORKSPACE_ROOT_INVALID", res.stderr)
+        self.assertNotIn("WORKSPACE_ROOT=", res.stdout)
+
+    def test_runner_accepts_a_valid_explicit_non_temp_workspace_root(self):
+        # A legitimate, non-temp, existing, absolute WorkspaceRoot (the
+        # supported "alternate workspace" case) must keep working exactly
+        # as before this hardening.
+        alternate = self.tmp_path / "alternate-legitimate-workspace-root"
+        alternate.mkdir(parents=True, exist_ok=True)
+        res = self._run_watcher(workspace_root=alternate)
+        self.assertEqual(0, res.returncode, f"stderr: {res.stderr}")
+        self.assertIn(f"WORKSPACE_ROOT={alternate}", res.stdout)
+
+
+@unittest.skipUnless(POWERSHELL and os.name == "nt", "Windows PowerShell required")
+class InstallerWorkspaceRootValidationTest(unittest.TestCase):
+    """install_command_watcher.ps1's WorkspaceRoot validation must reject
+    every invalid form before it ever reaches provenance activation or
+    Register-ScheduledTask -- exercised directly (unmocked) here because
+    every one of these invalid-input cases is guaranteed to exit before any
+    of that runs, so this can never touch a real Scheduled Task."""
+
+    _UNRELATED_FAKE_TEMP = "C:\\adm-test-fake-temp-root-unrelated"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run_installer(self, workspace_root, temp_env=_UNRELATED_FAKE_TEMP):
+        installer = MANAGER_DIR / "install_command_watcher.ps1"
+        # Every other Mandatory parameter is a throwaway placeholder: a
+        # rejected WorkspaceRoot exits before any of them are dereferenced.
+        cmd = (
+            f'& "{installer}" -PythonPath "python.exe" -RepositoryPath "{self.tmp_path}" '
+            f'-ManagerHome "{self.tmp_path}" -CodexBin "codex.exe" -CodexHome "codex-home" '
+            f'-PythonDeps "python-deps" -AllowlistPath "allowlist.json" -GcsBucket "b" -GcsObject "o" '
+            f'-WorkspaceRoot "{workspace_root}"'
+        )
+        env = os.environ.copy()
+        if temp_env is not None:
+            env["TEMP"] = temp_env
+            env["TMP"] = temp_env
+        return subprocess.run(
+            [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd],
+            capture_output=True, text=True, timeout=20, env=env,
+        )
+
+    def test_rejects_blank_workspace_root(self):
+        res = self._run_installer("")
+        self.assertNotEqual(0, res.returncode)
+
+    def test_rejects_relative_workspace_root(self):
+        res = self._run_installer("relative\\path")
+        self.assertNotEqual(0, res.returncode)
+        self.assertIn("WORKSPACE_ROOT_INVALID", res.stderr)
+
+    def test_rejects_nonexistent_workspace_root(self):
+        res = self._run_installer(self.tmp_path / "does-not-exist")
+        self.assertNotEqual(0, res.returncode)
+        self.assertIn("WORKSPACE_ROOT_INVALID", res.stderr)
+
+    def test_rejects_temp_rooted_workspace_root(self):
+        fake_temp = self.tmp_path / "fake-temp-root"
+        contaminated = fake_temp / "claude" / "scratchpad" / "ai-development-manager"
+        contaminated.mkdir(parents=True, exist_ok=True)
+        res = self._run_installer(contaminated, temp_env=str(fake_temp))
+        self.assertNotEqual(0, res.returncode)
+        self.assertIn("WORKSPACE_ROOT_INVALID", res.stderr)
+
+    def test_installer_validation_runs_before_provenance_activation(self):
+        installer = (MANAGER_DIR / "install_command_watcher.ps1").read_text(encoding="utf-8")
+        validation_index = installer.index("WORKSPACE_ROOT_INVALID")
+        activate_index = installer.index("manager.provenance activate")
+        register_index = installer.index("Register-ScheduledTask")
+        self.assertLess(validation_index, activate_index)
+        self.assertLess(activate_index, register_index)

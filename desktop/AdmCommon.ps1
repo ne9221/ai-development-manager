@@ -146,6 +146,19 @@ function Set-AdmWorkspacePointer {
         (Split-Path -Path $repository -Parent).TrimEnd('\')
     }
 
+    # Final-candidate re-check: the repository-parent fallback above is not
+    # itself guaranteed non-temp -- a Claude scratch clone's own checkout
+    # (e.g. %TEMP%\claude\...\scratchpad\ai-development-manager) has a
+    # parent that is STILL under %TEMP%, so a contaminated inherited value
+    # could silently be replaced with a different, still-contaminated
+    # fallback. Re-validate whichever candidate was actually chosen --
+    # inherited-and-trusted or fallback -- before any persistent mutation
+    # (User env var, junction) ever happens; on failure, nothing below this
+    # point has run yet, so no mutation occurs at all.
+    if (Test-AdmWorkspaceRootContaminated -CandidateRoot $workspaceRoot) {
+        throw "Refusing to establish workspace authority at $workspaceRoot -- it resolves under the OS temp directory (both the inherited ADM_WORKSPACE_ROOT and the repository's own parent are contaminated); no environment variable or junction was changed."
+    }
+
     if ($env:ADM_WORKSPACE_ROOT -ne $workspaceRoot) {
         Set-AdmPersistentUserEnvironmentVariable -Name "ADM_WORKSPACE_ROOT" -Value $workspaceRoot
         $env:ADM_WORKSPACE_ROOT = $workspaceRoot
