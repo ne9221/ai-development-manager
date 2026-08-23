@@ -82,6 +82,31 @@ def _tested_evidence_path(manager_home: Path) -> Path:
     return manager_home / "provenance" / "tested_sha.json"
 
 
+def read_tested_sha(manager_home: Path) -> str | None:
+    """Read back the current TESTED evidence's `tested_sha`, or None if no
+    TESTED evidence has been captured yet (or it is unreadable/malformed).
+
+    This is a narrow, read-only accessor over the same on-disk evidence file
+    `capture_tested()` writes -- added so other read-only verifiers (e.g. the
+    canonical baseline promotion guard) can consume the already-authoritative
+    TESTED value without duplicating its file path/schema, and without
+    themselves requiring a local git checkout. Never raises: an absent or
+    malformed evidence file simply yields None, so callers can fail closed
+    on "tested_sha unavailable" rather than crashing.
+    """
+    path = _tested_evidence_path(manager_home)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    sha = data.get("tested_sha") if isinstance(data, dict) else None
+    if not isinstance(sha, str) or not _SHA_RE.match(sha):
+        return None
+    return sha
+
+
 def _activated_evidence_path(manager_home: Path) -> Path:
     return manager_home / "provenance" / "activated_sha.json"
 
