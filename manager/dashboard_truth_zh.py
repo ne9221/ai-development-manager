@@ -24,6 +24,7 @@ from manager.dashboard_core import (
     ProvenanceViewModel,
     build_quota_truth,
     determine_execution_state,
+    find_account_quota_vm,
 )
 
 UNKNOWN_ZH = "未知"
@@ -199,10 +200,14 @@ def build_routing_truth_zh(command: Optional[Dict[str, Any]]) -> RoutingTruthVie
 @dataclass
 class QuotaTruthViewModel:
     """usable is the literal truth question "can this account actually be
-    dispatched to right now": 可用 (usable), 不可用（額度為 0）(zero quota),
-    or 未知 (UNKNOWN) whenever freshness/telemetry can't prove either way --
-    a stale record is never rendered as usable, and 0% is never rendered as
-    merely "low"."""
+    dispatched to right now" -- 可用 / 可用（透過額外額度）/ 不可用 / 未知.
+    This is NEVER re-derived from the 5h remaining percentage: it is a
+    direct relabeling of the matched AccountQuotaCardViewModel's own
+    effective_availability (which manager.dashboard_core already computed
+    from staleness + dispatchable + has_reliable_quota + extra-credit
+    fallback), with a defensive fail-closed check that dispatchable/
+    has_reliable_quota are also true before ever saying 可用 -- a
+    self-inconsistent upstream record must never be relabeled as usable."""
 
     provider: str
     account_id: str
@@ -218,22 +223,41 @@ class QuotaTruthViewModel:
     last_updated: str
 
 
+_USABLE_ZH = {
+    "available": "可用",
+    "available_via_credits": "可用（透過額外額度）",
+    "unavailable": "不可用",
+}
+
+
+def _usable_zh(vm: Optional[AccountQuotaCardViewModel]) -> str:
+    if vm is None:
+        return UNKNOWN_ZH
+    availability = vm.effective_availability
+    if availability == "unavailable":
+        return "不可用"
+    if availability in ("available", "available_via_credits"):
+        if not vm.has_reliable_quota or not vm.dispatchable:
+            # Core truth is self-inconsistent (claims availability without
+            # the reliability/dispatchability that should imply it) --
+            # never surface 可用 on a hunch.
+            return UNKNOWN_ZH
+        return _USABLE_ZH[availability]
+    return UNKNOWN_ZH
+
+
 def build_quota_truth_zh(
     account_vms: Sequence[AccountQuotaCardViewModel], provider: str, account_id: str
 ) -> QuotaTruthViewModel:
     raw = build_quota_truth(account_vms, provider, account_id)
     freshness = raw["freshness"]
 
-    if not raw["found"] or freshness != "fresh":
-        usable = UNKNOWN_ZH
-    else:
-        remaining = raw["five_hour_remaining_pct"]
-        if remaining is None:
-            usable = UNKNOWN_ZH
-        elif remaining <= 0:
-            usable = "不可用（額度為 0）"
-        else:
-            usable = "可用"
+    matched_vm = (
+        find_account_quota_vm(account_vms, provider, account_id)
+        if provider != UNKNOWN_LABEL and account_id != UNKNOWN_LABEL
+        else None
+    )
+    usable = _usable_zh(matched_vm)
 
     return QuotaTruthViewModel(
         provider=provider,
@@ -319,8 +343,23 @@ class SessionTruthViewModel:
     summary: str
 
 
-def build_session_truth_zh(session: Optional[Dict[str, Any]]) -> SessionTruthViewModel:
+def build_session_truth_zh(
+    session: Optional[Dict[str, Any]], referenced: bool = False
+) -> SessionTruthViewModel:
+    """referenced=True means an Execution actually points at a session_id --
+    if the record still can't be produced, that is session_unreadable
+    (broken linkage), not the normal "no session yet" state, and must not
+    be relabeled as NOT_CREATED_ZH (invariant #6)."""
     if not isinstance(session, dict):
+        if referenced:
+            return SessionTruthViewModel(
+                session_id=UNKNOWN_LABEL,
+                status_zh="無法讀取（session_unreadable）",
+                provider=UNKNOWN_LABEL,
+                started_at=UNKNOWN_LABEL,
+                updated_at=UNKNOWN_LABEL,
+                summary=UNKNOWN_LABEL,
+            )
         return SessionTruthViewModel(
             session_id=NOT_CREATED_ZH,
             status_zh=NOT_CREATED_ZH,
@@ -354,8 +393,21 @@ class HandoffTruthViewModel:
     next_action: str
 
 
-def build_handoff_truth_zh(handoff: Optional[Dict[str, Any]]) -> HandoffTruthViewModel:
+def build_handoff_truth_zh(
+    handoff: Optional[Dict[str, Any]], lookup_failed: bool = False
+) -> HandoffTruthViewModel:
+    """lookup_failed=True means the task-scoped latest-handoff read itself
+    could not be completed (a real I/O/data problem) -- that is UNKNOWN,
+    never the normal "尚未建立" (no handoff genuinely exists) state."""
     if not isinstance(handoff, dict):
+        if lookup_failed:
+            return HandoffTruthViewModel(
+                handoff_id=UNKNOWN_LABEL,
+                from_provider=UNKNOWN_LABEL,
+                to_provider=UNKNOWN_LABEL,
+                reason=UNKNOWN_LABEL,
+                next_action=UNKNOWN_LABEL,
+            )
         return HandoffTruthViewModel(
             handoff_id=NOT_CREATED_ZH,
             from_provider=UNKNOWN_LABEL,
@@ -446,6 +498,9 @@ def build_chain_truth_zh(
 # =====================================================================
 
 
+UNKNOWN_OR_UNVERIFIABLE_ZH = "未知 / 無法驗證"
+
+
 @dataclass
 class ProvenanceTruthViewModel:
     tested_sha: str
@@ -457,14 +512,26 @@ class ProvenanceTruthViewModel:
 
 
 def build_provenance_truth_zh(vm: ProvenanceViewModel) -> ProvenanceTruthViewModel:
-    """Never claims 一致 (aligned) unless manager.dashboard_core's own
-    all_match already proved every SHA is known AND identical."""
+    """Three-state, never collapsed to two: 一致 only when all four SHAs are
+    known AND identical; 未知 / 無法驗證 when one or more required SHAs is
+    the literal UNKNOWN (missing evidence -- nothing to compare); 不一致
+    only when every SHA IS known but at least one genuinely differs. A
+    missing SHA must never be reported as a mismatch -- that would claim
+    evidence of divergence that was never actually observed."""
+    shas = (vm.dashboard_reviewed_sha, vm.watcher_running_sha, vm.watcher_tested_sha, vm.watcher_activated_sha)
+    if any(sha == UNKNOWN_LABEL for sha in shas):
+        all_match_zh = UNKNOWN_OR_UNVERIFIABLE_ZH
+    elif vm.all_match:
+        all_match_zh = "一致"
+    else:
+        all_match_zh = "不一致"
+
     return ProvenanceTruthViewModel(
         tested_sha=vm.watcher_tested_sha,
         activated_sha=vm.watcher_activated_sha,
         running_sha=vm.watcher_running_sha,
         dashboard_sha=vm.dashboard_reviewed_sha,
-        all_match_zh="一致" if vm.all_match else "不一致",
+        all_match_zh=all_match_zh,
         detail=vm.match_detail,
     )
 

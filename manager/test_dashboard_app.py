@@ -5,6 +5,8 @@ from unittest.mock import patch, MagicMock
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
+from manager.tasks import TaskError
+
 
 class TestDashboardAppRender(unittest.TestCase):
     def setUp(self):
@@ -314,6 +316,120 @@ class TestDashboardAppRender(unittest.TestCase):
         self.assertEqual(df.iloc[0]["State"], "RUNNING")
         self.assertEqual(df.iloc[0]["Health"], "✅ OK")
         self.assertEqual(df.iloc[0]["Account"], "account-a")
+
+    # =================================================================
+    # zh-TW Dashboard Truth Layer follow-up fixes (ChatGPT review R2)
+    # =================================================================
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_zh_truth_no_eligible_provider_message_visible(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+        """Wiring gap: dispatch_availability_zh() must actually be rendered
+        when no dispatchable AI account exists, not merely exist as a
+        tested-but-unused function."""
+        mock_read_drive_status.return_value = {"providers": []}
+        mock_store = mock_drive_records.return_value
+        mock_store.list_projects.return_value = []
+
+        at = AppTest.from_file("../dashboard.py")
+        at.run(timeout=30)
+
+        self.assertFalse(at.exception, f"App crashed: {at.exception}")
+        all_text = " ".join(
+            [el.value for el in at.markdown] + [el.value for el in at.info] + [el.value for el in at.warning]
+        )
+        self.assertIn("自動派工目前不可用", all_text)
+
+    @patch("subprocess.run")
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_zh_truth_unknown_provenance_visible_as_unknown(
+        self, mock_build_service, mock_read_drive_status, mock_drive_records, mock_subprocess_run
+    ):
+        """Blocker 3: with no persisted Provenance evidence and no real
+        `schtasks`/`git` evidence available (forced here, since the actual
+        host machine running this test may itself have a real Watcher
+        Scheduled Task installed -- that would make the test's outcome
+        depend on host state instead of on the code under test), every SHA
+        is UNKNOWN -- the zh-TW card must say 未知 / 無法驗證, never 不一致."""
+        mock_subprocess_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+        mock_read_drive_status.return_value = {"providers": []}
+        mock_store = mock_drive_records.return_value
+        mock_store.list_projects.return_value = []
+
+        at = AppTest.from_file("../dashboard.py")
+        at.run(timeout=30)
+
+        self.assertFalse(at.exception, f"App crashed: {at.exception}")
+        all_text = " ".join(el.value for el in at.markdown)
+        self.assertIn("未知 / 無法驗證", all_text)
+        self.assertNotIn("整體一致性: **不一致**", all_text)
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_zh_truth_linked_session_older_than_recent_preload_still_renders(
+        self, mock_build_service, mock_read_drive_status, mock_drive_records
+    ):
+        """Blocker 2: an Execution-linked Session that is NOT among a
+        project's most-recently-modified six Session records must still be
+        resolved via the exact bounded lookup and render as readable, not
+        as session_unreadable."""
+        mock_read_drive_status.return_value = {"providers": []}
+        mock_store = mock_drive_records.return_value
+        mock_store.list_projects.return_value = [{"project_id": "test-project", "title": "Test Project"}]
+
+        def mock_children(parent, name=None):
+            if parent == "folder-tasks":
+                return [{"name": "test-task-1.json", "mimeType": "application/json", "modifiedTime": "2026-08-20T00:00:00Z"}]
+            if parent == "folder-executions":
+                return [{"name": "test-exec-1.json", "mimeType": "application/json", "modifiedTime": "2026-08-20T00:00:00Z"}]
+            if parent == "folder-commands":
+                return [{"name": "test-cmd-1.json", "mimeType": "application/json", "modifiedTime": "2026-08-20T00:00:00Z"}]
+            if parent == "folder-sessions":
+                items = [
+                    {"name": f"session-recent-{i}.json", "mimeType": "application/json", "modifiedTime": f"2026-08-{20 - i:02d}T00:00:00Z"}
+                    for i in range(6)
+                ]
+                items.append({"name": "session-old.json", "mimeType": "application/json", "modifiedTime": "2026-01-01T00:00:00Z"})
+                return items
+            return []
+
+        mock_store.project_folder.side_effect = lambda area, project_id, create=False: f"folder-{area}"
+        mock_store.children.side_effect = mock_children
+
+        def mock_get(area, project_id, name):
+            if area == "tasks":
+                return {"project_id": "test-project", "task_id": "test-task-1", "title": "T", "status": "in_progress"}
+            if area == "commands":
+                return {
+                    "project_id": "test-project", "task_id": "test-task-1", "command_id": "test-cmd-1",
+                    "provider": "claude", "account_id": None, "status": "running", "execution_id": "test-exec-1",
+                    "selection_reason": [],
+                }
+            if area == "executions":
+                return {
+                    "project_id": "test-project", "task_id": "test-task-1", "execution_id": "test-exec-1",
+                    "provider": "claude", "status": "running",
+                    "session_id": "session-old", "provider_session_id": "prov-old",
+                }
+            if area == "sessions":
+                if name == "session-old":
+                    return {"session_id": "session-old", "status": "completed", "provider": "claude"}
+                return {"session_id": name, "status": "obsolete", "provider": "claude"}
+            return {}
+        mock_store.get.side_effect = mock_get
+        mock_store.latest.side_effect = TaskError("no handoff found for task: test-task-1")
+
+        at = AppTest.from_file("../dashboard.py")
+        at.run(timeout=30)
+
+        self.assertFalse(at.exception, f"App crashed: {at.exception}")
+        all_text = " ".join(el.value for el in at.markdown)
+        self.assertIn("session-old", all_text)
+        self.assertNotIn("session_unreadable", all_text)
 
 
 if __name__ == "__main__":

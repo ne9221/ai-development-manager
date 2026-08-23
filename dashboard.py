@@ -1,4 +1,5 @@
 import streamlit as st
+import html
 import os
 import json
 import subprocess
@@ -10,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 
 from collectors.publish_drive import build_service
-from manager.tasks import DriveRecords, logical_record_id
+from manager.tasks import DriveRecords, TaskError, logical_record_id
 from manager.quota_reader import read_drive_status, summarize
 from manager.quota_history import get_default_quota_history_store
 from manager.dashboard_core import (
@@ -44,9 +45,17 @@ from manager.dashboard_truth_zh import (
     build_routing_truth_zh,
     build_session_truth_zh,
     build_task_truth_zh,
+    dispatch_availability_zh,
     dispatch_state_zh,
     latest_handoff,
 )
+
+def _e(value):
+    """Escape a Drive/record-derived value before interpolating it into an
+    unsafe_allow_html=True markdown block -- Task/Command/Handoff/Session
+    text fields are attacker/user-influenceable data, not trusted markup."""
+    return html.escape(str(value), quote=True)
+
 
 WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
 SUPERVISOR_TASK_NAME = "AI Development Manager - Session Center Supervisor"
@@ -394,6 +403,48 @@ def load_all_data():
                 key = (handoff.get("project_id") or p_id, handoff.get("task_id"))
                 handoffs_dict.setdefault(key, []).append(handoff)
 
+        # Exact bounded resolution for genuinely-linked truth the recent-first
+        # preloads above may have missed: a real Session/Handoff for a
+        # displayed Task can be older than that project's most-recently-
+        # modified few records. Bounded to exactly the Executions/Tasks we
+        # are actually about to display -- not an unbounded re-scan.
+        handoff_lookup_failed = set()
+
+        for execution in all_executions:
+            session_ref = execution.get("session_id") or execution.get("provider_session_id")
+            if not session_ref:
+                continue
+            key = (execution.get("project_id"), execution.get("task_id"))
+            existing = sessions_dict.get(key, [])
+            if any(s.get("session_id") == session_ref or s.get("provider_session_id") == session_ref for s in existing):
+                continue
+            try:
+                session = store.get("sessions", execution.get("project_id"), session_ref)
+                sessions_dict.setdefault(key, []).append(session)
+            except Exception as exc:
+                all_warnings.append(f"Linked session exact lookup failed for '{session_ref}': {exc}")
+
+        for task in all_tasks:
+            key = (task.get("project_id"), task.get("task_id"))
+            if handoffs_dict.get(key):
+                continue
+            try:
+                handoff = store.latest("handoffs", task.get("project_id"), task.get("task_id"))
+                if isinstance(handoff, dict):
+                    handoffs_dict.setdefault(key, []).append(handoff)
+                else:
+                    handoff_lookup_failed.add(key)
+                    all_warnings.append(f"Handoff lookup for task '{task.get('task_id')}' returned a non-record result")
+            except TaskError as exc:
+                if "no handoff found for task" not in str(exc):
+                    handoff_lookup_failed.add(key)
+                    all_warnings.append(f"Handoff lookup failed for task '{task.get('task_id')}': {exc}")
+                # else: genuinely no handoff exists for this task -- leave
+                # handoffs_dict empty for it, a normal NOT_CREATED state.
+            except Exception as exc:
+                handoff_lookup_failed.add(key)
+                all_warnings.append(f"Handoff lookup failed for task '{task.get('task_id')}': {exc}")
+
         return {
             "success": True,
             "quota_summary": quota_summary,
@@ -404,6 +455,7 @@ def load_all_data():
             "all_executions": all_executions,
             "handoffs_dict": handoffs_dict,
             "sessions_dict": sessions_dict,
+            "handoff_lookup_failed": handoff_lookup_failed,
             "load_duration_seconds": round(time.perf_counter() - load_started, 3),
             "warnings": all_warnings,
             "error": None
@@ -421,6 +473,7 @@ def load_all_data():
             "all_executions": [],
             "handoffs_dict": {},
             "sessions_dict": {},
+            "handoff_lookup_failed": set(),
             "load_duration_seconds": round(time.perf_counter() - load_started, 3),
             "warnings": all_warnings + [str(e)],
             "error": str(e)
@@ -461,6 +514,7 @@ all_commands = data["all_commands"]
 all_executions = data["all_executions"]
 handoffs_dict = data["handoffs_dict"]
 sessions_dict = data["sessions_dict"]
+handoff_lookup_failed = data.get("handoff_lookup_failed", set())
 all_warnings = data.get("warnings", [])
 load_duration_seconds = data.get("load_duration_seconds")
 
@@ -665,6 +719,17 @@ st.markdown("---")
 # =====================================================================
 st.header("🈶 任務真相總覽 (HOME Dashboard Truth Layer)")
 
+# Invariant #9: no eligible provider must be stated plainly, not silently
+# omitted. This reuses the exact same recommendation daily_brief_vm already
+# computed above -- never a second, divergent eligibility calculation.
+_dispatch_availability_zh_msg = dispatch_availability_zh(
+    daily_brief_vm.recommended_provider, daily_brief_vm.recommended_display_name
+)
+if daily_brief_vm.recommended_provider is None:
+    st.warning(f"🚦 {_dispatch_availability_zh_msg}")
+else:
+    st.info(f"🚦 {_dispatch_availability_zh_msg}")
+
 if not all_tasks:
     st.info("目前沒有可顯示的任務記錄。")
 else:
@@ -679,18 +744,22 @@ else:
         _execution_truth = build_execution_truth_zh(_zh_execution, now)
 
         _execution_id_referenced = bool(_zh_command and _zh_command.get("execution_id"))
-        _session_id_referenced = bool(
-            _zh_execution and (_zh_execution.get("provider_session_id") or _zh_execution.get("session_id"))
+        _wanted_session_id = (
+            (_zh_execution.get("session_id") or _zh_execution.get("provider_session_id")) if _zh_execution else None
         )
+        _session_id_referenced = bool(_wanted_session_id)
         _zh_sessions = sessions_dict.get(_zh_key, [])
         _zh_session_record = None
         if _session_id_referenced:
-            _wanted_session_id = _zh_execution.get("provider_session_id") or _zh_execution.get("session_id")
+            # Session/Handoff loading in load_all_data() already performs an
+            # exact bounded lookup for any linked-but-unpreloaded record, so
+            # "not found here" genuinely means the exact lookup failed --
+            # never merely that a project-global recent-N preload missed it.
             _zh_session_record = next(
                 (s for s in _zh_sessions if s.get("session_id") == _wanted_session_id or s.get("provider_session_id") == _wanted_session_id),
                 None,
             )
-        _session_truth = build_session_truth_zh(_zh_session_record)
+        _session_truth = build_session_truth_zh(_zh_session_record, referenced=_session_id_referenced)
 
         _chain_truth = build_chain_truth_zh(
             _execution_id_referenced, _zh_execution, _session_id_referenced, _zh_session_record, _task_truth.status_raw,
@@ -698,38 +767,39 @@ else:
 
         _zh_handoffs = handoffs_dict.get(_zh_key, [])
         _latest_handoff = latest_handoff(_zh_handoffs)
-        _handoff_truth = build_handoff_truth_zh(_latest_handoff)
+        _handoff_lookup_failed = _zh_key in handoff_lookup_failed
+        _handoff_truth = build_handoff_truth_zh(_latest_handoff, lookup_failed=_handoff_lookup_failed)
 
         with st.container():
             st.markdown(f"""<div class="glass-card">
-                <b>專案:</b> {_zh_task.get('project_id') or UNKNOWN_LABEL} ·
-                <b>Task ID:</b> <code>{_task_truth.task_id}</code> ·
-                <b>Command ID:</b> <code>{_task_truth.command_id}</code><br>
-                <b>任務狀態:</b> {_task_truth.status_zh} ·
-                <b>current_progress:</b> {_task_truth.current_progress}<br>
-                <b>next_action:</b> {_task_truth.next_action} ·
-                <b>blocked_reason:</b> {_task_truth.blocked_reason}<br>
+                <b>專案:</b> {_e(_zh_task.get('project_id') or UNKNOWN_LABEL)} ·
+                <b>Task ID:</b> <code>{_e(_task_truth.task_id)}</code> ·
+                <b>Command ID:</b> <code>{_e(_task_truth.command_id)}</code><br>
+                <b>任務狀態:</b> {_e(_task_truth.status_zh)} ·
+                <b>current_progress:</b> {_e(_task_truth.current_progress)}<br>
+                <b>next_action:</b> {_e(_task_truth.next_action)} ·
+                <b>blocked_reason:</b> {_e(_task_truth.blocked_reason)}<br>
                 <hr style="border-color:#30363d;margin:8px 0;">
                 <b>派工 requested → actual:</b>
-                {_routing_truth.requested_provider}/{_routing_truth.requested_account_id}
-                → {_routing_truth.actual_provider}/{_routing_truth.actual_account_id}
-                (match={_routing_truth.provider_matches_request})<br>
-                <b>selection_reason:</b> {'; '.join(_routing_truth.selection_reason) or '—'}<br>
+                {_e(_routing_truth.requested_provider)}/{_e(_routing_truth.requested_account_id)}
+                → {_e(_routing_truth.actual_provider)}/{_e(_routing_truth.actual_account_id)}
+                (match={_e(_routing_truth.provider_matches_request)})<br>
+                <b>selection_reason:</b> {_e('; '.join(_routing_truth.selection_reason) or '—')}<br>
                 <hr style="border-color:#30363d;margin:8px 0;">
-                <b>額度 5h:</b> {_quota_truth.five_hour_used} 已用 / {_quota_truth.five_hour_remaining} 剩餘
-                (重設 {_quota_truth.five_hour_reset_at}) ·
-                <b>可用性:</b> {_quota_truth.usable} · <b>新鮮度:</b> {_quota_truth.freshness_zh}<br>
+                <b>額度 5h:</b> {_e(_quota_truth.five_hour_used)} 已用 / {_e(_quota_truth.five_hour_remaining)} 剩餘
+                (重設 {_e(_quota_truth.five_hour_reset_at)}) ·
+                <b>可用性:</b> {_e(_quota_truth.usable)} · <b>新鮮度:</b> {_e(_quota_truth.freshness_zh)}<br>
                 <hr style="border-color:#30363d;margin:8px 0;">
-                <b>執行:</b> <code>{_execution_truth.execution_id}</code> ({_execution_truth.status_zh}) ·
-                <b>Provider evidence:</b> {_execution_truth.provider_evidence_available}<br>
-                <b>工作階段:</b> <code>{_session_truth.session_id}</code> ({_session_truth.status_zh}) ·
-                <b>摘要:</b> {_session_truth.summary}<br>
-                <b>鏈結真相:</b> execution={_chain_truth.execution_link_zh} ·
-                session={_chain_truth.session_link_zh} · chain={_chain_truth.chain_state_zh}<br>
+                <b>執行:</b> <code>{_e(_execution_truth.execution_id)}</code> ({_e(_execution_truth.status_zh)}) ·
+                <b>Provider evidence:</b> {_e(_execution_truth.provider_evidence_available)}<br>
+                <b>工作階段:</b> <code>{_e(_session_truth.session_id)}</code> ({_e(_session_truth.status_zh)}) ·
+                <b>摘要:</b> {_e(_session_truth.summary)}<br>
+                <b>鏈結真相:</b> execution={_e(_chain_truth.execution_link_zh)} ·
+                session={_e(_chain_truth.session_link_zh)} · chain={_e(_chain_truth.chain_state_zh)}<br>
                 <hr style="border-color:#30363d;margin:8px 0;">
-                <b>最新交接:</b> <code>{_handoff_truth.handoff_id}</code>
-                {_handoff_truth.from_provider} → {_handoff_truth.to_provider} ·
-                <b>原因:</b> {_handoff_truth.reason} · <b>下一步:</b> {_handoff_truth.next_action}
+                <b>最新交接:</b> <code>{_e(_handoff_truth.handoff_id)}</code>
+                {_e(_handoff_truth.from_provider)} → {_e(_handoff_truth.to_provider)} ·
+                <b>原因:</b> {_e(_handoff_truth.reason)} · <b>下一步:</b> {_e(_handoff_truth.next_action)}
                 </div>""", unsafe_allow_html=True)
 
 with st.expander("🧬 產品版本真相 (Provenance)"):

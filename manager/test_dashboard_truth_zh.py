@@ -37,19 +37,28 @@ def _quota_vm(**overrides) -> AccountQuotaCardViewModel:
         source_type="official", has_reliable_quota=True, source_reliable=True, source_verified=True,
         dispatchable=True, last_updated="2026-08-23T11:55:00Z",
         five_hour_remaining_pct=42.0, five_hour_used_pct=58.0, five_hour_resets_at="2026-08-23T16:00:00Z",
+        effective_availability="available",
     )
     base.update(overrides)
     return AccountQuotaCardViewModel(**base)
 
 
 class TestFreshUsableProvider(unittest.TestCase):
-    """Fresh telemetry with remaining quota > 0 must render usable (可用)."""
+    """A matched account whose core truth (dispatchable, has_reliable_quota,
+    effective_availability) already proves usability must render 可用."""
 
     def test_fresh_usable(self):
         vm = build_quota_truth_zh([_quota_vm()], "claude", "a1")
         self.assertEqual(vm.freshness_zh, "最新")
         self.assertEqual(vm.usable, "可用")
         self.assertTrue(vm.found)
+
+    def test_available_via_credits(self):
+        vm = build_quota_truth_zh(
+            [_quota_vm(effective_availability="available_via_credits", five_hour_remaining_pct=0.0)],
+            "claude", "a1",
+        )
+        self.assertEqual(vm.usable, "可用（透過額外額度）")
 
 
 class TestStaleProvider(unittest.TestCase):
@@ -58,18 +67,23 @@ class TestStaleProvider(unittest.TestCase):
 
     def test_stale_never_usable(self):
         vm = build_quota_truth_zh(
-            [_quota_vm(freshness="STALE", stale=True, five_hour_remaining_pct=90.0)], "claude", "a1"
+            [_quota_vm(freshness="STALE", stale=True, five_hour_remaining_pct=90.0, effective_availability="unknown")],
+            "claude", "a1",
         )
         self.assertEqual(vm.freshness_zh, "過時")
         self.assertEqual(vm.usable, UNKNOWN_ZH)
 
 
 class TestZeroQuota(unittest.TestCase):
-    """0% remaining must render explicitly unusable, not merely 'low' (invariant #3)."""
+    """0% remaining reflected via effective_availability='unavailable' must
+    render explicitly unusable, not merely 'low' (invariant #3)."""
 
     def test_zero_quota_unusable(self):
-        vm = build_quota_truth_zh([_quota_vm(five_hour_remaining_pct=0.0)], "claude", "a1")
-        self.assertEqual(vm.usable, "不可用（額度為 0）")
+        vm = build_quota_truth_zh(
+            [_quota_vm(five_hour_remaining_pct=0.0, dispatchable=False, effective_availability="unavailable")],
+            "claude", "a1",
+        )
+        self.assertEqual(vm.usable, "不可用")
 
 
 class TestUnknownQuota(unittest.TestCase):
@@ -82,6 +96,52 @@ class TestUnknownQuota(unittest.TestCase):
         self.assertEqual(vm.freshness_zh, UNKNOWN_ZH)
         self.assertEqual(vm.usable, UNKNOWN_ZH)
         self.assertEqual(vm.five_hour_remaining, UNKNOWN_LABEL)
+
+
+class TestQuotaUsabilityReusesCoreTruth(unittest.TestCase):
+    """Blocker 1: never re-derive eligibility from the 5h percentage alone --
+    always defer to the matched AccountQuotaCardViewModel's own
+    dispatchable / has_reliable_quota / effective_availability."""
+
+    def test_fresh_positive_but_not_dispatchable_is_not_usable(self):
+        vm = build_quota_truth_zh(
+            [_quota_vm(five_hour_remaining_pct=99.0, dispatchable=False)], "claude", "a1"
+        )
+        self.assertNotEqual(vm.usable, "可用")
+
+    def test_fresh_positive_but_not_reliable_is_not_usable(self):
+        vm = build_quota_truth_zh(
+            [_quota_vm(five_hour_remaining_pct=99.0, has_reliable_quota=False)], "claude", "a1"
+        )
+        self.assertNotEqual(vm.usable, "可用")
+
+    def test_effective_availability_unknown_renders_unknown(self):
+        vm = build_quota_truth_zh(
+            [_quota_vm(effective_availability="unknown")], "claude", "a1"
+        )
+        self.assertEqual(vm.usable, UNKNOWN_ZH)
+
+    def test_effective_availability_unavailable_renders_unavailable(self):
+        vm = build_quota_truth_zh(
+            [_quota_vm(dispatchable=False, effective_availability="unavailable")], "claude", "a1"
+        )
+        self.assertEqual(vm.usable, "不可用")
+
+    def test_valid_available_renders_usable(self):
+        vm = build_quota_truth_zh(
+            [_quota_vm(dispatchable=True, has_reliable_quota=True, effective_availability="available")],
+            "claude", "a1",
+        )
+        self.assertEqual(vm.usable, "可用")
+
+    def test_inconsistent_core_truth_never_claims_usable(self):
+        """A record claiming effective_availability='available' while also
+        claiming not-dispatchable is self-inconsistent -- must fail closed."""
+        vm = build_quota_truth_zh(
+            [_quota_vm(effective_availability="available", dispatchable=False, has_reliable_quota=True)],
+            "claude", "a1",
+        )
+        self.assertEqual(vm.usable, UNKNOWN_ZH)
 
 
 class TestRequestedNotEqualSelected(unittest.TestCase):
@@ -175,8 +235,8 @@ class TestBlockedChain(unittest.TestCase):
 
 
 class TestShaMismatch(unittest.TestCase):
-    """Any SHA divergence across dashboard/running/tested/activated must
-    render 不一致 (not aligned), never a soft/partial pass (invariant #10)."""
+    """Every SHA known but at least one genuinely differs -> 不一致. Must be
+    distinguishable from the UNKNOWN case (invariant #10, Blocker 3)."""
 
     def test_mismatch(self):
         vm = build_provenance_vm(
@@ -201,6 +261,22 @@ class TestAllShasAligned(unittest.TestCase):
         )
         truth = build_provenance_truth_zh(vm)
         self.assertEqual(truth.all_match_zh, "一致")
+
+
+class TestProvenanceUnknownDistinctFromMismatch(unittest.TestCase):
+    """Blocker 3: a missing/UNKNOWN SHA must never be reported as 不一致 --
+    that would claim observed divergence that was never actually proven."""
+
+    def test_one_unknown_sha_is_unknown_not_mismatch(self):
+        vm = build_provenance_vm(
+            dashboard_repository_path="C:/repo", dashboard_branch="main", dashboard_sha="aaa",
+            watcher_repository_path="C:/repo", watcher_branch="main",
+            watcher_running_sha="aaa", watcher_tested_sha=None, watcher_activated_sha="aaa",
+            now=NOW,
+        )
+        truth = build_provenance_truth_zh(vm)
+        self.assertEqual(truth.all_match_zh, "未知 / 無法驗證")
+        self.assertNotEqual(truth.all_match_zh, "不一致")
 
 
 class TestNoEligibleProvider(unittest.TestCase):
@@ -245,6 +321,51 @@ class TestSessionAndHandoffTruth(unittest.TestCase):
 
     def test_latest_handoff_empty_list_is_none(self):
         self.assertIsNone(latest_handoff([]))
+
+
+class TestExactSessionTruth(unittest.TestCase):
+    """Blocker 2: a genuinely-linked session that a project-wide recent-N
+    preload happened to miss must still read as readable once the exact
+    lookup succeeds -- and only a real lookup failure is session_unreadable."""
+
+    def test_linked_session_found_via_exact_lookup_is_readable(self):
+        # Whether this record came from a recent-6 preload or a dedicated
+        # exact lookup makes no difference to the pure builder -- it only
+        # cares whether a real record was ultimately produced.
+        session = {"session_id": "s-old", "status": "completed", "provider": "codex"}
+        vm = build_session_truth_zh(session, referenced=True)
+        self.assertEqual(vm.session_id, "s-old")
+        self.assertNotIn("unreadable", vm.status_zh)
+
+    def test_referenced_session_exact_lookup_genuinely_fails(self):
+        vm = build_session_truth_zh(None, referenced=True)
+        self.assertIn("session_unreadable", vm.status_zh)
+        self.assertNotEqual(vm.session_id, NOT_CREATED_ZH)
+
+    def test_unreferenced_session_is_not_created_not_unreadable(self):
+        vm = build_session_truth_zh(None, referenced=False)
+        self.assertEqual(vm.session_id, NOT_CREATED_ZH)
+
+
+class TestTaskScopedHandoffTruth(unittest.TestCase):
+    """Blocker 2: a task-scoped handoff read (not a project-global recent-N
+    preload) is authoritative -- a genuinely nonexistent handoff is
+    尚未建立, but a failed read is UNKNOWN, never silently the same thing."""
+
+    def test_handoff_found_outside_recent_preload_is_displayed(self):
+        handoff = {"handoff_id": "h-old", "from_provider": "codex", "to_provider": "claude",
+                   "reason": "context switch", "next_action": "continue review"}
+        vm = build_handoff_truth_zh(handoff)
+        self.assertEqual(vm.handoff_id, "h-old")
+
+    def test_no_handoff_genuinely_exists(self):
+        vm = build_handoff_truth_zh(None, lookup_failed=False)
+        self.assertEqual(vm.handoff_id, NOT_CREATED_ZH)
+
+    def test_handoff_lookup_unavailable_is_unknown_not_not_created(self):
+        vm = build_handoff_truth_zh(None, lookup_failed=True)
+        self.assertEqual(vm.handoff_id, UNKNOWN_LABEL)
+        self.assertNotEqual(vm.handoff_id, NOT_CREATED_ZH)
 
 
 if __name__ == "__main__":
