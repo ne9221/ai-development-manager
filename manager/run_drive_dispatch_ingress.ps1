@@ -14,6 +14,7 @@ param(
     # dispatch-requests/{project_id}/{request_id}.json.
     [Parameter(Mandatory=$true)][string]$GcsBucket,
     [string]$GoogleDriveToken,
+    [string]$ClaudeAccountsConfig,
     [Parameter(Mandatory=$true)][string]$WorkspaceRoot
 )
 
@@ -71,6 +72,22 @@ $env:ADM_DRIVE_DISPATCH_INGRESS_OWNER = $IngressOwner
 # exact name (os.environ.get(BUCKET_ENV)) and fails closed (TaskError) if
 # it is unset; there is no separate ingress-specific bucket/object pair.
 $env:ADM_LOCK_GCS_BUCKET = $GcsBucket
+
+# Canonical Claude account registry, exported under the exact env var name
+# cloud.dispatch_ingress._claude_account_registry() reads
+# (CLAUDE_ACCOUNTS_CONFIG) -- same contract and same fail-closed semantics
+# as manager/run_command_watcher.ps1. Without this, _claude_account_registry()
+# returns None in this process and handle_dispatch() rejects every request
+# that carries an explicit account_id as "unknown_account" before a claim is
+# ever attempted, no matter how valid the request or how fresh quota is.
+if (-not $ClaudeAccountsConfig) {
+    $ClaudeAccountsConfig = Join-Path $ManagerHome "config\claude_accounts.json"
+}
+if (-not (Test-Path -LiteralPath $ClaudeAccountsConfig)) {
+    Write-Error "CLAUDE_ACCOUNTS_CONFIG_MISSING: Claude accounts configuration file not found at '$ClaudeAccountsConfig'"
+    exit 1
+}
+$env:CLAUDE_ACCOUNTS_CONFIG = $ClaudeAccountsConfig
 
 # CWD must be $RepositoryPath before any `python -m manager.*` invocation so
 # the manager package resolves regardless of the caller's own working

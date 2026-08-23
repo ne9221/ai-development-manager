@@ -49,7 +49,7 @@ function New-FakePython([string]$Dir, [bool]$ProvenanceFails = $false, [string]$
         # ADM_LOCK_GCS_BUCKET idempotency bucket, WorkspaceRoot) actually
         # reached the child process environment rather than merely existing
         # in the caller's $env:.
-        "  echo ENV FOLDER=%ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID% OWNER=%ADM_DRIVE_DISPATCH_INGRESS_OWNER% BUCKET=%ADM_LOCK_GCS_BUCKET% WORKSPACE=%ADM_WORKSPACE_ROOT% >> `"%FAKE_PYTHON_LOG%`"",
+        "  echo ENV FOLDER=%ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID% OWNER=%ADM_DRIVE_DISPATCH_INGRESS_OWNER% BUCKET=%ADM_LOCK_GCS_BUCKET% WORKSPACE=%ADM_WORKSPACE_ROOT% CLAUDEACCOUNTS=%CLAUDE_ACCOUNTS_CONFIG% >> `"%FAKE_PYTHON_LOG%`"",
         "  exit /b 0",
         ")",
         "exit /b 1"
@@ -158,6 +158,34 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
         # manager.dispatch_requests.dispatch_request_registry(), not a
         # static per-install value.
         $vbsContent | Should Not Match ([regex]::Escape('-IdempotencyObject'))
+    }
+
+    It "propagates a default-resolved ClaudeAccountsConfig into the wrapped command line when omitted" {
+        Invoke-Install | Out-Null
+        $vbsPath = $global:admCapturedAction.Arguments.Trim('"')
+        $vbsContent = Get-Content -Raw -LiteralPath $vbsPath
+        $expectedDefault = Join-Path $global:admManagerHome "config\claude_accounts.json"
+        $vbsContent | Should Match ([regex]::Escape('-ClaudeAccountsConfig'))
+        $vbsContent | Should Match ([regex]::Escape($expectedDefault))
+    }
+
+    It "preserves an explicit ClaudeAccountsConfig verbatim through the installer into the wrapped command line" {
+        $explicitConfig = Join-Path $global:admCase "explicit-claude-accounts.json"
+        & $installScript `
+            -PythonPath $global:admFakePython `
+            -RepositoryPath $repository `
+            -ManagerHome $global:admManagerHome `
+            -PythonDeps "deps" `
+            -IngressFolderId "folder-id" `
+            -IngressOwner "owner@example.com" `
+            -GcsBucket "idem-bucket" `
+            -ClaudeAccountsConfig $explicitConfig `
+            -WorkspaceRoot $global:admWorkspaceRoot | Out-Null
+        $vbsPath = $global:admCapturedAction.Arguments.Trim('"')
+        $vbsContent = Get-Content -Raw -LiteralPath $vbsPath
+        $vbsContent | Should Match ([regex]::Escape("-ClaudeAccountsConfig `"`"$explicitConfig`"`""))
+        $defaultConfig = Join-Path $global:admManagerHome "config\claude_accounts.json"
+        $vbsContent | Should Not Match ([regex]::Escape($defaultConfig))
     }
 
     It "runs every 1 minute with no overlapping instances" {
@@ -274,6 +302,18 @@ Describe "run_drive_dispatch_ingress.ps1 -- runtime behavior" {
         New-Item -ItemType Directory -Force -Path $global:admWorkspaceRoot | Out-Null
         $global:admManagerHome = Join-Path $global:admCase "manager-home"
         New-Item -ItemType Directory -Force -Path $global:admManagerHome | Out-Null
+        # Default-resolution fixture: run_drive_dispatch_ingress.ps1 now
+        # fails closed if ClaudeAccountsConfig (explicit or default-resolved
+        # to $ManagerHome\config\claude_accounts.json) does not exist on
+        # disk. Tests below that omit -ClaudeAccountsConfig rely on this
+        # default file being present so they keep exercising the rest of
+        # the runtime contract (folder/owner/bucket/workspace env vars,
+        # provenance gate, exact python invocation) unaffected by this
+        # change; the dedicated "missing config" tests below explicitly
+        # remove or redirect it instead.
+        $global:admClaudeAccountsConfig = Join-Path $global:admManagerHome "config\claude_accounts.json"
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $global:admClaudeAccountsConfig) | Out-Null
+        Set-Content -LiteralPath $global:admClaudeAccountsConfig -Value '{"accounts": [{"account_id": "account-a", "enabled": true, "config_dir": null}]}' -Encoding utf8
         $global:admLog = Join-Path $global:admCase "fakepython.log"
         $global:admFakePython = New-FakePython -Dir (Join-Path $global:admCase "python")
         $global:admFakePythonFailing = New-FakePython -Dir (Join-Path $global:admCase "python-fail") -ProvenanceFails $true
@@ -286,6 +326,7 @@ Describe "run_drive_dispatch_ingress.ps1 -- runtime behavior" {
         Remove-Item Env:ADM_DRIVE_DISPATCH_INGRESS_OWNER -ErrorAction SilentlyContinue
         Remove-Item Env:ADM_LOCK_GCS_BUCKET -ErrorAction SilentlyContinue
         Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue
+        Remove-Item Env:CLAUDE_ACCOUNTS_CONFIG -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $global:admOutsideCase) {
             Remove-Item -LiteralPath $global:admOutsideCase -Recurse -Force -ErrorAction SilentlyContinue
         }
@@ -335,6 +376,59 @@ Describe "run_drive_dispatch_ingress.ps1 -- runtime behavior" {
         $log | Should Match "OWNER=owner@example.com"
         $log | Should Match "BUCKET=idem-bucket"
         $log | Should Match ([regex]::Escape("WORKSPACE=$global:admWorkspaceRoot"))
+    }
+
+    It "exports CLAUDE_ACCOUNTS_CONFIG into the ingress poller's process environment (default-resolved path)" {
+        # No -ClaudeAccountsConfig supplied: must default-resolve to
+        # $ManagerHome\config\claude_accounts.json (the same fixture file
+        # BeforeEach created) and export it under the exact env var name
+        # cloud.dispatch_ingress._claude_account_registry() reads.
+        Invoke-Run -PythonPath $global:admFakePython | Out-Null
+        $LASTEXITCODE | Should Be 0
+        $log = Get-Content -Raw -LiteralPath $global:admLog
+        $log | Should Match ([regex]::Escape("CLAUDEACCOUNTS=$global:admClaudeAccountsConfig"))
+    }
+
+    It "exports an explicitly-supplied CLAUDE_ACCOUNTS_CONFIG verbatim, not the default path" {
+        $explicitConfig = Join-Path $global:admCase "explicit-claude-accounts.json"
+        Set-Content -LiteralPath $explicitConfig -Value '{"accounts": []}' -Encoding utf8
+        & $runScript `
+            -PythonPath $global:admFakePython `
+            -RepositoryPath $repository `
+            -ManagerHome $global:admManagerHome `
+            -IngressFolderId "folder-id" `
+            -IngressOwner "owner@example.com" `
+            -GcsBucket "idem-bucket" `
+            -ClaudeAccountsConfig $explicitConfig `
+            -WorkspaceRoot $global:admWorkspaceRoot | Out-Null
+        $LASTEXITCODE | Should Be 0
+        $log = Get-Content -Raw -LiteralPath $global:admLog
+        $log | Should Match ([regex]::Escape("CLAUDEACCOUNTS=$explicitConfig"))
+        $log | Should Not Match ([regex]::Escape("CLAUDEACCOUNTS=$global:admClaudeAccountsConfig"))
+    }
+
+    It "fails closed before touching python when CLAUDE_ACCOUNTS_CONFIG (default-resolved) does not exist on disk" {
+        # Remove the fixture BeforeEach created, so default resolution
+        # points at a path that genuinely does not exist.
+        Remove-Item -LiteralPath $global:admClaudeAccountsConfig -Force
+        Invoke-Run -PythonPath $global:admFakePython 2>$null
+        $LASTEXITCODE | Should Not Be 0
+        (Test-Path -LiteralPath $global:admLog) | Should Be $false
+    }
+
+    It "fails closed before touching python when an explicit CLAUDE_ACCOUNTS_CONFIG path does not exist on disk" {
+        $missingConfig = Join-Path $global:admCase "does-not-exist-claude-accounts.json"
+        & $runScript `
+            -PythonPath $global:admFakePython `
+            -RepositoryPath $repository `
+            -ManagerHome $global:admManagerHome `
+            -IngressFolderId "folder-id" `
+            -IngressOwner "owner@example.com" `
+            -GcsBucket "idem-bucket" `
+            -ClaudeAccountsConfig $missingConfig `
+            -WorkspaceRoot $global:admWorkspaceRoot 2>$null
+        $LASTEXITCODE | Should Not Be 0
+        (Test-Path -LiteralPath $global:admLog) | Should Be $false
     }
 
     It "fails closed on a provenance mismatch and never reaches the ingress poller" {

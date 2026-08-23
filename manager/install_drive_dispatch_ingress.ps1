@@ -35,6 +35,20 @@ param(
     # dispatch-requests/{project_id}/{request_id}.json, not a static path.
     [Parameter(Mandatory=$true)][string]$GcsBucket,
     [string]$GoogleDriveToken,
+    # Canonical Claude account registry path, propagated verbatim into the
+    # hidden wrapper's -ClaudeAccountsConfig argument so
+    # run_drive_dispatch_ingress.ps1 can export CLAUDE_ACCOUNTS_CONFIG on
+    # every tick -- the same env var manager/run_command_watcher.ps1 already
+    # exports and cloud.dispatch_ingress._claude_account_registry() reads.
+    # Without it, this task's process never has that var set, so any Drive
+    # request carrying an explicit account_id is unconditionally rejected as
+    # "unknown_account" before a claim is ever attempted (confirmed live).
+    # Resolved to a default below when omitted, exactly like
+    # install_command_watcher.ps1 already does for the existing Command
+    # Watcher install -- no file-existence check here; that fail-closed
+    # check belongs to run_drive_dispatch_ingress.ps1 at actual run time,
+    # matching run_command_watcher.ps1's own split of responsibility.
+    [string]$ClaudeAccountsConfig,
     # Trusted authority for manager.project_registry's ADM_WORKSPACE_ROOT
     # resolution -- explicitly serialized into the Scheduled Task action
     # (below) and re-exported by run_drive_dispatch_ingress.ps1 on every
@@ -104,9 +118,12 @@ if ($activationExit -ne 0) {
 if (-not $GoogleDriveToken) {
     $GoogleDriveToken = Join-Path $ManagerHome "google-drive-token.json"
 }
+if (-not $ClaudeAccountsConfig) {
+    $ClaudeAccountsConfig = Join-Path $ManagerHome "config\claude_accounts.json"
+}
 
 $runner = Join-Path $RepositoryPath "manager\run_drive_dispatch_ingress.ps1"
-$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -PythonDeps `"$PythonDeps`" -IngressFolderId `"$IngressFolderId`" -IngressOwner `"$IngressOwner`" -GcsBucket `"$GcsBucket`" -GoogleDriveToken `"$GoogleDriveToken`" -WorkspaceRoot `"$WorkspaceRoot`""
+$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -PythonDeps `"$PythonDeps`" -IngressFolderId `"$IngressFolderId`" -IngressOwner `"$IngressOwner`" -GcsBucket `"$GcsBucket`" -GoogleDriveToken `"$GoogleDriveToken`" -ClaudeAccountsConfig `"$ClaudeAccountsConfig`" -WorkspaceRoot `"$WorkspaceRoot`""
 # Same "route through a generated hidden VBS wrapper" mechanism as the
 # Command Watcher -- WshShell.Run(cmd, 0, True) sets the window style to
 # hidden before the process is even created, which is what actually
