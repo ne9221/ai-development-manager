@@ -219,6 +219,35 @@ _SMOKE_COMPONENTS = (
 )
 
 
+def _check_automatic_selection(section: Dict[str, Any], name: str) -> Optional[CheckResult]:
+    """Returns a FAIL/UNKNOWN CheckResult if the smoke's provider/account
+    selection cannot be proven automatic, else None (caller continues to the
+    remaining lifecycle checks). Lifecycle completeness alone never proves
+    automatic selection -- a manually pinned provider/account can complete
+    a perfectly valid lifecycle and still not be the automatic-dispatch
+    smoke HOME_VISIBLE requires, so this is checked independently of, and
+    before, the lifecycle component checks below."""
+    automatic = section.get("automatic_selection")
+    if automatic is None:
+        return CheckResult(name, STATUS_UNKNOWN, f"{name}: automatic_selection not supplied")
+    if automatic is not True:
+        return CheckResult(name, STATUS_FAIL, f"{name}: automatic_selection is False (caller-pinned dispatch)")
+    if section.get("requested_provider"):
+        return CheckResult(
+            name, STATUS_FAIL,
+            f"{name}: requested_provider {section.get('requested_provider')!r} was caller-pinned, not automatic",
+        )
+    if section.get("requested_account_id"):
+        return CheckResult(
+            name, STATUS_FAIL,
+            f"{name}: requested_account_id {section.get('requested_account_id')!r} was caller-pinned, not automatic",
+        )
+    if not section.get("selected_provider"):
+        return CheckResult(name, STATUS_UNKNOWN,
+                            f"{name}: selected_provider (ADM's own automatic choice) not supplied")
+    return None
+
+
 def _check_smoke(evidence: Dict[str, Any], now: datetime) -> CheckResult:
     name = "automatic_provider_smoke"
     section = evidence.get("smoke")
@@ -235,6 +264,10 @@ def _check_smoke(evidence: Dict[str, Any], now: datetime) -> CheckResult:
         return CheckResult(name, STATUS_FAIL, f"{name}: request_id was reused from a historical record")
     if not section.get("request_id"):
         return CheckResult(name, STATUS_UNKNOWN, f"{name}: request_id not supplied")
+
+    not_automatic = _check_automatic_selection(section, name)
+    if not_automatic is not None:
+        return not_automatic
 
     components = section.get("components")
     if not isinstance(components, dict):
@@ -313,16 +346,56 @@ _UPSTREAM_STATUS_ALIASES = {
 }
 
 
-def _check_upstream_status(evidence: Dict[str, Any], key: str, name: str) -> CheckResult:
+# Timestamp field names accepted for time-sensitive upstream evidence, in
+# preference order -- the first one present in the section is used.
+_UPSTREAM_TIMESTAMP_FIELDS = ("generated_at", "captured_at")
+
+
+def _check_upstream_freshness(name: str, section: Dict[str, Any], now: datetime) -> Optional[CheckResult]:
+    """Returns a FAIL/UNKNOWN CheckResult if the upstream section's own
+    freshness evidence (a generated_at/captured_at timestamp bounded by
+    max_age_seconds) is missing, malformed, stale, or from the future; else
+    None (caller proceeds to read the propagated status). A historical
+    PASS from a long-finished run must not be silently reusable forever --
+    it must be re-proven fresh, exactly like every other time-sensitive
+    check in this module."""
+    max_age = section.get("max_age_seconds")
+    if not isinstance(max_age, (int, float)) or max_age <= 0:
+        return CheckResult(name, STATUS_UNKNOWN, f"{name}: no valid max_age_seconds supplied")
+    raw_ts = next((section.get(f) for f in _UPSTREAM_TIMESTAMP_FIELDS if section.get(f) is not None), None)
+    ts = _parse_ts(raw_ts)
+    if ts is None:
+        return CheckResult(
+            name, STATUS_UNKNOWN,
+            f"{name}: none of {_UPSTREAM_TIMESTAMP_FIELDS} is present/parseable",
+        )
+    age = (now - ts).total_seconds()
+    if age < 0:
+        return CheckResult(name, STATUS_FAIL, f"{name}: timestamp is in the future relative to `now`")
+    if age > max_age:
+        return CheckResult(name, STATUS_FAIL, f"{name}: timestamp is stale ({age:.0f}s old, max_age_seconds={max_age})")
+    return None
+
+
+def _check_upstream_status(evidence: Dict[str, Any], key: str, name: str, now: datetime) -> CheckResult:
     """For sub-gates that already produce their own bounded status (Rule44's
     promotion gate, etc.) -- propagate that status verbatim rather than
     re-deriving it, per 'consume existing evidence contracts'. Known upstream
     aliases (see _UPSTREAM_STATUS_ALIASES) are normalized to this module's
     vocabulary first; anything else unrecognized is still UNKNOWN, never
-    silently coerced."""
+    silently coerced.
+
+    These upstream gates report live repo/baseline truth, which can change
+    after the evidence was captured, so a PASS is only trusted if it also
+    carries its own bounded freshness evidence (see
+    _check_upstream_freshness) -- a stale PASS is FAIL, not a free pass to
+    reuse an old snapshot."""
     section = evidence.get(key)
     if not isinstance(section, dict):
         return _missing(name)
+    stale = _check_upstream_freshness(name, section, now)
+    if stale is not None:
+        return stale
     raw_status = section.get("status")
     status = _UPSTREAM_STATUS_ALIASES.get(raw_status, raw_status)
     if status not in _VALID_STATUSES:
@@ -391,6 +464,20 @@ def _check_write_e2e(evidence: Dict[str, Any], key: str, name: str, now: datetim
 # the E2E evidence's own `project_id` field; the "adm_write_e2e" /
 # "non_adm_write_e2e" *dict key names* are never treated as proof of which
 # project an E2E actually ran against.
+#
+# TRUST BOUNDARY (for the future live evidence assembler, not this pure
+# slice): this verifier accepts expected_adm_project_id from the generic
+# `evidence` dict because it has no live config of its own to consult --
+# it only evaluates whatever it is handed. That is acceptable ONLY because
+# nothing in this repo yet assembles `evidence` from untrusted input. Once
+# a live caller wires real dispatch/user-supplied data into `evidence`,
+# that caller MUST source expected_adm_project_id from trusted internal
+# project configuration (e.g. the ADM project registry), never from
+# dispatch payloads or any other caller/user-controlled evidence -- an
+# attacker who could set expected_adm_project_id could rename their own
+# project to "be" the canonical ADM project and defeat this check. Do not
+# redesign this verifier around live config in this slice; this is a
+# constraint on the assembler that will eventually populate `evidence`.
 DEFAULT_ADM_PROJECT_ID = "ai-development-manager"
 
 
@@ -492,10 +579,10 @@ def evaluate_global_hands_off_complete(
     checks = [
         CheckResult("home_visible_prerequisite", home_visible_result.status,
                     f"HOME_VISIBLE status is {home_visible_result.status}"),
-        _check_upstream_status(evidence, "canonical_baseline", "canonical_baseline_authority"),
+        _check_upstream_status(evidence, "canonical_baseline", "canonical_baseline_authority", now),
         _check_accepted_frozen(evidence, "direct_invoke", "direct_invoke"),
         _check_accepted_frozen(evidence, "continuation", "autonomous_continuation_foundation"),
-        _check_upstream_status(evidence, "rule44", "rule44_evidence_verifier"),
+        _check_upstream_status(evidence, "rule44", "rule44_evidence_verifier", now),
         _check_write_e2e(evidence, "adm_write_e2e", "adm_repo_write_e2e", now),
         _check_write_e2e(evidence, "non_adm_write_e2e", "non_adm_repo_write_e2e", now),
         _check_distinct_write_e2e_projects(evidence),

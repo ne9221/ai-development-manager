@@ -37,6 +37,11 @@ def _complete_smoke():
         "max_age_seconds": 3600,
         "is_duplicate": False,
         "reused_historical_request_id": False,
+        "automatic_selection": True,
+        "requested_provider": None,
+        "requested_account_id": None,
+        "selected_provider": "claude",
+        "selected_account_id": "account-b",
         "components": {
             "ingress": True,
             "task": True,
@@ -109,10 +114,16 @@ def _complete_non_adm_write_e2e():
 def _complete_global_evidence():
     return {
         "home_visible": _complete_home_visible_evidence(),
-        "canonical_baseline": {"status": STATUS_PASS, "reason": "main/formal/tested/target identical"},
+        "canonical_baseline": {
+            "status": STATUS_PASS, "reason": "main/formal/tested/target identical",
+            "generated_at": FRESH, "max_age_seconds": 3600,
+        },
         "direct_invoke": {"accepted": True, "frozen": True},
         "continuation": {"accepted": True, "frozen": True},
-        "rule44": {"status": STATUS_PASS, "reason": "promotion gate passed"},
+        "rule44": {
+            "status": STATUS_PASS, "reason": "promotion gate passed",
+            "generated_at": FRESH, "max_age_seconds": 3600,
+        },
         "adm_write_e2e": _complete_adm_write_e2e(),
         "non_adm_write_e2e": _complete_non_adm_write_e2e(),
         "autonomous_continuation": {
@@ -331,7 +342,10 @@ class GlobalHandsOffAntiFakeTest(unittest.TestCase):
 
     def test_canonical_main_formal_mismatch(self):
         def mutate(e):
-            e["canonical_baseline"] = {"status": STATUS_FAIL, "reason": "diverged"}
+            e["canonical_baseline"] = {
+                "status": STATUS_FAIL, "reason": "diverged",
+                "generated_at": FRESH, "max_age_seconds": 3600,
+            }
         result = self._mutated(mutate)
         self.assertEqual(result.status, STATUS_FAIL)
 
@@ -394,7 +408,10 @@ class GlobalHandsOffAntiFakeTest(unittest.TestCase):
 
     def test_rule44_reports_convergence_required_not_pass(self):
         def mutate(e):
-            e["rule44"] = {"status": STATUS_NOT_READY, "reason": "convergence required"}
+            e["rule44"] = {
+                "status": STATUS_NOT_READY, "reason": "convergence required",
+                "generated_at": FRESH, "max_age_seconds": 3600,
+            }
         result = self._mutated(mutate)
         self.assertNotEqual(result.status, STATUS_PASS)
 
@@ -410,7 +427,10 @@ class GlobalHandsOffAntiFakeTest(unittest.TestCase):
         # be recognized (normalized), not fall through to UNKNOWN as an
         # unrecognized status.
         def mutate(e):
-            e["rule44"] = {"status": "CONVERGENCE_REQUIRED", "reason": "upstream convergence required"}
+            e["rule44"] = {
+                "status": "CONVERGENCE_REQUIRED", "reason": "upstream convergence required",
+                "generated_at": FRESH, "max_age_seconds": 3600,
+            }
         result = self._mutated(mutate)
         self.assertEqual(result.status, STATUS_NOT_READY)
         rule44_check = next(c for c in result.checks if c.name == "rule44_evidence_verifier")
@@ -418,7 +438,10 @@ class GlobalHandsOffAntiFakeTest(unittest.TestCase):
 
     def test_canonical_baseline_convergence_required_normalizes_to_not_ready(self):
         def mutate(e):
-            e["canonical_baseline"] = {"status": "CONVERGENCE_REQUIRED", "reason": "main not yet fast-forwarded"}
+            e["canonical_baseline"] = {
+                "status": "CONVERGENCE_REQUIRED", "reason": "main not yet fast-forwarded",
+                "generated_at": FRESH, "max_age_seconds": 3600,
+            }
         result = self._mutated(mutate)
         self.assertEqual(result.status, STATUS_NOT_READY)
 
@@ -427,7 +450,10 @@ class GlobalHandsOffAntiFakeTest(unittest.TestCase):
         # "accept anything" -- a genuinely unrecognized status is still
         # UNKNOWN, not silently coerced to NOT_READY or PASS.
         def mutate(e):
-            e["rule44"] = {"status": "SOME_FUTURE_STATUS_NOT_YET_KNOWN", "reason": "?"}
+            e["rule44"] = {
+                "status": "SOME_FUTURE_STATUS_NOT_YET_KNOWN", "reason": "?",
+                "generated_at": FRESH, "max_age_seconds": 3600,
+            }
         result = self._mutated(mutate)
         self.assertEqual(result.status, STATUS_UNKNOWN)
 
@@ -504,6 +530,150 @@ class DistinctWriteE2EProjectsTest(unittest.TestCase):
             e["non_adm_write_e2e"] = copy.deepcopy(shared)
         result = self._mutated(mutate)
         self.assertEqual(result.status, STATUS_FAIL)
+
+
+class AutomaticProviderSmokeTest(unittest.TestCase):
+    """Blocker 1: lifecycle completeness alone must not prove automatic
+    provider/account selection -- a manually pinned smoke must be
+    rejected even with a perfect lifecycle."""
+
+    def _mutated(self, mutate):
+        evidence = _complete_home_visible_evidence()
+        mutate(evidence)
+        return evaluate_home_visible(evidence, now=NOW)
+
+    def _smoke_check(self, result):
+        return next(c for c in result.checks if c.name == "automatic_provider_smoke")
+
+    def test_manual_requested_provider_fails(self):
+        def mutate(e):
+            e["smoke"]["requested_provider"] = "claude"
+        result = self._mutated(mutate)
+        self.assertEqual(self._smoke_check(result).status, STATUS_FAIL)
+        self.assertEqual(result.status, STATUS_FAIL)
+
+    def test_manual_requested_account_id_fails(self):
+        def mutate(e):
+            e["smoke"]["requested_account_id"] = "account-b"
+        result = self._mutated(mutate)
+        self.assertEqual(self._smoke_check(result).status, STATUS_FAIL)
+
+    def test_automatic_selection_missing_is_unknown(self):
+        def mutate(e):
+            del e["smoke"]["automatic_selection"]
+        result = self._mutated(mutate)
+        self.assertEqual(self._smoke_check(result).status, STATUS_UNKNOWN)
+
+    def test_automatic_selection_false_fails(self):
+        def mutate(e):
+            e["smoke"]["automatic_selection"] = False
+        result = self._mutated(mutate)
+        self.assertEqual(self._smoke_check(result).status, STATUS_FAIL)
+
+    def test_selected_provider_absent_is_unknown(self):
+        def mutate(e):
+            del e["smoke"]["selected_provider"]
+        result = self._mutated(mutate)
+        self.assertEqual(self._smoke_check(result).status, STATUS_UNKNOWN)
+
+    def test_automatic_selection_with_omitted_request_and_real_selection_passes(self):
+        result = evaluate_home_visible(_complete_home_visible_evidence(), now=NOW)
+        self.assertEqual(result.status, STATUS_PASS)
+        smoke_check = next(c for c in result.checks if c.name == "automatic_provider_smoke")
+        self.assertEqual(smoke_check.status, STATUS_PASS)
+
+    def test_lifecycle_success_alone_does_not_imply_automatic(self):
+        # Every lifecycle component is True, but the dispatch itself was
+        # caller-pinned -- completeness must not be mistaken for
+        # automatic-selection proof.
+        def mutate(e):
+            e["smoke"]["requested_provider"] = "claude"
+            e["smoke"]["requested_account_id"] = "account-a"
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_FAIL)
+
+
+class UpstreamFreshnessTest(unittest.TestCase):
+    """Blocker 2: canonical_baseline and rule44 report live repo/baseline
+    truth that can change after evidence capture -- a historical PASS must
+    not be reusable forever."""
+
+    def _mutated(self, mutate):
+        evidence = _complete_global_evidence()
+        mutate(evidence)
+        return evaluate_global_hands_off_complete(evidence, now=NOW)
+
+    def test_stale_canonical_pass_fails(self):
+        def mutate(e):
+            e["canonical_baseline"]["generated_at"] = STALE
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_FAIL)
+
+    def test_stale_rule44_pass_fails(self):
+        def mutate(e):
+            e["rule44"]["generated_at"] = STALE
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_FAIL)
+
+    def test_fresh_canonical_pass_passes(self):
+        result = evaluate_global_hands_off_complete(_complete_global_evidence(), now=NOW)
+        self.assertEqual(result.status, STATUS_PASS)
+        check = next(c for c in result.checks if c.name == "canonical_baseline_authority")
+        self.assertEqual(check.status, STATUS_PASS)
+
+    def test_fresh_rule44_pass_passes(self):
+        result = evaluate_global_hands_off_complete(_complete_global_evidence(), now=NOW)
+        check = next(c for c in result.checks if c.name == "rule44_evidence_verifier")
+        self.assertEqual(check.status, STATUS_PASS)
+
+    def test_fresh_convergence_required_is_not_ready(self):
+        def mutate(e):
+            e["rule44"]["status"] = "CONVERGENCE_REQUIRED"
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_NOT_READY)
+
+    def test_missing_freshness_on_canonical_baseline_is_unknown(self):
+        def mutate(e):
+            del e["canonical_baseline"]["generated_at"]
+        result = self._mutated(mutate)
+        check = next(c for c in result.checks if c.name == "canonical_baseline_authority")
+        self.assertEqual(check.status, STATUS_UNKNOWN)
+
+    def test_missing_max_age_on_rule44_is_unknown(self):
+        def mutate(e):
+            del e["rule44"]["max_age_seconds"]
+        result = self._mutated(mutate)
+        check = next(c for c in result.checks if c.name == "rule44_evidence_verifier")
+        self.assertEqual(check.status, STATUS_UNKNOWN)
+
+    def test_malformed_timestamp_on_canonical_baseline_is_unknown(self):
+        def mutate(e):
+            e["canonical_baseline"]["generated_at"] = "not-a-timestamp"
+        result = self._mutated(mutate)
+        check = next(c for c in result.checks if c.name == "canonical_baseline_authority")
+        self.assertEqual(check.status, STATUS_UNKNOWN)
+
+    def test_future_timestamp_on_rule44_fails(self):
+        def mutate(e):
+            e["rule44"]["generated_at"] = (NOW + timedelta(seconds=120)).isoformat()
+        result = self._mutated(mutate)
+        self.assertEqual(result.status, STATUS_FAIL)
+
+    def test_captured_at_alias_accepted(self):
+        def mutate(e):
+            del e["canonical_baseline"]["generated_at"]
+            e["canonical_baseline"]["captured_at"] = FRESH
+        result = self._mutated(mutate)
+        check = next(c for c in result.checks if c.name == "canonical_baseline_authority")
+        self.assertEqual(check.status, STATUS_PASS)
+
+    def test_direct_invoke_accepted_frozen_unaffected_by_freshness_contract(self):
+        # accepted+frozen flags (direct_invoke, continuation) are stable
+        # source-artifact facts, not time-sensitive live gates -- they must
+        # not gain an implicit freshness requirement from this change.
+        result = evaluate_global_hands_off_complete(_complete_global_evidence(), now=NOW)
+        check = next(c for c in result.checks if c.name == "direct_invoke")
+        self.assertEqual(check.status, STATUS_PASS)
 
 
 class StatusVocabularyTest(unittest.TestCase):
