@@ -63,8 +63,39 @@ param(
     # Drive poll + idempotency-bucket check per tick and must never be
     # allowed to run long enough to overlap its own next 1-minute trigger
     # in a way IgnoreNew alone can't cheaply bound.
-    [int]$ExecutionTimeLimitMinutes = 5
+    [int]$ExecutionTimeLimitMinutes = 5,
+    # Test-only override for where the generated .vbs wrapper is written,
+    # forwarded verbatim to New-AdmHiddenScheduledTaskAction. Left empty in
+    # every real install, which preserves the exact production default
+    # (manager\generated under $RepositoryPath). See the
+    # ADM_PESTER_TEST_ACTIVE guard below.
+    [string]$GeneratedWrapperDir
 )
+
+# Fail-closed test-isolation guard (see
+# fix/pester-scheduled-task-isolation-20260823): a Pester run sets
+# $env:ADM_PESTER_TEST_ACTIVE for the duration of its own It blocks. If that
+# sentinel is active, this script must never be allowed to target a
+# canonical production Scheduled Task name, and must never be allowed to
+# fall back to the production generated-wrapper location -- both would let
+# a test (even one that never reaches Register-ScheduledTask, which Pester
+# mocks) silently overwrite the real checkout's live wrapper file or task
+# identity. This check runs before any other validation, provenance
+# activation, or file write below.
+if (-not [string]::IsNullOrEmpty($env:ADM_PESTER_TEST_ACTIVE)) {
+    $admProductionTaskNames = @(
+        "AI Development Manager - Drive Dispatch Ingress",
+        "AI Development Manager - Command Watcher"
+    )
+    if ($admProductionTaskNames -contains $TaskName) {
+        Write-Error "PRODUCTION_TASK_NAME_FORBIDDEN_UNDER_TEST: -TaskName '$TaskName' is a canonical production Scheduled Task name; refusing to proceed while `$env:ADM_PESTER_TEST_ACTIVE is set. Pass an isolated test-only -TaskName."
+        exit 1
+    }
+    if ([string]::IsNullOrWhiteSpace($GeneratedWrapperDir)) {
+        Write-Error "GENERATED_WRAPPER_DIR_REQUIRED_UNDER_TEST: `$env:ADM_PESTER_TEST_ACTIVE is set; -GeneratedWrapperDir must be supplied so the generated .vbs wrapper is never written into the real repository tree."
+        exit 1
+    }
+}
 
 # Fail-closed WorkspaceRoot validation, before any provenance activation or
 # Scheduled Task mutation below: non-empty, absolute, an existing
@@ -130,7 +161,11 @@ $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy By
 # eliminates the console flash that plain "-WindowStyle Hidden" on a
 # directly-registered powershell.exe action cannot prevent. Distinct
 # WrapperName so the generated .vbs never collides with command-watcher.vbs.
-$action = New-AdmHiddenScheduledTaskAction -RepositoryPath $RepositoryPath -WrapperName "drive-dispatch-ingress" -PowerShellArguments $arguments
+if ($GeneratedWrapperDir) {
+    $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $RepositoryPath -WrapperName "drive-dispatch-ingress" -PowerShellArguments $arguments -GeneratedWrapperDir $GeneratedWrapperDir
+} else {
+    $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $RepositoryPath -WrapperName "drive-dispatch-ingress" -PowerShellArguments $arguments
+}
 
 # Every 1 minute, starting 1 minute from install time -- matches the
 # Command Watcher's own cadence, since Drive dispatch requests should be

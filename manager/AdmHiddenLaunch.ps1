@@ -13,11 +13,20 @@ function New-AdmHiddenScheduledTaskAction {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
         [Parameter(Mandatory = $true)][string]$WrapperName,
-        [Parameter(Mandatory = $true)][string]$PowerShellArguments
+        [Parameter(Mandatory = $true)][string]$PowerShellArguments,
+        # Overrides where the generated .vbs wrapper is written. Defaults to
+        # the production location under $RepositoryPath so real installs
+        # (install_command_watcher.ps1, install_drive_dispatch_ingress.ps1
+        # called without this param) are byte-for-byte unchanged. Callers
+        # under test pass an isolated temp directory here so a Pester run
+        # invoked against a real checkout can never overwrite that
+        # checkout's live production wrapper file on disk -- see
+        # fix/pester-scheduled-task-isolation-20260823.
+        [string]$GeneratedWrapperDir
     )
 
     $escapedArgs = $PowerShellArguments.Replace('"', '""')
-    $vbsDir = Join-Path $RepositoryPath "manager\generated"
+    $vbsDir = if ($GeneratedWrapperDir) { $GeneratedWrapperDir } else { Join-Path $RepositoryPath "manager\generated" }
     New-Item -ItemType Directory -Force -Path $vbsDir | Out-Null
     $vbsPath = Join-Path $vbsDir "$WrapperName.vbs"
 

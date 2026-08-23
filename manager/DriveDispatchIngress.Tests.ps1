@@ -10,12 +10,68 @@
 # "python" stub batch file under $TestDrive, never a real interpreter or
 # provider binary.
 
+# Isolation contract (see fix/pester-scheduled-task-isolation-20260823):
+# this suite must be incapable of touching the real, already-registered
+# "AI Development Manager - Drive Dispatch Ingress" / "... - Command
+# Watcher" Scheduled Tasks or their live generated .vbs wrapper files, even
+# when run against a real production checkout (where $repository below
+# resolves to that checkout, not a throwaway clone).
+#
+# Three independent layers enforce that:
+#   1. Every install invocation below uses a unique test-only -TaskName,
+#      never one of the two canonical production names.
+#   2. Every install invocation passes an isolated -GeneratedWrapperDir
+#      under $TestDrive, so the generated .vbs wrapper is never written to
+#      the real checkout's manager\generated\ (see AdmHiddenLaunch.ps1).
+#   3. $env:ADM_PESTER_TEST_ACTIVE is set for the lifetime of this file's
+#      test execution: install_drive_dispatch_ingress.ps1 itself refuses
+#      (exit 1, before any provenance activation or file write) to run
+#      with a production -TaskName or without an explicit
+#      -GeneratedWrapperDir while that sentinel is set -- so even a future
+#      regression in this file that forgets (1)/(2) fails closed inside
+#      the script under test, not silently.
+# On top of that, Register-ScheduledTask/Get-ScheduledTask/
+# Unregister-ScheduledTask/Start-ScheduledTask/Stop-ScheduledTask are all
+# mocked below to either capture (Register-ScheduledTask only) or throw
+# (the other four, which neither installer script ever legitimately calls)
+# -- and a read-only Get-ScheduledTask snapshot of the two production task
+# names is taken before and after this file's Describe blocks run, outside
+# any Mock scope, to prove production state is unchanged.
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repository = (Resolve-Path (Join-Path $here "..")).Path
 $installScript = Join-Path $here "install_drive_dispatch_ingress.ps1"
 $runScript = Join-Path $here "run_drive_dispatch_ingress.ps1"
-$ingressTaskName = "AI Development Manager - Drive Dispatch Ingress"
+$ingressTaskName = "AI Development Manager - Drive Dispatch Ingress [PESTER-TEST-ISOLATED]"
 $watcherTaskName = "AI Development Manager - Command Watcher"
+$admProductionTaskNames = @(
+    "AI Development Manager - Drive Dispatch Ingress",
+    "AI Development Manager - Command Watcher"
+)
+
+function Get-AdmProductionTaskSnapshot {
+    # Deliberately does NOT capture .State: these are live, running
+    # production tasks polling on their own 1-minute triggers, so State
+    # legitimately flips between Ready/Running/Queued from one snapshot to
+    # the next with zero relation to this test file. Registration identity
+    # (Exists) and the actual wrapper the task launches (Actions -- exe +
+    # full argument string, which is exactly what a contaminated
+    # regenerated .vbs would change) are what a test run must never alter.
+    $admProductionTaskNames | ForEach-Object {
+        $task = $null
+        try { $task = Get-ScheduledTask -TaskName $_ -ErrorAction Stop } catch { $task = $null }
+        if ($task) {
+            $actionSummary = ($task.Actions | ForEach-Object { "$($_.Execute)|$($_.Arguments)" }) -join ";"
+            [PSCustomObject]@{ TaskName = $_; Exists = $true; Actions = $actionSummary }
+        } else {
+            [PSCustomObject]@{ TaskName = $_; Exists = $false; Actions = $null }
+        }
+    }
+}
+
+# Read-only, unmocked, taken before this file's Describe blocks (and their
+# It-scoped Mocks) exist at all.
+$admBeforeSnapshot = @(Get-AdmProductionTaskSnapshot)
+$env:ADM_PESTER_TEST_ACTIVE = "1"
 
 function New-FakePython([string]$Dir, [bool]$ProvenanceFails = $false, [string]$LogFile) {
     # A real, invokable external command (not a PowerShell Mock) standing
@@ -75,6 +131,9 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
         $global:admManagerHome = Join-Path $global:admCase "manager-home"
         New-Item -ItemType Directory -Force -Path $global:admManagerHome | Out-Null
         $global:admFakePython = New-FakePython -Dir (Join-Path $global:admCase "python")
+        # Isolated wrapper output -- never the real checkout's
+        # manager\generated\ -- see the file-header note above.
+        $global:admGeneratedWrapperDir = Join-Path $global:admCase "generated-wrapper"
 
         $global:admCapturedAction = $null
         $global:admCapturedTrigger = $null
@@ -98,6 +157,17 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
             $global:admCapturedTrigger = $Trigger
             $global:admCapturedSettings = $Settings
         }
+        # Neither installer script legitimately calls any of these four --
+        # confirmed by reading install_drive_dispatch_ingress.ps1 and
+        # install_command_watcher.ps1 (Register-ScheduledTask is the only
+        # Task Scheduler cmdlet either one invokes). Mocking them to throw
+        # turns any future accidental call (a regression that adds a
+        # reinstall-by-unregister-then-register path, for example) into an
+        # immediate test failure instead of a real mutation.
+        Mock Get-ScheduledTask { throw "ADM_TEST_SAFETY: Get-ScheduledTask must not be called from install_drive_dispatch_ingress.ps1 under test." }
+        Mock Unregister-ScheduledTask { throw "ADM_TEST_SAFETY: Unregister-ScheduledTask must not be called from install_drive_dispatch_ingress.ps1 under test." }
+        Mock Start-ScheduledTask { throw "ADM_TEST_SAFETY: Start-ScheduledTask must not be called from install_drive_dispatch_ingress.ps1 under test." }
+        Mock Stop-ScheduledTask { throw "ADM_TEST_SAFETY: Stop-ScheduledTask must not be called from install_drive_dispatch_ingress.ps1 under test." }
     }
 
     AfterEach {
@@ -108,6 +178,7 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
 
     function Invoke-Install {
         & $installScript `
+            -TaskName $ingressTaskName `
             -PythonPath $global:admFakePython `
             -RepositoryPath $repository `
             -ManagerHome $global:admManagerHome `
@@ -115,7 +186,8 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
             -IngressFolderId "folder-id" `
             -IngressOwner "owner@example.com" `
             -GcsBucket "idem-bucket" `
-            -WorkspaceRoot $global:admWorkspaceRoot
+            -WorkspaceRoot $global:admWorkspaceRoot `
+            -GeneratedWrapperDir $global:admGeneratedWrapperDir
     }
 
     It "invokes the exact runner interface via a hidden wscript wrapper, not a visible PowerShell host" {
@@ -172,6 +244,7 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
     It "preserves an explicit ClaudeAccountsConfig verbatim through the installer into the wrapped command line" {
         $explicitConfig = Join-Path $global:admCase "explicit-claude-accounts.json"
         & $installScript `
+            -TaskName $ingressTaskName `
             -PythonPath $global:admFakePython `
             -RepositoryPath $repository `
             -ManagerHome $global:admManagerHome `
@@ -180,7 +253,8 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
             -IngressOwner "owner@example.com" `
             -GcsBucket "idem-bucket" `
             -ClaudeAccountsConfig $explicitConfig `
-            -WorkspaceRoot $global:admWorkspaceRoot | Out-Null
+            -WorkspaceRoot $global:admWorkspaceRoot `
+            -GeneratedWrapperDir $global:admGeneratedWrapperDir | Out-Null
         $vbsPath = $global:admCapturedAction.Arguments.Trim('"')
         $vbsContent = Get-Content -Raw -LiteralPath $vbsPath
         $vbsContent | Should Match ([regex]::Escape("-ClaudeAccountsConfig `"`"$explicitConfig`"`""))
@@ -204,6 +278,7 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
 
     It "honors a caller-supplied bounded execution timeout" {
         & $installScript `
+            -TaskName $ingressTaskName `
             -PythonPath $global:admFakePython `
             -RepositoryPath $repository `
             -ManagerHome $global:admManagerHome `
@@ -211,6 +286,7 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
             -IngressOwner "owner@example.com" `
             -GcsBucket "idem-bucket" `
             -WorkspaceRoot $global:admWorkspaceRoot `
+            -GeneratedWrapperDir $global:admGeneratedWrapperDir `
             -ExecutionTimeLimitMinutes 2 | Out-Null
         $global:admCapturedSettings.ExecutionTimeLimit | Should Be "PT2M"
     }
@@ -221,13 +297,15 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
     )) {
         It "fails closed and never registers a Scheduled Task when WorkspaceRoot is $($case.Name)" {
             & $installScript `
+                -TaskName $ingressTaskName `
                 -PythonPath $global:admFakePython `
                 -RepositoryPath $repository `
                 -ManagerHome $global:admManagerHome `
                 -IngressFolderId "folder-id" `
                 -IngressOwner "owner@example.com" `
                 -GcsBucket "idem-bucket" `
-                -WorkspaceRoot $case.Value 2>$null
+                -WorkspaceRoot $case.Value `
+                -GeneratedWrapperDir $global:admGeneratedWrapperDir 2>$null
             $LASTEXITCODE | Should Not Be 0
             Assert-MockCalled Register-ScheduledTask -Times 0 -Exactly -Scope It
         }
@@ -242,13 +320,15 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
         $threw = $false
         try {
             & $installScript `
+                -TaskName $ingressTaskName `
                 -PythonPath $global:admFakePython `
                 -RepositoryPath $repository `
                 -ManagerHome $global:admManagerHome `
                 -IngressFolderId "folder-id" `
                 -IngressOwner "owner@example.com" `
                 -GcsBucket "idem-bucket" `
-                -WorkspaceRoot "" 2>$null
+                -WorkspaceRoot "" `
+                -GeneratedWrapperDir $global:admGeneratedWrapperDir 2>$null
         } catch {
             $threw = $true
         }
@@ -258,13 +338,15 @@ Describe "install_drive_dispatch_ingress.ps1 -- Scheduled Task shape" {
 
     It "fails closed and never registers a Scheduled Task when WorkspaceRoot resolves under Temp" {
         & $installScript `
+            -TaskName $ingressTaskName `
             -PythonPath $global:admFakePython `
             -RepositoryPath $repository `
             -ManagerHome $global:admManagerHome `
             -IngressFolderId "folder-id" `
             -IngressOwner "owner@example.com" `
             -GcsBucket "idem-bucket" `
-            -WorkspaceRoot ([IO.Path]::GetTempPath()) 2>$null
+            -WorkspaceRoot ([IO.Path]::GetTempPath()) `
+            -GeneratedWrapperDir $global:admGeneratedWrapperDir 2>$null
         $LASTEXITCODE | Should Not Be 0
         Assert-MockCalled Register-ScheduledTask -Times 0 -Exactly -Scope It
     }
@@ -318,6 +400,17 @@ Describe "run_drive_dispatch_ingress.ps1 -- runtime behavior" {
         $global:admFakePython = New-FakePython -Dir (Join-Path $global:admCase "python")
         $global:admFakePythonFailing = New-FakePython -Dir (Join-Path $global:admCase "python-fail") -ProvenanceFails $true
         $env:FAKE_PYTHON_LOG = $global:admLog
+
+        # run_drive_dispatch_ingress.ps1 never calls any Task Scheduler
+        # cmdlet (confirmed by reading the script -- it only shells out to
+        # $PythonPath). Mocked to throw anyway as a defense-in-depth
+        # tripwire against a future regression, matching the install-script
+        # Describe block above.
+        Mock Get-ScheduledTask { throw "ADM_TEST_SAFETY: Get-ScheduledTask must not be called from run_drive_dispatch_ingress.ps1 under test." }
+        Mock Register-ScheduledTask { throw "ADM_TEST_SAFETY: Register-ScheduledTask must not be called from run_drive_dispatch_ingress.ps1 under test." }
+        Mock Unregister-ScheduledTask { throw "ADM_TEST_SAFETY: Unregister-ScheduledTask must not be called from run_drive_dispatch_ingress.ps1 under test." }
+        Mock Start-ScheduledTask { throw "ADM_TEST_SAFETY: Start-ScheduledTask must not be called from run_drive_dispatch_ingress.ps1 under test." }
+        Mock Stop-ScheduledTask { throw "ADM_TEST_SAFETY: Stop-ScheduledTask must not be called from run_drive_dispatch_ingress.ps1 under test." }
     }
 
     AfterEach {
@@ -587,5 +680,23 @@ except mod.TaskError as exc:
         $result.bucket_env_name | Should Be "ADM_LOCK_GCS_BUCKET"
         $result.outcome | Should Be "fail_closed"
         $result.error | Should Match "ADM_LOCK_GCS_BUCKET"
+    }
+}
+
+# Clear the sentinel now that every Describe block above has run, then take
+# the read-only "after" snapshot -- unmocked (all Mocks created inside a
+# Describe block are scoped to that block and are gone by the time control
+# reaches back here) and outside any It, exactly mirroring $admBeforeSnapshot
+# at the top of this file. Any mismatch means something in this file (or a
+# regression in install_drive_dispatch_ingress.ps1 / AdmHiddenLaunch.ps1)
+# reached a real production Scheduled Task despite every isolation layer
+# above -- surfaced loudly rather than silently.
+Remove-Item Env:ADM_PESTER_TEST_ACTIVE -ErrorAction SilentlyContinue
+$admAfterSnapshot = @(Get-AdmProductionTaskSnapshot)
+for ($admI = 0; $admI -lt $admProductionTaskNames.Count; $admI++) {
+    $admBefore = $admBeforeSnapshot[$admI]
+    $admAfter = $admAfterSnapshot[$admI]
+    if ($admBefore.Exists -ne $admAfter.Exists -or $admBefore.State -ne $admAfter.State -or $admBefore.Actions -ne $admAfter.Actions) {
+        Write-Error "PRODUCTION_SCHEDULED_TASK_MUTATED: '$($admBefore.TaskName)' changed during this Pester file's execution.`nBefore: Exists=$($admBefore.Exists) State=$($admBefore.State) Actions=$($admBefore.Actions)`nAfter:  Exists=$($admAfter.Exists) State=$($admAfter.State) Actions=$($admAfter.Actions)"
     }
 }
