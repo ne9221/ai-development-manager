@@ -11,7 +11,11 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from collectors.claude import normalize as normalize_claude
-from collectors.claude_oauth import RateLimitedError as ClaudeOauthRateLimited, AuthStaleError as ClaudeOauthAuthStale
+from collectors.claude_oauth import (
+    RateLimitedError as ClaudeOauthRateLimited,
+    AuthStaleError as ClaudeOauthAuthStale,
+    AuthRefreshNotPersistedError as ClaudeOauthAuthRefreshNotPersisted,
+)
 from manager.claude_account_selector import select_claude_account, resolve_claude_account
 from manager.command_watcher import process_command, provider_quota_reliable, claude_quota_reliable
 from manager.quota_forecast import forecast_account, RiskStatus, ActionRecommendation, WarningLevel
@@ -517,6 +521,44 @@ class ClaudeOauthRefreshIntegrationTests(unittest.TestCase):
         published_claude = next(p for p in published[0]["providers"] if p.get("provider") == "claude" and p.get("account_id") == "account-a")
         self.assertEqual("claude_code_statusline_rate_limits", published_claude["source"])
         self.assertEqual(85, published_claude["windows"][0]["remaining_percent"])
+
+    # 18. On the AUTH_REFRESH_NOT_PERSISTED fail-closed path (CLI ran but did
+    #     not persist a fresh token, and no statusline fallback is
+    #     available), the existing last-good cached quota entry is left
+    #     byte-for-byte untouched -- never cleared or corrupted.
+    def test_18_auth_refresh_not_persisted_preserves_last_good_entry(self):
+        last_good = {
+            "provider": "claude", "account_id": "account-a", "display_name": "Claude Code",
+            "collection_mode": "automatic", "source": "claude_oauth_usage", "source_type": "official",
+            "confidence": "official", "last_updated": "2026-08-22T01:00:00Z", "status": "ok",
+            "windows": [{"name": "five_hour", "duration_minutes": 300, "used_percent": 40.0,
+                         "remaining_percent": 60.0, "resets_at": None}],
+            "metadata": {},
+        }
+
+        def oauth_collector(config_dir, account_id, timeout=15):
+            raise ClaudeOauthAuthRefreshNotPersisted()
+
+        published = []
+        missing_payload = self.base / "missing-statusline.json"
+        result = refresh(
+            service=object(),
+            runtime_path=self.base / "status.json",
+            log_path=self.base / "refresh.log",
+            lock_path=self.base / "refresh.lock",
+            claude_path=missing_payload,
+            claude_accounts={"account-a": missing_payload},
+            claude_config_dirs={"account-a": None},
+            claude_oauth_collector=oauth_collector,
+            reader=lambda **_: self._empty_doc(existing_claude=last_good),
+            codex_collector=lambda **_: ({}, {"providers": [self._empty_doc()["providers"][0]]}),
+            publisher=lambda s, p: published.append(json.loads(p.read_text())) or {"action": "updated"},
+            history_store=False,
+        )
+        self.assertEqual("unavailable", result["providers"]["claude:account-a"])
+        published_claude = next(p for p in published[0]["providers"] if p.get("provider") == "claude" and p.get("account_id") == "account-a")
+        self.assertEqual(last_good, published_claude,
+                          "AUTH_REFRESH_NOT_PERSISTED must leave the last-good entry byte-for-byte untouched")
 
     # Codex refresh path is completely unaffected by the OAuth changes
     def test_codex_refresh_unaffected_by_oauth_changes(self):
