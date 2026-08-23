@@ -13,14 +13,38 @@ never refreshes under ADM's own launch pattern (see
 manager.refresh_status for how this collector and the statusline path are
 combined).
 
-Security contract: the access token is read once per call, used only in
-the Authorization header of a single outbound request, and never appears
-in any return value, log line, or exception message this module raises.
+Stale-access-token recovery: this module never implements the OAuth
+refresh protocol itself and never reads or uses the stored refresh
+material directly -- the Claude CLI is the sole credential authority.
+When the stored access token looks clearly expired, or the usage endpoint
+itself rejects it with HTTP 401, this module runs one bounded,
+non-interactive `claude auth status --json` preflight against the exact
+account's own environment, then re-reads the credentials file to see
+whether the CLI actually persisted a newer access token. Only when a
+genuinely different/fresher token is now on disk does it retry the usage
+GET, and only once. If the CLI preflight cannot be confirmed to have
+persisted a fresh token -- whether it reports not-logged-in, reports
+logged-in without changing anything on disk, or the preflight itself
+fails/times out/returns something unparseable -- this fails closed
+(AuthRefreshNotPersistedError for the two "checked, nothing new" cases,
+CollectorError for a broken preflight) rather than looping or reusing a
+stale token.
+
+Security contract: neither the access token nor the on-disk credential
+material this module reads is ever placed in a return value, log line, or
+exception message this module raises. The CLI preflight is only ever
+invoked with the account's own config_dir (via CLAUDE_CONFIG_DIR when
+config_dir is set, or the ambient environment untouched for the default
+account) -- one account's preflight can never read another account's
+credentials.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -30,6 +54,7 @@ from typing import Any, Callable, Optional
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
+AUTH_PREFLIGHT_TIMEOUT_SECONDS = 10.0
 
 
 class CollectorError(RuntimeError):
@@ -46,10 +71,27 @@ class AuthStaleError(CollectorError):
     fail closed: never guess quota, never treat this as a 0%/100% value."""
 
 
+class AuthRefreshNotPersistedError(CollectorError):
+    """The Claude CLI auth preflight ran, but re-reading the credentials
+    file afterward shows no new/fresher access token was actually
+    persisted (either the CLI reported not-logged-in, or it reported
+    logged-in yet left the on-disk token/expiry unchanged). ADM never
+    calls the Anthropic OAuth refresh endpoint itself and never treats the
+    stored refresh material as usable credential authority on its own --
+    when the CLI (the sole refresh authority) doesn't produce a fresh
+    token, this fails closed instead of retrying in a loop or reusing the
+    stale token."""
+
+    def __init__(self):
+        super().__init__("AUTH_REFRESH_NOT_PERSISTED")
+
+
 class RateLimitedError(CollectorError):
     """HTTP 429 from the usage endpoint. Callers must not overwrite any
     existing last-good quota entry on this outcome, and must not retry in
-    a loop -- one refresh cycle gets one request per account, full stop."""
+    a loop -- one refresh cycle gets one request per account, full stop.
+    A 429 must never trigger the CLI auth preflight either: rate limiting
+    is not an authentication problem."""
 
     def __init__(self, retry_after: Optional[str] = None):
         super().__init__("rate limited by oauth usage endpoint")
@@ -74,23 +116,132 @@ def _reset_iso(value: Any) -> Optional[str]:
     return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def read_access_token(config_dir: Optional[str]) -> str:
-    """Reads the OAuth access token for one account's config_dir (or the
-    default ~/.claude when config_dir is falsy). Returns the bare token
-    string only -- never the parsed credentials dict, so a caller cannot
-    accidentally log the whole structure."""
+def _credentials_path(config_dir: Optional[str]) -> Path:
     base = Path(config_dir) if config_dir else Path.home() / ".claude"
-    cred_path = base / ".credentials.json"
+    return base / ".credentials.json"
+
+
+def _read_oauth_section(config_dir: Optional[str]) -> dict:
+    """Reads and returns the raw `claudeAiOauth` object for one account's
+    config_dir (or the default ~/.claude when config_dir is falsy).
+    Internal helper only -- callers outside this module must never log or
+    return this dict verbatim; extract only the specific safe field(s)
+    actually needed (see read_access_token)."""
+    cred_path = _credentials_path(config_dir)
     if not cred_path.is_file():
         raise CredentialsUnavailableError("credentials file not found")
     try:
         data = json.loads(cred_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise CredentialsUnavailableError("credentials file unreadable") from exc
-    token = (data.get("claudeAiOauth") or {}).get("accessToken")
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        raise CredentialsUnavailableError("credentials file missing oauth section")
+    return oauth
+
+
+def read_access_token(config_dir: Optional[str]) -> str:
+    """Reads the OAuth access token for one account's config_dir (or the
+    default ~/.claude when config_dir is falsy). Returns the bare token
+    string only -- never the parsed credentials dict, so a caller cannot
+    accidentally log the whole structure."""
+    oauth = _read_oauth_section(config_dir)
+    token = oauth.get("accessToken")
     if not token or not isinstance(token, str):
         raise CredentialsUnavailableError("access token missing from credentials")
     return token
+
+
+def _is_clearly_expired(oauth: dict, now_ms: Optional[int] = None) -> bool:
+    """True only when the credentials file carries an explicit, well-formed
+    `expiresAt` (epoch milliseconds) that is already in the past. Anything
+    ambiguous (missing/non-numeric) returns False -- staleness in that case
+    is still caught by the usage endpoint's own 401, never guessed here."""
+    expires_at = oauth.get("expiresAt")
+    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+        return False
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    return expires_at <= now_ms
+
+
+def _cli_executable(explicit: Optional[str]) -> str:
+    if explicit:
+        return explicit
+    env_bin = os.environ.get("CLAUDE_BIN")
+    if env_bin:
+        return env_bin
+    return "claude.exe" if os.name == "nt" else "claude"
+
+
+def _cli_env(config_dir: Optional[str]) -> Optional[dict]:
+    """None (inherit the ambient environment untouched) for the default
+    account; an explicit CLAUDE_CONFIG_DIR override for any other account.
+    This is the only mechanism that keeps one account's CLI preflight from
+    ever reading another account's credentials."""
+    if not config_dir:
+        return None
+    env = dict(os.environ)
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    return env
+
+
+def run_auth_preflight(config_dir: Optional[str], timeout: float = AUTH_PREFLIGHT_TIMEOUT_SECONDS,
+                        run: Callable[..., Any] = subprocess.run,
+                        executable: Optional[str] = None) -> bool:
+    """Runs one bounded, non-interactive `claude auth status --json` against
+    the exact account environment, and returns only the `loggedIn` boolean
+    it reports. This never performs a refresh itself -- it only asks the
+    CLI to report status; whatever internal refresh logic the CLI may run
+    on its own is entirely up to the CLI. Raises CollectorError on anything
+    that isn't an unambiguous loggedIn result (timeout, OS error, unexpected
+    exit code, unparseable output, or an inconsistent exit-code/body
+    combination) so an uncertain check is never mistaken for a clear
+    answer. Never logs or returns anything from the subprocess output other
+    than this one boolean."""
+    exe = _cli_executable(executable)
+    env = _cli_env(config_dir)
+    try:
+        completed = run([exe, "auth", "status", "--json"], capture_output=True,
+                         text=True, timeout=timeout, env=env, shell=False)
+    except subprocess.TimeoutExpired as exc:
+        raise CollectorError("claude auth preflight timed out") from None
+    except OSError as exc:
+        raise CollectorError("claude auth preflight failed to start") from None
+
+    if completed.returncode not in (0, 1):
+        raise CollectorError("claude auth preflight exited with unexpected code")
+    try:
+        payload = json.loads(completed.stdout)
+    except (json.JSONDecodeError, ValueError):
+        raise CollectorError("claude auth preflight returned unparseable output") from None
+    logged_in = payload.get("loggedIn") if isinstance(payload, dict) else None
+    if not isinstance(logged_in, bool):
+        raise CollectorError("claude auth preflight returned an unexpected shape")
+    if (completed.returncode, logged_in) not in ((0, True), (1, False)):
+        raise CollectorError("claude auth preflight returned an inconsistent result")
+    return logged_in
+
+
+def _refresh_access_token_via_cli(config_dir: Optional[str], pre_oauth: dict, timeout: float,
+                                   run: Callable[..., Any], executable: Optional[str]) -> str:
+    """Runs exactly one CLI auth preflight, then re-reads the credentials
+    file and returns the new access token only if it genuinely changed
+    (token value or expiry) from what was on disk before the preflight.
+    Otherwise raises AuthRefreshNotPersistedError -- never falls back to
+    the stale token, never loops."""
+    logged_in = run_auth_preflight(config_dir, timeout=timeout, run=run, executable=executable)
+    if not logged_in:
+        raise AuthRefreshNotPersistedError()
+
+    post_oauth = _read_oauth_section(config_dir)
+    pre_token = pre_oauth.get("accessToken")
+    post_token = post_oauth.get("accessToken")
+    if not post_token or not isinstance(post_token, str):
+        raise AuthRefreshNotPersistedError()
+    if post_token == pre_token and post_oauth.get("expiresAt") == pre_oauth.get("expiresAt"):
+        raise AuthRefreshNotPersistedError()
+    return post_token
 
 
 def fetch_usage(token: str, timeout: float = 15, opener: Optional[Callable[..., Any]] = None) -> dict:
@@ -183,13 +334,44 @@ def normalize(payload: dict, account_id: Optional[str], captured_at: Optional[st
 
 
 def collect(config_dir: Optional[str], account_id: Optional[str], timeout: float = 15,
-            opener: Optional[Callable[..., Any]] = None) -> dict:
-    """Orchestrates one credentials read + one HTTP request for one
-    account, returning a normalized provider entry. Raises
-    CredentialsUnavailableError / AuthStaleError / RateLimitedError /
-    CollectorError on failure -- callers (manager.refresh_status) decide
-    what to do about each, including whether to fall back to the
-    statusline-based compatibility path."""
-    token = read_access_token(config_dir)
-    payload = fetch_usage(token, timeout=timeout, opener=opener)
+            opener: Optional[Callable[..., Any]] = None,
+            cli_run: Optional[Callable[..., Any]] = None,
+            cli_executable: Optional[str] = None) -> dict:
+    """Orchestrates one credentials read + at most one HTTP request (plus,
+    only when needed, exactly one CLI auth preflight and exactly one retry
+    request) for one account, returning a normalized provider entry.
+
+    Recovery path for a stale access token:
+      - If the on-disk token is clearly expired (expiresAt already past),
+        this runs the CLI preflight *before* ever calling the usage
+        endpoint, then makes exactly one usage request with whatever token
+        is on disk afterward.
+      - Otherwise, this calls the usage endpoint first; only if that
+        specific call returns 401 does it run the CLI preflight and retry
+        the usage request exactly once.
+    In both cases the CLI preflight runs at most once per call, and the
+    usage endpoint is ever called at most twice per call (initial attempt +
+    at most one retry) -- never a loop. A 429 from the usage endpoint is
+    never treated as an auth problem and never triggers the preflight.
+
+    Raises CredentialsUnavailableError / AuthStaleError / RateLimitedError /
+    AuthRefreshNotPersistedError / CollectorError on failure -- callers
+    (manager.refresh_status) decide what to do about each, including
+    whether to fall back to the statusline-based compatibility path."""
+    run = cli_run or subprocess.run
+    oauth = _read_oauth_section(config_dir)
+    token = oauth.get("accessToken")
+    if not token or not isinstance(token, str):
+        raise CredentialsUnavailableError("access token missing from credentials")
+
+    if _is_clearly_expired(oauth):
+        token = _refresh_access_token_via_cli(config_dir, oauth, timeout, run, cli_executable)
+        payload = fetch_usage(token, timeout=timeout, opener=opener)
+        return normalize(payload, account_id)
+
+    try:
+        payload = fetch_usage(token, timeout=timeout, opener=opener)
+    except AuthStaleError:
+        token = _refresh_access_token_via_cli(config_dir, oauth, timeout, run, cli_executable)
+        payload = fetch_usage(token, timeout=timeout, opener=opener)
     return normalize(payload, account_id)
