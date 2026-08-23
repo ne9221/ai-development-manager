@@ -3,7 +3,7 @@
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
 from manager.dispatch_requests import dispatch_request_registry
@@ -16,7 +16,8 @@ OWNER_ENV = "ADM_DRIVE_DISPATCH_INGRESS_OWNER"
 MAX_AGE_SECONDS = 86400
 MAX_FILE_BYTES = 16384
 METADATA_FIELDS = ("id,name,mimeType,trashed,parents,size,driveId,ownedByMe,"
-                   "owners(emailAddress,permissionId,me),permissions(id,type,role,emailAddress),createdTime")
+                   "owners(emailAddress,permissionId,me),permissions(id,type,role,emailAddress),"
+                   "createdTime,modifiedTime")
 
 # Bounded-poll defaults (see poll_drive_dispatch_requests docstring). These
 # exist so one --once tick can never again degrade into O(lifetime request
@@ -27,11 +28,17 @@ DEFAULT_MAX_METADATA_PAGES = 3
 DEFAULT_RECENT_CANDIDATES = 8
 DEFAULT_MAX_CANDIDATES_PER_POLL = 12
 # Conservative clock-skew margin before trusting Drive's own metadata
-# createdTime to skip a download outright -- always strictly more
+# modifiedTime to skip a download outright -- always strictly more
 # conservative than read_request()'s own -300s future-dated tolerance, so
 # this optimization can never skip something the authoritative body check
 # would have accepted.
 STALE_METADATA_SKIP_MARGIN_SECONDS = 300
+# Bounded, stateless fairness slice (see poll_drive_dispatch_requests
+# docstring): the ~24h acceptance window (MAX_AGE_SECONDS) is divided into
+# this many equal wall-clock-rotated slices, each covered by its own small,
+# separately bounded Drive query.
+DEFAULT_FAIRNESS_SLICES = 24
+DEFAULT_FAIRNESS_SLICE_CANDIDATES = 5
 
 
 def _identity_matches(identity, expected):
@@ -105,25 +112,82 @@ def _request_files(service, folder_id, order_by=None, max_pages=None, deadline=N
         page_token = next_token
 
 
-def _created_time_indicates_stale(metadata, now, margin_seconds=STALE_METADATA_SKIP_MARGIN_SECONDS):
+def _modified_time_indicates_stale(metadata, now, margin_seconds=STALE_METADATA_SKIP_MARGIN_SECONDS):
     """Optimization only, never authoritative: skip an obviously-ancient
     candidate's get_media() download using Drive's own metadata
-    `createdTime`, conservatively margined for clock skew. A missing,
-    malformed, or not-old-enough-to-skip createdTime always falls through
-    to a real download -- read_request()'s own `created_at` request-body
-    check remains the sole authority on staleness/future-dating; this can
-    only ever skip a download early, never accept or reject a request."""
+    `modifiedTime`, conservatively margined for clock skew.
+
+    `createdTime` is NOT used here and must never be: a Drive file's
+    createdTime never changes even if the file is later overwritten with a
+    fresh body, so an old createdTime does not prove the current CONTENT is
+    stale. `modifiedTime` reflects the most recent content write, so "old
+    modifiedTime" is the only metadata-only signal that safely proves the
+    body has not changed inside the accepted age window.
+
+    A missing, malformed, or not-old-enough-to-skip modifiedTime always
+    falls through to a real download -- read_request()'s own `created_at`
+    request-body check remains the sole authority on staleness/future-dating
+    whenever metadata alone does not prove otherwise; this can only ever
+    skip a download early, never accept or reject a request."""
     if not isinstance(metadata, dict):
         return False
-    created_time = metadata.get("createdTime")
-    if not isinstance(created_time, str) or not created_time:
+    modified_time = metadata.get("modifiedTime")
+    if not isinstance(modified_time, str) or not modified_time:
         return False
     try:
-        created = datetime.fromisoformat(created_time.replace("Z", "+00:00"))
+        modified = datetime.fromisoformat(modified_time.replace("Z", "+00:00"))
     except ValueError:
         return False
-    age = (now - created.astimezone(timezone.utc)).total_seconds()
+    age = (now - modified.astimezone(timezone.utc)).total_seconds()
     return age > (MAX_AGE_SECONDS + margin_seconds)
+
+
+def _fairness_slice_bounds(now, max_age_seconds=MAX_AGE_SECONDS, slices=DEFAULT_FAIRNESS_SLICES):
+    """Pick one deterministic, wall-clock-rotated time slice of the ~24h
+    acceptance window (now - max_age_seconds, now]. No cursor or other
+    state is persisted anywhere: the slice index is derived solely from
+    `now`, so a fresh process picks up exactly where the wall clock says it
+    should, and the same instant always yields the same slice. Because the
+    slice index only changes once per `max_age_seconds / slices` seconds
+    (1 hour by default), a single slice stays selected across many
+    consecutive polls, giving each slice a real window in which its
+    dedicated bounded query can find and admit an eligible request."""
+    slice_seconds = max_age_seconds / slices
+    window_start = now - timedelta(seconds=max_age_seconds)
+    slice_index = int(now.timestamp() // slice_seconds) % slices
+    slice_start = window_start + timedelta(seconds=slice_index * slice_seconds)
+    slice_end = slice_start + timedelta(seconds=slice_seconds)
+    return slice_start, slice_end
+
+
+def _fairness_slice_metadata(service, folder_id, slice_start, slice_end,
+                             candidates=DEFAULT_FAIRNESS_SLICE_CANDIDATES, deadline=None):
+    """One separate, small, server-side-filtered Drive `files.list()` call
+    scoped to a single deterministic age slice (see `_fairness_slice_bounds`)
+    inside the accepted ~24h window. This is deliberately independent of
+    the main newest-first metadata listing and its `max_metadata_pages`
+    bound -- a request old enough to have scrolled past that bounded
+    listing can still be found here, because this query is filtered by
+    Drive itself (`createdTime` range in `q`) rather than by paging through
+    everything newer first. Bounded to `candidates` results and never more
+    than a single page, so it costs the same regardless of how much history
+    exists in the folder."""
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
+    start_str = slice_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = slice_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+    query = (f"'{folder_id}' in parents and trashed=false and "
+             f"createdTime > '{start_str}' and createdTime < '{end_str}'")
+    params = {
+        "q": query, "spaces": "drive",
+        "fields": f"nextPageToken,files({METADATA_FIELDS})",
+        "pageSize": candidates, "orderBy": "createdTime desc",
+    }
+    response = service.files().list(**params).execute()
+    page = response.get("files") if isinstance(response, dict) else None
+    if not isinstance(page, list):
+        raise TaskError("malformed Drive ingress listing response")
+    return page[:candidates]
 
 
 def read_request(service, folder_id, expected_owner, metadata, now=None):
@@ -175,36 +239,79 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
     - Exactly one Drive `files.list()` walk is performed, ordered newest
       first (`orderBy="createdTime desc"`) and capped to `max_metadata_pages`
       pages -- metadata only, no content is downloaded here. This single
-      listing is bounded regardless of total historical file count.
+      listing is bounded regardless of total historical file count
+      (`max_metadata_pages` pages of up to 100 entries each, so
+      `DEFAULT_MAX_METADATA_PAGES` = 3 caps it at 300 newest entries).
     - The front of that listing (`recent_candidates` entries) is
       considered first, so a brand-new request is never starved behind
       history.
-    - An obviously-ancient candidate (Drive's own `createdTime` older than
-      MAX_AGE_SECONDS plus a clock-skew margin) is skipped before ever
-      calling get_media() -- cheap, metadata-only, and never counted
-      against the download budget. This is purely an optimization:
+    - An obviously-ancient candidate is skipped before ever calling
+      get_media(), using Drive's own metadata `modifiedTime` (never
+      `createdTime` -- a file's createdTime never changes even when its
+      body is later overwritten, so it cannot prove the current content is
+      stale; `modifiedTime` reflects the most recent content write and
+      margined conservatively for clock skew) older than MAX_AGE_SECONDS
+      plus that margin. This is purely an optimization and is
+      metadata-content-safe: it can only skip a download when metadata
+      itself proves the content has not changed inside the accepted body-
+      age window; in every other case (including a fresh `modifiedTime`
+      behind an old `createdTime`) it falls through to a real download.
       read_request()'s own request-body `created_at` check remains the
-      sole authority on staleness and is never weakened or bypassed.
-    - After the recent window, remaining budget (`max_candidates` total
-      downloads per poll) is spent on the *rest* of the same bounded
-      listing -- the candidates recency pushed just past the front. This
-      is the fairness pass: a still-valid (<24h) request that a burst of
-      newer arrivals pushed out of the recent window is not starved
-      forever. Which slice of that remainder gets serviced rotates
-      deterministically from the wall clock (current UTC minute), so
-      across enough ticks every position in the bounded remainder
-      eventually gets a turn -- without persisting any cursor/database
-      state between polls.
+      sole authority whenever metadata alone does not conclusively prove
+      staleness, and is never weakened or bypassed.
+    - Between the recent pass and the in-listing tail pass below, a second,
+      independent, small bounded fairness query (`_fairness_slice_metadata`)
+      covers one deterministic age slice of the full ~24h acceptance window
+      on every poll (see `_fairness_slice_bounds`; `DEFAULT_FAIRNESS_SLICES`
+      slices, rotated by wall clock, up to `DEFAULT_FAIRNESS_SLICE_CANDIDATES`
+      results per slice). This is what makes a still-valid request deeper
+      than `max_metadata_pages` * 100 (i.e. never present in the bounded
+      newest-first listing at all) reachable in the first place: the slice
+      query is filtered server-side by Drive on a `createdTime` range in
+      `q`, rather than by paging through everything newer first. It shares
+      the same overall `max_candidates` ceiling as every other pass in this
+      function -- that bound is never exceeded -- but is deliberately run
+      *before* the tail pass below so it is not starved by it: the tail
+      pass routinely has ample same-listing candidates and will spend its
+      entire remaining budget every poll once it runs, which is exactly
+      when a deep request needs this query's turn most. Because this query
+      only actually consumes budget when its slice genuinely contains an
+      eligible candidate (an empty slice, the common case, costs nothing),
+      the tail pass keeps its full ordinary budget on every poll where this
+      query finds nothing. Guarantee actually provided: any request inside
+      the accepted window falls into exactly one of `DEFAULT_FAIRNESS_SLICES`
+      deterministic slices, and that slice is queried at least once per full
+      rotation (i.e. within a bounded number of poll cycles determined by
+      the trigger interval), PROVIDED the volume of still-eligible
+      candidates within that one slice does not exceed
+      `DEFAULT_FAIRNESS_SLICE_CANDIDATES` and the recent/tail passes above
+      have not already exhausted `max_candidates` for that poll (Drive
+      returns that slice's own newest-first, so more candidates than the
+      bound in a single slice can still push an older one out for as long
+      as that slice remains oversubscribed). This is a bounded-load
+      guarantee, not an unconditional no-starvation guarantee -- an
+      unconditional guarantee is not achievable without persistent cursor
+      state or an explicit bound on new-arrival rate, neither of which this
+      function has.
+    - After that, remaining budget (`max_candidates` total downloads per
+      poll, shared across every pass above) is spent on the *rest* of the
+      same bounded newest-first listing -- the candidates recency pushed
+      just past the front. This tail fairness pass rotates deterministically
+      from the wall clock (current UTC minute) through that bounded
+      remainder, exactly as before this fix.
     - Every individual candidate is still fault-isolated exactly as
       before: a malformed/rejected/stale file can never abort any other
       candidate, and always resolves to `{"file_id": ..., "accepted": False}`
       rather than raising.
     - `deadline` (a `time.monotonic()` value; defaults to now +
-      `time_budget_seconds`) is checked before starting the metadata
-      listing and before starting each new candidate's read/dispatch --
-      once exhausted, no new work is started. Exactly like poll_once()'s
-      own deadline contract, this never interrupts a read/dispatch already
-      in progress.
+      `time_budget_seconds`) governs a "stop starting new work after the
+      deadline" admission contract, not a hard wall-clock cutoff: it is
+      checked before starting the metadata listing and before starting
+      each new candidate's read/dispatch or fairness-slice query, but an
+      already-started Drive API call or dispatch that is in progress when
+      the deadline is reached is never interrupted and can run past it.
+      A true hard cutoff is out of scope here and is expected to come from
+      the calling Scheduled Task's own execution time limit instead.
     - No Drive request file is ever archived, trashed, moved, or deleted
       here (or anywhere in this module) -- every file remains in
       DISPATCH-REQUESTS for audit regardless of outcome. Idempotency
@@ -254,7 +361,7 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
             if not file_id or file_id in seen_ids:
                 continue
             seen_ids.add(file_id)
-            if _created_time_indicates_stale(metadata, current):
+            if _modified_time_indicates_stale(metadata, current):
                 continue
             _handle_one(metadata)
             used += 1
@@ -265,6 +372,27 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
     metadata_list = _request_files(service, folder_id, order_by="createdTime desc",
                                     max_pages=max_metadata_pages, deadline=deadline)
     _scan(metadata_list[:recent_candidates], recent_candidates)
+
+    # Deep-slice fairness query: runs between the recent pass and the
+    # in-listing tail pass below, sharing the same hard `max_candidates`
+    # ceiling for the whole poll (that bound is never exceeded). It is
+    # placed here, ahead of the tail pass, specifically so it is not
+    # starved out by it: the tail below routinely has ample same-listing
+    # candidates and will happily spend its *entire* remaining budget every
+    # poll once it runs, which is exactly when a request sitting deeper
+    # than the bounded newest-first listing (`max_metadata_pages` * 100
+    # entries -- where this query, and only this query, can still reach)
+    # needs a turn. Because it only actually consumes budget when its
+    # slice genuinely contains an eligible candidate (the common case is an
+    # empty slice, costing nothing), the tail pass keeps its full original
+    # budget on every poll where this query finds nothing.
+    remaining_after_recent = max_candidates - downloads_used
+    if remaining_after_recent > 0 and time.monotonic() < deadline:
+        slice_start, slice_end = _fairness_slice_bounds(current)
+        fairness_slice_metadata = _fairness_slice_metadata(
+            service, folder_id, slice_start, slice_end,
+            candidates=DEFAULT_FAIRNESS_SLICE_CANDIDATES, deadline=deadline)
+        _scan(fairness_slice_metadata, min(DEFAULT_FAIRNESS_SLICE_CANDIDATES, remaining_after_recent))
 
     tail = metadata_list[recent_candidates:]
     fairness_budget = max_candidates - downloads_used

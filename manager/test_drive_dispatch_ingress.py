@@ -1,6 +1,7 @@
 import ast
 import inspect
 import json
+import re
 import time
 import unittest
 from copy import deepcopy
@@ -10,7 +11,8 @@ from unittest.mock import Mock
 
 import manager.drive_dispatch_ingress as drive_dispatch_ingress
 from manager.drive_dispatch_ingress import (
-    FOLDER_NAME, METADATA_FIELDS, _created_time_indicates_stale, _request_files,
+    DEFAULT_MAX_METADATA_PAGES, FOLDER_NAME, METADATA_FIELDS,
+    _fairness_slice_bounds, _modified_time_indicates_stale, _request_files,
     poll_drive_dispatch_requests, read_request, verify_ingress_folder,
 )
 from manager.tasks import MIME_FOLDER, MIME_JSON, TaskError
@@ -272,12 +274,16 @@ class DriveDispatchIngressTests(unittest.TestCase):
         self.assertEqual(2, handler.call_count)
 
 
-def make_item(file_id, request_id, created_time, created_at=None, extra=None):
+def make_item(file_id, request_id, created_time, created_at=None, extra=None, modified_time=None):
     """One (metadata, raw_bytes) DISPATCH-REQUESTS candidate. `created_time`
     is Drive's own file metadata createdTime (a datetime); `created_at`
     defaults to the same instant for the request *body* unless overridden
     -- letting tests deliberately diverge metadata createdTime from the
-    body's created_at to prove the metadata check is optimization-only."""
+    body's created_at to prove the metadata check is optimization-only.
+    `modified_time` is Drive's own file metadata modifiedTime and defaults
+    to `created_time` unless overridden -- letting tests deliberately
+    diverge it from createdTime to prove the metadata-only skip decision is
+    driven by modifiedTime, not createdTime."""
     document = request(request_id=request_id,
                        created_at=(created_at or created_time).strftime("%Y-%m-%dT%H:%M:%SZ"))
     if extra:
@@ -287,9 +293,13 @@ def make_item(file_id, request_id, created_time, created_at=None, extra=None):
         "id": file_id, "name": f"{request_id}.json", "mimeType": MIME_JSON, "trashed": False,
         "parents": [FOLDER_ID], "size": str(len(raw)), "driveId": None,
         "createdTime": created_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "modifiedTime": (modified_time or created_time).strftime("%Y-%m-%dT%H:%M:%SZ"),
         **private_owner(),
     }
     return metadata, raw
+
+
+_CREATED_TIME_RANGE_RE = re.compile(r"createdTime > '([^']+)' and createdTime < '([^']+)'")
 
 
 class MultiFiles:
@@ -297,7 +307,12 @@ class MultiFiles:
     list() returns them in exactly the order given (as a real Drive
     `orderBy="createdTime desc"` listing would for pre-sorted fixtures),
     recording every list()/get_media() call so tests can assert on
-    ordering, pagination bounds, and which files were ever downloaded."""
+    ordering, pagination bounds, and which files were ever downloaded. A
+    `q` carrying a `createdTime > '...' and createdTime < '...'` range (as
+    `_fairness_slice_metadata` builds) is honored by filtering to that
+    range, exactly like the real Drive API would -- letting the fairness-
+    slice query's own targeting be exercised realistically even in tests
+    that otherwise don't care about it."""
 
     def __init__(self, items=None, folder=None):
         self.items = items or []
@@ -318,7 +333,13 @@ class MultiFiles:
 
     def list(self, **kwargs):
         self.list_calls.append(kwargs)
-        return Call({"files": [metadata for metadata, _raw in self.items]})
+        candidates = [metadata for metadata, _raw in self.items]
+        match = _CREATED_TIME_RANGE_RE.search(kwargs.get("q", ""))
+        if match:
+            start, end = match.groups()
+            candidates = [m for m in candidates if start < m.get("createdTime", "") < end]
+            candidates = candidates[:kwargs.get("pageSize", 100)]
+        return Call({"files": candidates})
 
     def get_media(self, fileId):
         self.get_media_calls.append(fileId)
@@ -331,6 +352,74 @@ class MultiFiles:
 class MultiService:
     def __init__(self, items=None, folder=None):
         self._files = MultiFiles(items=items, folder=folder)
+
+    def files(self): return self._files
+    def about(self): return About()
+
+
+class DeepFolderFiles:
+    """A folder plus a large, realistically PAGINATED and QUERY-AWARE list
+    of candidate files, standing in for real Drive behavior in ways
+    `MultiFiles` (which returns everything in one unpaginated, query-blind
+    shot) deliberately does not: `items` is provided already sorted newest
+    first, exactly like a real `orderBy="createdTime desc"` listing would
+    return; the plain newest-first `list()` call is paginated by
+    `pageSize`/`pageToken` exactly like the real API; and a `list()` call
+    whose `q` carries a `createdTime > '...' and createdTime < '...'`
+    range (as `_fairness_slice_metadata` builds) is answered by filtering
+    server-side on that range instead of by page position -- letting a
+    test prove a deep item unreachable via pagination is reachable via the
+    range query."""
+
+    _RANGE_RE = re.compile(r"createdTime > '([^']+)' and createdTime < '([^']+)'")
+
+    def __init__(self, items, folder=None):
+        self.items = items
+        self.folder = folder or {
+            "id": FOLDER_ID, "name": FOLDER_NAME, "mimeType": MIME_FOLDER, "trashed": False,
+            "parents": ["adm-root"], "driveId": None, **private_owner(),
+        }
+        self.list_calls = []
+        self.get_media_calls = []
+
+    def get(self, fileId, fields):
+        if fileId == FOLDER_ID:
+            return Call(self.folder)
+        for metadata, _raw in self.items:
+            if metadata["id"] == fileId:
+                return Call(metadata)
+        raise AssertionError(f"unknown fileId {fileId}")
+
+    def list(self, **kwargs):
+        self.list_calls.append(kwargs)
+        candidates = [metadata for metadata, _raw in self.items]
+        match = self._RANGE_RE.search(kwargs.get("q", ""))
+        if match:
+            start, end = match.groups()
+            filtered = [m for m in candidates if start < m["createdTime"] < end]
+            page_size = kwargs.get("pageSize", 100)
+            return Call({"files": filtered[:page_size]})
+        page_size = kwargs.get("pageSize", 100)
+        page_token = kwargs.get("pageToken")
+        start_index = int(page_token) if page_token else 0
+        page = candidates[start_index:start_index + page_size]
+        response = {"files": page}
+        next_index = start_index + page_size
+        if next_index < len(candidates):
+            response["nextPageToken"] = str(next_index)
+        return Call(response)
+
+    def get_media(self, fileId):
+        self.get_media_calls.append(fileId)
+        for metadata, raw in self.items:
+            if metadata["id"] == fileId:
+                return Call(raw)
+        raise AssertionError(f"unknown fileId {fileId}")
+
+
+class DeepFolderService:
+    def __init__(self, items, folder=None):
+        self._files = DeepFolderFiles(items, folder)
 
     def files(self): return self._files
     def about(self): return About()
@@ -462,6 +551,41 @@ class DriveDispatchIngressBoundedTests(unittest.TestCase):
             serviced.update(fid for fid in service._files.get_media_calls if fid.startswith("older-"))
         self.assertEqual({"older-0", "older-1", "older-2", "older-3"}, serviced)
 
+    def test_fairness_slice_query_reaches_request_beyond_metadata_page_bound(self):
+        # ISSUE 2 regression: a still-valid (<24h) request sitting deeper
+        # than the bounded newest-first metadata listing
+        # (DEFAULT_MAX_METADATA_PAGES * 100 == 300 entries) can never be
+        # covered by the recent-first + in-listing-tail fairness passes
+        # alone -- it never even appears in that listing. Prove the new
+        # deep-slice fairness query actually reaches it regardless.
+        tick_now = datetime(2026, 8, 21, 0, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(3, DEFAULT_MAX_METADATA_PAGES)  # this test's math assumes the real bound
+        slice_start, slice_end = _fairness_slice_bounds(tick_now)
+        # This is the OLDEST hour of the 24h window at this tick_now (see
+        # _fairness_slice_bounds: at an exact-midnight tick_now, slice
+        # index 0 lands at window_start), far from the 305 recent filler
+        # items below -- so there is no accidental overlap.
+        target_time = slice_start + timedelta(seconds=1800)
+        filler = [make_item(f"filler-{i}", f"filler-req-{i}", tick_now - timedelta(seconds=i + 1))
+                 for i in range(300 + 5)]  # 305 > DEFAULT_MAX_METADATA_PAGES * 100 (300)
+        target = make_item("deep-file", "deep-req", target_time)
+        items = filler + [target]  # already newest-first: filler, then the oldest (target), last
+        service = DeepFolderService(items)
+        handler, order = self._accepting_handler()
+
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            results = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, tick_now,
+                                                    registry_factory=lambda *_a: object(),
+                                                    max_candidates=12, recent_candidates=8)
+
+        # The bounded newest-first listing (3 pages of 100) never reaches
+        # index 305 -- confirm the fixture actually exercises that bound.
+        self.assertEqual(3, sum(1 for call in service._files.list_calls if "createdTime >" not in call.get("q", "")))
+        self.assertIn("deep-file", service._files.get_media_calls)
+        self.assertIn("deep-req", order)
+        by_id = {r.get("file_id"): r for r in results}
+        self.assertTrue(by_id["deep-file"]["accepted"])
+
     def test_duplicate_request_remains_idempotent_under_bounded_poll(self):
         service = Service()
         handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1", "task_id": "dispatch-drive-e2e-1",
@@ -497,13 +621,49 @@ class DriveDispatchIngressBoundedTests(unittest.TestCase):
         with self.assertRaises(TaskError):
             poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW)
 
-    def test_created_time_indicates_stale_helper_is_conservative(self):
-        self.assertFalse(_created_time_indicates_stale({}, NOW))
-        self.assertFalse(_created_time_indicates_stale({"createdTime": "not-a-date"}, NOW))
-        self.assertFalse(_created_time_indicates_stale(
-            {"createdTime": (NOW - timedelta(hours=23)).strftime("%Y-%m-%dT%H:%M:%SZ")}, NOW))
-        self.assertTrue(_created_time_indicates_stale(
+    def test_modified_time_indicates_stale_helper_is_conservative(self):
+        self.assertFalse(_modified_time_indicates_stale({}, NOW))
+        self.assertFalse(_modified_time_indicates_stale({"modifiedTime": "not-a-date"}, NOW))
+        self.assertFalse(_modified_time_indicates_stale(
+            {"modifiedTime": (NOW - timedelta(hours=23)).strftime("%Y-%m-%dT%H:%M:%SZ")}, NOW))
+        self.assertTrue(_modified_time_indicates_stale(
+            {"modifiedTime": (NOW - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")}, NOW))
+        # createdTime alone must have zero effect on this decision -- only
+        # modifiedTime is consulted.
+        self.assertFalse(_modified_time_indicates_stale(
             {"createdTime": (NOW - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")}, NOW))
+
+    def test_old_created_time_fresh_modified_time_forces_download_not_skip(self):
+        # ISSUE 1 regression: an old createdTime with a fresh modifiedTime
+        # and a fresh body created_at must NOT be skipped based on
+        # createdTime alone -- the file must be downloaded and evaluated.
+        old_created = NOW - timedelta(days=3)
+        fresh_modified = NOW - timedelta(minutes=1)
+        item = make_item("file-1", "req-1", created_time=old_created,
+                         created_at=NOW - timedelta(minutes=1), modified_time=fresh_modified)
+        service = MultiService([item])
+        handler, order = self._accepting_handler()
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            results = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                                    registry_factory=lambda *_a: object())
+        self.assertIn("file-1", service._files.get_media_calls)
+        self.assertEqual(["req-1"], order)
+        self.assertTrue(results[0]["accepted"])
+
+    def test_old_created_time_and_old_modified_time_may_skip_get_media(self):
+        # ISSUE 1 regression: an old createdTime *and* an old modifiedTime
+        # together safely prove the content has not changed, so the
+        # get_media() download may be skipped.
+        old_time = NOW - timedelta(days=3)
+        item = make_item("file-1", "req-1", created_time=old_time, modified_time=old_time)
+        service = MultiService([item])
+        handler, order = self._accepting_handler()
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            results = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                                    registry_factory=lambda *_a: object())
+        self.assertNotIn("file-1", service._files.get_media_calls)
+        self.assertEqual([], order)
+        self.assertFalse(any(r.get("file_id") == "file-1" for r in results))
 
     def test_runner_contract_three_positional_args_still_work(self):
         # manager.drive_dispatch_watcher.run_once() (the frozen bounded
