@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from collectors.publish_drive import build_service
-from manager.tasks import DriveRecords, logical_record_id
+from manager.tasks import DriveRecords, logical_record_id, safe_id
 from manager.quota_reader import read_drive_status, summarize
 from manager.quota_history import get_default_quota_history_store
 from manager.dashboard_core import (
@@ -34,6 +34,9 @@ from manager.dashboard_core import (
     compute_overall_visible_dispatch_gate,
     validate_provenance_evidence_document,
     reconcile_watcher_provenance_evidence,
+    select_task_command,
+    select_task_execution,
+    select_task_handoff,
 )
 
 WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
@@ -283,6 +286,51 @@ def list_records_isolated(store, area, project_id, limit=RECENT_RECORD_LIMIT, in
         # Ignore normal missing folder cases
         pass
     return records, warnings
+
+
+@st.cache_data(ttl=30)
+def load_task_handoff_from_store(project_id: str, task_id: str):
+    """Targeted, on-demand read of handoff records for one specific task.
+
+    Avoids hydrating the historical handoff backlog during HOME first paint
+    (load_all_data() intentionally leaves handoffs_dict empty for that
+    reason). Only queries the project's HANDOFFS folder when a task is
+    actually inspected in the Task Detail panel, so the canonical handoff /
+    completion-report truth for that task is genuinely fetched instead of
+    being permanently unavailable.
+    """
+    if not project_id or not task_id:
+        return []
+    try:
+        service = build_service()
+        store = DriveRecords(service)
+        parent = store.project_folder("handoffs", project_id, create=False)
+        items = store.children(parent)
+        candidates = [item for item in items if item.get("name", "").endswith(".json")]
+        if not candidates:
+            return []
+
+        prefix = safe_id(task_id)
+        matching_items = [item for item in candidates if item.get("name", "").startswith(prefix)]
+        search_items = matching_items if matching_items else candidates[:20]
+
+        records = []
+        for item in search_items:
+            name = item.get("name", "")
+            storage_id = name[:-5]
+            try:
+                if item.get("id") and hasattr(store, "files") and hasattr(store.files, "get_media"):
+                    raw = store.files.get_media(fileId=item["id"]).execute()
+                    doc = json.loads(raw.decode("utf-8"))
+                else:
+                    doc = store.get("handoffs", project_id, logical_record_id(storage_id))
+                if isinstance(doc, dict) and doc.get("project_id") == project_id and doc.get("task_id") == task_id:
+                    records.append(doc)
+            except Exception:
+                pass
+        return records
+    except Exception:
+        return []
 
 
 # Recent-first reads keep the HOME view bounded; the manual sync button clears
@@ -988,8 +1036,19 @@ else:
     if selected_option:
         p_id, t_id, _ = selected_option
 
-        # Find the task
+        # Find the task, and the exact task-scoped command/execution/handoff.
+        # Deliberately NOT active_executions_dict / handoffs_dict here:
+        # active_executions_dict only covers non-terminal executions (a
+        # terminal-but-still-relevant execution silently reads as "no active
+        # execution"), and handoffs_dict is always empty (load_all_data()
+        # intentionally defers historical handoff hydration from first
+        # paint) -- both previously made a genuinely running/completed task
+        # show as "cannot confirm" even though its Drive records exist.
         task = next((t for t in all_tasks if t.get("project_id") == p_id and t.get("task_id") == t_id), {})
+        cmd = select_task_command(all_commands, p_id, t_id)
+        exe = select_task_execution(all_executions, p_id, t_id, command=cmd)
+        task_handoffs = load_task_handoff_from_store(p_id, t_id)
+        ho = select_task_handoff(task_handoffs, p_id, t_id, execution=exe, command=cmd)
 
         col1, col2 = st.columns(2)
 
@@ -1002,19 +1061,23 @@ else:
             st.write(f"**CWD**: `{task.get('working_directory')}`")
             st.write(f"**Branch**: `{task.get('branch')}`")
 
-            # Check for linked execution
-            linked_exe = active_executions_dict.get((p_id, t_id))
-            if linked_exe:
-                st.info("There is an active running execution for this task.")
-                st.write(f"Execution ID: `{linked_exe.get('execution_id')}`")
-                st.write(f"Provider Session ID: `{linked_exe.get('provider_session_id')}`")
-                st.write(f"Heartbeat: `{linked_exe.get('heartbeat_at')}`")
+            # Check for the exact task-scoped execution (any status, not just
+            # "active") -- this is the record select_task_execution proved
+            # belongs to this (project_id, task_id), never borrowed.
+            if exe:
+                exec_state = determine_execution_state(exe, now)
+                st.info(f"Execution found (lifecycle state: {exec_state.upper()}).")
+                st.write(f"Execution ID: `{exe.get('execution_id') or 'UNKNOWN'}`")
+                st.write(f"Execution Status: `{exe.get('status') or 'UNKNOWN'}`")
+                st.write(f"Provider Session ID: `{exe.get('provider_session_id') or exe.get('session_id') or 'UNKNOWN'}`")
+                st.write(f"Heartbeat: `{exe.get('heartbeat_at') or exe.get('completed_at') or 'UNKNOWN'}`")
+            elif cmd:
+                st.write(f"No execution record found for this task's command (status: `{cmd.get('status') or 'UNKNOWN'}`).")
             else:
-                st.write("No active execution.")
+                st.write("No command or execution record found for this task.")
 
         with col2:
             st.subheader("Latest Handoff")
-            ho = handoffs_dict.get((p_id, t_id))
             if ho:
                 st.write(f"Handoff ID: `{ho.get('handoff_id')}`")
                 st.write(f"Created At: `{ho.get('created_at')}`")
