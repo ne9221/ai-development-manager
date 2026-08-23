@@ -742,6 +742,13 @@ class CapturePreflightSnapshotHelperTest(unittest.TestCase):
             self._fake_registry().get_project(PROJECT_ID), REQUEST_ID, workspace_root="C:/workspace",
             exists_check=lambda p: True, git_runner=fake_git_runner,
         )
+        # capture_preflight_snapshot() stamps observed_at with the real wall
+        # clock; the fixture's dispatch_request.created_at is a fixed literal
+        # ("2026-08-23T00:00:00Z") that real "now" eventually overtakes,
+        # which would fail invariant O's R5.1 chronology check on any run
+        # after that instant. Pin created_at to a fixed point far in the
+        # future instead so the PASS case doesn't rot into a time-bomb.
+        fixture["dispatch_request"]["created_at"] = "2099-01-01T00:00:00Z"
 
         original_collect_evidence = v.collect_evidence
 
