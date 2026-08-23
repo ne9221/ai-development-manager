@@ -35,6 +35,18 @@ from manager.dashboard_core import (
     validate_provenance_evidence_document,
     reconcile_watcher_provenance_evidence,
 )
+from manager.dashboard_truth_zh import (
+    build_chain_truth_zh,
+    build_execution_truth_zh,
+    build_handoff_truth_zh,
+    build_provenance_truth_zh,
+    build_quota_truth_zh,
+    build_routing_truth_zh,
+    build_session_truth_zh,
+    build_task_truth_zh,
+    dispatch_state_zh,
+    latest_handoff,
+)
 
 WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
 SUPERVISOR_TASK_NAME = "AI Development Manager - Session Center Supervisor"
@@ -365,8 +377,22 @@ def load_all_data():
             all_tasks.extend(tasks)
             all_warnings.extend(t_warns)
 
-            # Historical handoff/session detail is intentionally deferred from
-            # the P0 first paint. Session identity is authoritative on Execution.
+            # Session/Handoff detail: best-effort, recent-first reads (same
+            # bounded pattern as commands/executions/tasks above), grouped by
+            # (project_id, task_id) for the zh-TW Truth Layer. A read failure
+            # here degrades to "no records found" (never fabricated), not a
+            # blocked first paint.
+            sessions, s_warns = list_records_isolated(store, "sessions", p_id)
+            all_warnings.extend(s_warns)
+            for session in sessions:
+                key = (session.get("project_id") or p_id, session.get("task_id"))
+                sessions_dict.setdefault(key, []).append(session)
+
+            handoffs, h_warns = list_records_isolated(store, "handoffs", p_id)
+            all_warnings.extend(h_warns)
+            for handoff in handoffs:
+                key = (handoff.get("project_id") or p_id, handoff.get("task_id"))
+                handoffs_dict.setdefault(key, []).append(handoff)
 
         return {
             "success": True,
@@ -624,6 +650,95 @@ else:
             with st.expander("Technical IDs"):
                 st.write(f"project_id=`{_row['project_id']}` · task_id=`{_row['task_id']}`")
                 st.write(f"execution_id=`{_row['execution_id']}` · session_id=`{_row['session_id']}`")
+
+st.markdown("---")
+
+# =====================================================================
+# HOME 儀表板真相層 (zh-TW Dashboard Truth Layer)
+#
+# Traditional-Chinese, per-task truth cards: 任務/派工/額度/執行/工作階段/
+# 交接/鏈結真相, built purely from manager.dashboard_truth_zh over the same
+# already-loaded Task/Command/Execution/Session/Handoff records above --
+# never a second, divergent read of the SSOT. Unknown/unavailable fields
+# render literally as 未知/尚未建立, never guessed. See manager/
+# dashboard_truth_zh.py for the truth rules this section follows.
+# =====================================================================
+st.header("🈶 任務真相總覽 (HOME Dashboard Truth Layer)")
+
+if not all_tasks:
+    st.info("目前沒有可顯示的任務記錄。")
+else:
+    for _zh_task in all_tasks:
+        _zh_key = (_zh_task.get("project_id"), _zh_task.get("task_id"))
+        _zh_command = _dispatch_commands_by_task.get(_zh_key)
+        _zh_execution = _dispatch_executions_by_id.get(_zh_command.get("execution_id")) if _zh_command else None
+
+        _task_truth = build_task_truth_zh(_zh_task, _zh_command)
+        _routing_truth = build_routing_truth_zh(_zh_command)
+        _quota_truth = build_quota_truth_zh(daily_brief_vm.accounts, _routing_truth.actual_provider, _routing_truth.actual_account_id)
+        _execution_truth = build_execution_truth_zh(_zh_execution, now)
+
+        _execution_id_referenced = bool(_zh_command and _zh_command.get("execution_id"))
+        _session_id_referenced = bool(
+            _zh_execution and (_zh_execution.get("provider_session_id") or _zh_execution.get("session_id"))
+        )
+        _zh_sessions = sessions_dict.get(_zh_key, [])
+        _zh_session_record = None
+        if _session_id_referenced:
+            _wanted_session_id = _zh_execution.get("provider_session_id") or _zh_execution.get("session_id")
+            _zh_session_record = next(
+                (s for s in _zh_sessions if s.get("session_id") == _wanted_session_id or s.get("provider_session_id") == _wanted_session_id),
+                None,
+            )
+        _session_truth = build_session_truth_zh(_zh_session_record)
+
+        _chain_truth = build_chain_truth_zh(
+            _execution_id_referenced, _zh_execution, _session_id_referenced, _zh_session_record, _task_truth.status_raw,
+        )
+
+        _zh_handoffs = handoffs_dict.get(_zh_key, [])
+        _latest_handoff = latest_handoff(_zh_handoffs)
+        _handoff_truth = build_handoff_truth_zh(_latest_handoff)
+
+        with st.container():
+            st.markdown(f"""<div class="glass-card">
+                <b>專案:</b> {_zh_task.get('project_id') or UNKNOWN_LABEL} ·
+                <b>Task ID:</b> <code>{_task_truth.task_id}</code> ·
+                <b>Command ID:</b> <code>{_task_truth.command_id}</code><br>
+                <b>任務狀態:</b> {_task_truth.status_zh} ·
+                <b>current_progress:</b> {_task_truth.current_progress}<br>
+                <b>next_action:</b> {_task_truth.next_action} ·
+                <b>blocked_reason:</b> {_task_truth.blocked_reason}<br>
+                <hr style="border-color:#30363d;margin:8px 0;">
+                <b>派工 requested → actual:</b>
+                {_routing_truth.requested_provider}/{_routing_truth.requested_account_id}
+                → {_routing_truth.actual_provider}/{_routing_truth.actual_account_id}
+                (match={_routing_truth.provider_matches_request})<br>
+                <b>selection_reason:</b> {'; '.join(_routing_truth.selection_reason) or '—'}<br>
+                <hr style="border-color:#30363d;margin:8px 0;">
+                <b>額度 5h:</b> {_quota_truth.five_hour_used} 已用 / {_quota_truth.five_hour_remaining} 剩餘
+                (重設 {_quota_truth.five_hour_reset_at}) ·
+                <b>可用性:</b> {_quota_truth.usable} · <b>新鮮度:</b> {_quota_truth.freshness_zh}<br>
+                <hr style="border-color:#30363d;margin:8px 0;">
+                <b>執行:</b> <code>{_execution_truth.execution_id}</code> ({_execution_truth.status_zh}) ·
+                <b>Provider evidence:</b> {_execution_truth.provider_evidence_available}<br>
+                <b>工作階段:</b> <code>{_session_truth.session_id}</code> ({_session_truth.status_zh}) ·
+                <b>摘要:</b> {_session_truth.summary}<br>
+                <b>鏈結真相:</b> execution={_chain_truth.execution_link_zh} ·
+                session={_chain_truth.session_link_zh} · chain={_chain_truth.chain_state_zh}<br>
+                <hr style="border-color:#30363d;margin:8px 0;">
+                <b>最新交接:</b> <code>{_handoff_truth.handoff_id}</code>
+                {_handoff_truth.from_provider} → {_handoff_truth.to_provider} ·
+                <b>原因:</b> {_handoff_truth.reason} · <b>下一步:</b> {_handoff_truth.next_action}
+                </div>""", unsafe_allow_html=True)
+
+with st.expander("🧬 產品版本真相 (Provenance)"):
+    _provenance_truth_zh = build_provenance_truth_zh(provenance_vm)
+    st.write(f"TESTED SHA: `{_provenance_truth_zh.tested_sha}`")
+    st.write(f"ACTIVATED SHA: `{_provenance_truth_zh.activated_sha}`")
+    st.write(f"RUNNING SHA: `{_provenance_truth_zh.running_sha}`")
+    st.write(f"Dashboard SHA: `{_provenance_truth_zh.dashboard_sha}`")
+    st.write(f"整體一致性: **{_provenance_truth_zh.all_match_zh}** — {_provenance_truth_zh.detail}")
 
 st.markdown("---")
 
