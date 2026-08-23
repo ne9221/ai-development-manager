@@ -6,6 +6,12 @@ Every test uses an in-memory ProjectRegistry plus fake `ref_sha_reader` /
 call, a local git command, or any ref mutation (no push, no force-push, no
 branch move). That is the whole point of the gate: it must be verifiable
 entirely offline.
+
+TEST_FORMAL_BRANCH deliberately uses the project's actual *current* formal
+branch name (integration/adm-runtime-repowrite-v2-20260822) rather than any
+hardcoded stand-in like the stale "formal/production" -- proving the gate
+treats formal_branch as an opaque, caller-supplied trusted value rather than
+assuming any particular naming convention.
 """
 
 import inspect
@@ -13,7 +19,6 @@ import unittest
 
 from manager.canonical_baseline_guard import (
     CanonicalBaselineGuardError,
-    DEFAULT_FORMAL_BRANCH,
     STATUS_CONVERGENCE_REQUIRED,
     STATUS_FAIL,
     STATUS_PASS,
@@ -30,6 +35,8 @@ SHA_TARGET = "b" * 40
 SHA_FORMAL = "a" * 40  # identical to main by default
 SHA_OTHER = "c" * 40
 SHA_TARGET_64 = "d" * 64
+
+TEST_FORMAL_BRANCH = "integration/adm-runtime-repowrite-v2-20260822"
 
 
 def registry_entry(project_id="proj-a", owner="acme", name="repo-a", default_branch="main",
@@ -93,6 +100,7 @@ def build(registry_projects=None, remote=None, **kwargs):
     remote = remote or FakeRemote()
     kwargs.setdefault("target_sha", SHA_TARGET)
     kwargs.setdefault("tested_sha", SHA_TARGET)
+    kwargs.setdefault("formal_branch", TEST_FORMAL_BRANCH)
     result = evaluate_promotion_gate(
         "proj-a",
         registry=registry,
@@ -107,7 +115,7 @@ class Case1AllAligned(unittest.TestCase):
     def test_main_formal_tested_target_all_equal_activation_allowed(self):
         remote = FakeRemote(shas={
             ("acme", "repo-a", "main"): SHA_TARGET,
-            ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET,
+            ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET,
         })
         result, remote = build(remote=remote, target_sha=SHA_TARGET, tested_sha=SHA_TARGET)
         self.assertEqual(STATUS_PASS, result.status)
@@ -126,7 +134,7 @@ class Case2MainBehindDescendant(unittest.TestCase):
         remote = FakeRemote(
             shas={
                 ("acme", "repo-a", "main"): SHA_MAIN,
-                ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET,
+                ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET,
             },
             relations={("acme", "repo-a", SHA_MAIN, SHA_TARGET): "ahead"},
         )
@@ -142,7 +150,7 @@ class Case3MainDiverged(unittest.TestCase):
         remote = FakeRemote(
             shas={
                 ("acme", "repo-a", "main"): SHA_MAIN,
-                ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET,
+                ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET,
             },
             relations={("acme", "repo-a", SHA_MAIN, SHA_TARGET): "diverged"},
         )
@@ -157,7 +165,7 @@ class Case4MainAhead(unittest.TestCase):
         remote = FakeRemote(
             shas={
                 ("acme", "repo-a", "main"): SHA_MAIN,
-                ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET,
+                ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET,
             },
             relations={("acme", "repo-a", SHA_MAIN, SHA_TARGET): "behind"},
         )
@@ -172,7 +180,7 @@ class Case5FormalBehindFastForwardable(unittest.TestCase):
         remote = FakeRemote(
             shas={
                 ("acme", "repo-a", "main"): SHA_TARGET,
-                ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_FORMAL,
+                ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_FORMAL,
             },
             relations={("acme", "repo-a", SHA_FORMAL, SHA_TARGET): "ahead"},
         )
@@ -189,7 +197,7 @@ class Case6FormalDiverged(unittest.TestCase):
         remote = FakeRemote(
             shas={
                 ("acme", "repo-a", "main"): SHA_TARGET,
-                ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_FORMAL,
+                ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_FORMAL,
             },
             relations={("acme", "repo-a", SHA_FORMAL, SHA_TARGET): "diverged"},
         )
@@ -202,7 +210,7 @@ class Case7TestedMismatch(unittest.TestCase):
     def test_tested_not_equal_target_fails(self):
         remote = FakeRemote(shas={
             ("acme", "repo-a", "main"): SHA_TARGET,
-            ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET,
+            ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET,
         })
         result, _ = build(remote=remote, target_sha=SHA_TARGET, tested_sha=SHA_OTHER)
         self.assertEqual(STATUS_FAIL, result.status)
@@ -215,7 +223,7 @@ class Case7TestedMismatch(unittest.TestCase):
         SHA that was never actually tested."""
         remote = FakeRemote(shas={
             ("acme", "repo-a", "main"): SHA_TARGET,
-            ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET,
+            ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET,
         })
         build(remote=remote, target_sha=SHA_TARGET, tested_sha=SHA_OTHER)
         self.assertEqual([], remote.compare_calls)
@@ -231,7 +239,7 @@ class Case8RemoteUnavailable(unittest.TestCase):
     def test_formal_branch_read_failure_is_unknown(self):
         remote = FakeRemote(
             shas={("acme", "repo-a", "main"): SHA_TARGET},
-            unavailable_refs={("acme", "repo-a", DEFAULT_FORMAL_BRANCH)},
+            unavailable_refs={("acme", "repo-a", TEST_FORMAL_BRANCH)},
         )
         result, _ = build(remote=remote)
         self.assertEqual(STATUS_UNKNOWN, result.status)
@@ -240,7 +248,7 @@ class Case8RemoteUnavailable(unittest.TestCase):
     def test_no_tested_evidence_is_unknown_not_fail(self):
         remote = FakeRemote(shas={
             ("acme", "repo-a", "main"): SHA_TARGET,
-            ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET,
+            ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET,
         })
         result, _ = build(remote=remote, tested_sha=None)
         self.assertEqual(STATUS_UNKNOWN, result.status)
@@ -250,7 +258,7 @@ class Case8RemoteUnavailable(unittest.TestCase):
         remote = FakeRemote(
             shas={
                 ("acme", "repo-a", "main"): SHA_MAIN,
-                ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET,
+                ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET,
             },
             unavailable_compares={("acme", "repo-a", SHA_MAIN, SHA_TARGET)},
         )
@@ -288,7 +296,7 @@ class Case11PinnedCommitStrategyNotBroken(unittest.TestCase):
         projects = [registry_entry(strategy="pinned_commit", pinned_ref=pinned, default_branch="main")]
         remote = FakeRemote(shas={
             ("acme", "repo-a", pinned): pinned,
-            ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): pinned,
+            ("acme", "repo-a", TEST_FORMAL_BRANCH): pinned,
         })
         result, remote = build(registry_projects=projects, remote=remote, target_sha=pinned, tested_sha=pinned)
         self.assertEqual(STATUS_PASS, result.status)
@@ -306,6 +314,70 @@ class Case11PinnedCommitStrategyNotBroken(unittest.TestCase):
         self.assertFalse(result.activation_allowed)
 
 
+class Case11bPinnedCommitImmutability(unittest.TestCase):
+    """Rule44 R5.1: `pinned_commit` names one exact, immutable commit. There
+    is NO fast-forward/convergence operation for it -- TARGET must equal the
+    pin exactly, full stop, regardless of whether TARGET is an ancestor, a
+    descendant, or diverged from the pin."""
+
+    PINNED = "f" * 40
+
+    def _projects(self, **overrides):
+        return [registry_entry(strategy="pinned_commit", pinned_ref=self.PINNED, default_branch="main",
+                                **overrides)]
+
+    def test_pinned_equals_target_formal_tested_passes(self):
+        remote = FakeRemote(shas={
+            ("acme", "repo-a", self.PINNED): self.PINNED,
+            ("acme", "repo-a", TEST_FORMAL_BRANCH): self.PINNED,
+        })
+        result, _ = build(registry_projects=self._projects(), remote=remote,
+                           target_sha=self.PINNED, tested_sha=self.PINNED)
+        self.assertEqual(STATUS_PASS, result.status)
+        self.assertTrue(result.activation_allowed)
+
+    def test_target_strict_descendant_of_pin_fails_not_convergence_required(self):
+        descendant = "1" * 40
+        remote = FakeRemote()
+        result, _ = build(registry_projects=self._projects(), remote=remote,
+                           target_sha=descendant, tested_sha=descendant)
+        self.assertEqual(STATUS_FAIL, result.status)
+        self.assertNotEqual(STATUS_CONVERGENCE_REQUIRED, result.status)
+        self.assertFalse(result.activation_allowed)
+        self.assertFalse(result.canonical_convergence_required)
+        self.assertFalse(result.fast_forward_possible)
+        # Immutable mismatch is decided with zero remote calls of any kind.
+        self.assertEqual([], remote.ref_calls)
+        self.assertEqual([], remote.compare_calls)
+
+    def test_target_older_than_pin_fails(self):
+        older = "2" * 40
+        remote = FakeRemote()
+        result, _ = build(registry_projects=self._projects(), remote=remote,
+                           target_sha=older, tested_sha=older)
+        self.assertEqual(STATUS_FAIL, result.status)
+        self.assertFalse(result.activation_allowed)
+        self.assertEqual([], remote.ref_calls)
+        self.assertEqual([], remote.compare_calls)
+
+    def test_target_diverged_from_pin_fails(self):
+        diverged = "3" * 40
+        remote = FakeRemote()
+        result, _ = build(registry_projects=self._projects(), remote=remote,
+                           target_sha=diverged, tested_sha=diverged)
+        self.assertEqual(STATUS_FAIL, result.status)
+        self.assertFalse(result.activation_allowed)
+        self.assertEqual([], remote.ref_calls)
+        self.assertEqual([], remote.compare_calls)
+
+    def test_mismatch_reason_mentions_immutability(self):
+        descendant = "1" * 40
+        remote = FakeRemote()
+        result, _ = build(registry_projects=self._projects(), remote=remote,
+                           target_sha=descendant, tested_sha=descendant)
+        self.assertIn("immutable", result.reason)
+
+
 class Case12NoForcePush(unittest.TestCase):
     def test_module_source_contains_no_force_push_or_push_invocation(self):
         import manager.canonical_baseline_guard as mod
@@ -318,7 +390,7 @@ class Case12NoForcePush(unittest.TestCase):
     def test_gate_never_calls_the_fake_remotes_push_method(self):
         remote = FakeRemote(shas={
             ("acme", "repo-a", "main"): SHA_TARGET,
-            ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET,
+            ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET,
         })
         build(remote=remote, target_sha=SHA_TARGET, tested_sha=SHA_TARGET)
         self.assertEqual(0, len(remote.mutating_calls))
@@ -361,7 +433,7 @@ class SignatureAndResultShapeTests(unittest.TestCase):
     def test_result_to_dict_shape(self):
         remote = FakeRemote(shas={
             ("acme", "repo-a", "main"): SHA_TARGET,
-            ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET,
+            ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET,
         })
         result, _ = build(remote=remote, target_sha=SHA_TARGET, tested_sha=SHA_TARGET)
         self.assertEqual({
@@ -373,14 +445,14 @@ class SignatureAndResultShapeTests(unittest.TestCase):
     def test_malformed_target_sha_raises_input_error(self):
         registry = ProjectRegistry(projects=[registry_entry()])
         with self.assertRaises(CanonicalBaselineGuardError):
-            evaluate_promotion_gate("proj-a", "not-a-sha", registry=registry,
+            evaluate_promotion_gate("proj-a", "not-a-sha", formal_branch=TEST_FORMAL_BRANCH, registry=registry,
                                      ref_sha_reader=FakeRemote().ref_sha_reader,
                                      compare_reader=FakeRemote().compare_reader)
 
     def test_accepts_sha256_target(self):
         remote = FakeRemote(shas={
             ("acme", "repo-a", "main"): SHA_TARGET_64,
-            ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET_64,
+            ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET_64,
         })
         result, _ = build(remote=remote, target_sha=SHA_TARGET_64, tested_sha=SHA_TARGET_64)
         self.assertEqual(STATUS_PASS, result.status)
@@ -389,7 +461,7 @@ class SignatureAndResultShapeTests(unittest.TestCase):
         registry = ProjectRegistry(projects=[])
         remote = FakeRemote()
         result = evaluate_promotion_gate(
-            "does-not-exist", SHA_TARGET, registry=registry,
+            "does-not-exist", SHA_TARGET, formal_branch=TEST_FORMAL_BRANCH, registry=registry,
             ref_sha_reader=remote.ref_sha_reader, compare_reader=remote.compare_reader,
         )
         self.assertEqual(STATUS_UNKNOWN, result.status)
@@ -400,11 +472,11 @@ class TestedShaReaderTests(unittest.TestCase):
     def test_tested_sha_reader_used_when_tested_sha_not_supplied(self):
         remote = FakeRemote(shas={
             ("acme", "repo-a", "main"): SHA_TARGET,
-            ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET,
+            ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET,
         })
         registry = ProjectRegistry(projects=[registry_entry()])
         result = evaluate_promotion_gate(
-            "proj-a", SHA_TARGET, registry=registry,
+            "proj-a", SHA_TARGET, formal_branch=TEST_FORMAL_BRANCH, registry=registry,
             ref_sha_reader=remote.ref_sha_reader, compare_reader=remote.compare_reader,
             tested_sha_reader=lambda: SHA_TARGET,
         )
@@ -413,15 +485,87 @@ class TestedShaReaderTests(unittest.TestCase):
     def test_tested_sha_reader_returning_none_is_unknown(self):
         remote = FakeRemote(shas={
             ("acme", "repo-a", "main"): SHA_TARGET,
-            ("acme", "repo-a", DEFAULT_FORMAL_BRANCH): SHA_TARGET,
+            ("acme", "repo-a", TEST_FORMAL_BRANCH): SHA_TARGET,
         })
         registry = ProjectRegistry(projects=[registry_entry()])
         result = evaluate_promotion_gate(
-            "proj-a", SHA_TARGET, registry=registry,
+            "proj-a", SHA_TARGET, formal_branch=TEST_FORMAL_BRANCH, registry=registry,
             ref_sha_reader=remote.ref_sha_reader, compare_reader=remote.compare_reader,
             tested_sha_reader=lambda: None,
         )
         self.assertEqual(STATUS_UNKNOWN, result.status)
+
+
+class FormalBranchRequiredTests(unittest.TestCase):
+    """formal_branch is a required, no-default, trusted-config-only input --
+    it must never silently fall back to any hardcoded branch name (the
+    project's real formal branch has already changed once)."""
+
+    def test_formal_branch_is_a_required_keyword_argument(self):
+        params = inspect.signature(evaluate_promotion_gate).parameters
+        self.assertIn("formal_branch", params)
+        self.assertEqual(inspect.Parameter.empty, params["formal_branch"].default)
+
+    def test_missing_formal_branch_raises_type_error(self):
+        registry = ProjectRegistry(projects=[registry_entry()])
+        remote = FakeRemote()
+        with self.assertRaises(TypeError):
+            evaluate_promotion_gate(  # noqa: missing required formal_branch kwarg, intentionally
+                "proj-a", SHA_TARGET, registry=registry,
+                ref_sha_reader=remote.ref_sha_reader, compare_reader=remote.compare_reader,
+            )
+
+    def test_blank_formal_branch_fails_closed_as_input_error(self):
+        registry = ProjectRegistry(projects=[registry_entry()])
+        remote = FakeRemote()
+        with self.assertRaises(CanonicalBaselineGuardError):
+            evaluate_promotion_gate(
+                "proj-a", SHA_TARGET, formal_branch="   ", registry=registry,
+                ref_sha_reader=remote.ref_sha_reader, compare_reader=remote.compare_reader,
+            )
+
+    def test_none_formal_branch_fails_closed_as_input_error(self):
+        registry = ProjectRegistry(projects=[registry_entry()])
+        remote = FakeRemote()
+        with self.assertRaises(CanonicalBaselineGuardError):
+            evaluate_promotion_gate(
+                "proj-a", SHA_TARGET, formal_branch=None, registry=registry,
+                ref_sha_reader=remote.ref_sha_reader, compare_reader=remote.compare_reader,
+            )
+
+    def test_explicit_current_style_formal_branch_resolves_correctly(self):
+        remote = FakeRemote(shas={
+            ("acme", "repo-a", "main"): SHA_TARGET,
+            ("acme", "repo-a", "integration/adm-runtime-repowrite-v2-20260822"): SHA_TARGET,
+        })
+        result, _ = build(remote=remote, target_sha=SHA_TARGET, tested_sha=SHA_TARGET,
+                           formal_branch="integration/adm-runtime-repowrite-v2-20260822")
+        self.assertEqual(STATUS_PASS, result.status)
+        self.assertTrue(result.activation_allowed)
+        self.assertEqual(SHA_TARGET, result.formal_sha)
+
+    def test_remote_unreadable_formal_branch_is_unknown(self):
+        remote = FakeRemote(
+            shas={("acme", "repo-a", "main"): SHA_TARGET},
+            unavailable_refs={("acme", "repo-a", "integration/adm-runtime-repowrite-v2-20260822")},
+        )
+        result, _ = build(remote=remote, target_sha=SHA_TARGET, tested_sha=SHA_TARGET,
+                           formal_branch="integration/adm-runtime-repowrite-v2-20260822")
+        self.assertEqual(STATUS_UNKNOWN, result.status)
+        self.assertFalse(result.activation_allowed)
+
+    def test_target_equality_still_required_even_with_valid_formal_branch(self):
+        remote = FakeRemote(shas={
+            ("acme", "repo-a", "main"): SHA_TARGET,
+            ("acme", "repo-a", "integration/adm-runtime-repowrite-v2-20260822"): SHA_OTHER,
+        })
+        result, _ = build(remote=remote, target_sha=SHA_TARGET, tested_sha=SHA_TARGET,
+                           formal_branch="integration/adm-runtime-repowrite-v2-20260822")
+        # formal (SHA_OTHER) has no configured relation to target -> a real
+        # comparison is attempted and, with none configured, raises inside
+        # the fake -> surfaces as UNKNOWN (never silently PASS).
+        self.assertNotEqual(STATUS_PASS, result.status)
+        self.assertFalse(result.activation_allowed)
 
 
 if __name__ == "__main__":

@@ -60,13 +60,17 @@ from manager.remote_baseline_resolver import (
 GITHUB_API_BASE = "https://api.github.com"
 GITHUB_API_TIMEOUT_SECONDS = 15
 
-DEFAULT_FORMAL_BRANCH = "formal/production"
-
 SUPPORTED_STRATEGIES = ("origin_default", "pinned_commit")
 
-# Overall gate status values. UNKNOWN is deliberately distinct from PASS/FAIL
-# so "we could not determine the truth" is never conflated with "we checked
-# and it is fine".
+# Overall gate status values.
+#
+# UNKNOWN means "the truth could not be established" -- a remote read
+# failure, an unresolvable/disabled project, missing or malformed TESTED
+# evidence, or any other input the gate cannot independently verify. It is
+# deliberately distinct from both PASS ("checked and confirmed safe") and
+# FAIL ("checked and confirmed unsafe/non-fast-forward/mismatched"): an
+# unverifiable promotion is neither of those, and must never be treated as
+# either by a caller that only checks `activation_allowed`.
 STATUS_PASS = "PASS"
 STATUS_CONVERGENCE_REQUIRED = "CONVERGENCE_REQUIRED"
 STATUS_FAIL = "FAIL"
@@ -242,10 +246,10 @@ def evaluate_promotion_gate(
     project_reference: str,
     target_sha: str,
     *,
+    formal_branch: str,
     registry: Optional[ProjectRegistry] = None,
     ref_sha_reader: Callable[..., str] = default_ref_sha_reader,
     compare_reader: Callable[..., str] = default_compare_reader,
-    formal_branch: str = DEFAULT_FORMAL_BRANCH,
     tested_sha: Optional[str] = None,
     tested_sha_reader: Optional[Callable[[], Optional[str]]] = None,
     canonical_convergence_phase: bool = False,
@@ -260,6 +264,15 @@ def evaluate_promotion_gate(
     default to a plain `GET`; tests inject in-memory fakes so nothing here
     ever needs live network access or a local git checkout).
 
+    `formal_branch` is REQUIRED and has no default -- there is no single
+    branch name this project's formal/production authority can safely be
+    assumed to be (it has already changed once: `formal/production` is
+    stale, the current one is `integration/adm-runtime-repowrite-v2-20260822`,
+    and it will change again). The caller -- a trusted internal promotion
+    workflow -- must supply this from its own trusted promotion
+    configuration; it must never be sourced from external/dispatch-caller
+    input, and this gate refuses to guess or silently default it.
+
     `canonical_convergence_phase=True` only relaxes "activation NOT yet
     allowed" reporting nuance for a workflow explicitly announcing it is
     mid fast-forward-convergence; it never causes this gate to *report* an
@@ -269,6 +282,13 @@ def evaluate_promotion_gate(
     """
     if not isinstance(target_sha, str) or not BASELINE_HEAD_PATTERN.match(target_sha):
         raise CanonicalBaselineGuardError(f"target_sha must be a valid commit id, got {target_sha!r}")
+
+    if not isinstance(formal_branch, str) or not formal_branch.strip():
+        raise CanonicalBaselineGuardError(
+            "formal_branch must be a non-empty branch identity supplied by trusted internal promotion "
+            "configuration; this gate never guesses or defaults a formal/production branch name"
+        )
+    formal_branch = formal_branch.strip()
 
     registry = registry or get_global_registry()
     try:
@@ -319,6 +339,24 @@ def evaluate_promotion_gate(
                 "pinned_commit",
                 f"project {project.project_id!r} declares strategy='pinned_commit' but pinned_ref={pinned_ref!r} "
                 "is not a valid commit id",
+                target_sha=target_sha,
+            )
+        # Rule44 R5.1 contract: `pinned_commit` names one exact, immutable
+        # commit -- it is NOT a moving ref that TARGET can fast-forward
+        # past. There is no such thing as "converging" a pinned commit:
+        # either TARGET is that exact commit, or the promotion is invalid,
+        # full stop -- regardless of whether TARGET happens to be a
+        # descendant, an ancestor, or diverged from the pin. This check is
+        # a pure string comparison against an already-known-good value, so
+        # it is decided before any remote call of any kind (no ref read,
+        # no ancestry compare) -- an immutable pin needs no network access
+        # to be judged as mismatched.
+        if target_sha != pinned_ref:
+            return _fail(
+                "pinned_commit",
+                f"project {project.project_id!r} strategy='pinned_commit' pins {pinned_ref}, which is an exact "
+                f"immutable commit, not a movable branch; TARGET ({target_sha}) does not equal the pinned commit "
+                "-- there is no fast-forward/convergence operation for a pinned commit, this is a hard mismatch",
                 target_sha=target_sha,
             )
         canonical_branch = pinned_ref
