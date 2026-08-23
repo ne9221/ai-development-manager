@@ -576,6 +576,22 @@ class AutomaticProviderSmokeTest(unittest.TestCase):
         result = self._mutated(mutate)
         self.assertEqual(self._smoke_check(result).status, STATUS_UNKNOWN)
 
+    def test_selected_account_id_missing_is_unknown(self):
+        def mutate(e):
+            del e["smoke"]["selected_account_id"]
+        result = self._mutated(mutate)
+        self.assertEqual(self._smoke_check(result).status, STATUS_UNKNOWN)
+
+    def test_selected_account_id_blank_is_unknown(self):
+        def mutate(e):
+            e["smoke"]["selected_account_id"] = ""
+        result = self._mutated(mutate)
+        self.assertEqual(self._smoke_check(result).status, STATUS_UNKNOWN)
+
+    def test_selected_provider_and_account_id_both_present_passes(self):
+        result = evaluate_home_visible(_complete_home_visible_evidence(), now=NOW)
+        self.assertEqual(self._smoke_check(result).status, STATUS_PASS)
+
     def test_automatic_selection_with_omitted_request_and_real_selection_passes(self):
         result = evaluate_home_visible(_complete_home_visible_evidence(), now=NOW)
         self.assertEqual(result.status, STATUS_PASS)

@@ -245,6 +245,9 @@ def _check_automatic_selection(section: Dict[str, Any], name: str) -> Optional[C
     if not section.get("selected_provider"):
         return CheckResult(name, STATUS_UNKNOWN,
                             f"{name}: selected_provider (ADM's own automatic choice) not supplied")
+    if not section.get("selected_account_id"):
+        return CheckResult(name, STATUS_UNKNOWN,
+                            f"{name}: selected_account_id (ADM's own automatic choice) not supplied")
     return None
 
 
