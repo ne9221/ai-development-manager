@@ -44,9 +44,13 @@
 # -- and a read-only snapshot (task Action identity AND the SHA-256 of the
 # .vbs wrapper file that Action points at) of the two production task names
 # is taken before and after this file's Describe blocks run, outside any
-# Mock scope, to prove production state -- including the wrapper's actual
-# file content, not just its registered path -- is unchanged.
+# Mock scope, and compared with Assert-AdmProductionSnapshotUnchanged (see
+# AdmProductionSnapshotGuard.ps1 / AdmProductionSnapshotGuard.Tests.ps1),
+# which THROWS -- a genuine terminating error, unlike a bare Write-Error --
+# on any mismatch, so a real mutation makes this Pester invocation
+# definitively fail rather than merely print a message.
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $here "AdmProductionSnapshotGuard.ps1")
 $repository = (Resolve-Path (Join-Path $here "..")).Path
 $installScript = Join-Path $here "install_drive_dispatch_ingress.ps1"
 $runScript = Join-Path $here "run_drive_dispatch_ingress.ps1"
@@ -732,24 +736,12 @@ except mod.TaskError as exc:
 # the read-only "after" snapshot -- unmocked (all Mocks created inside a
 # Describe block are scoped to that block and are gone by the time control
 # reaches back here) and outside any It, exactly mirroring $admBeforeSnapshot
-# at the top of this file. Any mismatch means something in this file (or a
-# regression in install_drive_dispatch_ingress.ps1 / AdmHiddenLaunch.ps1)
-# reached a real production Scheduled Task despite every isolation layer
-# above -- surfaced loudly rather than silently.
+# at the top of this file. Assert-AdmProductionSnapshotUnchanged THROWS on
+# any mismatch (task existence, Action Execute/Arguments, the resolved .vbs
+# path, or its SHA-256 -- see AdmProductionSnapshotGuard.ps1), which is a
+# terminating error independent of $ErrorActionPreference: a real mutation
+# here makes this Pester file's execution itself fail, not just print a
+# message that could be missed.
 Remove-Item Env:ADM_PESTER_TEST_ACTIVE -ErrorAction SilentlyContinue
 $admAfterSnapshot = @(Get-AdmProductionTaskSnapshot)
-for ($admI = 0; $admI -lt $admProductionTaskNames.Count; $admI++) {
-    $admBefore = $admBeforeSnapshot[$admI]
-    $admAfter = $admAfterSnapshot[$admI]
-    # Intentionally excludes .State (see the comment on
-    # Get-AdmProductionTaskSnapshot above) -- everything else, including
-    # VbsHash, must be byte-for-byte identical.
-    if ($admBefore.Exists -ne $admAfter.Exists `
-        -or $admBefore.Execute -ne $admAfter.Execute `
-        -or $admBefore.Arguments -ne $admAfter.Arguments `
-        -or $admBefore.VbsPath -ne $admAfter.VbsPath `
-        -or $admBefore.VbsExists -ne $admAfter.VbsExists `
-        -or $admBefore.VbsHash -ne $admAfter.VbsHash) {
-        Write-Error "PRODUCTION_SCHEDULED_TASK_MUTATED: '$($admBefore.TaskName)' changed during this Pester file's execution.`nBefore: Exists=$($admBefore.Exists) Execute=$($admBefore.Execute) Arguments=$($admBefore.Arguments) VbsPath=$($admBefore.VbsPath) VbsExists=$($admBefore.VbsExists) VbsHash=$($admBefore.VbsHash)`nAfter:  Exists=$($admAfter.Exists) Execute=$($admAfter.Execute) Arguments=$($admAfter.Arguments) VbsPath=$($admAfter.VbsPath) VbsExists=$($admAfter.VbsExists) VbsHash=$($admAfter.VbsHash)"
-    }
-}
+Assert-AdmProductionSnapshotUnchanged -Before $admBeforeSnapshot -After $admAfterSnapshot
