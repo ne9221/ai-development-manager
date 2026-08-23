@@ -95,7 +95,8 @@ def claude_snapshot(path, account_id=None):
     return provider
 
 
-def claude_oauth_snapshot(config_dir, account_id=None, timeout=15, collector=collect_claude_oauth, log_path=None):
+def claude_oauth_snapshot(config_dir, account_id=None, timeout=15, collector=collect_claude_oauth, log_path=None,
+                           cooldown_store=None, cooldown_key=None):
     """Attempts one real OAuth usage fetch for one account. Returns
     (outcome, provider_or_None):
       - ("success", provider) on a real 200 response with at least one window
@@ -105,14 +106,35 @@ def claude_oauth_snapshot(config_dir, account_id=None, timeout=15, collector=col
         malformed JSON, or any other collector failure -- caller may still
         try the statusline compatibility fallback
     Never logs or returns the access token; only exception type names are
-    logged, matching the rest of this module's logging convention."""
+    logged, matching the rest of this module's logging convention.
+
+    When `cooldown_store`/`cooldown_key` are given, a 429 here persists a
+    retry_until for that credential (parsed from Retry-After, sanitized by
+    manager.claude_oauth_cooldown.parse_retry_after) so a *future* refresh
+    cycle -- including one in a brand new process -- skips the HTTP request
+    entirely while the cooldown is active (see refresh()). A success clears
+    any stale cooldown recorded for that same credential. Omitting either
+    parameter reproduces this function's pre-cooldown behavior exactly."""
     try:
         provider = collector(config_dir, account_id, timeout=timeout)
+        if cooldown_store is not None and cooldown_key is not None:
+            try:
+                cooldown_store.clear(cooldown_key)
+            except Exception as exc:
+                if log_path is not None:
+                    log_line(log_path, f"claude oauth cooldown clear warning: {type(exc).__name__}")
         return "success", provider
     except ClaudeOauthRateLimited as exc:
         if log_path is not None:
             retry_note = f" retry_after={exc.retry_after}" if exc.retry_after else ""
             log_line(log_path, f"claude oauth rate_limited{retry_note}")
+        if cooldown_store is not None and cooldown_key is not None:
+            try:
+                from manager.claude_oauth_cooldown import parse_retry_after
+                cooldown_store.set_retry_until(cooldown_key, parse_retry_after(exc.retry_after))
+            except Exception as store_exc:
+                if log_path is not None:
+                    log_line(log_path, f"claude oauth cooldown persist warning: {type(store_exc).__name__}")
         return "rate_limited", None
     except ClaudeOauthError as exc:
         if log_path is not None:
@@ -130,7 +152,7 @@ def write_atomic(path, document):
 def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_accounts=None,
             claude_config_dirs=None, claude_oauth_collector=collect_claude_oauth, claude_oauth_timeout=15,
             reader=read_drive_status, codex_collector=collect_codex,
-            publisher=sync_drive, validator=validate_status, history_store=None):
+            publisher=sync_drive, validator=validate_status, history_store=None, cooldown_store=None):
     """`claude_path` remains the single/legacy-account payload path (account_id=None),
     unchanged from before. `claude_accounts`, if given, is an additional
     {account_id: path} mapping for extra Claude accounts; each is captured,
@@ -165,6 +187,22 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_a
                     resolved_history_store = QuotaHistoryStore(runtime_path.parent / "quota_history.json")
                 except Exception as exc:
                     log_line(log_path, f"history store init warning: {type(exc).__name__}")
+
+        # Initialize the OAuth rate-limit cooldown store if not explicitly
+        # disabled (cooldown_store=False), matching resolved_history_store's
+        # pattern. Its default path lives beside quota_history.json under
+        # AI_MANAGER_HOME/runtime, so restarting this process (a fresh
+        # Scheduled Task invocation) still sees a cooldown set by a prior one.
+        resolved_cooldown_store = None
+        if cooldown_store is not False:
+            if cooldown_store is not None:
+                resolved_cooldown_store = cooldown_store
+            else:
+                try:
+                    from manager.claude_oauth_cooldown import CooldownStore
+                    resolved_cooldown_store = CooldownStore(runtime_path.parent / "claude_oauth_cooldown.json")
+                except Exception as exc:
+                    log_line(log_path, f"cooldown store init warning: {type(exc).__name__}")
 
         outcomes = {}
         try:
@@ -207,11 +245,20 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_a
                     if cache_key in oauth_cache:
                         oauth_outcome, oauth_provider = oauth_cache[cache_key]
                     else:
-                        oauth_outcome, oauth_provider = claude_oauth_snapshot(
-                            config_dirs[account_id], account_id=account_id,
-                            timeout=claude_oauth_timeout, collector=claude_oauth_collector,
-                            log_path=log_path,
-                        )
+                        retry_until = resolved_cooldown_store.get(cache_key) if resolved_cooldown_store is not None else None
+                        if retry_until is not None:
+                            # A prior 429 (this cycle or a past process) is
+                            # still cooling down for this exact credential --
+                            # skip the HTTP request entirely rather than
+                            # merely deduping within this one call.
+                            oauth_outcome, oauth_provider = "rate_limited", None
+                            log_line(log_path, f"claude oauth cooldown active key={cache_key} retry_until={retry_until.isoformat(timespec='seconds').replace('+00:00', 'Z')}")
+                        else:
+                            oauth_outcome, oauth_provider = claude_oauth_snapshot(
+                                config_dirs[account_id], account_id=account_id,
+                                timeout=claude_oauth_timeout, collector=claude_oauth_collector,
+                                log_path=log_path, cooldown_store=resolved_cooldown_store, cooldown_key=cache_key,
+                            )
                         oauth_cache[cache_key] = (oauth_outcome, oauth_provider)
                     if oauth_provider is not None:
                         oauth_provider = dict(oauth_provider, account_id=account_id)

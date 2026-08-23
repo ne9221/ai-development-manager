@@ -2,8 +2,11 @@ import json
 import tempfile
 import unittest
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from collectors.claude_oauth import AuthStaleError, RateLimitedError
+from manager.claude_oauth_cooldown import CooldownStore
 from manager.refresh_status import RefreshError, refresh, runtime_lock
 
 
@@ -162,6 +165,217 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(1, len(published))
         codex_entry = next(x for x in result["document"]["providers"] if x["provider"] == "codex")
         self.assertEqual(95, codex_entry["windows"][0]["remaining_percent"])
+
+
+def oauth_provider(account_id=None, used_percent=5, updated="2026-08-23T12:00:00Z"):
+    return {
+        "provider": "claude",
+        "account_id": account_id,
+        "display_name": "Claude Code",
+        "collection_mode": "automatic",
+        "source": "claude_oauth_usage",
+        "source_type": "official",
+        "confidence": "official",
+        "last_updated": updated,
+        "status": "ok",
+        "windows": [{
+            "name": "five_hour", "duration_minutes": 300,
+            "used_percent": used_percent, "remaining_percent": 100 - used_percent, "resets_at": None,
+        }],
+        "metadata": {"official_rate_limits_available": True, "missing_windows": []},
+    }
+
+
+class ScriptedOauthCollector:
+    """Test double for collect_claude_oauth. `behaviors_by_key` maps a
+    credential key (config_dir string, or "<default>" for a falsy
+    config_dir) to a list of behaviors consumed in call order: either an
+    Exception instance to raise, or a provider dict to return. Any call
+    beyond what was scripted for its key raises AssertionError, so tests
+    can assert "zero HTTP calls" simply by scripting nothing."""
+
+    def __init__(self, behaviors_by_key):
+        self.behaviors_by_key = {k: list(v) for k, v in behaviors_by_key.items()}
+        self.calls = []
+
+    def __call__(self, config_dir, account_id, timeout=15):
+        key = str(config_dir) if config_dir else "<default>"
+        self.calls.append(key)
+        queue = self.behaviors_by_key.get(key, [])
+        if not queue:
+            raise AssertionError(f"unexpected OAuth HTTP call for credential key={key!r}")
+        behavior = queue.pop(0)
+        if isinstance(behavior, Exception):
+            raise behavior
+        return dict(behavior, account_id=account_id)
+
+
+class ClaudeOauthCooldownIntegrationTests(unittest.TestCase):
+    """Exercises manager.refresh_status.refresh()'s use of
+    manager.claude_oauth_cooldown.CooldownStore end-to-end: a real
+    CooldownStore backed by a real file, and a ScriptedOauthCollector that
+    fails the test the moment an un-scripted (i.e. cooldown-violating) HTTP
+    call happens."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def run_refresh(self, **overrides):
+        old = status()
+        published = []
+        defaults = dict(
+            service=object(), runtime_path=self.base / "status.json", log_path=self.base / "refresh.log",
+            lock_path=self.base / "refresh.lock", claude_path=self.base / "missing.json",
+            reader=lambda **_: deepcopy(old),
+            codex_collector=lambda **_: ({}, {"providers": [provider("codex", [], "2026-08-09T01:00:00Z")]}),
+            publisher=lambda service, path: published.append(json.loads(path.read_text())) or {"action": "updated", "id": "1"},
+            history_store=False,
+        )
+        defaults.update(overrides)
+        return refresh(**defaults), old, published
+
+    def cooldown_path(self):
+        return self.base / "claude_oauth_cooldown.json"
+
+    def test_429_persists_cooldown(self):
+        collector = ScriptedOauthCollector({"<default>": [RateLimitedError("120")]})
+        store = CooldownStore(self.cooldown_path())
+        result, _, _ = self.run_refresh(
+            claude_config_dirs={None: None}, claude_oauth_collector=collector, cooldown_store=store,
+        )
+        self.assertEqual("rate_limited", result["providers"]["claude"])
+        retry_until = store.get("<default>")
+        self.assertIsNotNone(retry_until)
+        self.assertGreater(retry_until, datetime.now(timezone.utc) + timedelta(seconds=100))
+
+    def test_next_refresh_before_expiry_performs_zero_http_calls(self):
+        store = CooldownStore(self.cooldown_path())
+        store.set_retry_until("<default>", datetime.now(timezone.utc) + timedelta(seconds=300))
+        collector = ScriptedOauthCollector({})  # any call fails the test
+        result, _, _ = self.run_refresh(
+            claude_config_dirs={None: None}, claude_oauth_collector=collector, cooldown_store=store,
+        )
+        self.assertEqual("rate_limited", result["providers"]["claude"])
+        self.assertEqual([], collector.calls)
+
+    def test_restart_new_refresh_instance_still_honors_persisted_cooldown(self):
+        original_store = CooldownStore(self.cooldown_path())
+        original_store.set_retry_until("<default>", datetime.now(timezone.utc) + timedelta(seconds=300))
+        # A brand new CooldownStore object pointed at the same path stands
+        # in for a freshly-started process (e.g. the next Scheduled Task
+        # invocation) that never saw the original in-memory store.
+        restarted_store = CooldownStore(self.cooldown_path())
+        collector = ScriptedOauthCollector({})
+        result, _, _ = self.run_refresh(
+            claude_config_dirs={None: None}, claude_oauth_collector=collector, cooldown_store=restarted_store,
+        )
+        self.assertEqual("rate_limited", result["providers"]["claude"])
+        self.assertEqual([], collector.calls)
+
+    def test_after_expiry_exactly_one_request_allowed(self):
+        store = CooldownStore(self.cooldown_path())
+        store.set_retry_until("<default>", datetime.now(timezone.utc) - timedelta(seconds=1))
+        collector = ScriptedOauthCollector({"<default>": [oauth_provider()]})
+        result, _, _ = self.run_refresh(
+            claude_config_dirs={None: None}, claude_oauth_collector=collector, cooldown_store=store,
+        )
+        self.assertEqual("success", result["providers"]["claude"])
+        self.assertEqual(["<default>"], collector.calls)
+
+    def test_default_legacy_and_account_a_alias_share_one_request(self):
+        payload_a = self.base / "account-a.json"
+        payload_a.write_text("{}", encoding="utf-8")
+        collector = ScriptedOauthCollector({"<default>": [oauth_provider()]})
+        store = CooldownStore(self.cooldown_path())
+        result, _, _ = self.run_refresh(
+            claude_accounts={"account-a": payload_a},
+            claude_config_dirs={None: None, "account-a": None},
+            claude_oauth_collector=collector, cooldown_store=store,
+        )
+        self.assertEqual("success", result["providers"]["claude"])
+        self.assertEqual("success", result["providers"]["claude:account-a"])
+        self.assertEqual(1, len(collector.calls))
+
+    def test_account_b_has_independent_cooldown(self):
+        payload_b = self.base / "account-b.json"
+        payload_b.write_text("{}", encoding="utf-8")
+        collector = ScriptedOauthCollector({
+            "<default>": [RateLimitedError("300")],
+            "/config/account-b": [oauth_provider(account_id="account-b")],
+        })
+        store = CooldownStore(self.cooldown_path())
+        result, _, _ = self.run_refresh(
+            claude_accounts={"account-b": payload_b},
+            claude_config_dirs={None: None, "account-b": "/config/account-b"},
+            claude_oauth_collector=collector, cooldown_store=store,
+        )
+        self.assertEqual("rate_limited", result["providers"]["claude"])
+        self.assertEqual("success", result["providers"]["claude:account-b"])
+        self.assertIsNotNone(store.get("<default>"))
+        self.assertIsNone(store.get("/config/account-b"))
+
+    def test_malformed_retry_after_is_bounded_not_unbounded_or_zero(self):
+        collector = ScriptedOauthCollector({"<default>": [RateLimitedError("not-a-valid-value")]})
+        store = CooldownStore(self.cooldown_path())
+        before = datetime.now(timezone.utc)
+        self.run_refresh(claude_config_dirs={None: None}, claude_oauth_collector=collector, cooldown_store=store)
+        retry_until = store.get("<default>")
+        self.assertIsNotNone(retry_until)
+        self.assertGreater(retry_until, before)
+        self.assertLess(retry_until, before + timedelta(seconds=120))
+
+    def test_malformed_cooldown_state_fails_closed_without_spamming(self):
+        self.cooldown_path().parent.mkdir(parents=True, exist_ok=True)
+        self.cooldown_path().write_text("{not valid json at all", encoding="utf-8")
+        store = CooldownStore(self.cooldown_path())
+        collector = ScriptedOauthCollector({})  # any call fails the test
+        result, _, _ = self.run_refresh(
+            claude_config_dirs={None: None}, claude_oauth_collector=collector, cooldown_store=store,
+        )
+        self.assertEqual("rate_limited", result["providers"]["claude"])
+        self.assertEqual([], collector.calls)
+
+    def test_last_good_last_updated_unchanged_during_cooldown(self):
+        old = status()
+        old["providers"][1] = provider("claude", [{"name": "seven_day", "used_percent": 40, "remaining_percent": 60, "resets_at": None}], updated="2026-08-20T00:00:00Z")
+        store = CooldownStore(self.cooldown_path())
+        store.set_retry_until("<default>", datetime.now(timezone.utc) + timedelta(seconds=300))
+        collector = ScriptedOauthCollector({})
+        result, _, _ = self.run_refresh(
+            reader=lambda **_: deepcopy(old),
+            claude_config_dirs={None: None}, claude_oauth_collector=collector, cooldown_store=store,
+        )
+        claude = next(x for x in result["document"]["providers"] if x["provider"] == "claude")
+        self.assertEqual("2026-08-20T00:00:00Z", claude["last_updated"])
+        self.assertEqual(60, claude["windows"][0]["remaining_percent"])
+
+    def test_401_stays_auth_stale_not_treated_as_quota_data(self):
+        collector = ScriptedOauthCollector({"<default>": [AuthStaleError("access token rejected (401)")]})
+        store = CooldownStore(self.cooldown_path())
+        result, _, _ = self.run_refresh(
+            claude_config_dirs={None: None}, claude_oauth_collector=collector, cooldown_store=store,
+        )
+        self.assertEqual("unavailable", result["providers"]["claude"])
+        self.assertIsNone(store.get("<default>"))
+
+    def test_token_or_credential_material_never_persisted_or_logged(self):
+        secret = "sk-ant-oat01-super-secret-token-value"
+        collector = ScriptedOauthCollector({"<default>": [RateLimitedError("30")]})
+        store = CooldownStore(self.cooldown_path())
+        self.run_refresh(
+            claude_config_dirs={None: None}, claude_oauth_collector=collector, cooldown_store=store,
+            log_path=self.base / "refresh.log",
+        )
+        cooldown_text = self.cooldown_path().read_text(encoding="utf-8")
+        log_text = (self.base / "refresh.log").read_text(encoding="utf-8")
+        for blob in (cooldown_text, log_text):
+            self.assertNotIn(secret, blob)
+            self.assertNotIn("Bearer", blob)
+            self.assertNotIn("accessToken", blob)
 
 
 if __name__ == "__main__":
