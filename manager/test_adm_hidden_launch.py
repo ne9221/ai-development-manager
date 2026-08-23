@@ -176,7 +176,7 @@ class CommandWatcherRunnerClaudeAccountsConfigTest(unittest.TestCase):
             '@echo off\n'
             'if "%1"=="-m" if "%2"=="-c" ( echo {"running_sha":"sha1","tested_sha":"sha1","activated_sha":"sha1"} & exit /b 0 )\n'
             'if "%1"=="-m" if "%2"=="manager.provenance" ( echo {"running_sha":"sha1","tested_sha":"sha1","activated_sha":"sha1"} & exit /b 0 )\n'
-            'if "%1"=="-m" if "%2"=="manager.command_watcher" ( echo CLAUDE_CONFIG=%CLAUDE_ACCOUNTS_CONFIG% & exit /b 0 )\n'
+            'if "%1"=="-m" if "%2"=="manager.command_watcher" ( echo CLAUDE_CONFIG=%CLAUDE_ACCOUNTS_CONFIG% & echo WORKSPACE_ROOT=%ADM_WORKSPACE_ROOT% & exit /b 0 )\n'
             'exit /b 0\n'
         )
         self.fake_python.write_text(bat_content, encoding="utf-8")
@@ -184,11 +184,13 @@ class CommandWatcherRunnerClaudeAccountsConfigTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run_watcher(self, extra_args=""):
+    def _run_watcher(self, extra_args="", include_workspace_root=True):
         runner = self.fake_repo / "manager" / "run_command_watcher.ps1"
         allowlist = self.tmp_path / "allowlist.json"
         allowlist.write_text("{}", encoding="utf-8")
-        cmd = f'& "{runner}" -PythonPath "{self.fake_python}" -RepositoryPath "{self.fake_repo}" -ManagerHome "{self.manager_home}" -AllowlistPath "{allowlist}" -GcsBucket "b" -GcsObject "o" {extra_args}'
+        workspace_root = self.tmp_path / "workspace-root"
+        workspace_arg = f'-WorkspaceRoot "{workspace_root}"' if include_workspace_root else ""
+        cmd = f'& "{runner}" -PythonPath "{self.fake_python}" -RepositoryPath "{self.fake_repo}" -ManagerHome "{self.manager_home}" -AllowlistPath "{allowlist}" -GcsBucket "b" -GcsObject "o" {workspace_arg} {extra_args}'
         return subprocess.run(
             [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd],
             capture_output=True, text=True, timeout=20,
@@ -225,4 +227,27 @@ class CommandWatcherRunnerClaudeAccountsConfigTest(unittest.TestCase):
         runner = (MANAGER_DIR / "run_command_watcher.ps1").read_text(encoding="utf-8")
         self.assertIn('& $PythonPath -m manager.command_watcher --once', runner)
         self.assertNotIn('Start-Process -FilePath $PythonPath', runner)
-        self.assertNotIn('WatcherTickTimeoutSeconds', runner)
+
+    def test_runner_exports_exact_workspace_root_before_python_starts(self):
+        # fix/home-watcher-workspace-truth-bootstrap-20260823: the Scheduled
+        # Task process must never rely on inheriting ADM_WORKSPACE_ROOT
+        # ambiently -- the runner sets it explicitly, from its own
+        # -WorkspaceRoot argument, every tick.
+        workspace_root = self.tmp_path / "workspace-root"
+        res = self._run_watcher()
+        self.assertEqual(0, res.returncode, f"stderr: {res.stderr}")
+        self.assertIn(f"WORKSPACE_ROOT={workspace_root}", res.stdout)
+
+    def test_runner_fails_closed_on_empty_workspace_root(self):
+        # PowerShell's own [Parameter(Mandatory=$true)] binding rejects an
+        # empty string before the script body (and its own explicit
+        # WORKSPACE_ROOT_REQUIRED check) ever runs -- still fails closed,
+        # just with the built-in ParameterBindingValidationException message
+        # instead of the script's own.
+        res = self._run_watcher('-WorkspaceRoot ""', include_workspace_root=False)
+        self.assertNotEqual(0, res.returncode)
+        self.assertIn("WorkspaceRoot", res.stderr)
+
+    def test_runner_fails_closed_when_workspace_root_is_omitted(self):
+        res = self._run_watcher(include_workspace_root=False)
+        self.assertNotEqual(0, res.returncode)

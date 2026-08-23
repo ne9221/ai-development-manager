@@ -92,6 +92,22 @@ function Set-AdmPersistentUserEnvironmentVariable {
     [Environment]::SetEnvironmentVariable($Name, $Value, "User")
 }
 
+function Test-AdmWorkspaceRootContaminated {
+    # A workspace root inherited from ambient process state that resolves
+    # into the OS/user temp directory is never legitimate ADM authority --
+    # this is exactly the ambient-TEMP-fallback contamination pattern found
+    # live on HOME (fix/home-watcher-workspace-truth-bootstrap-20260823): a
+    # stray inherited ADM_WORKSPACE_ROOT=%TEMP% let a real Task materialize
+    # working_directory under %TEMP%\ai-development-manager. Only an exact
+    # match or a real subpath of the temp root is rejected -- a legitimate
+    # workspace root that merely starts with the same characters (e.g.
+    # "C:\Temporary-Files") is not.
+    param([Parameter(Mandatory = $true)][string]$CandidateRoot)
+    $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+    $candidate = [IO.Path]::GetFullPath($CandidateRoot).TrimEnd('\')
+    return ($candidate -eq $temp) -or $candidate.StartsWith($temp + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Set-AdmWorkspacePointer {
     # Establishes the stable, machine-local pointer that
     # manager.project_registry.resolve_authoritative_working_directory()
@@ -118,9 +134,15 @@ function Set-AdmWorkspacePointer {
         [Parameter(Mandatory = $true)][string]$ProjectId
     )
     $repository = [IO.Path]::GetFullPath($RepositoryPath).TrimEnd('\')
-    $workspaceRoot = if ($env:ADM_WORKSPACE_ROOT) {
-        [IO.Path]::GetFullPath($env:ADM_WORKSPACE_ROOT).TrimEnd('\')
+    $inheritedRoot = $env:ADM_WORKSPACE_ROOT
+    $workspaceRoot = if ($inheritedRoot -and -not (Test-AdmWorkspaceRootContaminated -CandidateRoot $inheritedRoot)) {
+        [IO.Path]::GetFullPath($inheritedRoot).TrimEnd('\')
     } else {
+        # Either genuinely unset, or an inherited value that resolves into
+        # the OS/user temp directory -- never trusted as canonical authority
+        # (see Test-AdmWorkspaceRootContaminated). Recomputing from the
+        # repository's own parent, same as the "unset" case, is what
+        # replaces the contaminated value below.
         (Split-Path -Path $repository -Parent).TrimEnd('\')
     }
 
