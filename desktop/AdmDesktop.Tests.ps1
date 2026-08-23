@@ -183,48 +183,75 @@ Describe "Set-AdmWorkspacePointer workspace-root contamination guard" {
     # under %TEMP% was trusted as canonical authority, so a real Task
     # ended up materializing working_directory under
     # %TEMP%\ai-development-manager. Test-AdmWorkspaceRootContaminated is
-    # exercised for real here (unmocked), against the real
-    # [IO.Path]::GetTempPath() -- deliberately not $TestDrive (see the
-    # Describe block above for why that would be a false positive).
+    # exercised for real here (unmocked), against a real -- but redirected
+    # -- temp path: $env:TEMP/$env:TMP are pointed at a subfolder of
+    # $TestDrive for the duration of each It, so "temp" and "not temp" can
+    # both be proven with real (Pester-cleaned-up) filesystem paths instead
+    # of writing anywhere outside the sandbox. [IO.Path]::GetTempPath()
+    # re-reads the process environment on every call (never cached), so
+    # this redirection is transparent to the real, unmocked function.
     BeforeEach {
         Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue
         Mock Set-AdmPersistentUserEnvironmentVariable {}
         $global:admContamCaseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
-        $global:admContamRepo = Join-Path $global:admContamCaseRoot "checkout"
-        New-Item -ItemType Directory -Force -Path $global:admContamRepo | Out-Null
+        $global:admContamFakeTemp = Join-Path $global:admContamCaseRoot "fake-temp-root"
+        New-Item -ItemType Directory -Force -Path $global:admContamFakeTemp | Out-Null
+        $global:admOrigTemp = $env:TEMP
+        $global:admOrigTmp = $env:TMP
+        $env:TEMP = $global:admContamFakeTemp
+        $env:TMP = $global:admContamFakeTemp
     }
-    AfterEach { Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue }
+    AfterEach {
+        Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue
+        $env:TEMP = $global:admOrigTemp
+        $env:TMP = $global:admOrigTmp
+    }
 
     It "flags the exact temp root and any subpath of it as contaminated" {
-        $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
-        Test-AdmWorkspaceRootContaminated -CandidateRoot $temp | Should Be $true
-        Test-AdmWorkspaceRootContaminated -CandidateRoot (Join-Path $temp "ai-development-manager") | Should Be $true
+        Test-AdmWorkspaceRootContaminated -CandidateRoot $global:admContamFakeTemp | Should Be $true
+        Test-AdmWorkspaceRootContaminated -CandidateRoot (Join-Path $global:admContamFakeTemp "ai-development-manager") | Should Be $true
     }
 
     It "does not flag a legitimate root that merely shares a prefix with the temp path" {
-        $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
-        $lookalike = $temp.Substring(0, $temp.Length - 1) + "-not-actually-temp"
+        $lookalike = $global:admContamFakeTemp.Substring(0, $global:admContamFakeTemp.Length - 1) + "-not-actually-temp"
         Test-AdmWorkspaceRootContaminated -CandidateRoot $lookalike | Should Be $false
     }
 
-    It "refuses to trust an inherited ADM_WORKSPACE_ROOT that resolves under the real temp directory" {
-        $contaminated = Join-Path ([IO.Path]::GetTempPath()) "ai-development-manager-workspace-root-contamination-test"
-        $env:ADM_WORKSPACE_ROOT = $contaminated
-        $pointer = Set-AdmWorkspacePointer -RepositoryPath $global:admContamRepo -ProjectId "ai-development-manager"
-        $expectedRoot = Split-Path $global:admContamRepo -Parent
+    It "fails closed with no persistence and no ADM_WORKSPACE_ROOT mutation when both the inherited root and the repository-parent fallback resolve under temp (case A)" {
+        # Real-world reproduction: RepositoryPath is a Claude scratch clone
+        # whose own parent (...\scratchpad) is itself still under %TEMP% --
+        # replacing a contaminated inherited value with an equally
+        # contaminated fallback must never happen.
+        $contaminatedInherited = Join-Path $global:admContamFakeTemp "ai-development-manager-workspace-root-contamination-test"
+        $env:ADM_WORKSPACE_ROOT = $contaminatedInherited
+        $scratchRepo = Join-Path $global:admContamFakeTemp "claude\scratchpad\ai-development-manager"
+        New-Item -ItemType Directory -Force -Path $scratchRepo | Out-Null
+        { Set-AdmWorkspacePointer -RepositoryPath $scratchRepo -ProjectId "ai-development-manager" } | Should Throw
+        Assert-MockCalled Set-AdmPersistentUserEnvironmentVariable -Times 0 -Exactly -Scope It
+        $env:ADM_WORKSPACE_ROOT | Should Be $contaminatedInherited
+    }
+
+    It "falls back to the repository parent and succeeds when the inherited root is contaminated but the repository parent is legitimate (case B)" {
+        $contaminatedInherited = Join-Path $global:admContamFakeTemp "stray-inherited-root"
+        $env:ADM_WORKSPACE_ROOT = $contaminatedInherited
+        $legitimateRepo = Join-Path $global:admContamCaseRoot "legitimate-checkout"
+        New-Item -ItemType Directory -Force -Path $legitimateRepo | Out-Null
+        $pointer = Set-AdmWorkspacePointer -RepositoryPath $legitimateRepo -ProjectId "ai-development-manager"
+        $expectedRoot = Split-Path $legitimateRepo -Parent
         $pointer | Should Be (Join-Path $expectedRoot "ai-development-manager")
         $env:ADM_WORKSPACE_ROOT | Should Be $expectedRoot
         Assert-MockCalled Set-AdmPersistentUserEnvironmentVariable -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq "ADM_WORKSPACE_ROOT" -and $Value -eq $expectedRoot }
     }
 
-    # "A legitimate, non-temp inherited ADM_WORKSPACE_ROOT is still trusted"
-    # is covered by the main "Set-AdmWorkspacePointer" Describe block above
-    # (Test-AdmWorkspaceRootContaminated mocked $false there) rather than
-    # here: every path available inside this sandboxed test run -- including
-    # $TestDrive -- is itself a real subdirectory of the OS temp folder, so
-    # exercising the real (unmocked) gate end-to-end here could only ever
-    # legitimately return "contaminated" for any fixture this suite is
-    # allowed to create.
+    It "still trusts a legitimate, non-temp inherited ADM_WORKSPACE_ROOT" {
+        $legitimateInherited = Join-Path $global:admContamCaseRoot "legitimate-inherited-root"
+        New-Item -ItemType Directory -Force -Path $legitimateInherited | Out-Null
+        $env:ADM_WORKSPACE_ROOT = $legitimateInherited
+        $repo = Join-Path $global:admContamCaseRoot "some-checkout"
+        New-Item -ItemType Directory -Force -Path $repo | Out-Null
+        $pointer = Set-AdmWorkspacePointer -RepositoryPath $repo -ProjectId "ai-development-manager"
+        $pointer | Should Be (Join-Path $legitimateInherited "ai-development-manager")
+    }
 }
 
 Describe "Watcher hidden-VBS (wscript.exe) identity guard" {

@@ -14,8 +14,27 @@ param(
     [Parameter(Mandatory=$true)][string]$WorkspaceRoot
 )
 
+# Fail-closed WorkspaceRoot validation, before ADM_WORKSPACE_ROOT is ever
+# exported and before any provenance/Python invocation below: non-empty,
+# absolute, an existing directory, and not equal to or under the OS temp
+# directory. A Scheduled Task carrying an invalid/temp WorkspaceRoot must
+# never reach Python at all.
 if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
     Write-Error "WORKSPACE_ROOT_REQUIRED: -WorkspaceRoot must be a non-empty trusted workspace path; refusing to launch without explicit workspace authority"
+    exit 1
+}
+if (-not [IO.Path]::IsPathRooted($WorkspaceRoot)) {
+    Write-Error "WORKSPACE_ROOT_INVALID: -WorkspaceRoot must be an absolute path: '$WorkspaceRoot'"
+    exit 1
+}
+if (-not (Test-Path -LiteralPath $WorkspaceRoot -PathType Container)) {
+    Write-Error "WORKSPACE_ROOT_INVALID: -WorkspaceRoot does not exist or is not a directory: '$WorkspaceRoot'"
+    exit 1
+}
+$resolvedWorkspaceRoot = [IO.Path]::GetFullPath($WorkspaceRoot).TrimEnd('\')
+$tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+if ($resolvedWorkspaceRoot -eq $tempRoot -or $resolvedWorkspaceRoot.StartsWith($tempRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    Write-Error "WORKSPACE_ROOT_INVALID: -WorkspaceRoot resolves under the OS temp directory ('$resolvedWorkspaceRoot'); refusing to trust it as workspace authority"
     exit 1
 }
 # Explicit trusted authority for manager.project_registry's

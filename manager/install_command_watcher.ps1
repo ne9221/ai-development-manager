@@ -23,8 +23,27 @@ param(
     [Parameter(Mandatory=$true)][string]$WorkspaceRoot
 )
 
+# Fail-closed WorkspaceRoot validation, before any provenance activation or
+# Scheduled Task mutation below: non-empty, absolute, an existing directory,
+# and not equal to or under the OS temp directory. A Claude scratch clone's
+# own checkout parent (e.g. %TEMP%\claude\...\scratchpad) is exactly the
+# kind of value that could otherwise slip through a bare non-empty check.
 if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
     Write-Error "WORKSPACE_ROOT_REQUIRED: -WorkspaceRoot must be a non-empty trusted workspace path; refusing to install the Command Watcher without one"
+    exit 1
+}
+if (-not [IO.Path]::IsPathRooted($WorkspaceRoot)) {
+    Write-Error "WORKSPACE_ROOT_INVALID: -WorkspaceRoot must be an absolute path: '$WorkspaceRoot'"
+    exit 1
+}
+if (-not (Test-Path -LiteralPath $WorkspaceRoot -PathType Container)) {
+    Write-Error "WORKSPACE_ROOT_INVALID: -WorkspaceRoot does not exist or is not a directory: '$WorkspaceRoot'"
+    exit 1
+}
+$resolvedWorkspaceRoot = [IO.Path]::GetFullPath($WorkspaceRoot).TrimEnd('\')
+$tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+if ($resolvedWorkspaceRoot -eq $tempRoot -or $resolvedWorkspaceRoot.StartsWith($tempRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    Write-Error "WORKSPACE_ROOT_INVALID: -WorkspaceRoot resolves under the OS temp directory ('$resolvedWorkspaceRoot'); refusing to trust it as workspace authority"
     exit 1
 }
 
