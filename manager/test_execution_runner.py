@@ -11,6 +11,7 @@ from manager.claude_config_locks import ConfigLockBusyError, acquire_claude_conf
 from manager.claude_launcher import ClaudeLaunchError
 from manager.codex_launcher import CodexLaunchError, LaunchOutcome, LaunchRequest
 from manager.execution_runner import _resolve_working_directory, _stopped, launch_task, run_execution
+from manager.production_guard import mark_production_path
 from manager.task_claims import check_task_execution_claim
 from manager.tasks import TaskError, create_project, create_task, now_iso, update_task
 from manager.test_execution_lifecycle import MemoryStore, build_store, quota_document
@@ -853,6 +854,32 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         result, launcher = self._launch(store)
         self.assertEqual(self.valid_dir, launcher.request.working_directory)
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
+
+    # -- Production checkout drift guard: a legacy repo-edit Task must never
+    # fall back onto a checkout manager.provenance.activate() has marked as
+    # a protected production runtime path.
+
+    def test_legacy_repo_edit_fallback_rejects_marked_production_path(self):
+        mark_production_path(self.valid_dir, "a" * 40, self.lock_home.name)
+        store = self._store(project_working_directory=self.valid_dir)
+        with self.assertRaisesRegex(TaskError, "PRODUCTION_PATH_PROTECTED"):
+            _resolve_working_directory(store, store.get("tasks", "p1", "t1"))
+
+    def test_legacy_read_only_fallback_still_allowed_onto_marked_production_path(self):
+        # Reading (not writing) inside the production checkout is not the
+        # drift this guard exists to prevent -- only a developer/write task
+        # is rejected.
+        mark_production_path(self.valid_dir, "a" * 40, self.lock_home.name)
+        store = self._store(project_working_directory=self.valid_dir,
+                             task_overrides={"read_only": True, "needs_repo_edit": False})
+        resolved = _resolve_working_directory(store, store.get("tasks", "p1", "t1"))
+        self.assertEqual(self.valid_dir, resolved)
+
+    def test_legacy_fallback_unaffected_when_directory_is_not_marked_production(self):
+        # No marker present -- normal Hands-off behavior must be unchanged.
+        store = self._store(project_working_directory=self.valid_dir)
+        resolved = _resolve_working_directory(store, store.get("tasks", "p1", "t1"))
+        self.assertEqual(self.valid_dir, resolved)
 
     def test_legacy_fallback_is_backfilled_onto_the_task_as_its_own_snapshot(self):
         # So this Task behaves exactly like a post-fix, dispatch-time

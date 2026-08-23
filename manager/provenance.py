@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from manager.production_guard import PRODUCTION_MARKER_FILENAME, mark_production_path
+
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_MAX_AGE_SECONDS = 30 * 24 * 60 * 60  # 30 days
 
@@ -76,6 +78,22 @@ def get_git_head_sha(repository_path: Path) -> str:
 
 def get_git_branch(repository_path: Path) -> str:
     return _run_git(repository_path, "rev-parse", "--abbrev-ref", "HEAD")
+
+
+def is_checkout_clean(repository_path: Path) -> bool:
+    """Whether repository_path has zero uncommitted changes (tracked or
+    untracked), ignoring this module's own ADM-managed production marker
+    file (manager.production_guard.PRODUCTION_MARKER_FILENAME) -- an
+    untracked marker that activate() itself just wrote into repository_path
+    is not developer drift and must never make an otherwise-clean, freshly
+    activated checkout look dirty. A real dirty production checkout means
+    the on-disk state no longer matches the SHA verify_running() is about
+    to vouch for -- e.g. a developer edited files in place without
+    committing -- so this must gate verify_running() rather than being
+    purely informational."""
+    status = _run_git(repository_path, "status", "--porcelain", "--", ".",
+                       f":(exclude){PRODUCTION_MARKER_FILENAME}")
+    return status == ""
 
 
 def _tested_evidence_path(manager_home: Path) -> Path:
@@ -182,6 +200,14 @@ def activate(repository_path: Path, manager_home: Path) -> dict:
     path = _activated_evidence_path(manager_home)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+
+    # Mechanical, on-disk consequence of activation: mark repository_path
+    # itself as a protected production runtime checkout so
+    # manager.execution_runner / manager.worktree_materializer can refuse
+    # to ever hand it out as a developer/write task's working_directory
+    # (see manager.production_guard).
+    mark_production_path(repository_path, activating_sha, manager_home)
+
     return evidence
 
 
@@ -219,6 +245,12 @@ def verify_running(
     a fresh `git rev-parse HEAD` against repository_path.
     """
     running_sha = get_git_head_sha(repository_path)
+
+    if not is_checkout_clean(repository_path):
+        raise ProvenanceError(
+            f"PROVENANCE_MISMATCH: {repository_path} has uncommitted changes (dirty working tree); "
+            "refusing to trust RUNNING sha until the checkout is clean"
+        )
 
     activated = _read_json(_activated_evidence_path(manager_home), "ACTIVATED")
     tested_sha = activated.get("tested_sha", "")

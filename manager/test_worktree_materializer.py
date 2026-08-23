@@ -7,6 +7,7 @@ from copy import deepcopy
 
 import pytest
 
+from manager.production_guard import mark_production_path
 from manager.project_registry import ProjectMetadata
 from manager.worktree_materializer import (
     WorktreeMaterializationError,
@@ -162,6 +163,22 @@ def test_baseline_lineage_mismatch_rejected(canonical_repo, project):
     with pytest.raises(WorktreeMaterializationError) as exc:
         materialize_worktree(store, project, task, canonical_repo["path"], canonical_repo["path"].parent / "workspace")
     assert exc.value.code == "baseline_lineage_mismatch"
+
+
+def test_worktree_path_collision_with_marked_production_path_rejected(canonical_repo, project):
+    # Defense in depth: even though the deterministic naming should never
+    # produce this, a misconfigured workspace_root that resolves the
+    # computed worktree_path onto a checkout manager.provenance.activate()
+    # has marked as production must still fail closed.
+    workspace_root = canonical_repo["path"].parent / "workspace"
+    task = _task(baseline_head=canonical_repo["head"])
+    store = _store_with_task(task)
+    worktree_path, _ = compute_worktree_path(workspace_root, task["project_id"], task["task_id"])
+    worktree_path.mkdir(parents=True)
+    mark_production_path(worktree_path, "a" * 40, canonical_repo["path"].parent / "manager_home")
+    with pytest.raises(WorktreeMaterializationError) as exc:
+        materialize_worktree(store, project, task, canonical_repo["path"], workspace_root)
+    assert exc.value.code == "production_path_protected"
 
 
 def test_non_repo_write_task_rejected(canonical_repo, project):

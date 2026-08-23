@@ -30,6 +30,7 @@ from manager.tasks import DriveRecords, TaskError, update_task, validate
 from manager.trusted_ingress import repo_write_policy_satisfied
 from manager.worktree_locks import link_session as link_writer_session
 from manager.worktree_materializer import materialize_worktree, verify_checkout_repo_identity
+from manager.production_guard import ProductionPathGuardError, assert_not_production_path
 
 
 RPC_TIMEOUT_SECONDS = 30.0
@@ -236,6 +237,18 @@ def _resolve_working_directory(store, task):
         raise TaskError(f"working_directory does not exist or is not a directory: {value!r}")
     if registry_project is not None:
         verify_checkout_repo_identity(value, registry_project)
+    # Drift-prevention gate: a repo-edit Task that fell through to the legacy
+    # project-literal fallback (i.e. it never went through Slice C's isolated
+    # worktree materialization above) must never be allowed to land on a
+    # checkout that manager.provenance.activate() has marked as production --
+    # that is exactly the "developer task working_directory silently becomes
+    # the production runtime checkout" drift this guard exists to close. A
+    # read-only task may still legitimately run there.
+    if from_project and task.get("needs_repo_edit", True):
+        try:
+            assert_not_production_path(value, "resolve a developer task's working_directory")
+        except ProductionPathGuardError as exc:
+            raise TaskError(str(exc)) from exc
     if from_project:
         update_task(store, task["project_id"], task["task_id"], working_directory=value)
     return value
