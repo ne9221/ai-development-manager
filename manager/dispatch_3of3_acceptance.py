@@ -45,6 +45,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
+from manager.scheduler_provenance import evidence_status
+
 STATUS_PASS = "PASS"
 STATUS_FAIL = "FAIL"
 STATUS_NOT_APPLICABLE = "N/A"
@@ -299,6 +301,7 @@ class AcceptanceReport:
                 line("HANDOFF_LINKAGE"),
                 line("IDEMPOTENCY"),
                 line("REAL_PROVIDER"),
+                line("SCHEDULER_PROVENANCE"),
                 line("NO_MANUAL_TRIGGER"),
                 line("DASHBOARD_TRUTH"),
                 f"RESULT: {r.result}",
@@ -515,9 +518,20 @@ def evaluate_dispatch(
     else:
         checks.append(CheckResult("REAL_PROVIDER", STATUS_PASS, f"pid={provider_evidence.get('pid')} host={provider_evidence.get('host')}"))
 
+    # -- scheduler provenance: the canonical evaluator is invoked by the
+    #    real collector; a missing/legacy record is deliberately UNKNOWN ----
+    scheduler = evidence.get("scheduler_provenance") or {}
+    scheduler_status = scheduler.get("status", STATUS_UNKNOWN)
+    if scheduler_status not in (STATUS_PASS, STATUS_FAIL, STATUS_UNKNOWN):
+        scheduler_status = STATUS_UNKNOWN
+    checks.append(CheckResult("SCHEDULER_PROVENANCE", scheduler_status, scheduler.get("reason", "not observed")))
+
     # -- no manual intervention --------------------------------------------
     manual = evidence.get("manual_trigger_evidence")
-    if manual is None:
+    if scheduler_status != STATUS_PASS:
+        checks.append(CheckResult("NO_MANUAL_TRIGGER", scheduler_status,
+                                  "positive scheduler provenance is required"))
+    elif manual is None:
         checks.append(CheckResult("NO_MANUAL_TRIGGER", STATUS_UNKNOWN, "manual-trigger evidence not observed"))
     elif manual.get("found"):
         checks.append(CheckResult("NO_MANUAL_TRIGGER", STATUS_FAIL, f"manual trigger evidence found: {manual.get('source', 'unspecified source')}"))
@@ -851,6 +865,20 @@ def collect_evidence(
     if execution and execution.get("quota_evidence"):
         account_id = execution["quota_evidence"].get("account_id")
 
+    process_provenance = (command or {}).get("process_provenance") or {}
+    os_evidence = process_provenance.get("os_scheduler_evidence") or {}
+    scheduler_status = evidence_status(command, execution)
+    scheduler_provenance = {
+        "status": scheduler_status,
+        "scheduler_invocation_id": process_provenance.get("scheduler_invocation_id"),
+        "task_name": os_evidence.get("task_name"),
+        "os_scheduler_evidence": {key: os_evidence.get(key) for key in (
+            "status", "instance_id", "trigger_event_record_id", "action_event_record_id",
+            "action_process_id", "trigger_origin", "reason",
+        )},
+        "reason": os_evidence.get("reason") or "scheduler provenance unavailable",
+    }
+
     return {
         "request_id": request_id,
         "project_id": project_id,
@@ -867,6 +895,7 @@ def collect_evidence(
         "manual_trigger_evidence": manual_trigger_evidence,
         "reached_running": reached_running,
         "real_provider_evidence": provider_evidence,
+        "scheduler_provenance": scheduler_provenance,
         "terminal": {"state": terminal_state, "reason_code": reason_code} if terminal_state else None,
         "freshness": _compute_freshness(ingress_first_observed_at, acceptance_run_started_at),
     }
