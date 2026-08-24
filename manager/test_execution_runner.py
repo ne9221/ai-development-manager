@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import tempfile
@@ -11,7 +12,8 @@ from manager.claude_config_locks import ConfigLockBusyError, acquire_claude_conf
 from manager.claude_launcher import ClaudeLaunchError
 from manager.codex_launcher import CodexLaunchError, LaunchOutcome, LaunchRequest
 from manager.execution_runner import _resolve_working_directory, _stopped, launch_task, run_execution
-from manager.production_guard import mark_production_path
+from manager.production_guard import RuntimeGuardError, mark_production_path
+from manager import provenance
 from manager.task_claims import check_task_execution_claim
 from manager.tasks import TaskError, create_project, create_task, now_iso, update_task
 from manager.test_execution_lifecycle import MemoryStore, build_store, quota_document
@@ -921,6 +923,55 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         result, launcher = self._launch(store)
         self.assertEqual(self.valid_dir, launcher.request.working_directory)
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
+
+    def _activated_runtime(self):
+        runtime = Path(self.temp.name) / "production-runtime"
+        runtime.mkdir()
+        for args in (("init",), ("config", "user.email", "test@example.invalid"),
+                     ("config", "user.name", "test")):
+            subprocess.run(["git", *args], cwd=runtime, check=True, capture_output=True)
+        (runtime / "tracked.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=runtime, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=runtime, check=True, capture_output=True)
+        manager_home = Path(self.lock_home.name)
+        provenance.capture_tested(runtime, manager_home)
+        provenance.activate(runtime, manager_home)
+        return runtime
+
+    def test_direct_launch_from_foreign_cwd_fails_closed_for_bad_production_evidence(self):
+        runtime = self._activated_runtime()
+        evidence = Path(self.lock_home.name) / "provenance" / "activated_sha.json"
+        document = json.loads(evidence.read_text(encoding="utf-8"))
+        document["tested_sha"] = "0" * 40
+        evidence.write_text(json.dumps(document), encoding="utf-8")
+        store = self._store(task_overrides={"working_directory": str(runtime), "read_only": True,
+                                            "needs_repo_edit": False})
+        launcher = Launcher()
+        foreign = Path(self.temp.name) / "foreign-cwd"; foreign.mkdir()
+        previous = Path.cwd()
+        try:
+            os.chdir(foreign)
+            with self.assertRaises(RuntimeGuardError):
+                self._launch(store, launcher=launcher)
+        finally:
+            os.chdir(previous)
+        self.assertEqual([], launcher.events)
+        with self.assertRaises((TaskError, KeyError)):
+            store.get("executions", "p1", "exec-a")
+
+    def test_direct_launch_from_foreign_cwd_accepts_valid_production_identity(self):
+        runtime = self._activated_runtime()
+        store = self._store(task_overrides={"working_directory": str(runtime), "read_only": True,
+                                            "needs_repo_edit": False})
+        foreign = Path(self.temp.name) / "foreign-cwd"; foreign.mkdir()
+        previous = Path.cwd()
+        try:
+            os.chdir(foreign)
+            result, launcher = self._launch(store)
+        finally:
+            os.chdir(previous)
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+        self.assertEqual(["prepare", "start", "wait", "close"], launcher.events)
 
     # -- Production checkout drift guard: a legacy repo-edit Task must never
     # fall back onto a checkout manager.provenance.activate() has marked as

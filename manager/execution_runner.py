@@ -31,7 +31,7 @@ from manager.tasks import DriveRecords, TaskError, update_task, validate
 from manager.trusted_ingress import repo_write_policy_satisfied
 from manager.worktree_locks import link_session as link_writer_session
 from manager.worktree_materializer import materialize_worktree, verify_checkout_repo_identity
-from manager.production_guard import ProductionPathGuardError, RuntimeGuardError, assert_not_production_path
+from manager.production_guard import ProductionPathGuardError, RuntimeGuardError, assert_not_production_path, require_runtime_guard
 
 
 RPC_TIMEOUT_SECONDS = 30.0
@@ -338,13 +338,15 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     The pre-P0.1.5 single-account default path -- provider="claude" with
     neither `account_id` nor `claude_accounts` supplied -- is unaffected.
     """
-    # Gate before reading/claiming or preparing a provider: direct Python and
-    # watcher calls share this same last line of defence.
-    from manager.production_guard import require_runtime_guard
-    require_runtime_guard()
     task = store.get("tasks", project_id, task_id)
     validate("task", task)
     working_directory = _resolve_working_directory(store, task)
+    # Guard the runtime the Task will execute in, never the caller's cwd.
+    # This remains before dispatch, reservation, and provider preparation.
+    require_runtime_guard(
+        repository_path=working_directory,
+        manager_home=os.environ.get("AI_MANAGER_HOME") or str(Path(working_directory) / ".ai-development-manager"),
+    )
     turn_timeout = task_turn_timeout(task["expected_minutes"], timeout_seconds)
     if provider == "claude" and claude_accounts is not None:
         quota_document = quota_document or read_drive_status(service=service)
