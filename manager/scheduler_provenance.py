@@ -230,9 +230,11 @@ def finish(manager_home, context, status):
 def command_origin(context=None):
     if not context:
         return {"caller_origin": "direct_or_unknown", "scheduler_invocation_id": None}
-    return {"caller_origin": "watcher_poll", "scheduler_invocation_id": context["scheduler_invocation_id"],
-            "wrapper_pid": context["wrapper_pid"], "wrapper_creation_identity": context["wrapper_creation_identity"],
-            "os_scheduler_evidence": context.get("os_scheduler_evidence")}
+    origin = {"caller_origin": "watcher_poll", "scheduler_invocation_id": context.get("scheduler_invocation_id")}
+    for key in ("wrapper_pid", "wrapper_creation_identity", "os_scheduler_evidence"):
+        if key in context:
+            origin[key] = context[key]
+    return origin
 
 
 def evidence_status(command, execution):
@@ -253,5 +255,7 @@ def evidence_status(command, execution):
         return "FAIL"
     if (os_evidence.get("status") != "PASS" or os_evidence.get("trigger_origin") != "scheduled_time"
             or not all(os_evidence.get(key) for key in os_required)):
+        return "UNKNOWN"
+    if not command_evidence.get("wrapper_pid"):
         return "UNKNOWN"
     return "PASS" if os_evidence["action_process_id"] == command_evidence.get("wrapper_pid") else "FAIL"
