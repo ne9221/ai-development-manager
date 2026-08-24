@@ -474,7 +474,18 @@ def test_freshness_1_real_collect_evidence_historical_request_fails():
     # declared cutoff must fail FRESHNESS even though every other stage of
     # its evidence is otherwise perfectly self-consistent.
     store = build_fake_store("historical-1916", HISTORICAL_TS)
-    evidence = collect_evidence(store, PROJECT, "historical-1916", dashboard_probe=_running_dashboard_probe(HISTORICAL_TS))
+    evidence = collect_evidence(
+        store, PROJECT, "historical-1916",
+        dashboard_probe=_running_dashboard_probe(HISTORICAL_TS),
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
+    # collect_evidence() itself must emit the freshness evidence record --
+    # not leave it to be inferred later -- with all four required fields.
+    assert evidence["freshness"]["status"] == STATUS_FAIL
+    assert evidence["freshness"]["ingress_first_observed_at"] == HISTORICAL_TS
+    assert evidence["freshness"]["acceptance_run_started_at"] == RUN_STARTED_AT
+    assert evidence["freshness"]["reason"]
+
     result = evaluate_dispatch(evidence, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS, acceptance_run_started_at=RUN_STARTED_AT)
     freshness = [c for c in result.checks if c.name == "FRESHNESS"][0]
     assert freshness.status == STATUS_FAIL
@@ -484,11 +495,38 @@ def test_freshness_1_real_collect_evidence_historical_request_fails():
 def test_freshness_2_real_collect_evidence_fresh_request_passes():
     fresh_ts = ts(1.0)  # one minute after RUN_STARTED_AT = ts(0.0)
     store = build_fake_store("r-fresh", fresh_ts)
-    evidence = collect_evidence(store, PROJECT, "r-fresh", dashboard_probe=_running_dashboard_probe(fresh_ts))
+    evidence = collect_evidence(
+        store, PROJECT, "r-fresh",
+        dashboard_probe=_running_dashboard_probe(fresh_ts),
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
+    assert evidence["freshness"]["status"] == STATUS_PASS
+    assert evidence["freshness"]["ingress_first_observed_at"] == fresh_ts
+    assert evidence["freshness"]["acceptance_run_started_at"] == RUN_STARTED_AT
+    assert evidence["freshness"]["reason"]
+
     result = evaluate_dispatch(evidence, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS, acceptance_run_started_at=RUN_STARTED_AT)
     freshness = [c for c in result.checks if c.name == "FRESHNESS"][0]
     assert freshness.status == STATUS_PASS
     assert result.result == STATUS_PASS
+
+
+def test_freshness_12_collect_evidence_without_cutoff_emits_unknown_freshness():
+    # collect_evidence() called without acceptance_run_started_at (e.g. an
+    # older caller that hasn't been updated to pass one) must not omit the
+    # freshness record either -- it degrades to an explicit UNKNOWN, and
+    # evaluate_dispatch() independently still fails closed regardless of
+    # what collect_evidence() attached.
+    fresh_ts = ts(1.0)
+    store = build_fake_store("r-fresh", fresh_ts)
+    evidence = collect_evidence(store, PROJECT, "r-fresh", dashboard_probe=_running_dashboard_probe(fresh_ts))
+    assert evidence["freshness"]["status"] == STATUS_UNKNOWN
+    assert evidence["freshness"]["acceptance_run_started_at"] is None
+
+    result = evaluate_dispatch(evidence, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS)
+    freshness = [c for c in result.checks if c.name == "FRESHNESS"][0]
+    assert freshness.status == STATUS_UNKNOWN
+    assert result.result == STATUS_FAIL
 
 
 def test_freshness_3_missing_ingress_first_observed_at_is_unknown():

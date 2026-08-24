@@ -150,6 +150,66 @@ def _parse_iso(value: Optional[str]) -> Optional[float]:
     return parsed.timestamp()
 
 
+def _compute_freshness(
+    ingress_first_observed_at: Optional[str],
+    acceptance_run_started_at: Optional[str],
+) -> Dict[str, Any]:
+    """Single source of truth for the freshness determination.
+
+    Pure and deterministic: PASS iff `ingress_first_observed_at` is at or
+    after `acceptance_run_started_at` (instant comparison, timezone-aware,
+    never request_id lexical order). A missing cutoff, a missing
+    `ingress_first_observed_at`, or an unparseable/naive timestamp all
+    degrade to UNKNOWN rather than defaulting to PASS.
+
+    Used by both `evaluate_dispatch()` (as the authority for the FRESHNESS
+    CheckResult -- always recomputed there from its own
+    `acceptance_run_started_at` argument, never trusted from a caller- or
+    collector-supplied `evidence["freshness"]`) and `collect_evidence()`
+    (to attach an observability record onto the evidence it returns). Using
+    one function in both places means the two can never silently disagree.
+    """
+    if acceptance_run_started_at is None:
+        return {
+            "status": STATUS_UNKNOWN,
+            "ingress_first_observed_at": ingress_first_observed_at,
+            "acceptance_run_started_at": None,
+            "reason": "no acceptance_run_started_at cutoff supplied",
+        }
+    if ingress_first_observed_at is None:
+        return {
+            "status": STATUS_UNKNOWN,
+            "ingress_first_observed_at": None,
+            "acceptance_run_started_at": acceptance_run_started_at,
+            "reason": "no ingress_first_observed_at in evidence",
+        }
+    ingress_ts = _parse_iso(ingress_first_observed_at)
+    cutoff_ts = _parse_iso(acceptance_run_started_at)
+    if ingress_ts is None or cutoff_ts is None:
+        return {
+            "status": STATUS_UNKNOWN,
+            "ingress_first_observed_at": ingress_first_observed_at,
+            "acceptance_run_started_at": acceptance_run_started_at,
+            "reason": "ingress_first_observed_at or acceptance_run_started_at not parseable",
+        }
+    if ingress_ts >= cutoff_ts:
+        return {
+            "status": STATUS_PASS,
+            "ingress_first_observed_at": ingress_first_observed_at,
+            "acceptance_run_started_at": acceptance_run_started_at,
+            "reason": f"ingress_first_observed_at {ingress_first_observed_at!r} >= acceptance_run_started_at {acceptance_run_started_at!r}",
+        }
+    return {
+        "status": STATUS_FAIL,
+        "ingress_first_observed_at": ingress_first_observed_at,
+        "acceptance_run_started_at": acceptance_run_started_at,
+        "reason": (
+            f"ingress_first_observed_at {ingress_first_observed_at!r} precedes acceptance_run_started_at "
+            f"{acceptance_run_started_at!r} (historical/reused record, cannot count toward this run)"
+        ),
+    }
+
+
 @dataclass
 class DispatchResult:
     request_id: str
@@ -418,40 +478,18 @@ def evaluate_dispatch(
             checks.append(CheckResult("CROSS_TASK_BORROWING", STATUS_PASS))
 
     # -- freshness: reject a historical/pre-existing record mistakenly
-    #    picked up as if it were fresh. Computed from timestamps + an
-    #    explicit cutoff -- never from request_id lexical order (that is
-    #    RunLedger's job, and only as a same-process secondary guard) --
-    #    and ALWAYS appended, so a missing cutoff or a missing/unparseable
-    #    ingress_first_observed_at cannot silently vanish from the result;
-    #    it degrades to UNKNOWN (folded to FAIL), never to an absent check.
-    if acceptance_run_started_at is None:
-        checks.append(CheckResult(
-            "FRESHNESS", STATUS_UNKNOWN,
-            "no acceptance_run_started_at cutoff supplied to evaluate_dispatch()",
-        ))
-    elif sla_start_raw is None:
-        checks.append(CheckResult(
-            "FRESHNESS", STATUS_UNKNOWN,
-            "no ingress_first_observed_at in evidence",
-        ))
-    else:
-        cutoff = _parse_iso(acceptance_run_started_at)
-        if sla_start is None or cutoff is None:
-            checks.append(CheckResult(
-                "FRESHNESS", STATUS_UNKNOWN,
-                "ingress_first_observed_at or acceptance_run_started_at not parseable",
-            ))
-        elif sla_start >= cutoff:
-            checks.append(CheckResult(
-                "FRESHNESS", STATUS_PASS,
-                f"ingress_first_observed_at {sla_start_raw!r} >= acceptance_run_started_at {acceptance_run_started_at!r}",
-            ))
-        else:
-            checks.append(CheckResult(
-                "FRESHNESS", STATUS_FAIL,
-                f"ingress_first_observed_at {sla_start_raw!r} precedes acceptance_run_started_at "
-                f"{acceptance_run_started_at!r} (historical/reused record, cannot count toward this run)",
-            ))
+    #    picked up as if it were fresh. ALWAYS recomputed here via the same
+    #    _compute_freshness() used by collect_evidence() -- this function is
+    #    the authority regardless of whether evidence["freshness"] happens
+    #    to already carry a (possibly stale, possibly built against a
+    #    different cutoff) precomputed record; never from request_id
+    #    lexical order (that is RunLedger's job, and only as a same-process
+    #    secondary guard). The check is ALWAYS appended, so a missing
+    #    cutoff or a missing/unparseable ingress_first_observed_at cannot
+    #    silently vanish from the result; it degrades to UNKNOWN (folded to
+    #    FAIL), never to an absent check.
+    freshness = _compute_freshness(sla_start_raw, acceptance_run_started_at)
+    checks.append(CheckResult("FRESHNESS", freshness["status"], freshness["reason"]))
 
     # -- idempotency: exactly one canonical Task and one canonical Command;
     #    duplicate_counts >1 for any canonical entity is a FAIL ------------
@@ -650,6 +688,7 @@ def collect_evidence(
     dashboard_probe: Optional[Any] = None,
     ingress_probe: Optional[Any] = None,
     manual_trigger_probe: Optional[Any] = None,
+    acceptance_run_started_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Best-effort real-store evidence collection for one request_id.
 
@@ -672,6 +711,16 @@ def collect_evidence(
     the caller's `acceptance_run_started_at` cutoff -- faithfully passed
     through from the store (or `ingress_probe`) rather than fabricated, so a
     genuinely-missing value correctly surfaces as FRESHNESS=UNKNOWN.
+
+    If `acceptance_run_started_at` is supplied, this function also attaches
+    an observability record at `evidence["freshness"]` (status/
+    ingress_first_observed_at/acceptance_run_started_at/reason), computed by
+    the same `_compute_freshness()` `evaluate_dispatch()` uses -- so the two
+    can never disagree. `evaluate_dispatch()` does not read this field back
+    as an authority; it always recomputes FRESHNESS itself from its own
+    `acceptance_run_started_at` argument. This attached record exists so a
+    human or downstream tool reading raw evidence JSON can see the
+    freshness verdict without separately knowing which cutoff was used.
     """
     records = getattr(store, "records", None)
     tasks = []
@@ -687,6 +736,7 @@ def collect_evidence(
             "request_id": request_id,
             "project_id": project_id,
             "linkage": {"task": {"occurred": False}},
+            "freshness": _compute_freshness(None, acceptance_run_started_at),
         }
 
     task = max(tasks, key=lambda t: t.get("created_at") or "")
@@ -818,4 +868,5 @@ def collect_evidence(
         "reached_running": reached_running,
         "real_provider_evidence": provider_evidence,
         "terminal": {"state": terminal_state, "reason_code": reason_code} if terminal_state else None,
+        "freshness": _compute_freshness(ingress_first_observed_at, acceptance_run_started_at),
     }
