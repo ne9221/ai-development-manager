@@ -347,11 +347,12 @@ def discover_claude_config_dirs(home_path=None):
 
 def main():
     home = Path(os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
+    log_path = home / "logs" / "refresh.log"
     try:
         result = refresh(
             service=build_service(),
             runtime_path=home / "runtime" / "status.json",
-            log_path=home / "logs" / "refresh.log",
+            log_path=log_path,
             lock_path=home / "refresh.lock",
             claude_path=Path(os.environ.get("CLAUDE_STATUSLINE_PAYLOAD", Path.home() / ".claude" / "statusline-payload.json")),
             claude_accounts=discover_claude_accounts(home),
@@ -365,9 +366,17 @@ def main():
         print(f"REFRESHED Drive status.json ({result['publish']['action']})")
         return 0
     except RefreshError as exc:
+        # This is the only place a lock-contention failure (or any other
+        # RefreshError raised before the "refresh start" line at
+        # refresh()'s runtime_lock entry) gets recorded anywhere -- the
+        # wscript.exe scheduled-task wrapper runs hidden and discards
+        # stdout/stderr, so without this log_line the run leaves zero
+        # trace in refresh.log.
+        log_line(log_path, f"refresh failed before start: RefreshError: {exc}")
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
+        log_line(log_path, f"refresh initialization failed: {type(exc).__name__}")
         print(f"ERROR: refresh initialization failed: {type(exc).__name__}", file=sys.stderr)
         return 1
 
