@@ -19,8 +19,9 @@ from manager.command_watcher import (
 )
 from manager.execution_lifecycle import enter_running_gate
 from manager.executions import execution_health, heartbeat_execution, reserve_execution
+from manager.scheduler_provenance import command_origin
 from manager.task_claims import TaskClaimConflict
-from manager.tasks import TaskError, create_project, create_task, now_iso
+from manager.tasks import TaskError, create_project, create_task, now_iso, validate
 from manager.trusted_ingress import ADMISSION_VERSION_V2_REPO_WRITE, REQUIRED_REPO_WRITE_TASK_POLICIES
 from manager.test_execution_lifecycle import project, task
 from manager.test_execution_lifecycle import quota_document
@@ -113,6 +114,76 @@ class CommandWatcherTests(unittest.TestCase):
         stored = self.store.get("commands", "p1", "cmd-1")
         self.assertEqual("command-cmd-1", stored["execution_id"]); self.assertEqual("completed", stored["result"]["status"])
         self.assertEqual("code", stored["mode"]); self.assertEqual(["fresh quota"], stored["selection_reason"])
+
+    def test_scheduled_origin_claim_validates_and_persists_through_watcher_write_path(self):
+        context = {
+            "scheduler_invocation_id": "a" * 32,
+            "wrapper_pid": 41,
+            "wrapper_creation_identity": "windows-filetime:123456789",
+            "os_scheduler_evidence": {
+                "status": "PASS", "reason": "event_129_pid_and_instance_link",
+                "task_name": "AI Development Manager - Command Watcher", "instance_id": "instance-1",
+                "trigger_event_record_id": 10, "trigger_event_id": 107,
+                "trigger_time": "2026-08-25T00:00:00Z", "action_event_record_id": 12,
+                "action_process_id": 41, "action_executable": "powershell.exe",
+                "trigger_origin": "scheduled_time", "ignore_new_events": [],
+            },
+        }
+        expected = command_origin(context)
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])
+        with patch("manager.command_watcher.launch_task", runner):
+            result = process_command(
+                self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST,
+                health_check=lambda: True, quota_check=lambda _service: True, origin_context=context,
+            )
+        self.assertEqual("completed", result["status"])
+        stored = self.store.get("commands", "p1", "cmd-1")
+        self.assertEqual(expected, stored["process_provenance"])
+        self.assertEqual(expected, runner.call_args.kwargs["provenance"])
+        validate("command", stored)
+
+    def test_process_provenance_legacy_shapes_remain_valid(self):
+        validate("command", command())
+        validate("command", command(process_provenance={
+            "caller_origin": "watcher_poll", "scheduler_invocation_id": "a" * 32,
+        }))
+
+    def test_unknown_and_fail_os_scheduler_evidence_remain_valid(self):
+        for status, reason in (("UNKNOWN", "windows_operational_log_unavailable"),
+                               ("FAIL", "wrapper_creation_identity_mismatch")):
+            with self.subTest(status=status):
+                validate("command", command(process_provenance={
+                    "caller_origin": "watcher_poll", "scheduler_invocation_id": "a" * 32,
+                    "wrapper_pid": 41, "wrapper_creation_identity": "wrapper-41",
+                    "os_scheduler_evidence": {"status": status, "reason": reason},
+                }))
+
+    def test_process_provenance_schema_rejects_malformed_evidence(self):
+        provenance = {
+            "caller_origin": "watcher_poll", "scheduler_invocation_id": "a" * 32,
+            "wrapper_pid": 41, "wrapper_creation_identity": "wrapper-41",
+            "os_scheduler_evidence": {
+                "status": "PASS", "reason": "event_129_pid_and_instance_link",
+                "task_name": "AI Development Manager - Command Watcher", "instance_id": "instance-1",
+                "trigger_event_record_id": 10, "trigger_event_id": 107,
+                "trigger_time": "2026-08-25T00:00:00Z", "action_event_record_id": 12,
+                "action_process_id": 41, "action_executable": "powershell.exe",
+                "trigger_origin": "scheduled_time", "ignore_new_events": [],
+            },
+        }
+        cases = {
+            "wrapper_pid_string": {**provenance, "wrapper_pid": "41"},
+            "wrapper_pid_nonpositive": {**provenance, "wrapper_pid": 0},
+            "invalid_status": {**provenance, "os_scheduler_evidence": {**provenance["os_scheduler_evidence"], "status": "MAYBE"}},
+            "invalid_trigger_origin": {**provenance, "os_scheduler_evidence": {**provenance["os_scheduler_evidence"], "trigger_origin": "manual"}},
+            "unexpected_field": {**provenance, "unexpected": True},
+            "malformed_ignore_new": {**provenance, "os_scheduler_evidence": {**provenance["os_scheduler_evidence"], "ignore_new_events": [{"reason": "already_running"}]}},
+            "event_record_id_string": {**provenance, "os_scheduler_evidence": {**provenance["os_scheduler_evidence"], "trigger_event_record_id": "10"}},
+            "action_pid_string": {**provenance, "os_scheduler_evidence": {**provenance["os_scheduler_evidence"], "action_process_id": "41"}},
+        }
+        for name, value in cases.items():
+            with self.subTest(name=name), self.assertRaises(TaskError):
+                validate("command", command(process_provenance=value))
 
     def test_restart_never_relaunches_claimed_or_running_command(self):
         claimed = command(status="claimed", execution_id="command-cmd-1", claimed_at=now_iso())
