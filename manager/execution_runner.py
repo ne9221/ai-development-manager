@@ -301,7 +301,7 @@ def _claude_account_auth_ready(account):
 def launch_task(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                 execution_id=None, model=None, timeout_seconds=None, quota_document=None, executions=None,
                 retry_count=0, retry_of_execution_id=None, on_running=None, provider="codex",
-                account_id=None, config_dir=None, claude_accounts=None):
+                account_id=None, config_dir=None, claude_accounts=None, provenance=None):
     """Dispatch, reserve, and run one ready task; callers supply real authorities.
 
     `provider` names which provider this launcher belongs to (the caller
@@ -385,14 +385,14 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
                            execution_id, dispatched["generated_prompt"], request,
                            access="read_only" if task["read_only"] else "production_write",
                            baseline_head=task.get("baseline_head"), on_running=on_running, provider=provider,
-                           account_id=account_id, config_dir=config_dir)
+                           account_id=account_id, config_dir=config_dir, provenance=provenance)
     return {"execution_id": execution_id, "dispatch": dispatched, **result}
 
 
 def run_execution(store, service, writer_registry, claim_registry, launcher,
                   project_id, task_id, execution_id, prompt, launch_request: LaunchRequest,
                   access="production_write", baseline_head=None, on_running=None, provider="codex",
-                  account_id=None, config_dir=None):
+                  account_id=None, config_dir=None, provenance=None):
     """Run one reserved execution through the reviewed lifecycle gates.
 
     ``provider_stopped`` is derived only after prepare-owned cleanup or after
@@ -439,10 +439,16 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
                 task_id=task_id, execution_id=execution_id,
             )
         prepared = launcher.prepare(launch_request, **prepare_kwargs)
+        from manager.codex_launcher import process_creation_identity
+        provenance = provenance or {"caller_origin": "direct_or_unknown", "scheduler_invocation_id": None}
+        launcher_identity = process_creation_identity(os.getpid())
         provider_evidence = {
             "host": socket.gethostname()[:100], "pid": prepared.pid,
-            "creation_identity": prepared.process_creation_identity,
-            "started_at": prepared.prepared_at,
+            "creation_identity": prepared.process_creation_identity, "started_at": prepared.prepared_at,
+            "launcher_pid": os.getpid(), "launcher_creation_identity": launcher_identity,
+            "provider_pid": prepared.pid, "provider_creation_identity": prepared.process_creation_identity,
+            "provider_parent_identity": launcher_identity,
+            "scheduler_invocation_id": provenance.get("scheduler_invocation_id"),
         }
         heartbeat_execution(store, project_id, execution_id, "provider_prepared",
                             at=prepared.prepared_at, provider_evidence=provider_evidence)

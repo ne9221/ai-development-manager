@@ -114,6 +114,17 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertEqual("command-cmd-1", stored["execution_id"]); self.assertEqual("completed", stored["result"]["status"])
         self.assertEqual("code", stored["mode"]); self.assertEqual(["fresh quota"], stored["selection_reason"])
 
+    def test_watcher_threads_scheduler_origin_to_command_and_runner(self):
+        context = {"scheduler_invocation_id": "a" * 32, "wrapper_pid": 41,
+                   "wrapper_creation_identity": "wrapper-41", "os_scheduler_evidence": {"status": "UNKNOWN", "reason": "no_os_proof"}}
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])
+        with patch("manager.command_watcher.launch_task", runner):
+            process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST,
+                            health_check=lambda: True, quota_check=lambda _service: True, origin_context=context)
+        origin = self.store.get("commands", "p1", "cmd-1")["process_provenance"]
+        self.assertEqual("watcher_poll", origin["caller_origin"])
+        self.assertEqual("a" * 32, runner.call_args.kwargs["provenance"]["scheduler_invocation_id"])
+
     def test_restart_never_relaunches_claimed_or_running_command(self):
         claimed = command(status="claimed", execution_id="command-cmd-1", claimed_at=now_iso())
         runner = Mock()

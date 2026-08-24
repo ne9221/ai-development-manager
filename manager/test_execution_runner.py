@@ -203,6 +203,13 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("completed", result["session"]["status"])
         self.assertEqual("codex:thread-1", next(iter(writer.document["locks"].values()))["session_id"])
 
+    def test_provider_evidence_distinguishes_launcher_and_provider_processes(self):
+        store, _, _, _, _ = self.execute(read_only=True, launcher=Launcher())
+        evidence = store.get("executions", "p1", "exec-a")["provider_evidence"]
+        self.assertEqual(evidence["pid"], evidence["provider_pid"])
+        self.assertNotEqual(evidence["launcher_pid"], evidence["provider_pid"])
+        self.assertEqual(evidence["launcher_creation_identity"], evidence["provider_parent_identity"])
+
     def test_session_link_failure_never_starts_and_closes(self):
         store = build_store(working_directory=self.request.working_directory); real_put = store.put
         def fail_link(area, project, name, document):
