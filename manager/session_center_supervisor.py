@@ -43,6 +43,7 @@ from manager.refresh_status import RefreshError, runtime_lock, write_atomic
 from manager.runtime_bridge import all_projects
 from manager.tasks import DriveRecords, TaskError
 from manager.trusted_ingress import verify_trusted_ingress_admission
+from manager.production_guard import RuntimeGuardError, require_runtime_guard
 
 ACTIVE_STATUSES = ("queued", "claimed", "running")
 PORT_RECHECK_ATTEMPTS = 10
@@ -290,6 +291,7 @@ def run_once(store, allowlist, state_path, python_exe, repo, port, wait_seconds,
     """The entire read-decide-kill/spawn-write cycle for one invocation.
     Callers must hold the exclusive lock for the whole duration -- see main().
     """
+    require_runtime_guard(repo)
     state = read_state(state_path)
     target = find_active_command(store, allowlist, bucket=bucket, ingress_registry_factory=ingress_registry_factory)
     decision = decide(state, target)
@@ -332,6 +334,11 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--wait-seconds", type=float, default=1800.0)
     args = parser.parse_args(argv)
+    try:
+        require_runtime_guard(args.repository_path, args.manager_home)
+    except RuntimeGuardError as exc:
+        print(json.dumps({"status": "blocked", "reason": exc.code}))
+        return 1
 
     try:
         with runtime_lock(lock_path_for(args.state_file)):

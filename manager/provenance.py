@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from manager.production_guard import PRODUCTION_MARKER_FILENAME, mark_production_path
+from manager.production_guard import PRODUCTION_MARKER_FILENAME, RuntimeGuardError, mark_production_path, validate_production_marker
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_MAX_AGE_SECONDS = 30 * 24 * 60 * 60  # 30 days
@@ -289,6 +289,10 @@ def verify_running(
             "PROVENANCE_MISMATCH: tested_sha=%s activated_sha=%s running_sha=%s"
             % (tested_sha, activated_sha, running_sha)
         )
+    try:
+        validate_production_marker(repository_path, manager_home, activated_sha)
+    except RuntimeGuardError as exc:
+        raise ProvenanceError(f"{exc.code}: {exc}") from exc
 
     contract = ProvenanceContract(
         running_sha=running_sha,

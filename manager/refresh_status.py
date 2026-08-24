@@ -146,6 +146,8 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_a
     pre-OAuth statusline-only behavior byte-for-byte -- this keeps every
     existing caller/test that doesn't pass this parameter unaffected,
     including Codex, which this parameter has no effect on at all."""
+    from manager.production_guard import require_runtime_guard
+    require_runtime_guard(manager_home=Path(runtime_path).parents[1])
     with runtime_lock(lock_path):
         log_line(log_path, "refresh start")
         try:
@@ -349,6 +351,8 @@ def main():
     home = Path(os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
     log_path = home / "logs" / "refresh.log"
     try:
+        from manager.production_guard import RuntimeGuardError, require_runtime_guard
+        require_runtime_guard(manager_home=home)
         result = refresh(
             service=build_service(),
             runtime_path=home / "runtime" / "status.json",
@@ -365,6 +369,10 @@ def main():
         )
         print(f"REFRESHED Drive status.json ({result['publish']['action']})")
         return 0
+    except RuntimeGuardError as exc:
+        # A blocked runtime must not create a refresh/status artifact.
+        print(json.dumps({"status": "blocked", "reason": exc.code}), file=sys.stderr)
+        return 1
     except RefreshError as exc:
         # This is the only place a lock-contention failure (or any other
         # RefreshError raised before the "refresh start" line at

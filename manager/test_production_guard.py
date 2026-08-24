@@ -5,7 +5,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+import subprocess
 
+from manager import provenance
 from manager.production_guard import (
     PRODUCTION_MARKER_FILENAME,
     ProductionPathGuardError,
@@ -13,6 +15,8 @@ from manager.production_guard import (
     is_marked_production_path,
     mark_production_path,
     production_marker_path,
+    RuntimeGuardError,
+    require_runtime_guard,
 )
 
 
@@ -64,6 +68,49 @@ class ProductionGuardTests(unittest.TestCase):
     def test_marker_filename_is_the_documented_constant(self):
         mark_production_path(self.root, "a" * 40, self.root / "manager_home")
         self.assertTrue((self.root / PRODUCTION_MARKER_FILENAME).exists())
+
+    def _activated_repo(self):
+        repo, home = self.root / "repo", self.root / "home"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+        (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        provenance.capture_tested(repo, home)
+        provenance.activate(repo, home)
+        return repo, home
+
+    def test_valid_production_contract_passes_and_dev_is_unaffected(self):
+        repo, home = self._activated_repo()
+        self.assertTrue(require_runtime_guard(repo, home)["production"])
+        dev = self.root / "dev"; dev.mkdir()
+        self.assertEqual({"state": "PASS", "production": False}, require_runtime_guard(dev, home))
+
+    def test_missing_or_malformed_marker_fails_closed_without_repair(self):
+        repo, home = self._activated_repo()
+        marker = production_marker_path(repo)
+        marker.unlink()
+        with self.assertRaisesRegex(RuntimeGuardError, "MARKER_MISSING"):
+            require_runtime_guard(repo, home)
+        self.assertFalse(marker.exists())
+        marker.write_text("not json", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeGuardError, "EVIDENCE_INVALID"):
+            require_runtime_guard(repo, home)
+        self.assertEqual("not json", marker.read_text(encoding="utf-8"))
+
+    def test_dirty_production_tree_fails_closed(self):
+        repo, home = self._activated_repo()
+        (repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeGuardError, "DIRTY_WORKTREE"):
+            require_runtime_guard(repo, home)
+
+    def test_all_four_wrappers_keep_the_same_preflight(self):
+        manager = Path(__file__).parent
+        for name in ("run_command_watcher.ps1", "run_drive_dispatch_ingress.ps1",
+                     "run_session_center_supervisor.ps1", "run_refresh.ps1"):
+            self.assertIn("manager.provenance verify-running", (manager / name).read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

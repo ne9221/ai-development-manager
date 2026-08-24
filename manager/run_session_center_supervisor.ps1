@@ -15,6 +15,8 @@ if ($PythonDeps) { $env:PYTHONPATH = $PythonDeps }
 if ($AllowlistPath) { $env:ADM_WATCHER_ALLOWLIST_PATH = $AllowlistPath }
 if ($GcsBucket) { $env:ADM_LOCK_GCS_BUCKET = $GcsBucket }
 Set-Location -LiteralPath $RepositoryPath
+$provenanceOutput = & $PythonPath -m manager.provenance verify-running --repository-path $RepositoryPath --manager-home $ManagerHome 2>&1
+if ($LASTEXITCODE -ne 0) { Write-Error "PROVENANCE_MISMATCH: Session Supervisor provenance contract failed.`n$provenanceOutput"; exit 1 }
 & $PythonPath -m manager.session_center_supervisor `
     --python-path $PythonPath --repository-path $RepositoryPath `
     --manager-home $ManagerHome --state-file $StateFile --port $Port
