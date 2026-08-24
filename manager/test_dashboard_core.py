@@ -42,6 +42,12 @@ from manager.dashboard_core import (
     select_task_command,
     select_task_execution,
     select_task_handoff,
+    fetch_project_records,
+    fetch_task_handoffs,
+    classify_drive_folder_absence,
+    summarize_drive_read_error,
+    READ_STATUS_OK,
+    READ_STATUS_UNKNOWN,
 )
 from manager.quota_forecast import (
     AccountQuotaForecast,
@@ -1268,6 +1274,192 @@ class TaskScopedLinkageContractTests(unittest.TestCase):
         self.assertIsNone(select_task_command([], self.project_id, self.task_id))
         self.assertIsNone(select_task_execution([], self.project_id, self.task_id))
         self.assertIsNone(select_task_handoff([], self.project_id, self.task_id))
+
+
+class _RaisingFolderStore:
+    """Store double whose project_folder() itself fails -- simulates a
+    folder-level Drive read failure (auth/network/timeout/5xx/malformed
+    listing) before any children()/get() call would happen."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def project_folder(self, area, project_id, create=False):
+        raise self._exc
+
+    def children(self, parent):
+        raise AssertionError("children() must not be called after project_folder() failed")
+
+    def get(self, area, project_id, name):
+        raise AssertionError("get() must not be called after project_folder() failed")
+
+
+class _FakeRecordStore:
+    """Store double serving a fixed list of (name, doc) records for one
+    project_folder(), reached via the store.get() fallback path (no Drive
+    file 'id' on the listed items, matching test doubles elsewhere in this
+    suite). Names listed in `malformed_names` raise on get() to simulate
+    an unparseable individual record."""
+
+    def __init__(self, items, docs_by_name, malformed_names=()):
+        self._items = items
+        self._docs_by_name = docs_by_name
+        self._malformed_names = set(malformed_names)
+
+    def project_folder(self, area, project_id, create=False):
+        return "fake-parent"
+
+    def children(self, parent):
+        return self._items
+
+    def get(self, area, project_id, name):
+        if name in self._malformed_names:
+            raise ValueError(f"malformed JSON: {name}")
+        return self._docs_by_name[name]
+
+
+class TestCanonicalDriveReadContract(unittest.TestCase):
+    """Regression coverage for dashboard-quota-canonical-truth-20260824
+    blockers 1 (UNKNOWN != NONE) and 2 (handoff lookup completeness)."""
+
+    def setUp(self):
+        self.project_id = "test-project"
+        self.task_id = "test-task"
+
+    # -- Blocker 1: a confirmed-empty read is NOT a failure --------------
+
+    def test_handoff_drive_success_zero_records_is_confirmed_none(self):
+        store = _FakeRecordStore(items=[], docs_by_name={})
+        result = fetch_task_handoffs(store, self.project_id, self.task_id)
+        self.assertEqual(result["status"], READ_STATUS_OK)
+        self.assertEqual(result["records"], [])
+        self.assertIsNone(result["error"])
+
+    def test_handoff_confirmed_absent_folder_is_confirmed_none_not_unknown(self):
+        from manager.tasks import TaskError
+        store = _RaisingFolderStore(TaskError("Drive folder not found: HANDOFFS/test-project"))
+        result = fetch_task_handoffs(store, self.project_id, self.task_id)
+        self.assertEqual(result["status"], READ_STATUS_OK)
+        self.assertEqual(result["records"], [])
+
+    # -- Blocker 1: read failures must surface as UNKNOWN, never NONE ----
+
+    def test_handoff_drive_auth_failure_is_unknown(self):
+        store = _RaisingFolderStore(Exception("403 Forbidden: insufficient permission"))
+        result = fetch_task_handoffs(store, self.project_id, self.task_id)
+        self.assertEqual(result["status"], READ_STATUS_UNKNOWN)
+        self.assertEqual(result["records"], [])
+        self.assertIsNotNone(result["error"])
+
+    def test_handoff_drive_timeout_is_unknown(self):
+        store = _RaisingFolderStore(Exception("Request timed out after 45s"))
+        result = fetch_task_handoffs(store, self.project_id, self.task_id)
+        self.assertEqual(result["status"], READ_STATUS_UNKNOWN)
+        self.assertEqual(result["records"], [])
+
+    def test_handoff_drive_5xx_is_unknown(self):
+        store = _RaisingFolderStore(Exception("Drive API error: 503 Service Unavailable"))
+        result = fetch_task_handoffs(store, self.project_id, self.task_id)
+        self.assertEqual(result["status"], READ_STATUS_UNKNOWN)
+        self.assertEqual(result["records"], [])
+
+    def test_handoff_malformed_json_is_unknown_not_false_none(self):
+        """A handoff file that fails to parse must not be silently skipped
+        into a confirmed-empty result -- the unreadable file could have
+        been the target task's own handoff, so the caller must be told
+        UNKNOWN, not that the task definitely has no handoff."""
+        items = [{"name": "unreadable-handoff.json"}]
+        store = _FakeRecordStore(items=items, docs_by_name={}, malformed_names={"unreadable-handoff"})
+        result = fetch_task_handoffs(store, self.project_id, self.task_id)
+        self.assertEqual(result["status"], READ_STATUS_UNKNOWN)
+        self.assertEqual(result["records"], [])
+
+    def test_read_error_categories_never_leak_raw_exception_text(self):
+        self.assertEqual(summarize_drive_read_error(Exception("401 auth failed")), "auth_or_permission")
+        self.assertEqual(summarize_drive_read_error(Exception("connection timed out")), "timeout")
+        self.assertEqual(summarize_drive_read_error(Exception("502 Bad Gateway")), "server_error")
+        self.assertEqual(summarize_drive_read_error(Exception("could not decode json body")), "malformed_response")
+        self.assertTrue(classify_drive_folder_absence(Exception("Drive folder not found: X")))
+        self.assertFalse(classify_drive_folder_absence(Exception("network unreachable")))
+
+    # -- Blocker 2: handoff lookup completeness ---------------------------
+
+    def test_handoff_found_past_the_old_20_item_cap(self):
+        """Reproduces the reviewer's finding: with 25+ handoffs in the
+        project and the target beyond position 20, the old
+        candidates[:20] fallback produced a false NONE."""
+        items = []
+        docs = {}
+        for i in range(30):
+            name = f"unrelated-handoff-{i:02d}"
+            items.append({"name": f"{name}.json"})
+            docs[name] = {
+                "project_id": self.project_id,
+                "task_id": f"other-task-{i}",
+                "handoff_id": name,
+            }
+        target_name = "unrelated-handoff-24"  # the 25th item (index 24)
+        docs[target_name] = {
+            "project_id": self.project_id,
+            "task_id": self.task_id,
+            "handoff_id": target_name,
+        }
+        store = _FakeRecordStore(items=items, docs_by_name=docs)
+        result = fetch_task_handoffs(store, self.project_id, self.task_id)
+        self.assertEqual(result["status"], READ_STATUS_OK)
+        self.assertEqual(len(result["records"]), 1)
+        self.assertEqual(result["records"][0]["handoff_id"], target_name)
+
+    def test_handoff_found_with_no_filename_prefix_relationship(self):
+        """handoff_id/filename has zero relationship to task_id -- only the
+        record's own project_id/task_id fields prove the match."""
+        filename = "zzz-completely-unrelated-name-8f3a"
+        items = [{"name": f"{filename}.json"}]
+        docs = {filename: {
+            "project_id": self.project_id,
+            "task_id": self.task_id,
+            "handoff_id": filename,
+        }}
+        store = _FakeRecordStore(items=items, docs_by_name=docs)
+        result = fetch_task_handoffs(store, self.project_id, self.task_id)
+        self.assertEqual(result["status"], READ_STATUS_OK)
+        self.assertEqual(len(result["records"]), 1)
+        self.assertEqual(result["records"][0]["handoff_id"], filename)
+
+    def test_task_a_handoff_never_borrowed_by_task_b(self):
+        items = [{"name": "handoff-a.json"}, {"name": "handoff-b.json"}]
+        docs = {
+            "handoff-a": {"project_id": self.project_id, "task_id": "task-a", "handoff_id": "handoff-a"},
+            "handoff-b": {"project_id": self.project_id, "task_id": "task-b", "handoff_id": "handoff-b"},
+        }
+        store = _FakeRecordStore(items=items, docs_by_name=docs)
+        result_a = fetch_task_handoffs(store, self.project_id, "task-a")
+        result_b = fetch_task_handoffs(store, self.project_id, "task-b")
+        self.assertEqual([r["handoff_id"] for r in result_a["records"]], ["handoff-a"])
+        self.assertEqual([r["handoff_id"] for r in result_b["records"]], ["handoff-b"])
+
+    # -- Blocker 1: same UNKNOWN != NONE contract for Commands/Executions -
+
+    def test_commands_read_failure_is_unknown_not_confirmed_empty(self):
+        store = _RaisingFolderStore(Exception("connection reset by peer"))
+        result = fetch_project_records(store, "commands", self.project_id, limit=6)
+        self.assertEqual(result["status"], READ_STATUS_UNKNOWN)
+        self.assertEqual(result["records"], [])
+        self.assertIsNotNone(result["error"])
+
+    def test_executions_read_failure_is_unknown_not_confirmed_empty(self):
+        store = _RaisingFolderStore(Exception("504 Gateway Timeout"))
+        result = fetch_project_records(store, "executions", self.project_id, limit=6)
+        self.assertEqual(result["status"], READ_STATUS_UNKNOWN)
+        self.assertEqual(result["records"], [])
+        self.assertIsNotNone(result["error"])
+
+    def test_commands_confirmed_absent_folder_is_empty_not_unknown(self):
+        from manager.tasks import TaskError
+        store = _RaisingFolderStore(TaskError("Drive folder not found: COMMANDS/test-project"))
+        result = fetch_project_records(store, "commands", self.project_id, limit=6)
+        self.assertEqual(result["status"], READ_STATUS_OK)
+        self.assertEqual(result["records"], [])
 
 
 if __name__ == "__main__":

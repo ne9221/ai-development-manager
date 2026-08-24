@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Union
@@ -879,6 +880,167 @@ _REQUIRED_DISPATCH_TRUTH_FIELDS = (
     "project_id", "task_id", "provider", "account_id", "model", "mode",
     "dispatch_state", "execution_id", "session_id", "quota",
 )
+
+
+# =====================================================================
+# Canonical Drive read-result contract (Task Detail truth)
+# =====================================================================
+#
+# A Drive read that fails (auth, network, timeout, 5xx, malformed payload)
+# must never collapse to the same "records=[]" shape as a genuinely empty,
+# successfully-confirmed folder -- to an operator those mean opposite
+# things ("nothing has happened yet" vs. "we don't actually know, go
+# check"). Every canonical Task Detail read (Commands/Executions/Handoffs)
+# reports one of these three states instead of a bare list.
+
+READ_STATUS_OK = "ok"  # Drive read succeeded; `records` is the true set (possibly empty -- confirmed absence).
+READ_STATUS_UNKNOWN = "unknown"  # Drive read could not be completed/trusted; `records` is always [] and carries no truth value.
+
+
+def classify_drive_folder_absence(exc: BaseException) -> bool:
+    """True only for a confirmed-absent Drive folder (the area's folder was
+    never created for this project, i.e. genuinely zero records), as
+    produced by `DriveRecords.folder(..., create=False)`. Any other
+    exception (auth, network, timeout, 5xx, malformed response, duplicate
+    folder, ...) is a real read failure, not a confirmed absence."""
+    return "drive folder not found" in str(exc).lower()
+
+
+def summarize_drive_read_error(exc: BaseException) -> str:
+    """Short, credential-free failure category for a failed Drive read.
+
+    Deliberately returns a coarse label, never the raw exception text --
+    googleapiclient errors can embed request details that must not be
+    surfaced verbatim in the UI.
+    """
+    text = str(exc).lower()
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "auth" in text or "credential" in text or "permission" in text or "forbidden" in text or " 401" in text or " 403" in text:
+        return "auth_or_permission"
+    if "500" in text or "502" in text or "503" in text or "504" in text or "server error" in text:
+        return "server_error"
+    if "malformed" in text or "json" in text or "decode" in text:
+        return "malformed_response"
+    return "read_failure"
+
+
+def fetch_project_records(
+    store: Any,
+    area: str,
+    project_id: str,
+    limit: int,
+    include_ids: Optional[set] = None,
+) -> Dict[str, Any]:
+    """Recent-first, isolated read of one project's records for `area`.
+
+    Returns {"status", "records", "warnings", "error"}. `status` is
+    READ_STATUS_OK whenever the folder read itself succeeded (even if it
+    turned up zero or only malformed records) -- a malformed individual
+    record is reported via `warnings`, not a folder-level failure.
+    READ_STATUS_UNKNOWN means the folder-level read itself could not be
+    completed/trusted (auth, network, timeout, 5xx, malformed listing
+    response, ...) and must never be rendered the same as "confirmed no
+    records".
+    """
+    from manager.tasks import logical_record_id  # local import: avoids a
+    # module-load-order dependency between manager.tasks and dashboard_core.
+
+    records: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    try:
+        parent = store.project_folder(area, project_id, create=False)
+        items = sorted(
+            store.children(parent),
+            key=lambda item: item.get("modifiedTime") or "",
+            reverse=True,
+        )
+        json_items = [item for item in items if item.get("name", "").endswith(".json")]
+        selected_items = json_items[:limit]
+        if include_ids:
+            selected_names = {item.get("name") for item in selected_items}
+            selected_items.extend(
+                item for item in json_items[limit:]
+                if item.get("name") not in selected_names
+                and logical_record_id(item["name"][:-5]) in include_ids
+            )
+        for item in selected_items:
+            name = item.get("name", "")
+            storage_id = name[:-5]
+            try:
+                if item.get("id"):
+                    raw = store.files.get_media(fileId=item["id"]).execute()
+                    doc = json.loads(raw.decode("utf-8"))
+                else:  # Test doubles and legacy adapters may not expose Drive file IDs.
+                    logical_id = logical_record_id(storage_id)
+                    doc = store.get(area, project_id, logical_id)
+                records.append(doc)
+            except Exception as exc:
+                warnings.append(f"Malformed record '{name}' in '{area}' for project '{project_id}': {exc}")
+    except Exception as exc:
+        if classify_drive_folder_absence(exc):
+            return {"status": READ_STATUS_OK, "records": [], "warnings": warnings, "error": None}
+        error = summarize_drive_read_error(exc)
+        warnings.append(f"Drive read failure for '{area}' in project '{project_id}': {error}")
+        return {"status": READ_STATUS_UNKNOWN, "records": [], "warnings": warnings, "error": error}
+    return {"status": READ_STATUS_OK, "records": records, "warnings": warnings, "error": None}
+
+
+def fetch_task_handoffs(store: Any, project_id: str, task_id: str) -> Dict[str, Any]:
+    """Targeted, complete read of every handoff record for one (project_id,
+    task_id), regardless of filename/ordering.
+
+    Returns {"status", "records", "error"}. Scans every JSON candidate in
+    the project's HANDOFFS folder (a handoff_id is not guaranteed to be
+    prefixed by its task_id, and Drive listing order is not guaranteed to
+    put the target task's handoff first) rather than truncating to a
+    small recent window -- a filename-prefix or count-based cutoff would
+    let a real handoff silently read as "no handoff found" purely because
+    of where it happened to sort. If any candidate fails to parse, that by
+    itself does not prove the target task has no handoff (the unreadable
+    file could have been it), so a scan that finds zero *confirmed*
+    matches but has at least one unreadable candidate reports UNKNOWN, not
+    confirmed-empty. A scan that already found a genuine match returns it
+    regardless of unrelated unreadable files elsewhere in the folder.
+    """
+    from manager.tasks import logical_record_id
+
+    if not project_id or not task_id:
+        return {"status": READ_STATUS_OK, "records": [], "error": None}
+    try:
+        try:
+            parent = store.project_folder("handoffs", project_id, create=False)
+        except Exception as exc:
+            if classify_drive_folder_absence(exc):
+                return {"status": READ_STATUS_OK, "records": [], "error": None}
+            return {"status": READ_STATUS_UNKNOWN, "records": [], "error": summarize_drive_read_error(exc)}
+
+        candidates = [item for item in store.children(parent) if item.get("name", "").endswith(".json")]
+
+        records: List[Dict[str, Any]] = []
+        unreadable = 0
+        for item in candidates:
+            name = item.get("name", "")
+            storage_id = name[:-5]
+            try:
+                if item.get("id") and hasattr(store, "files") and hasattr(store.files, "get_media"):
+                    raw = store.files.get_media(fileId=item["id"]).execute()
+                    doc = json.loads(raw.decode("utf-8"))
+                else:
+                    doc = store.get("handoffs", project_id, logical_record_id(storage_id))
+            except Exception:
+                unreadable += 1
+                continue
+            if isinstance(doc, dict) and doc.get("project_id") == project_id and doc.get("task_id") == task_id:
+                records.append(doc)
+
+        if records:
+            return {"status": READ_STATUS_OK, "records": records, "error": None}
+        if unreadable:
+            return {"status": READ_STATUS_UNKNOWN, "records": [], "error": "malformed_response"}
+        return {"status": READ_STATUS_OK, "records": [], "error": None}
+    except Exception as exc:
+        return {"status": READ_STATUS_UNKNOWN, "records": [], "error": summarize_drive_read_error(exc)}
 
 
 def select_task_command(
