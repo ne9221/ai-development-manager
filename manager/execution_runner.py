@@ -341,12 +341,9 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     task = store.get("tasks", project_id, task_id)
     validate("task", task)
     working_directory = _resolve_working_directory(store, task)
-    # Guard the runtime the Task will execute in, never the caller's cwd.
-    # This remains before dispatch, reservation, and provider preparation.
-    require_runtime_guard(
-        repository_path=working_directory,
-        manager_home=os.environ.get("AI_MANAGER_HOME") or str(Path(working_directory) / ".ai-development-manager"),
-    )
+    # Guard the ADM runtime identified by activated evidence; the Task target
+    # above has its own repository/worktree authorization checks.
+    require_runtime_guard(manager_home=os.environ.get("AI_MANAGER_HOME"))
     turn_timeout = task_turn_timeout(task["expected_minutes"], timeout_seconds)
     if provider == "claude" and claude_accounts is not None:
         quota_document = quota_document or read_drive_status(service=service)

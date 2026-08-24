@@ -973,6 +973,36 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
         self.assertEqual(["prepare", "start", "wait", "close"], launcher.events)
 
+    def test_activated_adm_runtime_allows_a_separate_task_worktree_from_foreign_cwd(self):
+        runtime = self._activated_runtime()
+        target = Path(self.temp.name) / "isolated-task-worktree"; target.mkdir()
+        store = self._store(task_overrides={"working_directory": str(target), "read_only": True,
+                                            "needs_repo_edit": False})
+        foreign = Path(self.temp.name) / "foreign-cwd"; foreign.mkdir()
+        previous = Path.cwd()
+        try:
+            os.chdir(foreign)
+            result, launcher = self._launch(store)
+        finally:
+            os.chdir(previous)
+        self.assertNotEqual(runtime.resolve(), target.resolve())
+        self.assertEqual(str(target), launcher.request.working_directory)
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+
+    def test_bad_activated_adm_runtime_blocks_a_separate_task_worktree(self):
+        self._activated_runtime()
+        evidence = Path(self.lock_home.name) / "provenance" / "activated_sha.json"
+        document = json.loads(evidence.read_text(encoding="utf-8"))
+        document["tested_sha"] = "0" * 40
+        evidence.write_text(json.dumps(document), encoding="utf-8")
+        target = Path(self.temp.name) / "isolated-task-worktree"; target.mkdir()
+        store = self._store(task_overrides={"working_directory": str(target), "read_only": True,
+                                            "needs_repo_edit": False})
+        launcher = Launcher()
+        with self.assertRaises(RuntimeGuardError):
+            self._launch(store, launcher=launcher)
+        self.assertEqual([], launcher.events)
+
     # -- Production checkout drift guard: a legacy repo-edit Task must never
     # fall back onto a checkout manager.provenance.activate() has marked as
     # a protected production runtime path.
