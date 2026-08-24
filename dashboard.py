@@ -62,6 +62,11 @@ RECENT_RECORD_LIMIT = 6
 # -- a single bounded GCS prefix listing, never a full-history scan. See
 # load_pretask_dispatch_requests()'s docstring.
 PRETASK_DISPATCH_REQUEST_LIMIT = 20
+# One complete Dashboard refresh per active browser session per minute: this
+# matches the 60s Drive/GCS caches below, so periodic reruns cannot increase
+# their upstream read cadence.
+AUTO_REFRESH_INTERVAL_SECONDS = 60
+_AUTO_REFRESH_ARMED_KEY = "dashboard_auto_refresh_armed"
 
 
 def query_scheduled_task_raw(task_name):
@@ -502,6 +507,24 @@ def load_all_data():
         }
 
 # Main App Loop
+st.session_state[_AUTO_REFRESH_ARMED_KEY] = False
+_periodic_fragment = getattr(st, "fragment", None) or st.experimental_fragment
+
+
+@_periodic_fragment(run_every=AUTO_REFRESH_INTERVAL_SECONDS)
+def _refresh_dashboard_automatically():
+    """Turn a bounded fragment tick into one full Dashboard refresh.
+
+    The initial full-script call only arms the next tick. A tick reruns the
+    app, which disarms and re-arms it, preventing an immediate rerun loop.
+    """
+    if st.session_state.get(_AUTO_REFRESH_ARMED_KEY):
+        st.rerun()
+    st.session_state[_AUTO_REFRESH_ARMED_KEY] = True
+
+
+_refresh_dashboard_automatically()
+
 st.title("🤖 ADM Unified Operations Dashboard")
 st.caption("AI Operations Command Center — Multi-Account Telemetry, Forecast & Execution Monitor")
 
@@ -516,9 +539,8 @@ with st.sidebar:
     st.markdown("### Runtime Status")
     st.info("Read-only execution monitoring active. Local Drive token is valid.")
 
-    # Auto-refresh check
     st.markdown("---")
-    st.caption("Recent HOME data is cached for 60 seconds. Sync clears the cache immediately.")
+    st.caption("Dashboard refreshes automatically every 60 seconds. Sync clears the cache immediately.")
 
 # Load Data
 data = load_all_data()
@@ -601,7 +623,7 @@ if visibility_rows:
     st.dataframe(pd.DataFrame(visibility_rows), use_container_width=True, hide_index=True)
 else:
     st.info("No recent HOME Task / Command / Execution records found.")
-st.caption(f"Showing the {RECENT_RECORD_LIMIT} most recently modified records per lifecycle type for `{DASHBOARD_PROJECT_ID}`. Drive load: {load_duration_seconds}s. Use Sync with Google Drive for an immediate refresh.")
+st.caption(f"Showing the {RECENT_RECORD_LIMIT} most recently modified records per lifecycle type for `{DASHBOARD_PROJECT_ID}`. Drive load: {load_duration_seconds}s. Dashboard refreshes automatically every {AUTO_REFRESH_INTERVAL_SECONDS} seconds; Sync is available for an immediate refresh.")
 
 # =====================================================================
 # Visible Dispatch Truth Gate: stricter, task-provider-account-quota-bound
