@@ -4,13 +4,16 @@ proven approach against an in-memory double of the GCS transport."""
 
 import threading
 import unittest
+from unittest.mock import MagicMock
 
 from manager.dispatch_requests import (
-    DispatchRequestClaimConflict, claim_dispatch_request, dispatch_request_object_name,
-    mark_dispatch_request_status, read_dispatch_request_status, release_dispatch_request_claim,
+    DEFAULT_RECENT_REQUEST_LIST_LIMIT, DispatchRequestClaimConflict, claim_dispatch_request,
+    dispatch_request_object_name, list_recent_dispatch_request_ids, mark_dispatch_request_status,
+    read_dispatch_request_status, release_dispatch_request_claim, resolve_dispatch_status_for_request,
 )
-from manager.tasks import TaskError
+from manager.tasks import DriveRecords, TaskError, create_project
 from manager.test_task_claims import AmbiguousThenUnreadableRegistry, MemoryClaimRegistry
+from manager.test_tasks import FakeDriveService
 
 
 class DispatchRequestClaimTests(unittest.TestCase):
@@ -176,6 +179,146 @@ class DispatchRequestClaimTests(unittest.TestCase):
         claim = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-24T00:00:00Z")
         with self.assertRaises(TaskError):
             mark_dispatch_request_status(registry, "p1", "req-1", claim["generation"], "bogus-status")
+
+
+def _fake_session(status_code=200, items=None, raise_exc=None):
+    session = MagicMock()
+    if raise_exc is not None:
+        session.get.side_effect = raise_exc
+    else:
+        response = MagicMock()
+        response.status_code = status_code
+        response.json.return_value = {"items": items or []}
+        session.get.return_value = response
+    return session
+
+
+class ListRecentDispatchRequestIdsTests(unittest.TestCase):
+    """Bounded discovery of candidate request_ids for the Dashboard's
+    pre-Task ingress-truth view -- must never become an unbounded/
+    full-history scan (see project memory: prior incidents from unbounded
+    list_executions()/full Drive history scans caused multi-minute
+    Dashboard load latency)."""
+
+    def test_returns_request_ids_stripped_of_prefix_and_suffix(self):
+        session = _fake_session(items=[
+            {"name": "dispatch-requests/p1/req-a.json"},
+            {"name": "dispatch-requests/p1/req-b.json"},
+        ])
+        ids = list_recent_dispatch_request_ids("bucket-1", "p1", session=session)
+        self.assertEqual(["req-a", "req-b"], ids)
+
+    def test_bounded_by_max_results_query_param(self):
+        session = _fake_session(items=[])
+        list_recent_dispatch_request_ids("bucket-1", "p1", session=session, max_results=7)
+        _, kwargs = session.get.call_args
+        self.assertEqual(7, kwargs["params"]["maxResults"])
+
+    def test_default_max_results_is_a_small_fixed_cap(self):
+        # The default itself must be a small fixed number, never "unbounded"
+        # (e.g. None) -- this is the actual guardrail against an
+        # ever-growing dispatch-requests/ prefix turning one Dashboard
+        # refresh into a full-history scan.
+        self.assertIsInstance(DEFAULT_RECENT_REQUEST_LIST_LIMIT, int)
+        self.assertLessEqual(DEFAULT_RECENT_REQUEST_LIST_LIMIT, 100)
+        session = _fake_session(items=[])
+        list_recent_dispatch_request_ids("bucket-1", "p1", session=session)
+        _, kwargs = session.get.call_args
+        self.assertEqual(DEFAULT_RECENT_REQUEST_LIST_LIMIT, kwargs["params"]["maxResults"])
+
+    def test_result_is_never_longer_than_max_results_even_if_backend_over_returns(self):
+        # A defensive local slice -- even if a (misbehaving or future)
+        # backend response somehow returns more items than maxResults asked
+        # for, this function must never hand back more than it promised.
+        items = [{"name": f"dispatch-requests/p1/req-{i}.json"} for i in range(50)]
+        session = _fake_session(items=items)
+        ids = list_recent_dispatch_request_ids("bucket-1", "p1", session=session, max_results=5)
+        self.assertLessEqual(len(ids), 5)
+
+    def test_missing_bucket_or_project_id_returns_empty_without_a_call(self):
+        session = _fake_session(items=[{"name": "dispatch-requests/p1/req-a.json"}])
+        self.assertEqual([], list_recent_dispatch_request_ids(None, "p1", session=session))
+        self.assertEqual([], list_recent_dispatch_request_ids("bucket-1", None, session=session))
+        session.get.assert_not_called()
+
+    def test_non_200_response_fails_soft_to_empty_list(self):
+        session = _fake_session(status_code=500, items=[{"name": "dispatch-requests/p1/req-a.json"}])
+        self.assertEqual([], list_recent_dispatch_request_ids("bucket-1", "p1", session=session))
+
+    def test_transport_exception_fails_soft_to_empty_list(self):
+        session = _fake_session(raise_exc=Exception("simulated network failure"))
+        self.assertEqual([], list_recent_dispatch_request_ids("bucket-1", "p1", session=session))
+
+    def test_names_outside_the_project_prefix_or_wrong_suffix_are_ignored(self):
+        session = _fake_session(items=[
+            {"name": "dispatch-requests/other-project/req-x.json"},
+            {"name": "dispatch-requests/p1/req-a.json"},
+            {"name": "dispatch-requests/p1/not-json.txt"},
+        ])
+        ids = list_recent_dispatch_request_ids("bucket-1", "p1", session=session)
+        self.assertEqual(["req-a"], ids)
+
+
+class ResolveDispatchStatusReadFailureTests(unittest.TestCase):
+    """P0 fix: resolve_dispatch_status_for_request() must distinguish a
+    genuine backend/read failure of the claim record from "no claim record
+    exists at all" -- see the function's own docstring. Before this fix,
+    both cases silently collapsed to `dispatch_request_status: None`,
+    making a real read failure indistinguishable from "this request was
+    never received" to any caller (e.g. the Dashboard), which could then
+    either show nothing at all, or (worse, if also passing
+    has_dispatch_request=True) report a false ACCEPTED. This must never
+    change what a SUCCESSFUL read reports for ACCEPTED/DISPATCHED/FAILED --
+    only a failed read's shape changes (additively)."""
+
+    def _project_store(self):
+        store = DriveRecords(FakeDriveService())
+        create_project(store, {"project_id": "p1", "name": "P1", "repo": "r", "default_branch": "main",
+                               "runtime_ssot": "Drive", "project_rules": [], "active_tasks": [],
+                               "current_phase": "Phase 1", "important_constraints": []})
+        return store
+
+    def test_genuinely_never_received_request_reports_no_read_failure(self):
+        store = self._project_store()
+        registry = MemoryClaimRegistry()
+        resolved = resolve_dispatch_status_for_request(store, registry, "p1", "req-never-seen")
+        self.assertIsNone(resolved["task"])
+        self.assertIsNone(resolved["dispatch_request_status"])
+        self.assertFalse(resolved["dispatch_request_read_failed"])
+
+    def test_genuine_read_failure_is_flagged_distinctly_from_no_record(self):
+        store = self._project_store()
+        registry = MemoryClaimRegistry()
+        claim_dispatch_request(registry, "p1", "req-x", "dispatch-req-x", "dispatch-req-x", "2026-08-24T00:00:00Z")
+        # The claim record genuinely exists (a request WAS received) but its
+        # read is now failing -- e.g. a transient GCS/network outage.
+        registry.read_unavailable = True
+        resolved = resolve_dispatch_status_for_request(store, registry, "p1", "req-x")
+        self.assertIsNone(resolved["task"])
+        self.assertIsNone(resolved["dispatch_request_status"])
+        self.assertTrue(resolved["dispatch_request_read_failed"])
+
+    def test_successful_read_of_an_accepted_request_is_unaffected_by_the_fix(self):
+        store = self._project_store()
+        registry = MemoryClaimRegistry()
+        claim_dispatch_request(registry, "p1", "req-y", "dispatch-req-y", "dispatch-req-y", "2026-08-24T00:00:00Z")
+        resolved = resolve_dispatch_status_for_request(store, registry, "p1", "req-y")
+        self.assertIsNone(resolved["task"])
+        self.assertEqual("accepted", resolved["dispatch_request_status"]["status"])
+        self.assertFalse(resolved["dispatch_request_read_failed"])
+
+    def test_task_exists_branch_also_carries_the_new_flag_as_false(self):
+        store = self._project_store()
+        from manager.tasks import create_task
+        create_task(store, {
+            "task_id": "dispatch-req-z", "project_id": "p1", "title": "Ingress task",
+            "task_type": "general", "expected_minutes": 20, "scope": [], "constraints": [],
+            "acceptance_criteria": [], "source_context": {},
+        }, assign=False)
+        registry = MemoryClaimRegistry()
+        resolved = resolve_dispatch_status_for_request(store, registry, "p1", "req-z")
+        self.assertIsNotNone(resolved["task"])
+        self.assertFalse(resolved["dispatch_request_read_failed"])
 
 
 if __name__ == "__main__":

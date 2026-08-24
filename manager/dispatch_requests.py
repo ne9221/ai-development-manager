@@ -8,8 +8,15 @@ that remains solely governed by task_claims.py and the existing Command
 Watcher.
 """
 
-from manager.gcs_lock_registry import GCSLockRegistry, RegistryConflict
+from urllib.parse import quote
+
+from manager.gcs_lock_registry import GCS_SCOPE, GCSLockRegistry, RegistryConflict
 from manager.tasks import TaskError, safe_id
+
+# Bounded prefix-listing default for list_recent_dispatch_request_ids(): a
+# small fixed cap, never an unbounded/full-history scan. See that function's
+# docstring for why this exists and how it must be used.
+DEFAULT_RECENT_REQUEST_LIST_LIMIT = 20
 
 
 DISPATCH_REQUEST_SCHEMA_VERSION = "0.1.0"
@@ -364,10 +371,80 @@ def resolve_dispatch_status_for_request(store, registry, project_id, request_id)
     task = _fetch("tasks", task_id)
     if task is not None:
         return {"task": task, "command": _fetch("commands", command_id), "task_id": task_id,
-                "command_id": command_id, "dispatch_request_status": None}
+                "command_id": command_id, "dispatch_request_status": None,
+                "dispatch_request_read_failed": False}
+    # A genuine backend/read failure here (network error, malformed record,
+    # GCS unavailable) must NEVER be silently collapsed onto "no record
+    # exists" -- those are two different truths for a caller like the
+    # Dashboard: "this request_id was never received" vs. "this request_id
+    # was received but its status could not be read right now". Losing that
+    # distinction is exactly what let a real read failure render as nothing
+    # at all (a missing row) instead of an honest UNKNOWN. See
+    # dispatch_request_read_failed below -- callers that only look at
+    # dispatch_request_status keep working unchanged (None still means "no
+    # richer evidence, fall back to has_dispatch_request/UNKNOWN"), this is
+    # a purely additive signal for the ones that care about the distinction.
     try:
         status = read_dispatch_request_status(registry, project_id, request_id)
+        read_failed = False
     except TaskError:
         status = None
+        read_failed = True
     return {"task": None, "command": None, "task_id": task_id, "command_id": command_id,
-            "dispatch_request_status": status}
+            "dispatch_request_status": status, "dispatch_request_read_failed": read_failed}
+
+
+def list_recent_dispatch_request_ids(bucket, project_id, session=None, max_results=DEFAULT_RECENT_REQUEST_LIST_LIMIT):
+    """Bounded discovery of candidate request_ids for one project -- used
+    ONLY to seed which request_ids a pre-Task Dashboard view should look up
+    via resolve_dispatch_status_for_request()/read_dispatch_request_status();
+    NEVER treated as state truth itself (a name appearing here proves
+    nothing about status -- the resolver call is still the sole source of
+    truth for ACCEPTED/REJECTED/FAILED/etc).
+
+    `max_results` is a hard, small, fixed cap (default
+    DEFAULT_RECENT_REQUEST_LIST_LIMIT) passed straight through to the GCS
+    JSON API's own `maxResults` query param -- this is a single bounded
+    listing call, never pagination through full history, and callers must
+    not loop past the first page. This is the same "bounded, cached,
+    no-full-history-scan" discipline as manager/dashboard.py's existing
+    list_records_isolated()/RECENT_RECORD_LIMIT for Drive-backed records --
+    prior incidents (unbounded list_executions(), full Drive history scans)
+    caused multi-minute Dashboard load latency, and this must not repeat
+    that class of bug.
+
+    Fails soft: returns [] on any error (missing bucket, no credentials, GCS
+    unreachable, malformed response) rather than raising -- a listing
+    failure degrades to "no pre-Task rows shown this refresh", never a
+    Dashboard crash, matching every other best-effort observability reader
+    in this module.
+    """
+    if not bucket or not project_id:
+        return []
+    if session is None:
+        try:
+            import google.auth
+            from google.auth.transport.requests import AuthorizedSession
+            credentials, _ = google.auth.default(scopes=[GCS_SCOPE])
+            session = AuthorizedSession(credentials)
+        except Exception:
+            return []
+    prefix = f"dispatch-requests/{safe_id(project_id)}/"
+    encoded_bucket = quote(bucket, safe="")
+    list_url = f"https://storage.googleapis.com/storage/v1/b/{encoded_bucket}/o"
+    try:
+        response = session.get(
+            list_url, params={"prefix": prefix, "maxResults": int(max_results)}, timeout=10,
+        )
+        if response.status_code != 200:
+            return []
+        items = response.json().get("items", [])
+    except Exception:
+        return []
+    request_ids = []
+    for item in items:
+        name = item.get("name", "")
+        if not name.startswith(prefix) or not name.endswith(".json"):
+            continue
+        request_ids.append(name[len(prefix):-len(".json")])
+    return request_ids[:max_results]

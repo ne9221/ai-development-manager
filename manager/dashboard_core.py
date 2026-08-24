@@ -730,6 +730,38 @@ def compute_dispatch_state(
 ) -> Dict[str, str]:
     """Truthfully classify one task's dispatch state.
 
+    =====================================================================
+    Two-Tick Visibility SLA -- formal contract (SLA_START_POINT)
+    =====================================================================
+    SLA_START_POINT = the moment ingress first successfully observes a
+    valid request file -- NOT the file's own created-at timestamp, since
+    the system cannot guarantee file-created -> observed-by-scheduler
+    ordering before the scheduler has actually run (a file can be created
+    long before any scheduler tick looks at it; measuring from creation
+    would make the SLA unmeetable by construction on a cold/backlogged
+    queue, and would blame ingress for OS/Drive propagation delay that
+    ingress has no control over).
+
+    Formal definition: from the first successful ingress observation of
+    the request, within at most 2 normal scheduler ticks, the ADM
+    user-visible interface (this Dashboard, via the functions in this
+    module) must show one of: ACCEPTED, QUEUED, RUNNING, BLOCKED,
+    REJECTED, FAILED (i.e. never nothing at all, and never a state that
+    understates progress -- see compute_dispatch_state()'s state-priority
+    rules below for what "never nothing at all" requires: a request with
+    NO Task record yet must still resolve to a real state via
+    `dispatch_request_status`/`has_dispatch_request`, not silently vanish).
+
+    `request_created_at` (the request file's own created_at field, as
+    written by whatever produced it) should still be recorded/available
+    wherever a request's Drive/GCS record already carries it (e.g.
+    manager.dispatch_requests's claim record `created_at` field) -- it is
+    useful for measuring file-created -> first-observed latency as a
+    SEPARATE diagnostic metric. It is explicitly NOT the 2-tick execution
+    SLA's starting point; do not conflate the two when reasoning about
+    whether the 2-tick SLA was met.
+    =====================================================================
+
     Never reports SUBMITTED/ACCEPTED/QUEUED/CLAIMED as RUNNING: RUNNING is
     only reached when the *command* says running AND
     determine_execution_state() independently proves the execution is
@@ -920,6 +952,86 @@ def build_dispatch_truth_row(
         "execution_id": execution_id or UNKNOWN_LABEL,
         "session_id": session_id or UNKNOWN_LABEL,
         "quota": quota,
+    }
+
+
+def build_pretask_dispatch_truth_row(
+    project: Optional[Dict[str, Any]],
+    project_id: str,
+    request_id: str,
+    dispatch_request_status: Optional[Dict[str, Any]],
+    account_vms: Sequence[AccountQuotaCardViewModel],
+    now: datetime,
+    dispatch_request_read_failed: bool = False,
+) -> Dict[str, Any]:
+    """Same output shape/contract as build_dispatch_truth_row(), for a
+    dispatch request ingress has observed BEFORE any Task record exists yet
+    (VISIBLE_BEFORE_TASK: this is the P0 gap that made an ACCEPTED/
+    REJECTED/FAILED request invisible in the real Dashboard when no Task
+    had been created for it yet).
+
+    task_id here is the deterministic f"dispatch-{request_id}" identity
+    (manager.dispatch_requests.resolve_dispatch_status_for_request()'s own
+    scheme) -- a caller MUST only call this once it has confirmed no real
+    Task record exists for that id (see resolve_dispatch_status_for_request
+    returning task=None), so this row is never a duplicate of a Task-truth
+    row: once a Task exists, Task/Command/Execution truth is the sole
+    source (see compute_dispatch_state()'s task-first branching), and no
+    caller here should still be building a pre-Task row for it.
+
+    Provider/account/model/mode are always the literal UNKNOWN at this
+    stage -- no Command/Execution exists yet to carry them, so this is an
+    honest UNKNOWN, not a guess. compute_visible_dispatch_gate() already
+    treats a literal UNKNOWN value as a truthful PASS for a required field
+    (see its docstring), so this row still passes the Gate.
+
+    `dispatch_request_read_failed=True` (see
+    manager.dispatch_requests.resolve_dispatch_status_for_request()'s own
+    `dispatch_request_read_failed` field) means the underlying status read
+    itself definitively failed (backend/network/malformed-record error) --
+    NOT "no record was ever received". compute_dispatch_state() itself is
+    never told about this distinction (its own has_dispatch_request/
+    dispatch_request_status contract is intentionally unchanged -- see its
+    docstring), so a genuine read failure is special-cased here, in this
+    view-model layer, to an honest UNKNOWN with a reason that says so --
+    never silently reported as ACCEPTED (which would be a guess) and never
+    as "no row at all" (which is exactly the failure mode
+    VISIBLE_BEFORE_TASK/dashboard_gate case 4 exists to close).
+    """
+    if dispatch_request_read_failed:
+        dispatch = {
+            "state": DISPATCH_STATE_UNKNOWN,
+            "reason": "dispatch request status read failed (backend/network error); "
+                      "state cannot be truthfully determined this refresh",
+        }
+    else:
+        dispatch = compute_dispatch_state(
+            None, None, None, now, has_dispatch_request=True,
+            dispatch_request_status=dispatch_request_status,
+        )
+    project_name = (project.get("name") if isinstance(project, dict) else None) or project_id or UNKNOWN_LABEL
+
+    return {
+        "project_id": project_id or UNKNOWN_LABEL,
+        "project_name": project_name,
+        "task_id": f"dispatch-{request_id}",
+        # No Task record exists yet -- there is no real title to show -- but
+        # the request_id itself is real, durable evidence (this is why this
+        # row exists at all), so it is surfaced here rather than the bare
+        # literal UNKNOWN_LABEL: a blank/UNKNOWN title would leave a user
+        # unable to tell which pre-Task row is which at a glance.
+        "task_title": f"(pre-task) request {request_id}" if request_id else UNKNOWN_LABEL,
+        "provider": UNKNOWN_LABEL,
+        "account_id": UNKNOWN_LABEL,
+        "model": UNKNOWN_LABEL,
+        "mode": UNKNOWN_LABEL,
+        "dispatch_state": dispatch["state"],
+        "dispatch_reason": dispatch["reason"],
+        "execution_id": UNKNOWN_LABEL,
+        "session_id": UNKNOWN_LABEL,
+        "quota": build_quota_truth(account_vms, UNKNOWN_LABEL, UNKNOWN_LABEL),
+        "request_id": request_id,
+        "pretask": True,
     }
 
 
