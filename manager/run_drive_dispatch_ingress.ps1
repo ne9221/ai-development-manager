@@ -18,6 +18,11 @@ param(
     [Parameter(Mandatory=$true)][string]$WorkspaceRoot
 )
 
+$env:ADM_SCHEDULER_INVOCATION_ID = [guid]::NewGuid().ToString("N")
+$env:ADM_SCHEDULER_TASK_NAME = "AI Development Manager - Drive Dispatch Ingress"
+$env:ADM_SCHEDULER_WRAPPER_PID = "$PID"
+$env:ADM_SCHEDULER_TRIGGER_ORIGIN = "unknown"
+
 # Fail-closed WorkspaceRoot validation, before ADM_WORKSPACE_ROOT is ever
 # exported and before any provenance/Python invocation below: non-empty,
 # absolute, an existing directory, and not equal to or under the OS temp

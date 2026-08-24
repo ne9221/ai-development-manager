@@ -333,6 +333,8 @@ def main(argv=None):
     parser.add_argument("--wait-seconds", type=float, default=1800.0)
     args = parser.parse_args(argv)
 
+    from manager.scheduler_provenance import finish, start
+    invocation = start(os.environ.get("AI_MANAGER_HOME", "."), "session_center_supervisor")
     try:
         with runtime_lock(lock_path_for(args.state_file)):
             runtime = Path(args.manager_home) / "runtime"
@@ -356,6 +358,8 @@ def main(argv=None):
         # nothing. This is not a failure -- it is mutual exclusion working.
         result = {"status": "locked"}
     print(json.dumps(result))
+    finish(os.environ.get("AI_MANAGER_HOME", "."), invocation,
+           "failed" if result.get("status") == "unavailable" else "completed")
     return 0
 
 

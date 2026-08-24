@@ -607,6 +607,24 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertEqual(self.REGISTRY, kwargs.get("claude_accounts"))
         self.assertEqual("completed", result["status"])
 
+    def test_direct_process_command_is_explicitly_marked_unknown(self):
+        result, runner = self._run_explicit(command(provider="claude", account_id="account-a"))
+        _, kwargs = runner.call_args
+        self.assertEqual({"caller_origin": "direct_or_unknown", "scheduler_invocation_id": None},
+                         kwargs.get("provenance"))
+        self.assertEqual("completed", result["status"])
+
+    def test_watcher_context_threads_one_invocation_id_to_launch(self):
+        runner = Mock(return_value=self.complete("exec-claude"))
+        context = {"scheduler_invocation_id": "a" * 32}
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher._claude_account_registry", return_value=self.REGISTRY):
+            process_command(self.store, object(), command(provider="claude", account_id="account-a"),
+                            claim_factory=self.claim_factory, allowlist=frozenset({("p1", "t1")} ),
+                            health_check=lambda: True, quota_check=lambda service: True, origin_context=context)
+        self.assertEqual({"caller_origin": "watcher_poll", "scheduler_invocation_id": "a" * 32},
+                         runner.call_args.kwargs["provenance"])
+
     def test_command_explicit_account_b_threads_through_to_launch_task(self):
         result, runner = self._run_explicit(command(provider="claude", account_id="account-b"))
         runner.assert_called_once()

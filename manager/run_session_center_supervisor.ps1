@@ -9,6 +9,11 @@ param(
     [string]$GcsBucket
 )
 
+$env:ADM_SCHEDULER_INVOCATION_ID = [guid]::NewGuid().ToString("N")
+$env:ADM_SCHEDULER_TASK_NAME = "AI Development Manager - Session Center Supervisor"
+$env:ADM_SCHEDULER_WRAPPER_PID = "$PID"
+$env:ADM_SCHEDULER_TRIGGER_ORIGIN = "unknown"
+
 $env:AI_MANAGER_HOME = $ManagerHome
 $env:GOOGLE_DRIVE_TOKEN = Join-Path $ManagerHome "google-drive-token.json"
 if ($PythonDeps) { $env:PYTHONPATH = $PythonDeps }
