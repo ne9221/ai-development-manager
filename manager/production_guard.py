@@ -49,6 +49,20 @@ def _activated_evidence_path(manager_home) -> Path:
     return Path(manager_home) / "provenance" / "activated_sha.json"
 
 
+def runtime_repository_path(manager_home, fallback) -> Path:
+    """Resolve the ADM runtime identity from its activated evidence, never cwd."""
+    evidence_path = _activated_evidence_path(manager_home)
+    if not evidence_path.exists():
+        return Path(fallback)
+    try:
+        repository_path = json.loads(evidence_path.read_text(encoding="utf-8")).get("repository_path")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeGuardError("EVIDENCE_INVALID", f"EVIDENCE_INVALID: activated evidence {evidence_path} is malformed") from exc
+    if not isinstance(repository_path, str) or not repository_path.strip():
+        raise RuntimeGuardError("EVIDENCE_INVALID", "EVIDENCE_INVALID: activated evidence repository_path is invalid")
+    return Path(repository_path)
+
+
 def _is_production_runtime(repository_path, manager_home) -> bool:
     """Production is explicit: a marker, or activation evidence for this checkout.
 
@@ -75,12 +89,14 @@ def require_runtime_guard(repository_path=None, manager_home=None) -> dict:
     an unmarked developer checkout; it never captures evidence, activates, or
     repairs a marker.
     """
-    repository_path = Path(repository_path or os.getcwd())
     home_value = manager_home or os.environ.get("AI_MANAGER_HOME")
     # Tests and service accounts can legitimately have no resolvable HOME.
     # This fallback is only for an unmarked developer checkout; production
     # wrappers/direct invocations supply AI_MANAGER_HOME explicitly.
-    manager_home = Path(home_value) if home_value else repository_path / ".ai-development-manager"
+    manager_home = Path(home_value) if home_value else Path(__file__).resolve().parents[1] / ".ai-development-manager"
+    repository_path = Path(repository_path) if repository_path is not None else runtime_repository_path(
+        manager_home, Path(__file__).resolve().parents[1]
+    )
     if not _is_production_runtime(repository_path, manager_home):
         return {"state": "PASS", "production": False}
 

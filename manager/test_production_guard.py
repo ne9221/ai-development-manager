@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,7 @@ from manager.production_guard import (
     production_marker_path,
     RuntimeGuardError,
     require_runtime_guard,
+    runtime_repository_path,
 )
 
 
@@ -87,6 +89,17 @@ class ProductionGuardTests(unittest.TestCase):
         self.assertTrue(require_runtime_guard(repo, home)["production"])
         dev = self.root / "dev"; dev.mkdir()
         self.assertEqual({"state": "PASS", "production": False}, require_runtime_guard(dev, home))
+
+    def test_implicit_runtime_identity_comes_from_activated_evidence_not_cwd(self):
+        repo, home = self._activated_repo()
+        foreign = self.root / "foreign"; foreign.mkdir()
+        self.assertEqual(repo.resolve(), runtime_repository_path(home, foreign).resolve())
+        previous = Path.cwd()
+        try:
+            os.chdir(foreign)
+            self.assertTrue(require_runtime_guard(manager_home=home)["production"])
+        finally:
+            os.chdir(previous)
 
     def test_missing_or_malformed_marker_fails_closed_without_repair(self):
         repo, home = self._activated_repo()
