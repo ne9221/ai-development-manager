@@ -6,8 +6,8 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
-from manager.dispatch_requests import dispatch_request_registry
-from manager.tasks import MIME_FOLDER, MIME_JSON, TaskError, validate
+from manager.dispatch_requests import dispatch_rejection_registry, dispatch_request_registry, record_dispatch_rejection
+from manager.tasks import MIME_FOLDER, MIME_JSON, TaskError, now_iso, validate
 
 
 FOLDER_NAME = "DISPATCH-REQUESTS"
@@ -267,6 +267,7 @@ def read_request(service, folder_id, expected_owner, metadata, now=None):
 
 def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expected_owner=None, now=None,
                                  registry_factory=dispatch_request_registry,
+                                 rejection_registry_factory=dispatch_rejection_registry,
                                  max_candidates=DEFAULT_MAX_CANDIDATES_PER_POLL,
                                  recent_candidates=DEFAULT_RECENT_CANDIDATES,
                                  deadline=None, time_budget_seconds=DEFAULT_TIME_BUDGET_SECONDS,
@@ -384,7 +385,17 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
       here (or anywhere in this module) -- every file remains in
       DISPATCH-REQUESTS for audit regardless of outcome. Idempotency
       remains solely manager.dispatch_requests.dispatch_request_registry()
-      via handle_dispatch(); this function creates no other durable state.
+      via handle_dispatch(). A candidate rejected before ever reaching that
+      registry (malformed JSON, schema-invalid payload, unverifiable
+      provenance, invalid project_id/provider/account, oversized/wrong-MIME,
+      or any other TaskError/DispatchIngressError _handle_one() catches) now
+      durably records that rejection instead -- keyed by the Drive file's
+      own id, via manager.dispatch_requests.record_dispatch_rejection() --
+      so it is never silently lost with only this poll's own in-memory
+      return value as evidence (see P0 dispatch-two-tick-final-20260824
+      Phase 3). This is still best-effort/non-authoritative: a failure to
+      record the rejection itself never masks or replaces the real
+      rejection outcome already reflected in this function's return value.
     """
     folder_id = folder_id or os.environ.get(FOLDER_ENV)
     expected_owner = expected_owner or os.environ.get(OWNER_ENV)
@@ -415,8 +426,19 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
             result = handle_dispatch(store, service, lambda project_id, request_id:
                                      registry_factory(bucket, project_id, request_id), payload)
             results.append({"file_id": metadata["id"], **result})
-        except (TaskError, DispatchIngressError):
-            results.append({"file_id": metadata.get("id"), "accepted": False})
+        except (TaskError, DispatchIngressError) as exc:
+            file_id = metadata.get("id") if isinstance(metadata, dict) else None
+            reason_code = exc.code if isinstance(exc, DispatchIngressError) else "ingress_rejected"
+            if file_id:
+                try:
+                    record_dispatch_rejection(rejection_registry_factory(bucket, file_id), file_id,
+                                              reason_code, str(exc), now_iso())
+                except Exception:
+                    # Best-effort only (see docstring): never let a failure
+                    # to durably record the rejection mask the real
+                    # rejection outcome this poll already produced below.
+                    pass
+            results.append({"file_id": file_id, "accepted": False})
 
     def _scan(metadata_list, budget):
         used = 0

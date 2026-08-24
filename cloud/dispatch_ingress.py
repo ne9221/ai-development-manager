@@ -151,6 +151,18 @@ CLAIM_VERIFICATION_DELAY_SECONDS = 0.02
 # visibility gap this task exists to close.
 INGRESS_DISPATCH_HISTORY_BUDGET_SECONDS = 15.0
 
+# Bounds manager.dispatcher.dispatch()'s own manager.quota_reader.
+# read_drive_status() call (via the `quota_timeout_seconds` it accepts) on
+# this ingress's request -> Task/Command creation path. A slow/hanging
+# quota read can then never silently block visibility beyond this budget --
+# it surfaces as a definite, durable "failed" claim-record outcome (see
+# handle_dispatch()'s create()) with an exact reason instead. This never
+# causes UNKNOWN quota to be guessed as any specific provider: on timeout,
+# dispatch() itself never runs past the quota read, so no provider
+# selection happens at all -- the request simply fails closed and becomes
+# retryable, exactly like any other pre-artifact dispatch() failure.
+INGRESS_QUOTA_READ_BUDGET_SECONDS = 10.0
+
 
 class DispatchIngressError(TaskError):
     def __init__(self, code, message):
@@ -637,7 +649,8 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
         if requested_account_id is not None:
             internal_request["account_id"] = requested_account_id
         result = dispatcher_dispatch(store, service, internal_request,
-                                     history_deadline=time.monotonic() + INGRESS_DISPATCH_HISTORY_BUDGET_SECONDS)
+                                     history_deadline=time.monotonic() + INGRESS_DISPATCH_HISTORY_BUDGET_SECONDS,
+                                     quota_timeout_seconds=INGRESS_QUOTA_READ_BUDGET_SECONDS)
 
         # Defense in depth: the explicit request was already validated above,
         # but never trust that dispatcher_dispatch() actually honored it --

@@ -439,6 +439,63 @@ class DispatcherTests(unittest.TestCase):
         bounded.assert_not_called()
         unbounded.assert_called_once_with(self.store, "p1")
 
+    def test_dispatch_bounds_quota_read_and_fails_closed_on_timeout(self):
+        """P0 dispatch-two-tick-final Phase 3: a hanging/slow quota read
+        must never block dispatch() (and therefore the caller's downstream
+        Task creation) beyond `quota_timeout_seconds` -- it must fail closed
+        (TaskError) with an exact, distinguishing reason instead of hanging
+        indefinitely."""
+        import threading
+        import time as time_module
+
+        release = threading.Event()
+
+        def hanging_read_drive_status(service=None):
+            release.wait(timeout=5)
+            return quota()
+
+        with mock.patch("manager.dispatcher.read_drive_status", side_effect=hanging_read_drive_status):
+            before = time_module.monotonic()
+            with self.assertRaisesRegex(TaskError, "quota read did not complete"):
+                dispatch(self.store, object(), request(task_id="quota-timeout-task"), executions=[],
+                        quota_timeout_seconds=0.2)
+            elapsed = time_module.monotonic() - before
+        release.set()
+        self.assertLess(elapsed, 2.0)
+
+    def test_dispatch_quota_timeout_never_guesses_a_provider(self):
+        """On a quota-read timeout, dispatch() must never proceed past the
+        quota read at all -- no provider selection, no Task creation, no
+        quota data (real or fabricated) reaches manager.assignment.decide()."""
+        with mock.patch("manager.dispatcher.read_drive_status", side_effect=lambda service=None: __import__("time").sleep(5)):
+            with self.assertRaises(TaskError):
+                dispatch(self.store, object(), request(task_id="quota-timeout-no-guess"), executions=[],
+                        quota_timeout_seconds=0.1)
+        with self.assertRaises(TaskError):
+            self.store.get("tasks", "p1", "quota-timeout-no-guess")
+
+    def test_dispatch_explicit_quota_document_bypasses_bounded_read(self):
+        """An explicitly supplied quota_document (every existing test/caller
+        that already precomputes it) must always win over
+        quota_timeout_seconds -- the bounded read is never attempted."""
+        with mock.patch("manager.dispatcher._read_drive_status_bounded") as bounded, \
+             mock.patch("manager.dispatcher.read_drive_status") as unbounded:
+            dispatch(self.store, object(), request(task_id="quota-doc-task"), quota(), executions=[],
+                    quota_timeout_seconds=5.0)
+        bounded.assert_not_called()
+        unbounded.assert_not_called()
+
+    def test_dispatch_omits_bounded_quota_read_when_no_timeout_given(self):
+        """No quota_timeout_seconds (every existing caller that does not
+        pass it) must keep calling the original unbounded read_drive_status()
+        directly -- this fix must not silently change behavior for callers
+        that never opted into bounding."""
+        with mock.patch("manager.dispatcher._read_drive_status_bounded") as bounded, \
+             mock.patch("manager.dispatcher.read_drive_status", return_value=quota()) as unbounded:
+            dispatch(self.store, object(), request(task_id="quota-no-timeout-task"), executions=[])
+        bounded.assert_not_called()
+        unbounded.assert_called_once_with(service=mock.ANY)
+
 
 class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
     """Regression test suite for M1 Slice 2: Forecast Evidence -> Account-aware Quota Routing."""

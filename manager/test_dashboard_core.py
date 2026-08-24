@@ -27,6 +27,8 @@ from manager.dashboard_core import (
     DISPATCH_STATE_RUNNING,
     DISPATCH_STATE_COMPLETED,
     DISPATCH_STATE_BLOCKED,
+    DISPATCH_STATE_FAILED,
+    DISPATCH_STATE_REJECTED,
     DISPATCH_STATE_UNKNOWN,
     compute_dispatch_state,
     build_provider_truth,
@@ -47,7 +49,8 @@ from manager.quota_forecast import (
     RiskStatus,
     ActionRecommendation
 )
-from manager.tasks import DriveRecords, create_project
+from manager.dispatch_requests import claim_dispatch_request, mark_dispatch_request_status, resolve_dispatch_status_for_request
+from manager.tasks import DriveRecords, create_project, create_task
 from manager.test_dispatcher import quota as quota_fixture
 from manager.test_task_claims import MemoryClaimRegistry
 from manager.test_tasks import FakeDriveService
@@ -859,6 +862,96 @@ class VisibleDispatchTruthGateTests(unittest.TestCase):
     # 12. Missing Drive record degrades gracefully to UNKNOWN.
     def test_missing_task_record_is_unknown(self):
         result = compute_dispatch_state(None, None, None, self.now)
+        self.assertEqual(result["state"], DISPATCH_STATE_UNKNOWN)
+
+    # 12b. P0 dispatch-two-tick-final Phase 3C: real dispatch_request_status
+    # evidence must be consulted even with NO Task record at all -- this was
+    # this function's own gap in the request->Task visibility window (a
+    # request already durably accepted/failed by ingress must never report
+    # UNKNOWN just because no Task exists yet).
+    def test_no_task_but_accepted_dispatch_request_status_is_accepted_not_unknown(self):
+        result = compute_dispatch_state(None, None, None, self.now,
+                                        dispatch_request_status={"status": "accepted", "failure_reason": None})
+        self.assertEqual(result["state"], DISPATCH_STATE_ACCEPTED)
+
+    def test_no_task_but_dispatched_status_is_accepted_not_unknown(self):
+        result = compute_dispatch_state(None, None, None, self.now,
+                                        dispatch_request_status={"status": "dispatched", "failure_reason": None})
+        self.assertEqual(result["state"], DISPATCH_STATE_ACCEPTED)
+
+    def test_no_task_and_failed_dispatch_request_status_is_failed_with_reason(self):
+        result = compute_dispatch_state(None, None, None, self.now,
+                                        dispatch_request_status={"status": "failed", "failure_reason": "no eligible provider"})
+        self.assertEqual(result["state"], DISPATCH_STATE_FAILED)
+        self.assertEqual("no eligible provider", result["reason"])
+
+    def test_no_task_and_rejected_status_is_rejected_with_reason(self):
+        result = compute_dispatch_state(None, None, None, self.now,
+                                        dispatch_request_status={"status": "rejected", "reason_code": "malformed_request"})
+        self.assertEqual(result["state"], DISPATCH_STATE_REJECTED)
+        self.assertEqual("malformed_request", result["reason"])
+
+    def test_no_task_no_dispatch_request_status_still_unknown(self):
+        """A genuinely never-received request_id must still report UNKNOWN
+        -- this evidence-based ACCEPTED/FAILED/REJECTED reporting must never
+        fabricate a status when nothing was actually ever recorded."""
+        result = compute_dispatch_state(None, None, None, self.now, dispatch_request_status=None)
+        self.assertEqual(result["state"], DISPATCH_STATE_UNKNOWN)
+
+    def test_dispatch_request_status_takes_priority_over_plain_boolean(self):
+        result = compute_dispatch_state(None, None, None, self.now, has_dispatch_request=True,
+                                        dispatch_request_status={"status": "failed", "failure_reason": "boom"})
+        self.assertEqual(result["state"], DISPATCH_STATE_FAILED)
+
+    # 12c. End-to-end canonical status reader: manager.dispatch_requests.
+    # resolve_dispatch_status_for_request() feeding compute_dispatch_state()
+    # directly, covering both branches (Task exists / Task does not exist
+    # yet) against a real DriveRecords + MemoryClaimRegistry double.
+    def test_resolver_prefers_task_truth_when_task_exists(self):
+        store = DriveRecords(FakeDriveService())
+        create_project(store, {"project_id": "p1", "name": "P1", "repo": "r", "default_branch": "main",
+                               "runtime_ssot": "Drive", "project_rules": [], "active_tasks": [],
+                               "current_phase": "Phase 1", "important_constraints": []})
+        create_task(store, {
+            "task_id": "dispatch-req-x", "project_id": "p1", "title": "Ingress task",
+            "task_type": "general", "expected_minutes": 20, "scope": [], "constraints": [],
+            "acceptance_criteria": [], "source_context": {},
+        }, assign=False)
+        registry = MemoryClaimRegistry()
+        claim_dispatch_request(registry, "p1", "req-x", "dispatch-req-x", "dispatch-req-x", "2026-08-24T00:00:00Z")
+        mark_dispatch_request_status(registry, "p1", "req-x", 1, "dispatched")
+        resolved = resolve_dispatch_status_for_request(store, registry, "p1", "req-x")
+        self.assertIsNotNone(resolved["task"])
+        self.assertIsNone(resolved["dispatch_request_status"])
+        result = compute_dispatch_state(resolved["task"], resolved["command"], None, self.now,
+                                        dispatch_request_status=resolved["dispatch_request_status"])
+        self.assertEqual(result["state"], DISPATCH_STATE_SUBMITTED)
+
+    def test_resolver_falls_back_to_ingress_truth_when_no_task_exists(self):
+        store = DriveRecords(FakeDriveService())
+        create_project(store, {"project_id": "p1", "name": "P1", "repo": "r", "default_branch": "main",
+                               "runtime_ssot": "Drive", "project_rules": [], "active_tasks": [],
+                               "current_phase": "Phase 1", "important_constraints": []})
+        registry = MemoryClaimRegistry()
+        claim_dispatch_request(registry, "p1", "req-y", "dispatch-req-y", "dispatch-req-y", "2026-08-24T00:00:00Z")
+        resolved = resolve_dispatch_status_for_request(store, registry, "p1", "req-y")
+        self.assertIsNone(resolved["task"])
+        self.assertEqual("accepted", resolved["dispatch_request_status"]["status"])
+        result = compute_dispatch_state(resolved["task"], resolved["command"], None, self.now,
+                                        dispatch_request_status=resolved["dispatch_request_status"])
+        self.assertEqual(result["state"], DISPATCH_STATE_ACCEPTED)
+
+    def test_resolver_reports_none_when_nothing_was_ever_received(self):
+        store = DriveRecords(FakeDriveService())
+        create_project(store, {"project_id": "p1", "name": "P1", "repo": "r", "default_branch": "main",
+                               "runtime_ssot": "Drive", "project_rules": [], "active_tasks": [],
+                               "current_phase": "Phase 1", "important_constraints": []})
+        registry = MemoryClaimRegistry()
+        resolved = resolve_dispatch_status_for_request(store, registry, "p1", "req-never-seen")
+        self.assertIsNone(resolved["task"])
+        self.assertIsNone(resolved["dispatch_request_status"])
+        result = compute_dispatch_state(resolved["task"], resolved["command"], None, self.now,
+                                        dispatch_request_status=resolved["dispatch_request_status"])
         self.assertEqual(result["state"], DISPATCH_STATE_UNKNOWN)
 
     # 13. Dashboard truth rows use the real schema fields (not renamed/invented ones).

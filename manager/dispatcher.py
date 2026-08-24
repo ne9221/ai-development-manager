@@ -2,6 +2,7 @@
 """Compose existing runtime signals into an AI-ready prompt without executing it."""
 
 import argparse
+import concurrent.futures
 import json
 import math
 import re
@@ -140,7 +141,31 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
     return clean("\n".join(lines))
 
 
-def dispatch(store, service, request, quota_document=None, executions=None, history_store=None, history_deadline=None):
+def _read_drive_status_bounded(service, timeout_seconds):
+    """Bounds manager.quota_reader.read_drive_status() with a hard wall-clock
+    timeout so a slow/hanging quota read (Drive API latency, network stall)
+    can never block dispatch()'s own downstream Task creation/visibility --
+    raises TaskError instead of hanging indefinitely once `timeout_seconds`
+    elapses. read_drive_status() has no native deadline parameter of its
+    own; this wraps it in a single-use bounded executor rather than
+    modifying its internals (out of this task's minimal-change scope). If
+    the underlying call does eventually complete after the timeout, its
+    result is simply discarded -- this function's caller never sees or acts
+    on it, so a late-arriving quota read cannot retroactively contradict
+    whatever this call already decided (e.g. a "failed" dispatch-request
+    status already recorded)."""
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(read_drive_status, service=service)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        raise TaskError(f"quota read did not complete within {timeout_seconds}s") from exc
+    finally:
+        executor.shutdown(wait=False)
+
+
+def dispatch(store, service, request, quota_document=None, executions=None, history_store=None, history_deadline=None,
+             quota_timeout_seconds=None):
     """`history_deadline`, if given, is a `time.monotonic()` value forwarded to
     manager.executions.list_executions_bounded() for the historical-estimate
     lookup below, instead of the unbounded list_executions() -- see that
@@ -149,12 +174,27 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
     exists to bound. Ignored whenever `executions` is explicitly supplied
     (every existing test/caller that passes its own history list). Defaults
     to None, reproducing this function's exact unbounded behavior for every
-    existing caller that does not pass it."""
+    existing caller that does not pass it.
+
+    `quota_timeout_seconds`, if given, bounds the read_drive_status() call
+    below via _read_drive_status_bounded() -- a slow/hanging quota read can
+    then never silently block this function's own downstream Task creation
+    for longer than that budget; it fails closed (TaskError) instead.
+    Ignored whenever `quota_document` is explicitly supplied (every existing
+    test/caller that passes its own quota document). Defaults to None,
+    reproducing this function's exact unbounded behavior for every existing
+    caller that does not pass it."""
     request_ok(request)
     if request.get("research_gate_required"):
         validate_research_gate(request.get("research_evidence"))
     project = store.get("projects", request["project_id"], request["project_id"]); validate("project", project)
-    quota = summarize(quota_document or read_drive_status(service=service), 60)
+    if quota_document is not None:
+        quota_source = quota_document
+    elif quota_timeout_seconds is not None:
+        quota_source = _read_drive_status_bounded(service, quota_timeout_seconds)
+    else:
+        quota_source = read_drive_status(service=service)
+    quota = summarize(quota_source, 60)
     if executions is not None:
         history = executions
     elif history_deadline is not None:

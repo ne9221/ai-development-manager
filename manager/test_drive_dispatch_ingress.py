@@ -16,6 +16,7 @@ from manager.drive_dispatch_ingress import (
     _request_files, poll_drive_dispatch_requests, read_request, verify_ingress_folder,
 )
 from manager.tasks import MIME_FOLDER, MIME_JSON, TaskError
+from manager.test_task_claims import MemoryClaimRegistry
 
 
 OWNER = "owner@example.com"
@@ -239,6 +240,67 @@ class DriveDispatchIngressTests(unittest.TestCase):
                 result = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW)
             self.assertFalse(result[0]["accepted"])
             handler.assert_not_called()
+
+    def test_malformed_request_leaves_durable_rejected_truth(self):
+        """P0 dispatch-two-tick-final Phase 3B: a request that fails before
+        ever reaching (or that can never safely reach -- e.g. missing
+        request_id) the request_id-scoped claim registry must still leave
+        durable, queryable "rejected" truth -- keyed by the Drive file's own
+        id, since the request_id itself may not be trustworthy/present.
+        Previously this was silently lost the moment this poll's own
+        in-memory return value went out of scope."""
+        cases = [
+            # read_request() itself raises plain TaskError for these (schema
+            # validation, unrecognized provider enum) -- reason_code is the
+            # generic "ingress_rejected" fallback, not a DispatchIngressError
+            # .code, since the request never got far enough to reach
+            # validate_dispatch_payload().
+            (b"{broken", "ingress_rejected"),
+            ({k: v for k, v in request().items() if k != "request_id"}, "ingress_rejected"),
+            (request(preferred_provider="gemini"), "ingress_rejected"),
+        ]
+        for document, expected_reason_code in cases:
+            with self.subTest(document=document if isinstance(document, bytes) else document.get("request_id")):
+                service = Service(document)
+                registry = MemoryClaimRegistry()
+                result = poll_drive_dispatch_requests(
+                    object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                    rejection_registry_factory=lambda _bucket, _file_id: registry)
+                self.assertFalse(result[0]["accepted"])
+                self.assertIsNotNone(registry.document)
+                self.assertEqual("rejected", registry.document["status"])
+                self.assertEqual("request-file", registry.document["file_id"])
+                self.assertEqual(expected_reason_code, registry.document["reason_code"])
+                self.assertIsNotNone(registry.document["message"])
+
+    def test_malformed_request_rejection_recording_is_idempotent_across_polls(self):
+        """The same still-malformed file, re-scanned across separate polls
+        (it is never trashed/archived -- see poll_drive_dispatch_requests's
+        own no-deletion contract), must keep exactly one current rejection
+        record, not accumulate duplicates or ever error on the second
+        write."""
+        service = Service(b"{broken")
+        registry = MemoryClaimRegistry()
+        for _ in range(2):
+            poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                         rejection_registry_factory=lambda _bucket, _file_id: registry)
+        self.assertEqual("rejected", registry.document["status"])
+        self.assertEqual(2, registry.generation)
+
+    def test_rejection_recording_failure_never_masks_the_real_rejection_outcome(self):
+        """Best-effort observability, matching manager.dispatch_requests'
+        established contract: if durably recording the rejection itself
+        fails, the poll's own real (in-memory) rejection outcome must still
+        be reported -- never raise, never silently flip to accepted."""
+        service = Service(b"{broken")
+
+        class BrokenRegistry:
+            def read_if_exists(self): raise TaskError("simulated backend unavailable")
+
+        result = poll_drive_dispatch_requests(
+            object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+            rejection_registry_factory=lambda _bucket, _file_id: BrokenRegistry())
+        self.assertFalse(result[0]["accepted"])
 
     def test_wrong_folder_owner_oauth_or_shared_permissions_fail_closed(self):
         mutations = [

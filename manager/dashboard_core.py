@@ -673,6 +673,7 @@ DISPATCH_STATE_COMPLETED = "COMPLETED"
 DISPATCH_STATE_FAILED = "FAILED"
 DISPATCH_STATE_BLOCKED = "BLOCKED"
 DISPATCH_STATE_CANCELLED = "CANCELLED"
+DISPATCH_STATE_REJECTED = "REJECTED"
 DISPATCH_STATE_UNKNOWN = "UNKNOWN"
 
 # Maps manager.dashboard_core.determine_execution_state()'s execution-level
@@ -690,12 +691,42 @@ _TERMINAL_EXECUTION_STATE_TO_DISPATCH_STATE = {
 }
 
 
+def _dispatch_request_state(dispatch_request_status: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """Maps a manager.dispatch_requests.read_dispatch_request_status()/
+    read_dispatch_rejection_status() result onto a Dispatch Truth
+    state+reason, or None if no such evidence is available at all (the
+    caller then falls back to `has_dispatch_request`/SUBMITTED/UNKNOWN
+    exactly as before this existed). "accepted"/"dispatched" both mean
+    ACCEPTED here -- both are real evidence the request was received before
+    any Task/Command was observed; "dispatched" additionally means Task/
+    Command creation itself already succeeded once, so if this is still
+    being consulted (no Task/Command found), something else must have
+    removed them, which is out of scope to second-guess here. "failed" and
+    "rejected" are kept as distinct terminal states (FAILED = a claimed
+    ingress request whose Task/Command creation itself failed; REJECTED = a
+    request that never even reached the claim stage, e.g. malformed/
+    unverifiable) so a caller can tell which stage the request died at.
+    """
+    if not isinstance(dispatch_request_status, dict):
+        return None
+    status = dispatch_request_status.get("status")
+    reason = dispatch_request_status.get("failure_reason") or dispatch_request_status.get("reason_code")
+    if status in ("accepted", "dispatched"):
+        return {"state": DISPATCH_STATE_ACCEPTED, "reason": "dispatch request accepted; no task record found yet"}
+    if status == "failed":
+        return {"state": DISPATCH_STATE_FAILED, "reason": reason or "ingress request failed before a task was created"}
+    if status == "rejected":
+        return {"state": DISPATCH_STATE_REJECTED, "reason": reason or "ingress request rejected before it was claimed"}
+    return None
+
+
 def compute_dispatch_state(
     task: Optional[Dict[str, Any]],
     command: Optional[Dict[str, Any]],
     execution: Optional[Dict[str, Any]],
     now: datetime,
     has_dispatch_request: bool = False,
+    dispatch_request_status: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     """Truthfully classify one task's dispatch state.
 
@@ -705,12 +736,29 @@ def compute_dispatch_state(
     running (status == "running" with provider session evidence) --
     reusing that existing, already-tested distinction rather than
     duplicating it. `has_dispatch_request` is real evidence (a
-    dispatch-requests/*.json idempotency record) that ingress accepted the
-    request before a Task/Command was observed; without it, ACCEPTED is
-    never guessed as a phase distinct from SUBMITTED, because the current
-    schema has no independent signal for it.
+    dispatch-requests/*.json idempotency record exists at all) that ingress
+    accepted the request before a Task/Command was observed; without it,
+    ACCEPTED is never guessed as a phase distinct from SUBMITTED, because
+    the current schema has no independent signal for it. `dispatch_request_
+    status` (manager.dispatch_requests.read_dispatch_request_status()'s own
+    result, or an equivalent rejection-record lookup) is strictly richer
+    evidence when available -- it additionally distinguishes FAILED/REJECTED
+    with an exact reason, not just "was accepted, yes/no" -- and takes
+    priority over the plain boolean when both are given.
+
+    Critically, this evidence is now consulted even when NO Task record
+    exists at all (see the `not isinstance(task, dict)` branch below): a
+    request that was durably accepted/failed/rejected by ingress before any
+    Task was ever created must never report UNKNOWN just because the Task
+    lookup itself came back empty -- that was this function's own gap in
+    the request -> Task visibility window this whole task exists to close.
     """
     if not isinstance(task, dict):
+        request_state = _dispatch_request_state(dispatch_request_status)
+        if request_state is not None:
+            return request_state
+        if has_dispatch_request:
+            return {"state": DISPATCH_STATE_ACCEPTED, "reason": "dispatch request accepted; no task record found yet"}
         return {"state": DISPATCH_STATE_UNKNOWN, "reason": "no task record found"}
 
     task_status = task.get("status")
@@ -722,6 +770,9 @@ def compute_dispatch_state(
             return {"state": DISPATCH_STATE_COMPLETED, "reason": "task completed with no command record"}
         if task_status == "cancelled":
             return {"state": DISPATCH_STATE_CANCELLED, "reason": "task cancelled with no command record"}
+        request_state = _dispatch_request_state(dispatch_request_status)
+        if request_state is not None and request_state["state"] in (DISPATCH_STATE_ACCEPTED, DISPATCH_STATE_FAILED):
+            return request_state
         if has_dispatch_request:
             return {"state": DISPATCH_STATE_ACCEPTED, "reason": "dispatch request accepted; no command observed yet"}
         return {"state": DISPATCH_STATE_SUBMITTED, "reason": "task created, not yet dispatched to a command"}
@@ -838,10 +889,12 @@ def build_dispatch_truth_row(
     account_vms: Sequence[AccountQuotaCardViewModel],
     now: datetime,
     has_dispatch_request: bool = False,
+    dispatch_request_status: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """One user-visible truth row: Project/Task/Provider/Account/Model/Mode/
     Dispatch State/Execution/Session, plus that account's Quota truth."""
-    dispatch = compute_dispatch_state(task, command, execution, now, has_dispatch_request=has_dispatch_request)
+    dispatch = compute_dispatch_state(task, command, execution, now, has_dispatch_request=has_dispatch_request,
+                                      dispatch_request_status=dispatch_request_status)
     provider_truth = build_provider_truth(command, execution)
     quota = build_quota_truth(account_vms, provider_truth["provider"], provider_truth["account_id"])
 
