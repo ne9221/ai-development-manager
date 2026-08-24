@@ -37,6 +37,7 @@
         "caller_origin": {"enum": ["watcher_poll", "direct_or_unknown"]},
         "scheduler_invocation_id": {"type": ["string", "null"], "pattern": "^[0-9a-f]{32}$"},
         "wrapper_pid": {"type": "integer", "minimum": 1},
+        "wrapper_parent_pid": {"type": "integer", "minimum": 1},
         "wrapper_creation_identity": {"type": "string", "minLength": 1, "maxLength": 200},
         "os_scheduler_evidence": {
           "oneOf": [

@@ -119,13 +119,14 @@ class CommandWatcherTests(unittest.TestCase):
         context = {
             "scheduler_invocation_id": "a" * 32,
             "wrapper_pid": 41,
+            "wrapper_parent_pid": 111,
             "wrapper_creation_identity": "windows-filetime:123456789",
             "os_scheduler_evidence": {
                 "status": "PASS", "reason": "event_129_pid_and_instance_link",
                 "task_name": "AI Development Manager - Command Watcher", "instance_id": "instance-1",
                 "trigger_event_record_id": 10, "trigger_event_id": 107,
                 "trigger_time": "2026-08-25T00:00:00Z", "action_event_record_id": 12,
-                "action_process_id": 41, "action_executable": "powershell.exe",
+                "action_process_id": 111, "action_executable": "wscript.exe",
                 "trigger_origin": "scheduled_time", "ignore_new_events": [],
             },
         }
@@ -161,7 +162,7 @@ class CommandWatcherTests(unittest.TestCase):
     def test_process_provenance_schema_rejects_malformed_evidence(self):
         provenance = {
             "caller_origin": "watcher_poll", "scheduler_invocation_id": "a" * 32,
-            "wrapper_pid": 41, "wrapper_creation_identity": "wrapper-41",
+            "wrapper_pid": 41, "wrapper_parent_pid": 111, "wrapper_creation_identity": "wrapper-41",
             "os_scheduler_evidence": {
                 "status": "PASS", "reason": "event_129_pid_and_instance_link",
                 "task_name": "AI Development Manager - Command Watcher", "instance_id": "instance-1",
@@ -174,6 +175,8 @@ class CommandWatcherTests(unittest.TestCase):
         cases = {
             "wrapper_pid_string": {**provenance, "wrapper_pid": "41"},
             "wrapper_pid_nonpositive": {**provenance, "wrapper_pid": 0},
+            "wrapper_parent_pid_string": {**provenance, "wrapper_parent_pid": "111"},
+            "wrapper_parent_pid_nonpositive": {**provenance, "wrapper_parent_pid": 0},
             "invalid_status": {**provenance, "os_scheduler_evidence": {**provenance["os_scheduler_evidence"], "status": "MAYBE"}},
             "invalid_trigger_origin": {**provenance, "os_scheduler_evidence": {**provenance["os_scheduler_evidence"], "trigger_origin": "manual"}},
             "unexpected_field": {**provenance, "unexpected": True},
