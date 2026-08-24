@@ -117,7 +117,20 @@ def good_evidence(
         "manual_trigger_evidence": {"found": manual_found, "source": "Start-ScheduledTask (manual)" if manual_found else None},
         "reached_running": reached_running,
         "real_provider_evidence": {"present": provider_present, "pid": 4242, "host": "HOME"} if provider_present else {"present": False},
+        "scheduler_provenance": scheduler_provenance(),
         "terminal": {"state": terminal_state, "reason_code": terminal_reason} if terminal_state else None,
+    }
+
+
+def scheduler_provenance(status=STATUS_PASS, *, action_pid=41):
+    return {
+        "status": status, "scheduler_invocation_id": "a" * 32, "task_name": "ADM watcher",
+        "os_scheduler_evidence": {"status": status, "instance_id": "instance-1",
+            "task_name": "ADM watcher",
+            "trigger_event_record_id": 10, "action_event_record_id": 12,
+            "action_process_id": action_pid, "trigger_origin": "scheduled_time",
+            "reason": "event_129_pid_and_instance_link"},
+        "reason": "event_129_pid_and_instance_link",
     }
 
 
@@ -170,6 +183,8 @@ def build_fake_store(request_id: str, ingress_first_observed_at: str, *, request
             "execution_id": execution_id,
             "provider": "codex",
             "selection_reason": "quota-eligible-auto-dispatch",
+            "process_provenance": {"scheduler_invocation_id": "a" * 32, "wrapper_pid": 41,
+                "wrapper_creation_identity": "wrapper", "os_scheduler_evidence": scheduler_provenance()["os_scheduler_evidence"]},
         },
         ("executions", PROJECT, execution_id): {
             "task_id": task_id,
@@ -179,7 +194,9 @@ def build_fake_store(request_id: str, ingress_first_observed_at: str, *, request
             "completed_at": ingress_first_observed_at,
             "session_id": session_id,
             "status": "succeeded",
-            "provider_evidence": {"pid": 4242, "host": "HOME"},
+            "provider_evidence": {"pid": 4242, "host": "HOME", "scheduler_invocation_id": "a" * 32,
+                "launcher_pid": 11, "launcher_creation_identity": "launcher", "provider_pid": 4242,
+                "provider_creation_identity": "provider", "provider_parent_identity": "launcher"},
             "quota_evidence": {"account_id": "acct-1"},
         },
         ("sessions", PROJECT, session_id): {
@@ -737,3 +754,52 @@ def test_consecutive_pass_count_stops_at_first_failure():
     assert report.results[1].result == STATUS_FAIL
     assert report.consecutive_pass_count == 1
     assert report.overall == STATUS_FAIL
+
+
+def _check(result, name):
+    return next(check for check in result.checks if check.name == name)
+
+
+def test_scheduler_provenance_is_required_and_complete_proof_passes():
+    result = eval_one(good_evidence("r1"))
+    assert _check(result, "SCHEDULER_PROVENANCE").status == STATUS_PASS
+    assert result.result == STATUS_PASS
+
+
+def test_python_only_missing_and_legacy_provenance_are_unknown_not_pass():
+    for value in ({"status": "UNKNOWN"}, None, {}):
+        evidence = good_evidence("r1")
+        if value is None:
+            evidence.pop("scheduler_provenance")
+        else:
+            evidence["scheduler_provenance"] = value
+        result = eval_one(evidence)
+        assert _check(result, "SCHEDULER_PROVENANCE").status == STATUS_UNKNOWN
+        assert result.result == STATUS_FAIL
+
+
+def test_explicit_provenance_failure_and_middle_failure_cannot_pass_batch():
+    failing = good_evidence("r2")
+    failing["scheduler_provenance"] = scheduler_provenance(STATUS_FAIL)
+    result = eval_one(failing)
+    assert _check(result, "SCHEDULER_PROVENANCE").status == STATUS_FAIL
+    report = evaluate_three_consecutive(
+        ["r1", "r2", "r3"], {"r1": good_evidence("r1"), "r2": failing, "r3": good_evidence("r3")},
+        expected_project_id=PROJECT, tick_seconds=TICK_SECONDS, acceptance_run_started_at=RUN_STARTED_AT,
+    )
+    assert report.overall == STATUS_FAIL
+    assert report.consecutive_pass_count == 1
+
+
+def test_collect_evidence_emits_canonical_scheduler_provenance_and_rejects_cross_task_provider():
+    fresh = ts(1.0)
+    store = build_fake_store("r1", fresh)
+    evidence = collect_evidence(store, PROJECT, "r1", dashboard_probe=_running_dashboard_probe(fresh),
+                                acceptance_run_started_at=RUN_STARTED_AT)
+    assert evidence["scheduler_provenance"]["status"] == STATUS_PASS
+    assert evidence["scheduler_provenance"]["os_scheduler_evidence"]["instance_id"] == "instance-1"
+    execution = next(doc for (area, _, _), doc in store.records.items() if area == "executions")
+    execution["provider_evidence"]["scheduler_invocation_id"] = "b" * 32
+    mismatched = collect_evidence(store, PROJECT, "r1", dashboard_probe=_running_dashboard_probe(fresh),
+                                  acceptance_run_started_at=RUN_STARTED_AT)
+    assert mismatched["scheduler_provenance"]["status"] == STATUS_FAIL
