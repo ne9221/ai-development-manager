@@ -430,7 +430,7 @@ class TestDashboardVisibleBeforeTaskRender(unittest.TestCase):
         mock_store.children.side_effect = lambda parent, name=None: []
         mock_store.get.side_effect = lambda area, project_id, name: {}
 
-        mock_list_ids.return_value = ["req-1"]
+        mock_list_ids.return_value = {"request_ids": ["req-1"], "truncated": False}
         mock_registry.return_value = MagicMock()
         mock_resolve.return_value = resolved
 
@@ -532,6 +532,37 @@ class TestDashboardVisibleBeforeTaskRender(unittest.TestCase):
         markdown_texts = [el.value for el in at.markdown]
         self.assertFalse(any("(pre-task) request req-1" in m for m in markdown_texts),
                          f"A Task now exists for req-1 -- no ingress-only pre-Task row must be shown, got: {markdown_texts}")
+
+    # Blocker 1 (PRETASK_FALSE_NEGATIVE_RISK): when the bounded recent-request
+    # scan could not prove completeness (list_recent_dispatch_request_ids's
+    # truncated=True), the real rendered Dashboard must show an explicit
+    # UNKNOWN/incomplete row -- never silently nothing, even with zero
+    # resolved pretask rows.
+    @patch("manager.dispatch_requests.dispatch_request_registry")
+    @patch("manager.dispatch_requests.resolve_dispatch_status_for_request")
+    @patch("manager.dispatch_requests.list_recent_dispatch_request_ids")
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_pretask_truncated_listing_renders_unknown_not_silent_none(self, mock_build_service, mock_read_drive_status,
+                                                                         mock_drive_records, mock_list_ids, mock_resolve, mock_registry):
+        mock_read_drive_status.return_value = {"providers": []}
+        mock_store = mock_drive_records.return_value
+        mock_store.list_projects.return_value = [{"project_id": "test-project", "title": "Test Project"}]
+        mock_store.project_folder.side_effect = lambda area, project_id, create=False: f"folder-{area}"
+        mock_store.children.side_effect = lambda parent, name=None: []
+        mock_store.get.side_effect = lambda area, project_id, name: {}
+
+        mock_list_ids.return_value = {"request_ids": [], "truncated": True}
+        mock_registry.return_value = MagicMock()
+        mock_resolve.return_value = {"task": None, "command": None}
+
+        at = AppTest.from_file("../dashboard.py")
+        at.run(timeout=30)
+        self.assertFalse(at.exception, f"App crashed rendering a truncated pre-Task listing: {at.exception}")
+        markdown_texts = [el.value for el in at.markdown]
+        self.assertTrue(any("UNKNOWN" in m and "incomplete" in m for m in markdown_texts),
+                        f"Expected a rendered UNKNOWN row for the truncated listing, got: {markdown_texts}")
 
 
 if __name__ == "__main__":

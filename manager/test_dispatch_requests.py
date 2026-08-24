@@ -180,37 +180,105 @@ class DispatchRequestClaimTests(unittest.TestCase):
         with self.assertRaises(TaskError):
             mark_dispatch_request_status(registry, "p1", "req-1", claim["generation"], "bogus-status")
 
+    # --- Blocker 2 (SLA_START_POINT durability) required tests ---
 
-def _fake_session(status_code=200, items=None, raise_exc=None):
+    def test_ingress_first_observed_at_set_once_and_durable_across_retries(self):
+        registry = MemoryClaimRegistry()
+        first = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-24T00:00:00Z")
+        self.assertEqual("2026-08-24T00:00:00Z", first["ingress_first_observed_at"])
+        retry = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-24T00:05:00Z")
+        # The retry's own (later) call-time value must never overwrite the
+        # winner's durable first-observation evidence.
+        self.assertEqual("2026-08-24T00:00:00Z", retry["ingress_first_observed_at"])
+        status = read_dispatch_request_status(registry, "p1", "req-1")
+        self.assertEqual("2026-08-24T00:00:00Z", status["ingress_first_observed_at"])
+
+    def test_request_created_at_persisted_when_provided_and_none_when_omitted(self):
+        registry = MemoryClaimRegistry()
+        claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-24T00:00:00Z",
+                               request_created_at="2026-08-23T23:57:00Z")
+        status = read_dispatch_request_status(registry, "p1", "req-1")
+        self.assertEqual("2026-08-23T23:57:00Z", status["request_created_at"])
+
+        registry2 = MemoryClaimRegistry()
+        claim_dispatch_request(registry2, "p1", "req-2", "dispatch-req-2", "dispatch-req-2", "2026-08-24T00:00:00Z")
+        status2 = read_dispatch_request_status(registry2, "p1", "req-2")
+        self.assertIsNone(status2["request_created_at"])
+
+    def test_status_updated_at_advances_on_transition_but_created_at_never_moves(self):
+        registry = MemoryClaimRegistry()
+        claim = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-24T00:00:00Z")
+        initial = read_dispatch_request_status(registry, "p1", "req-1")
+        self.assertEqual("2026-08-24T00:00:00Z", initial["status_updated_at"])
+        mark_dispatch_request_status(registry, "p1", "req-1", claim["generation"], "dispatched", updated_at="2026-08-24T00:00:45Z")
+        after = read_dispatch_request_status(registry, "p1", "req-1")
+        self.assertEqual("2026-08-24T00:00:45Z", after["status_updated_at"])
+        # created_at/ingress_first_observed_at must remain untouched by a
+        # status transition.
+        self.assertEqual("2026-08-24T00:00:00Z", after["created_at"])
+        self.assertEqual("2026-08-24T00:00:00Z", after["ingress_first_observed_at"])
+
+    def test_legacy_record_without_sla_fields_defaults_first_observed_at_to_created_at(self):
+        """A record written before this change has no ingress_first_
+        observed_at/request_created_at/status_updated_at fields at all --
+        created_at is the mechanically correct default for
+        ingress_first_observed_at (every existing record's created_at
+        already IS that same moment), while request_created_at stays
+        honestly None (never guessed)."""
+        registry = MemoryClaimRegistry()
+        registry.document = {"schema_version": "0.1.0", "project_id": "p1", "request_id": "req-legacy",
+                              "task_id": "dispatch-req-legacy", "command_id": "dispatch-req-legacy",
+                              "created_at": "2026-08-16T00:00:00Z"}
+        registry.generation = 1
+        status = read_dispatch_request_status(registry, "p1", "req-legacy")
+        self.assertEqual("2026-08-16T00:00:00Z", status["ingress_first_observed_at"])
+        self.assertEqual("2026-08-16T00:00:00Z", status["status_updated_at"])
+        self.assertIsNone(status["request_created_at"])
+
+
+def _fake_session(status_code=200, items=None, raise_exc=None, next_page_token=None):
     session = MagicMock()
     if raise_exc is not None:
         session.get.side_effect = raise_exc
     else:
         response = MagicMock()
         response.status_code = status_code
-        response.json.return_value = {"items": items or []}
+        payload = {"items": items or []}
+        if next_page_token is not None:
+            payload["nextPageToken"] = next_page_token
+        response.json.return_value = payload
         session.get.return_value = response
     return session
 
 
+def _item(request_id, updated, project_id="p1"):
+    return {"name": f"dispatch-requests/{project_id}/{request_id}.json", "updated": updated}
+
+
 class ListRecentDispatchRequestIdsTests(unittest.TestCase):
-    """Bounded discovery of candidate request_ids for the Dashboard's
-    pre-Task ingress-truth view -- must never become an unbounded/
-    full-history scan (see project memory: prior incidents from unbounded
-    list_executions()/full Drive history scans caused multi-minute
-    Dashboard load latency)."""
+    """Bounded, recency-CORRECT discovery of candidate request_ids for the
+    Dashboard's pre-Task ingress-truth view -- must never become an
+    unbounded/full-history scan (see project memory: prior incidents from
+    unbounded list_executions()/full Drive history scans caused
+    multi-minute Dashboard load latency), and must never silently return
+    the alphabetically-first page instead of the truly most recent
+    request_ids (GCS Objects.list has no server-side recency ordering --
+    see this module's own docstring for the incident this class guards
+    against: a real most-recent pending request sorting past a naive
+    lexicographic single-page cap and vanishing with no signal)."""
 
     def test_returns_request_ids_stripped_of_prefix_and_suffix(self):
         session = _fake_session(items=[
-            {"name": "dispatch-requests/p1/req-a.json"},
-            {"name": "dispatch-requests/p1/req-b.json"},
+            _item("req-a", "2026-08-24T00:00:01Z"),
+            _item("req-b", "2026-08-24T00:00:02Z"),
         ])
-        ids = list_recent_dispatch_request_ids("bucket-1", "p1", session=session)
-        self.assertEqual(["req-a", "req-b"], ids)
+        result = list_recent_dispatch_request_ids("bucket-1", "p1", session=session)
+        self.assertEqual({"req-b", "req-a"}, set(result["request_ids"]))
+        self.assertFalse(result["truncated"])
 
-    def test_bounded_by_max_results_query_param(self):
+    def test_bounded_by_page_size_query_param(self):
         session = _fake_session(items=[])
-        list_recent_dispatch_request_ids("bucket-1", "p1", session=session, max_results=7)
+        list_recent_dispatch_request_ids("bucket-1", "p1", session=session, page_size=7)
         _, kwargs = session.get.call_args
         self.assertEqual(7, kwargs["params"]["maxResults"])
 
@@ -221,42 +289,114 @@ class ListRecentDispatchRequestIdsTests(unittest.TestCase):
         # refresh into a full-history scan.
         self.assertIsInstance(DEFAULT_RECENT_REQUEST_LIST_LIMIT, int)
         self.assertLessEqual(DEFAULT_RECENT_REQUEST_LIST_LIMIT, 100)
-        session = _fake_session(items=[])
-        list_recent_dispatch_request_ids("bucket-1", "p1", session=session)
-        _, kwargs = session.get.call_args
-        self.assertEqual(DEFAULT_RECENT_REQUEST_LIST_LIMIT, kwargs["params"]["maxResults"])
+        items = [_item(f"req-{i}", f"2026-08-24T00:{i:02d}:00Z") for i in range(DEFAULT_RECENT_REQUEST_LIST_LIMIT + 5)]
+        session = _fake_session(items=items)
+        result = list_recent_dispatch_request_ids("bucket-1", "p1", session=session)
+        self.assertLessEqual(len(result["request_ids"]), DEFAULT_RECENT_REQUEST_LIST_LIMIT)
 
     def test_result_is_never_longer_than_max_results_even_if_backend_over_returns(self):
         # A defensive local slice -- even if a (misbehaving or future)
-        # backend response somehow returns more items than maxResults asked
-        # for, this function must never hand back more than it promised.
-        items = [{"name": f"dispatch-requests/p1/req-{i}.json"} for i in range(50)]
+        # backend response somehow returns more items than the caller asked
+        # to keep, this function must never hand back more than it promised.
+        items = [_item(f"req-{i}", f"2026-08-24T00:{i:02d}:00Z") for i in range(50)]
         session = _fake_session(items=items)
-        ids = list_recent_dispatch_request_ids("bucket-1", "p1", session=session, max_results=5)
-        self.assertLessEqual(len(ids), 5)
+        result = list_recent_dispatch_request_ids("bucket-1", "p1", session=session, max_results=5)
+        self.assertLessEqual(len(result["request_ids"]), 5)
 
     def test_missing_bucket_or_project_id_returns_empty_without_a_call(self):
-        session = _fake_session(items=[{"name": "dispatch-requests/p1/req-a.json"}])
-        self.assertEqual([], list_recent_dispatch_request_ids(None, "p1", session=session))
-        self.assertEqual([], list_recent_dispatch_request_ids("bucket-1", None, session=session))
+        session = _fake_session(items=[_item("req-a", "2026-08-24T00:00:00Z")])
+        self.assertEqual({"request_ids": [], "truncated": False}, list_recent_dispatch_request_ids(None, "p1", session=session))
+        self.assertEqual({"request_ids": [], "truncated": False}, list_recent_dispatch_request_ids("bucket-1", None, session=session))
         session.get.assert_not_called()
 
-    def test_non_200_response_fails_soft_to_empty_list(self):
-        session = _fake_session(status_code=500, items=[{"name": "dispatch-requests/p1/req-a.json"}])
-        self.assertEqual([], list_recent_dispatch_request_ids("bucket-1", "p1", session=session))
+    def test_non_200_response_fails_soft_and_reports_truncated(self):
+        # Blocker 1, requirement 3: a pagination/backend failure must be
+        # reported as truncated (unproven), never as a confirmed empty list.
+        session = _fake_session(status_code=500, items=[_item("req-a", "2026-08-24T00:00:00Z")])
+        result = list_recent_dispatch_request_ids("bucket-1", "p1", session=session)
+        self.assertEqual([], result["request_ids"])
+        self.assertTrue(result["truncated"])
 
-    def test_transport_exception_fails_soft_to_empty_list(self):
+    def test_transport_exception_fails_soft_and_reports_truncated(self):
         session = _fake_session(raise_exc=Exception("simulated network failure"))
-        self.assertEqual([], list_recent_dispatch_request_ids("bucket-1", "p1", session=session))
+        result = list_recent_dispatch_request_ids("bucket-1", "p1", session=session)
+        self.assertEqual([], result["request_ids"])
+        self.assertTrue(result["truncated"])
 
     def test_names_outside_the_project_prefix_or_wrong_suffix_are_ignored(self):
         session = _fake_session(items=[
-            {"name": "dispatch-requests/other-project/req-x.json"},
-            {"name": "dispatch-requests/p1/req-a.json"},
-            {"name": "dispatch-requests/p1/not-json.txt"},
+            _item("req-x", "2026-08-24T00:00:00Z", project_id="other-project"),
+            _item("req-a", "2026-08-24T00:00:00Z"),
+            {"name": "dispatch-requests/p1/not-json.txt", "updated": "2026-08-24T00:00:00Z"},
         ])
-        ids = list_recent_dispatch_request_ids("bucket-1", "p1", session=session)
-        self.assertEqual(["req-a"], ids)
+        result = list_recent_dispatch_request_ids("bucket-1", "p1", session=session)
+        self.assertEqual(["req-a"], result["request_ids"])
+        self.assertFalse(result["truncated"])
+
+    # --- Blocker 1 required tests (dispatch-two-tick-final-20260824 R6) ---
+
+    def test_true_most_recent_request_found_despite_reversed_lexical_order(self):
+        # 30 requests where filename lexical order is the OPPOSITE of write
+        # recency: req-000 (lexically first) is oldest, req-029 (lexically
+        # last) is newest -- but the single response page returns them in
+        # GCS's real lexicographic order (req-000, req-001, ...), so a naive
+        # "take the first max_results" implementation would keep req-000..
+        # req-019 and completely miss the true most-recent, still-pending
+        # req-029 (lexical position 29, i.e. past a cap of 20).
+        items = [_item(f"req-{i:03d}", f"2026-08-24T00:{i:02d}:00Z") for i in range(30)]
+        session = _fake_session(items=items)
+        result = list_recent_dispatch_request_ids("bucket-1", "p1", session=session, max_results=20)
+        self.assertIn("req-029", result["request_ids"], "the true most-recent request must not be dropped")
+        self.assertNotIn("req-000", result["request_ids"], "the oldest request must be pushed out by recency, not kept by lexical luck")
+        self.assertFalse(result["truncated"])
+
+    def test_exceeding_cap_with_unprovable_completeness_never_reports_confirmed_none(self):
+        # More objects exist than one page (page_size) budget can read, and
+        # GCS reports more pages remain (nextPageToken) -- completeness is
+        # not provable, so truncated=True must be set even if some
+        # candidates were still found this call.
+        page1 = [_item(f"req-{i:03d}", f"2026-08-24T00:{i:02d}:00Z") for i in range(5)]
+        session = _fake_session(items=page1, next_page_token="more")
+        result = list_recent_dispatch_request_ids("bucket-1", "p1", session=session, page_size=5, page_budget=1)
+        self.assertTrue(result["truncated"])
+
+    def test_pagination_failure_mid_scan_reports_truncated_not_empty_confirmed(self):
+        first_response = MagicMock()
+        first_response.status_code = 200
+        first_response.json.return_value = {
+            "items": [_item("req-a", "2026-08-24T00:00:00Z")], "nextPageToken": "page-2",
+        }
+        session = MagicMock()
+        session.get.side_effect = [first_response, Exception("simulated mid-scan failure")]
+        result = list_recent_dispatch_request_ids("bucket-1", "p1", session=session, page_size=1, page_budget=5)
+        # The candidate found on the successful first page is still
+        # returned (best-effort), but the scan is honestly unproven.
+        self.assertEqual(["req-a"], result["request_ids"])
+        self.assertTrue(result["truncated"])
+
+    def test_item_missing_updated_metadata_is_excluded_and_marks_truncated(self):
+        session = _fake_session(items=[
+            {"name": "dispatch-requests/p1/req-no-metadata.json"},  # no "updated" field
+            _item("req-a", "2026-08-24T00:00:00Z"),
+        ])
+        result = list_recent_dispatch_request_ids("bucket-1", "p1", session=session)
+        self.assertEqual(["req-a"], result["request_ids"])
+        self.assertTrue(result["truncated"])
+
+    def test_boundedness_never_scans_past_the_page_budget(self):
+        # Simulate an effectively unbounded backlog (every page reports a
+        # nextPageToken) and prove the scan still stops after exactly
+        # page_budget calls -- never an unbounded/full-history walk.
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "items": [_item("req-x", "2026-08-24T00:00:00Z")], "nextPageToken": "keep-going",
+        }
+        session = MagicMock()
+        session.get.return_value = response
+        result = list_recent_dispatch_request_ids("bucket-1", "p1", session=session, page_size=10, page_budget=4)
+        self.assertEqual(4, session.get.call_count)
+        self.assertTrue(result["truncated"])
 
 
 class ResolveDispatchStatusReadFailureTests(unittest.TestCase):

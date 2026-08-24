@@ -839,6 +839,80 @@ def compute_dispatch_state(
     return {"state": DISPATCH_STATE_UNKNOWN, "reason": f"unrecognized command status: {cmd_status!r}"}
 
 
+# Real, callable implementation of the Two-Tick Visibility SLA formally
+# documented on compute_dispatch_state() above (SLA_START_POINT) -- prior to
+# this, that contract existed only as a docstring; nothing computed
+# visibility_elapsed or a PASS/FAIL verdict from it. See
+# evaluate_two_tick_visibility_sla()'s own docstring.
+TWO_TICK_SLA_TICK_COUNT = 2
+
+
+def _default_scheduler_tick_seconds() -> float:
+    """The real scheduler cadence contract (manager.command_watcher.
+    POLL_SECONDS), read live rather than duplicated as a separate,
+    potentially-inconsistent constant here. Deferred import: manager.
+    command_watcher pulls in the full provider-launcher stack (AgRunner,
+    ClaudeLauncher, CodexLauncher, execution_runner, ...) -- this module is
+    imported at Streamlit dashboard.py startup and must not be forced to
+    load that entire stack just to read one integer."""
+    from manager.command_watcher import POLL_SECONDS
+    return float(POLL_SECONDS)
+
+
+def evaluate_two_tick_visibility_sla(
+    dispatch_request_status: Optional[Dict[str, Any]],
+    now: datetime,
+    tick_seconds: Optional[float] = None,
+    ticks: int = TWO_TICK_SLA_TICK_COUNT,
+) -> Dict[str, Any]:
+    """Real evaluator for the Two-Tick Visibility SLA (see
+    compute_dispatch_state()'s SLA_START_POINT contract above) -- computes
+    `visibility_elapsed_seconds` from the durable `ingress_first_observed_at`
+    evidence (manager.dispatch_requests.claim_dispatch_request()/
+    read_dispatch_request_status()) and reports PASS/FAIL against `ticks`
+    normal scheduler ticks (default `tick_seconds` is the real
+    manager.command_watcher.POLL_SECONDS cadence, never a separately
+    hardcoded duplicate -- pass `tick_seconds` explicitly only to test
+    against a different cadence).
+
+    Deliberately reads `ingress_first_observed_at`, never
+    `request_created_at`/`created_at` from the request's own body -- per the
+    SLA_START_POINT contract, measuring from file-created time would blame
+    ingress for OS/Drive propagation delay it has no control over.
+
+    Returns {"result": "PASS"|"FAIL"|"UNKNOWN", "visibility_elapsed_seconds":
+    float|None, "sla_seconds": float, "reason": str}.
+
+    UNKNOWN (never a guessed PASS or FAIL) when `dispatch_request_status`
+    itself is missing, or its `ingress_first_observed_at` is missing/
+    malformed/future-dated -- an acceptance harness reading this directly
+    must never fabricate a verdict for a request ingress never durably
+    proved it observed.
+    """
+    if tick_seconds is None:
+        tick_seconds = _default_scheduler_tick_seconds()
+    sla_seconds = float(tick_seconds) * int(ticks)
+    if not isinstance(dispatch_request_status, dict):
+        return {"result": "UNKNOWN", "visibility_elapsed_seconds": None, "sla_seconds": sla_seconds,
+                "reason": "no dispatch request status evidence available"}
+    observed_raw = dispatch_request_status.get("ingress_first_observed_at")
+    if not isinstance(observed_raw, str) or not observed_raw.strip():
+        return {"result": "UNKNOWN", "visibility_elapsed_seconds": None, "sla_seconds": sla_seconds,
+                "reason": "ingress_first_observed_at is missing; visibility elapsed cannot be truthfully computed"}
+    try:
+        observed = datetime.fromisoformat(observed_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return {"result": "UNKNOWN", "visibility_elapsed_seconds": None, "sla_seconds": sla_seconds,
+                "reason": "ingress_first_observed_at is not a valid ISO-8601 timestamp"}
+    elapsed = (now.astimezone(timezone.utc) - observed).total_seconds()
+    if elapsed < 0:
+        return {"result": "UNKNOWN", "visibility_elapsed_seconds": elapsed, "sla_seconds": sla_seconds,
+                "reason": "ingress_first_observed_at is in the future relative to now"}
+    result = "PASS" if elapsed <= sla_seconds else "FAIL"
+    return {"result": result, "visibility_elapsed_seconds": elapsed, "sla_seconds": sla_seconds,
+            "reason": f"visible {elapsed:.1f}s after first ingress observation (SLA {sla_seconds:.1f}s)"}
+
+
 def build_provider_truth(command: Optional[Dict[str, Any]], execution: Optional[Dict[str, Any]]) -> Dict[str, str]:
     """provider/account_id/model/mode from the most authoritative record
     available (command, then execution); any missing/blank field is the
@@ -1033,6 +1107,53 @@ def build_pretask_dispatch_truth_row(
         "quota": build_quota_truth(account_vms, UNKNOWN_LABEL, UNKNOWN_LABEL),
         "request_id": request_id,
         "pretask": True,
+    }
+
+
+def build_pretask_listing_truncated_row(
+    project: Optional[Dict[str, Any]],
+    project_id: str,
+    account_vms: Sequence[AccountQuotaCardViewModel],
+) -> Dict[str, Any]:
+    """One synthetic pre-Task row surfaced when manager.dispatch_requests.
+    list_recent_dispatch_request_ids() could not prove its scan of
+    dispatch-requests/ for this project was complete this refresh (its own
+    `truncated` field) -- e.g. the bounded page budget was exhausted while
+    more objects remained, a page/metadata read failed mid-scan, or an
+    object was missing usable recency metadata.
+
+    This exists specifically to close the PRETASK_FALSE_NEGATIVE_RISK gap:
+    an incomplete scan must never be rendered as a silent, confirmed "no
+    pending pre-Task requests" -- even when the scan happened to find zero
+    or few request_ids on the pages it did manage to read, a truly recent
+    pending request may still exist beyond what was scanned.
+
+    Same row shape/contract as build_dispatch_truth_row()/
+    build_pretask_dispatch_truth_row() so it fits unchanged into the same
+    Dashboard render loop and Visible Dispatch Gate. dispatch_state is the
+    literal UNKNOWN -- this is an honest "cannot prove completeness", never
+    a guess at any individual request's real status.
+    """
+    project_name = (project.get("name") if isinstance(project, dict) else None) or project_id or UNKNOWN_LABEL
+    return {
+        "project_id": project_id or UNKNOWN_LABEL,
+        "project_name": project_name,
+        "task_id": f"pretask-listing-truncated-{project_id or UNKNOWN_LABEL}",
+        "task_title": "(pre-task) recent request listing incomplete -- a pending request may not be shown",
+        "provider": UNKNOWN_LABEL,
+        "account_id": UNKNOWN_LABEL,
+        "model": UNKNOWN_LABEL,
+        "mode": UNKNOWN_LABEL,
+        "dispatch_state": DISPATCH_STATE_UNKNOWN,
+        "dispatch_reason": "recent dispatch-request listing could not prove completeness this refresh "
+                           "(bounded page budget exhausted, a page/metadata read failed, or an object had no "
+                           "usable recency metadata); a truly recent pending request may exist but not be shown",
+        "execution_id": UNKNOWN_LABEL,
+        "session_id": UNKNOWN_LABEL,
+        "quota": build_quota_truth(account_vms, UNKNOWN_LABEL, UNKNOWN_LABEL),
+        "request_id": None,
+        "pretask": True,
+        "pretask_listing_truncated": True,
     }
 
 

@@ -564,12 +564,22 @@ def _handle_retry_dispatch(store, lock_registry_factory, project_id, request_id,
     return {"accepted": True, "request_id": request_id, "task_id": task_id, "command_id": command_id, "status": "queued"}
 
 
-def handle_dispatch(store, service, lock_registry_factory, payload):
+def handle_dispatch(store, service, lock_registry_factory, payload, request_created_at=None):
     """Idempotently create a queued Task+Command for one external request and
     return its identity. Never launches a provider.
 
     `lock_registry_factory(project_id, request_id)` must return a
     GCSLockRegistry-compatible object (create_if_absent/read/read_if_exists).
+
+    `request_created_at`, if given, is the request's own separately-declared
+    created_at (e.g. manager.drive_dispatch_ingress's Drive JSON body
+    created_at) -- purely additive SLA evidence threaded straight through to
+    manager.dispatch_requests.claim_dispatch_request(); it is NOT part of
+    `payload`'s own strict schema (validate_dispatch_payload's ALLOWED_FIELDS)
+    since not every caller of this function has such a value, and it must
+    never be used as the Two-Tick Visibility SLA's own start point (see
+    manager.dashboard_core.compute_dispatch_state()'s SLA_START_POINT
+    contract for why).
     """
     clean = validate_dispatch_payload(payload)
     project_id, request_id = clean["project_id"], clean["request_id"]
@@ -602,7 +612,8 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
     task_id = command_id = f"dispatch-{request_id}"
     try:
         registry = lock_registry_factory(project_id, request_id)
-        claim = claim_dispatch_request(registry, project_id, request_id, task_id, command_id, now_iso())
+        claim = claim_dispatch_request(registry, project_id, request_id, task_id, command_id, now_iso(),
+                                       request_created_at=request_created_at)
     except DispatchIngressError:
         raise
     except Exception as exc:

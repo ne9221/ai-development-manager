@@ -145,7 +145,7 @@ class RunOnceTests(unittest.TestCase):
 
     def test_two_valid_requests_are_both_evaluated(self):
         service = FakeDriveService([_request_document("drive-e2e-1"), _request_document("drive-e2e-2")])
-        handler = Mock(side_effect=lambda store, svc, factory, payload: {
+        handler = Mock(side_effect=lambda store, svc, factory, payload, request_created_at=None: {
             "accepted": True, "request_id": payload["request_id"],
             "task_id": f'dispatch-{payload["request_id"]}', "command_id": f'dispatch-{payload["request_id"]}',
             "status": "queued",
@@ -207,7 +207,7 @@ class RunOnceTests(unittest.TestCase):
         # one request, not a crash and not a silent no-op.
         service = FakeDriveService([_request_document()])
 
-        def broken_handle_dispatch(store, svc, lock_registry_factory, payload):
+        def broken_handle_dispatch(store, svc, lock_registry_factory, payload, request_created_at=None):
             # Mirrors what real handle_dispatch does: calls the injected
             # lock_registry_factory(project_id, request_id), which here
             # simulates a GCS bucket/object misconfiguration.

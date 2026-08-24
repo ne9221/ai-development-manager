@@ -11,12 +11,25 @@ Watcher.
 from urllib.parse import quote
 
 from manager.gcs_lock_registry import GCS_SCOPE, GCSLockRegistry, RegistryConflict
-from manager.tasks import TaskError, safe_id
+from manager.tasks import TaskError, now_iso, safe_id
 
 # Bounded prefix-listing default for list_recent_dispatch_request_ids(): a
 # small fixed cap, never an unbounded/full-history scan. See that function's
 # docstring for why this exists and how it must be used.
 DEFAULT_RECENT_REQUEST_LIST_LIMIT = 20
+# Bounded page-scan budget used to CORRECT the GCS Objects.list API's own
+# default ordering -- it lists objects lexicographically by name, NEVER by
+# recency (there is no server-side modifiedTime/createdTime `orderBy` for
+# GCS object listing, unlike Drive's files.list). A single page taken as-is
+# (the prior implementation) silently returns the alphabetically-first
+# `maxResults` request_ids, not the most recent ones -- once a project has
+# more live requests than one page, the true most-recent (likely still
+# pending) request can sort past the cap and never be shown at all, with no
+# signal that anything was missed. See list_recent_dispatch_request_ids()'s
+# docstring for the fix and DEFAULT_RECENT_LISTING_PAGE_SIZE/_BUDGET's exact
+# bound on total objects scanned.
+DEFAULT_RECENT_LISTING_PAGE_SIZE = 200
+DEFAULT_RECENT_LISTING_PAGE_BUDGET = 5
 
 
 DISPATCH_REQUEST_SCHEMA_VERSION = "0.1.0"
@@ -60,20 +73,49 @@ def dispatch_request_registry(bucket, project_id, request_id, session=None):
     return GCSLockRegistry(bucket, dispatch_request_object_name(project_id, request_id), session=session)
 
 
-def _new_record(project_id, request_id, task_id, command_id, created_at):
+def _new_record(project_id, request_id, task_id, command_id, created_at, request_created_at=None):
     for name, value in (("project_id", project_id), ("request_id", request_id), ("task_id", task_id), ("command_id", command_id), ("created_at", created_at)):
         if not isinstance(value, str) or not value.strip():
             raise TaskError(f"dispatch request claim requires a non-empty {name}")
+    if request_created_at is not None and (not isinstance(request_created_at, str) or not request_created_at.strip()):
+        raise TaskError("dispatch request claim's request_created_at must be a non-empty string or None")
     return {
         "schema_version": DISPATCH_REQUEST_SCHEMA_VERSION,
         "project_id": project_id, "request_id": request_id,
         "task_id": task_id, "command_id": command_id,
         "created_at": created_at,
+        # SLA_START_POINT evidence (see manager.dashboard_core.
+        # compute_dispatch_state()'s formal Two-Tick Visibility SLA
+        # contract): `created_at` above is already, in every real caller,
+        # the moment claim_dispatch_request() was first invoked for this
+        # request_id -- i.e. the first successful ingress observation --
+        # but was never callable-readable under that name. `ingress_first_
+        # observed_at` restates that exact same value under its own
+        # explicit name so an SLA evaluator (see evaluate_two_tick_
+        # visibility_sla()) never has to guess which "created_at" it means.
+        # Written once, in this same create-if-absent call, and never
+        # touched again by a retry (see claim_dispatch_request()'s
+        # docstring: a retry never re-creates or overwrites this record).
+        "ingress_first_observed_at": created_at,
+        # The *request's own* declared created_at (its JSON body's
+        # created_at field, as produced by whoever wrote the request) --
+        # deliberately a SEPARATE, optional field from both `created_at`
+        # and `ingress_first_observed_at` above: it is not proven to be
+        # trustworthy/skew-free the way a server-stamped timestamp is, and
+        # is never used as the SLA's own start point (see the Two-Tick
+        # Visibility SLA contract for why). None when the caller has no
+        # such evidence (e.g. a caller that is not Drive-ingress-based).
+        "request_created_at": request_created_at,
         # Durable, queryable "request received" truth -- persisted in this
         # SAME create-if-absent write, i.e. strictly before any slow
         # provider/quota/execution-history resolution ever runs. See
         # mark_dispatch_request_status()/read_dispatch_request_status().
         "status": DEFAULT_DISPATCH_REQUEST_STATUS, "failure_reason": None,
+        # Durable "last status transition" truth, distinct from `created_at`/
+        # `ingress_first_observed_at`: at creation the status has never
+        # transitioned yet, so this starts equal to the observation moment,
+        # and only mark_dispatch_request_status() ever advances it.
+        "status_updated_at": created_at,
     }
 
 
@@ -91,7 +133,26 @@ def _validate_record(document, project_id, request_id):
     failure_reason = document.get("failure_reason")
     if failure_reason is not None and not isinstance(failure_reason, str):
         raise TaskError("malformed dispatch request record: failure_reason must be a string or null")
-    return {**document, "status": status, "failure_reason": failure_reason}
+    # Additive SLA-evidence fields (see _new_record()): a record written
+    # before this change has none of these -- for `ingress_first_observed_at`
+    # and `status_updated_at`, `created_at` is the mechanically correct
+    # default (every existing record's `created_at` already IS that exact
+    # moment/that exact "no transition since creation" state; this is not a
+    # guess, see _new_record()'s own comment). `request_created_at` has no
+    # such equivalent for a legacy record -- it was never captured at all,
+    # so it stays honestly None/missing rather than being defaulted to
+    # anything, per the SLA contract's explicit "must not guess" rule.
+    ingress_first_observed_at = document.get("ingress_first_observed_at") or document["created_at"]
+    status_updated_at = document.get("status_updated_at") or ingress_first_observed_at
+    for name, value in (("ingress_first_observed_at", ingress_first_observed_at), ("status_updated_at", status_updated_at)):
+        if not isinstance(value, str) or not value.strip():
+            raise TaskError(f"malformed dispatch request record: invalid {name}")
+    request_created_at = document.get("request_created_at")
+    if request_created_at is not None and (not isinstance(request_created_at, str) or not request_created_at.strip()):
+        raise TaskError("malformed dispatch request record: invalid request_created_at")
+    return {**document, "status": status, "failure_reason": failure_reason,
+            "ingress_first_observed_at": ingress_first_observed_at,
+            "status_updated_at": status_updated_at, "request_created_at": request_created_at}
 
 
 def _resolve_conflict(registry, project_id, request_id):
@@ -141,7 +202,8 @@ def _resolve_ambiguous(registry, record, attempts):
     raise TaskError("dispatch request ambiguous create outcome did not resolve after retries; failing closed")
 
 
-def claim_dispatch_request(registry, project_id, request_id, task_id, command_id, created_at, attempts=DEFAULT_AMBIGUOUS_ATTEMPTS):
+def claim_dispatch_request(registry, project_id, request_id, task_id, command_id, created_at,
+                           attempts=DEFAULT_AMBIGUOUS_ATTEMPTS, request_created_at=None):
     """Atomically claim exactly one (task_id, command_id) identity for one
     external request_id.
 
@@ -150,10 +212,22 @@ def claim_dispatch_request(registry, project_id, request_id, task_id, command_id
     - Retry (same request_id resubmitted, network timeout, or a simultaneous
       duplicate racing the first): resolves by re-reading and returning the
       already-claimed identity (`claimed: False`) -- the caller must not
-      create anything a second time.
+      create anything a second time. `request_created_at` on a retry call is
+      likewise discarded in favor of whatever the winning claim already
+      recorded (see _new_record()'s docstring comments) -- a retry can never
+      overwrite the durable ingress_first_observed_at/request_created_at
+      evidence with its own, later, call-time values.
     - Backend unavailable / malformed record: fails closed (TaskError).
+
+    `created_at` is (and has always been, for every real caller) the moment
+    this call itself is first made for this request_id -- i.e. the first
+    successful ingress observation; it is durably restated under the
+    explicit `ingress_first_observed_at` name in the persisted record (see
+    _new_record()). `request_created_at`, if given, is the request's own
+    separately-declared created_at (e.g. from its Drive JSON body) -- purely
+    additive evidence, never used as the SLA start point.
     """
-    record = _new_record(project_id, request_id, task_id, command_id, created_at)
+    record = _new_record(project_id, request_id, task_id, command_id, created_at, request_created_at=request_created_at)
     try:
         generation = registry.create_if_absent(record)
         return {**record, "generation": generation, "claimed": True, "created_by_this_call": True}
@@ -196,12 +270,16 @@ def release_dispatch_request_claim(registry, project_id, request_id, task_id, co
     return {"released": True, "generation": current_generation}
 
 
-def mark_dispatch_request_status(registry, project_id, request_id, generation, status, failure_reason=None):
+def mark_dispatch_request_status(registry, project_id, request_id, generation, status, failure_reason=None, updated_at=None):
     """Best-effort CAS status transition on an already-claimed request's
     durable claim record -- e.g. "accepted" (the default at claim time) ->
     "dispatched" (Task/Command successfully created) or "failed" (a definite,
     sole-owned pre-artifact failure; see cloud.dispatch_ingress's caller for
     when it is safe to call this with status="failed").
+
+    `updated_at` (defaults to now_iso() at call time) durably records
+    `status_updated_at` on the record -- distinct from `created_at`/
+    `ingress_first_observed_at`, which this call never touches.
 
     This is observability, not authority: a lost race (the record changed
     concurrently -- `generation` no longer matches) or any backend/validation
@@ -223,7 +301,7 @@ def mark_dispatch_request_status(registry, project_id, request_id, generation, s
         document = _validate_record(current, project_id, request_id)
     except TaskError:
         return None
-    updated = {**document, "status": status, "failure_reason": failure_reason}
+    updated = {**document, "status": status, "failure_reason": failure_reason, "status_updated_at": updated_at or now_iso()}
     try:
         return registry.compare_and_swap(current_generation, updated)
     except Exception:
@@ -339,6 +417,9 @@ def read_dispatch_request_status(registry, project_id, request_id):
         "status": document["status"], "failure_reason": document["failure_reason"],
         "task_id": document["task_id"], "command_id": document["command_id"],
         "created_at": document["created_at"], "generation": generation,
+        "ingress_first_observed_at": document["ingress_first_observed_at"],
+        "request_created_at": document["request_created_at"],
+        "status_updated_at": document["status_updated_at"],
     }
 
 
@@ -394,7 +475,9 @@ def resolve_dispatch_status_for_request(store, registry, project_id, request_id)
             "dispatch_request_status": status, "dispatch_request_read_failed": read_failed}
 
 
-def list_recent_dispatch_request_ids(bucket, project_id, session=None, max_results=DEFAULT_RECENT_REQUEST_LIST_LIMIT):
+def list_recent_dispatch_request_ids(bucket, project_id, session=None, max_results=DEFAULT_RECENT_REQUEST_LIST_LIMIT,
+                                     page_size=DEFAULT_RECENT_LISTING_PAGE_SIZE,
+                                     page_budget=DEFAULT_RECENT_LISTING_PAGE_BUDGET):
     """Bounded discovery of candidate request_ids for one project -- used
     ONLY to seed which request_ids a pre-Task Dashboard view should look up
     via resolve_dispatch_status_for_request()/read_dispatch_request_status();
@@ -402,25 +485,58 @@ def list_recent_dispatch_request_ids(bucket, project_id, session=None, max_resul
     nothing about status -- the resolver call is still the sole source of
     truth for ACCEPTED/REJECTED/FAILED/etc).
 
-    `max_results` is a hard, small, fixed cap (default
-    DEFAULT_RECENT_REQUEST_LIST_LIMIT) passed straight through to the GCS
-    JSON API's own `maxResults` query param -- this is a single bounded
-    listing call, never pagination through full history, and callers must
-    not loop past the first page. This is the same "bounded, cached,
+    Returns {"request_ids": [...], "truncated": bool}.
+
+    RECENCY CORRECTNESS: the GCS Objects.list API has no server-side
+    recency ordering -- it lists objects lexicographically by `name`,
+    always. Earlier versions of this function passed `max_results` straight
+    through as the API's own `maxResults` and sliced the first page as-is;
+    once a project accumulated more than one page of live requests, that
+    silently returned the alphabetically-first `max_results` request_ids --
+    NOT the most recent ones -- so a brand-new, still-pending request could
+    sort past the cap and never be shown, with no signal anything was
+    missed. This is now fixed by scanning up to `page_budget` pages of
+    `page_size` objects each (requesting each item's own `updated` system
+    timestamp), sorting the resulting candidate set by that timestamp
+    descending, and only then taking the top `max_results` -- so the
+    request_ids returned really are the most recently written ones among
+    everything scanned.
+
+    BOUNDEDNESS is preserved: `page_size` * `page_budget` (default
+    200 * 5 = 1000) is a hard ceiling on how many objects this call will
+    ever read, completely independent of how many requests a project has
+    ever had -- this is still a single bounded call, never pagination
+    through full history. This is the same "bounded, cached,
     no-full-history-scan" discipline as manager/dashboard.py's existing
     list_records_isolated()/RECENT_RECORD_LIMIT for Drive-backed records --
     prior incidents (unbounded list_executions(), full Drive history scans)
     caused multi-minute Dashboard load latency, and this must not repeat
     that class of bug.
 
-    Fails soft: returns [] on any error (missing bucket, no credentials, GCS
-    unreachable, malformed response) rather than raising -- a listing
-    failure degrades to "no pre-Task rows shown this refresh", never a
-    Dashboard crash, matching every other best-effort observability reader
-    in this module.
+    `truncated=True` means this call could NOT prove its scan was complete
+    -- the page budget was exhausted while GCS still reported more pages
+    (`nextPageToken`), a page request failed (non-200/transport error) after
+    some pages had already been read, or an object was returned without a
+    usable `updated` timestamp (so its true recency could not be trusted and
+    it was excluded from candidates rather than guessed at). Callers MUST
+    treat `truncated=True` as "recent-request visibility is not fully
+    proven this refresh" -- e.g. render an explicit UNKNOWN/TRUNCATED signal
+    -- and MUST NOT treat it as a confirmed empty/complete list even when
+    `request_ids` happens to be [] or short: a truly recent pending request
+    may exist beyond what could be scanned.
+
+    Fails soft on total unavailability (missing bucket/project_id, no
+    credentials, first-page failure): returns {"request_ids": [],
+    "truncated": ...} rather than raising -- a listing failure degrades to
+    "no pre-Task rows shown this refresh", never a Dashboard crash, matching
+    every other best-effort observability reader in this module.
+    `truncated` is False specifically for missing bucket/project_id (no
+    scan was ever attempted -- there's nothing this call could have proven
+    or failed to prove) and True for every other unavailability, since those
+    genuinely leave completeness unproven.
     """
     if not bucket or not project_id:
-        return []
+        return {"request_ids": [], "truncated": False}
     if session is None:
         try:
             import google.auth
@@ -428,23 +544,50 @@ def list_recent_dispatch_request_ids(bucket, project_id, session=None, max_resul
             credentials, _ = google.auth.default(scopes=[GCS_SCOPE])
             session = AuthorizedSession(credentials)
         except Exception:
-            return []
+            return {"request_ids": [], "truncated": True}
     prefix = f"dispatch-requests/{safe_id(project_id)}/"
     encoded_bucket = quote(bucket, safe="")
     list_url = f"https://storage.googleapis.com/storage/v1/b/{encoded_bucket}/o"
-    try:
-        response = session.get(
-            list_url, params={"prefix": prefix, "maxResults": int(max_results)}, timeout=10,
-        )
-        if response.status_code != 200:
-            return []
-        items = response.json().get("items", [])
-    except Exception:
-        return []
-    request_ids = []
-    for item in items:
-        name = item.get("name", "")
-        if not name.startswith(prefix) or not name.endswith(".json"):
-            continue
-        request_ids.append(name[len(prefix):-len(".json")])
-    return request_ids[:max_results]
+
+    candidates = []
+    page_token = None
+    truncated = False
+    pages_fetched = 0
+    while pages_fetched < max(1, int(page_budget)):
+        params = {"prefix": prefix, "maxResults": int(page_size), "fields": "nextPageToken,items(name,updated)"}
+        if page_token:
+            params["pageToken"] = page_token
+        try:
+            response = session.get(list_url, params=params, timeout=10)
+            if response.status_code != 200:
+                truncated = True
+                break
+            payload = response.json()
+        except Exception:
+            truncated = True
+            break
+        pages_fetched += 1
+        for item in payload.get("items", []):
+            name = item.get("name", "")
+            if not name.startswith(prefix) or not name.endswith(".json"):
+                continue
+            updated = item.get("updated")
+            if not isinstance(updated, str) or not updated.strip():
+                # Metadata read incomplete for this object: its true
+                # recency cannot be trusted, so it is excluded rather than
+                # guessed at -- and completeness is no longer provable.
+                truncated = True
+                continue
+            candidates.append((updated, name[len(prefix):-len(".json")]))
+        page_token = payload.get("nextPageToken")
+        if not page_token:
+            break
+    else:
+        if page_token:
+            # Page budget exhausted while GCS still reports more objects --
+            # completeness of this scan is not provable.
+            truncated = True
+
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    request_ids = [request_id for _, request_id in candidates[:max_results]]
+    return {"request_ids": request_ids, "truncated": truncated}

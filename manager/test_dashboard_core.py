@@ -35,6 +35,7 @@ from manager.dashboard_core import (
     build_quota_truth,
     build_dispatch_truth_row,
     build_pretask_dispatch_truth_row,
+    build_pretask_listing_truncated_row,
     compute_visible_dispatch_gate,
     parse_task_to_run_path,
     build_provenance_vm,
@@ -51,6 +52,8 @@ from manager.dashboard_core import (
     summarize_drive_read_error,
     READ_STATUS_OK,
     READ_STATUS_UNKNOWN,
+    evaluate_two_tick_visibility_sla,
+    TWO_TICK_SLA_TICK_COUNT,
 )
 from manager.quota_forecast import (
     AccountQuotaForecast,
@@ -1755,6 +1758,121 @@ class PretaskDispatchTruthRowTests(unittest.TestCase):
     def test_pretask_project_name_falls_back_to_project_id(self):
         row = build_pretask_dispatch_truth_row(None, "p2", "req-g", {"status": "accepted"}, [], self.now)
         self.assertEqual(row["project_name"], "p2")
+
+
+class PretaskListingTruncatedRowTests(unittest.TestCase):
+    """Blocker 1 (PRETASK_FALSE_NEGATIVE_RISK): build_pretask_listing_truncated_row()
+    is the synthetic row that must be surfaced whenever manager.
+    dispatch_requests.list_recent_dispatch_request_ids() reports
+    truncated=True -- an incomplete recent-request scan must never render as
+    a silent, confirmed "nothing pending"."""
+
+    def setUp(self):
+        self.project = {"project_id": "p1", "name": "Project One"}
+
+    def test_truncated_row_is_unknown_and_passes_the_gate(self):
+        row = build_pretask_listing_truncated_row(self.project, "p1", [])
+        self.assertEqual(row["dispatch_state"], DISPATCH_STATE_UNKNOWN)
+        self.assertTrue(row["pretask"])
+        self.assertTrue(row.get("pretask_listing_truncated"))
+        self.assertIn("completeness", row["dispatch_reason"])
+        gate = compute_visible_dispatch_gate([row])
+        self.assertEqual(gate["result"], "PASS", gate["reasons"])
+
+    def test_truncated_row_project_name_falls_back_to_project_id(self):
+        row = build_pretask_listing_truncated_row(None, "p2", [])
+        self.assertEqual(row["project_name"], "p2")
+
+    def test_truncated_row_never_collides_with_a_real_request_task_id(self):
+        pretask_row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-a", {"status": "accepted"}, [], datetime(2026, 8, 24, tzinfo=timezone.utc),
+        )
+        truncated_row = build_pretask_listing_truncated_row(self.project, "p1", [])
+        self.assertNotEqual(pretask_row["task_id"], truncated_row["task_id"])
+
+
+class TwoTickVisibilitySlaEvaluatorTests(unittest.TestCase):
+    """Blocker 2 (SLA_IMPLEMENTATION_MATCHES_CONTRACT): real implementation
+    of the Two-Tick Visibility SLA formally documented on
+    compute_dispatch_state() -- prior to this it was docstring-only, with no
+    code actually computing visibility_elapsed or a PASS/FAIL verdict from
+    ingress_first_observed_at."""
+
+    def setUp(self):
+        self.tick_seconds = 60.0  # matches manager.command_watcher.POLL_SECONDS's default, pinned explicitly so this test never silently drifts if that default changes
+
+    # 1: SLA must be measured from ingress_first_observed_at, NOT
+    # request_created_at/created_at, even when they differ.
+    def test_sla_measured_from_first_observed_at_not_request_created_at(self):
+        status = {
+            "request_created_at": "2026-08-24T00:00:00Z",  # T0
+            "ingress_first_observed_at": "2026-08-24T00:03:00Z",  # T0 + 3m
+        }
+        now = datetime(2026, 8, 24, 0, 3, 30, tzinfo=timezone.utc)  # 30s after first_observed_at
+        result = evaluate_two_tick_visibility_sla(status, now, tick_seconds=self.tick_seconds)
+        self.assertEqual(result["result"], "PASS")
+        self.assertAlmostEqual(result["visibility_elapsed_seconds"], 30.0, delta=0.01)
+
+    # 2: a retry's later observation must never move first_observed_at --
+    # the durable record already guarantees this (see dispatch_requests'
+    # own tests); the evaluator itself just needs to trust whatever value
+    # it is handed and never recompute/guess a different one.
+    def test_sla_uses_the_durable_first_observation_not_a_later_retry_time(self):
+        first_observed = "2026-08-24T00:00:00Z"  # T1
+        status = {"ingress_first_observed_at": first_observed}
+        # A retry at T2 (much later) must not be what this evaluator sees --
+        # simulated here by simply confirming the evaluator only ever reads
+        # the single ingress_first_observed_at field it was given, matching
+        # claim_dispatch_request()'s own "retry never overwrites" contract.
+        now = datetime(2026, 8, 24, 0, 1, 0, tzinfo=timezone.utc)
+        result = evaluate_two_tick_visibility_sla(status, now, tick_seconds=self.tick_seconds)
+        self.assertEqual(result["visibility_elapsed_seconds"], 60.0)
+
+    # 3: visible within 2 ticks -> PASS.
+    def test_visible_within_two_ticks_passes(self):
+        status = {"ingress_first_observed_at": "2026-08-24T00:00:00Z"}
+        now = datetime(2026, 8, 24, 0, 2, 0, tzinfo=timezone.utc)  # exactly 2 ticks (120s)
+        result = evaluate_two_tick_visibility_sla(status, now, tick_seconds=self.tick_seconds)
+        self.assertEqual(result["result"], "PASS")
+        self.assertEqual(result["sla_seconds"], 120.0)
+
+    # 4: visible beyond 2 ticks -> FAIL.
+    def test_visible_beyond_two_ticks_fails(self):
+        status = {"ingress_first_observed_at": "2026-08-24T00:00:00Z"}
+        now = datetime(2026, 8, 24, 0, 2, 1, tzinfo=timezone.utc)  # 1s past 2 ticks
+        result = evaluate_two_tick_visibility_sla(status, now, tick_seconds=self.tick_seconds)
+        self.assertEqual(result["result"], "FAIL")
+
+    # 5: missing first_observed_at -> UNKNOWN, never a guessed verdict.
+    def test_missing_first_observed_at_is_unknown_not_guessed(self):
+        now = datetime(2026, 8, 24, 0, 5, 0, tzinfo=timezone.utc)
+        self.assertEqual("UNKNOWN", evaluate_two_tick_visibility_sla(None, now, tick_seconds=self.tick_seconds)["result"])
+        self.assertEqual("UNKNOWN", evaluate_two_tick_visibility_sla({}, now, tick_seconds=self.tick_seconds)["result"])
+        self.assertEqual("UNKNOWN", evaluate_two_tick_visibility_sla(
+            {"ingress_first_observed_at": ""}, now, tick_seconds=self.tick_seconds)["result"])
+        self.assertEqual("UNKNOWN", evaluate_two_tick_visibility_sla(
+            {"ingress_first_observed_at": "not-a-timestamp"}, now, tick_seconds=self.tick_seconds)["result"])
+
+    # 6: a caller (an acceptance harness) can read this field directly off
+    # real dispatch_request_status evidence with no fake probe needed --
+    # exercised end-to-end through the real claim record shape.
+    def test_acceptance_harness_can_read_the_real_field_directly(self):
+        registry = MemoryClaimRegistry()
+        claim = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-24T00:00:00Z")
+        real_status = {
+            "status": "accepted", "ingress_first_observed_at": claim["ingress_first_observed_at"],
+        }
+        now = datetime(2026, 8, 24, 0, 0, 30, tzinfo=timezone.utc)
+        result = evaluate_two_tick_visibility_sla(real_status, now, tick_seconds=self.tick_seconds)
+        self.assertEqual(result["result"], "PASS")
+
+    def test_default_tick_seconds_reads_the_real_scheduler_cadence_contract(self):
+        from manager.command_watcher import POLL_SECONDS
+        status = {"ingress_first_observed_at": "2026-08-24T00:00:00Z"}
+        now = datetime(2026, 8, 24, 0, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=2 * POLL_SECONDS)
+        result = evaluate_two_tick_visibility_sla(status, now)  # tick_seconds omitted -> must read the real contract
+        self.assertEqual(result["sla_seconds"], 2 * POLL_SECONDS)
+        self.assertEqual(TWO_TICK_SLA_TICK_COUNT, 2)
 
 
 class ResolveDispatchStatusReadFailureTests(unittest.TestCase):
