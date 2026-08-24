@@ -118,6 +118,15 @@ class SchedulerProvenanceTests(unittest.TestCase):
         command["process_provenance"]["os_scheduler_evidence"] = {**self.os_pass(), "action_process_id": 99}
         self.assertEqual("FAIL", provenance.evidence_status(command, provider))
 
+    def test_legacy_context_preserves_id_without_new_fields_or_pass(self):
+        context = {"scheduler_invocation_id": "a" * 32}
+        origin = provenance.command_origin(context)
+        self.assertEqual({"caller_origin": "watcher_poll", "scheduler_invocation_id": "a" * 32}, origin)
+        provider = {"provider_evidence": {"scheduler_invocation_id": "a" * 32, "launcher_pid": 1,
+                    "launcher_creation_identity": "launcher", "provider_pid": 2,
+                    "provider_creation_identity": "provider", "provider_parent_identity": "launcher"}}
+        self.assertEqual("UNKNOWN", provenance.evidence_status({"process_provenance": origin}, provider))
+
     def test_installed_watcher_and_supervisor_use_ignorenew(self):
         manager = provenance.Path(__file__).parent
         for filename in ("install_command_watcher.ps1", "install_session_center_supervisor.ps1"):
