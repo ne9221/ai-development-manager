@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from collectors.publish_drive import build_service
-from manager.tasks import DriveRecords, logical_record_id, safe_id
+from manager.tasks import DriveRecords
 from manager.quota_reader import read_drive_status, summarize
 from manager.quota_history import get_default_quota_history_store
 from manager.dashboard_core import (
@@ -37,6 +37,11 @@ from manager.dashboard_core import (
     select_task_command,
     select_task_execution,
     select_task_handoff,
+    fetch_project_records,
+    fetch_task_handoffs,
+    summarize_drive_read_error,
+    READ_STATUS_OK,
+    READ_STATUS_UNKNOWN,
 )
 
 WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
@@ -251,41 +256,12 @@ st.markdown("""
 
 
 def list_records_isolated(store, area, project_id, limit=RECENT_RECORD_LIMIT, include_ids=None):
-    records = []
-    warnings = []
-    try:
-        parent = store.project_folder(area, project_id, create=False)
-        items = sorted(
-            store.children(parent),
-            key=lambda item: item.get("modifiedTime") or "",
-            reverse=True,
-        )
-        json_items = [item for item in items if item.get("name", "").endswith(".json")]
-        selected_items = json_items[:limit]
-        if include_ids:
-            selected_names = {item.get("name") for item in selected_items}
-            selected_items.extend(
-                item for item in json_items[limit:]
-                if item.get("name") not in selected_names
-                and logical_record_id(item["name"][:-5]) in include_ids
-            )
-        for item in selected_items:
-            name = item.get("name", "")
-            storage_id = name[:-5]
-            try:
-                if item.get("id"):
-                    raw = store.files.get_media(fileId=item["id"]).execute()
-                    doc = json.loads(raw.decode("utf-8"))
-                else:  # Test doubles and legacy adapters may not expose Drive file IDs.
-                    logical_id = logical_record_id(storage_id)
-                    doc = store.get(area, project_id, logical_id)
-                records.append(doc)
-            except Exception as exc:
-                warnings.append(f"Malformed record '{name}' in '{area}' for project '{project_id}': {exc}")
-    except Exception:
-        # Ignore normal missing folder cases
-        pass
-    return records, warnings
+    """Thin wrapper: delegates to the pure, directly-testable
+    fetch_project_records() and keeps this function's prior (records,
+    warnings) return shape for existing callers. See load_all_data() for
+    the additional folder-level status/error this now also exposes."""
+    result = fetch_project_records(store, area, project_id, limit, include_ids=include_ids)
+    return result["records"], result["warnings"]
 
 
 @st.cache_data(ttl=30)
@@ -298,39 +274,19 @@ def load_task_handoff_from_store(project_id: str, task_id: str):
     actually inspected in the Task Detail panel, so the canonical handoff /
     completion-report truth for that task is genuinely fetched instead of
     being permanently unavailable.
+
+    Returns {"status", "records", "error"} (see fetch_task_handoffs()) --
+    never a bare list, so a Drive read failure can never be silently
+    displayed the same way as "confirmed no handoff for this task".
     """
     if not project_id or not task_id:
-        return []
+        return {"status": READ_STATUS_OK, "records": [], "error": None}
     try:
         service = build_service()
         store = DriveRecords(service)
-        parent = store.project_folder("handoffs", project_id, create=False)
-        items = store.children(parent)
-        candidates = [item for item in items if item.get("name", "").endswith(".json")]
-        if not candidates:
-            return []
-
-        prefix = safe_id(task_id)
-        matching_items = [item for item in candidates if item.get("name", "").startswith(prefix)]
-        search_items = matching_items if matching_items else candidates[:20]
-
-        records = []
-        for item in search_items:
-            name = item.get("name", "")
-            storage_id = name[:-5]
-            try:
-                if item.get("id") and hasattr(store, "files") and hasattr(store.files, "get_media"):
-                    raw = store.files.get_media(fileId=item["id"]).execute()
-                    doc = json.loads(raw.decode("utf-8"))
-                else:
-                    doc = store.get("handoffs", project_id, logical_record_id(storage_id))
-                if isinstance(doc, dict) and doc.get("project_id") == project_id and doc.get("task_id") == task_id:
-                    records.append(doc)
-            except Exception:
-                pass
-        return records
-    except Exception:
-        return []
+    except Exception as exc:
+        return {"status": READ_STATUS_UNKNOWN, "records": [], "error": summarize_drive_read_error(exc)}
+    return fetch_task_handoffs(store, project_id, task_id)
 
 
 # Recent-first reads keep the HOME view bounded; the manual sync button clears
@@ -388,6 +344,12 @@ def load_all_data():
         all_executions = []
         handoffs_dict = {}
         sessions_dict = {}
+        # Per-(area, project_id) folder-level read status/error, so a real
+        # Drive read failure for one project's Commands/Executions can be
+        # told apart from a confirmed-empty folder when Task Detail later
+        # asks "was this project's read even trustworthy?" (see
+        # fetch_project_records()'s READ_STATUS_UNKNOWN contract).
+        read_status = {}
 
         for project in projects:
             p_id = project.get("project_id")
@@ -395,23 +357,28 @@ def load_all_data():
                 continue
 
             # Read Commands
-            commands, c_warns = list_records_isolated(store, "commands", p_id)
+            c_result = fetch_project_records(store, "commands", p_id, RECENT_RECORD_LIMIT)
+            commands = c_result["records"]
             all_commands.extend(commands)
-            all_warnings.extend(c_warns)
+            all_warnings.extend(c_result["warnings"])
+            read_status[("commands", p_id)] = (c_result["status"], c_result["error"])
 
             # Read Executions
-            executions, e_warns = list_records_isolated(store, "executions", p_id)
+            e_result = fetch_project_records(store, "executions", p_id, RECENT_RECORD_LIMIT)
+            executions = e_result["records"]
             all_executions.extend(executions)
-            all_warnings.extend(e_warns)
+            all_warnings.extend(e_result["warnings"])
+            read_status[("executions", p_id)] = (e_result["status"], e_result["error"])
 
             active_task_ids = {
                 record.get("task_id") for record in [*commands, *executions]
                 if record.get("task_id") and record.get("status") not in {"completed", "failed", "interrupted", "cancelled", "rejected"}
             }
             # Read recent Tasks plus any Task owning a current lifecycle record.
-            tasks, t_warns = list_records_isolated(store, "tasks", p_id, include_ids=active_task_ids)
-            all_tasks.extend(tasks)
-            all_warnings.extend(t_warns)
+            t_result = fetch_project_records(store, "tasks", p_id, RECENT_RECORD_LIMIT, include_ids=active_task_ids)
+            all_tasks.extend(t_result["records"])
+            all_warnings.extend(t_result["warnings"])
+            read_status[("tasks", p_id)] = (t_result["status"], t_result["error"])
 
             # Historical handoff/session detail is intentionally deferred from
             # the P0 first paint. Session identity is authoritative on Execution.
@@ -426,6 +393,7 @@ def load_all_data():
             "all_executions": all_executions,
             "handoffs_dict": handoffs_dict,
             "sessions_dict": sessions_dict,
+            "read_status": read_status,
             "load_duration_seconds": round(time.perf_counter() - load_started, 3),
             "warnings": all_warnings,
             "error": None
@@ -443,6 +411,7 @@ def load_all_data():
             "all_executions": [],
             "handoffs_dict": {},
             "sessions_dict": {},
+            "read_status": {},
             "load_duration_seconds": round(time.perf_counter() - load_started, 3),
             "warnings": all_warnings + [str(e)],
             "error": str(e)
@@ -483,6 +452,7 @@ all_commands = data["all_commands"]
 all_executions = data["all_executions"]
 handoffs_dict = data["handoffs_dict"]
 sessions_dict = data["sessions_dict"]
+read_status = data.get("read_status", {})
 all_warnings = data.get("warnings", [])
 load_duration_seconds = data.get("load_duration_seconds")
 
@@ -1047,8 +1017,16 @@ else:
         task = next((t for t in all_tasks if t.get("project_id") == p_id and t.get("task_id") == t_id), {})
         cmd = select_task_command(all_commands, p_id, t_id)
         exe = select_task_execution(all_executions, p_id, t_id, command=cmd)
-        task_handoffs = load_task_handoff_from_store(p_id, t_id)
-        ho = select_task_handoff(task_handoffs, p_id, t_id, execution=exe, command=cmd)
+        handoff_result = load_task_handoff_from_store(p_id, t_id)
+        ho = select_task_handoff(handoff_result["records"], p_id, t_id, execution=exe, command=cmd)
+
+        # Folder-level read truth for this project's Commands/Executions --
+        # distinguishes "no command/execution record" (confirmed) from "we
+        # could not trust this project's Commands/Executions read" (Drive
+        # auth/network/timeout/5xx failure). Never collapse the latter into
+        # the former.
+        cmd_status, cmd_read_error = read_status.get(("commands", p_id), (READ_STATUS_OK, None))
+        exe_status, exe_read_error = read_status.get(("executions", p_id), (READ_STATUS_OK, None))
 
         col1, col2 = st.columns(2)
 
@@ -1073,6 +1051,11 @@ else:
                 st.write(f"Heartbeat: `{exe.get('heartbeat_at') or exe.get('completed_at') or 'UNKNOWN'}`")
             elif cmd:
                 st.write(f"No execution record found for this task's command (status: `{cmd.get('status') or 'UNKNOWN'}`).")
+            elif cmd_status == READ_STATUS_UNKNOWN or exe_status == READ_STATUS_UNKNOWN:
+                st.warning(
+                    f"UNKNOWN: command/execution truth for this project could not be confirmed "
+                    f"(read failure: `{cmd_read_error or exe_read_error}`). Not confirmed absent -- retry Sync."
+                )
             else:
                 st.write("No command or execution record found for this task.")
 
@@ -1097,6 +1080,11 @@ else:
                 if commits:
                     with st.expander("Commits"):
                         st.write(commits)
+            elif handoff_result["status"] == READ_STATUS_UNKNOWN:
+                st.warning(
+                    f"UNKNOWN: handoff truth for this task could not be confirmed "
+                    f"(read failure: `{handoff_result['error']}`). Not confirmed absent -- retry Sync."
+                )
             else:
                 st.write("No handoff records found for this task.")
 
