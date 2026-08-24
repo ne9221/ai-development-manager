@@ -30,6 +30,67 @@
     "created_via": {"type": "string", "maxLength": 80, "description": "Server-stamped provenance, e.g. 'direct_dispatch_ingress'; never taken verbatim from an external caller's request payload."},
     "admission_version": {"type": "string", "maxLength": 20, "description": "Safe Auto-Admission contract version this record was stamped under, for the Command Watcher's trusted-ingress verification."},
     "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$", "description": "External request identity, used to cross-check against the ingress idempotency record; not launch/account authority."},
+    "process_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "caller_origin": {"enum": ["watcher_poll", "direct_or_unknown"]},
+        "scheduler_invocation_id": {"type": ["string", "null"], "pattern": "^[0-9a-f]{32}$"},
+        "wrapper_pid": {"type": "integer", "minimum": 1},
+        "wrapper_creation_identity": {"type": "string", "minLength": 1, "maxLength": 200},
+        "os_scheduler_evidence": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "reason"],
+              "properties": {
+                "status": {"enum": ["UNKNOWN", "FAIL"]},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 200},
+                "ignore_new_events": {"$ref": "#/$defs/ignore_new_events"}
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "reason", "task_name", "instance_id", "trigger_event_record_id", "trigger_event_id", "trigger_time", "action_event_record_id", "action_process_id", "action_executable", "trigger_origin", "ignore_new_events"],
+              "properties": {
+                "status": {"const": "PASS"},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 200},
+                "task_name": {"type": "string", "minLength": 1, "maxLength": 200},
+                "instance_id": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "trigger_event_record_id": {"type": "integer", "minimum": 1},
+                "trigger_event_id": {"type": "integer", "minimum": 1},
+                "trigger_time": {"type": "string", "format": "date-time"},
+                "action_event_record_id": {"type": "integer", "minimum": 1},
+                "action_process_id": {"type": "integer", "minimum": 1},
+                "action_executable": {"type": ["string", "null"], "maxLength": 1000},
+                "trigger_origin": {"enum": ["scheduled_time", "unknown"]},
+                "ignore_new_events": {"$ref": "#/$defs/ignore_new_events"}
+              }
+            }
+          ]
+        }
+      }
+    },
     "result": {"type": ["object", "null"], "additionalProperties": false, "properties": {"status": {"enum": ["completed", "failed", "interrupted", "error"]}, "execution_id": {"type": ["string", "null"], "maxLength": 200}, "session_id": {"type": ["string", "null"], "maxLength": 600}, "error_kind": {"type": ["string", "null"], "maxLength": 100}}}
+  },
+  "$defs": {
+    "ignore_new_events": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["task_name", "instance_id", "event_record_id", "timestamp", "reason"],
+        "properties": {
+          "task_name": {"type": "string", "minLength": 1, "maxLength": 200},
+          "instance_id": {"type": ["string", "null"], "maxLength": 1000},
+          "event_record_id": {"type": "integer", "minimum": 1},
+          "timestamp": {"type": "string", "format": "date-time"},
+          "reason": {"const": "already_running"}
+        }
+      }
+    }
   }
 }

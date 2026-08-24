@@ -95,7 +95,13 @@
             "host": {"type": "string", "minLength": 1, "maxLength": 100},
             "pid": {"type": "integer", "minimum": 1},
             "creation_identity": {"type": "string", "minLength": 1, "maxLength": 200},
-            "started_at": {"type": "string", "format": "date-time"}
+            "started_at": {"type": "string", "format": "date-time"},
+            "launcher_pid": {"type": "integer", "minimum": 1},
+            "launcher_creation_identity": {"type": "string", "minLength": 1, "maxLength": 200},
+            "provider_pid": {"type": "integer", "minimum": 1},
+            "provider_creation_identity": {"type": "string", "minLength": 1, "maxLength": 200},
+            "provider_parent_identity": {"type": "string", "minLength": 1, "maxLength": 200},
+            "scheduler_invocation_id": {"type": ["string", "null"], "pattern": "^[0-9a-f]{32}$"}
           }
         }
       ]
