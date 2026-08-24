@@ -18,6 +18,7 @@ param(
 $env:ADM_SCHEDULER_INVOCATION_ID = [guid]::NewGuid().ToString("N")
 $env:ADM_SCHEDULER_TASK_NAME = "AI Development Manager - Command Watcher"
 $env:ADM_SCHEDULER_WRAPPER_PID = "$PID"
+$env:ADM_SCHEDULER_WRAPPER_PARENT_PID = "$((Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\").ParentProcessId)"
 # A wrapper cannot distinguish Task Scheduler's Run button from a time trigger.
 $env:ADM_SCHEDULER_TRIGGER_ORIGIN = "unknown"
 

@@ -21,6 +21,7 @@ param(
 $env:ADM_SCHEDULER_INVOCATION_ID = [guid]::NewGuid().ToString("N")
 $env:ADM_SCHEDULER_TASK_NAME = "AI Development Manager - Drive Dispatch Ingress"
 $env:ADM_SCHEDULER_WRAPPER_PID = "$PID"
+$env:ADM_SCHEDULER_WRAPPER_PARENT_PID = "$((Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\").ParentProcessId)"
 $env:ADM_SCHEDULER_TRIGGER_ORIGIN = "unknown"
 
 # Fail-closed WorkspaceRoot validation, before ADM_WORKSPACE_ROOT is ever

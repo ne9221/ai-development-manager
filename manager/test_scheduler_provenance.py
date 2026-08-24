@@ -11,21 +11,22 @@ from manager import scheduler_provenance as provenance
 class SchedulerProvenanceTests(unittest.TestCase):
     TASK = "AI Development Manager - Command Watcher"
 
-    def raw_event(self, event_id, record_id, instance, pid=None, message="", when=None):
+    def raw_event(self, event_id, record_id, instance, pid=None, message="", when=None, task_name=None):
         when = when or datetime.now(timezone.utc)
-        fields = f'<Data Name="TaskName">{self.TASK}</Data><Data Name="InstanceId">{instance}</Data>'
+        fields = f'<Data Name="TaskName">{task_name or self.TASK}</Data><Data Name="InstanceId">{instance}</Data>'
         if pid is not None:
-            fields += f'<Data Name="ProcessId">{pid}</Data>'
+            fields += f'<Data Name="ProcessID">{pid}</Data>'
         return {"record_id": record_id, "event_id": event_id, "time_created": when.isoformat(), "message": message,
                 "xml": f'<Event><System><EventID>{event_id}</EventID><EventRecordID>{record_id}</EventRecordID><TimeCreated SystemTime="{when.isoformat()}" /></System><EventData>{fields}</EventData></Event>'}
 
     def os_context(self):
-        return {"task_name": self.TASK, "wrapper_pid": 41, "wrapper_creation_identity": "wrapper-41"}
+        return {"task_name": self.TASK, "wrapper_pid": 222, "wrapper_parent_pid": 111,
+                "wrapper_creation_identity": "wrapper-222"}
 
     @staticmethod
     def os_pass():
         return {"status": "PASS", "trigger_origin": "scheduled_time", "instance_id": "i-1",
-                "trigger_event_record_id": 10, "action_event_record_id": 12, "action_process_id": 41}
+                "trigger_event_record_id": 10, "action_event_record_id": 12, "action_process_id": 111}
 
     def correlated(self, events):
         with patch.object(provenance.os, "name", "nt"), \
@@ -35,12 +36,12 @@ class SchedulerProvenanceTests(unittest.TestCase):
 
     def test_unique_natural_os_instance_requires_event_129_pid_link(self):
         evidence = self.correlated([
-            self.raw_event(107, 10, "i-1", message="due to a time trigger condition"),
-            self.raw_event(100, 11, "i-1"), self.raw_event(129, 12, "i-1", 41),
+            self.raw_event(107, 10, "i-1", message="due to a time trigger condition", task_name="\\" + self.TASK),
+            self.raw_event(129, 12, "i-1", 111, task_name="\\" + self.TASK),
         ])
         self.assertEqual("PASS", evidence["status"])
         self.assertEqual("scheduled_time", evidence["trigger_origin"])
-        self.assertEqual(41, evidence["action_process_id"])
+        self.assertEqual(111, evidence["action_process_id"])
 
     def test_pid_mismatch_is_fail_and_missing_or_duplicate_is_unknown(self):
         mismatch = self.correlated([self.raw_event(129, 12, "i-1", 99)])
@@ -48,17 +49,37 @@ class SchedulerProvenanceTests(unittest.TestCase):
         missing = self.correlated([])
         self.assertEqual("UNKNOWN", missing["status"])
         duplicate = self.correlated([
-            self.raw_event(107, 10, "i-1"), self.raw_event(100, 11, "i-1"), self.raw_event(129, 12, "i-1", 41),
-            self.raw_event(107, 20, "i-2"), self.raw_event(100, 21, "i-2"), self.raw_event(129, 22, "i-2", 41),
+            self.raw_event(107, 10, "i-1", message="scheduled time"), self.raw_event(129, 12, "i-1", 111),
+            self.raw_event(107, 20, "i-2", message="scheduled time"), self.raw_event(129, 22, "i-2", 111),
         ])
         self.assertEqual("UNKNOWN", duplicate["status"])
 
+    def test_task_name_and_pid_contracts_are_exact(self):
+        scheduled = self.raw_event(107, 10, "i-1", message="scheduled time")
+        action = self.raw_event(129, 12, "i-1", 111)
+        self.assertEqual("UNKNOWN", self.correlated([
+            self.raw_event(107, 10, "i-1", message="scheduled time", task_name="Other Task"), action,
+        ])["status"])
+        missing_parent = {key: value for key, value in self.os_context().items() if key != "wrapper_parent_pid"}
+        with patch.object(provenance.os, "name", "nt"), patch.object(provenance, "process_identity_state", return_value="live"):
+            self.assertEqual("UNKNOWN", provenance.correlate_os_evidence(missing_parent, datetime.now(timezone.utc).isoformat(), reader=lambda *_: [scheduled, action])["status"])
+        missing_wrapper = {key: value for key, value in self.os_context().items() if key != "wrapper_pid"}
+        with patch.object(provenance.os, "name", "nt"), patch.object(provenance, "process_identity_state", return_value="live"):
+            self.assertEqual("UNKNOWN", provenance.correlate_os_evidence(missing_wrapper, datetime.now(timezone.utc).isoformat(), reader=lambda *_: [scheduled, action])["status"])
+
+    def test_adjacent_tick_action_does_not_contaminate_unique_pid_match(self):
+        evidence = self.correlated([
+            self.raw_event(107, 10, "current", message="scheduled time"), self.raw_event(129, 12, "current", 111),
+            self.raw_event(107, 20, "adjacent", message="scheduled time"), self.raw_event(129, 22, "adjacent", 999),
+        ])
+        self.assertEqual(("PASS", "current"), (evidence["status"], evidence["instance_id"]))
+
     def test_missing_chain_parts_malformed_and_instance_mismatch_are_unknown(self):
         for events in (
-            [self.raw_event(100, 11, "i-1"), self.raw_event(129, 12, "i-1", 41)],
-            [self.raw_event(107, 10, "i-1"), self.raw_event(129, 12, "i-1", 41)],
-            [self.raw_event(107, 10, "i-1"), self.raw_event(100, 11, "i-1")],
-            [self.raw_event(107, 10, "i-1"), self.raw_event(100, 11, "i-2"), self.raw_event(129, 12, "i-1", 41)],
+            [self.raw_event(100, 11, "i-1"), self.raw_event(129, 12, "i-1", 111)],
+            [self.raw_event(107, 10, "i-1", message="manual run"), self.raw_event(129, 12, "i-1", 111)],
+            [self.raw_event(107, 10, "i-1", message="scheduled time")],
+            [self.raw_event(107, 10, "i-1", message="scheduled time"), self.raw_event(129, 12, "i-2", 111)],
             [{"xml": "not xml"}],
         ):
             self.assertEqual("UNKNOWN", self.correlated(events)["status"])
@@ -70,7 +91,7 @@ class SchedulerProvenanceTests(unittest.TestCase):
         old = datetime.now(timezone.utc) - timedelta(seconds=provenance.EVENT_WINDOW_SECONDS + 1)
         self.assertEqual("UNKNOWN", self.correlated([
             self.raw_event(107, 10, "i-1", when=old), self.raw_event(100, 11, "i-1", when=old),
-            self.raw_event(129, 12, "i-1", 41, when=old),
+            self.raw_event(129, 12, "i-1", 111, when=old),
         ])["status"])
 
     def test_identity_mismatch_and_log_failure_fail_closed(self):
@@ -82,13 +103,12 @@ class SchedulerProvenanceTests(unittest.TestCase):
             status, events, _ = provenance.read_os_events(datetime.now(timezone.utc).isoformat(), reader=lambda *_: (_ for _ in ()).throw(OSError()))
         self.assertEqual(("UNKNOWN", []), (status, events))
 
-    def test_manual_text_is_not_a_hardcoded_trigger_pattern(self):
+    def test_manual_text_cannot_pass_as_a_scheduled_trigger(self):
         evidence = self.correlated([
-            self.raw_event(107, 10, "i-1", message="manual run"), self.raw_event(100, 11, "i-1"),
-            self.raw_event(129, 12, "i-1", 41),
+            self.raw_event(107, 10, "i-1", message="manual run"),
+            self.raw_event(129, 12, "i-1", 111),
         ])
-        self.assertEqual("PASS", evidence["status"])
-        self.assertEqual("unknown", evidence["trigger_origin"])
+        self.assertEqual("UNKNOWN", evidence["status"])
 
     def test_retention_is_bounded(self):
         with tempfile.TemporaryDirectory() as home, patch.object(provenance, "MAX_RECORDS", 2), patch.object(provenance, "RETAIN_DAYS", 1):
@@ -108,7 +128,8 @@ class SchedulerProvenanceTests(unittest.TestCase):
 
     def test_evidence_status_requires_complete_scheduled_os_proof(self):
         command = {"process_provenance": {"caller_origin": "watcher_poll", "scheduler_invocation_id": "a" * 32,
-                   "wrapper_pid": 41, "os_scheduler_evidence": self.os_pass()}}
+                   "wrapper_pid": 222, "wrapper_parent_pid": 111, "wrapper_creation_identity": "wrapper-222",
+                   "os_scheduler_evidence": self.os_pass()}}
         provider = {"provider_evidence": {"scheduler_invocation_id": "a" * 32, "launcher_pid": 1,
                     "launcher_creation_identity": "launcher", "provider_pid": 2,
                     "provider_creation_identity": "provider", "provider_parent_identity": "launcher"}}
@@ -139,7 +160,7 @@ class SchedulerProvenanceTests(unittest.TestCase):
              patch.object(provenance, "correlate_os_evidence", return_value=self.os_pass()):
             context = provenance.start(home, "command_watcher", {
                 provenance.ENV_ID: "12345678-1234-1234-1234-123456789abc", provenance.ENV_TASK: self.TASK,
-                provenance.ENV_WRAPPER_PID: "41",
+                provenance.ENV_WRAPPER_PID: "41", provenance.ENV_WRAPPER_PARENT_PID: "111",
             })
         origin = provenance.command_origin(context)
         self.assertEqual(41, origin["wrapper_pid"])
@@ -152,7 +173,7 @@ class SchedulerProvenanceTests(unittest.TestCase):
             context = provenance.start(home, "command_watcher", {
                 provenance.ENV_ID: "12345678-1234-1234-1234-123456789abc",
                 provenance.ENV_TASK: "AI Development Manager - Command Watcher",
-                provenance.ENV_WRAPPER_PID: "41",
+                provenance.ENV_WRAPPER_PID: "41", provenance.ENV_WRAPPER_PARENT_PID: "111",
                 provenance.ENV_TRIGGER: "scheduled",
             })
             provenance.finish(home, context, "completed")
@@ -161,6 +182,7 @@ class SchedulerProvenanceTests(unittest.TestCase):
                 record = json.loads(handle.read())
         self.assertEqual("unknown", record["trigger_origin"])
         self.assertEqual(41, record["wrapper_pid"])
+        self.assertEqual(111, record["wrapper_parent_pid"])
         self.assertTrue(record["python_pid"] > 0)
         self.assertEqual("completed", record["status"])
         self.assertIsNotNone(record["ended_at"])
@@ -170,7 +192,7 @@ class SchedulerProvenanceTests(unittest.TestCase):
         with patch.object(provenance.os, "getppid", return_value=99):
             self.assertIsNone(provenance.context_from_environment({
                 provenance.ENV_ID: "12345678-1234-1234-1234-123456789abc",
-                provenance.ENV_TASK: "watcher", provenance.ENV_WRAPPER_PID: "41",
+                provenance.ENV_TASK: "watcher", provenance.ENV_WRAPPER_PID: "41", provenance.ENV_WRAPPER_PARENT_PID: "111",
             }))
         self.assertEqual({"caller_origin": "direct_or_unknown", "scheduler_invocation_id": None},
                          provenance.command_origin())

@@ -183,7 +183,7 @@ def build_fake_store(request_id: str, ingress_first_observed_at: str, *, request
             "execution_id": execution_id,
             "provider": "codex",
             "selection_reason": "quota-eligible-auto-dispatch",
-            "process_provenance": {"scheduler_invocation_id": "a" * 32, "wrapper_pid": 41,
+            "process_provenance": {"scheduler_invocation_id": "a" * 32, "wrapper_pid": 41, "wrapper_parent_pid": 41,
                 "wrapper_creation_identity": "wrapper", "os_scheduler_evidence": scheduler_provenance()["os_scheduler_evidence"]},
         },
         ("executions", PROJECT, execution_id): {

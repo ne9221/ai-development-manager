@@ -14,6 +14,7 @@ from manager.codex_launcher import process_creation_identity, process_identity_s
 ENV_ID = "ADM_SCHEDULER_INVOCATION_ID"
 ENV_TASK = "ADM_SCHEDULER_TASK_NAME"
 ENV_WRAPPER_PID = "ADM_SCHEDULER_WRAPPER_PID"
+ENV_WRAPPER_PARENT_PID = "ADM_SCHEDULER_WRAPPER_PARENT_PID"
 ENV_TRIGGER = "ADM_SCHEDULER_TRIGGER_ORIGIN"
 ORIGINS = frozenset(("scheduled", "manual", "unknown"))
 EVENT_LOG = "Microsoft-Windows-TaskScheduler/Operational"
@@ -57,12 +58,21 @@ def _parse_time(value):
         return None
 
 
+def _task_name(value):
+    """Canonical Task Scheduler identity; only its root separator is optional."""
+    return value.lstrip("\\") if isinstance(value, str) else None
+
+
+def _data_value(data, *names):
+    return next((data.get(name.casefold()) for name in names if data.get(name.casefold())), None)
+
+
 def _event(raw):
     """Keep only the small fields needed for correlation; malformed XML is ignored."""
     try:
         root = ET.fromstring(raw["xml"])
         system = next(node for node in root if node.tag.endswith("System"))
-        data = {node.attrib.get("Name", ""): (node.text or "") for node in root.iter()
+        data = {node.attrib.get("Name", "").casefold(): (node.text or "") for node in root.iter()
                 if node.tag.endswith("Data")}
         record_id = int(raw.get("record_id") or next(node.text for node in system if node.tag.endswith("EventRecordID")))
         event_id = int(raw.get("event_id") or next(node.text for node in system if node.tag.endswith("EventID")))
@@ -70,16 +80,16 @@ def _event(raw):
                                                                   if node.tag.endswith("TimeCreated")))
     except (KeyError, TypeError, ValueError, ET.ParseError, StopIteration):
         return None
-    task_name = data.get("TaskName") or data.get("Task")
-    instance_id = data.get("InstanceId") or data.get("InstanceID")
+    task_name = _data_value(data, "TaskName", "Task")
+    instance_id = _data_value(data, "InstanceId")
     try:
-        process_id = int(data.get("ProcessId") or data.get("PID") or "")
+        process_id = int(_data_value(data, "ProcessID", "ProcessId", "PID") or "")
     except ValueError:
         process_id = None
     text = " ".join(str(value) for value in (*data.values(), raw.get("message", "")))
     return {"record_id": record_id, "event_id": event_id, "time_created": created,
             "task_name": task_name, "instance_id": instance_id, "process_id": process_id,
-            "text": text[:1000], "action_executable": data.get("ActionName") or data.get("Path")}
+            "text": text[:1000], "action_executable": _data_value(data, "ActionName", "Path")}
 
 
 def _powershell_events(start, end, max_events):
@@ -134,11 +144,16 @@ def correlate_os_evidence(context, started_at, *, reader=None):
     status, events, reason = read_os_events(started_at, reader=reader)
     if status != "PASS":
         return {"status": "UNKNOWN", "reason": reason}
+    if not context.get("wrapper_parent_pid"):
+        return {"status": "UNKNOWN", "reason": "missing_wrapper_parent_pid"}
+    if not context.get("wrapper_pid") or not context.get("wrapper_creation_identity"):
+        return {"status": "UNKNOWN", "reason": "missing_wrapper_pid_identity"}
     if process_identity_state(context["wrapper_pid"], context["wrapper_creation_identity"]) != "live":
         return {"status": "FAIL", "reason": "wrapper_creation_identity_mismatch"}
-    matching = [event for event in events if event["task_name"] == context["task_name"]]
+    task_name = _task_name(context["task_name"])
+    matching = [event for event in events if _task_name(event["task_name"]) == task_name]
     actions = [event for event in matching if event["event_id"] == 129]
-    linked = [event for event in actions if event["process_id"] == context["wrapper_pid"] and event["instance_id"]
+    linked = [event for event in actions if event["process_id"] == context["wrapper_parent_pid"] and event["instance_id"]
               and _after_wrapper_creation(event, context["wrapper_creation_identity"])]
     ignored = [{"task_name": event["task_name"], "instance_id": event["instance_id"],
                 "event_record_id": event["record_id"], "timestamp": event["time_created"].isoformat(),
@@ -148,14 +163,14 @@ def correlate_os_evidence(context, started_at, *, reader=None):
     candidates = []
     for action in linked:
         instance = action["instance_id"]
-        trigger = [event for event in matching if event["event_id"] == 107 and event["instance_id"] == instance]
-        started = [event for event in matching if event["event_id"] == 100 and event["instance_id"] == instance]
-        if trigger and started:
+        trigger = [event for event in matching if event["event_id"] == 107 and event["instance_id"] == instance
+                   and _origin(event) == "scheduled_time"]
+        if len(trigger) == 1:
             candidates.append((action, trigger[0]))
     if len(candidates) != 1:
         return {"status": "UNKNOWN", "reason": "missing_or_ambiguous_os_instance", "ignore_new_events": ignored}
     action, trigger = candidates[0]
-    return {"status": "PASS", "task_name": context["task_name"], "instance_id": action["instance_id"],
+    return {"status": "PASS", "task_name": task_name, "instance_id": action["instance_id"],
             "trigger_event_record_id": trigger["record_id"], "trigger_event_id": trigger["event_id"],
             "trigger_time": trigger["time_created"].isoformat(), "action_event_record_id": action["record_id"],
             "action_process_id": action["process_id"], "action_executable": action["action_executable"],
@@ -187,15 +202,18 @@ def context_from_environment(environ=None):
     invocation_id = _safe_id(environ.get(ENV_ID)); task_name = environ.get(ENV_TASK)
     try:
         wrapper_pid = int(environ.get(ENV_WRAPPER_PID, ""))
+        wrapper_parent_pid = int(environ.get(ENV_WRAPPER_PARENT_PID, ""))
     except ValueError:
-        wrapper_pid = 0
-    if not invocation_id or not isinstance(task_name, str) or not task_name or wrapper_pid != os.getppid():
+        wrapper_pid = wrapper_parent_pid = 0
+    if (not invocation_id or not isinstance(task_name, str) or not task_name or wrapper_pid != os.getppid()
+            or wrapper_parent_pid < 1):
         return None
     wrapper_identity = process_creation_identity(wrapper_pid)
     if not wrapper_identity:
         return None
     return {"scheduler_invocation_id": invocation_id, "task_name": task_name[:200], "trigger_origin": "unknown",
-            "wrapper_pid": wrapper_pid, "wrapper_creation_identity": wrapper_identity, "python_pid": os.getpid(),
+            "wrapper_pid": wrapper_pid, "wrapper_parent_pid": wrapper_parent_pid,
+            "wrapper_creation_identity": wrapper_identity, "python_pid": os.getpid(),
             "python_creation_identity": process_creation_identity(os.getpid()), "caller_origin": "watcher_poll"}
 
 
@@ -231,7 +249,7 @@ def command_origin(context=None):
     if not context:
         return {"caller_origin": "direct_or_unknown", "scheduler_invocation_id": None}
     origin = {"caller_origin": "watcher_poll", "scheduler_invocation_id": context.get("scheduler_invocation_id")}
-    for key in ("wrapper_pid", "wrapper_creation_identity", "os_scheduler_evidence"):
+    for key in ("wrapper_pid", "wrapper_parent_pid", "wrapper_creation_identity", "os_scheduler_evidence"):
         if key in context:
             origin[key] = context[key]
     return origin
@@ -256,6 +274,8 @@ def evidence_status(command, execution):
     if (os_evidence.get("status") != "PASS" or os_evidence.get("trigger_origin") != "scheduled_time"
             or not all(os_evidence.get(key) for key in os_required)):
         return "UNKNOWN"
-    if not command_evidence.get("wrapper_pid"):
+    if not command_evidence.get("wrapper_pid") or not command_evidence.get("wrapper_creation_identity"):
         return "UNKNOWN"
-    return "PASS" if os_evidence["action_process_id"] == command_evidence.get("wrapper_pid") else "FAIL"
+    if not command_evidence.get("wrapper_parent_pid"):
+        return "UNKNOWN"
+    return "PASS" if os_evidence["action_process_id"] == command_evidence["wrapper_parent_pid"] else "FAIL"
