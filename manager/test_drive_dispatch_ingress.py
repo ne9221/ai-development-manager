@@ -155,6 +155,10 @@ class DriveDispatchIngressTests(unittest.TestCase):
         self.assertEqual("codex", payload["provider"])
         self.assertEqual({"read_only": True}, payload["constraints"])
         self.assertNotIn("created_at", payload)
+        # Blocker 2: the request body's own declared created_at reaches
+        # handle_dispatch() as a separate keyword, never smuggled into the
+        # strict payload schema.
+        self.assertEqual("2026-08-20T11:59:00Z", handler.call_args.kwargs["request_created_at"])
 
     def test_supported_providers_and_null_validate(self):
         for provider in ("codex", "claude", "antigravity", None):
@@ -491,7 +495,7 @@ class DriveDispatchIngressBoundedTests(unittest.TestCase):
     def _accepting_handler(self):
         calls = []
 
-        def handler(_store, _service, _registry_factory, payload):
+        def handler(_store, _service, _registry_factory, payload, request_created_at=None):
             calls.append(payload["request_id"])
             return {"accepted": True, "request_id": payload["request_id"],
                     "task_id": f"dispatch-{payload['request_id']}",

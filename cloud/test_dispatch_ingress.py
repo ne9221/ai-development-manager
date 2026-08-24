@@ -92,6 +92,24 @@ class DispatchIngressTests(unittest.TestCase):
         self.assertEqual(ADMISSION_VERSION, command["admission_version"])
         self.assertEqual("req-1", command["request_id"])
 
+    def test_request_created_at_is_threaded_through_to_the_durable_claim_record(self):
+        """Blocker 2: handle_dispatch()'s optional request_created_at kwarg
+        (e.g. manager.drive_dispatch_ingress's Drive JSON body created_at)
+        must reach the durable claim record as its own `request_created_at`
+        field, separate from `ingress_first_observed_at` (this call's own
+        now_iso() moment)."""
+        handle_dispatch(self.store, self.service, self.registries.factory, payload(),
+                        request_created_at="2026-08-23T23:57:00Z")
+        document = self.registries.factory("p1", "req-1").document
+        self.assertEqual("2026-08-23T23:57:00Z", document["request_created_at"])
+        self.assertIsInstance(document["ingress_first_observed_at"], str)
+        self.assertNotEqual("2026-08-23T23:57:00Z", document["ingress_first_observed_at"])
+
+    def test_request_created_at_omitted_leaves_it_none(self):
+        self.call()  # no request_created_at passed
+        document = self.registries.factory("p1", "req-1").document
+        self.assertIsNone(document["request_created_at"])
+
     def test_automatic_selection_persists_only_the_reliable_provider(self):
         document = quota_fixture(80, 90)
         next(item for item in document["providers"] if item["provider"] == "claude")["last_updated"] = "2020-01-01T00:00:00Z"

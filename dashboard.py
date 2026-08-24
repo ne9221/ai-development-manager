@@ -34,6 +34,7 @@ from manager.dashboard_core import (
     DISPATCH_STATE_RUNNING,
     build_dispatch_truth_row,
     build_pretask_dispatch_truth_row,
+    build_pretask_listing_truncated_row,
     compute_visible_dispatch_gate,
     parse_task_to_run_path,
     build_provenance_vm,
@@ -308,15 +309,24 @@ def load_pretask_dispatch_requests(project_ids):
 
     For each project_id: list at most PRETASK_DISPATCH_REQUEST_LIMIT recent
     dispatch-requests object names (manager.dispatch_requests.
-    list_recent_dispatch_request_ids() -- a single bounded GCS prefix
-    listing, never a full-history scan or pagination past the first page),
-    then resolve each request_id's canonical truth via
+    list_recent_dispatch_request_ids() -- a single bounded, recency-sorted
+    GCS prefix scan, never a full-history scan; see that function's own
+    docstring for why a raw single-page listing is not recency-correct and
+    how the `truncated` flag it also returns must be handled -- see
+    `truncated` below), then resolve each request_id's canonical truth via
     resolve_dispatch_status_for_request(). Only request_ids that resolve to
     task=None (no real Task record exists for them, checked fresh on every
     call) are returned -- once a Task exists, Task/Command/Execution truth
     is the sole source of dispatch state (STATE_PROMOTION contract: this
     function must never also surface a duplicate ingress-only row for a
     request that already has a Task).
+
+    Each project_id's value is {"rows": [...], "truncated": bool}.
+    `truncated=True` means list_recent_dispatch_request_ids() could not
+    prove its scan for this project was complete this refresh -- the caller
+    (dashboard.py's render loop) MUST surface this as an explicit UNKNOWN/
+    TRUNCATED row rather than silently treating a short/empty `rows` as a
+    confirmed "no pending pre-Task requests".
 
     Fails soft to {} (no pre-Task rows shown this refresh, never a crash)
     when ADM_LOCK_GCS_BUCKET is not configured or GCS/Drive is unreachable
@@ -335,11 +345,12 @@ def load_pretask_dispatch_requests(project_ids):
     out = {}
     for project_id in project_ids:
         try:
-            request_ids = list_recent_dispatch_request_ids(
+            listing = list_recent_dispatch_request_ids(
                 bucket, project_id, max_results=PRETASK_DISPATCH_REQUEST_LIMIT,
             )
         except Exception:
-            request_ids = []
+            listing = {"request_ids": [], "truncated": True}
+        request_ids = listing.get("request_ids", [])
         rows = []
         for request_id in request_ids:
             try:
@@ -354,7 +365,7 @@ def load_pretask_dispatch_requests(project_ids):
                 "dispatch_request_status": resolved.get("dispatch_request_status"),
                 "dispatch_request_read_failed": resolved.get("dispatch_request_read_failed", False),
             })
-        out[project_id] = rows
+        out[project_id] = {"rows": rows, "truncated": bool(listing.get("truncated", False))}
     return out
 
 
@@ -614,13 +625,20 @@ for _task in all_tasks:
 # have no Task record, so appending these never duplicates a row already
 # built from all_tasks above.
 _pretask_by_project = load_pretask_dispatch_requests(tuple(sorted(_dispatch_projects_by_id.keys())))
-for _pretask_project_id, _pretask_rows in _pretask_by_project.items():
+for _pretask_project_id, _pretask_entry in _pretask_by_project.items():
     _pretask_project = _dispatch_projects_by_id.get(_pretask_project_id)
-    for _pretask in _pretask_rows:
+    for _pretask in _pretask_entry["rows"]:
         _dispatch_rows.append(build_pretask_dispatch_truth_row(
             _pretask_project, _pretask_project_id, _pretask["request_id"],
             _pretask["dispatch_request_status"], daily_brief_vm.accounts, now,
             dispatch_request_read_failed=_pretask["dispatch_request_read_failed"],
+        ))
+    if _pretask_entry.get("truncated"):
+        # Blocker 1 fix: an incomplete recent-request scan must never be
+        # rendered as a silent, confirmed "nothing pending" -- see
+        # load_pretask_dispatch_requests()'s docstring.
+        _dispatch_rows.append(build_pretask_listing_truncated_row(
+            _pretask_project, _pretask_project_id, daily_brief_vm.accounts,
         ))
 
 dispatch_gate = compute_visible_dispatch_gate(_dispatch_rows)

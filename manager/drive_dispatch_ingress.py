@@ -423,8 +423,15 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
                 payload["provider"] = request["preferred_provider"]
             if request.get("account_id") is not None:
                 payload["account_id"] = request["account_id"]
+            # SLA evidence only (see cloud.dispatch_ingress.handle_dispatch()'s
+            # own docstring) -- the request body's own declared created_at,
+            # threaded through as a separate argument rather than a payload
+            # field, since it is not part of validate_dispatch_payload's
+            # strict schema and must never be used as the Two-Tick
+            # Visibility SLA's own start point.
             result = handle_dispatch(store, service, lambda project_id, request_id:
-                                     registry_factory(bucket, project_id, request_id), payload)
+                                     registry_factory(bucket, project_id, request_id), payload,
+                                     request_created_at=request.get("created_at"))
             results.append({"file_id": metadata["id"], **result})
         except (TaskError, DispatchIngressError) as exc:
             file_id = metadata.get("id") if isinstance(metadata, dict) else None
