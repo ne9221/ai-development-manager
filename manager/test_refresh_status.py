@@ -1,9 +1,12 @@
 import json
+import os
 import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest import mock
 
+from manager import refresh_status
 from manager.refresh_status import RefreshError, refresh, runtime_lock
 
 
@@ -162,6 +165,38 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(1, len(published))
         codex_entry = next(x for x in result["document"]["providers"] if x["provider"] == "codex")
         self.assertEqual(95, codex_entry["windows"][0]["remaining_percent"])
+
+
+class MainObservabilityTests(unittest.TestCase):
+    """Covers the 2026-08-24 scheduler-gap investigation finding: a
+    RefreshError raised by runtime_lock() contention (or any other
+    exception from main()'s own setup, e.g. build_service()) happens
+    before refresh() ever writes "refresh start", and previously was
+    only printed to stderr -- which the hidden wscript.exe scheduled-task
+    wrapper discards entirely, leaving zero trace in refresh.log."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.log_path = self.base / "logs" / "refresh.log"
+        self._env_patch = mock.patch.dict(os.environ, {"AI_MANAGER_HOME": str(self.base)})
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        self.temp.cleanup()
+
+    def test_lock_contention_failure_is_logged(self):
+        lock_path = self.base / "refresh.lock"
+        with runtime_lock(lock_path), \
+             mock.patch("manager.refresh_status.build_service", side_effect=RefreshError("another refresh is already running")):
+            self.assertEqual(1, refresh_status.main())
+        self.assertIn("refresh failed before start: RefreshError", self.log_path.read_text(encoding="utf-8"))
+
+    def test_setup_failure_is_logged(self):
+        with mock.patch("manager.refresh_status.build_service", side_effect=RuntimeError("Drive auth unreachable")):
+            self.assertEqual(1, refresh_status.main())
+        self.assertIn("refresh initialization failed: RuntimeError", self.log_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
