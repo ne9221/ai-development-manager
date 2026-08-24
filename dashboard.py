@@ -13,6 +13,12 @@ from collectors.publish_drive import build_service
 from manager.tasks import DriveRecords
 from manager.quota_reader import read_drive_status, summarize
 from manager.quota_history import get_default_quota_history_store
+from manager.gcs_lock_registry import BUCKET_ENV
+from manager.dispatch_requests import (
+    list_recent_dispatch_request_ids,
+    resolve_dispatch_status_for_request,
+    dispatch_request_registry,
+)
 from manager.dashboard_core import (
     parse_time,
     determine_execution_state,
@@ -27,6 +33,7 @@ from manager.dashboard_core import (
     UNKNOWN_LABEL,
     DISPATCH_STATE_RUNNING,
     build_dispatch_truth_row,
+    build_pretask_dispatch_truth_row,
     compute_visible_dispatch_gate,
     parse_task_to_run_path,
     build_provenance_vm,
@@ -49,6 +56,11 @@ SUPERVISOR_TASK_NAME = "AI Development Manager - Session Center Supervisor"
 SESSION_CENTER_URL = "http://127.0.0.1:8765"
 DASHBOARD_PROJECT_ID = os.environ.get("ADM_DASHBOARD_PROJECT_ID", "ai-development-manager")
 RECENT_RECORD_LIMIT = 6
+# Bounded cap on how many recent dispatch-requests object names are listed
+# per project for the pre-Task ("VISIBLE_BEFORE_TASK") Dashboard rows below
+# -- a single bounded GCS prefix listing, never a full-history scan. See
+# load_pretask_dispatch_requests()'s docstring.
+PRETASK_DISPATCH_REQUEST_LIMIT = 20
 
 
 def query_scheduled_task_raw(task_name):
@@ -287,6 +299,67 @@ def load_task_handoff_from_store(project_id: str, task_id: str):
     except Exception as exc:
         return {"status": READ_STATUS_UNKNOWN, "records": [], "error": summarize_drive_read_error(exc)}
     return fetch_task_handoffs(store, project_id, task_id)
+
+
+@st.cache_data(ttl=60)
+def load_pretask_dispatch_requests(project_ids):
+    """Bounded pre-Task ingress-truth lookup (closes VISIBLE_BEFORE_TASK): a
+    dispatch request ingress has durably ACCEPTED/REJECTED/FAILED before
+    any Task/Command/Execution record was ever created for it must still be
+    user-visible in this Dashboard -- previously it was completely
+    invisible, since every render loop only ever iterated existing Task/
+    Command/Execution records.
+
+    For each project_id: list at most PRETASK_DISPATCH_REQUEST_LIMIT recent
+    dispatch-requests object names (manager.dispatch_requests.
+    list_recent_dispatch_request_ids() -- a single bounded GCS prefix
+    listing, never a full-history scan or pagination past the first page),
+    then resolve each request_id's canonical truth via
+    resolve_dispatch_status_for_request(). Only request_ids that resolve to
+    task=None (no real Task record exists for them, checked fresh on every
+    call) are returned -- once a Task exists, Task/Command/Execution truth
+    is the sole source of dispatch state (STATE_PROMOTION contract: this
+    function must never also surface a duplicate ingress-only row for a
+    request that already has a Task).
+
+    Fails soft to {} (no pre-Task rows shown this refresh, never a crash)
+    when ADM_LOCK_GCS_BUCKET is not configured or GCS/Drive is unreachable
+    -- matches this Dashboard's existing fail-soft pattern for every other
+    optional data source (see load_infra_health, the quota/history
+    try/excepts in load_all_data below). Cached at the same 60s TTL as
+    load_all_data() and cleared by the same "Sync with Google Drive" button.
+    """
+    bucket = os.environ.get(BUCKET_ENV)
+    if not bucket:
+        return {}
+    try:
+        resolve_store = DriveRecords(build_service())
+    except Exception:
+        return {}
+    out = {}
+    for project_id in project_ids:
+        try:
+            request_ids = list_recent_dispatch_request_ids(
+                bucket, project_id, max_results=PRETASK_DISPATCH_REQUEST_LIMIT,
+            )
+        except Exception:
+            request_ids = []
+        rows = []
+        for request_id in request_ids:
+            try:
+                registry = dispatch_request_registry(bucket, project_id, request_id)
+                resolved = resolve_dispatch_status_for_request(resolve_store, registry, project_id, request_id)
+            except Exception:
+                continue
+            if resolved.get("task") is not None:
+                continue
+            rows.append({
+                "request_id": request_id,
+                "dispatch_request_status": resolved.get("dispatch_request_status"),
+                "dispatch_request_read_failed": resolved.get("dispatch_request_read_failed", False),
+            })
+        out[project_id] = rows
+    return out
 
 
 # Recent-first reads keep the HOME view bounded; the manual sync button clears
@@ -551,6 +624,23 @@ for _task in all_tasks:
     _project = _dispatch_projects_by_id.get(_task.get("project_id"))
     _dispatch_rows.append(build_dispatch_truth_row(_project, _task, _command, _execution, daily_brief_vm.accounts, now))
 
+# VISIBLE_BEFORE_TASK: a dispatch request ingress has durably ACCEPTED/
+# REJECTED/FAILED before any Task/Command/Execution record exists for it
+# must still be shown here -- see load_pretask_dispatch_requests()'s
+# docstring for the bounded-listing + Task-truth-priority contract. Each
+# entry it returns has ALREADY been confirmed (fresh, this same render) to
+# have no Task record, so appending these never duplicates a row already
+# built from all_tasks above.
+_pretask_by_project = load_pretask_dispatch_requests(tuple(sorted(_dispatch_projects_by_id.keys())))
+for _pretask_project_id, _pretask_rows in _pretask_by_project.items():
+    _pretask_project = _dispatch_projects_by_id.get(_pretask_project_id)
+    for _pretask in _pretask_rows:
+        _dispatch_rows.append(build_pretask_dispatch_truth_row(
+            _pretask_project, _pretask_project_id, _pretask["request_id"],
+            _pretask["dispatch_request_status"], daily_brief_vm.accounts, now,
+            dispatch_request_read_failed=_pretask["dispatch_request_read_failed"],
+        ))
+
 dispatch_gate = compute_visible_dispatch_gate(_dispatch_rows)
 
 # Production Provenance: this Dashboard's own identity vs. the real running
@@ -629,7 +719,10 @@ if not _dispatch_rows:
 else:
     for _row in _dispatch_rows:
         _state = _row["dispatch_state"]
-        _badge = "🟢" if _state == DISPATCH_STATE_RUNNING else ("🔴" if _state in ("FAILED", "BLOCKED") else "⚪")
+        if _row.get("pretask"):
+            _badge = "🕓"  # pre-Task ingress-only truth -- no Task/Command/Execution exists yet.
+        else:
+            _badge = "🟢" if _state == DISPATCH_STATE_RUNNING else ("🔴" if _state in ("FAILED", "BLOCKED") else "⚪")
         with st.container():
             st.markdown(f"""<div class="glass-card">
                 <b>{_badge} {_row['project_name']} → {_row['task_title']}</b><br>

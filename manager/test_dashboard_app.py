@@ -1,3 +1,4 @@
+import os
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -405,6 +406,132 @@ class TestDashboardAppRender(unittest.TestCase):
             any("Full E2E suite executed successfully" in str(el.value) for el in at.markdown)
             or any("Full E2E suite executed successfully" in str(el.value) for el in at.json)
         )
+
+
+class TestDashboardVisibleBeforeTaskRender(unittest.TestCase):
+    """Real Streamlit rendering coverage for VISIBLE_BEFORE_TASK: a
+    dispatch request ingress has durably observed (ACCEPTED/REJECTED/
+    FAILED, or whose status read itself failed) before any Task record
+    exists yet must still be shown in the actual rendered Dashboard page --
+    not just proven at the dashboard_core view-model level."""
+
+    def setUp(self):
+        st.cache_data.clear()
+        self._bucket_patch = patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "test-bucket"})
+        self._bucket_patch.start()
+        self.addCleanup(self._bucket_patch.stop)
+
+    def _run_with_pretask_resolution(self, resolved, mock_build_service, mock_read_drive_status, mock_drive_records,
+                                      mock_list_ids, mock_resolve, mock_registry):
+        mock_read_drive_status.return_value = {"providers": []}
+        mock_store = mock_drive_records.return_value
+        mock_store.list_projects.return_value = [{"project_id": "test-project", "title": "Test Project"}]
+        mock_store.project_folder.side_effect = lambda area, project_id, create=False: f"folder-{area}"
+        mock_store.children.side_effect = lambda parent, name=None: []
+        mock_store.get.side_effect = lambda area, project_id, name: {}
+
+        mock_list_ids.return_value = ["req-1"]
+        mock_registry.return_value = MagicMock()
+        mock_resolve.return_value = resolved
+
+        at = AppTest.from_file("../dashboard.py")
+        at.run(timeout=30)
+        self.assertFalse(at.exception, f"App crashed rendering a pre-Task dispatch row: {at.exception}")
+        return at
+
+    # F.1 / C.1: task=None, request status=accepted -> Dashboard shows ACCEPTED
+    @patch("manager.dispatch_requests.dispatch_request_registry")
+    @patch("manager.dispatch_requests.resolve_dispatch_status_for_request")
+    @patch("manager.dispatch_requests.list_recent_dispatch_request_ids")
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_pretask_accepted_request_renders_accepted(self, mock_build_service, mock_read_drive_status,
+                                                         mock_drive_records, mock_list_ids, mock_resolve, mock_registry):
+        resolved = {"task": None, "command": None, "task_id": "dispatch-req-1", "command_id": "dispatch-req-1",
+                    "dispatch_request_status": {"status": "accepted", "failure_reason": None},
+                    "dispatch_request_read_failed": False}
+        at = self._run_with_pretask_resolution(resolved, mock_build_service, mock_read_drive_status,
+                                                mock_drive_records, mock_list_ids, mock_resolve, mock_registry)
+        markdown_texts = [el.value for el in at.markdown]
+        self.assertTrue(any("ACCEPTED" in m and "req-1" in m for m in markdown_texts),
+                        f"Expected a rendered ACCEPTED pre-Task row for req-1, got: {markdown_texts}")
+
+    # F.2 / C.2: task=None, request status=rejected -> Dashboard shows REJECTED + sanitized reason
+    @patch("manager.dispatch_requests.dispatch_request_registry")
+    @patch("manager.dispatch_requests.resolve_dispatch_status_for_request")
+    @patch("manager.dispatch_requests.list_recent_dispatch_request_ids")
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_pretask_rejected_request_renders_rejected_with_reason(self, mock_build_service, mock_read_drive_status,
+                                                                     mock_drive_records, mock_list_ids, mock_resolve, mock_registry):
+        resolved = {"task": None, "command": None, "task_id": "dispatch-req-1", "command_id": "dispatch-req-1",
+                    "dispatch_request_status": {"status": "rejected", "reason_code": "malformed_request"},
+                    "dispatch_request_read_failed": False}
+        at = self._run_with_pretask_resolution(resolved, mock_build_service, mock_read_drive_status,
+                                                mock_drive_records, mock_list_ids, mock_resolve, mock_registry)
+        markdown_texts = [el.value for el in at.markdown]
+        self.assertTrue(any("REJECTED" in m and "malformed_request" in m for m in markdown_texts),
+                        f"Expected a rendered REJECTED row with reason, got: {markdown_texts}")
+
+    # F.3: task=None, request status=failed -> Dashboard shows FAILED + reason
+    @patch("manager.dispatch_requests.dispatch_request_registry")
+    @patch("manager.dispatch_requests.resolve_dispatch_status_for_request")
+    @patch("manager.dispatch_requests.list_recent_dispatch_request_ids")
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_pretask_failed_request_renders_failed_with_reason(self, mock_build_service, mock_read_drive_status,
+                                                                 mock_drive_records, mock_list_ids, mock_resolve, mock_registry):
+        resolved = {"task": None, "command": None, "task_id": "dispatch-req-1", "command_id": "dispatch-req-1",
+                    "dispatch_request_status": {"status": "failed", "failure_reason": "no eligible provider"},
+                    "dispatch_request_read_failed": False}
+        at = self._run_with_pretask_resolution(resolved, mock_build_service, mock_read_drive_status,
+                                                mock_drive_records, mock_list_ids, mock_resolve, mock_registry)
+        markdown_texts = [el.value for el in at.markdown]
+        self.assertTrue(any("FAILED" in m and "no eligible provider" in m for m in markdown_texts),
+                        f"Expected a rendered FAILED row with reason, got: {markdown_texts}")
+
+    # C.4 / F.6: request status read failure -> Dashboard shows UNKNOWN, never nothing.
+    @patch("manager.dispatch_requests.dispatch_request_registry")
+    @patch("manager.dispatch_requests.resolve_dispatch_status_for_request")
+    @patch("manager.dispatch_requests.list_recent_dispatch_request_ids")
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_pretask_read_failure_renders_unknown_not_nothing(self, mock_build_service, mock_read_drive_status,
+                                                                mock_drive_records, mock_list_ids, mock_resolve, mock_registry):
+        resolved = {"task": None, "command": None, "task_id": "dispatch-req-1", "command_id": "dispatch-req-1",
+                    "dispatch_request_status": None, "dispatch_request_read_failed": True}
+        at = self._run_with_pretask_resolution(resolved, mock_build_service, mock_read_drive_status,
+                                                mock_drive_records, mock_list_ids, mock_resolve, mock_registry)
+        markdown_texts = [el.value for el in at.markdown]
+        self.assertTrue(any("UNKNOWN" in m and "req-1" in m and "read failed" in m for m in markdown_texts),
+                        f"Expected an UNKNOWN row with a read-failure reason, not nothing at all, got: {markdown_texts}")
+
+    # C.3 / STATE_PROMOTION: once a Task exists for the request, the
+    # pre-Task ingress-only row must NOT also be shown (no duplicate row).
+    @patch("manager.dispatch_requests.dispatch_request_registry")
+    @patch("manager.dispatch_requests.resolve_dispatch_status_for_request")
+    @patch("manager.dispatch_requests.list_recent_dispatch_request_ids")
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_task_existing_suppresses_duplicate_pretask_row(self, mock_build_service, mock_read_drive_status,
+                                                              mock_drive_records, mock_list_ids, mock_resolve, mock_registry):
+        # resolve_dispatch_status_for_request() reports a real Task now
+        # exists for this request_id -- load_pretask_dispatch_requests()
+        # must filter it out entirely (never build a pretask row for it).
+        resolved = {"task": {"task_id": "dispatch-req-1", "project_id": "test-project", "title": "Real task",
+                              "status": "ready"},
+                    "command": None, "task_id": "dispatch-req-1", "command_id": "dispatch-req-1",
+                    "dispatch_request_status": None, "dispatch_request_read_failed": False}
+        at = self._run_with_pretask_resolution(resolved, mock_build_service, mock_read_drive_status,
+                                                mock_drive_records, mock_list_ids, mock_resolve, mock_registry)
+        markdown_texts = [el.value for el in at.markdown]
+        self.assertFalse(any("(pre-task) request req-1" in m for m in markdown_texts),
+                         f"A Task now exists for req-1 -- no ingress-only pre-Task row must be shown, got: {markdown_texts}")
 
 
 if __name__ == "__main__":

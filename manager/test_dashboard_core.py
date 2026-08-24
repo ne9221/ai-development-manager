@@ -34,6 +34,7 @@ from manager.dashboard_core import (
     build_provider_truth,
     build_quota_truth,
     build_dispatch_truth_row,
+    build_pretask_dispatch_truth_row,
     compute_visible_dispatch_gate,
     parse_task_to_run_path,
     build_provenance_vm,
@@ -998,6 +999,128 @@ class VisibleDispatchTruthGateTests(unittest.TestCase):
         self.assertEqual(row["quota"]["freshness"], UNKNOWN_LABEL)
         self.assertFalse(row["quota"]["found"])
 
+    # =====================================================================
+    # VISIBLE_BEFORE_TASK: build_pretask_dispatch_truth_row() -- a request
+    # ingress has durably observed (ACCEPTED/REJECTED/FAILED) but for which
+    # no Task record exists yet. Same output contract as
+    # build_dispatch_truth_row() (must satisfy compute_visible_dispatch_gate
+    # too), but with task/command/execution truth honestly UNKNOWN and the
+    # dispatch state driven entirely by dispatch_request_status.
+    # =====================================================================
+
+    def test_pretask_row_reports_accepted_state(self):
+        row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-1",
+            {"status": "accepted", "failure_reason": None},
+            [], self.now,
+        )
+        self.assertEqual(row["dispatch_state"], DISPATCH_STATE_ACCEPTED)
+        self.assertEqual(row["task_id"], "dispatch-req-1")
+        self.assertIn("req-1", row["task_title"])
+        self.assertTrue(row["pretask"])
+
+    def test_pretask_row_reports_rejected_state_with_reason(self):
+        row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-2",
+            {"status": "rejected", "reason_code": "malformed_request"},
+            [], self.now,
+        )
+        self.assertEqual(row["dispatch_state"], DISPATCH_STATE_REJECTED)
+        self.assertEqual(row["dispatch_reason"], "malformed_request")
+
+    def test_pretask_row_reports_failed_state_with_reason(self):
+        row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-3",
+            {"status": "failed", "failure_reason": "no eligible provider"},
+            [], self.now,
+        )
+        self.assertEqual(row["dispatch_state"], DISPATCH_STATE_FAILED)
+        self.assertEqual(row["dispatch_reason"], "no eligible provider")
+
+    def test_pretask_row_never_shows_running_or_guessed_provider(self):
+        row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-4",
+            {"status": "accepted", "failure_reason": None},
+            [], self.now,
+        )
+        self.assertNotEqual(row["dispatch_state"], DISPATCH_STATE_RUNNING)
+        self.assertEqual(row["provider"], UNKNOWN_LABEL)
+        self.assertEqual(row["account_id"], UNKNOWN_LABEL)
+        self.assertEqual(row["model"], UNKNOWN_LABEL)
+        self.assertEqual(row["mode"], UNKNOWN_LABEL)
+        self.assertEqual(row["execution_id"], UNKNOWN_LABEL)
+        self.assertEqual(row["session_id"], UNKNOWN_LABEL)
+
+    # 6/read-failure: a genuine read failure must show UNKNOWN, never
+    # silently show nothing (no row) and never a guessed ACCEPTED.
+    def test_pretask_row_on_read_failure_is_unknown_not_absent_or_guessed(self):
+        row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-5", None, [], self.now,
+            dispatch_request_read_failed=True,
+        )
+        self.assertEqual(row["dispatch_state"], DISPATCH_STATE_UNKNOWN)
+        self.assertIn("read failed", row["dispatch_reason"])
+        self.assertNotEqual(row["dispatch_state"], DISPATCH_STATE_ACCEPTED)
+
+    def test_pretask_row_read_failure_state_and_reason_distinct_from_no_richer_status(self):
+        # Case 6's whole point: a genuine read failure must be a DIFFERENT,
+        # honest UNKNOWN -- never collapsed onto the ACCEPTED fallback that
+        # applies when the request is merely confirmed-to-exist (via the
+        # listing) with no richer status evidence. This function is only
+        # ever called once the caller has confirmed the request exists (see
+        # its docstring), so `dispatch_request_read_failed=False` with no
+        # status correctly still reports ACCEPTED via the existing
+        # has_dispatch_request fallback -- it is `dispatch_request_read_
+        # failed=True` specifically that must override that fallback to an
+        # honest UNKNOWN, since a real read failure means the true state is
+        # simply not knowable this refresh (guessing ACCEPTED would be a lie).
+        read_failed_row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-6", None, [], self.now,
+            dispatch_request_read_failed=True,
+        )
+        confirmed_but_no_richer_status_row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-7", None, [], self.now,
+            dispatch_request_read_failed=False,
+        )
+        self.assertEqual(read_failed_row["dispatch_state"], DISPATCH_STATE_UNKNOWN)
+        self.assertEqual(confirmed_but_no_richer_status_row["dispatch_state"], DISPATCH_STATE_ACCEPTED)
+        self.assertNotEqual(read_failed_row["dispatch_reason"], confirmed_but_no_richer_status_row["dispatch_reason"])
+
+    def test_pretask_row_passes_the_visible_dispatch_gate(self):
+        row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-8",
+            {"status": "accepted", "failure_reason": None},
+            [], self.now,
+        )
+        gate = compute_visible_dispatch_gate([row])
+        self.assertEqual(gate["result"], "PASS")
+
+    def test_pretask_row_and_task_row_never_collide_in_the_same_gate(self):
+        # State promotion / no-duplicate-rows contract: a pre-Task row for
+        # one request_id and a real Task-truth row for a DIFFERENT task
+        # coexist fine in the same gate pass -- the caller (dashboard.py) is
+        # responsible for never emitting both for the SAME request_id (see
+        # its promotion logic, which re-checks resolved["task"] is None
+        # fresh before ever calling this function).
+        task_row = build_dispatch_truth_row(self.project, self.task(), self.command(), self.execution(), [], self.now)
+        pretask_row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-9", {"status": "accepted", "failure_reason": None}, [], self.now,
+        )
+        gate = compute_visible_dispatch_gate([task_row, pretask_row])
+        self.assertEqual(gate["result"], "PASS")
+        self.assertNotEqual(task_row["task_id"], pretask_row["task_id"])
+
+    # 9/SLA contract: compute_dispatch_state() documents SLA_START_POINT
+    # (ingress-observation time, never the raw file's own created_at) --
+    # assert the docstring is actually present so this contract cannot
+    # silently regress/get deleted without a test noticing.
+    def test_sla_start_point_contract_is_documented_on_compute_dispatch_state(self):
+        doc = compute_dispatch_state.__doc__ or ""
+        self.assertIn("SLA_START_POINT", doc)
+        self.assertIn("first successful ingress observation", doc)
+        self.assertIn("2 normal scheduler ticks", doc)
+        self.assertIn("request_created_at", doc)
+
 
 class ProductionProvenanceContractTests(unittest.TestCase):
     """Dashboard-vs-Watcher runtime identity truth (2026-08-22 hard
@@ -1553,6 +1676,131 @@ class TestCanonicalDriveReadContract(unittest.TestCase):
         result = fetch_project_records(store, "commands", self.project_id, limit=6)
         self.assertEqual(result["status"], READ_STATUS_OK)
         self.assertEqual(result["records"], [])
+class PretaskDispatchTruthRowTests(unittest.TestCase):
+    """VISIBLE_BEFORE_TASK: build_pretask_dispatch_truth_row() is the
+    view-model this task's Dashboard wiring uses to render a dispatch
+    request ingress has observed before any Task record exists yet."""
+
+    def setUp(self):
+        self.now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+        self.project = {"project_id": "p1", "name": "Project One"}
+
+    # F.1 pre-task ACCEPTED renders
+    def test_pretask_accepted_row(self):
+        row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-a",
+            {"status": "accepted", "failure_reason": None}, [], self.now,
+        )
+        self.assertEqual(row["dispatch_state"], DISPATCH_STATE_ACCEPTED)
+        self.assertEqual(row["task_id"], "dispatch-req-a")
+        self.assertEqual(row["request_id"], "req-a")
+        self.assertEqual(row["project_id"], "p1")
+        self.assertTrue(row["pretask"])
+        gate = compute_visible_dispatch_gate([row])
+        self.assertEqual(gate["result"], "PASS", gate["reasons"])
+
+    # F.2 pre-task REJECTED renders with reason
+    def test_pretask_rejected_row_carries_reason(self):
+        row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-b",
+            {"status": "rejected", "reason_code": "malformed_request"}, [], self.now,
+        )
+        self.assertEqual(row["dispatch_state"], DISPATCH_STATE_REJECTED)
+        self.assertEqual(row["dispatch_reason"], "malformed_request")
+        gate = compute_visible_dispatch_gate([row])
+        self.assertEqual(gate["result"], "PASS", gate["reasons"])
+
+    # F.3 pre-task FAILED renders
+    def test_pretask_failed_row(self):
+        row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-c",
+            {"status": "failed", "failure_reason": "no eligible provider"}, [], self.now,
+        )
+        self.assertEqual(row["dispatch_state"], DISPATCH_STATE_FAILED)
+        self.assertEqual(row["dispatch_reason"], "no eligible provider")
+
+    # F.6 request read error -> UNKNOWN, never silently NONE/no record.
+    def test_pretask_read_failure_is_unknown_not_none(self):
+        row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-d", None, [], self.now,
+            dispatch_request_read_failed=True,
+        )
+        self.assertEqual(row["dispatch_state"], DISPATCH_STATE_UNKNOWN)
+        self.assertIn("read failed", row["dispatch_reason"])
+        gate = compute_visible_dispatch_gate([row])
+        self.assertEqual(gate["result"], "PASS", gate["reasons"])
+
+    def test_pretask_known_to_exist_without_richer_status_falls_back_to_accepted(self):
+        """build_pretask_dispatch_truth_row() is only ever called for a
+        request_id the caller already confirmed exists (it came back from
+        list_recent_dispatch_request_ids()), so has_dispatch_request=True is
+        always implied here -- a None dispatch_request_status (no richer
+        accepted/rejected/failed evidence) still correctly falls back to
+        ACCEPTED under the existing has_dispatch_request contract (see
+        compute_dispatch_state()'s own documented has_dispatch_request
+        fallback), not UNKNOWN."""
+        row = build_pretask_dispatch_truth_row(self.project, "p1", "req-e", None, [], self.now)
+        self.assertEqual(row["dispatch_state"], DISPATCH_STATE_ACCEPTED)
+
+    def test_pretask_row_provider_fields_are_honest_unknown_not_guessed(self):
+        row = build_pretask_dispatch_truth_row(
+            self.project, "p1", "req-f", {"status": "accepted"}, [], self.now,
+        )
+        self.assertEqual(row["provider"], UNKNOWN_LABEL)
+        self.assertEqual(row["account_id"], UNKNOWN_LABEL)
+        self.assertEqual(row["model"], UNKNOWN_LABEL)
+        self.assertEqual(row["mode"], UNKNOWN_LABEL)
+        self.assertEqual(row["quota"]["freshness"], UNKNOWN_LABEL)
+
+    def test_pretask_project_name_falls_back_to_project_id(self):
+        row = build_pretask_dispatch_truth_row(None, "p2", "req-g", {"status": "accepted"}, [], self.now)
+        self.assertEqual(row["project_name"], "p2")
+
+
+class ResolveDispatchStatusReadFailureTests(unittest.TestCase):
+    """F.6 / dispatch_request_read_failed: resolve_dispatch_status_for_request()
+    must distinguish "request was genuinely never received" (dispatch_request_
+    status=None, dispatch_request_read_failed=False) from "a real backend
+    read failure occurred" (dispatch_request_status=None,
+    dispatch_request_read_failed=True) -- collapsing these was the P0 bug
+    this task closes: a real read failure must never silently render as
+    "no record" (i.e. no visible row at all)."""
+
+    def setUp(self):
+        self.store = DriveRecords(FakeDriveService())
+        create_project(self.store, {
+            "project_id": "p1", "name": "P1", "repo": "r", "default_branch": "main",
+            "runtime_ssot": "Drive", "project_rules": [], "active_tasks": [],
+            "current_phase": "Phase 1", "important_constraints": [],
+        })
+
+    def test_never_received_request_has_read_failed_false(self):
+        registry = MemoryClaimRegistry()
+        resolved = resolve_dispatch_status_for_request(self.store, registry, "p1", "req-never")
+        self.assertIsNone(resolved["task"])
+        self.assertIsNone(resolved["dispatch_request_status"])
+        self.assertFalse(resolved["dispatch_request_read_failed"])
+
+    def test_genuine_backend_read_failure_is_flagged_distinct_from_no_record(self):
+        registry = MemoryClaimRegistry()
+        claim_dispatch_request(registry, "p1", "req-broken", "dispatch-req-broken", "dispatch-req-broken", "2026-08-24T00:00:00Z")
+        registry.read_unavailable = True
+        resolved = resolve_dispatch_status_for_request(self.store, registry, "p1", "req-broken")
+        self.assertIsNone(resolved["task"])
+        self.assertIsNone(resolved["dispatch_request_status"])
+        self.assertTrue(resolved["dispatch_request_read_failed"],
+                        "a real backend read failure must be distinguishable from a genuinely-never-received request")
+
+    def test_task_found_branch_reports_read_failed_false(self):
+        create_task(self.store, {
+            "task_id": "dispatch-req-ok", "project_id": "p1", "title": "Ingress task",
+            "task_type": "general", "expected_minutes": 20, "scope": [], "constraints": [],
+            "acceptance_criteria": [], "source_context": {},
+        }, assign=False)
+        registry = MemoryClaimRegistry()
+        resolved = resolve_dispatch_status_for_request(self.store, registry, "p1", "req-ok")
+        self.assertIsNotNone(resolved["task"])
+        self.assertFalse(resolved["dispatch_request_read_failed"])
 
 
 if __name__ == "__main__":
