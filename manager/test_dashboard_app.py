@@ -36,6 +36,21 @@ class TestDashboardAppRender(unittest.TestCase):
     @patch("manager.tasks.DriveRecords")
     @patch("manager.quota_reader.read_drive_status")
     @patch("collectors.publish_drive.build_service")
+    def test_auto_refresh_arms_without_a_first_paint_rerun(self, mock_build_service, mock_read_drive_status,
+                                                            mock_drive_records):
+        """The 60s fragment must not rerun the app immediately on first paint."""
+        mock_read_drive_status.return_value = {"providers": []}
+        mock_drive_records.return_value.list_projects.return_value = []
+
+        at = AppTest.from_file("../dashboard.py")
+        at.run(timeout=30)
+
+        self.assertFalse(at.exception, f"Auto-refresh first paint crashed: {at.exception}")
+        self.assertTrue(at.session_state["dashboard_auto_refresh_armed"])
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
     def test_app_render_remaining_percent_none(self, mock_build_service, mock_read_drive_status, mock_drive_records):
         # Setup quota with remaining_percent=None and fresh last_updated
         now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
