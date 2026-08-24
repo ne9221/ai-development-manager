@@ -22,6 +22,11 @@ class SchedulerProvenanceTests(unittest.TestCase):
     def os_context(self):
         return {"task_name": self.TASK, "wrapper_pid": 41, "wrapper_creation_identity": "wrapper-41"}
 
+    @staticmethod
+    def os_pass():
+        return {"status": "PASS", "trigger_origin": "scheduled_time", "instance_id": "i-1",
+                "trigger_event_record_id": 10, "action_event_record_id": 12, "action_process_id": 41}
+
     def correlated(self, events):
         with patch.object(provenance.os, "name", "nt"), \
              patch.object(provenance, "process_identity_state", return_value="live"):
@@ -48,6 +53,16 @@ class SchedulerProvenanceTests(unittest.TestCase):
         ])
         self.assertEqual("UNKNOWN", duplicate["status"])
 
+    def test_missing_chain_parts_malformed_and_instance_mismatch_are_unknown(self):
+        for events in (
+            [self.raw_event(100, 11, "i-1"), self.raw_event(129, 12, "i-1", 41)],
+            [self.raw_event(107, 10, "i-1"), self.raw_event(129, 12, "i-1", 41)],
+            [self.raw_event(107, 10, "i-1"), self.raw_event(100, 11, "i-1")],
+            [self.raw_event(107, 10, "i-1"), self.raw_event(100, 11, "i-2"), self.raw_event(129, 12, "i-1", 41)],
+            [{"xml": "not xml"}],
+        ):
+            self.assertEqual("UNKNOWN", self.correlated(events)["status"])
+
     def test_ignorenew_is_recorded_without_binding_and_old_events_are_ignored(self):
         evidence = self.correlated([self.raw_event(322, 99, "running-instance")])
         self.assertEqual("UNKNOWN", evidence["status"])
@@ -67,6 +82,14 @@ class SchedulerProvenanceTests(unittest.TestCase):
             status, events, _ = provenance.read_os_events(datetime.now(timezone.utc).isoformat(), reader=lambda *_: (_ for _ in ()).throw(OSError()))
         self.assertEqual(("UNKNOWN", []), (status, events))
 
+    def test_manual_text_is_not_a_hardcoded_trigger_pattern(self):
+        evidence = self.correlated([
+            self.raw_event(107, 10, "i-1", message="manual run"), self.raw_event(100, 11, "i-1"),
+            self.raw_event(129, 12, "i-1", 41),
+        ])
+        self.assertEqual("PASS", evidence["status"])
+        self.assertEqual("unknown", evidence["trigger_origin"])
+
     def test_retention_is_bounded(self):
         with tempfile.TemporaryDirectory() as home, patch.object(provenance, "MAX_RECORDS", 2), patch.object(provenance, "RETAIN_DAYS", 1):
             directory = os.path.join(home, "runtime", "scheduler-invocations"); os.makedirs(directory)
@@ -75,6 +98,43 @@ class SchedulerProvenanceTests(unittest.TestCase):
                     json.dump({"started_at": (datetime.now(timezone.utc) - timedelta(days=age)).isoformat()}, handle)
             provenance._cleanup(provenance.Path(directory))
             self.assertEqual(1, len(os.listdir(directory)))
+
+    def test_retention_never_deletes_running_invocation(self):
+        with tempfile.TemporaryDirectory() as home, patch.object(provenance, "RETAIN_DAYS", 1):
+            directory = provenance.Path(home); path = directory / "running.json"
+            path.write_text(json.dumps({"started_at": "2000-01-01T00:00:00Z", "status": "running"}), encoding="utf-8")
+            provenance._cleanup(directory)
+            self.assertTrue(path.exists())
+
+    def test_evidence_status_requires_complete_scheduled_os_proof(self):
+        command = {"process_provenance": {"caller_origin": "watcher_poll", "scheduler_invocation_id": "a" * 32,
+                   "wrapper_pid": 41, "os_scheduler_evidence": self.os_pass()}}
+        provider = {"provider_evidence": {"scheduler_invocation_id": "a" * 32, "launcher_pid": 1,
+                    "launcher_creation_identity": "launcher", "provider_pid": 2,
+                    "provider_creation_identity": "provider", "provider_parent_identity": "launcher"}}
+        self.assertEqual("PASS", provenance.evidence_status(command, provider))
+        command["process_provenance"]["os_scheduler_evidence"] = {"status": "UNKNOWN"}
+        self.assertEqual("UNKNOWN", provenance.evidence_status(command, provider))
+        command["process_provenance"]["os_scheduler_evidence"] = {**self.os_pass(), "action_process_id": 99}
+        self.assertEqual("FAIL", provenance.evidence_status(command, provider))
+
+    def test_installed_watcher_and_supervisor_use_ignorenew(self):
+        manager = provenance.Path(__file__).parent
+        for filename in ("install_command_watcher.ps1", "install_session_center_supervisor.ps1"):
+            self.assertIn("-MultipleInstances IgnoreNew", (manager / filename).read_text(encoding="utf-8"))
+
+    def test_start_threads_os_evidence_to_command_provenance(self):
+        with tempfile.TemporaryDirectory() as home, \
+             patch.object(provenance.os, "getppid", return_value=41), \
+             patch.object(provenance, "process_creation_identity", side_effect=lambda pid: f"identity-{pid}"), \
+             patch.object(provenance, "correlate_os_evidence", return_value=self.os_pass()):
+            context = provenance.start(home, "command_watcher", {
+                provenance.ENV_ID: "12345678-1234-1234-1234-123456789abc", provenance.ENV_TASK: self.TASK,
+                provenance.ENV_WRAPPER_PID: "41",
+            })
+        origin = provenance.command_origin(context)
+        self.assertEqual(41, origin["wrapper_pid"])
+        self.assertEqual("PASS", origin["os_scheduler_evidence"]["status"])
 
     def test_verified_wrapper_context_persists_start_and_end(self):
         with tempfile.TemporaryDirectory() as home, \
@@ -113,7 +173,7 @@ class SchedulerProvenanceTests(unittest.TestCase):
         evidence = {"scheduler_invocation_id": "a" * 32, "launcher_pid": 1,
                     "launcher_creation_identity": "launcher", "provider_pid": 2,
                     "provider_creation_identity": "provider", "provider_parent_identity": "launcher"}
-        self.assertEqual("PASS", provenance.evidence_status(command, {"provider_evidence": evidence}))
+        self.assertEqual("UNKNOWN", provenance.evidence_status(command, {"provider_evidence": evidence}))
 
     def test_legacy_records_are_unknown_not_pass(self):
         self.assertEqual("UNKNOWN", provenance.evidence_status({}, {"provider_evidence": {"pid": 123}}))
