@@ -31,7 +31,7 @@ from manager.tasks import DriveRecords, TaskError, update_task, validate
 from manager.trusted_ingress import repo_write_policy_satisfied
 from manager.worktree_locks import link_session as link_writer_session
 from manager.worktree_materializer import materialize_worktree, verify_checkout_repo_identity
-from manager.production_guard import ProductionPathGuardError, assert_not_production_path
+from manager.production_guard import ProductionPathGuardError, RuntimeGuardError, assert_not_production_path
 
 
 RPC_TIMEOUT_SECONDS = 30.0
@@ -338,6 +338,10 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
     The pre-P0.1.5 single-account default path -- provider="claude" with
     neither `account_id` nor `claude_accounts` supplied -- is unaffected.
     """
+    # Gate before reading/claiming or preparing a provider: direct Python and
+    # watcher calls share this same last line of defence.
+    from manager.production_guard import require_runtime_guard
+    require_runtime_guard()
     task = store.get("tasks", project_id, task_id)
     validate("task", task)
     working_directory = _resolve_working_directory(store, task)
@@ -533,7 +537,7 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
 
 
 def _safe_error(exc):
-    classification = getattr(exc, "classification", None) or type(exc).__name__
+    classification = getattr(exc, "code", None) or getattr(exc, "classification", None) or type(exc).__name__
     return {"kind": str(classification)[:100], "message": "execution failed"}
 
 
@@ -558,7 +562,7 @@ def main(argv=None):
                   "session_id": result["session"]["session_id"], "cleanup": result["terminal"]["cleanup"]}
         print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
         return 0 if output["status"] == "completed" else 1
-    except (KeyboardInterrupt, CodexLaunchError, TaskError, OSError, ValueError) as exc:
+    except (KeyboardInterrupt, CodexLaunchError, RuntimeGuardError, TaskError, OSError, ValueError) as exc:
         terminal = None
         if store is not None:
             try:

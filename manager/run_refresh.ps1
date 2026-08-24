@@ -15,6 +15,10 @@ if ($CodexHome) { $env:CODEX_HOME = $CodexHome }
 if ($PythonDeps) { $env:PYTHONPATH = $PythonDeps }
 if ($ClaudePayload) { $env:CLAUDE_STATUSLINE_PAYLOAD = $ClaudePayload }
 
+Set-Location -LiteralPath $RepositoryPath
+$provenanceOutput = & $PythonPath -m manager.provenance verify-running --repository-path $RepositoryPath --manager-home $ManagerHome 2>&1
+if ($LASTEXITCODE -ne 0) { Write-Error "PROVENANCE_MISMATCH: Refresh provenance contract failed.`n$provenanceOutput"; exit 1 }
+
 # Wrapper-level start/end + PID lines exist so a hang or non-launch is
 # visible even when it happens before manager.refresh_status ever writes
 # its own "refresh start" line to this same log (e.g. the python process
@@ -25,7 +29,6 @@ New-Item -ItemType Directory -Force -Path (Split-Path -Parent $logPath) | Out-Nu
 $startedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 Add-Content -LiteralPath $logPath -Value "$startedAt wrapper start pid=$PID" -Encoding utf8
 
-Set-Location -LiteralPath $RepositoryPath
 & $PythonPath -m manager.refresh_status
 $exitCode = $LASTEXITCODE
 

@@ -38,6 +38,7 @@ from collectors.publish_drive import build_service
 from manager.drive_dispatch_ingress import poll_drive_dispatch_requests
 from manager.gcs_lock_registry import BUCKET_ENV
 from manager.tasks import DriveRecords, TaskError
+from manager.production_guard import RuntimeGuardError, require_runtime_guard
 
 
 def run_once(build_service_fn=build_service, store_factory=DriveRecords, poll=poll_drive_dispatch_requests):
@@ -46,6 +47,7 @@ def run_once(build_service_fn=build_service, store_factory=DriveRecords, poll=po
     once. Raises TaskError (missing config) or whatever build_service_fn
     raises (Drive auth failure) rather than silently no-oping; the caller
     decides how to turn that into a process exit status."""
+    require_runtime_guard()
     bucket = os.environ.get(BUCKET_ENV)
     if not bucket:
         raise TaskError(f"{BUCKET_ENV} is required")
@@ -68,6 +70,11 @@ def main(argv=None):
     parser.parse_args(argv)
     from manager.scheduler_provenance import finish, start
     invocation = start(os.environ.get("AI_MANAGER_HOME", "."), "drive_dispatch_ingress")
+    try:
+        require_runtime_guard()
+    except RuntimeGuardError as exc:
+        _print_error(exc.code)
+        return 1
     try:
         # Looked up from module globals at call time (not via run_once()'s
         # own default arguments, which bind at function-definition time) so

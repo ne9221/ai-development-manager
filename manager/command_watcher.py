@@ -27,6 +27,7 @@ from manager.trusted_ingress import (
     task_policy_satisfied_for_admission, verify_trusted_ingress_admission,
 )
 from manager.dispatch_requests import dispatch_request_registry
+from manager.production_guard import RuntimeGuardError, require_runtime_guard
 
 
 POLL_SECONDS = 60
@@ -446,6 +447,7 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     by the command's own provider. An unrecognized provider is rejected here
     -- it never silently falls back to Codex's launcher or quota gate.
     """
+    require_runtime_guard()
     try:
         validate("command", command)
     except TaskError:
@@ -803,6 +805,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not 10 <= args.interval_seconds <= MAX_POLL_SECONDS:
         raise SystemExit("interval-seconds must be from 10 to 900")
+    try:
+        require_runtime_guard()
+    except RuntimeGuardError as exc:
+        print(json.dumps({"status": "blocked", "reason": exc.code}, separators=(",", ":")))
+        return 1
     from manager.scheduler_provenance import finish, start
     invocation = start(os.environ.get("AI_MANAGER_HOME", "."), "command_watcher")
     while True:
