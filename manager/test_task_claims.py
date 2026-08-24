@@ -82,6 +82,19 @@ class MemoryClaimRegistry:
             self.document = None
             return True
 
+    def compare_and_swap(self, expected_generation, document):
+        with self.mutex:
+            if self.unavailable:
+                raise TaskError("simulated backend unavailable")
+            if self.document is None or self.generation != expected_generation:
+                raise RegistryConflict("GCS generation precondition failed")
+            self.generation += 1
+            self.document = deepcopy(document)
+            return self.generation
+
+    def cas(self, expected_generation, document):
+        return self.compare_and_swap(expected_generation, document)
+
 
 class AmbiguousThenUnreadableRegistry(MemoryClaimRegistry):
     """create_if_absent is ambiguous (server outcome unknown), and the
