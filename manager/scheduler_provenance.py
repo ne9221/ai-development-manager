@@ -115,8 +115,6 @@ def _origin(event):
     text = event["text"].lower()
     if "time trigger" in text or "scheduled time" in text:
         return "scheduled_time"
-    if "manual" in text or "on demand" in text:
-        return "manual_or_on_demand"
     return "unknown"
 
 
@@ -171,13 +169,15 @@ def _cleanup(directory):
     records = []
     for path in directory.glob("*.json"):
         try:
-            started = _parse_time(json.loads(path.read_text(encoding="utf-8")).get("started_at"))
+            record = json.loads(path.read_text(encoding="utf-8")); started = _parse_time(record.get("started_at"))
+            running = record.get("status") == "running"
         except (OSError, ValueError, AttributeError):
-            started = None
-        records.append((started or datetime.min.replace(tzinfo=timezone.utc), path))
-    for _, path in sorted(records)[:-MAX_RECORDS]:
+            started = None; running = True
+        records.append((started or datetime.min.replace(tzinfo=timezone.utc), path, running))
+    removable = [(started, path) for started, path, running in records if not running]
+    for _, path in sorted(removable)[:-MAX_RECORDS]:
         path.unlink(missing_ok=True)
-    for started, path in records:
+    for started, path in removable:
         if started < cutoff:
             path.unlink(missing_ok=True)
 
@@ -208,8 +208,12 @@ def start(manager_home, component, environ=None, *, reader=None):
     record = {**context, "component": component, "started_at": started_at, "ended_at": None, "status": "running",
               "trigger_origin": os_evidence.get("trigger_origin", "unknown"), "os_scheduler_evidence": os_evidence}
     path = _path(manager_home, context["scheduler_invocation_id"])
-    _write(path, record); _cleanup(path.parent)
-    return context
+    _write(path, record)
+    try:
+        _cleanup(path.parent)
+    except OSError:
+        pass
+    return {**context, "os_scheduler_evidence": os_evidence}
 
 
 def finish(manager_home, context, status):
@@ -226,7 +230,9 @@ def finish(manager_home, context, status):
 def command_origin(context=None):
     if not context:
         return {"caller_origin": "direct_or_unknown", "scheduler_invocation_id": None}
-    return {"caller_origin": "watcher_poll", "scheduler_invocation_id": context["scheduler_invocation_id"]}
+    return {"caller_origin": "watcher_poll", "scheduler_invocation_id": context["scheduler_invocation_id"],
+            "wrapper_pid": context["wrapper_pid"], "wrapper_creation_identity": context["wrapper_creation_identity"],
+            "os_scheduler_evidence": context.get("os_scheduler_evidence")}
 
 
 def evidence_status(command, execution):
@@ -239,4 +245,13 @@ def evidence_status(command, execution):
     if invocation_id != provider.get("scheduler_invocation_id"):
         return "FAIL"
     required = ("launcher_pid", "launcher_creation_identity", "provider_pid", "provider_creation_identity", "provider_parent_identity")
-    return "PASS" if all(provider.get(key) for key in required) else "UNKNOWN"
+    if not all(provider.get(key) for key in required):
+        return "UNKNOWN"
+    os_evidence = command_evidence.get("os_scheduler_evidence") or {}
+    os_required = ("instance_id", "trigger_event_record_id", "action_event_record_id", "action_process_id")
+    if os_evidence.get("status") == "FAIL":
+        return "FAIL"
+    if (os_evidence.get("status") != "PASS" or os_evidence.get("trigger_origin") != "scheduled_time"
+            or not all(os_evidence.get(key) for key in os_required)):
+        return "UNKNOWN"
+    return "PASS" if os_evidence["action_process_id"] == command_evidence.get("wrapper_pid") else "FAIL"
