@@ -4,7 +4,10 @@ All tests operate on constructed fixture dicts -- no real store, no Drive,
 no Dashboard, no Scheduled Task, no provider process. This is intentional:
 the spec requires evaluate_dispatch()/evaluate_three_consecutive() to be
 fully exercised, deterministically, against fixtures for every required
-failure scenario.
+failure scenario. The freshness tests additionally exercise the real
+collect_evidence() store-walk (against an in-memory FakeStore, still no
+network/Drive/Scheduled Task) to prove the fix holds on the actual
+evidence-collection path, not just on hand-built fixtures.
 """
 
 from __future__ import annotations
@@ -14,8 +17,10 @@ import pytest
 from manager.dispatch_3of3_acceptance import (
     STATUS_FAIL,
     STATUS_PASS,
+    STATUS_UNKNOWN,
     FreshnessViolation,
     RunLedger,
+    collect_evidence,
     detect_cross_task_borrowing,
     evaluate_dispatch,
     evaluate_three_consecutive,
@@ -33,6 +38,19 @@ def ts(minute: float) -> str:
     mm = total_minutes - int(total_minutes // 60) * 60
     ss = (mm - int(mm)) * 60
     return f"2026-08-24T{hh:02d}:{int(mm):02d}:{ss:05.2f}Z"
+
+
+# The cutoff every "real" test in this file declares for its acceptance run.
+# All good_evidence() fixtures default ingress_min=1.0, i.e. one minute after
+# this cutoff, so they PASS freshness unless a test deliberately backdates
+# ingress_first_observed_at to before RUN_STARTED_AT.
+RUN_STARTED_AT = ts(0.0)
+
+# A genuinely historical timestamp (5 days before the 2026-08-24 base date
+# used by ts()/RUN_STARTED_AT) -- stands in for a real once-seen historical
+# request (e.g. a prior "1916"-style id) that must never count toward a
+# fresh 3/3 run no matter how self-consistent its own timestamps are.
+HISTORICAL_TS = "2026-08-19T00:01:00Z"
 
 
 def good_evidence(
@@ -107,7 +125,78 @@ def eval_one(evidence, **kwargs):
     kwargs.setdefault("expected_project_id", PROJECT)
     kwargs.setdefault("tick_seconds", TICK_SECONDS)
     kwargs.setdefault("max_visibility_ticks", 2)
+    kwargs.setdefault("acceptance_run_started_at", RUN_STARTED_AT)
     return evaluate_dispatch(evidence, **kwargs)
+
+
+class FakeStore:
+    """Minimal stand-in for the real store: `.records` is {(area, project,
+    name): doc}, exactly what collect_evidence() walks. No I/O, no Drive."""
+
+    def __init__(self, records: dict):
+        self.records = records
+
+
+def build_fake_store(request_id: str, ingress_first_observed_at: str, *, request_created_at: str = None) -> FakeStore:
+    """A single well-formed task->command->execution->session->handoff chain,
+    for exercising the REAL collect_evidence() walk (not a hand-built
+    evaluate_dispatch() fixture). Only `ingress_first_observed_at` varies
+    across the freshness tests that use this -- everything else about the
+    request is otherwise legitimate, so FRESHNESS is provably the only
+    dimension that can fail/pass.
+    """
+    task_id = f"{request_id}-task"
+    command_id = f"{request_id}-cmd"
+    execution_id = f"{request_id}-exec"
+    session_id = f"{request_id}-sess"
+    handoff_id = f"{request_id}-handoff"
+    request_created_at = request_created_at or ingress_first_observed_at
+    records = {
+        ("tasks", PROJECT, task_id): {
+            "task_id": task_id,
+            "status": "running",
+            "created_at": ingress_first_observed_at,
+            "source_context": {
+                "request_id": request_id,
+                "request_created_at": request_created_at,
+                "ingress_first_observed_at": ingress_first_observed_at,
+            },
+        },
+        ("commands", PROJECT, command_id): {
+            "task_id": task_id,
+            "command_id": command_id,
+            "created_at": ingress_first_observed_at,
+            "claimed_at": ingress_first_observed_at,
+            "execution_id": execution_id,
+            "provider": "codex",
+            "selection_reason": "quota-eligible-auto-dispatch",
+        },
+        ("executions", PROJECT, execution_id): {
+            "task_id": task_id,
+            "execution_id": execution_id,
+            "reserved_at": ingress_first_observed_at,
+            "started_at": ingress_first_observed_at,
+            "completed_at": ingress_first_observed_at,
+            "session_id": session_id,
+            "status": "succeeded",
+            "provider_evidence": {"pid": 4242, "host": "HOME"},
+            "quota_evidence": {"account_id": "acct-1"},
+        },
+        ("sessions", PROJECT, session_id): {
+            "task_id": task_id,
+            "session_id": session_id,
+        },
+        ("handoffs", PROJECT, handoff_id): {
+            "task_id": task_id,
+            "handoff_id": handoff_id,
+            "created_at": ingress_first_observed_at,
+        },
+    }
+    return FakeStore(records)
+
+
+def _running_dashboard_probe(observed_at: str):
+    return lambda project_id, task_id: {"status": "RUNNING", "observed_at": observed_at}
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +212,7 @@ def test_scenario_1_three_of_three_normal_success():
     report = evaluate_three_consecutive(
         ["r1", "r2", "r3"], evidences,
         expected_project_id=PROJECT, tick_seconds=TICK_SECONDS,
+        acceptance_run_started_at=RUN_STARTED_AT,
     )
     assert report.overall == STATUS_PASS
     assert report.consecutive_pass_count == 3
@@ -140,7 +230,10 @@ def test_scenario_2_visibility_exceeds_two_ticks():
     # 20 minutes after SLA_START (ingress_first_observed_at).
     late = good_evidence("r2", backend_visible_min=1.0 + 20.0, user_visible_min=1.0 + 20.0)
     evidences = {"r1": good_evidence("r1"), "r2": late, "r3": good_evidence("r3")}
-    report = evaluate_three_consecutive(["r1", "r2", "r3"], evidences, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS)
+    report = evaluate_three_consecutive(
+        ["r1", "r2", "r3"], evidences, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS,
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
     assert report.overall == STATUS_FAIL
     r2 = report.results[1]
     assert r2.result == STATUS_FAIL
@@ -155,7 +248,10 @@ def test_scenario_3_cross_task_borrowed_execution():
     r2 = good_evidence("r2")
     r2["ids"]["execution_id"] = "r1-exec"  # borrowed from r1
     evidences = {"r1": good_evidence("r1"), "r2": r2, "r3": good_evidence("r3")}
-    report = evaluate_three_consecutive(["r1", "r2", "r3"], evidences, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS)
+    report = evaluate_three_consecutive(
+        ["r1", "r2", "r3"], evidences, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS,
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
     assert report.overall == STATUS_FAIL
     r2_result = report.results[1]
     assert any(c.name == "CROSS_TASK_BORROWING" and c.status == STATUS_FAIL for c in r2_result.checks)
@@ -212,7 +308,10 @@ def test_scenario_6b_borrowed_session_via_batch_conflict():
     r2 = good_evidence("r2")
     r2["ids"]["session_id"] = r1["ids"]["session_id"]
     evidences = {"r1": r1, "r2": r2, "r3": good_evidence("r3")}
-    report = evaluate_three_consecutive(["r1", "r2", "r3"], evidences, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS)
+    report = evaluate_three_consecutive(
+        ["r1", "r2", "r3"], evidences, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS,
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
     assert report.overall == STATUS_FAIL
 
 
@@ -285,18 +384,6 @@ def test_scenario_9b_blocked_without_reason_fails():
 
 
 # ---------------------------------------------------------------------------
-# 10. Historical/pre-existing execution mistakenly picked up as fresh -> FAIL
-# ---------------------------------------------------------------------------
-
-def test_scenario_10_stale_historical_record_fails_freshness():
-    ev = good_evidence("r1")
-    ev["freshness"] = {"is_fresh": False, "detail": "execution_id r1-exec pre-dates request_created_at by 3 days"}
-    result = eval_one(ev)
-    assert result.result == STATUS_FAIL
-    assert any(c.name == "FRESHNESS" and c.status == STATUS_FAIL for c in result.checks)
-
-
-# ---------------------------------------------------------------------------
 # 11. Cannot silently drop a failed sample and cherry-pick 3 passes
 # ---------------------------------------------------------------------------
 
@@ -307,6 +394,7 @@ def test_scenario_11_cannot_drop_failing_sample_and_recombine():
     report1 = evaluate_three_consecutive(
         ["r1", "r2", "r3"], evidences_run1,
         expected_project_id=PROJECT, tick_seconds=TICK_SECONDS, ledger=ledger,
+        acceptance_run_started_at=RUN_STARTED_AT,
     )
     assert report1.overall == STATUS_FAIL
 
@@ -318,6 +406,7 @@ def test_scenario_11_cannot_drop_failing_sample_and_recombine():
         evaluate_three_consecutive(
             ["r1", "r3", "r4"], evidences_run2,
             expected_project_id=PROJECT, tick_seconds=TICK_SECONDS, ledger=ledger,
+            acceptance_run_started_at=RUN_STARTED_AT,
         )
 
     # The only legitimate way forward is a brand-new consecutive fresh batch.
@@ -325,6 +414,7 @@ def test_scenario_11_cannot_drop_failing_sample_and_recombine():
     report3 = evaluate_three_consecutive(
         ["r4", "r5", "r6"], evidences_run3,
         expected_project_id=PROJECT, tick_seconds=TICK_SECONDS, ledger=ledger,
+        acceptance_run_started_at=RUN_STARTED_AT,
     )
     assert report3.overall == STATUS_PASS
 
@@ -371,6 +461,165 @@ def test_scenario_12c_out_of_order_request_id_rejected():
 
 
 # ---------------------------------------------------------------------------
+# Freshness contract: FRESHNESS is computed from
+# (ingress_first_observed_at, acceptance_run_started_at), never from
+# caller-supplied evidence["freshness"] and never from request_id lexical
+# order (that remains RunLedger's job, and only as a same-process secondary
+# guard against reuse/recombination within one run's lifetime).
+# ---------------------------------------------------------------------------
+
+def test_freshness_1_real_collect_evidence_historical_request_fails():
+    # Real collect_evidence() store-walk, not a hand-built fixture: a
+    # request whose own ingress_first_observed_at predates this run's
+    # declared cutoff must fail FRESHNESS even though every other stage of
+    # its evidence is otherwise perfectly self-consistent.
+    store = build_fake_store("historical-1916", HISTORICAL_TS)
+    evidence = collect_evidence(store, PROJECT, "historical-1916", dashboard_probe=_running_dashboard_probe(HISTORICAL_TS))
+    result = evaluate_dispatch(evidence, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS, acceptance_run_started_at=RUN_STARTED_AT)
+    freshness = [c for c in result.checks if c.name == "FRESHNESS"][0]
+    assert freshness.status == STATUS_FAIL
+    assert result.result == STATUS_FAIL
+
+
+def test_freshness_2_real_collect_evidence_fresh_request_passes():
+    fresh_ts = ts(1.0)  # one minute after RUN_STARTED_AT = ts(0.0)
+    store = build_fake_store("r-fresh", fresh_ts)
+    evidence = collect_evidence(store, PROJECT, "r-fresh", dashboard_probe=_running_dashboard_probe(fresh_ts))
+    result = evaluate_dispatch(evidence, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS, acceptance_run_started_at=RUN_STARTED_AT)
+    freshness = [c for c in result.checks if c.name == "FRESHNESS"][0]
+    assert freshness.status == STATUS_PASS
+    assert result.result == STATUS_PASS
+
+
+def test_freshness_3_missing_ingress_first_observed_at_is_unknown():
+    ev = good_evidence("r1")
+    ev["timestamps"]["ingress_first_observed_at"] = None
+    result = eval_one(ev, acceptance_run_started_at=RUN_STARTED_AT)
+    freshness = [c for c in result.checks if c.name == "FRESHNESS"][0]
+    assert freshness.status == STATUS_UNKNOWN
+    assert result.result == STATUS_FAIL
+
+
+def test_freshness_4_malformed_ingress_timestamp_is_unknown():
+    ev = good_evidence("r1")
+    ev["timestamps"]["ingress_first_observed_at"] = "not-a-timestamp"
+    result = eval_one(ev, acceptance_run_started_at=RUN_STARTED_AT)
+    freshness = [c for c in result.checks if c.name == "FRESHNESS"][0]
+    assert freshness.status == STATUS_UNKNOWN
+    assert result.result == STATUS_FAIL
+
+
+def test_freshness_5_no_cutoff_supplied_is_unknown_never_silently_omitted():
+    # This is the exact bug this fix closes: previously, when the caller
+    # (or a collector that never learned about the new contract) supplied
+    # no freshness signal at all, the FRESHNESS check simply did not appear
+    # in the results -- not even as UNKNOWN -- letting an otherwise-good
+    # evidence dict PASS overall. Now it must always be present and must
+    # always fail closed.
+    ev = good_evidence("r1")
+    result = evaluate_dispatch(ev, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS)  # no acceptance_run_started_at
+    names = [c.name for c in result.checks]
+    assert "FRESHNESS" in names
+    freshness = [c for c in result.checks if c.name == "FRESHNESS"][0]
+    assert freshness.status == STATUS_UNKNOWN
+    assert result.result == STATUS_FAIL
+
+
+def test_freshness_6_historical_1916_style_record_cannot_count_in_batch():
+    r1 = good_evidence("r1")
+    stale = good_evidence("r-1916")
+    stale["timestamps"]["ingress_first_observed_at"] = HISTORICAL_TS
+    r3 = good_evidence("r3")
+    evidences = {"r1": r1, "r-1916": stale, "r3": r3}
+    report = evaluate_three_consecutive(
+        ["r1", "r-1916", "r3"], evidences,
+        expected_project_id=PROJECT, tick_seconds=TICK_SECONDS,
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
+    stale_result = report.results[1]
+    assert any(c.name == "FRESHNESS" and c.status == STATUS_FAIL for c in stale_result.checks)
+    assert stale_result.result == STATUS_FAIL
+    assert report.overall == STATUS_FAIL
+    assert report.consecutive_pass_count == 1  # r1 passes, run breaks at r-1916
+
+
+def test_freshness_7_failed_middle_sample_cannot_be_replaced_by_fresh_fourth():
+    ledger = RunLedger()
+    r1 = good_evidence("r1")
+    stale_r2 = good_evidence("r2")
+    stale_r2["timestamps"]["ingress_first_observed_at"] = HISTORICAL_TS  # fails on FRESHNESS specifically
+    r3 = good_evidence("r3")
+    report1 = evaluate_three_consecutive(
+        ["r1", "r2", "r3"], {"r1": r1, "r2": stale_r2, "r3": r3},
+        expected_project_id=PROJECT, tick_seconds=TICK_SECONDS, ledger=ledger,
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
+    assert report1.overall == STATUS_FAIL
+    assert any(c.name == "FRESHNESS" and c.status == STATUS_FAIL for c in report1.results[1].checks)
+
+    # Drop the freshness-failing r2 and try to combine r1+r3 with a new r4.
+    with pytest.raises(FreshnessViolation):
+        evaluate_three_consecutive(
+            ["r1", "r3", "r4"], {"r1": good_evidence("r1"), "r3": good_evidence("r3"), "r4": good_evidence("r4")},
+            expected_project_id=PROJECT, tick_seconds=TICK_SECONDS, ledger=ledger,
+            acceptance_run_started_at=RUN_STARTED_AT,
+        )
+
+
+def test_freshness_8_brand_new_runledger_still_rejects_historical_request():
+    # A fresh process / fresh RunLedger instance has zero reuse history, so
+    # the ledger alone would have no basis to reject a never-before-seen id.
+    # FRESHNESS must still reject it on timestamp grounds -- proving
+    # RunLedger is a secondary guard, not the freshness source of truth.
+    ledger = RunLedger()
+    stale = good_evidence("historical-1916")
+    stale["timestamps"]["ingress_first_observed_at"] = HISTORICAL_TS
+    evidences = {"r1": good_evidence("r1"), "historical-1916": stale, "r3": good_evidence("r3")}
+    report = evaluate_three_consecutive(
+        ["historical-1916", "r1", "r3"], evidences,
+        expected_project_id=PROJECT, tick_seconds=TICK_SECONDS, ledger=ledger,
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
+    # No FreshnessViolation was raised (the ledger had never seen this id --
+    # this is not a ledger rejection); the rejection comes from FRESHNESS.
+    assert report.overall == STATUS_FAIL
+    assert any(c.name == "FRESHNESS" and c.status == STATUS_FAIL for c in report.results[0].checks)
+
+
+def test_freshness_9_exact_cutoff_boundary_is_deterministic():
+    cutoff = "2026-08-24T16:40:00.00Z"
+    at_cutoff = good_evidence("r1")
+    at_cutoff["timestamps"]["ingress_first_observed_at"] = cutoff
+    result_at = eval_one(at_cutoff, acceptance_run_started_at=cutoff)
+    assert any(c.name == "FRESHNESS" and c.status == STATUS_PASS for c in result_at.checks)
+
+    one_second_before = good_evidence("r1")
+    one_second_before["timestamps"]["ingress_first_observed_at"] = "2026-08-24T16:39:59.00Z"
+    result_before = eval_one(one_second_before, acceptance_run_started_at=cutoff)
+    assert any(c.name == "FRESHNESS" and c.status == STATUS_FAIL for c in result_before.checks)
+
+
+def test_freshness_10_timezone_aware_timestamps_are_compared_by_instant():
+    # "2026-08-25T00:40:00+08:00" is the exact same instant as
+    # "2026-08-24T16:40:00Z" -- a naive string/lexical comparison of these
+    # two representations would disagree; instant-based comparison must not.
+    cutoff = "2026-08-24T16:40:00.00Z"
+    same_instant_different_offset = good_evidence("r1")
+    same_instant_different_offset["timestamps"]["ingress_first_observed_at"] = "2026-08-25T00:40:00+08:00"
+    result = eval_one(same_instant_different_offset, acceptance_run_started_at=cutoff)
+    assert any(c.name == "FRESHNESS" and c.status == STATUS_PASS for c in result.checks)
+
+    # A naive (no offset/tzinfo) timestamp must not be silently interpreted
+    # as local machine time -- that would make the result depend on which
+    # host runs the evaluation. It degrades to UNKNOWN instead.
+    naive = good_evidence("r1")
+    naive["timestamps"]["ingress_first_observed_at"] = "2026-08-24T17:00:00"
+    naive_result = eval_one(naive, acceptance_run_started_at=cutoff)
+    assert any(c.name == "FRESHNESS" and c.status == STATUS_UNKNOWN for c in naive_result.checks)
+    assert naive_result.result == STATUS_FAIL
+
+
+# ---------------------------------------------------------------------------
 # Additional coverage: UNKNOWN handling, SLA-start semantics, human/json output
 # ---------------------------------------------------------------------------
 
@@ -379,7 +628,7 @@ def test_sla_start_is_ingress_observed_not_request_created():
     # (long scheduler pickup latency); visibility right after ingress
     # observation must still PASS the 2-tick SLA window.
     ev = good_evidence("r1", request_created_min=0.0, ingress_min=120.0, backend_visible_min=121.0, user_visible_min=121.5)
-    result = eval_one(ev)
+    result = eval_one(ev, acceptance_run_started_at=ts(0.0))
     assert result.sla_start == ev["timestamps"]["ingress_first_observed_at"]
     assert result.scheduler_pickup_latency_seconds == pytest.approx(120.0 * 60)
     assert any(c.name == "BACKEND_VISIBLE" and c.status == STATUS_PASS for c in result.checks)
@@ -397,11 +646,14 @@ def test_missing_evidence_is_unknown_not_pass():
 
 def test_human_summary_contains_required_fields():
     evidences = {"r1": good_evidence("r1"), "r2": good_evidence("r2"), "r3": good_evidence("r3")}
-    report = evaluate_three_consecutive(["r1", "r2", "r3"], evidences, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS)
+    report = evaluate_three_consecutive(
+        ["r1", "r2", "r3"], evidences, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS,
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
     text = report.to_human_summary()
     for required in (
         "REQUEST_1:", "REQUEST_ID:", "SLA_START:", "FIRST_VISIBLE:", "VISIBILITY_TICKS:",
-        "BACKEND_VISIBLE:", "USER_VISIBLE:", "TASK_LINKAGE:", "COMMAND_LINKAGE:",
+        "BACKEND_VISIBLE:", "USER_VISIBLE:", "FRESHNESS:", "TASK_LINKAGE:", "COMMAND_LINKAGE:",
         "EXECUTION_LINKAGE:", "SESSION_LINKAGE:", "HANDOFF_LINKAGE:", "IDEMPOTENCY:",
         "REAL_PROVIDER:", "NO_MANUAL_TRIGGER:", "DASHBOARD_TRUTH:", "RESULT:",
         "CONSECUTIVE_PASS_COUNT:", "HANDSOFF_DAILY_USABLE:",
@@ -411,7 +663,10 @@ def test_human_summary_contains_required_fields():
 
 def test_json_report_is_machine_readable():
     evidences = {"r1": good_evidence("r1"), "r2": good_evidence("r2"), "r3": good_evidence("r3")}
-    report = evaluate_three_consecutive(["r1", "r2", "r3"], evidences, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS)
+    report = evaluate_three_consecutive(
+        ["r1", "r2", "r3"], evidences, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS,
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
     data = report.to_json()
     assert data["HANDSOFF_DAILY_USABLE"] == "PASS"
     assert data["CONSECUTIVE_PASS_COUNT"] == 3
@@ -433,7 +688,10 @@ def test_consecutive_pass_count_stops_at_first_failure():
         "r2": good_evidence("r2", manual_found=True),
         "r3": good_evidence("r3"),
     }
-    report = evaluate_three_consecutive(["r1", "r2", "r3"], evidences, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS)
+    report = evaluate_three_consecutive(
+        ["r1", "r2", "r3"], evidences, expected_project_id=PROJECT, tick_seconds=TICK_SECONDS,
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
     # r1 passes, r2 fails, r3 (evaluated independently) may pass -- but the
     # CONSECUTIVE run is broken at r2, so consecutive_pass_count must be 1,
     # not "2 passes out of 3" cherry-picked.

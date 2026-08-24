@@ -25,6 +25,17 @@ never occurred, cross-task ID borrowing is detected across an entire batch
 (not just within one request), and a `RunLedger` makes it structurally
 impossible to silently drop a failed sample and recombine passes from
 different runs into a false 3/3.
+
+Freshness: FRESHNESS is computed, never caller-asserted. It compares each
+request's own `ingress_first_observed_at` against an explicit
+`acceptance_run_started_at` cutoff supplied to `evaluate_dispatch()` /
+`evaluate_three_consecutive()` -- never against request_id lexical order,
+which `RunLedger` uses only as a same-process secondary guard against
+reusing/recombining ids across evaluation runs, not as freshness truth. The
+FRESHNESS check is unconditionally appended to every evaluation (unlike a
+caller-supplied-optional check), so a missing cutoff, a missing
+`ingress_first_observed_at`, or an unparseable timestamp all degrade to an
+honest UNKNOWN (folded to FAIL) rather than silently omitting the check.
 """
 
 from __future__ import annotations
@@ -127,9 +138,16 @@ def _parse_iso(value: Optional[str]) -> Optional[float]:
         return None
     try:
         text = value[:-1] + "+00:00" if value.endswith("Z") else value
-        return datetime.fromisoformat(text).timestamp()
+        parsed = datetime.fromisoformat(text)
     except (ValueError, TypeError):
         return None
+    if parsed.tzinfo is None:
+        # A naive timestamp carries no fixed instant -- interpreting it as
+        # local machine time would make freshness/SLA comparisons depend on
+        # the evaluating host's timezone, which is not deterministic. Treat
+        # it as malformed rather than silently guessing an offset.
+        return None
+    return parsed.timestamp()
 
 
 @dataclass
@@ -213,6 +231,7 @@ class AcceptanceReport:
                 f"VISIBILITY_TICKS: {r.visibility_ticks}",
                 line("BACKEND_VISIBLE"),
                 line("USER_VISIBLE"),
+                line("FRESHNESS"),
                 line("TASK_LINKAGE"),
                 line("COMMAND_LINKAGE"),
                 line("EXECUTION_LINKAGE"),
@@ -270,12 +289,17 @@ def evaluate_dispatch(
     expected_project_id: str,
     tick_seconds: float,
     max_visibility_ticks: float = 2,
+    acceptance_run_started_at: Optional[str] = None,
 ) -> DispatchResult:
     """Pure evaluator: judges one request's evidence dict. No I/O.
 
     See module docstring / REQUIRED_EVIDENCE_FIELDS for the expected shape;
     every key is optional and missing data degrades the relevant check to
     UNKNOWN (which is never displayed as PASS) rather than a fabricated PASS.
+
+    `acceptance_run_started_at` is the explicit cutoff a real 3/3 run must
+    declare (see FRESHNESS below); omitting it is itself a fail-closed
+    UNKNOWN, not silent success.
     """
     request_id = evidence.get("request_id", "")
     ts = dict(evidence.get("timestamps") or {})
@@ -394,13 +418,40 @@ def evaluate_dispatch(
             checks.append(CheckResult("CROSS_TASK_BORROWING", STATUS_PASS))
 
     # -- freshness: reject a historical/pre-existing record mistakenly
-    #    picked up as if it were fresh ------------------------------------
-    freshness = evidence.get("freshness")
-    if freshness is not None:
-        if not freshness.get("is_fresh", True):
-            checks.append(CheckResult("FRESHNESS", STATUS_FAIL, freshness.get("detail", "evidence is not fresh (reused/historical record)")))
+    #    picked up as if it were fresh. Computed from timestamps + an
+    #    explicit cutoff -- never from request_id lexical order (that is
+    #    RunLedger's job, and only as a same-process secondary guard) --
+    #    and ALWAYS appended, so a missing cutoff or a missing/unparseable
+    #    ingress_first_observed_at cannot silently vanish from the result;
+    #    it degrades to UNKNOWN (folded to FAIL), never to an absent check.
+    if acceptance_run_started_at is None:
+        checks.append(CheckResult(
+            "FRESHNESS", STATUS_UNKNOWN,
+            "no acceptance_run_started_at cutoff supplied to evaluate_dispatch()",
+        ))
+    elif sla_start_raw is None:
+        checks.append(CheckResult(
+            "FRESHNESS", STATUS_UNKNOWN,
+            "no ingress_first_observed_at in evidence",
+        ))
+    else:
+        cutoff = _parse_iso(acceptance_run_started_at)
+        if sla_start is None or cutoff is None:
+            checks.append(CheckResult(
+                "FRESHNESS", STATUS_UNKNOWN,
+                "ingress_first_observed_at or acceptance_run_started_at not parseable",
+            ))
+        elif sla_start >= cutoff:
+            checks.append(CheckResult(
+                "FRESHNESS", STATUS_PASS,
+                f"ingress_first_observed_at {sla_start_raw!r} >= acceptance_run_started_at {acceptance_run_started_at!r}",
+            ))
         else:
-            checks.append(CheckResult("FRESHNESS", STATUS_PASS))
+            checks.append(CheckResult(
+                "FRESHNESS", STATUS_FAIL,
+                f"ingress_first_observed_at {sla_start_raw!r} precedes acceptance_run_started_at "
+                f"{acceptance_run_started_at!r} (historical/reused record, cannot count toward this run)",
+            ))
 
     # -- idempotency: exactly one canonical Task and one canonical Command;
     #    duplicate_counts >1 for any canonical entity is a FAIL ------------
@@ -480,6 +531,17 @@ class RunLedger:
     relative to what has already been consumed -- i.e. you cannot drop a
     failed sample from one run and cherry-pick 3 passing ones by recombining
     ids across runs.
+
+    This is a SECONDARY, same-process-only guard, not the freshness source
+    of truth: it has no memory across separate script invocations (nothing
+    here persists it to disk), and its ordering check trusts request_id
+    lexical order. Actual freshness -- whether a request counts as having
+    happened at or after this acceptance run -- is decided independently by
+    the FRESHNESS check in `evaluate_dispatch()`, which compares each
+    request's own `ingress_first_observed_at` against the explicit
+    `acceptance_run_started_at` cutoff. A brand-new RunLedger (a fresh
+    process with no reuse history at all) still cannot let a historical
+    request pass, because FRESHNESS does not consult the ledger.
     """
 
     seen_request_ids: set = field(default_factory=set)
@@ -500,6 +562,7 @@ def evaluate_three_consecutive(
     tick_seconds: float,
     max_visibility_ticks: float = 2,
     required_count: int = 3,
+    acceptance_run_started_at: Optional[str] = None,
     ledger: Optional[RunLedger] = None,
 ) -> AcceptanceReport:
     """Evaluate a pre-declared, fixed batch of fresh request_ids.
@@ -510,6 +573,13 @@ def evaluate_three_consecutive(
     successes. If a `RunLedger` is supplied, request_ids already consumed by
     a prior run (or out of order relative to them) raise
     `FreshnessViolation` before any evaluation happens.
+
+    `acceptance_run_started_at` is the explicit cutoff every real 3/3 run
+    must declare (ISO8601, timezone-aware) -- forwarded unchanged to every
+    `evaluate_dispatch()` call in the batch, so each request's own
+    FRESHNESS check is judged against the same run-level instant. Omitting
+    it does not skip freshness checking: every result's FRESHNESS check
+    still fires and degrades to UNKNOWN (folded to FAIL).
     """
     if len(declared_request_ids) != required_count:
         raise ValueError(f"declared_request_ids must have exactly {required_count} entries, got {len(declared_request_ids)}")
@@ -548,6 +618,7 @@ def evaluate_three_consecutive(
             expected_project_id=expected_project_id,
             tick_seconds=tick_seconds,
             max_visibility_ticks=max_visibility_ticks,
+            acceptance_run_started_at=acceptance_run_started_at,
         )
         for ev in evidences
     ]
@@ -595,6 +666,12 @@ def collect_evidence(
     and `manual_trigger_probe`, if supplied, are callables the caller wires
     up to whatever the real Dashboard/ingress-log/audit-trail APIs are; this
     module does not assume a specific implementation of any of them.
+
+    `timestamps["ingress_first_observed_at"]` returned here is the canonical
+    freshness anchor `evaluate_dispatch()`'s FRESHNESS check compares against
+    the caller's `acceptance_run_started_at` cutoff -- faithfully passed
+    through from the store (or `ingress_probe`) rather than fabricated, so a
+    genuinely-missing value correctly surfaces as FRESHNESS=UNKNOWN.
     """
     records = getattr(store, "records", None)
     tasks = []
