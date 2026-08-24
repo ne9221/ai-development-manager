@@ -284,6 +284,68 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("read-only", launcher.request.sandbox)
         self.assertEqual("never", launcher.request.approval_policy)
 
+    def test_launch_task_bounds_dispatch_history_lookup_deadline(self):
+        """P0 dispatch-two-tick-observability: launch_task() runs dispatch()
+        AFTER a Command is already written "claimed" but BEFORE
+        reserve_execution() -- a live HOME trace showed dispatch()'s
+        unbounded historical-estimate lookup add ~4.5 minutes here, growing
+        with total project execution history. When launch_task() does not
+        receive a precomputed `executions` list (the real production path --
+        manager.command_watcher never supplies one), it must forward a real,
+        near-future time.monotonic() deadline to dispatch() so that lookup
+        can never again grow unbounded."""
+        import time as time_module
+        from manager.execution_runner import DISPATCH_HISTORY_BUDGET_SECONDS
+
+        store = build_store(read_only=True, working_directory=self.request.working_directory)
+        launcher = Launcher()
+        captured = {}
+
+        def capturing_dispatch(store, service, request, quota_document=None, executions=None, history_deadline=None):
+            captured["executions"] = executions
+            captured["history_deadline"] = history_deadline
+            return {"recommended_provider": "codex", "quota_evidence": {"source": "test"},
+                   "mode": "auto", "effort": "medium", "generated_prompt": "bounded task"}
+
+        before = time_module.monotonic()
+        with patch("manager.execution_runner.dispatch", side_effect=capturing_dispatch), \
+             patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-deadline")
+        after = time_module.monotonic()
+
+        self.assertIsNone(captured["executions"])
+        self.assertIsNotNone(captured["history_deadline"])
+        # Bounded to roughly DISPATCH_HISTORY_BUDGET_SECONDS from now -- never
+        # unbounded (None) and never absurdly far in the future.
+        self.assertGreaterEqual(captured["history_deadline"], before + DISPATCH_HISTORY_BUDGET_SECONDS - 1.0)
+        self.assertLessEqual(captured["history_deadline"], after + DISPATCH_HISTORY_BUDGET_SECONDS + 1.0)
+
+    def test_launch_task_omits_history_deadline_when_executions_precomputed(self):
+        """A caller that already supplies its own `executions` history list
+        (e.g. an existing test/CLI path) must not have dispatch() silently
+        switch to the bounded lookup -- history_deadline stays None so
+        dispatch() uses the explicit list exactly as before this fix."""
+        store = build_store(read_only=True, working_directory=self.request.working_directory)
+        launcher = Launcher()
+        captured = {}
+
+        def capturing_dispatch(store, service, request, quota_document=None, executions=None, history_deadline=None):
+            captured["executions"] = executions
+            captured["history_deadline"] = history_deadline
+            return {"recommended_provider": "codex", "quota_evidence": {"source": "test"},
+                   "mode": "auto", "effort": "medium", "generated_prompt": "bounded task"}
+
+        with patch("manager.execution_runner.dispatch", side_effect=capturing_dispatch), \
+             patch("manager.execution_lifecycle.validate_local_preflight"), \
+             patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()), \
+             patch("manager.executions.read_drive_status", return_value=quota_document()):
+            launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-precomputed",
+                       executions=[])
+        self.assertEqual([], captured["executions"])
+        self.assertIsNone(captured["history_deadline"])
+
     def test_launch_task_resolves_claude_account_registry_and_threads_it_to_launcher(self):
         store = build_store(read_only=True, working_directory=self.request.working_directory, provider="claude")
         launcher = AccountAwareClaudeStyleLauncher()
@@ -329,7 +391,7 @@ class RunnerTests(unittest.TestCase):
         }]}
         captured = {}
 
-        def fake_dispatch(store, service, request, quota_document=None, executions=None):
+        def fake_dispatch(store, service, request, quota_document=None, executions=None, history_deadline=None):
             captured["request"] = request
             return {
                 "recommended_provider": "claude", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
