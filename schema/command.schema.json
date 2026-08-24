@@ -30,6 +30,7 @@
     "created_via": {"type": "string", "maxLength": 80, "description": "Server-stamped provenance, e.g. 'direct_dispatch_ingress'; never taken verbatim from an external caller's request payload."},
     "admission_version": {"type": "string", "maxLength": 20, "description": "Safe Auto-Admission contract version this record was stamped under, for the Command Watcher's trusted-ingress verification."},
     "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$", "description": "External request identity, used to cross-check against the ingress idempotency record; not launch/account authority."},
+    "process_provenance": {"type": "object", "additionalProperties": false, "properties": {"caller_origin": {"enum": ["watcher_poll", "direct_or_unknown"]}, "scheduler_invocation_id": {"type": ["string", "null"], "pattern": "^[0-9a-f]{32}$"}}},
     "result": {"type": ["object", "null"], "additionalProperties": false, "properties": {"status": {"enum": ["completed", "failed", "interrupted", "error"]}, "execution_id": {"type": ["string", "null"], "maxLength": 200}, "session_id": {"type": ["string", "null"], "maxLength": 600}, "error_kind": {"type": ["string", "null"], "maxLength": 100}}}
   }
 }

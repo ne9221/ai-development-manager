@@ -438,7 +438,7 @@ def _existing_terminal(store, command):
 
 def process_command(store, service, command, launcher_factory=None, writer_factory=GCSLockRegistry.from_environment,
                     claim_factory=task_claim_registry, allowlist=frozenset(), health_check=session_center_healthy,
-                    quota_check=None, ingress_registry_factory=dispatch_request_registry):
+                    quota_check=None, ingress_registry_factory=dispatch_request_registry, origin_context=None):
     """Claim/reconcile one command; a claimed command is never automatically relaunched.
 
     launcher_factory/quota_check are explicit-override escape hatches (tests
@@ -536,7 +536,9 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
             failed["recovery_reason"] = "retry_authority_or_linkage_not_proven"
             _write(store, failed)
             return {"status": "failed", "reconciled": True}
-    claimed = _claimed(command)
+    from manager.scheduler_provenance import command_origin
+    origin = command_origin(origin_context)
+    claimed = {**_claimed(command), "process_provenance": origin}
     _write(store, claimed)
     try:
         task = store.get("tasks", claimed["project_id"], claimed["task_id"])
@@ -548,7 +550,7 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         outcome = launch_task(store, service, writer_registry, claim_registry, launcher_factory(),
                               claimed["project_id"], claimed["task_id"], claimed["execution_id"], claimed["model"],
                               on_running=lambda _execution: _write(store, running), provider=claimed["provider"],
-                              claude_accounts=claude_accounts, account_id=explicit_account_id, **retry)
+                              claude_accounts=claude_accounts, account_id=explicit_account_id, provenance=origin, **retry)
         terminal = outcome["terminal"]["execution"]
         dispatch = outcome["dispatch"]
         # P0 claude-auth-routing-truth: `running` was captured before
@@ -719,7 +721,7 @@ def _prioritized_commands(commands):
     )
 
 
-def poll_once(store, service, allowlist=None, deadline=None, discovery_store=None, **factories):
+def poll_once(store, service, allowlist=None, deadline=None, discovery_store=None, origin_context=None, **factories):
     """`deadline`, if given, is a `time.monotonic()` value after which this
     call stops STARTING new project/command work and returns whatever it has
     so far -- any project/command not yet reached this tick is picked up on
@@ -789,7 +791,8 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
                 return results
             if time.monotonic() >= deadline:
                 return results
-            results.append(process_command(store, service, command, allowlist=allowlist, **factories))
+            results.append(process_command(store, service, command, allowlist=allowlist,
+                                           origin_context=origin_context, **factories))
     return results
 
 
@@ -800,7 +803,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not 10 <= args.interval_seconds <= MAX_POLL_SECONDS:
         raise SystemExit("interval-seconds must be from 10 to 900")
+    from manager.scheduler_provenance import finish, start
+    invocation = start(os.environ.get("AI_MANAGER_HOME", "."), "command_watcher")
     while True:
+        status = "completed"
         try:
             service = build_service()
             store = DriveRecords(service)
@@ -820,12 +826,14 @@ def main(argv=None):
             if embedded_ingress_enabled() and os.environ.get("ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID"):
                 from manager.drive_dispatch_ingress import poll_drive_dispatch_requests
                 ingress = poll_drive_dispatch_requests(store, service, os.environ.get("ADM_LOCK_GCS_BUCKET"))
-            result = poll_once(store, service, discovery_store=discovery_store)
+            result = poll_once(store, service, discovery_store=discovery_store, origin_context=invocation)
             print(json.dumps({"status": "ok", "host": socket.gethostname()[:100], "ingress": ingress,
                               "commands": result}, separators=(",", ":")))
         except Exception:
+            status = "failed"
             print(json.dumps({"status": "unavailable"}, separators=(",", ":")))
         if args.once:
+            finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, status)
             return 0
         time.sleep(args.interval_seconds)
 

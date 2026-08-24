@@ -647,6 +647,11 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("claude:claude-session-1", session["session_id"])
         self.assertEqual("claude", session["provider"])
         self.assertEqual("claude-session-1", session["provider_session_id"])
+        evidence = execution["provider_evidence"]
+        for key in ("launcher_pid", "launcher_creation_identity", "provider_pid",
+                    "provider_creation_identity", "provider_parent_identity"):
+            self.assertTrue(evidence[key])
+        self.assertIsNone(evidence["scheduler_invocation_id"])
 
     def test_account_id_and_config_dir_thread_through_to_launcher_and_session(self):
         launcher = AccountAwareClaudeStyleLauncher()

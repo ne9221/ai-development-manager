@@ -66,6 +66,8 @@ def main(argv=None):
     parser.add_argument("--once", action="store_true", required=True,
                          help="required: this runner only ever performs exactly one bounded poll, never a loop")
     parser.parse_args(argv)
+    from manager.scheduler_provenance import finish, start
+    invocation = start(os.environ.get("AI_MANAGER_HOME", "."), "drive_dispatch_ingress")
     try:
         # Looked up from module globals at call time (not via run_once()'s
         # own default arguments, which bind at function-definition time) so
@@ -74,11 +76,14 @@ def main(argv=None):
         result = run_once(build_service_fn=build_service, store_factory=DriveRecords)
     except TaskError as exc:
         _print_safe_failure(exc, "Drive dispatch ingress configuration or validation error")
+        finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, "failed")
         return 1
     except Exception as exc:
         _print_safe_failure(exc, "Drive dispatch ingress poll failed")
+        finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, "failed")
         return 1
     print(json.dumps(result, separators=(",", ":")))
+    finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, "completed")
     return 0
 
 
