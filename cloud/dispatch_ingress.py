@@ -74,7 +74,7 @@ import re
 import time
 
 from manager.claude_account_selector import load_claude_accounts
-from manager.dispatch_requests import claim_dispatch_request, release_dispatch_request_claim
+from manager.dispatch_requests import claim_dispatch_request, mark_dispatch_request_status
 from manager.dispatcher import dispatch as dispatcher_dispatch
 from manager.executions import MAX_RETRY_COUNT, linked_command_for_execution, list_executions, retry_eligible
 from manager.tasks import TaskError, now_iso, update_task, validate
@@ -137,6 +137,19 @@ CREDENTIAL_PATH_DENYLIST = re.compile(
 # without waiting so long the ingress call blocks indefinitely.
 CLAIM_VERIFICATION_ATTEMPTS = 5
 CLAIM_VERIFICATION_DELAY_SECONDS = 0.02
+
+# Bounds manager.dispatcher.dispatch()'s historical-estimate lookup
+# (manager.executions.list_executions_bounded(), via the `history_deadline`
+# it accepts) on THIS ingress's own request -> Task/Command creation path --
+# the same class of fix manager.execution_runner.launch_task() already
+# applies on the separate claimed -> reserved path (see
+# DISPATCH_HISTORY_BUDGET_SECONDS there). Unlike that path, dispatch() here
+# also runs manager.tasks.create_task() itself (see dispatcher.py's own
+# `task = create_task(...)` call for a brand-new task_id) -- so an unbounded
+# history lookup here does not just delay a launch-time estimate, it delays
+# the Task record's own FIRST WRITE, i.e. the exact request -> Task
+# visibility gap this task exists to close.
+INGRESS_DISPATCH_HISTORY_BUDGET_SECONDS = 15.0
 
 
 class DispatchIngressError(TaskError):
@@ -312,26 +325,73 @@ def _fetch_if_exists(store, area, project_id, name):
         raise
 
 
-def _release_pre_artifact_claim(store, registry, project_id, request_id, claim):
-    """Undo only a definitely-owned claim before any durable authority exists."""
+def _mark_pre_artifact_failure(store, registry, project_id, request_id, claim, reason):
+    """When THIS call is the definite, sole owner of a not-yet-materialized
+    claim (created_by_this_call, and no Task/Command/Execution exists for its
+    identity), persist status="failed" + failure_reason on the existing claim
+    record -- never deleted/released -- so a request that fails before ever
+    producing a Task/Command still leaves a durable, queryable "failed" truth
+    (manager.dispatch_requests.read_dispatch_request_status) instead of
+    becoming invisible again. (task_id, command_id) is deterministic from
+    request_id, so releasing the identity to allow a "fresh" claim -- the old
+    design -- never actually enabled anything a same-identity retry could not
+    already do; handle_dispatch()'s own status=="failed" CAS-retry path is
+    that same-identity retry, done safely (see its own comment for why no
+    second existence re-check is needed there).
+
+    Deliberately a no-op (leaves status untouched) whenever ownership is not
+    definite (`created_by_this_call` False, i.e. an ambiguous create
+    outcome) -- an ambiguous claim's real server-side outcome is unknown, so
+    it must never be marked "failed" and made retryable-in-place; it keeps
+    failing closed exactly as before this change (matches
+    manager.dispatch_requests' own conservative ambiguous-write contract;
+    see test_ambiguous_claim_is_never_rolled_back).
+
+    Never raises: this is observability only. Any failure to verify
+    non-existence, or to read/validate/CAS-update the claim record, is
+    silently swallowed -- the caller's own exception (the actual dispatch
+    failure) is what propagates, never this.
+    """
     if not claim.get("created_by_this_call"):
         return False
     task_id, command_id = claim["task_id"], claim["command_id"]
-    if _fetch_if_exists(store, "tasks", project_id, task_id) is not None:
-        return False
-    if _fetch_if_exists(store, "commands", project_id, command_id) is not None:
-        return False
-    # Execution records are independent durable authority. list_executions()
-    # treats a missing EXECUTIONS folder as a proven empty set, but any real
-    # backend failure remains an exception and therefore fails closed.
-    if any(item.get("task_id") == task_id or item.get("command_id") == command_id
-           for item in list_executions(store, project_id)):
-        return False
-    released = release_dispatch_request_claim(
-        registry, project_id, request_id, task_id, command_id, claim["generation"])
-    if not released["released"]:
-        raise DispatchIngressError("dispatch_claim_release_unconfirmed", "pre-artifact request claim could not be safely released")
+    try:
+        if _fetch_if_exists(store, "tasks", project_id, task_id) is not None:
+            return False
+        if _fetch_if_exists(store, "commands", project_id, command_id) is not None:
+            return False
+        # Execution records are independent durable authority. list_executions()
+        # treats a missing EXECUTIONS folder as a proven empty set; any real
+        # backend failure here just means this best-effort marker is skipped
+        # (see the bare except below), never that the caller's real failure
+        # is masked.
+        if any(item.get("task_id") == task_id or item.get("command_id") == command_id
+               for item in list_executions(store, project_id)):
+            return False
+        mark_dispatch_request_status(registry, project_id, request_id, claim["generation"],
+                                     "failed", failure_reason=str(reason)[:500])
+    except Exception:
+        pass
     return True
+
+
+def _mark_retry_failure(registry, project_id, request_id, generation, reason):
+    """The retry-in-place counterpart of _mark_pre_artifact_failure, for
+    handle_dispatch()'s status=="failed" CAS-retry path: `generation` is the
+    new generation THIS call already won by CAS-transitioning the existing
+    claim record's own status from "failed" back to "accepted" before
+    attempting creation again. That CAS win is itself the ownership proof --
+    only one caller can ever win transitioning one specific prior generation
+    forward -- so, unlike _mark_pre_artifact_failure's original-claim path,
+    no separate Task/Command/Execution existence re-check is performed (and,
+    deliberately, the unbounded manager.executions.list_executions() scan
+    this whole task exists to stop calling unnecessarily is never re-run
+    here). Never raises: same best-effort contract as above."""
+    try:
+        mark_dispatch_request_status(registry, project_id, request_id, generation,
+                                     "failed", failure_reason=str(reason)[:500])
+    except Exception:
+        pass
 
 
 def _repo_write_replay_matches(task, requested_repo_write):
@@ -536,99 +596,134 @@ def handle_dispatch(store, service, lock_registry_factory, payload):
     except Exception as exc:
         raise DispatchIngressError("idempotency_backend_unavailable", "could not establish request idempotency") from exc
 
-    if not claim["claimed"]:
-        return _resolve_existing_claim(store, project_id, request_id, claim, clean=clean)
-
     is_repo_write = clean["repo_write"] is not None
     admission_version = ADMISSION_VERSION_V2_REPO_WRITE if is_repo_write else ADMISSION_VERSION
-    internal_request = {
-        "project_id": project_id, "task_id": task_id, "title": clean["title"],
-        "task_type": "general", "complexity": "medium",
-        # v1: this ingress is unconditionally read-only (read_only=True is
-        # forced below, server-side, with no caller override). v2-repo-write:
-        # needs_repo_edit=True is likewise forced here, from clean/repo_write
-        # having already been fully validated above, never a raw caller flag.
-        # manager.dispatcher.dispatch() has no read_only concept of its own
-        # and defaults needs_repo_edit=True for any new task that doesn't
-        # specify it, which would create a self-contradictory read-only Task
-        # (read_only=True, needs_repo_edit=True) that
-        # manager.execution_lifecycle.enter_running_gate() correctly refuses
-        # to ever launch. Setting needs_repo_edit explicitly, matching the
-        # request shape, keeps the Task's own contract internally consistent
-        # from the moment it is first persisted.
-        "needs_repo_edit": is_repo_write,
-        "source_context": {
-            "origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": request_id,
-            "goal": clean["goal"], "admission_version": admission_version,
-            **({"repo": clean["repo_write"]["repo"]} if is_repo_write else {}),
-        },
-    }
-    if requested_provider is not None:
-        # preferred_provider short-circuits manager.dispatcher's quota-based
-        # recommendation outright (`selected = request.get("preferred_provider")
-        # or decision["recommended_provider"] or ...`) -- an explicit request
-        # here is never subject to auto-selection.
-        internal_request["preferred_provider"] = requested_provider
-    if requested_account_id is not None:
-        internal_request["account_id"] = requested_account_id
-    try:
-        result = dispatcher_dispatch(store, service, internal_request)
-    except Exception:
-        _release_pre_artifact_claim(store, registry, project_id, request_id, claim)
-        raise
 
-    # Defense in depth: the explicit request was already validated above,
-    # but never trust that dispatcher_dispatch() actually honored it --
-    # fail closed on any mismatch instead of silently persisting a Command
-    # for a different provider/account than what was requested.
-    if requested_provider is not None and result["provider"] != requested_provider:
-        raise DispatchIngressError(
-            "dispatch_state_inconsistent",
-            f"requested provider {requested_provider!r} but dispatcher resolved {result['provider']!r}",
-        )
-    if requested_account_id is not None and result.get("account_id") != requested_account_id:
-        raise DispatchIngressError(
-            "dispatch_state_inconsistent",
-            f"requested account_id {requested_account_id!r} but dispatcher resolved {result.get('account_id')!r}",
-        )
+    def create():
+        """Create the Task+Command for this claimed (task_id, command_id)
+        identity. Bounds manager.dispatcher.dispatch()'s own historical-
+        estimate lookup (see INGRESS_DISPATCH_HISTORY_BUDGET_SECONDS above)
+        so a large project's execution history can never again delay this
+        call's own Task creation (dispatch() calls manager.tasks.create_task()
+        internally for a brand-new task_id, before ever returning here)."""
+        internal_request = {
+            "project_id": project_id, "task_id": task_id, "title": clean["title"],
+            "task_type": "general", "complexity": "medium",
+            # v1: this ingress is unconditionally read-only (read_only=True is
+            # forced below, server-side, with no caller override). v2-repo-write:
+            # needs_repo_edit=True is likewise forced here, from clean/repo_write
+            # having already been fully validated above, never a raw caller flag.
+            # manager.dispatcher.dispatch() has no read_only concept of its own
+            # and defaults needs_repo_edit=True for any new task that doesn't
+            # specify it, which would create a self-contradictory read-only Task
+            # (read_only=True, needs_repo_edit=True) that
+            # manager.execution_lifecycle.enter_running_gate() correctly refuses
+            # to ever launch. Setting needs_repo_edit explicitly, matching the
+            # request shape, keeps the Task's own contract internally consistent
+            # from the moment it is first persisted.
+            "needs_repo_edit": is_repo_write,
+            "source_context": {
+                "origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": request_id,
+                "goal": clean["goal"], "admission_version": admission_version,
+                **({"repo": clean["repo_write"]["repo"]} if is_repo_write else {}),
+            },
+        }
+        if requested_provider is not None:
+            # preferred_provider short-circuits manager.dispatcher's quota-based
+            # recommendation outright (`selected = request.get("preferred_provider")
+            # or decision["recommended_provider"] or ...`) -- an explicit request
+            # here is never subject to auto-selection.
+            internal_request["preferred_provider"] = requested_provider
+        if requested_account_id is not None:
+            internal_request["account_id"] = requested_account_id
+        result = dispatcher_dispatch(store, service, internal_request,
+                                     history_deadline=time.monotonic() + INGRESS_DISPATCH_HISTORY_BUDGET_SECONDS)
 
-    # read_only and execution_policies are forced here, server-side, from a
-    # fixed policy set -- never from clean/payload -- so this Task always
-    # satisfies the matching policy gate in manager.trusted_ingress
-    # (task_policy_satisfied for v1, repo_write_policy_satisfied for
-    # v2-repo-write) the Command Watcher re-checks independently before
-    # ever launching it. v2-repo-write additionally stamps allowed_paths/
-    # baseline_head -- the Task's own bounded-write evidence.
-    if is_repo_write:
-        # working_directory=None here is deliberate and load-bearing: dispatcher_
-        # dispatch() above already snapshotted *some* working_directory onto
-        # this Task (from the Global Project Registry when configured,
-        # otherwise the Drive Project record's literal) before this ingress
-        # ever knew the request was v2-repo-write. manager.execution_runner.
-        # _resolve_working_directory() only materializes an isolated worktree
-        # (Slice C) when a Task's working_directory is still None -- so
-        # without this reset, a bounded repo-write Task would silently run
-        # directly in the shared canonical checkout instead of its own
-        # isolated worktree, defeating this project's own registered
-        # isolation_policy (worktree_per_task).
-        update_task(store, project_id, task_id, clear=("working_directory",), priority=clean["priority"],
-                    read_only=False, execution_policies=sorted(REQUIRED_REPO_WRITE_TASK_POLICIES),
-                    allowed_paths=clean["repo_write"]["allowed_paths"], baseline_head=clean["repo_write"]["baseline_head"])
-    else:
-        update_task(store, project_id, task_id, priority=clean["priority"],
-                    read_only=True, execution_policies=sorted(REQUIRED_TASK_POLICIES))
+        # Defense in depth: the explicit request was already validated above,
+        # but never trust that dispatcher_dispatch() actually honored it --
+        # fail closed on any mismatch instead of silently persisting a Command
+        # for a different provider/account than what was requested.
+        if requested_provider is not None and result["provider"] != requested_provider:
+            raise DispatchIngressError(
+                "dispatch_state_inconsistent",
+                f"requested provider {requested_provider!r} but dispatcher resolved {result['provider']!r}",
+            )
+        if requested_account_id is not None and result.get("account_id") != requested_account_id:
+            raise DispatchIngressError(
+                "dispatch_state_inconsistent",
+                f"requested account_id {requested_account_id!r} but dispatcher resolved {result.get('account_id')!r}",
+            )
 
-    command = {
-        "command_id": command_id, "project_id": project_id, "task_id": task_id,
-        "provider": result["provider"], "account_id": result.get("account_id"),
-        "requested_provider": requested_provider, "requested_account_id": requested_account_id,
-        "model": result["model"], "fallback_model": result["fallback_model"],
-        "mode": result["mode"], "effort": result["effort"], "selection_reason": result["selection_reason"],
-        "quota_evidence": result["quota_evidence"], "created_at": now_iso(), "status": "queued",
-        "execution_id": None, "claimed_at": None, "completed_at": None, "result": None,
-        "created_via": TRUSTED_INGRESS_ORIGIN, "admission_version": admission_version, "request_id": request_id,
-    }
-    validate("command", command)
-    store.put("commands", project_id, command_id, command)
-    return {"accepted": True, "request_id": request_id, "task_id": task_id, "command_id": command_id, "status": "queued"}
+        # read_only and execution_policies are forced here, server-side, from a
+        # fixed policy set -- never from clean/payload -- so this Task always
+        # satisfies the matching policy gate in manager.trusted_ingress
+        # (task_policy_satisfied for v1, repo_write_policy_satisfied for
+        # v2-repo-write) the Command Watcher re-checks independently before
+        # ever launching it. v2-repo-write additionally stamps allowed_paths/
+        # baseline_head -- the Task's own bounded-write evidence.
+        if is_repo_write:
+            # working_directory=None here is deliberate and load-bearing: dispatcher_
+            # dispatch() above already snapshotted *some* working_directory onto
+            # this Task (from the Global Project Registry when configured,
+            # otherwise the Drive Project record's literal) before this ingress
+            # ever knew the request was v2-repo-write. manager.execution_runner.
+            # _resolve_working_directory() only materializes an isolated worktree
+            # (Slice C) when a Task's working_directory is still None -- so
+            # without this reset, a bounded repo-write Task would silently run
+            # directly in the shared canonical checkout instead of its own
+            # isolated worktree, defeating this project's own registered
+            # isolation_policy (worktree_per_task).
+            update_task(store, project_id, task_id, clear=("working_directory",), priority=clean["priority"],
+                        read_only=False, execution_policies=sorted(REQUIRED_REPO_WRITE_TASK_POLICIES),
+                        allowed_paths=clean["repo_write"]["allowed_paths"], baseline_head=clean["repo_write"]["baseline_head"])
+        else:
+            update_task(store, project_id, task_id, priority=clean["priority"],
+                        read_only=True, execution_policies=sorted(REQUIRED_TASK_POLICIES))
+
+        command = {
+            "command_id": command_id, "project_id": project_id, "task_id": task_id,
+            "provider": result["provider"], "account_id": result.get("account_id"),
+            "requested_provider": requested_provider, "requested_account_id": requested_account_id,
+            "model": result["model"], "fallback_model": result["fallback_model"],
+            "mode": result["mode"], "effort": result["effort"], "selection_reason": result["selection_reason"],
+            "quota_evidence": result["quota_evidence"], "created_at": now_iso(), "status": "queued",
+            "execution_id": None, "claimed_at": None, "completed_at": None, "result": None,
+            "created_via": TRUSTED_INGRESS_ORIGIN, "admission_version": admission_version, "request_id": request_id,
+        }
+        validate("command", command)
+        store.put("commands", project_id, command_id, command)
+        return {"accepted": True, "request_id": request_id, "task_id": task_id, "command_id": command_id, "status": "queued"}
+
+    if claim["claimed"]:
+        try:
+            result = create()
+        except Exception as exc:
+            _mark_pre_artifact_failure(store, registry, project_id, request_id, claim, exc)
+            raise
+        mark_dispatch_request_status(registry, project_id, request_id, claim["generation"], "dispatched")
+        return result
+
+    if claim.get("status") == "failed":
+        # The prior attempt for this exact request_id is confirmed dead (see
+        # _mark_pre_artifact_failure: only ever set when no Task/Command/
+        # Execution was found for this identity). Try to become the
+        # exclusive retrier by CAS-transitioning the existing claim record's
+        # own status from "failed" back to "accepted" -- only one concurrent
+        # caller can ever win that transition (it targets `claim["generation"]`
+        # specifically). A loser (None) falls through to the ordinary
+        # bounded-polling resolution below, exactly as before this change --
+        # the safe default for "someone else is already retrying, or this
+        # read was stale."
+        retry_generation = mark_dispatch_request_status(
+            registry, project_id, request_id, claim["generation"], "accepted")
+        if retry_generation is not None:
+            try:
+                result = create()
+            except Exception as exc:
+                _mark_retry_failure(registry, project_id, request_id, retry_generation, exc)
+                raise
+            mark_dispatch_request_status(registry, project_id, request_id, retry_generation, "dispatched")
+            return result
+
+    return _resolve_existing_claim(store, project_id, request_id, claim, clean=clean)
 

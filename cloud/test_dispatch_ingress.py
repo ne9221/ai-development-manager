@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -116,14 +117,105 @@ class DispatchIngressTests(unittest.TestCase):
         command = self.store.get("commands", "p1", result["command_id"])
         self.assertEqual("codex", command["provider"])
 
-    def test_failure_before_task_creation_releases_only_our_definite_claim(self):
+    def test_failure_before_task_creation_marks_failed_truth_and_stays_retryable(self):
+        """P0 dispatch-two-tick-final: a definite (created_by_this_call),
+        pre-artifact failure must leave durable "failed" + failure_reason
+        truth on the claim record instead of deleting it (the old
+        release-based design), so a caller can observe the request was
+        received and definitively failed without waiting for/polling a
+        Task/Command that will never exist -- and a retry of the same
+        request_id must still succeed once the underlying cause is fixed."""
         request = payload(request_id="req-pre-artifact-failure")
         with patch("cloud.dispatch_ingress.dispatcher_dispatch", side_effect=TaskError("simulated pre-task failure")):
             with self.assertRaisesRegex(TaskError, "pre-task failure"):
                 self.call(request)
-        self.assertIsNone(self.registries.factory("p1", "req-pre-artifact-failure").document)
+        document = self.registries.factory("p1", "req-pre-artifact-failure").document
+        self.assertIsNotNone(document)
+        self.assertEqual("failed", document["status"])
+        self.assertIn("pre-task failure", document["failure_reason"])
+        self.assertEqual("dispatch-req-pre-artifact-failure", document["task_id"])
         result = self.call(request)
         self.assertEqual("dispatch-req-pre-artifact-failure", result["task_id"])
+        self.assertEqual("dispatched", self.registries.factory("p1", "req-pre-artifact-failure").document["status"])
+
+    def test_request_visible_as_accepted_before_slow_dispatch_resolves(self):
+        """P0 dispatch-two-tick-final: the durable claim record must show
+        status="accepted" the instant the request is received -- written in
+        the SAME create-if-absent call claim_dispatch_request() makes,
+        strictly before manager.dispatcher.dispatch() (quota read +
+        execution-history lookup + Task creation) ever runs. A caller that
+        queries the claim record while dispatch() is still resolving (slow
+        quota, slow execution history, or just ordinary latency) must see
+        durable "accepted" truth, not nothing."""
+        seen_while_dispatching = {}
+
+        def slow_dispatch(store, service, request, **kwargs):
+            # Snapshot the claim record's own state from *inside* dispatch()
+            # -- i.e. while the request -> Task creation is still in flight --
+            # then delegate to the real dispatcher so the call still succeeds.
+            seen_while_dispatching["document"] = self.registries.factory("p1", "req-slow").document
+            return dispatcher_dispatch(store, service, request, **kwargs)
+
+        with patch("cloud.dispatch_ingress.dispatcher_dispatch", side_effect=slow_dispatch):
+            result = self.call(payload(request_id="req-slow"))
+        self.assertEqual("accepted", seen_while_dispatching["document"]["status"])
+        self.assertEqual("dispatch-req-slow", seen_while_dispatching["document"]["task_id"])
+        self.assertTrue(result["accepted"])
+        self.assertEqual("dispatched", self.registries.factory("p1", "req-slow").document["status"])
+
+    def test_ingress_dispatch_uses_bounded_history_lookup(self):
+        """P0 dispatch-two-tick-final: cloud.dispatch_ingress.handle_dispatch()
+        must bound manager.dispatcher.dispatch()'s own historical-estimate
+        lookup on its request -> Task/Command creation path -- the same
+        unbounded manager.executions.list_executions() call
+        fix/dispatch-two-tick-observability-20260824 already bounded on the
+        separate claimed -> reserved (execution_runner.launch_task()) path,
+        but never applied here. Without this, a growing project execution
+        history delays the Task's own FIRST WRITE, not just a launch-time
+        estimate."""
+        before = time.monotonic()
+        with patch("cloud.dispatch_ingress.dispatcher_dispatch", wraps=dispatcher_dispatch) as wrapped:
+            self.call(payload(request_id="req-bounded-history"))
+        after = time.monotonic()
+        wrapped.assert_called_once()
+        history_deadline = wrapped.call_args.kwargs["history_deadline"]
+        self.assertIsNotNone(history_deadline)
+        from cloud.dispatch_ingress import INGRESS_DISPATCH_HISTORY_BUDGET_SECONDS
+        self.assertGreaterEqual(history_deadline, before + INGRESS_DISPATCH_HISTORY_BUDGET_SECONDS - 1.0)
+        self.assertLessEqual(history_deadline, after + INGRESS_DISPATCH_HISTORY_BUDGET_SECONDS + 1.0)
+
+    def test_concurrent_retry_of_failed_claim_creates_exactly_one_task_and_command(self):
+        """P0 dispatch-two-tick-final: two callers racing to retry the same
+        definitively-failed request_id must produce exactly one Task/Command
+        -- only one may win the CAS transition of the claim's own status
+        from "failed" back to "accepted"; the loser must fall back to the
+        ordinary bounded-polling resolution and observe the winner's result,
+        never attempt its own concurrent create()."""
+        request = payload(request_id="req-concurrent-retry")
+        with patch("cloud.dispatch_ingress.dispatcher_dispatch", side_effect=TaskError("simulated failure")):
+            with self.assertRaises(TaskError):
+                self.call(request)
+        self.assertEqual("failed", self.registries.factory("p1", "req-concurrent-retry").document["status"])
+
+        barrier = threading.Barrier(2)
+        results, errors = [], []
+
+        def run():
+            barrier.wait(timeout=2)
+            try:
+                results.append(self.call(request))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(timeout=5)
+        succeeded = [r for r in results if r]
+        self.assertGreaterEqual(len(succeeded), 1)
+        for result in succeeded:
+            self.assertEqual("dispatch-req-concurrent-retry", result["task_id"])
+        self.store.get("tasks", "p1", "dispatch-req-concurrent-retry")
+        self.store.get("commands", "p1", "dispatch-req-concurrent-retry")
 
     def test_ambiguous_claim_is_never_rolled_back(self):
         request = payload(request_id="req-ambiguous-no-provider")

@@ -14,6 +14,16 @@ from manager.tasks import TaskError, safe_id
 
 DISPATCH_REQUEST_SCHEMA_VERSION = "0.1.0"
 DEFAULT_AMBIGUOUS_ATTEMPTS = 3
+# Additive, optional fields (see _new_record/_validate_record): a record
+# written before this change has neither, and .get(..., default) treats that
+# exactly like a freshly-claimed, not-yet-resolved request -- so this stays
+# fully backward compatible with every record already live in GCS, without a
+# schema_version bump (see module docstring update below for why one is not
+# needed: DISPATCH_REQUEST_SCHEMA_VERSION is compared for exact equality by
+# _validate_record, so bumping it would make every already-live record
+# suddenly "malformed" the instant it is next read).
+DISPATCH_REQUEST_STATUSES = ("accepted", "dispatched", "failed")
+DEFAULT_DISPATCH_REQUEST_STATUS = "accepted"
 
 
 class DispatchRequestClaimConflict(TaskError):
@@ -40,6 +50,11 @@ def _new_record(project_id, request_id, task_id, command_id, created_at):
         "project_id": project_id, "request_id": request_id,
         "task_id": task_id, "command_id": command_id,
         "created_at": created_at,
+        # Durable, queryable "request received" truth -- persisted in this
+        # SAME create-if-absent write, i.e. strictly before any slow
+        # provider/quota/execution-history resolution ever runs. See
+        # mark_dispatch_request_status()/read_dispatch_request_status().
+        "status": DEFAULT_DISPATCH_REQUEST_STATUS, "failure_reason": None,
     }
 
 
@@ -51,7 +66,13 @@ def _validate_record(document, project_id, request_id):
             raise TaskError(f"malformed dispatch request record: missing {key}")
     if document["project_id"] != project_id or document["request_id"] != request_id:
         raise TaskError("malformed dispatch request record: identity does not match the claim key")
-    return document
+    status = document.get("status", DEFAULT_DISPATCH_REQUEST_STATUS)
+    if status not in DISPATCH_REQUEST_STATUSES:
+        raise TaskError(f"malformed dispatch request record: invalid status {status!r}")
+    failure_reason = document.get("failure_reason")
+    if failure_reason is not None and not isinstance(failure_reason, str):
+        raise TaskError("malformed dispatch request record: failure_reason must be a string or null")
+    return {**document, "status": status, "failure_reason": failure_reason}
 
 
 def _resolve_conflict(registry, project_id, request_id):
@@ -154,3 +175,59 @@ def release_dispatch_request_claim(registry, project_id, request_id, task_id, co
             return {"released": True, "generation": current_generation, "confirmed_after_ambiguous_delete": True}
         raise TaskError("dispatch request release outcome is ambiguous") from exc
     return {"released": True, "generation": current_generation}
+
+
+def mark_dispatch_request_status(registry, project_id, request_id, generation, status, failure_reason=None):
+    """Best-effort CAS status transition on an already-claimed request's
+    durable claim record -- e.g. "accepted" (the default at claim time) ->
+    "dispatched" (Task/Command successfully created) or "failed" (a definite,
+    sole-owned pre-artifact failure; see cloud.dispatch_ingress's caller for
+    when it is safe to call this with status="failed").
+
+    This is observability, not authority: a lost race (the record changed
+    concurrently -- `generation` no longer matches) or any backend/validation
+    failure returns None rather than raising, so a caller must never let this
+    affect whether the surrounding dispatch itself succeeded or failed. On
+    success returns the new generation.
+    """
+    if status not in DISPATCH_REQUEST_STATUSES:
+        raise TaskError(f"invalid dispatch request status: {status!r}")
+    if failure_reason is not None and not isinstance(failure_reason, str):
+        raise TaskError("failure_reason must be a string or null")
+    try:
+        current, current_generation, _ = registry.read()
+    except Exception:
+        return None
+    if current_generation != generation:
+        return None
+    try:
+        document = _validate_record(current, project_id, request_id)
+    except TaskError:
+        return None
+    updated = {**document, "status": status, "failure_reason": failure_reason}
+    try:
+        return registry.compare_and_swap(current_generation, updated)
+    except Exception:
+        return None
+
+
+def read_dispatch_request_status(registry, project_id, request_id):
+    """Best-effort read of one request_id's current durable claim-record
+    truth -- status/failure_reason/task_id/command_id/created_at -- for any
+    caller (Dashboard, CLI, tests, an audit script) that wants to know
+    whether a request was ever received, without waiting for its Task/
+    Command to exist. Returns None only when no claim record exists at all
+    (the request was never received, or -- pre this change -- a legacy
+    release-based rollback already deleted it). A malformed record fails
+    closed (TaskError), matching every other reader of this same object.
+    """
+    existing = registry.read_if_exists()
+    if existing is None:
+        return None
+    document, generation, _ = existing
+    document = _validate_record(document, project_id, request_id)
+    return {
+        "status": document["status"], "failure_reason": document["failure_reason"],
+        "task_id": document["task_id"], "command_id": document["command_id"],
+        "created_at": document["created_at"], "generation": generation,
+    }

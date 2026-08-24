@@ -7,7 +7,7 @@ import unittest
 
 from manager.dispatch_requests import (
     DispatchRequestClaimConflict, claim_dispatch_request, dispatch_request_object_name,
-    release_dispatch_request_claim,
+    mark_dispatch_request_status, read_dispatch_request_status, release_dispatch_request_claim,
 )
 from manager.tasks import TaskError
 from manager.test_task_claims import AmbiguousThenUnreadableRegistry, MemoryClaimRegistry
@@ -99,6 +99,83 @@ class DispatchRequestClaimTests(unittest.TestCase):
         self.assertEqual("dispatch-requests/p1/req-1.json", dispatch_request_object_name("p1", "req-1"))
         with self.assertRaises(TaskError):
             dispatch_request_object_name("../p1", "req-1")
+
+    def test_claim_is_accepted_status_immediately_on_creation(self):
+        """P0 dispatch-two-tick-final: status defaults to "accepted" in the
+        SAME create-if-absent write the claim itself lands in -- durable,
+        queryable request-received truth before any slow provider/quota/
+        history resolution ever runs."""
+        registry = MemoryClaimRegistry()
+        claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-24T00:00:00Z")
+        status = read_dispatch_request_status(registry, "p1", "req-1")
+        self.assertEqual("accepted", status["status"])
+        self.assertIsNone(status["failure_reason"])
+
+    def test_missing_claim_status_is_none_not_a_fabricated_status(self):
+        registry = MemoryClaimRegistry()
+        self.assertIsNone(read_dispatch_request_status(registry, "p1", "req-never-seen"))
+
+    def test_mark_status_transitions_and_is_queryable(self):
+        registry = MemoryClaimRegistry()
+        claim = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-24T00:00:00Z")
+        new_generation = mark_dispatch_request_status(registry, "p1", "req-1", claim["generation"], "dispatched")
+        self.assertIsNotNone(new_generation)
+        status = read_dispatch_request_status(registry, "p1", "req-1")
+        self.assertEqual("dispatched", status["status"])
+        self.assertIsNone(status["failure_reason"])
+
+    def test_mark_status_failed_carries_a_reason(self):
+        registry = MemoryClaimRegistry()
+        claim = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-24T00:00:00Z")
+        mark_dispatch_request_status(registry, "p1", "req-1", claim["generation"], "failed", failure_reason="no eligible provider")
+        status = read_dispatch_request_status(registry, "p1", "req-1")
+        self.assertEqual("failed", status["status"])
+        self.assertEqual("no eligible provider", status["failure_reason"])
+
+    def test_mark_status_stale_generation_is_a_lost_race_not_an_exception(self):
+        """Best-effort, observability-only contract: a stale generation must
+        return None (lost race), never raise -- the caller's own real
+        success/failure must never be masked by this side channel failing."""
+        registry = MemoryClaimRegistry()
+        claim = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-24T00:00:00Z")
+        mark_dispatch_request_status(registry, "p1", "req-1", claim["generation"], "dispatched")
+        result = mark_dispatch_request_status(registry, "p1", "req-1", claim["generation"], "failed", failure_reason="stale")
+        self.assertIsNone(result)
+        # The winning "dispatched" transition must survive untouched.
+        self.assertEqual("dispatched", read_dispatch_request_status(registry, "p1", "req-1")["status"])
+
+    def test_mark_status_backend_unavailable_returns_none_not_exception(self):
+        registry = MemoryClaimRegistry()
+        claim = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-24T00:00:00Z")
+        registry.unavailable = True
+        self.assertIsNone(mark_dispatch_request_status(registry, "p1", "req-1", claim["generation"], "dispatched"))
+
+    def test_legacy_record_without_status_field_defaults_to_accepted(self):
+        """A record written before this change (no status/failure_reason
+        fields at all) must still validate and read as "accepted" rather
+        than being treated as malformed -- full backward compatibility with
+        every dispatch-request claim already live in GCS."""
+        registry = MemoryClaimRegistry()
+        registry.document = {"schema_version": "0.1.0", "project_id": "p1", "request_id": "req-legacy",
+                              "task_id": "dispatch-req-legacy", "command_id": "dispatch-req-legacy",
+                              "created_at": "2026-08-16T00:00:00Z"}
+        registry.generation = 1
+        status = read_dispatch_request_status(registry, "p1", "req-legacy")
+        self.assertEqual("accepted", status["status"])
+        self.assertIsNone(status["failure_reason"])
+
+    def test_read_status_of_malformed_record_fails_closed(self):
+        registry = MemoryClaimRegistry()
+        registry.document = {"schema_version": "0.1.0", "project_id": "p1"}  # missing required fields
+        registry.generation = 1
+        with self.assertRaises(TaskError):
+            read_dispatch_request_status(registry, "p1", "req-malformed")
+
+    def test_invalid_status_value_rejected(self):
+        registry = MemoryClaimRegistry()
+        claim = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1", "2026-08-24T00:00:00Z")
+        with self.assertRaises(TaskError):
+            mark_dispatch_request_status(registry, "p1", "req-1", claim["generation"], "bogus-status")
 
 
 if __name__ == "__main__":
