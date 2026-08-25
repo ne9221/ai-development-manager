@@ -13,7 +13,9 @@ class SchedulerProvenanceTests(unittest.TestCase):
 
     def raw_event(self, event_id, record_id, instance, pid=None, message="", when=None, task_name=None):
         when = when or datetime.now(timezone.utc)
-        fields = f'<Data Name="TaskName">{task_name or self.TASK}</Data><Data Name="InstanceId">{instance}</Data>'
+        fields = f'<Data Name="TaskName">{task_name or self.TASK}</Data>'
+        if instance is not None:
+            fields += f'<Data Name="InstanceId">{instance}</Data>'
         if pid is not None:
             fields += f'<Data Name="ProcessID">{pid}</Data>'
         return {"record_id": record_id, "event_id": event_id, "time_created": when.isoformat(), "message": message,
@@ -24,14 +26,20 @@ class SchedulerProvenanceTests(unittest.TestCase):
                 "wrapper_creation_identity": "wrapper-222"}
 
     @staticmethod
+    def windows_identity(created):
+        epoch = datetime(1601, 1, 1, tzinfo=timezone.utc)
+        return f"windows-filetime:{int((created - epoch).total_seconds() * 10_000_000)}"
+
+    @staticmethod
     def os_pass():
         return {"status": "PASS", "trigger_origin": "scheduled_time", "instance_id": "i-1",
                 "trigger_event_record_id": 10, "action_event_record_id": 12, "action_process_id": 111}
 
-    def correlated(self, events):
+    def correlated(self, events, identity="wrapper-222"):
+        context = {**self.os_context(), "wrapper_creation_identity": identity}
         with patch.object(provenance.os, "name", "nt"), \
              patch.object(provenance, "process_identity_state", return_value="live"):
-            return provenance.correlate_os_evidence(self.os_context(), datetime.now(timezone.utc).isoformat(),
+            return provenance.correlate_os_evidence(context, datetime.now(timezone.utc).isoformat(),
                                                      reader=lambda *_: events)
 
     def test_unique_natural_os_instance_requires_event_129_pid_link(self):
@@ -73,6 +81,28 @@ class SchedulerProvenanceTests(unittest.TestCase):
             self.raw_event(107, 20, "adjacent", message="scheduled time"), self.raw_event(129, 22, "adjacent", 999),
         ])
         self.assertEqual(("PASS", "current"), (evidence["status"], evidence["instance_id"]))
+
+    def test_event129_parent_before_wrapper_has_bounded_causality(self):
+        created = datetime.now(timezone.utc)
+        identity = self.windows_identity(created)
+        for delta, expected in ((-.119, "PASS"), (0, "PASS"), (.5, "PASS"),
+                                (2, "FAIL"), (-6, "FAIL")):
+            with self.subTest(delta=delta):
+                evidence = self.correlated([
+                    self.raw_event(107, 10, "i-1", message="scheduled time", when=created),
+                    self.raw_event(129, 12, "i-1", 111,
+                                   when=created + timedelta(seconds=delta)),
+                ], identity)
+                self.assertEqual(expected, evidence["status"])
+
+    def test_event129_without_instance_uses_only_its_unique_prior_event107(self):
+        created = datetime.now(timezone.utc)
+        evidence = self.correlated([
+            self.raw_event(107, 10, "i-1", message="scheduled time", when=created - timedelta(milliseconds=125)),
+            self.raw_event(129, 12, None, 111, when=created - timedelta(milliseconds=119)),
+            self.raw_event(107, 20, "adjacent", message="scheduled time", when=created - timedelta(seconds=2)),
+        ], self.windows_identity(created))
+        self.assertEqual(("PASS", "i-1"), (evidence["status"], evidence["instance_id"]))
 
     def test_missing_chain_parts_malformed_and_instance_mismatch_are_unknown(self):
         for events in (

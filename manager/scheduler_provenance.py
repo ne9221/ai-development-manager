@@ -20,6 +20,9 @@ ORIGINS = frozenset(("scheduled", "manual", "unknown"))
 EVENT_LOG = "Microsoft-Windows-TaskScheduler/Operational"
 EVENT_TIMEOUT_SECONDS = 5
 EVENT_WINDOW_SECONDS = 120
+PARENT_CHILD_START_MAX_SECONDS = 5
+EVENT_TIMESTAMP_TOLERANCE_SECONDS = 1
+EVENT129_INSTANCE_LINK_MAX_SECONDS = 1
 MAX_EVENTS = 200
 RETAIN_DAYS = 7
 MAX_RECORDS = 10000
@@ -128,15 +131,25 @@ def _origin(event):
     return "unknown"
 
 
-def _after_wrapper_creation(event, identity):
-    """Reject an Event 129 that predates the current Windows PID identity."""
+def _within_parent_child_causality(event, identity):
+    """Accept only the short Event129 action-parent -> wrapper-child interval."""
     if not identity.startswith("windows-filetime:"):
         return True  # Test/non-Windows identity; live identity was still verified above.
     try:
         created = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=int(identity.split(":", 1)[1]) / 10)
     except (ValueError, OverflowError):
         return False
-    return event["time_created"] >= created - timedelta(seconds=2)
+    delta = event["time_created"] - created
+    return (-timedelta(seconds=PARENT_CHILD_START_MAX_SECONDS)
+            <= delta <= timedelta(seconds=EVENT_TIMESTAMP_TOLERANCE_SECONDS))
+
+
+def _action_matches_trigger(action, trigger):
+    """Link Event129 to its Event107 instance when Windows omits InstanceId."""
+    if action["instance_id"]:
+        return action["instance_id"] == trigger["instance_id"]
+    delta = action["time_created"] - trigger["time_created"]
+    return timedelta() <= delta <= timedelta(seconds=EVENT129_INSTANCE_LINK_MAX_SECONDS)
 
 
 def correlate_os_evidence(context, started_at, *, reader=None):
@@ -153,24 +166,23 @@ def correlate_os_evidence(context, started_at, *, reader=None):
     task_name = _task_name(context["task_name"])
     matching = [event for event in events if _task_name(event["task_name"]) == task_name]
     actions = [event for event in matching if event["event_id"] == 129]
-    linked = [event for event in actions if event["process_id"] == context["wrapper_parent_pid"] and event["instance_id"]
-              and _after_wrapper_creation(event, context["wrapper_creation_identity"])]
+    linked = [event for event in actions if event["process_id"] == context["wrapper_parent_pid"]
+              and _within_parent_child_causality(event, context["wrapper_creation_identity"])]
     ignored = [{"task_name": event["task_name"], "instance_id": event["instance_id"],
                 "event_record_id": event["record_id"], "timestamp": event["time_created"].isoformat(),
                 "reason": "already_running"} for event in matching if event["event_id"] == 322]
     if actions and not linked:
         return {"status": "FAIL", "reason": "event_129_process_id_mismatch", "ignore_new_events": ignored}
+    triggers = [event for event in matching if event["event_id"] == 107 and _origin(event) == "scheduled_time"]
     candidates = []
     for action in linked:
-        instance = action["instance_id"]
-        trigger = [event for event in matching if event["event_id"] == 107 and event["instance_id"] == instance
-                   and _origin(event) == "scheduled_time"]
+        trigger = [event for event in triggers if _action_matches_trigger(action, event)]
         if len(trigger) == 1:
             candidates.append((action, trigger[0]))
     if len(candidates) != 1:
         return {"status": "UNKNOWN", "reason": "missing_or_ambiguous_os_instance", "ignore_new_events": ignored}
     action, trigger = candidates[0]
-    return {"status": "PASS", "task_name": task_name, "instance_id": action["instance_id"],
+    return {"status": "PASS", "task_name": task_name, "instance_id": trigger["instance_id"],
             "trigger_event_record_id": trigger["record_id"], "trigger_event_id": trigger["event_id"],
             "trigger_time": trigger["time_created"].isoformat(), "action_event_record_id": action["record_id"],
             "action_process_id": action["process_id"], "action_executable": action["action_executable"],
