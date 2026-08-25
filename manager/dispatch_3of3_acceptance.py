@@ -757,27 +757,27 @@ def collect_evidence(
         except Exception:
             dispatch_request = None
 
-    records = getattr(store, "records", None)
     tasks = []
     ambiguous_task_identity = False
-    if records is not None:
-        for (area, proj, _name), doc in records.items():
-            if area == "tasks" and proj == project_id:
-                source_context = doc.get("source_context") or {}
-                external_request_id = source_context.get("external_request_id")
-                legacy_request_id = source_context.get("request_id")
-                if (external_request_id is not None and legacy_request_id is not None
-                        and external_request_id != legacy_request_id):
-                    ambiguous_task_identity |= request_id in (external_request_id, legacy_request_id)
-                    continue
-                source_request_id = external_request_id if external_request_id is not None else legacy_request_id
-                if source_request_id == request_id:
-                    tasks.append(doc)
+    for doc in _list_area_records(store, "tasks", project_id):
+        source_context = doc.get("source_context") or {}
+        external_request_id = source_context.get("external_request_id")
+        legacy_request_id = source_context.get("request_id")
+        if (external_request_id is not None and legacy_request_id is not None
+                and external_request_id != legacy_request_id):
+            ambiguous_task_identity |= request_id in (external_request_id, legacy_request_id)
+            continue
+        source_request_id = external_request_id if external_request_id is not None else legacy_request_id
+        if source_request_id == request_id:
+            tasks.append(doc)
 
     if not tasks:
         ingress_first_observed_at = (dispatch_request or {}).get("ingress_first_observed_at")
-        backend_visibility = _durable_visibility(dispatch_request, "backend", request_id)
-        user_visibility = _durable_visibility(dispatch_request, "user", request_id)
+        # No Task/Command exists yet -- the only possible real evidence is
+        # whatever the durable dispatch-request registry record explicitly
+        # carries (never fabricated; see _durable_visibility_from_registry).
+        backend_visibility = _durable_visibility_from_registry(dispatch_request, "backend", request_id)
+        user_visibility = _durable_visibility_from_registry(dispatch_request, "user", request_id)
         return {
             "request_id": request_id,
             "project_id": project_id,
@@ -798,10 +798,10 @@ def collect_evidence(
     task_id = task.get("task_id")
     source_context = task.get("source_context") or {}
 
-    commands = [doc for (area, proj, _n), doc in records.items() if area == "commands" and proj == project_id and doc.get("task_id") == task_id]
-    executions = [doc for (area, proj, _n), doc in records.items() if area == "executions" and proj == project_id and doc.get("task_id") == task_id]
-    sessions = [doc for (area, proj, _n), doc in records.items() if area == "sessions" and proj == project_id and doc.get("task_id") == task_id]
-    handoffs = [doc for (area, proj, _n), doc in records.items() if area == "handoffs" and proj == project_id and doc.get("task_id") == task_id]
+    commands = [doc for doc in _list_area_records(store, "commands", project_id) if doc.get("task_id") == task_id]
+    executions = [doc for doc in _list_area_records(store, "executions", project_id) if doc.get("task_id") == task_id]
+    sessions = [doc for doc in _list_area_records(store, "sessions", project_id) if doc.get("task_id") == task_id]
+    handoffs = [doc for doc in _list_area_records(store, "handoffs", project_id) if doc.get("task_id") == task_id]
 
     command = max(commands, key=lambda c: c.get("created_at") or "") if commands else None
     execution = None
@@ -889,8 +889,31 @@ def collect_evidence(
         dashboard_status = probe_result.get("status")
         dashboard_observed_at = probe_result.get("observed_at")
 
-    backend_visibility = _durable_visibility(dispatch_request, "backend", request_id)
-    user_visibility = _durable_visibility(dispatch_request, "user", request_id)
+    # BACKEND_VISIBLE: once a real Task exists, the canonical Task/Command
+    # truth is the ONLY source -- a caller/registry-supplied claim can never
+    # override real machine observation (see _backend_visibility_from_records
+    # for why Command.claimed_at is real, immutable "first accepted"
+    # evidence a later terminal transition cannot overwrite or fake). The
+    # dispatch-request registry is consulted only in the "no Task exists
+    # yet" branch above, where it is the sole possible evidence, not an
+    # override of anything.
+    backend_visibility = _backend_visibility_from_records(task, command, request_id, task_id)
+
+    # USER_VISIBLE: the real, independently-observed Dashboard probe result
+    # only -- a missing/not-found/error probe fails closed (None -> UNKNOWN)
+    # rather than falling back to anything that could be stale or absent.
+    # Identity comes from the probe's own observation when it supplies one
+    # (so a Dashboard row that itself names a different task/request can be
+    # caught as a mismatch), falling back to the identity this collection
+    # was resolved against for probes too simple to report their own.
+    user_visibility = None
+    if dashboard_status and dashboard_observed_at:
+        user_visibility = {
+            "status": str(dashboard_status).upper(),
+            "observed_at": dashboard_observed_at,
+            "request_id": probe_result.get("request_id", request_id),
+            "task_id": probe_result.get("task_id", task_id),
+        }
 
     terminal_state = None
     reason_code = None
@@ -943,20 +966,89 @@ def collect_evidence(
     }
 
 
-def _durable_visibility(record: Optional[Dict[str, Any]], phase: str, request_id: str) -> Optional[Dict[str, Any]]:
-    """Return immutable ingress/Dashboard visibility proof, if the record has it."""
+def _durable_visibility_from_registry(record: Optional[Dict[str, Any]], phase: str, request_id: str) -> Optional[Dict[str, Any]]:
+    """Return explicit, real Phase-1 visibility proof from the dispatch-
+    request registry record, if a real writer ever populated it. Never
+    fabricates: a record lacking either `{phase}_visible_status` or
+    `first_{phase}_visible_at` returns None (UNKNOWN) rather than
+    synthesizing "accepted @ ingress_first_observed_at" -- that synthesis is
+    exactly the fabricated-zero-tick bug this function replaces. The
+    `task_id` attached is the registry's OWN claimed task_id (not the
+    resolved real task_id), so a registry record that disagrees with the
+    actual Task still fails identity in evaluate_dispatch()'s
+    `_visibility_check` rather than silently adopting the correct id.
+    """
     if not record:
         return None
     status = record.get(f"{phase}_visible_status")
     observed_at = record.get(f"first_{phase}_visible_at")
-    if not status and not observed_at:
-        # Every valid dispatch-request record is created atomically with
-        # status=accepted at ingress_first_observed_at. Later CAS transitions
-        # only replace the current status; the immutable creation timestamp
-        # still proves the canonical backend and Dashboard source first
-        # exposed ACCEPTED. This consumes b060's existing durable contract
-        # and requires no production runtime activation.
-        status = "accepted"
-        observed_at = record.get("ingress_first_observed_at")
+    if not status or not observed_at:
+        return None
     return {"status": status.upper() if isinstance(status, str) else status, "observed_at": observed_at,
             "request_id": request_id, "task_id": record.get("task_id")}
+
+
+def _backend_visibility_from_records(
+    task: Dict[str, Any], command: Optional[Dict[str, Any]], request_id: str, task_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Real, non-fabricated backend-visible evidence from the canonical
+    Task/Command truth -- never from request existence or ingress timing.
+
+    Prefers the Command's own `claimed_at`: the durable, immutable moment
+    the Command Watcher first accepted this request onto the backend. This
+    timestamp is written once and never overwritten by a later terminal
+    transition, so it can honestly represent "first became visible" even
+    long after the request has moved on to RUNNING/COMPLETED/FAILED --
+    preserving real early evidence without ever manufacturing a fake one:
+    if the watcher was genuinely backlogged, `claimed_at` is genuinely late
+    and the 2-tick SLA check in evaluate_dispatch() will correctly FAIL it.
+
+    Falls back to the Task's own current status/timestamp only when no
+    Command has been claimed yet (e.g. a request blocked before any Command
+    was created) -- still a real, machine-observed record, never a guess.
+    """
+    if command is not None and command.get("claimed_at"):
+        return {
+            "status": "ACCEPTED",
+            "observed_at": command["claimed_at"],
+            "request_id": request_id,
+            "task_id": task_id,
+        }
+    status = task.get("status")
+    observed_at = task.get("updated_at") or task.get("created_at")
+    if not status or not observed_at:
+        return None
+    return {
+        "status": str(status).upper(),
+        "observed_at": observed_at,
+        "request_id": request_id,
+        "task_id": task_id,
+    }
+
+
+def _list_area_records(store: Any, area: str, project_id: str) -> List[Dict[str, Any]]:
+    """Acceptance-only compatibility shim so collect_evidence() can consume
+    either the real Drive-backed `manager.tasks.DriveRecords` (which exposes
+    `list_records(area, project_id) -> list`, `get(...)`, `children(...)` --
+    and has NO `.records` mapping) or the in-memory unit-test FakeStore
+    (`.records` is a `{(area, project, name): doc}` dict) directly, with no
+    external reshaping adapter and no change to DriveRecords' own semantics.
+
+    `.records` (if present) takes priority so existing tests keep their
+    exact prior behavior untouched; otherwise falls through to the real
+    `list_records()` API. A project/area that doesn't exist yet on Drive
+    raises inside DriveRecords.list_records() (no folder to list) -- that's
+    a legitimate "nothing here yet" state for this read-only evidence
+    collector, not an error, so it degrades to an empty list rather than
+    propagating.
+    """
+    records = getattr(store, "records", None)
+    if records is not None:
+        return [doc for (rec_area, proj, _name), doc in records.items() if rec_area == area and proj == project_id]
+    list_records = getattr(store, "list_records", None)
+    if list_records is None:
+        return []
+    try:
+        return list(list_records(area, project_id))
+    except Exception:
+        return []

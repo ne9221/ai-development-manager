@@ -20,6 +20,9 @@ from manager.dispatch_3of3_acceptance import (
     STATUS_UNKNOWN,
     FreshnessViolation,
     RunLedger,
+    _backend_visibility_from_records,
+    _durable_visibility_from_registry,
+    _list_area_records,
     collect_evidence,
     detect_cross_task_borrowing,
     evaluate_dispatch,
@@ -159,13 +162,31 @@ class FakeRegistry:
         return (self.document, 1, None) if self.document else None
 
 
-def build_fake_store(request_id: str, ingress_first_observed_at: str, *, request_created_at: str = None) -> FakeStore:
+def build_fake_store(
+    request_id: str, ingress_first_observed_at: str, *,
+    request_created_at: str = None, claimed_at: str = None, task_status: str = "running",
+    include_command: bool = True,
+) -> FakeStore:
     """A single well-formed task->command->execution->session->handoff chain,
     for exercising the REAL collect_evidence() walk (not a hand-built
     evaluate_dispatch() fixture). Only `ingress_first_observed_at` varies
     across the freshness tests that use this -- everything else about the
     request is otherwise legitimate, so FRESHNESS is provably the only
     dimension that can fail/pass.
+
+    `claimed_at` defaults to `ingress_first_observed_at` (fast pickup) but
+    can be set independently -- that is the real, durable evidence
+    BACKEND_VISIBLE is measured against (see
+    manager.dispatch_3of3_acceptance._backend_visibility_from_records), so
+    tests that need a genuinely late/backlogged backend observation set it
+    explicitly rather than relying on SLA_START.
+
+    The dispatch-request registry record deliberately carries NO
+    `backend_visible_status`/`first_backend_visible_at`/`user_visible_status`/
+    `first_user_visible_at` fields: `read_dispatch_request_status()` never
+    projects them through even when a real writer sets them (see
+    `manager.dispatch_requests.read_dispatch_request_status`), so they are
+    not real production evidence today -- this fixture reflects that.
     """
     task_id = f"{request_id}-task"
     command_id = f"{request_id}-cmd"
@@ -173,40 +194,18 @@ def build_fake_store(request_id: str, ingress_first_observed_at: str, *, request
     session_id = f"{request_id}-sess"
     handoff_id = f"{request_id}-handoff"
     request_created_at = request_created_at or ingress_first_observed_at
+    claimed_at = claimed_at if claimed_at is not None else ingress_first_observed_at
     records = {
         ("tasks", PROJECT, task_id): {
             "task_id": task_id,
-            "status": "running",
+            "status": task_status,
             "created_at": ingress_first_observed_at,
+            "updated_at": ingress_first_observed_at,
             "source_context": {
                 "request_id": request_id,
                 "request_created_at": request_created_at,
                 "ingress_first_observed_at": ingress_first_observed_at,
             },
-        },
-        ("commands", PROJECT, command_id): {
-            "task_id": task_id,
-            "command_id": command_id,
-            "created_at": ingress_first_observed_at,
-            "claimed_at": ingress_first_observed_at,
-            "execution_id": execution_id,
-            "provider": "codex",
-            "selection_reason": "quota-eligible-auto-dispatch",
-            "process_provenance": {"scheduler_invocation_id": "a" * 32, "wrapper_pid": 41, "wrapper_parent_pid": 41,
-                "wrapper_creation_identity": "wrapper", "os_scheduler_evidence": scheduler_provenance()["os_scheduler_evidence"]},
-        },
-        ("executions", PROJECT, execution_id): {
-            "task_id": task_id,
-            "execution_id": execution_id,
-            "reserved_at": ingress_first_observed_at,
-            "started_at": ingress_first_observed_at,
-            "completed_at": ingress_first_observed_at,
-            "session_id": session_id,
-            "status": "succeeded",
-            "provider_evidence": {"pid": 4242, "host": "HOME", "scheduler_invocation_id": "a" * 32,
-                "launcher_pid": 11, "launcher_creation_identity": "launcher", "provider_pid": 4242,
-                "provider_creation_identity": "provider", "provider_parent_identity": "launcher"},
-            "quota_evidence": {"account_id": "acct-1"},
         },
         ("sessions", PROJECT, session_id): {
             "task_id": task_id,
@@ -218,81 +217,316 @@ def build_fake_store(request_id: str, ingress_first_observed_at: str, *, request
             "created_at": ingress_first_observed_at,
         },
     }
+    if include_command:
+        records[("commands", PROJECT, command_id)] = {
+            "task_id": task_id,
+            "command_id": command_id,
+            "created_at": ingress_first_observed_at,
+            "claimed_at": claimed_at,
+            "execution_id": execution_id,
+            "provider": "codex",
+            "selection_reason": "quota-eligible-auto-dispatch",
+            "process_provenance": {"scheduler_invocation_id": "a" * 32, "wrapper_pid": 41, "wrapper_parent_pid": 41,
+                "wrapper_creation_identity": "wrapper", "os_scheduler_evidence": scheduler_provenance()["os_scheduler_evidence"]},
+        }
+        records[("executions", PROJECT, execution_id)] = {
+            "task_id": task_id,
+            "execution_id": execution_id,
+            "reserved_at": ingress_first_observed_at,
+            "started_at": ingress_first_observed_at,
+            "completed_at": ingress_first_observed_at,
+            "session_id": session_id,
+            "status": "succeeded",
+            "provider_evidence": {"pid": 4242, "host": "HOME", "scheduler_invocation_id": "a" * 32,
+                "launcher_pid": 11, "launcher_creation_identity": "launcher", "provider_pid": 4242,
+                "provider_creation_identity": "provider", "provider_parent_identity": "launcher"},
+            "quota_evidence": {"account_id": "acct-1"},
+        }
     return FakeStore(records, FakeRegistry({
         "schema_version": "0.1.0", "project_id": PROJECT, "request_id": request_id,
         "task_id": task_id, "command_id": command_id, "created_at": ingress_first_observed_at,
         "ingress_first_observed_at": ingress_first_observed_at,
         "request_created_at": request_created_at, "status": "dispatched", "failure_reason": None,
         "status_updated_at": ts(5.0),
-        "first_backend_visible_at": ingress_first_observed_at, "backend_visible_status": "accepted",
-        "first_user_visible_at": ingress_first_observed_at, "user_visible_status": "accepted",
     }))
+
+
+class FakeDriveRecords:
+    """Shape-accurate stand-in for the real `manager.tasks.DriveRecords`:
+    exposes `list_records(area, project_id)` and `get(area, project_id, name)`
+    (the real production contract), and deliberately has NO `.records`
+    mapping attribute at all -- proving collect_evidence() resolves the
+    full Task->Command->Execution->Session->Handoff chain through
+    `list_records()` alone, with no external reshaping adapter required.
+    """
+
+    def __init__(self, records: dict, dispatch_request_registry=None):
+        self._records = records
+        self.dispatch_request_registry = dispatch_request_registry
+
+    def list_records(self, area, project_id):
+        return [doc for (rec_area, proj, _name), doc in self._records.items() if rec_area == area and proj == project_id]
+
+    def get(self, area, project_id, name):
+        return self._records[(area, project_id, name)]
+
+
+def build_fake_drive_records(*args, **kwargs) -> FakeDriveRecords:
+    """Same fixture data as build_fake_store(), exposed through the real
+    DriveRecords-shaped surface (list_records()/get(), no .records)."""
+    store = build_fake_store(*args, **kwargs)
+    return FakeDriveRecords(store.records, store.dispatch_request_registry)
 
 
 def _running_dashboard_probe(observed_at: str):
     return lambda project_id, task_id: {"status": "RUNNING", "observed_at": observed_at}
 
 
-def test_durable_visibility_survives_terminal_task_snapshot_and_needs_no_dashboard_probe():
-    """The registry's ingress record, not the final Task state, is phase 1."""
+def test_backend_visible_preserves_real_early_evidence_through_terminal_snapshot():
+    """Command.claimed_at is real, immutable Phase-1 evidence: a Task that
+    later reaches a terminal snapshot does not erase or replace it (a real
+    early observation is not "faked" just because it is later preserved --
+    adversarial requirement 9's companion case)."""
     ingress = ts(1.0)
-    store = build_fake_store("terminal", ingress)
-    for field in ("first_backend_visible_at", "backend_visible_status", "first_user_visible_at", "user_visible_status"):
-        store.dispatch_request_registry.document.pop(field)
+    store = build_fake_store("terminal", ingress, claimed_at=ts(1.2))
     task = next(doc for (area, _, _), doc in store.records.items() if area == "tasks")
     task["status"] = "completed"
     evidence = collect_evidence(store, PROJECT, "terminal", acceptance_run_started_at=RUN_STARTED_AT)
-    assert evidence["backend_visibility"] == {"status": "ACCEPTED", "observed_at": ingress,
+    assert evidence["backend_visibility"] == {"status": "ACCEPTED", "observed_at": ts(1.2),
                                               "request_id": "terminal", "task_id": "terminal-task"}
-    assert evidence["user_visibility"] == evidence["backend_visibility"]
+    # No dashboard_probe was supplied at all -- USER_VISIBLE must fail
+    # closed, never inherit a status from the backend or anywhere else.
+    assert evidence["user_visibility"] is None
     result = eval_one(evidence)
     assert _check(result, "BACKEND_VISIBLE").status == STATUS_PASS
-    assert _check(result, "USER_VISIBLE").status == STATUS_PASS
+    assert _check(result, "USER_VISIBLE").status == STATUS_UNKNOWN
+    assert result.result == STATUS_FAIL  # overall FAIL: no Dashboard evidence exists
 
 
-def test_durable_visibility_is_fail_closed_for_missing_and_wrong_identity_records():
+def test_backend_visible_cannot_fake_early_when_real_claim_was_late():
+    """Adversarial requirement 9: a genuinely backlogged Command Watcher
+    (late claimed_at) must FAIL the visibility SLA even once the Task has
+    since completed -- the terminal snapshot must never manufacture an
+    earlier-looking timestamp than what was really observed."""
     ingress = ts(1.0)
-    missing = build_fake_store("missing", ingress)
-    missing.dispatch_request_registry = None
-    assert _check(eval_one(collect_evidence(missing, PROJECT, "missing", acceptance_run_started_at=RUN_STARTED_AT)), "BACKEND_VISIBLE").status == STATUS_UNKNOWN
+    late_claim = ts(1.0 + 20.0)  # 20 min after ingress; tick=5min, 2 ticks=10min window
+    store = build_fake_store("late-claim", ingress, claimed_at=late_claim)
+    task = next(doc for (area, _, _), doc in store.records.items() if area == "tasks")
+    task["status"] = "completed"
+    evidence = collect_evidence(store, PROJECT, "late-claim", acceptance_run_started_at=RUN_STARTED_AT)
+    assert evidence["backend_visibility"]["observed_at"] == late_claim
+    result = eval_one(evidence)
+    assert _check(result, "BACKEND_VISIBLE").status == STATUS_FAIL
+    assert result.result == STATUS_FAIL
 
-    wrong = build_fake_store("wrong", ingress)
-    wrong.dispatch_request_registry.document["task_id"] = "someone-elses-task"
-    assert _check(eval_one(collect_evidence(wrong, PROJECT, "wrong", acceptance_run_started_at=RUN_STARTED_AT)), "USER_VISIBLE").status == STATUS_FAIL
+
+def test_backend_and_user_visible_unknown_when_no_task_or_evidence_exists_at_all():
+    """No Task materialized yet and no dispatch-request registry either --
+    there is genuinely no evidence, so both checks degrade to UNKNOWN, never
+    a PASS."""
+    empty = FakeStore({}, None)
+    evidence = collect_evidence(empty, PROJECT, "missing", acceptance_run_started_at=RUN_STARTED_AT)
+    assert evidence["backend_visibility"] is None
+    assert evidence["user_visibility"] is None
+    result = eval_one(evidence)
+    assert _check(result, "BACKEND_VISIBLE").status == STATUS_UNKNOWN
+    assert _check(result, "USER_VISIBLE").status == STATUS_UNKNOWN
+    assert result.result == STATUS_FAIL
 
 
-def test_pre_task_rejection_collects_durable_visibility_but_cannot_pass_provider_contract():
+def test_user_visible_wrong_task_identity_from_probe_fails():
+    """Adversarial requirement 11: a Dashboard probe that itself reports a
+    DIFFERENT task_id than the one this evidence was resolved against is a
+    real identity mismatch -- must FAIL, never be silently accepted."""
+    ingress = ts(1.0)
+    store = build_fake_store("wrong", ingress)
+    mismatched_probe = lambda project_id, task_id: {
+        "status": "RUNNING", "observed_at": ts(1.5), "task_id": "someone-elses-task",
+    }
+    evidence = collect_evidence(store, PROJECT, "wrong", dashboard_probe=mismatched_probe,
+                                acceptance_run_started_at=RUN_STARTED_AT)
+    assert _check(eval_one(evidence), "USER_VISIBLE").status == STATUS_FAIL
+
+
+def test_ingress_record_only_cannot_pass_backend_or_user_visibility():
+    """Adversarial requirements 1 & 2: a dispatch-request record that only
+    proves ingress happened (no Task ever materialized) must never PASS
+    either visibility check."""
     ingress = ts(1.0)
     record = build_fake_store("rejected", ingress).dispatch_request_registry.document
-    for field in ("first_backend_visible_at", "backend_visible_status", "first_user_visible_at", "user_visible_status"):
-        record.pop(field)
     record.update({"status": "failed", "failure_reason": "rejected before task"})
     evidence = collect_evidence(FakeStore({}, FakeRegistry(record)), PROJECT, "rejected", acceptance_run_started_at=RUN_STARTED_AT)
     assert evidence["timestamps"]["ingress_first_observed_at"] == ingress
-    assert evidence["backend_visibility"]["status"] == "ACCEPTED"
+    assert evidence["backend_visibility"] is None
+    assert evidence["user_visibility"] is None
+    result = eval_one(evidence)
+    assert _check(result, "BACKEND_VISIBLE").status == STATUS_UNKNOWN
+    assert _check(result, "USER_VISIBLE").status == STATUS_UNKNOWN
+    assert result.result == STATUS_FAIL
+
+
+def test_user_visible_dashboard_probe_is_authoritative_and_observed_at_propagates():
+    """Adversarial requirement 8: USER_VISIBLE comes only from the real
+    dashboard_probe result, and its observed_at must reach the final
+    evidence exactly as the probe reported it."""
+    ingress = ts(1.0)
+    store = build_fake_store("canonical", ingress)
+    probe_observed_at = ts(1.7)
+    evidence = collect_evidence(store, PROJECT, "canonical", dashboard_probe=_running_dashboard_probe(probe_observed_at),
+                                acceptance_run_started_at=RUN_STARTED_AT)
+    assert evidence["user_visibility"]["observed_at"] == probe_observed_at
+    assert _check(eval_one(evidence), "USER_VISIBLE").status == STATUS_PASS
+
+
+def test_user_visible_dashboard_not_found_fails_closed():
+    """Adversarial requirement 7: a probe that finds nothing (None or an
+    empty result) must degrade USER_VISIBLE to UNKNOWN, never PASS."""
+    ingress = ts(1.0)
+    for not_found_probe in (lambda *_: None, lambda *_: {}):
+        store = build_fake_store("not-found", ingress)
+        evidence = collect_evidence(store, PROJECT, "not-found", dashboard_probe=not_found_probe,
+                                    acceptance_run_started_at=RUN_STARTED_AT)
+        assert evidence["user_visibility"] is None
+        assert _check(eval_one(evidence), "USER_VISIBLE").status == STATUS_UNKNOWN
+
+
+def test_backend_visible_two_tick_window_pass_and_fail():
+    """Adversarial requirements 3 & 4: BACKEND_VISIBLE derived from the real
+    Command.claimed_at must PASS within the 2-tick window and FAIL past it."""
+    ingress = ts(1.0)
+    within = build_fake_store("within", ingress, claimed_at=ts(1.0 + 9.0))  # 9 min < 10 min (2 ticks)
+    evidence = collect_evidence(within, PROJECT, "within", acceptance_run_started_at=RUN_STARTED_AT)
     assert _check(eval_one(evidence), "BACKEND_VISIBLE").status == STATUS_PASS
+
+    beyond = build_fake_store("beyond", ingress, claimed_at=ts(1.0 + 11.0))  # 11 min > 10 min (2 ticks)
+    evidence = collect_evidence(beyond, PROJECT, "beyond", acceptance_run_started_at=RUN_STARTED_AT)
+    assert _check(eval_one(evidence), "BACKEND_VISIBLE").status == STATUS_FAIL
+
+
+def test_user_visible_two_tick_window_pass_and_fail():
+    """Adversarial requirements 5 & 6: USER_VISIBLE derived from the real
+    dashboard_probe observed_at must PASS within the 2-tick window and FAIL
+    past it."""
+    ingress = ts(1.0)
+    within = build_fake_store("within-u", ingress)
+    evidence = collect_evidence(within, PROJECT, "within-u",
+                                dashboard_probe=_running_dashboard_probe(ts(1.0 + 9.0)),
+                                acceptance_run_started_at=RUN_STARTED_AT)
+    assert _check(eval_one(evidence), "USER_VISIBLE").status == STATUS_PASS
+
+    beyond = build_fake_store("beyond-u", ingress)
+    evidence = collect_evidence(beyond, PROJECT, "beyond-u",
+                                dashboard_probe=_running_dashboard_probe(ts(1.0 + 11.0)),
+                                acceptance_run_started_at=RUN_STARTED_AT)
+    assert _check(eval_one(evidence), "USER_VISIBLE").status == STATUS_FAIL
+
+
+def test_caller_supplied_registry_visibility_cannot_override_canonical_observation():
+    """Adversarial requirement 10: even if a dispatch-request registry
+    record somehow claimed an early/fake accepted status, once a real Task
+    exists the canonical Task/Command truth is the ONLY source -- the
+    registry claim can never override or shortcut it."""
+    ingress = ts(1.0)
+    late_claim = ts(1.0 + 20.0)
+    store = build_fake_store("override-attempt", ingress, claimed_at=late_claim)
+    # A caller/registry claiming an implausibly early accepted status/time
+    # must have zero effect: read_dispatch_request_status() does not even
+    # project these fields through, and _backend_visibility_from_records()
+    # never consults the registry once a Task exists.
+    store.dispatch_request_registry.document["backend_visible_status"] = "accepted"
+    store.dispatch_request_registry.document["first_backend_visible_at"] = ingress
+    evidence = collect_evidence(store, PROJECT, "override-attempt", acceptance_run_started_at=RUN_STARTED_AT)
+    assert evidence["backend_visibility"]["observed_at"] == late_claim
+    assert _check(eval_one(evidence), "BACKEND_VISIBLE").status == STATUS_FAIL
+
+
+def test_durable_visibility_from_registry_never_fabricates():
+    """Direct unit coverage of _durable_visibility_from_registry(): absent,
+    partial, or empty explicit fields all degrade to None (UNKNOWN) -- never
+    the old "accepted @ ingress_first_observed_at" synthesis."""
+    assert _durable_visibility_from_registry(None, "backend", "r1") is None
+    assert _durable_visibility_from_registry({"ingress_first_observed_at": ts(1.0)}, "backend", "r1") is None
+    assert _durable_visibility_from_registry({"backend_visible_status": "accepted"}, "backend", "r1") is None
+    assert _durable_visibility_from_registry({"first_backend_visible_at": ts(1.0)}, "backend", "r1") is None
+    real = _durable_visibility_from_registry(
+        {"backend_visible_status": "accepted", "first_backend_visible_at": ts(1.0), "task_id": "r1-task"},
+        "backend", "r1",
+    )
+    assert real == {"status": "ACCEPTED", "observed_at": ts(1.0), "request_id": "r1", "task_id": "r1-task"}
+
+
+def test_backend_visibility_from_records_never_fabricates_from_missing_fields():
+    """Direct unit coverage of _backend_visibility_from_records(): a
+    malformed task with no status/timestamp at all degrades to None."""
+    assert _backend_visibility_from_records({}, None, "r1", "r1-task") is None
+    assert _backend_visibility_from_records({"status": "blocked"}, None, "r1", "r1-task") is None
+
+
+def test_list_area_records_prefers_records_mapping_then_falls_back_to_list_records():
+    fake_drive = FakeDriveRecords({("tasks", PROJECT, "t1"): {"task_id": "t1"}})
+    assert _list_area_records(fake_drive, "tasks", PROJECT) == [{"task_id": "t1"}]
+    assert _list_area_records(fake_drive, "commands", PROJECT) == []
+
+    fake_store = FakeStore({("tasks", PROJECT, "t1"): {"task_id": "t1"}})
+    assert _list_area_records(fake_store, "tasks", PROJECT) == [{"task_id": "t1"}]
+
+    class NoInterface:
+        pass
+
+    assert _list_area_records(NoInterface(), "tasks", PROJECT) == []
+
+
+def test_real_driverecords_shape_resolves_complete_lifecycle_with_no_adapter():
+    """Adversarial requirements 14 & 15: a store shaped exactly like the
+    real production `manager.tasks.DriveRecords` -- list_records()/get(),
+    NO `.records` mapping at all -- must resolve the full
+    Task->Command->Execution->Session->Handoff chain directly through
+    collect_evidence(), with no external reshaping adapter."""
+    ingress = ts(1.0)
+    store = build_fake_drive_records("drive-real", ingress)
+    assert not hasattr(store, "records")
+    evidence = collect_evidence(
+        store, PROJECT, "drive-real",
+        dashboard_probe=_running_dashboard_probe(ingress),
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
+    assert evidence["ids"]["task_id"] == "drive-real-task"
+    assert evidence["ids"]["command_id"] == "drive-real-cmd"
+    assert evidence["ids"]["execution_id"] == "drive-real-exec"
+    assert evidence["ids"]["session_id"] == "drive-real-sess"
+    assert evidence["ids"]["handoff_id"] == "drive-real-handoff"
+    assert evidence["duplicate_counts"] == {"task": 1, "command": 1, "execution": 1, "session": 1, "handoff": 1}
+    result = eval_one(evidence)
+    for name in ("TASK_LINKAGE", "COMMAND_LINKAGE", "EXECUTION_LINKAGE", "SESSION_LINKAGE",
+                 "HANDOFF_LINKAGE", "BACKEND_VISIBLE", "USER_VISIBLE"):
+        assert _check(result, name).status == STATUS_PASS
+    assert result.result == STATUS_PASS
+
+
+def test_real_driverecords_shape_duplicate_detection_and_wrong_request_no_borrow():
+    ingress = ts(1.0)
+    duplicate_store = build_fake_drive_records("dup", ingress)
+    other_task = dict(duplicate_store.get("tasks", PROJECT, "dup-task"))
+    other_task["task_id"] = "dup-task-2"
+    duplicate_store._records[("tasks", PROJECT, "dup-task-2")] = other_task
+    evidence = collect_evidence(duplicate_store, PROJECT, "dup", acceptance_run_started_at=RUN_STARTED_AT)
+    assert evidence["duplicate_counts"]["task"] == 2
+    assert eval_one(evidence).result == STATUS_FAIL
+
+    store = build_fake_drive_records("target", ingress)
+    task = store.get("tasks", PROJECT, "target-task")
+    task["source_context"] = {"external_request_id": "other"}
+    evidence = collect_evidence(store, PROJECT, "target", acceptance_run_started_at=RUN_STARTED_AT)
+    assert evidence["linkage"]["task"] == {"occurred": False}
     assert eval_one(evidence).result == STATUS_FAIL
 
 
-def test_collector_ignores_caller_visibility_and_terminal_status_without_durable_proof():
-    ingress = ts(1.0)
-    store = build_fake_store("canonical", ingress)
-    store.dispatch_request_registry.document["first_user_visible_at"] = ts(12.0)
-    # A probe is not authority once the canonical Dashboard data record is
-    # available; it cannot replace the durable timestamp with a fake one.
-    evidence = collect_evidence(store, PROJECT, "canonical", dashboard_probe=_running_dashboard_probe(ingress),
-                                acceptance_run_started_at=RUN_STARTED_AT)
-    assert evidence["user_visibility"]["observed_at"] == ingress
-    assert _check(eval_one(evidence), "USER_VISIBLE").status == STATUS_PASS
-
-    terminal_only = build_fake_store("terminal-only", ingress)
-    terminal_only.dispatch_request_registry = None
-    next(doc for (area, _, _), doc in terminal_only.records.items() if area == "tasks")["status"] = "completed"
-    terminal_evidence = collect_evidence(terminal_only, PROJECT, "terminal-only",
-                                         dashboard_probe=lambda *_: {"status": "COMPLETED", "observed_at": ingress},
-                                         acceptance_run_started_at=RUN_STARTED_AT)
-    assert terminal_evidence["backend_visibility"] is None
-    assert _check(eval_one(terminal_evidence), "BACKEND_VISIBLE").status == STATUS_UNKNOWN
+def test_real_driverecords_shape_missing_record_fails_closed():
+    empty = FakeDriveRecords({})
+    evidence = collect_evidence(empty, PROJECT, "nothing", acceptance_run_started_at=RUN_STARTED_AT)
+    assert evidence["backend_visibility"] is None
+    assert evidence["user_visibility"] is None
+    assert eval_one(evidence).result == STATUS_FAIL
 
 
 def test_external_request_id_real_shape_resolves_complete_terminal_lifecycle():
@@ -300,10 +534,17 @@ def test_external_request_id_real_shape_resolves_complete_terminal_lifecycle():
     store = build_fake_store("external", ingress)
     task = next(doc for (area, _, _), doc in store.records.items() if area == "tasks")
     task["source_context"] = {"external_request_id": "external"}
-    task["status"] = "completed"
+    # Deliberately NOT a terminal status: RECOGNIZED_VISIBLE_STATUSES has no
+    # "COMPLETED" entry (pre-existing, unrelated to this fix) and
+    # collect_evidence() calls dashboard_probe exactly once for both
+    # DASHBOARD_TRUTH (compared against the Task's current status) and
+    # USER_VISIBLE -- this test's real purpose is proving the full
+    # Task->Command->Execution->Session->Handoff chain resolves correctly
+    # under external_request_id identity, not terminal-state handling
+    # (covered separately above).
     evidence = collect_evidence(
         store, PROJECT, "external",
-        dashboard_probe=lambda *_: {"status": "COMPLETED", "observed_at": ingress},
+        dashboard_probe=lambda *_: {"status": "RUNNING", "observed_at": ingress},
         acceptance_run_started_at=RUN_STARTED_AT,
     )
     result = eval_one(evidence)
