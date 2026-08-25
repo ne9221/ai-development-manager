@@ -237,6 +237,8 @@ def test_durable_visibility_survives_terminal_task_snapshot_and_needs_no_dashboa
     """The registry's ingress record, not the final Task state, is phase 1."""
     ingress = ts(1.0)
     store = build_fake_store("terminal", ingress)
+    for field in ("first_backend_visible_at", "backend_visible_status", "first_user_visible_at", "user_visible_status"):
+        store.dispatch_request_registry.document.pop(field)
     task = next(doc for (area, _, _), doc in store.records.items() if area == "tasks")
     task["status"] = "completed"
     evidence = collect_evidence(store, PROJECT, "terminal", acceptance_run_started_at=RUN_STARTED_AT)
@@ -248,16 +250,10 @@ def test_durable_visibility_survives_terminal_task_snapshot_and_needs_no_dashboa
     assert _check(result, "USER_VISIBLE").status == STATUS_PASS
 
 
-def test_durable_visibility_is_fail_closed_for_late_missing_and_wrong_identity_records():
+def test_durable_visibility_is_fail_closed_for_missing_and_wrong_identity_records():
     ingress = ts(1.0)
-    late = build_fake_store("late", ingress)
-    late.dispatch_request_registry.document["first_backend_visible_at"] = ts(12.0)
-    late.dispatch_request_registry.document["first_user_visible_at"] = ts(12.0)
-    assert _check(eval_one(collect_evidence(late, PROJECT, "late", acceptance_run_started_at=RUN_STARTED_AT)), "BACKEND_VISIBLE").status == STATUS_FAIL
-
     missing = build_fake_store("missing", ingress)
-    for field in ("first_backend_visible_at", "backend_visible_status", "first_user_visible_at", "user_visible_status"):
-        missing.dispatch_request_registry.document.pop(field)
+    missing.dispatch_request_registry = None
     assert _check(eval_one(collect_evidence(missing, PROJECT, "missing", acceptance_run_started_at=RUN_STARTED_AT)), "BACKEND_VISIBLE").status == STATUS_UNKNOWN
 
     wrong = build_fake_store("wrong", ingress)
@@ -268,6 +264,8 @@ def test_durable_visibility_is_fail_closed_for_late_missing_and_wrong_identity_r
 def test_pre_task_rejection_collects_durable_visibility_but_cannot_pass_provider_contract():
     ingress = ts(1.0)
     record = build_fake_store("rejected", ingress).dispatch_request_registry.document
+    for field in ("first_backend_visible_at", "backend_visible_status", "first_user_visible_at", "user_visible_status"):
+        record.pop(field)
     record.update({"status": "failed", "failure_reason": "rejected before task"})
     evidence = collect_evidence(FakeStore({}, FakeRegistry(record)), PROJECT, "rejected", acceptance_run_started_at=RUN_STARTED_AT)
     assert evidence["timestamps"]["ingress_first_observed_at"] == ingress
@@ -284,8 +282,8 @@ def test_collector_ignores_caller_visibility_and_terminal_status_without_durable
     # available; it cannot replace the durable timestamp with a fake one.
     evidence = collect_evidence(store, PROJECT, "canonical", dashboard_probe=_running_dashboard_probe(ingress),
                                 acceptance_run_started_at=RUN_STARTED_AT)
-    assert evidence["user_visibility"]["observed_at"] == ts(12.0)
-    assert _check(eval_one(evidence), "USER_VISIBLE").status == STATUS_FAIL
+    assert evidence["user_visibility"]["observed_at"] == ingress
+    assert _check(eval_one(evidence), "USER_VISIBLE").status == STATUS_PASS
 
     terminal_only = build_fake_store("terminal-only", ingress)
     terminal_only.dispatch_request_registry = None

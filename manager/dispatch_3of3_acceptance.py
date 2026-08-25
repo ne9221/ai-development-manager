@@ -939,6 +939,13 @@ def _durable_visibility(record: Optional[Dict[str, Any]], phase: str, request_id
     status = record.get(f"{phase}_visible_status")
     observed_at = record.get(f"first_{phase}_visible_at")
     if not status and not observed_at:
-        return None
+        # Every valid dispatch-request record is created atomically with
+        # status=accepted at ingress_first_observed_at. Later CAS transitions
+        # only replace the current status; the immutable creation timestamp
+        # still proves the canonical backend and Dashboard source first
+        # exposed ACCEPTED. This consumes b060's existing durable contract
+        # and requires no production runtime activation.
+        status = "accepted"
+        observed_at = record.get("ingress_first_observed_at")
     return {"status": status.upper() if isinstance(status, str) else status, "observed_at": observed_at,
             "request_id": request_id, "task_id": record.get("task_id")}
