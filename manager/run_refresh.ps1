@@ -11,7 +11,14 @@ param(
 $env:ADM_SCHEDULER_INVOCATION_ID = [guid]::NewGuid().ToString("N")
 $env:ADM_SCHEDULER_TASK_NAME = "AI Development Manager - Refresh"
 $env:ADM_SCHEDULER_WRAPPER_PID = "$PID"
-$env:ADM_SCHEDULER_WRAPPER_PARENT_PID = "$((Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\").ParentProcessId)"
+$wrapperParentPid = $null
+try {
+    $wrapperProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop
+    if ($null -ne $wrapperProcess -and $null -ne $wrapperProcess.ParentProcessId -and [int64]$wrapperProcess.ParentProcessId -gt 0) {
+        $wrapperParentPid = [int64]$wrapperProcess.ParentProcessId
+    }
+} catch {}
+$env:ADM_SCHEDULER_WRAPPER_PARENT_PID = "$wrapperParentPid"
 $env:ADM_SCHEDULER_TRIGGER_ORIGIN = "unknown"
 
 $env:AI_MANAGER_HOME = $ManagerHome
