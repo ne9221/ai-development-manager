@@ -111,6 +111,13 @@ def _new_record(project_id, request_id, task_id, command_id, created_at, request
         # provider/quota/execution-history resolution ever runs. See
         # mark_dispatch_request_status()/read_dispatch_request_status().
         "status": DEFAULT_DISPATCH_REQUEST_STATUS, "failure_reason": None,
+        # The registry is also the canonical pre-Task Dashboard truth
+        # source.  Capture its first truthful visible state once here so a
+        # later dispatched/failed transition cannot erase the ingress fact.
+        "first_backend_visible_at": created_at,
+        "backend_visible_status": "accepted",
+        "first_user_visible_at": created_at,
+        "user_visible_status": "accepted",
         # Durable "last status transition" truth, distinct from `created_at`/
         # `ingress_first_observed_at`: at creation the status has never
         # transitioned yet, so this starts equal to the observation moment,
@@ -150,6 +157,9 @@ def _validate_record(document, project_id, request_id):
     request_created_at = document.get("request_created_at")
     if request_created_at is not None and (not isinstance(request_created_at, str) or not request_created_at.strip()):
         raise TaskError("malformed dispatch request record: invalid request_created_at")
+    for name in ("first_backend_visible_at", "backend_visible_status", "first_user_visible_at", "user_visible_status"):
+        if name in document and (not isinstance(document[name], str) or not document[name].strip()):
+            raise TaskError(f"malformed dispatch request record: invalid {name}")
     return {**document, "status": status, "failure_reason": failure_reason,
             "ingress_first_observed_at": ingress_first_observed_at,
             "status_updated_at": status_updated_at, "request_created_at": request_created_at}
@@ -420,6 +430,10 @@ def read_dispatch_request_status(registry, project_id, request_id):
         "ingress_first_observed_at": document["ingress_first_observed_at"],
         "request_created_at": document["request_created_at"],
         "status_updated_at": document["status_updated_at"],
+        "first_backend_visible_at": document.get("first_backend_visible_at"),
+        "backend_visible_status": document.get("backend_visible_status"),
+        "first_user_visible_at": document.get("first_user_visible_at"),
+        "user_visible_status": document.get("user_visible_status"),
     }
 
 

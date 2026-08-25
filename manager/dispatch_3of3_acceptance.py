@@ -46,6 +46,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
 from manager.scheduler_provenance import evidence_status
+from manager.dispatch_requests import read_dispatch_request_status
 
 STATUS_PASS = "PASS"
 STATUS_FAIL = "FAIL"
@@ -407,6 +408,13 @@ def evaluate_dispatch(
         if vis is None:
             checks.append(CheckResult(name, STATUS_UNKNOWN, "visibility not observed"))
             return None
+        if vis.get("request_id") not in (None, request_id):
+            checks.append(CheckResult(name, STATUS_FAIL, "visibility belongs to a different request_id"))
+            return None
+        expected_task_id = (evidence.get("ids") or {}).get("task_id")
+        if expected_task_id and vis.get("task_id") not in (None, expected_task_id):
+            checks.append(CheckResult(name, STATUS_FAIL, "visibility belongs to a different task_id"))
+            return None
         status = vis.get("status")
         observed_at_raw = vis.get("observed_at")
         observed_at = _parse_iso(observed_at_raw)
@@ -701,6 +709,7 @@ def collect_evidence(
     *,
     dashboard_probe: Optional[Any] = None,
     ingress_probe: Optional[Any] = None,
+    dispatch_request_registry: Optional[Any] = None,
     manual_trigger_probe: Optional[Any] = None,
     acceptance_run_started_at: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -736,6 +745,17 @@ def collect_evidence(
     human or downstream tool reading raw evidence JSON can see the
     freshness verdict without separately knowing which cutoff was used.
     """
+    dispatch_request = None
+    dispatch_request_registry = dispatch_request_registry or getattr(store, "dispatch_request_registry", None)
+    if dispatch_request_registry is not None:
+        try:
+            # Directly consume the same durable record the Dashboard renders
+            # before a Task exists; never infer first visibility from a
+            # terminal Task snapshot.
+            dispatch_request = read_dispatch_request_status(dispatch_request_registry, project_id, request_id)
+        except Exception:
+            dispatch_request = None
+
     records = getattr(store, "records", None)
     tasks = []
     if records is not None:
@@ -746,11 +766,22 @@ def collect_evidence(
                     tasks.append(doc)
 
     if not tasks:
+        ingress_first_observed_at = (dispatch_request or {}).get("ingress_first_observed_at")
+        backend_visibility = _durable_visibility(dispatch_request, "backend", request_id)
+        user_visibility = _durable_visibility(dispatch_request, "user", request_id)
         return {
             "request_id": request_id,
             "project_id": project_id,
+            "timestamps": {
+                "request_created_at": (dispatch_request or {}).get("request_created_at"),
+                "ingress_first_observed_at": ingress_first_observed_at,
+            },
+            "ids": {"task_id": (dispatch_request or {}).get("task_id"), "command_id": (dispatch_request or {}).get("command_id")},
+            "backend_visibility": backend_visibility,
+            "user_visibility": user_visibility,
+            "duplicate_counts": {"task": 0, "command": 0, "execution": 0, "session": 0, "handoff": 0},
             "linkage": {"task": {"occurred": False}},
-            "freshness": _compute_freshness(None, acceptance_run_started_at),
+            "freshness": _compute_freshness(ingress_first_observed_at, acceptance_run_started_at),
         }
 
     task = max(tasks, key=lambda t: t.get("created_at") or "")
@@ -778,7 +809,7 @@ def collect_evidence(
     status = task.get("status")
     is_blocked = status == "blocked"
 
-    ingress_first_observed_at = source_context.get("ingress_first_observed_at")
+    ingress_first_observed_at = (dispatch_request or {}).get("ingress_first_observed_at") or source_context.get("ingress_first_observed_at")
     if ingress_first_observed_at is None and ingress_probe is not None:
         ingress_first_observed_at = ingress_probe(project_id, request_id)
 
@@ -847,8 +878,8 @@ def collect_evidence(
         dashboard_status = probe_result.get("status")
         dashboard_observed_at = probe_result.get("observed_at")
 
-    backend_visibility = {"status": backend_status, "observed_at": task.get("created_at")} if backend_status else None
-    user_visibility = {"status": dashboard_status, "observed_at": dashboard_observed_at} if dashboard_status else None
+    backend_visibility = _durable_visibility(dispatch_request, "backend", request_id)
+    user_visibility = _durable_visibility(dispatch_request, "user", request_id)
 
     terminal_state = None
     reason_code = None
@@ -899,3 +930,15 @@ def collect_evidence(
         "terminal": {"state": terminal_state, "reason_code": reason_code} if terminal_state else None,
         "freshness": _compute_freshness(ingress_first_observed_at, acceptance_run_started_at),
     }
+
+
+def _durable_visibility(record: Optional[Dict[str, Any]], phase: str, request_id: str) -> Optional[Dict[str, Any]]:
+    """Return immutable ingress/Dashboard visibility proof, if the record has it."""
+    if not record:
+        return None
+    status = record.get(f"{phase}_visible_status")
+    observed_at = record.get(f"first_{phase}_visible_at")
+    if not status and not observed_at:
+        return None
+    return {"status": status.upper() if isinstance(status, str) else status, "observed_at": observed_at,
+            "request_id": request_id, "task_id": record.get("task_id")}
