@@ -28,6 +28,7 @@ from manager.dispatch_3of3_acceptance import (
     evaluate_dispatch,
     evaluate_three_consecutive,
 )
+from manager.tasks import TaskError
 
 PROJECT = "adm-demo"
 TICK_SECONDS = 300.0  # 5-minute scheduler tick, matches Command Watcher cadence
@@ -258,24 +259,34 @@ class FakeDriveRecords:
     mapping attribute at all -- proving collect_evidence() resolves the
     full Task->Command->Execution->Session->Handoff chain through
     `list_records()` alone, with no external reshaping adapter required.
+
+    `fail_areas`, if given, maps an area name to the exact exception
+    `list_records(area, ...)` should raise instead of returning -- used to
+    simulate the real DriveRecords failure contract (a `TaskError` whose
+    message is either the legitimate "Drive folder not found: ..." absence,
+    or any other real read/API/decode/pagination failure) for that one area,
+    while every other area still resolves normally.
     """
 
-    def __init__(self, records: dict, dispatch_request_registry=None):
+    def __init__(self, records: dict, dispatch_request_registry=None, fail_areas: dict = None):
         self._records = records
         self.dispatch_request_registry = dispatch_request_registry
+        self._fail_areas = fail_areas or {}
 
     def list_records(self, area, project_id):
+        if area in self._fail_areas:
+            raise self._fail_areas[area]
         return [doc for (rec_area, proj, _name), doc in self._records.items() if rec_area == area and proj == project_id]
 
     def get(self, area, project_id, name):
         return self._records[(area, project_id, name)]
 
 
-def build_fake_drive_records(*args, **kwargs) -> FakeDriveRecords:
+def build_fake_drive_records(*args, fail_areas: dict = None, **kwargs) -> FakeDriveRecords:
     """Same fixture data as build_fake_store(), exposed through the real
     DriveRecords-shaped surface (list_records()/get(), no .records)."""
     store = build_fake_store(*args, **kwargs)
-    return FakeDriveRecords(store.records, store.dispatch_request_registry)
+    return FakeDriveRecords(store.records, store.dispatch_request_registry, fail_areas=fail_areas)
 
 
 def _running_dashboard_probe(observed_at: str):
@@ -501,6 +512,113 @@ def test_real_driverecords_shape_resolves_complete_lifecycle_with_no_adapter():
                  "HANDOFF_LINKAGE", "BACKEND_VISIBLE", "USER_VISIBLE"):
         assert _check(result, name).status == STATUS_PASS
     assert result.result == STATUS_PASS
+
+
+def test_list_area_records_returns_empty_only_for_confirmed_folder_absence():
+    """The ONE legitimate empty-area case: the area's project folder was
+    genuinely never created on Drive. `_list_area_records()` must degrade
+    to `[]`, exactly like it always has -- confirming this narrow fix did
+    not regress the real "nothing here yet" path."""
+    store = FakeDriveRecords({}, fail_areas={
+        "commands": TaskError(f"Drive folder not found: {PROJECT}"),
+    })
+    assert _list_area_records(store, "commands", PROJECT) == []
+    # A genuinely empty (but existing) area must still resolve to [] too.
+    assert _list_area_records(store, "executions", PROJECT) == []
+
+
+@pytest.mark.parametrize("message", [
+    "duplicate Drive folder: commands",
+    "malformed Drive listing response",
+    "invalid or repeated Drive pagination token",
+    "could not read Drive record: drive-real-cmd.json",
+    "expected one Drive record drive-real-cmd.json; found 2",
+])
+def test_list_area_records_never_swallows_a_genuine_drive_read_failure(message):
+    """Adversarial follow-up: every real DriveRecords failure OTHER than
+    the exact folder-not-found message must propagate, never fold into
+    `[]`. Covers the exact real-world TaskError messages
+    manager.tasks.DriveRecords itself raises for duplicate folders,
+    malformed listings, bad pagination tokens, unreadable/undecodable
+    records, and ambiguous record matches."""
+    store = FakeDriveRecords({}, fail_areas={"commands": TaskError(message)})
+    with pytest.raises(TaskError):
+        _list_area_records(store, "commands", PROJECT)
+
+
+def test_collect_evidence_late_backend_claim_cannot_be_masked_by_commands_read_failure():
+    """Requirement 3: a real Task exists (created_at = ingress + 10s) and
+    the real Command.claimed_at is genuinely late (ingress + 180s, outside
+    the 2-tick/120s window), but the `commands` area read fails with a
+    genuine (non-absence) Drive error. Before this fix, the swallowed
+    exception produced commands=[] -> command=None ->
+    _backend_visibility_from_records() fell back to the Task's own
+    created_at (ingress + 10s), which is well within the window --
+    fabricating a PASS the real, late claimed_at should have FAILED.
+    Forbidden outcome: BACKEND_VISIBLE PASS. Acceptable: collect_evidence()
+    raises (asserted here), or -- were it ever changed to degrade instead
+    of raise -- UNKNOWN/FAIL."""
+    ingress = ts(1.0)
+    store = build_fake_drive_records(
+        "late-claim-masked", ingress,
+        claimed_at=ts(1.0 + 3.0),  # +180s: outside the 2-tick/120s window
+        fail_areas={"commands": TaskError("could not read Drive record: late-claim-masked-cmd.json")},
+    )
+    with pytest.raises(TaskError):
+        collect_evidence(store, PROJECT, "late-claim-masked", acceptance_run_started_at=RUN_STARTED_AT)
+
+
+def test_collect_evidence_execution_read_failure_cannot_become_benign_na_or_pass():
+    """Requirement 4: a real Execution exists, but the `executions` area
+    read fails with a genuine Drive error. Before this fix, the swallowed
+    exception produced executions=[] -> execution=None -> reached_running
+    silently became False -> REAL_PROVIDER degraded to the benign N/A
+    ("request never reached RUNNING") instead of surfacing the real read
+    failure, and EXECUTION_LINKAGE silently became N/A instead of
+    reflecting a real (unread) execution. Forbidden: REAL_PROVIDER or
+    EXECUTION_LINKAGE reporting N/A/PASS as if nothing was wrong."""
+    ingress = ts(1.0)
+    store = build_fake_drive_records(
+        "exec-read-failure", ingress,
+        fail_areas={"executions": TaskError("malformed Drive listing response")},
+    )
+    with pytest.raises(TaskError):
+        collect_evidence(store, PROJECT, "exec-read-failure", acceptance_run_started_at=RUN_STARTED_AT)
+
+
+@pytest.mark.parametrize("area", ["commands", "executions", "sessions", "handoffs"])
+def test_collect_evidence_duplicate_masking_prevented_by_read_failure(area):
+    """Requirement 5: whatever real duplicates might exist in `area`, a
+    genuine read failure there must never let collect_evidence() report
+    duplicate_counts[area] == 0 and continue on toward a PASS-eligible
+    result. Parametrized across every area duplicate_counts tracks besides
+    tasks (whose own failure is covered by the top-level tasks walk)."""
+    ingress = ts(1.0)
+    store = build_fake_drive_records(
+        f"dup-masked-{area}", ingress,
+        fail_areas={area: TaskError(f"duplicate Drive record: {area}")},
+    )
+    with pytest.raises(TaskError):
+        collect_evidence(store, PROJECT, f"dup-masked-{area}", acceptance_run_started_at=RUN_STARTED_AT)
+
+
+def test_collect_evidence_legitimate_empty_area_still_resolves_and_fails_closed():
+    """Requirement 6: the genuinely-legitimate case -- the tasks area's
+    Drive folder was never created for this project at all (a fresh
+    project, zero requests ever made) -- must still resolve as `[]` (not
+    raise), and the resulting evidence naturally fails closed (UNKNOWN, not
+    PASS) because mandatory lifecycle evidence is absent, not because of a
+    read error being misreported as one."""
+    store = FakeDriveRecords({}, fail_areas={
+        "tasks": TaskError(f"Drive folder not found: {PROJECT}"),
+    })
+    evidence = collect_evidence(store, PROJECT, "never-requested", acceptance_run_started_at=RUN_STARTED_AT)
+    assert evidence["backend_visibility"] is None
+    assert evidence["user_visibility"] is None
+    result = eval_one(evidence)
+    assert _check(result, "BACKEND_VISIBLE").status == STATUS_UNKNOWN
+    assert _check(result, "USER_VISIBLE").status == STATUS_UNKNOWN
+    assert result.result == STATUS_FAIL
 
 
 def test_real_driverecords_shape_duplicate_detection_and_wrong_request_no_borrow():

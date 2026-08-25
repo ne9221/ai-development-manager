@@ -45,8 +45,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
+from manager.dashboard_core import classify_drive_folder_absence
 from manager.scheduler_provenance import evidence_status
 from manager.dispatch_requests import read_dispatch_request_status
+from manager.tasks import TaskError
 
 STATUS_PASS = "PASS"
 STATUS_FAIL = "FAIL"
@@ -1036,11 +1038,26 @@ def _list_area_records(store: Any, area: str, project_id: str) -> List[Dict[str,
 
     `.records` (if present) takes priority so existing tests keep their
     exact prior behavior untouched; otherwise falls through to the real
-    `list_records()` API. A project/area that doesn't exist yet on Drive
-    raises inside DriveRecords.list_records() (no folder to list) -- that's
-    a legitimate "nothing here yet" state for this read-only evidence
-    collector, not an error, so it degrades to an empty list rather than
-    propagating.
+    `list_records()` API.
+
+    Only ONE failure is a legitimate "nothing here yet" state: the area's
+    project folder was genuinely never created on Drive, which
+    `DriveRecords.folder(..., create=False)` reports as a `TaskError`
+    whose message is exactly "Drive folder not found: ..." (see
+    `manager.dashboard_core.classify_drive_folder_absence`, the same real
+    predicate the Dashboard's own `fetch_project_records()` already uses for
+    this exact distinction -- reused here rather than re-implemented).
+    Every other `TaskError` DriveRecords can raise -- "duplicate Drive
+    folder", "malformed Drive listing response", "invalid or repeated Drive
+    pagination token", "could not read Drive record: ...", "expected one
+    Drive record ...; found N" -- is a genuine read/API/decode/pagination
+    failure, NOT an empty area, and must never be silently folded into `[]`:
+    doing so previously let a transient Drive error masquerade as "this
+    Command/Execution/Session/Handoff never existed", which could hide a
+    real late `claimed_at` behind a fabricated N/A or a real duplicate
+    behind a fabricated `duplicate_counts == 0`. Any non-folder-absence
+    `TaskError` is re-raised so `collect_evidence()` aborts this sample
+    loudly instead of returning evidence built on an incomplete read.
     """
     records = getattr(store, "records", None)
     if records is not None:
@@ -1050,5 +1067,7 @@ def _list_area_records(store: Any, area: str, project_id: str) -> List[Dict[str,
         return []
     try:
         return list(list_records(area, project_id))
-    except Exception:
-        return []
+    except TaskError as exc:
+        if classify_drive_folder_absence(exc):
+            return []
+        raise
