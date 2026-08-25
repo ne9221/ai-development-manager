@@ -295,6 +295,67 @@ def test_collector_ignores_caller_visibility_and_terminal_status_without_durable
     assert _check(eval_one(terminal_evidence), "BACKEND_VISIBLE").status == STATUS_UNKNOWN
 
 
+def test_external_request_id_real_shape_resolves_complete_terminal_lifecycle():
+    ingress = ts(1.0)
+    store = build_fake_store("external", ingress)
+    task = next(doc for (area, _, _), doc in store.records.items() if area == "tasks")
+    task["source_context"] = {"external_request_id": "external"}
+    task["status"] = "completed"
+    evidence = collect_evidence(
+        store, PROJECT, "external",
+        dashboard_probe=lambda *_: {"status": "COMPLETED", "observed_at": ingress},
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
+    result = eval_one(evidence)
+    for name in ("TASK_LINKAGE", "COMMAND_LINKAGE", "EXECUTION_LINKAGE", "SESSION_LINKAGE",
+                 "HANDOFF_LINKAGE", "REAL_PROVIDER", "SCHEDULER_PROVENANCE", "NO_MANUAL_TRIGGER"):
+        assert _check(result, name).status == STATUS_PASS
+    assert _check(result, "BACKEND_VISIBLE").status == STATUS_PASS
+    assert _check(result, "USER_VISIBLE").status == STATUS_PASS
+    assert result.result == STATUS_PASS
+
+
+def test_external_request_id_precedence_accepts_agreeing_legacy_identity():
+    ingress = ts(1.0)
+    store = build_fake_store("same", ingress)
+    task = next(doc for (area, _, _), doc in store.records.items() if area == "tasks")
+    task["source_context"] = {"external_request_id": "same", "request_id": "same"}
+    evidence = collect_evidence(
+        store, PROJECT, "same", dashboard_probe=_running_dashboard_probe(ingress),
+        acceptance_run_started_at=RUN_STARTED_AT,
+    )
+    assert _check(eval_one(evidence), "TASK_LINKAGE").status == STATUS_PASS
+
+
+def test_legacy_request_id_remains_an_explicit_fallback():
+    store = build_fake_store("legacy", ts(1.0))
+    evidence = collect_evidence(store, PROJECT, "legacy", acceptance_run_started_at=RUN_STARTED_AT)
+    assert _check(eval_one(evidence), "TASK_LINKAGE").status == STATUS_PASS
+
+
+def test_disagreeing_source_identities_fail_closed_even_when_legacy_matches():
+    for external_request_id, legacy_request_id in (("other", "ambiguous"), ("ambiguous", "other")):
+        store = build_fake_store("ambiguous", ts(1.0))
+        task = next(doc for (area, _, _), doc in store.records.items() if area == "tasks")
+        task["source_context"] = {
+            "external_request_id": external_request_id,
+            "request_id": legacy_request_id,
+        }
+        evidence = collect_evidence(store, PROJECT, "ambiguous", acceptance_run_started_at=RUN_STARTED_AT)
+        assert evidence["linkage"]["task"]["identity_ambiguous"] is True
+        assert _check(eval_one(evidence), "TASK_LINKAGE").status == STATUS_FAIL
+
+
+def test_wrong_external_request_id_and_missing_source_identity_cannot_borrow_task():
+    for source_context in ({"external_request_id": "other"}, {}):
+        store = build_fake_store("target", ts(1.0))
+        task = next(doc for (area, _, _), doc in store.records.items() if area == "tasks")
+        task["source_context"] = source_context
+        evidence = collect_evidence(store, PROJECT, "target", acceptance_run_started_at=RUN_STARTED_AT)
+        assert evidence["linkage"]["task"] == {"occurred": False}
+        assert eval_one(evidence).result == STATUS_FAIL
+
+
 # ---------------------------------------------------------------------------
 # 1. 3/3 normal success
 # ---------------------------------------------------------------------------

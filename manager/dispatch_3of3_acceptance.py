@@ -716,10 +716,11 @@ def collect_evidence(
     """Best-effort real-store evidence collection for one request_id.
 
     Resolution path: scan the `tasks` area of `store` for a Task whose
-    `source_context` dict carries a matching `request_id`, then walk
-    task -> command(s) -> execution -> session -> handoff via the task_id
-    foreign keys already required by schema/{command,execution,session,
-    handoff}.schema.json (see schema/*.schema.json on main).
+    `source_context` carries an exact matching `external_request_id`, with
+    legacy `request_id` as fallback only. If both fields exist and disagree,
+    identity fails closed. Then walk task -> command(s) -> execution ->
+    session -> handoff via the task_id foreign keys already required by
+    schema/{command,execution,session,handoff}.schema.json.
 
     Any leg of this walk that not-yet-merged infrastructure would normally
     populate (e.g. a dedicated ingress-observed-at timestamp, or a manual-
@@ -758,11 +759,19 @@ def collect_evidence(
 
     records = getattr(store, "records", None)
     tasks = []
+    ambiguous_task_identity = False
     if records is not None:
         for (area, proj, _name), doc in records.items():
             if area == "tasks" and proj == project_id:
                 source_context = doc.get("source_context") or {}
-                if source_context.get("request_id") == request_id:
+                external_request_id = source_context.get("external_request_id")
+                legacy_request_id = source_context.get("request_id")
+                if (external_request_id is not None and legacy_request_id is not None
+                        and external_request_id != legacy_request_id):
+                    ambiguous_task_identity |= request_id in (external_request_id, legacy_request_id)
+                    continue
+                source_request_id = external_request_id if external_request_id is not None else legacy_request_id
+                if source_request_id == request_id:
                     tasks.append(doc)
 
     if not tasks:
@@ -780,7 +789,8 @@ def collect_evidence(
             "backend_visibility": backend_visibility,
             "user_visibility": user_visibility,
             "duplicate_counts": {"task": 0, "command": 0, "execution": 0, "session": 0, "handoff": 0},
-            "linkage": {"task": {"occurred": False}},
+            "linkage": {"task": {"occurred": True, "task_id_matches": False, "identity_ambiguous": True}
+                        if ambiguous_task_identity else {"occurred": False}},
             "freshness": _compute_freshness(ingress_first_observed_at, acceptance_run_started_at),
         }
 
@@ -831,7 +841,8 @@ def collect_evidence(
         return {"occurred": True, "task_id_matches": (record_task_id == task_id) if record_task_id is not None else None}
 
     linkage = {
-        "task": {"occurred": True, "task_id_matches": task.get("task_id") == task_id},
+        "task": {"occurred": True, "task_id_matches": task.get("task_id") == task_id and not ambiguous_task_identity,
+                 "identity_ambiguous": ambiguous_task_identity},
         "command": _stage(command is not None, command.get("task_id") if command else None),
         "execution": _stage(execution is not None, execution.get("task_id") if execution else None),
         "session": _stage(session is not None, session.get("task_id") if session else None),
