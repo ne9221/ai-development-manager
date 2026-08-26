@@ -164,6 +164,16 @@ CAPABILITY_REGISTRY = {
 # trailing "s" so that e.g. "task briefs", "handoff documents", or "agent
 # prompts" match the same as their singular forms - the previous version
 # only pluralized "governance ...s?", which was a false-negative bug.
+#
+# Known, deliberately-accepted false negatives (do NOT expand this regex to
+# chase them - see manager/test_capabilities.py and the task history for
+# why): subagent-first/inverted phrasing generally, e.g. "write prompt for
+# the agent" or "write instructions for the AI assistant". Catching those
+# would require matching on a bare context word co-occurring with a bare
+# authoring verb across the whole sentence, which is exactly the
+# over-broad-matching failure mode fixed below for "skill(s)" and for
+# "governance .../system prompt" - so it is intentionally left unfixed
+# rather than reintroduced here.
 _AGENT_FACING_PATTERN = re.compile(
     r"(?i)(?:"
     r"\bAGENTS\.md\b"
@@ -179,31 +189,64 @@ _AGENT_FACING_PATTERN = re.compile(
     r"|\btask briefs?\b"
     r"|\bhandoff (?:document|template|schema|format)s?\b"
     r"|\b(?:new |a |an |the )?skill(?:'s)? (?:SKILL\.md|definition|authoring|creation)\b"
-    r"|\b(?:write|writing|wrote|written|author|authoring|authored|create|creating|created|"
+    r"|\bwriting-for-agents\b"
+    r")"
+)
+
+# A bare "(verb) ... skill(s)" phrase (e.g. "create ... skills", "build ...
+# skill") is ordinary English across countless non-agent domains - HR ("soft
+# skills filter"), games ("combat skill system"), business ("employee
+# leadership skills matrix"). Unlike the filename/category markers above, it
+# only counts as Agent-Skill authoring when the same text field also names
+# actual AI-agent-skill vocabulary: an agent platform (agent/AI/Claude/
+# Codex/Antigravity), an explicit SKILL.md/"skill authoring"/"agent skill"
+# reference, or the skill marketplace these Agent Skills are published to -
+# not merely because the sentence happens to contain the word "skill(s)"
+# next to some authoring verb. This deliberately does NOT widen the
+# verb-to-noun word window (that was the original bug); it gates the
+# existing phrase with a co-occurrence check, the same shape as the
+# governance/system-prompt gate below. See manager/test_capabilities.py for
+# the business/game-domain regression cases this must exclude, and the
+# marketplace regression case it must still catch.
+_SKILL_VERB_PATTERN = re.compile(
+    r"(?i)\b(?:write|writing|wrote|written|author|authoring|authored|create|creating|created|"
     r"draft|drafting|drafted|revise|revising|revised|rewrite|rewriting|rewrote|"
     r"add|adding|added|build|building|built)\s+(?:\w+\s+){0,3}?skills?(?:'s)?\b"
-    r"|\bwriting-for-agents\b"
+)
+
+_AGENT_SKILL_CONTEXT_PATTERN = re.compile(
+    r"(?i)(?:"
+    r"\b(?:agents?|AI|Claude|Codex|Antigravity|marketplace)\b"
+    r"|\bSKILL\.md\b"
+    r"|\bskill authoring\b"
+    r"|\bagent skill\b"
     r")"
 )
 
 # "governance <file|rule|document>" and "system prompt" are ordinary English
 # in plenty of ungoverned, non-agent contexts ("data governance rule",
 # "governance document viewer", "system prompt caching in the LLM client").
-# Unlike the always-fire alternatives above, these two only count as
-# agent-facing when the same text field also names actual AI-agent-instruction
-# context - "agent"/"AI"/"assistant"/"chatbot"/"skill" or one of this
-# codebase's own agent-config filenames. Note "LLM" deliberately does NOT
-# count as qualifying context: mentioning an LLM client is not the same as
-# writing agent instructions.
+# They only count as agent-facing when an actual AI-agent-instruction context
+# word (agent/AI/assistant/chatbot) directly modifies the phrase - either
+# immediately before it ("AI assistant governance rule") or immediately
+# after it via "for"/"of" ("system prompt for the agent") - not merely
+# present *somewhere* in the same sentence. A plain same-field co-occurrence
+# check (the previous version of this gate) was too permissive: "add a data
+# governance rule for user privacy in the AI assistant module" and "add a
+# governance document for insurance agents compliance" both contain a
+# context word and the gated phrase, but the context word describes an
+# unrelated noun several words away (the module the rule applies to; the
+# business/compliance domain of the document) rather than the
+# governance/prompt artifact itself, so they must not match. Note "LLM"
+# deliberately does NOT count as qualifying context: mentioning an LLM
+# client is not the same as writing agent instructions.
 _CONTEXT_GATED_PATTERN = re.compile(
     r"(?i)(?:"
-    r"\bgovernance (?:file|rule|document)s?\b"
-    r"|\bsystem prompts?\b"
+    r"\b(?:agents?|AI|assistants?|chatbots?)(?:'s)?\s+(?:\w+\s+){0,1}?"
+    r"(?:governance (?:file|rule|document)s?|system prompts?)\b"
+    r"|\b(?:governance (?:file|rule|document)s?|system prompts?)\b\s+(?:for|of)\s+"
+    r"(?:the\s+|an?\s+)?(?:agents?|AI|assistants?|chatbots?)\b"
     r")"
-)
-
-_CONTEXT_WORD_PATTERN = re.compile(
-    r"(?i)\b(?:agents?|AI|assistants?|chatbots?|skills?|AGENTS\.md|CLAUDE\.md|GEMINI\.md)\b"
 )
 
 
@@ -238,12 +281,22 @@ def is_agent_facing_task(task):
     actual Agent-facing document category, not a bare English word like
     "spec" or "handoff" used in its everyday sense.
 
-    A second, narrower signal handles two phrases ("governance
-    file/rule/document", "system prompt") that are ordinary English outside
-    an AI-agent context: they only count when the *same* text field also
-    names actual agent-instruction context (see ``_CONTEXT_WORD_PATTERN``),
-    so "add a data governance rule to the compliance module" or "add system
-    prompt caching to the LLM client" are correctly excluded.
+    Two further, narrower signals are gated on additional context rather
+    than firing on the bare phrase alone:
+
+    3. A "(verb) ... skill(s)" phrase (e.g. "create ... skills", "build a
+       skill") only counts when the same text field also names actual
+       AI-agent-skill vocabulary (see ``_AGENT_SKILL_CONTEXT_PATTERN``), so
+       "create user profile with skills" or "build employee leadership
+       skills matrix" are correctly excluded while "write a new skill for
+       the marketplace" still matches.
+    4. "governance file/rule/document" or "system prompt" only count when an
+       agent-instruction context word directly modifies that phrase (see
+       ``_CONTEXT_GATED_PATTERN``), so "add a data governance rule to the
+       compliance module" or "add system prompt caching to the LLM client"
+       are correctly excluded - and so is a context word merely present
+       *elsewhere* in the sentence, e.g. "add a data governance rule for
+       user privacy in the AI assistant module".
     """
     if not isinstance(task, dict):
         return False
@@ -252,7 +305,9 @@ def is_agent_facing_task(task):
     for text in _task_text_fields(task):
         if _AGENT_FACING_PATTERN.search(text):
             return True
-        if _CONTEXT_GATED_PATTERN.search(text) and _CONTEXT_WORD_PATTERN.search(text):
+        if _CONTEXT_GATED_PATTERN.search(text):
+            return True
+        if _SKILL_VERB_PATTERN.search(text) and _AGENT_SKILL_CONTEXT_PATTERN.search(text):
             return True
     return False
 

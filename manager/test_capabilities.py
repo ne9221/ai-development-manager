@@ -152,8 +152,8 @@ class TaskClassificationTests(unittest.TestCase):
         # Regression coverage for a real false-positive bug found by the same
         # review: bare "governance rule/document" and "system prompt" phrases
         # matched even in ordinary, non-agent-instruction business/technical
-        # usage. These now require co-occurrence with actual AI-agent context
-        # (see _CONTEXT_WORD_PATTERN) in the same text field.
+        # usage. These now require an agent-instruction context word to
+        # directly modify the phrase (see _CONTEXT_GATED_PATTERN).
         cases = [
             ordinary_task(
                 task_type="business_logic",
@@ -169,6 +169,86 @@ class TaskClassificationTests(unittest.TestCase):
                 task_type="implementation",
                 title="Add system prompt caching to reduce latency in the LLM client",
                 scope=["manager/llm_client.py"],
+            ),
+        ]
+        for task in cases:
+            with self.subTest(title=task["title"]):
+                self.assertFalse(is_agent_facing_task(task))
+                self.assertEqual([], required_capabilities_for_task(task))
+
+    def test_bare_skill_word_in_business_or_game_content_does_not_false_positive(self):
+        # Regression coverage for a second real false-positive bug found by a
+        # further adversarial review: the "(verb) ... skill(s)" branch added
+        # to fix "write a new skill for the marketplace" was too loose and
+        # matched ordinary business/game-domain content that merely contains
+        # the word "skill(s)", with no actual AI-agent-skill signal anywhere
+        # in the text. These now require co-occurrence with real
+        # AI-agent-skill vocabulary (see _AGENT_SKILL_CONTEXT_PATTERN).
+        cases = [
+            ordinary_task(
+                task_type="implementation",
+                title="Create user profile with skills",
+                scope=["manager/profile.py"],
+            ),
+            ordinary_task(
+                task_type="ui",
+                title="Add soft skills filter to HR dashboard",
+                scope=["hr/dashboard.tsx"],
+            ),
+            ordinary_task(
+                task_type="business_logic",
+                title="Build employee leadership skills matrix",
+                scope=["hr/leadership.py"],
+            ),
+            ordinary_task(
+                task_type="implementation",
+                title="Create combat skills tree for RPG character",
+                scope=["game/skills_tree.py"],
+            ),
+            ordinary_task(
+                task_type="implementation",
+                title="Build the player combat skill system in game client",
+                scope=["game/client/combat.py"],
+            ),
+        ]
+        for task in cases:
+            with self.subTest(title=task["title"]):
+                self.assertFalse(is_agent_facing_task(task))
+                self.assertEqual([], required_capabilities_for_task(task))
+
+    def test_skill_verb_phrase_still_triggers_with_genuine_agent_skill_signal(self):
+        # Must not regress: the marketplace-Agent-Skill phrasing that
+        # motivated the "(verb) ... skill(s)" branch in the first place must
+        # keep matching once it is gated on real AI-agent-skill vocabulary.
+        task = agent_facing_task(title="Write a new skill for the marketplace", scope=[])
+        self.assertTrue(is_agent_facing_task(task))
+        self.assertEqual(["writing-for-agents"], required_capabilities_for_task(task))
+
+    def test_context_word_must_modify_the_gated_phrase_not_merely_co_occur(self):
+        # Regression coverage for a third real bug found by the same review:
+        # _CONTEXT_GATED_PATTERN used to fire whenever an agent/AI/assistant/
+        # chatbot word appeared *anywhere* in the same text field as
+        # "governance file/rule/document" or "system prompt", even when the
+        # context word was describing an unrelated noun several words away
+        # (a database schema field, a compliance/business-role domain, the
+        # module a rule applies to) rather than the governance/prompt
+        # artifact itself. The gate is now tightened to require the context
+        # word to directly modify the phrase.
+        cases = [
+            ordinary_task(
+                task_type="implementation",
+                title="Add a data governance rule for user privacy in the AI assistant module",
+                scope=["manager/privacy.py"],
+            ),
+            ordinary_task(
+                task_type="implementation",
+                title="Add system prompt field to the database schema of AI assistant app",
+                scope=["manager/schema.py"],
+            ),
+            ordinary_task(
+                task_type="business_logic",
+                title="Add a governance document for insurance agents compliance",
+                scope=["manager/compliance.py"],
             ),
         ]
         for task in cases:
