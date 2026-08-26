@@ -176,6 +176,63 @@ class TaskClassificationTests(unittest.TestCase):
                 self.assertFalse(is_agent_facing_task(task))
                 self.assertEqual([], required_capabilities_for_task(task))
 
+    def test_ordinary_business_and_game_skill_usage_does_not_false_positive(self):
+        # Regression coverage for a real false-positive bug found by a
+        # strict read-only adversarial review: the bare "(write/create/
+        # build/...) ... skill(s)" construction matched ordinary business
+        # and game-logic tasks that merely mention "skill(s)" as a noun,
+        # never as Agent Skill authoring. These now require co-occurrence
+        # with an explicit Agent Skill signal (see _SKILL_CONTEXT_PATTERN)
+        # in the same text field.
+        cases = [
+            ordinary_task(title="Create user profile with skills", scope=["manager/profiles.py"]),
+            ordinary_task(title="Add soft skills filter to HR dashboard", scope=["hr/dashboard.py"]),
+            ordinary_task(title="Build employee leadership skills matrix", scope=["hr/skills_matrix.py"]),
+            ordinary_task(title="Create combat skills tree for RPG character", scope=["game/skills_tree.py"]),
+            ordinary_task(title="Build the player combat skill system in game client", scope=["game/combat.py"]),
+        ]
+        for task in cases:
+            with self.subTest(title=task["title"]):
+                self.assertFalse(is_agent_facing_task(task))
+                self.assertEqual([], required_capabilities_for_task(task))
+
+    def test_agent_skill_authoring_without_explicit_agent_word_still_triggers(self):
+        # The fix for the false positives above must not regress real Agent
+        # Skill authoring that names an explicit Agent Skill signal
+        # (Agent/AI/Claude/Codex/Antigravity/marketplace) instead of a bare
+        # "skill(s)" noun phrase.
+        task = ordinary_task(title="Write a new skill for the marketplace", scope=[])
+        self.assertTrue(is_agent_facing_task(task))
+        self.assertEqual(["writing-for-agents"], required_capabilities_for_task(task))
+
+    def test_governance_and_system_prompt_require_explicit_agent_phrasing_not_bare_ai_word(self):
+        # Regression coverage for a real false-positive bug found by the same
+        # adversarial review: _CONTEXT_WORD_PATTERN previously unlocked the
+        # governance/system-prompt gate on a bare "AI"/"assistant"/"chatbot"/
+        # "agent" word appearing anywhere in the sentence, even when the
+        # sentence has nothing to do with authoring agent instructions (an
+        # "AI assistant" product/module name, "insurance agents" as ordinary
+        # English). It now requires the same text field to explicitly
+        # express governance/instructions/prompts FOR an AI agent.
+        cases = [
+            ordinary_task(
+                title="Add a data governance rule for user privacy in the AI assistant module",
+                scope=["manager/privacy.py"],
+            ),
+            ordinary_task(
+                title="Add system prompt field to the database schema of AI assistant app",
+                scope=["manager/schema.py"],
+            ),
+            ordinary_task(
+                title="Add a governance document for insurance agents compliance",
+                scope=["manager/compliance.py"],
+            ),
+        ]
+        for task in cases:
+            with self.subTest(title=task["title"]):
+                self.assertFalse(is_agent_facing_task(task))
+                self.assertEqual([], required_capabilities_for_task(task))
+
 
 class ProviderResolutionTests(unittest.TestCase):
     def test_supported_provider_resolves_available_with_pinned_version(self):

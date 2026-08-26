@@ -179,21 +179,47 @@ _AGENT_FACING_PATTERN = re.compile(
     r"|\btask briefs?\b"
     r"|\bhandoff (?:document|template|schema|format)s?\b"
     r"|\b(?:new |a |an |the )?skill(?:'s)? (?:SKILL\.md|definition|authoring|creation)\b"
-    r"|\b(?:write|writing|wrote|written|author|authoring|authored|create|creating|created|"
-    r"draft|drafting|drafted|revise|revising|revised|rewrite|rewriting|rewrote|"
-    r"add|adding|added|build|building|built)\s+(?:\w+\s+){0,3}?skills?(?:'s)?\b"
     r"|\bwriting-for-agents\b"
     r")"
+)
+
+# A bare "(write/create/build/...) ... skill(s)" construction is ordinary
+# English for plenty of non-Agent-Skill domains: "create user profile with
+# skills", "build employee leadership skills matrix", "create combat skills
+# tree for RPG character" all matched here before this fix, misclassifying
+# ordinary business/game-logic tasks as Agent Skill authoring. Unlike the
+# always-fire alternatives above, this construction only counts as
+# agent-facing when the same text field also names an explicit Agent Skill
+# signal (see _SKILL_CONTEXT_PATTERN) - never from widening this verb/word
+# window further, which would only chase more surface phrasing without
+# fixing the underlying ambiguity (a bare "skill(s)" noun phrase alone never
+# distinguishes a business/game "skill" from an Agent Skill).
+_SKILL_AUTHORING_VERB_PATTERN = re.compile(
+    r"(?i)\b(?:write|writing|wrote|written|author|authoring|authored|create|creating|created|"
+    r"draft|drafting|drafted|revise|revising|revised|rewrite|rewriting|rewrote|"
+    r"add|adding|added|build|building|built)\s+(?:\w+\s+){0,3}?skills?(?:'s)?\b"
+)
+
+# Explicit Agent Skill signal required to qualify the verb+skill(s)
+# construction above. Deliberately excludes bare "skill"/"skills" itself
+# (already guaranteed present by _SKILL_AUTHORING_VERB_PATTERN, so including
+# it here would gate on nothing) - only independent evidence that this is
+# actually about an Agent/AI-provider skill, not a business/game "skill".
+_SKILL_CONTEXT_PATTERN = re.compile(
+    r"(?i)\b(?:agents?|AI|Claude|Codex|Antigravity|marketplace)\b"
 )
 
 # "governance <file|rule|document>" and "system prompt" are ordinary English
 # in plenty of ungoverned, non-agent contexts ("data governance rule",
 # "governance document viewer", "system prompt caching in the LLM client").
 # Unlike the always-fire alternatives above, these two only count as
-# agent-facing when the same text field also names actual AI-agent-instruction
-# context - "agent"/"AI"/"assistant"/"chatbot"/"skill" or one of this
-# codebase's own agent-config filenames. Note "LLM" deliberately does NOT
-# count as qualifying context: mentioning an LLM client is not the same as
+# agent-facing when the same text field also explicitly expresses writing
+# instructions/prompts/governance FOR an AI agent - not merely mentioning
+# "AI"/"assistant"/"chatbot"/"agent" anywhere in an unrelated sentence (e.g.
+# "the AI assistant module", "AI assistant app" name a product, not agent-
+# instruction authorship; bare "agents" in "insurance agents" is an ordinary
+# English word, not an AI agent). Note "LLM" deliberately does NOT count as
+# qualifying context either: mentioning an LLM client is not the same as
 # writing agent instructions.
 _CONTEXT_GATED_PATTERN = re.compile(
     r"(?i)(?:"
@@ -203,7 +229,15 @@ _CONTEXT_GATED_PATTERN = re.compile(
 )
 
 _CONTEXT_WORD_PATTERN = re.compile(
-    r"(?i)\b(?:agents?|AI|assistants?|chatbots?|skills?|AGENTS\.md|CLAUDE\.md|GEMINI\.md)\b"
+    r"(?i)\b(?:"
+    r"agent instructions?"
+    r"|agent prompts?"
+    r"|agent governance"
+    r"|AI agents?"
+    r"|for (?:the |an? )?(?:AI )?agents?"
+    r"|governing (?:AI )?agents?"
+    r"|AGENTS\.md|CLAUDE\.md|GEMINI\.md"
+    r")\b"
 )
 
 
@@ -241,9 +275,21 @@ def is_agent_facing_task(task):
     A second, narrower signal handles two phrases ("governance
     file/rule/document", "system prompt") that are ordinary English outside
     an AI-agent context: they only count when the *same* text field also
-    names actual agent-instruction context (see ``_CONTEXT_WORD_PATTERN``),
-    so "add a data governance rule to the compliance module" or "add system
-    prompt caching to the LLM client" are correctly excluded.
+    explicitly expresses agent instructions/prompts/governance FOR an AI
+    agent (see ``_CONTEXT_WORD_PATTERN``) - bare "AI"/"assistant"/"chatbot"/
+    "agent" anywhere in the sentence is not enough, so "add a data governance
+    rule for user privacy in the AI assistant module" or "add system prompt
+    field to the database schema of AI assistant app" are correctly excluded.
+
+    A third signal handles a bare "(write/create/build/...) ... skill(s)"
+    construction (see ``_SKILL_AUTHORING_VERB_PATTERN``), which is ordinary
+    English for plenty of non-Agent-Skill domains ("create user profile with
+    skills", "build employee leadership skills matrix"). It only counts when
+    the same text field also names an explicit Agent Skill signal (see
+    ``_SKILL_CONTEXT_PATTERN``) - Agent/AI/Claude/Codex/Antigravity/
+    marketplace - so ordinary business/game "skill(s)" usage is excluded
+    while genuine authoring tasks like "write a new skill for the
+    marketplace" still trigger.
     """
     if not isinstance(task, dict):
         return False
@@ -253,6 +299,8 @@ def is_agent_facing_task(task):
         if _AGENT_FACING_PATTERN.search(text):
             return True
         if _CONTEXT_GATED_PATTERN.search(text) and _CONTEXT_WORD_PATTERN.search(text):
+            return True
+        if _SKILL_AUTHORING_VERB_PATTERN.search(text) and _SKILL_CONTEXT_PATTERN.search(text):
             return True
     return False
 
