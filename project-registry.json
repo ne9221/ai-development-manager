@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0.0",
-  "updated_at": "2026-08-21T20:26:00Z",
+  "updated_at": "2026-08-26T17:00:00Z",
   "description": "Canonical Global Project Registry for AI Development Manager",
   "projects": [
     {
@@ -139,18 +139,21 @@
     },
     {
       "project_id": "outlook-mail",
-      "display_name": "Outlook 群發 Mail (Outlook Mail)",
+      "display_name": "Outlook 群發 Mail 工具 / Excel Mail Generator",
       "aliases": [
         "Outlook 群發 Mail",
+        "Outlook 群發 Mail 工具",
+        "Excel Mail Generator",
         "outlook-mail",
+        "excel-mail-generator",
         "outlook_mail",
         "outlook-bulk-mail",
-        "outlook"
+        "mail"
       ],
       "repo": {
-        "canonical_url": "https://github.com/ne9221/outlook-mail.git",
+        "canonical_url": "https://github.com/ne9221/excel-mail-generator.git",
         "owner": "ne9221",
-        "name": "outlook-mail"
+        "name": "excel-mail-generator"
       },
       "default_branch": "main",
       "baseline_resolution_policy": {
@@ -165,27 +168,36 @@
         "reference": "PROJECT-RULES.md"
       },
       "working_directory_policy": {
-        "relative_path": "outlook-mail",
+        "relative_path": "mail",
         "resolver_strategy": "workspace_relative",
         "env_var": "ADM_WORKSPACE_ROOT"
       },
       "isolation_policy": {
         "mode": "worktree_per_task",
-        "worktree_prefix": "wt-outlook-",
+        "worktree_prefix": "wt-mail-",
         "branch_prefix": "feat/"
       },
       "provider_restrictions": {
         "allowed_providers": [
-          "claude",
           "codex",
-          "antigravity",
-          "gemini"
+          "claude",
+          "antigravity"
         ],
         "blocked_providers": []
       },
-      "protected_paths": [],
+      "protected_paths": [
+        "backend/outlook_bridge_server.ps1",
+        "scripts/Start-ExcelMailGenerator.ps1",
+        "scripts/Stop-ExcelMailGenerator.ps1",
+        "Outlook群發Mail工具.vbs",
+        "Start Excel Mail Generator.vbs",
+        "Stop Excel Mail Generator.cmd"
+      ],
       "default_write_boundaries": [
-        "*"
+        "js/mail-core.js",
+        "js/mail-ui.js",
+        "css/styles.css",
+        "tests/*"
       ],
       "pointer_rules": {
         "tasks_area": "tasks",
@@ -195,8 +207,8 @@
         "overviews_area": "overviews"
       },
       "status": "enabled",
-      "resolution_status": "unresolved",
-      "unresolved_reason": "Remote repository metadata and PROJECT-RULES pending cloud SSOT verification"
+      "resolution_status": "verified",
+      "unresolved_reason": null
     },
     {
       "project_id": "email-organizer",
