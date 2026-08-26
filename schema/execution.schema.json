@@ -137,6 +137,26 @@
       "type": ["object", "null"],
       "description": "Bounded terminal cleanup audit; never contains a lease token."
     },
+    "repo_write_evidence": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["files_changed", "commits", "final_commit_sha", "branch", "worktree_path", "push_status", "remote_sha", "tests"],
+          "properties": {
+            "files_changed": {"type": "array", "items": {"type": "string"}},
+            "commits": {"type": "array", "items": {"type": "string", "pattern": "^[0-9a-f]{40}$"}},
+            "final_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "branch": {"type": "string", "minLength": 1},
+            "worktree_path": {"type": "string", "minLength": 1},
+            "push_status": {"const": "verified"},
+            "remote_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "tests": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      ],
+      "description": "Real, independently git-verified repo-write terminal success evidence (Global Hands-off Execution Layer, Slice D2); only ever set on a completed bounded repo-write execution whose push was proven equal to the remote by direct query, never fabricated."
+    },
     "notes": {"type": "array", "items": {"type": "string"}},
     "task_snapshot": {"type": "object"}
   }

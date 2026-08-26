@@ -220,6 +220,52 @@ def _verify_existing_worktree_owner(worktree_path, branch, baseline_head, owner)
         )
 
 
+def _reset_worktree_to_baseline(worktree_path: Path, baseline_head: str, owner, runner) -> None:
+    """Same-task retry hygiene (Global Hands-off Execution Layer, Slice C2):
+    a worktree already materialized for this exact task/branch/baseline_head
+    (ownership already verified by the caller) may still carry the PRIOR
+    attempt's provider changes -- stray commits made after baseline_head,
+    uncommitted edits, stray untracked files -- reusing it as-is would
+    silently hand a retry a dirty starting point instead of the admitted
+    baseline. This restores the worktree deterministically back to
+    baseline_head and removes every untracked/ignored artifact the prior
+    attempt may have left (including ADM's own owner marker, since it too is
+    untracked), then recreates the owner marker -- refusing (fail-closed)
+    rather than reusing the worktree if any step cannot be proven to have
+    succeeded. A fresh task_id never reaches this function at all: it only
+    runs once an existing worktree at this exact deterministic path has
+    already been verified to belong to this project_id/task_id/branch/
+    baseline_head."""
+    reset = _run(worktree_path, "reset", "--hard", baseline_head, runner=runner)
+    if reset.returncode != 0:
+        raise WorktreeMaterializationError(
+            "retry_reset_failed", f"git reset --hard {baseline_head} failed: {(reset.stderr or '').strip()}")
+    head = _run(worktree_path, "rev-parse", "HEAD", runner=runner)
+    if head.returncode != 0 or (head.stdout or "").strip() != baseline_head:
+        raise WorktreeMaterializationError(
+            "retry_reset_verification_failed",
+            f"worktree at {worktree_path} did not verifiably reset to baseline_head {baseline_head!r}",
+        )
+
+    clean = _run(worktree_path, "clean", "-fdx", runner=runner)
+    if clean.returncode != 0:
+        raise WorktreeMaterializationError(
+            "retry_clean_failed", f"git clean -fdx failed at {worktree_path}: {(clean.stderr or '').strip()}")
+    status = _run(worktree_path, "status", "--porcelain", runner=runner)
+    if status.returncode != 0 or (status.stdout or "").strip():
+        raise WorktreeMaterializationError(
+            "retry_clean_verification_failed",
+            f"worktree at {worktree_path} is not verifiably clean after retry cleanup: {(status.stdout or '').strip()!r}",
+        )
+
+    _write_owner_marker(worktree_path, owner)
+    if _read_owner_marker(worktree_path) != owner:
+        raise WorktreeMaterializationError(
+            "retry_owner_marker_verification_failed",
+            f"ADM owner marker could not be verified after retry cleanup at {worktree_path}",
+        )
+
+
 def _ensure_physical_worktree(canonical_checkout, worktree_path: Path, branch: str, branch_short: str,
                                baseline_head: str, owner, runner) -> None:
     # Defense in depth: the deterministic worktrees/<project_id>/<task_id>
@@ -237,6 +283,7 @@ def _ensure_physical_worktree(canonical_checkout, worktree_path: Path, branch: s
     match = next((entry for entry in entries if _same_path(entry.get("path"), worktree_path)), None)
     if match is not None:
         _verify_existing_worktree_owner(worktree_path, branch, baseline_head, owner)
+        _reset_worktree_to_baseline(worktree_path, baseline_head, owner, runner)
         return
 
     if worktree_path.exists():
@@ -256,6 +303,7 @@ def _ensure_physical_worktree(canonical_checkout, worktree_path: Path, branch: s
             raise WorktreeMaterializationError(
                 "worktree_create_failed", f"git worktree add failed: {(result.stderr or '').strip()}")
         _verify_existing_worktree_owner(worktree_path, branch, baseline_head, owner)
+        _reset_worktree_to_baseline(worktree_path, baseline_head, owner, runner)
         return
 
     _write_owner_marker(worktree_path, owner)

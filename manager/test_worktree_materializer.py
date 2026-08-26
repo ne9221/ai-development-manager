@@ -4,6 +4,7 @@
 import dataclasses
 import subprocess
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
@@ -352,6 +353,127 @@ def test_canonical_checkout_remains_untouched(canonical_repo, project):
     assert _git(canonical_repo["path"], "symbolic-ref", "--short", "HEAD") == branch_before
     assert _git(canonical_repo["path"], "rev-parse", "HEAD") == head_before
     assert dirty_file.read_text(encoding="utf-8") == "unrelated in-progress work\n"
+
+
+# --- same-task retry hygiene (P0-C) -----------------------------------------
+
+def test_retry_removes_stale_untracked_provider_artifact(canonical_repo, project):
+    """A prior attempt's own untracked file (e.g. a scratch/build artifact
+    the provider left behind) must never survive into a genuine retry of the
+    same task."""
+    task = _task(baseline_head=canonical_repo["head"])
+    store = _store_with_task(task)
+    workspace_root = canonical_repo["path"].parent / "workspace"
+    first = materialize_worktree(store, project, task, canonical_repo["path"], workspace_root)
+
+    stray = Path(first["working_directory"]) / "stray_untracked.py"
+    stray.write_text("leftover from a failed attempt\n", encoding="utf-8")
+    assert stray.exists()
+
+    second = materialize_worktree(store, project, _task(baseline_head=canonical_repo["head"]),
+                                  canonical_repo["path"], workspace_root)
+
+    assert first == second
+    assert not stray.exists()
+    # Only ADM's own (legitimately untracked) owner marker remains -- never
+    # the stray artifact, and nothing else.
+    assert _git(second["working_directory"], "status", "--porcelain") == "?? .adm-worktree-owner.json"
+
+
+def test_retry_discards_prior_uncommitted_edit_to_a_tracked_file(canonical_repo, project):
+    task = _task(baseline_head=canonical_repo["head"])
+    store = _store_with_task(task)
+    workspace_root = canonical_repo["path"].parent / "workspace"
+    first = materialize_worktree(store, project, task, canonical_repo["path"], workspace_root)
+
+    tracked = Path(first["working_directory"]) / "README.md"
+    tracked.write_text("dirtied by a failed attempt\n", encoding="utf-8")
+
+    materialize_worktree(store, project, _task(baseline_head=canonical_repo["head"]),
+                         canonical_repo["path"], workspace_root)
+
+    assert tracked.read_text(encoding="utf-8") == "hello\n"
+    assert _git(first["working_directory"], "status", "--porcelain") == "?? .adm-worktree-owner.json"
+
+
+def test_retry_resets_stray_extra_commit_back_to_baseline(canonical_repo, project):
+    """A prior attempt that committed changes on the task's own branch (but
+    never reached a genuine successful terminal state) must not have that
+    commit survive into the next attempt -- the branch tip must be restored
+    to exactly baseline_head."""
+    task = _task(baseline_head=canonical_repo["head"])
+    store = _store_with_task(task)
+    workspace_root = canonical_repo["path"].parent / "workspace"
+    first = materialize_worktree(store, project, task, canonical_repo["path"], workspace_root)
+
+    (Path(first["working_directory"]) / "README.md").write_text("stray commit content\n", encoding="utf-8")
+    _git(first["working_directory"], "commit", "-am", "stray prior-attempt commit")
+    stray_head = _git(first["working_directory"], "rev-parse", "HEAD")
+    assert stray_head != canonical_repo["head"]
+
+    second = materialize_worktree(store, project, _task(baseline_head=canonical_repo["head"]),
+                                  canonical_repo["path"], workspace_root)
+
+    assert _git(second["working_directory"], "rev-parse", "HEAD") == canonical_repo["head"]
+
+
+def test_retry_preserves_and_recreates_owner_marker(canonical_repo, project):
+    task = _task(baseline_head=canonical_repo["head"])
+    store = _store_with_task(task)
+    workspace_root = canonical_repo["path"].parent / "workspace"
+    first = materialize_worktree(store, project, task, canonical_repo["path"], workspace_root)
+    marker_path = Path(first["working_directory"]) / ".adm-worktree-owner.json"
+    original_marker = marker_path.read_text(encoding="utf-8")
+
+    # An untracked marker is exactly what `git clean -fdx` would otherwise
+    # delete along with real stray artifacts -- prove it survives (is
+    # recreated identically) rather than being silently lost.
+    materialize_worktree(store, project, _task(baseline_head=canonical_repo["head"]),
+                         canonical_repo["path"], workspace_root)
+
+    assert marker_path.exists()
+    assert marker_path.read_text(encoding="utf-8") == original_marker
+
+
+def test_fresh_task_id_never_goes_through_retry_reset_path(canonical_repo, project):
+    """Fresh task IDs must remain unaffected: a brand-new task_id's first
+    materialization never touches the retry-reset/clean codepath at all --
+    proven here by a canonical checkout whose only linked worktree is the
+    freshly created one, with nothing to have been "reset" from."""
+    task = _task(task_id="fresh-task", baseline_head=canonical_repo["head"])
+    store = _store_with_task(task)
+    workspace_root = canonical_repo["path"].parent / "workspace"
+    result = materialize_worktree(store, project, task, canonical_repo["path"], workspace_root)
+
+    assert _git(result["working_directory"], "rev-parse", "HEAD") == canonical_repo["head"]
+    entries = [line for line in _git(canonical_repo["path"], "worktree", "list", "--porcelain").split("\n\n") if line.strip()]
+    assert len(entries) == 2
+
+
+def test_cross_task_reuse_still_forbidden_and_leaves_foreign_worktree_untouched(canonical_repo, project):
+    """Ownership verification must still run -- and still reject -- before
+    any reset/clean logic could ever run against a foreign task's worktree;
+    retry hygiene must never weaken cross-task ownership protection."""
+    task_a = _task(task_id="task-a", baseline_head=canonical_repo["head"])
+    store = _store_with_task(task_a)
+    workspace_root = canonical_repo["path"].parent / "workspace"
+    materialize_worktree(store, project, task_a, canonical_repo["path"], workspace_root)
+
+    identity_a = compute_worktree_identity("proj-a", "task-a")
+    foreign_marker_path = Path(store.get("tasks", "proj-a", "task-a")["working_directory"]) / ".adm-worktree-owner.json"
+    dirty_file = Path(store.get("tasks", "proj-a", "task-a")["working_directory"]) / "untouched_marker.py"
+    dirty_file.write_text("must survive a rejected cross-task call\n", encoding="utf-8")
+
+    spoofed = _task(task_id="task-b", baseline_head=canonical_repo["head"],
+                     worktree_id=identity_a["worktree_id"], branch=identity_a["branch"])
+    store.put("tasks", "proj-a", "task-b", spoofed)
+    with pytest.raises(WorktreeMaterializationError) as exc:
+        materialize_worktree(store, project, spoofed, canonical_repo["path"], workspace_root)
+    assert exc.value.code in ("worktree_ownership_mismatch", "worktree_identity_mismatch")
+
+    assert dirty_file.exists()
+    assert dirty_file.read_text(encoding="utf-8") == "must survive a rejected cross-task call\n"
+    assert foreign_marker_path.exists()
 
 
 def test_dirty_canonical_checkout_not_modified_on_rejected_call(canonical_repo, project):
