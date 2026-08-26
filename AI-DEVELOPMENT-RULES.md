@@ -1,7 +1,7 @@
 # AI Development Rules
 
-version: 0.1.3
-last_updated: 2026-08-10
+version: 0.1.4
+last_updated: 2026-08-26
 
 Single source of truth for cross-project AI-development rules. This document
 governs how AI coding tools (ChatGPT, Claude Code, Codex, Antigravity,
@@ -69,6 +69,24 @@ individual project's own `TASKS` or business rules - it sits above them.
     Project business/acceptance requirements win within their scope; Global
     Rules govern coordination and execution. Claude, Codex, and Antigravity
     must not maintain drifting copies of these common rules.
+17. When creating or substantially revising any governance file, Project
+    Rules, Spec, Task Brief, Handoff, Skill, `AGENTS.md`, `CLAUDE.md`, or other
+    Agent-facing instruction document, structure it using the
+    `writing-for-agents` skill's principles to improve structure,
+    actionability, trigger conditions, completion criteria, and context
+    efficiency. `writing-for-agents` operates purely at the expression /
+    agent-instruction-design layer and carries no governance authority: it
+    must never delete, weaken, merge away, or reinterpret any authoritative
+    governance rule, mandatory gate, SSOT, permission boundary, task
+    isolation rule, security rule, research-before-build requirement,
+    test/evidence requirement, commit/push requirement, status-reporting
+    requirement, or other mandatory constraint. Where a simplification or
+    trimming suggestion from `writing-for-agents` would conflict with an
+    existing governance rule, the governance semantics and constraints must
+    be preserved unchanged - only phrasing may improve. Do not force-invoke
+    this skill for ordinary source code, UI/visual implementation, or
+    business logic work; it applies only to authoring or restructuring
+    Agent-facing instructions.
 
 ## Changelog
 
@@ -81,3 +99,13 @@ individual project's own `TASKS` or business rules - it sits above them.
 - 0.1.3 (2026-08-10): Added Development Overview, GitHub Research Gate,
   Weekly GitHub Discovery, cloud/local exception approval, and Global Rules
   SSOT enforcement.
+- 0.1.4 (2026-08-26): Added rule 17 requiring Agent-facing instruction
+  documents (governance files, Project Rules, Specs, Task Briefs, Handoffs,
+  Skills, `AGENTS.md`, `CLAUDE.md`, etc.) to be structured using the
+  `writing-for-agents` skill's principles when created or substantially
+  revised, while making explicit that the skill has no governance authority
+  and must never weaken or reinterpret a mandatory rule or gate. No
+  per-provider rule-mirror files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, or
+  similar) exist at the repository root as of this version; if any are added
+  later they must carry the same rule 17 language, per rule 16's prohibition
+  on drifting copies.

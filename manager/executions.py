@@ -7,6 +7,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from collectors.publish_drive import build_service
+from manager.capabilities import resolve_task_capabilities
 from manager.quota_reader import read_drive_status
 from manager.session_identity import manager_session_key, parse_manager_session_key, session_provider_identity
 from manager.task_claims import check_task_execution_claim
@@ -217,12 +218,19 @@ def reserve_execution(store, project_id, task_id, execution_id, provider, quota_
         raise TaskError(f"retry_count must be from 0 to {MAX_RETRY_COUNT}")
     if (retry_count == 0) != (retry_of_execution_id is None):
         raise TaskError("retry metadata must link every retry to its prior execution")
+    capability_resolution = resolve_task_capabilities(task, provider)
     expected = {
         "execution_id": execution_id, "task_id": task_id, "project_id": project_id,
         "provider": provider, "mode": mode or task.get("mode"), "effort": effort or task.get("effort"),
         "notes": list(notes or []), "task_snapshot": task_snapshot(task),
         "quota_evidence": quota_evidence,
         "retry_count": retry_count, "retry_of_execution_id": retry_of_execution_id,
+        "required_capabilities": capability_resolution["required_capabilities"],
+        "resolved_capabilities": capability_resolution["resolved_capabilities"],
+        "provider_capability_availability": capability_resolution["provider_capability_availability"],
+        "actual_capability_source_version": capability_resolution["actual_capability_source_version"],
+        "capability_resolution_status": capability_resolution["resolution_status"],
+        "capability_fallback_reason": capability_resolution["fallback_reason"],
     }
     try:
         existing = store.get("executions", project_id, execution_id)

@@ -9,6 +9,7 @@ import sys
 
 from collectors.publish_drive import build_service
 from manager.assignment import CAPABILITIES, decide
+from manager.capabilities import capability_prompt_note, resolve_task_capabilities
 from manager.estimator import estimate
 from manager.executions import list_executions
 from manager.quota_reader import read_drive_status, summarize
@@ -58,7 +59,7 @@ def phase_goals(scope, count):
     return ["; ".join(group) if group else "Integrate and validate the preceding phase" for group in groups]
 
 
-def prompt_for(project, task, handoff, provider, estimate_result, quota_summary, warnings, shared_rules=None, ponytail_available=None):
+def prompt_for(project, task, handoff, provider, estimate_result, quota_summary, warnings, shared_rules=None, ponytail_available=None, capability_note=None):
     forbidden = list(project.get("important_constraints", [])) + list(task.get("constraints", []))
     if handoff:
         forbidden += handoff.get("do_not_touch", [])
@@ -98,6 +99,8 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
     if ponytail:
         skill = "Enable the local Ponytail skill. " if ponytail_available is not False else "Ponytail skill is unavailable; use the equivalent text policy. "
         lines += ["Ponytail minimal-change preference (lower priority than requirements above):", skill + "Use Ponytail/minimal-change principles: make the smallest safe change that satisfies the acceptance criteria; do not refactor unrelated code. Necessary tests, schema changes, compatibility fixes, correctness, and regression protection remain required."]
+    if capability_note:
+        lines += ["Agent-facing-instruction authoring aid (lower priority than requirements above):", capability_note]
     lines += [
         f"Quota summary: {quota_summary}",
         f"Warnings: {'; '.join(warnings) if warnings else 'none'}",
@@ -167,7 +170,9 @@ def dispatch(store, service, request, quota_document=None, executions=None):
         if persist_task and task["task_id"] not in project["active_tasks"]:
             project["active_tasks"].append(task["task_id"]); store.put("projects", project["project_id"], project["project_id"], project)
     summary = quota_line(selected_quota)
-    generated = prompt_for(project, task, handoff, selected, selected_estimate, summary, warnings, request.get("shared_rules"), request.get("ponytail_available"))
+    capability_resolution = resolve_task_capabilities(task_input, selected)
+    capability_note = capability_prompt_note("writing-for-agents", selected) if "writing-for-agents" in capability_resolution["resolved_capabilities"] else None
+    generated = prompt_for(project, task, handoff, selected, selected_estimate, summary, warnings, request.get("shared_rules"), request.get("ponytail_available"), capability_note)
     return {
         "recommended_provider": selected, "provider": selected,
         "model": request.get("model"), "fallback_model": request.get("fallback_model"),
@@ -176,6 +181,12 @@ def dispatch(store, service, request, quota_document=None, executions=None):
         "quota_evidence": decision["quota_evidence"],
         "estimated_minutes": selected_estimate["estimated_minutes"], "split_recommended": selected_estimate["split_recommended"], "phase_count": selected_estimate["suggested_phases"],
         "alternatives": alternatives, "quota_summary": summary, "warnings": warnings, "generated_prompt": generated,
+        "required_capabilities": capability_resolution["required_capabilities"],
+        "resolved_capabilities": capability_resolution["resolved_capabilities"],
+        "provider_capability_availability": capability_resolution["provider_capability_availability"],
+        "actual_capability_source_version": capability_resolution["actual_capability_source_version"],
+        "capability_resolution_status": capability_resolution["resolution_status"],
+        "capability_fallback_reason": capability_resolution["fallback_reason"],
     }
 
 

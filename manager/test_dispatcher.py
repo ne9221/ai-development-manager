@@ -99,5 +99,28 @@ class DispatcherTests(unittest.TestCase):
         with self.assertRaises(TaskError): request_ok({"project_id": "p1"})
         with self.assertRaises(TaskError): request_ok(request(preferred_provider="codex", excluded_provider="codex"))
 
+    def test_ordinary_task_carries_no_required_capability(self):
+        result = self.dispatch_case(request())
+        self.assertEqual([], result["required_capabilities"])
+        self.assertEqual("not_required", result["capability_resolution_status"])
+        self.assertNotIn("Agent-facing-instruction authoring aid", result["generated_prompt"])
+
+    def test_agent_facing_task_resolves_writing_for_agents_on_a_supported_provider(self):
+        result = self.dispatch_case(request(title="Update AGENTS.md with the new dispatch rule", scope=["AGENTS.md"], preferred_provider="claude"))
+        self.assertEqual(["writing-for-agents"], result["required_capabilities"])
+        self.assertEqual(["writing-for-agents"], result["resolved_capabilities"])
+        self.assertEqual("resolved", result["capability_resolution_status"])
+        self.assertEqual("0ab1b63a410a03d3627979a109c8695de27af954", result["actual_capability_source_version"])
+        self.assertIn("Agent-facing-instruction authoring aid", result["generated_prompt"])
+        self.assertIn("writing-for-agents", result["generated_prompt"])
+
+    def test_agent_facing_task_on_unsupported_provider_reports_truthful_fallback_not_fake_success(self):
+        result = self.dispatch_case(request(title="Update AGENTS.md with the new dispatch rule", scope=["AGENTS.md"], preferred_provider="gemini_app"))
+        self.assertEqual(["writing-for-agents"], result["required_capabilities"])
+        self.assertEqual([], result["resolved_capabilities"])
+        self.assertEqual("unsupported_provider", result["capability_resolution_status"])
+        self.assertIsNotNone(result["capability_fallback_reason"])
+        self.assertNotIn("Agent-facing-instruction authoring aid", result["generated_prompt"])
+
 
 if __name__ == "__main__": unittest.main()

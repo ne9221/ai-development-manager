@@ -103,6 +103,23 @@ class ExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(TaskError, "reserved_at"):
             validate("execution", invalid)
 
+    def test_reserve_records_actual_capability_usage_for_agent_facing_task(self):
+        create_task(self.store, {**task(), "task_id": "t-agents", "title": "Update AGENTS.md with the new dispatch rule", "scope": ["AGENTS.md"]}, assign=False)
+        reserved = reserve_execution(self.store, "p1", "t-agents", "reserved-agents", "claude", decision(), reserved_at="2026-08-09T00:00:00Z")
+        self.assertEqual(["writing-for-agents"], reserved["required_capabilities"])
+        self.assertEqual(["writing-for-agents"], reserved["resolved_capabilities"])
+        self.assertEqual("resolved", reserved["capability_resolution_status"])
+        self.assertEqual("0ab1b63a410a03d3627979a109c8695de27af954", reserved["actual_capability_source_version"])
+        self.assertIsNone(reserved["capability_fallback_reason"])
+        validate("execution", reserved)
+
+    def test_reserve_records_ordinary_task_as_not_requiring_any_capability(self):
+        reserved = reserve_execution(self.store, "p1", "t1", "reserved-ordinary", "codex", decision(), reserved_at="2026-08-09T00:00:00Z")
+        self.assertEqual([], reserved["required_capabilities"])
+        self.assertEqual([], reserved["resolved_capabilities"])
+        self.assertEqual("not_required", reserved["capability_resolution_status"])
+        validate("execution", reserved)
+
     def test_cancel_never_started_reservation_is_strict_and_idempotent(self):
         reserved = reserve_execution(self.store, "p1", "t1", "cancel-me", "codex", decision(), reserved_at="2026-08-09T00:00:00Z")
         cancelled = cancel_reserved_execution(self.store, MemoryClaimRegistry(), "p1", "cancel-me", "retry requested", "2026-08-09T00:01:00Z")
