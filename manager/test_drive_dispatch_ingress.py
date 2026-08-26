@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import manager.drive_dispatch_ingress as drive_dispatch_ingress
+from cloud.dispatch_ingress import DispatchIngressError
 from manager.drive_dispatch_ingress import (
     DEFAULT_FAIRNESS_SLICES, DEFAULT_MAX_METADATA_PAGES, FOLDER_NAME, METADATA_FIELDS,
     _fairness_bucket_bounds, _fairness_rotation_slot, _modified_time_indicates_stale,
@@ -338,6 +339,153 @@ class DriveDispatchIngressTests(unittest.TestCase):
             second = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW)
         self.assertEqual(first, second)
         self.assertEqual(2, handler.call_count)
+
+    # -- repo_write wiring: feat/drive-ingress-repowrite-wiring-20260826 --
+    # A Drive request may now explicitly opt into v2-repo-write by naming its
+    # own repo_write object -- schema/dispatch_request.schema.json's own
+    # required/additionalProperties:false shape rejects anything malformed
+    # before it ever reaches handle_dispatch(); a well-shaped repo_write is
+    # forwarded verbatim, never re-validated here (cloud.dispatch_ingress.
+    # _validate_repo_write_request remains the single canonical field-level
+    # validator). Absence or null must reproduce the exact prior behavior.
+
+    VALID_REPO_WRITE = {
+        "allowed_paths": ["js/mail-core.js", "js/mail-ui.js", "css/styles.css", "tests/*"],
+        "baseline_head": "ff4ab5bb77582f56c6f2bd7091cf8bf952d67fe2",
+        "repo": "https://github.com/ne9221/excel-mail-generator",
+    }
+
+    def test_legacy_read_only_request_unchanged(self):
+        """1: a request with no repo_write field behaves byte-for-byte as
+        before this field existed -- no repo_write key in the payload at
+        all, not even null."""
+        service = Service()
+        handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1", "task_id": "dispatch-drive-e2e-1",
+                                     "command_id": "dispatch-drive-e2e-1", "status": "queued"})
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            result = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                                  registry_factory=lambda *_args: object())
+        self.assertTrue(result[0]["accepted"])
+        payload = handler.call_args.args[3]
+        self.assertEqual({"read_only": True}, payload["constraints"])
+        self.assertNotIn("repo_write", payload)
+
+    def test_explicit_valid_repo_write_forwarded_exactly(self):
+        """2: a well-shaped repo_write is forwarded to handle_dispatch()
+        verbatim, unmodified, alongside constraints.read_only: false."""
+        service = Service(request(project_id="outlook-mail", repo_write=self.VALID_REPO_WRITE))
+        handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1", "task_id": "dispatch-drive-e2e-1",
+                                     "command_id": "dispatch-drive-e2e-1", "status": "queued"})
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            result = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                                  registry_factory=lambda *_args: object())
+        # 12: scheduler-facing output shape stays identical to the read-only case.
+        self.assertEqual({"file_id", "accepted", "request_id", "task_id", "command_id", "status"}, set(result[0]))
+        self.assertTrue(result[0]["accepted"])
+        payload = handler.call_args.args[3]
+        self.assertEqual({"read_only": False}, payload["constraints"])
+        self.assertEqual(self.VALID_REPO_WRITE, payload["repo_write"])
+
+    def _assert_repo_write_rejected_without_dispatch(self, repo_write):
+        service = Service(request(repo_write=repo_write))
+        handler = Mock()
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            result = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW)
+        self.assertFalse(result[0]["accepted"])
+        # 7: malformed write intent must FAIL, never silently downgrade to a
+        # read-only dispatch -- handle_dispatch() must never even be called.
+        handler.assert_not_called()
+
+    def test_repo_write_missing_baseline_fail_closed(self):
+        """3."""
+        bad = {k: v for k, v in self.VALID_REPO_WRITE.items() if k != "baseline_head"}
+        self._assert_repo_write_rejected_without_dispatch(bad)
+
+    def test_repo_write_invalid_repo_type_fail_closed(self):
+        """4: schema-level malformation (wrong type) fails closed here;
+        a well-typed-but-wrong repo string is cloud.dispatch_ingress's own
+        canonical cross-check, already covered by cloud/test_dispatch_ingress.py."""
+        bad = {**self.VALID_REPO_WRITE, "repo": 12345}
+        self._assert_repo_write_rejected_without_dispatch(bad)
+
+    def test_repo_write_missing_allowed_paths_fail_closed(self):
+        """5."""
+        bad = {k: v for k, v in self.VALID_REPO_WRITE.items() if k != "allowed_paths"}
+        self._assert_repo_write_rejected_without_dispatch(bad)
+
+    def test_repo_write_empty_allowed_paths_fail_closed(self):
+        """6."""
+        bad = {**self.VALID_REPO_WRITE, "allowed_paths": []}
+        self._assert_repo_write_rejected_without_dispatch(bad)
+
+    def test_repo_write_unknown_project_fail_closed_not_masked(self):
+        """8: when handle_dispatch() itself rejects (e.g. unknown_project),
+        the repo-write wiring must record that rejection exactly like a
+        read-only one -- no special-casing that could mask or reclassify it."""
+        service = Service(request(project_id="not-a-registered-project", repo_write=self.VALID_REPO_WRITE))
+        handler = Mock(side_effect=DispatchIngressError("unknown_project", "unknown project: not-a-registered-project"))
+        registry = MemoryClaimRegistry()
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            result = poll_drive_dispatch_requests(
+                object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                rejection_registry_factory=lambda _bucket, _file_id: registry)
+        self.assertFalse(result[0]["accepted"])
+        self.assertEqual("unknown_project", registry.document["reason_code"])
+
+    def test_outlook_mail_canonical_repo_write_accepted(self):
+        """9: outlook-mail's own real canonical repo/paths travel through the
+        wiring intact, project_id included."""
+        service = Service(request(project_id="outlook-mail", repo_write=self.VALID_REPO_WRITE))
+        handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1", "task_id": "dispatch-drive-e2e-1",
+                                     "command_id": "dispatch-drive-e2e-1", "status": "queued"})
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            result = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                                  registry_factory=lambda *_args: object())
+        self.assertTrue(result[0]["accepted"])
+        payload = handler.call_args.args[3]
+        self.assertEqual("outlook-mail", payload["project_id"])
+        self.assertEqual("https://github.com/ne9221/excel-mail-generator", payload["repo_write"]["repo"])
+
+    def test_ai_development_manager_repo_write_behavior_unchanged(self):
+        """10: ai-development-manager's own default project_id (from the
+        request() fixture) works identically under repo_write as any other
+        project -- no ADM-specific special-casing was introduced."""
+        service = Service(request(repo_write=self.VALID_REPO_WRITE))
+        handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1", "task_id": "dispatch-drive-e2e-1",
+                                     "command_id": "dispatch-drive-e2e-1", "status": "queued"})
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            result = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                                  registry_factory=lambda *_args: object())
+        self.assertTrue(result[0]["accepted"])
+        self.assertEqual("ai-development-manager", handler.call_args.args[3]["project_id"])
+
+    def test_duplicate_repo_write_request_is_delegated_to_existing_gcs_idempotency(self):
+        """11: a repeated poll of the same repo_write request_id behaves the
+        same as the existing read-only idempotency test above -- delegated
+        entirely to the unmodified claim registry, not anything in this
+        wiring."""
+        service = Service(request(repo_write=self.VALID_REPO_WRITE))
+        handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1", "task_id": "dispatch-drive-e2e-1",
+                                     "command_id": "dispatch-drive-e2e-1", "status": "completed"})
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            first = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW)
+            second = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW)
+        self.assertEqual(first, second)
+        self.assertEqual(2, handler.call_count)
+
+    def test_null_repo_write_is_equivalent_to_absent(self):
+        """Explicit JSON null for repo_write (schema allows it, matching
+        this file's existing preferred_provider/account_id convention) is
+        exactly as much "no write intent" as omitting the field."""
+        service = Service(request(repo_write=None))
+        handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1", "task_id": "dispatch-drive-e2e-1",
+                                     "command_id": "dispatch-drive-e2e-1", "status": "queued"})
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                         registry_factory=lambda *_args: object())
+        payload = handler.call_args.args[3]
+        self.assertEqual({"read_only": True}, payload["constraints"])
+        self.assertNotIn("repo_write", payload)
 
 
 def make_item(file_id, request_id, created_time, created_at=None, extra=None, modified_time=None):

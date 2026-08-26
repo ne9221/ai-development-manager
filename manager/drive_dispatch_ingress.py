@@ -417,8 +417,31 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
                 "request_id": request["request_id"], "project_id": request["project_id"],
                 "title": request["title"], "goal": request["goal"],
                 "priority": request.get("priority") or "normal",
-                "constraints": {"read_only": True},
             }
+            # Explicit opt-in only: a request is write-mode if and only if it
+            # names its own repo_write object (schema/dispatch_request.schema.
+            # json's own required/additionalProperties:false shape already
+            # rejects anything malformed before this point ever sees it).
+            # Absence or null means exactly what it always meant here --
+            # constraints.read_only stays True, byte-for-byte the same as
+            # before this field existed. There is deliberately no inference
+            # from title/goal text and no server-side default to write mode.
+            # cloud.dispatch_ingress._validate_repo_write_request() remains
+            # the single canonical field-level validator (path safety,
+            # baseline_head hex pattern, repo identity shape) -- forwarding
+            # repo_write here unmodified, rather than re-validating it,
+            # avoids two divergent implementations of those checks ever
+            # drifting apart. A repo_write that fails that canonical check
+            # raises DispatchIngressError, caught by this same function's
+            # existing except clause below exactly like any other rejected
+            # candidate -- it is recorded as a rejection, never silently
+            # downgraded to a read-only Task.
+            repo_write = request.get("repo_write")
+            if repo_write is not None:
+                payload["constraints"] = {"read_only": False}
+                payload["repo_write"] = repo_write
+            else:
+                payload["constraints"] = {"read_only": True}
             if request.get("preferred_provider") is not None:
                 payload["provider"] = request["preferred_provider"]
             if request.get("account_id") is not None:

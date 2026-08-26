@@ -12,6 +12,16 @@
     "preferred_provider": {"type": ["string", "null"], "enum": ["codex", "claude", "antigravity", null]},
     "account_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 200},
     "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
-    "created_at": {"type": "string", "format": "date-time"}
+    "created_at": {"type": "string", "format": "date-time"},
+    "repo_write": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["allowed_paths", "baseline_head", "repo"],
+      "properties": {
+        "allowed_paths": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "baseline_head": {"type": "string"},
+        "repo": {"type": "string"}
+      }
+    }
   }
 }
