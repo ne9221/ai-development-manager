@@ -427,3 +427,139 @@ def test_no_fallback_and_unregistered_returns_none(monkeypatch):
     monkeypatch.delenv("ADM_WORKSPACE_ROOT", raising=False)
     assert resolve_authoritative_working_directory("not-a-registered-project-id") is None
 
+
+# -- outlook-mail registry activation: 2026-08-26 --
+# outlook-mail moved from repo_identity_status=MISSING_CANONICAL_REPO_REGISTRATION
+# (repo: null, resolution_status: unresolved) to a verified binding against the
+# real ne9221/excel-mail-generator repo, confirmed reachable via a fresh
+# `git ls-remote` and a fresh clone whose tree was inspected file-by-file before
+# any protected_paths/default_write_boundaries entry below was written.
+
+def test_outlook_mail_resolves_by_canonical_id():
+    """1: resolve('outlook-mail') -> project_id outlook-mail, now verified."""
+    registry = get_global_registry(reload=True)
+    proj = registry.get_project("outlook-mail")
+    assert proj.project_id == "outlook-mail"
+    assert proj.resolution_status == "verified"
+    assert proj.status == "enabled"
+
+
+def test_outlook_mail_resolves_by_display_name_alias():
+    """2: resolve('Outlook 群發 Mail 工具') -> outlook-mail."""
+    registry = get_global_registry()
+    proj = registry.get_project("Outlook 群發 Mail 工具")
+    assert proj.project_id == "outlook-mail"
+
+
+def test_outlook_mail_resolves_by_english_alias():
+    """3: resolve('Excel Mail Generator') -> outlook-mail."""
+    registry = get_global_registry()
+    proj = registry.get_project("Excel Mail Generator")
+    assert proj.project_id == "outlook-mail"
+    # the bare repo-name alias must resolve identically
+    assert registry.get_project("excel-mail-generator").project_id == "outlook-mail"
+
+
+def test_outlook_mail_resolves_by_canonical_repo_url():
+    """4: resolve canonical repo URL -> outlook-mail, across URL/SSH/owner-repo forms."""
+    registry = get_global_registry()
+    for q in [
+        "https://github.com/ne9221/excel-mail-generator.git",
+        "https://github.com/ne9221/excel-mail-generator",
+        "git@github.com:ne9221/excel-mail-generator.git",
+        "ne9221/excel-mail-generator",
+    ]:
+        proj = registry.get_project(q)
+        assert proj.project_id == "outlook-mail", f"failed to resolve repo identity: {q}"
+
+
+def test_outlook_mail_write_dispatch_now_eligible():
+    """5: resolve_for_dispatch('outlook-mail', write=True) -> verified / repo_write_eligible."""
+    registry = get_global_registry()
+    proj = registry.resolve_for_dispatch("outlook-mail", write=True)
+    assert proj.project_id == "outlook-mail"
+    assert proj.resolution_status == "verified"
+    assert proj.repo_url == "https://github.com/ne9221/excel-mail-generator.git"
+
+
+def test_outlook_mail_wrong_repo_fail_closed():
+    """6: a repo string that isn't outlook-mail's (or anyone's) FAILS CLOSED."""
+    registry = get_global_registry()
+    with pytest.raises(ProjectNotFoundError):
+        registry.get_project("https://github.com/ne9221/outlook-mail.git")  # old, never-real placeholder URL
+    with pytest.raises(ProjectNotFoundError):
+        registry.get_project("ne9221/not-a-real-mail-repo")
+
+
+def test_outlook_mail_does_not_spoof_adm_repo_identity():
+    """7: ADM repo spoof FAILS CLOSED -- outlook-mail's activation must not let
+    either project's repo identity bleed into the other inside the same
+    registry, and re-registering both together must not raise
+    DuplicateRepositoryError."""
+    registry = get_global_registry()
+    adm = registry.get_project("https://github.com/ne9221/ai-development-manager.git")
+    outlook = registry.get_project("https://github.com/ne9221/excel-mail-generator.git")
+    assert adm.project_id == "ai-development-manager"
+    assert outlook.project_id == "outlook-mail"
+    assert adm.project_id != outlook.project_id
+
+
+def test_outlook_mail_missing_project_rules_fail_closed_for_write_dispatch():
+    """8: missing/wrong PROJECT-RULES FAILS CLOSED for write dispatch, using
+    outlook-mail's own real raw entry with project_rules stripped."""
+    raw = get_global_registry().get_raw_entry("outlook-mail")
+    mutated = dict(raw)
+    mutated.pop("project_rules", None)
+    registry = ProjectRegistry.from_dict({
+        "schema_version": "1.0.0", "updated_at": "2026-08-26T00:00:00Z", "projects": [mutated],
+    })
+    with pytest.raises(GovernanceRuleMissingError) as exc_info:
+        registry.resolve_for_dispatch("outlook-mail", write=True)
+    assert "project-rules" in str(exc_info.value).lower()
+
+
+def test_outlook_mail_invalid_baseline_policy_fail_closed_schema():
+    """9: invalid baseline_resolution_policy.strategy FAILS CLOSED at the
+    schema-validation gate (the only layer that currently enforces the
+    baseline_resolution_policy.strategy enum)."""
+    import jsonschema
+
+    repo_root = Path(__file__).parents[1]
+    schema = json.loads((repo_root / "schema" / "project_registry.schema.json").read_text(encoding="utf-8"))
+    raw = get_global_registry().get_raw_entry("outlook-mail")
+    mutated = dict(raw)
+    mutated["baseline_resolution_policy"] = {"strategy": "not-a-real-strategy"}
+    bad_data = {"schema_version": "1.0.0", "updated_at": "2026-08-26T00:00:00Z", "projects": [mutated]}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=bad_data, schema=schema)
+
+
+def test_outlook_mail_protected_path_recorded():
+    """10: protected path backend/outlook_bridge_server.ps1 is recorded as
+    protected. NOTE: no runtime path-boundary enforcement function exists yet
+    in manager.project_registry -- protected_paths/default_write_boundaries
+    are metadata only at this point, so this test verifies the data, not an
+    enforcement call. Wiring an actual write-boundary check is out of scope
+    for this registry-activation change."""
+    proj = get_global_registry().get_project("outlook-mail")
+    assert "backend/outlook_bridge_server.ps1" in proj.protected_paths
+    assert "js/mail-core.js" not in proj.protected_paths
+
+
+def test_outlook_mail_allowed_path_recorded():
+    """11: allowed path js/mail-core.js is recorded in default_write_boundaries
+    (same metadata-only caveat as the protected-path test above)."""
+    proj = get_global_registry().get_project("outlook-mail")
+    assert "js/mail-core.js" in proj.default_write_boundaries
+    assert "backend/outlook_bridge_server.ps1" not in proj.default_write_boundaries
+
+
+def test_outlook_mail_no_duplicate_repo_collision_with_existing_projects():
+    """12: activating outlook-mail's real repo identity does not collide with
+    any other already-registered project's repo (would otherwise raise
+    DuplicateRepositoryError at load time -- this test just re-confirms the
+    whole registry, including outlook-mail, loads cleanly)."""
+    registry = get_global_registry(reload=True)
+    for pid in ("ai-development-manager", "outlook-mail"):
+        assert registry.get_project(pid).project_id == pid
+
