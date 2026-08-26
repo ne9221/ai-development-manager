@@ -14,7 +14,7 @@
     "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
     "created_at": {"type": "string", "format": "date-time"},
     "repo_write": {
-      "type": ["object", "null"],
+      "type": "object",
       "additionalProperties": false,
       "required": ["allowed_paths", "baseline_head", "repo"],
       "properties": {

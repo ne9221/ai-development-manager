@@ -418,28 +418,31 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
                 "title": request["title"], "goal": request["goal"],
                 "priority": request.get("priority") or "normal",
             }
-            # Explicit opt-in only: a request is write-mode if and only if it
-            # names its own repo_write object (schema/dispatch_request.schema.
-            # json's own required/additionalProperties:false shape already
-            # rejects anything malformed before this point ever sees it).
-            # Absence or null means exactly what it always meant here --
-            # constraints.read_only stays True, byte-for-byte the same as
-            # before this field existed. There is deliberately no inference
-            # from title/goal text and no server-side default to write mode.
-            # cloud.dispatch_ingress._validate_repo_write_request() remains
-            # the single canonical field-level validator (path safety,
-            # baseline_head hex pattern, repo identity shape) -- forwarding
-            # repo_write here unmodified, rather than re-validating it,
-            # avoids two divergent implementations of those checks ever
-            # drifting apart. A repo_write that fails that canonical check
-            # raises DispatchIngressError, caught by this same function's
-            # existing except clause below exactly like any other rejected
-            # candidate -- it is recorded as a rejection, never silently
-            # downgraded to a read-only Task.
-            repo_write = request.get("repo_write")
-            if repo_write is not None:
+            # Explicit opt-in only, by KEY PRESENCE -- not `is not None` --
+            # a request is write-mode if and only if it names its own
+            # repo_write key. schema/dispatch_request.schema.json's own
+            # repo_write.type is "object" (not ["object", "null"]), so
+            # `"repo_write": null` already fails schema validation inside
+            # read_request() above and never reaches this line at all --
+            # this dict membership check is never actually asked to
+            # distinguish null from absence itself, but is written as
+            # membership regardless so the security contract ("only two
+            # valid states: absent, or a valid object") is legible here too,
+            # not just enforced one layer up. There is deliberately no
+            # inference from title/goal text and no server-side default to
+            # write mode. cloud.dispatch_ingress._validate_repo_write_request()
+            # remains the single canonical field-level validator (path
+            # safety, baseline_head hex pattern, repo identity shape) --
+            # forwarding repo_write here unmodified, rather than
+            # re-validating it, avoids two divergent implementations of
+            # those checks ever drifting apart. A repo_write that fails
+            # that canonical check raises DispatchIngressError, caught by
+            # this same function's existing except clause below exactly
+            # like any other rejected candidate -- it is recorded as a
+            # rejection, never silently downgraded to a read-only Task.
+            if "repo_write" in request:
                 payload["constraints"] = {"read_only": False}
-                payload["repo_write"] = repo_write
+                payload["repo_write"] = request["repo_write"]
             else:
                 payload["constraints"] = {"read_only": True}
             if request.get("preferred_provider") is not None:

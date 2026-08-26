@@ -347,7 +347,12 @@ class DriveDispatchIngressTests(unittest.TestCase):
     # before it ever reaches handle_dispatch(); a well-shaped repo_write is
     # forwarded verbatim, never re-validated here (cloud.dispatch_ingress.
     # _validate_repo_write_request remains the single canonical field-level
-    # validator). Absence or null must reproduce the exact prior behavior.
+    # validator). Only two valid states exist: the repo_write key is ABSENT
+    # (legacy read-only behavior, unchanged), or PRESENT with a valid object
+    # (write mode). repo_write.type is "object" only (not ["object", "null"]),
+    # so "repo_write": null now fails schema validation and is rejected
+    # before handle_dispatch() is ever called -- it is never treated as
+    # equivalent to absence, and never silently downgrades to read-only.
 
     VALID_REPO_WRITE = {
         "allowed_paths": ["js/mail-core.js", "js/mail-ui.js", "css/styles.css", "tests/*"],
@@ -473,19 +478,17 @@ class DriveDispatchIngressTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(2, handler.call_count)
 
-    def test_null_repo_write_is_equivalent_to_absent(self):
-        """Explicit JSON null for repo_write (schema allows it, matching
-        this file's existing preferred_provider/account_id convention) is
-        exactly as much "no write intent" as omitting the field."""
-        service = Service(request(repo_write=None))
-        handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1", "task_id": "dispatch-drive-e2e-1",
-                                     "command_id": "dispatch-drive-e2e-1", "status": "queued"})
-        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
-            poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
-                                         registry_factory=lambda *_args: object())
-        payload = handler.call_args.args[3]
-        self.assertEqual({"read_only": True}, payload["constraints"])
-        self.assertNotIn("repo_write", payload)
+    def test_explicit_null_repo_write_rejected_not_downgraded(self):
+        """3: unlike preferred_provider/account_id, repo_write is NOT
+        nullable -- only absence means "no write intent". Explicit JSON
+        null for repo_write must fail schema validation before
+        handle_dispatch() is ever called, and must NEVER be silently
+        downgraded to a read-only dispatch (that would violate the
+        explicit-write fail-closed contract: a caller who wrote
+        "repo_write": null clearly intended /something/ write-related, and
+        silently granting it read-only access anyway is a downgrade, not a
+        rejection)."""
+        self._assert_repo_write_rejected_without_dispatch(None)
 
 
 def make_item(file_id, request_id, created_time, created_at=None, extra=None, modified_time=None):
