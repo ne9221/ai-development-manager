@@ -224,6 +224,42 @@ class TaskClassificationTests(unittest.TestCase):
         self.assertTrue(is_agent_facing_task(task))
         self.assertEqual(["writing-for-agents"], required_capabilities_for_task(task))
 
+    def test_marketplace_context_requires_skill_authored_for_marketplace_not_bare_cooccurrence(self):
+        # Regression coverage for a fourth real bug found by the same review:
+        # the bare "marketplace" alternative in _AGENT_SKILL_CONTEXT_PATTERN
+        # was too wide for a cross-project global classifier - an ordinary
+        # e-commerce/HR marketplace task can easily contain both "skill(s)"
+        # and "marketplace" without being about Agent Skill authoring at all.
+        # The signal is now tightened to a proximity check specific to "a
+        # skill ... for the marketplace" (see _SKILL_MARKETPLACE_PATTERN),
+        # not "marketplace" as a bare co-occurring token anywhere in the
+        # text.
+        true_task = agent_facing_task(title="Write a new skill for the marketplace", scope=[])
+        self.assertTrue(is_agent_facing_task(true_task))
+        self.assertEqual(["writing-for-agents"], required_capabilities_for_task(true_task))
+
+        false_cases = [
+            ordinary_task(
+                task_type="business_logic",
+                title="Create seller skills matrix for marketplace users",
+                scope=["marketplace/seller_profile.py"],
+            ),
+            ordinary_task(
+                task_type="ui",
+                title="Build marketplace employee skills dashboard",
+                scope=["marketplace/hr_dashboard.tsx"],
+            ),
+            ordinary_task(
+                task_type="implementation",
+                title="Add customer service skills to marketplace profile",
+                scope=["marketplace/profile.py"],
+            ),
+        ]
+        for task in false_cases:
+            with self.subTest(title=task["title"]):
+                self.assertFalse(is_agent_facing_task(task))
+                self.assertEqual([], required_capabilities_for_task(task))
+
     def test_context_word_must_modify_the_gated_phrase_not_merely_co_occur(self):
         # Regression coverage for a third real bug found by the same review:
         # _CONTEXT_GATED_PATTERN used to fire whenever an agent/AI/assistant/

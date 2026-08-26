@@ -200,14 +200,15 @@ _AGENT_FACING_PATTERN = re.compile(
 # only counts as Agent-Skill authoring when the same text field also names
 # actual AI-agent-skill vocabulary: an agent platform (agent/AI/Claude/
 # Codex/Antigravity), an explicit SKILL.md/"skill authoring"/"agent skill"
-# reference, or the skill marketplace these Agent Skills are published to -
-# not merely because the sentence happens to contain the word "skill(s)"
-# next to some authoring verb. This deliberately does NOT widen the
-# verb-to-noun word window (that was the original bug); it gates the
-# existing phrase with a co-occurrence check, the same shape as the
-# governance/system-prompt gate below. See manager/test_capabilities.py for
-# the business/game-domain regression cases this must exclude, and the
-# marketplace regression case it must still catch.
+# reference, or a skill being authored *for* the Agent Skill marketplace
+# (see _SKILL_MARKETPLACE_PATTERN below) - not merely because the sentence
+# happens to contain the word "skill(s)" next to some authoring verb. This
+# deliberately does NOT widen the verb-to-noun word window (that was the
+# original bug); it gates the existing phrase with a co-occurrence check,
+# the same shape as the governance/system-prompt gate below. See
+# manager/test_capabilities.py for the business/game-domain regression cases
+# this must exclude, and the marketplace regression case it must still
+# catch.
 _SKILL_VERB_PATTERN = re.compile(
     r"(?i)\b(?:write|writing|wrote|written|author|authoring|authored|create|creating|created|"
     r"draft|drafting|drafted|revise|revising|revised|rewrite|rewriting|rewrote|"
@@ -216,11 +217,35 @@ _SKILL_VERB_PATTERN = re.compile(
 
 _AGENT_SKILL_CONTEXT_PATTERN = re.compile(
     r"(?i)(?:"
-    r"\b(?:agents?|AI|Claude|Codex|Antigravity|marketplace)\b"
+    r"\b(?:agents?|AI|Claude|Codex|Antigravity)\b"
     r"|\bSKILL\.md\b"
     r"|\bskill authoring\b"
     r"|\bagent skill\b"
     r")"
+)
+
+# ADM is a cross-project global classifier, so a bare "marketplace" token
+# co-occurring anywhere in the text is too wide a signal: an ordinary
+# e-commerce/HR "marketplace" task can easily contain both "skill(s)" and
+# "marketplace" without being about Agent Skill authoring at all (e.g.
+# "Create seller skills matrix for marketplace users", "Build marketplace
+# employee skills dashboard"). What actually distinguishes genuine Agent
+# Skill marketplace phrasing is a skill being authored *for* the
+# marketplace - "a new skill for the marketplace" - not "marketplace"
+# merely appearing somewhere in the sentence. This mirrors the same
+# "<phrase> + connector + optional article + context noun" proximity idiom
+# used by _CONTEXT_GATED_PATTERN below for the governance/system-prompt
+# gate, requiring "marketplace" to sit directly as the object of "for"
+# relative to "skill(s)" itself. Deliberately "for" only, not "for|to":
+# "Add customer service skills to marketplace profile" has "skills"
+# directly followed by "to marketplace" with zero word gap too - the same
+# shape the "for" idiom would otherwise match - but that sentence is adding
+# a skills listing to a marketplace profile, not authoring a skill for the
+# marketplace, so allowing "to" here would reintroduce a real false
+# positive. Only "for" reliably distinguishes the two in the required
+# regression cases (see manager/test_capabilities.py).
+_SKILL_MARKETPLACE_PATTERN = re.compile(
+    r"(?i)\bskills?(?:'s)?\s+for\s+(?:the\s+|an?\s+)?marketplace\b"
 )
 
 # "governance <file|rule|document>" and "system prompt" are ordinary English
@@ -286,10 +311,14 @@ def is_agent_facing_task(task):
 
     3. A "(verb) ... skill(s)" phrase (e.g. "create ... skills", "build a
        skill") only counts when the same text field also names actual
-       AI-agent-skill vocabulary (see ``_AGENT_SKILL_CONTEXT_PATTERN``), so
-       "create user profile with skills" or "build employee leadership
-       skills matrix" are correctly excluded while "write a new skill for
-       the marketplace" still matches.
+       AI-agent-skill vocabulary (see ``_AGENT_SKILL_CONTEXT_PATTERN``) or
+       the skill is authored *for* the Agent Skill marketplace specifically
+       (see ``_SKILL_MARKETPLACE_PATTERN``), so "create user profile with
+       skills" or "build employee leadership skills matrix" are correctly
+       excluded while "write a new skill for the marketplace" still
+       matches - and a bare co-occurrence like "skills ... marketplace"
+       elsewhere in an unrelated e-commerce/HR sentence ("add customer
+       service skills to marketplace profile") does not.
     4. "governance file/rule/document" or "system prompt" only count when an
        agent-instruction context word directly modifies that phrase (see
        ``_CONTEXT_GATED_PATTERN``), so "add a data governance rule to the
@@ -307,7 +336,9 @@ def is_agent_facing_task(task):
             return True
         if _CONTEXT_GATED_PATTERN.search(text):
             return True
-        if _SKILL_VERB_PATTERN.search(text) and _AGENT_SKILL_CONTEXT_PATTERN.search(text):
+        if _SKILL_VERB_PATTERN.search(text) and (
+            _AGENT_SKILL_CONTEXT_PATTERN.search(text) or _SKILL_MARKETPLACE_PATTERN.search(text)
+        ):
             return True
     return False
 
