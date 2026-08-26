@@ -24,6 +24,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 from manager.tasks import TaskError
 from manager.trusted_ingress import REQUIRED_REPO_WRITE_TASK_POLICIES
+from manager.worktree_materializer import OWNER_MARKER_FILENAME
 
 
 class AllowedPathsViolationError(TaskError):
@@ -78,6 +79,17 @@ def collect_changed_paths(working_directory, baseline_head: str, runner=subproce
     already captures both staged and unstaged tracked-file changes; it
     cannot see untracked files, which `git ls-files --others
     --exclude-standard` supplies separately.
+
+    Excludes exactly `manager.worktree_materializer.OWNER_MARKER_FILENAME`
+    (`.adm-worktree-owner.json`) at the worktree root -- ADM's own internal
+    ownership-tracking file, written unconditionally into every repo-write
+    worktree by `materialize_worktree()`, never something a provider wrote
+    or a task's `allowed_paths` could ever have named. This exclusion is
+    exact-match only (never a prefix/suffix/wildcard match), so a similarly
+    named path a provider actually created or modified --
+    `.adm-worktree-owner.json.bak`, `.adm-other.json`, the marker filename
+    appearing anywhere other than the worktree root -- is still collected
+    and enforced normally; only this one literal ADM-owned path is exempt.
     """
     diff = _run(working_directory, "diff", "--name-status", "-M", "--no-color", baseline_head, "--", ".", runner=runner)
     if diff.returncode != 0:
@@ -104,6 +116,7 @@ def collect_changed_paths(working_directory, baseline_head: str, runner=subproce
         if line.strip():
             changed.add(line.strip())
 
+    changed.discard(OWNER_MARKER_FILENAME)
     return sorted(changed)
 
 

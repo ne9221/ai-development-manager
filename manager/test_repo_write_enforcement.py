@@ -7,6 +7,7 @@ import pytest
 
 from manager.repo_write_enforcement import (
     AllowedPathsViolationError,
+    OWNER_MARKER_FILENAME,
     collect_changed_paths,
     enforce_allowed_paths,
 )
@@ -170,3 +171,88 @@ def test_collect_changed_paths_includes_rename_both_sides():
 
     changed = collect_changed_paths("/fake/dir", "a" * 40, runner=fake_runner)
     assert changed == ["manager/x.py", "new/path.py", "old/path.py", "untracked/new.py"]
+
+
+# --- OWNER_MARKER_FILENAME exclusion (fix/repo-write-owner-marker-exclusion-20260826) --
+#
+# manager.worktree_materializer.materialize_worktree() unconditionally
+# writes OWNER_MARKER_FILENAME (".adm-worktree-owner.json") into every
+# repo-write worktree it creates -- ADM's own internal ownership-tracking
+# file, never something a provider wrote or a task's allowed_paths could
+# ever have named. Before this fix it was collected as an untracked change
+# like any other file and unconditionally rejected as an allowed_paths
+# violation, so every real repo-write task failed regardless of what the
+# provider actually touched.
+
+def _write_owner_marker(repo_path):
+    (repo_path / OWNER_MARKER_FILENAME).write_text('{"task_id": "t1"}\n', encoding="utf-8")
+
+
+def test_worktree_with_only_owner_marker_passes(repo):
+    """1: a worktree whose only change is the owner marker itself passes
+    with an empty changed-paths result -- the marker is invisible to
+    allowed_paths enforcement entirely, not merely "authorized"."""
+    _write_owner_marker(repo["path"])
+    changed = enforce_allowed_paths(repo["path"], repo["baseline"], ["manager/foo.py"])
+    assert changed == []
+
+
+def test_allowed_real_file_plus_owner_marker_passes(repo):
+    """2."""
+    (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _write_owner_marker(repo["path"])
+    changed = enforce_allowed_paths(repo["path"], repo["baseline"], ["manager/foo.py"])
+    assert changed == ["manager/foo.py"]
+
+
+def test_unauthorized_real_file_plus_owner_marker_fails_on_real_file_only(repo):
+    """3: the owner marker never appears in the violation list, even when a
+    real violation is present alongside it."""
+    (repo["path"] / "other" / "bar.py").write_text("changed\n", encoding="utf-8")
+    _write_owner_marker(repo["path"])
+    with pytest.raises(AllowedPathsViolationError) as exc:
+        enforce_allowed_paths(repo["path"], repo["baseline"], ["manager/foo.py"])
+    assert exc.value.violations == ["other/bar.py"]
+
+
+def test_arbitrary_hidden_file_still_fails_closed(repo):
+    """4: the exclusion is exact-match only -- an unrelated hidden file is
+    still collected and enforced normally."""
+    (repo["path"] / ".evil.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(AllowedPathsViolationError) as exc:
+        enforce_allowed_paths(repo["path"], repo["baseline"], ["manager/foo.py"])
+    assert exc.value.violations == [".evil.json"]
+
+
+def test_similar_named_files_still_fail_closed(repo):
+    """5: a provider-created file that merely resembles the marker name
+    (suffix or different content) is never silently exempted -- only the
+    exact literal OWNER_MARKER_FILENAME path is excluded."""
+    (repo["path"] / f"{OWNER_MARKER_FILENAME}.bak").write_text("{}\n", encoding="utf-8")
+    (repo["path"] / ".adm-other.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(AllowedPathsViolationError) as exc:
+        enforce_allowed_paths(repo["path"], repo["baseline"], ["manager/foo.py"])
+    assert exc.value.violations == [".adm-other.json", f"{OWNER_MARKER_FILENAME}.bak"]
+
+
+def test_owner_marker_exclusion_is_root_relative_not_a_basename_match(repo):
+    """A same-named file nested in a subdirectory is a different path from
+    the root-level marker and must still be enforced -- this exclusion is
+    an exact repo-relative path match, never a bare filename/basename
+    match that could be exploited by nesting a same-named file elsewhere."""
+    (repo["path"] / "manager" / OWNER_MARKER_FILENAME).write_text("{}\n", encoding="utf-8")
+    with pytest.raises(AllowedPathsViolationError) as exc:
+        enforce_allowed_paths(repo["path"], repo["baseline"], ["other/bar.py"])
+    assert exc.value.violations == [f"manager/{OWNER_MARKER_FILENAME}"]
+
+
+def test_collect_changed_paths_excludes_owner_marker_via_mocked_runner():
+    """OWNER_MARKER_FILENAME is excluded even when it is the only untracked
+    entry git reports, exercised in isolation like the rename test above."""
+    def fake_runner(command, **kwargs):
+        if "diff" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(command, 0, f"{OWNER_MARKER_FILENAME}\nreal/file.py\n", "")
+
+    changed = collect_changed_paths("/fake/dir", "a" * 40, runner=fake_runner)
+    assert changed == ["real/file.py"]
