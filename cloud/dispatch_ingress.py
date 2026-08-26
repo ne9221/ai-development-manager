@@ -69,6 +69,8 @@ authority:
   the new, trusted-ingress-stamped Command that carries the linkage.
 """
 
+import hashlib
+import json
 import os
 import re
 import time
@@ -168,6 +170,51 @@ class DispatchIngressError(TaskError):
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
+
+
+def compute_request_fingerprint(clean):
+    """Canonical, order-independent digest of everything that defines what
+    one request_id actually MEANS: project_id, title, goal, priority,
+    provider, account_id, retry_of_execution_id, and the full repo_write
+    triple (repo, baseline_head, allowed_paths). This is the durable
+    evidence manager.dispatch_requests.claim_dispatch_request() persists
+    once, at first claim, and compares every later attempt for the same
+    request_id against (see handle_dispatch() below) -- so a second,
+    materially different payload uploaded under the same request_id (e.g.
+    two distinct Drive files that happen to share a filename/request_id)
+    fails closed with request_identity_conflict instead of either being
+    silently absorbed as if it were a legitimate retry, or silently
+    redefining what the request_id means.
+
+    Deliberately EXCLUDES the request's own declared created_at: that is
+    purely additive SLA evidence (see claim_dispatch_request()'s own
+    `request_created_at` parameter) and must never be treated as identity --
+    resubmitting the exact same request an instant later with a fresher
+    created_at is still the same request, not a conflict.
+
+    `clean` must be validate_dispatch_payload()'s own output -- already
+    fully validated and normalized (stripped strings, defaulted priority,
+    canonicalized repo_write shape) -- so this only ever hashes trusted,
+    schema-correct values. `allowed_paths` is sorted before hashing since
+    it names an unordered set of paths, not a meaningful sequence.
+    """
+    repo_write = clean.get("repo_write")
+    canonical = {
+        "project_id": clean["project_id"],
+        "title": clean["title"],
+        "goal": clean["goal"],
+        "priority": clean["priority"],
+        "provider": clean.get("provider"),
+        "account_id": clean.get("account_id"),
+        "retry_of_execution_id": clean.get("retry_of_execution_id"),
+        "repo_write": None if repo_write is None else {
+            "repo": repo_write["repo"],
+            "baseline_head": repo_write["baseline_head"],
+            "allowed_paths": sorted(repo_write["allowed_paths"]),
+        },
+    }
+    canonical_json = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 
 def _safe_repo_write_path(path):
@@ -449,6 +496,20 @@ def _resolve_existing_claim(store, project_id, request_id, claim, clean=None):
     this retry's request_id -- that specific cross-check is skipped only
     for retries; the task_id/request_id linkage on the Command itself is
     still fully verified either way.
+
+    This function is only ever reached once handle_dispatch() has already
+    checked `claim.get("identity_conflict")` and found it False -- so for
+    any claim record written with a fingerprint (every claim created after
+    compute_request_fingerprint() existed), a genuinely different `clean`
+    payload has already been rejected with request_identity_conflict before
+    this function ever runs. The repo_write-scope check below (`clean` names
+    a different allowed_paths/baseline_head/repo, or a read_only/repo_write
+    mismatch) remains as defense in depth for a claim record with no stored
+    fingerprint at all -- a legacy record written before this field existed,
+    where identity_conflict can never be proven either way (see
+    manager.dispatch_requests._fingerprint_conflict()) -- so this narrower,
+    repo_write-only check is still this function's ONLY protection for that
+    case, and is deliberately left unchanged rather than removed.
     """
     task_id, command_id = claim["task_id"], claim["command_id"]
     for attempt in range(CLAIM_VERIFICATION_ATTEMPTS):
@@ -488,7 +549,7 @@ def _resolve_existing_claim(store, project_id, request_id, claim, clean=None):
     )
 
 
-def _handle_retry_dispatch(store, lock_registry_factory, project_id, request_id, retry_of_execution_id):
+def _handle_retry_dispatch(store, lock_registry_factory, project_id, request_id, retry_of_execution_id, fingerprint=None):
     """The retry-linkage branch of handle_dispatch(): server-side-validate
     the requested linkage, then create a new, trusted-ingress-stamped
     Command for the *existing* task (never a new task), carrying
@@ -536,11 +597,19 @@ def _handle_retry_dispatch(store, lock_registry_factory, project_id, request_id,
     command_id = f"dispatch-{request_id}"
     try:
         registry = lock_registry_factory(project_id, request_id)
-        claim = claim_dispatch_request(registry, project_id, request_id, task_id, command_id, now_iso())
+        claim = claim_dispatch_request(registry, project_id, request_id, task_id, command_id, now_iso(),
+                                       fingerprint=fingerprint)
     except DispatchIngressError:
         raise
     except Exception as exc:
         raise DispatchIngressError("idempotency_backend_unavailable", "could not establish request idempotency") from exc
+
+    if claim.get("identity_conflict"):
+        raise DispatchIngressError(
+            "request_identity_conflict",
+            f"request_id {request_id} was already claimed with different content; refusing to reuse "
+            "or reinterpret it for this retry request",
+        )
 
     if not claim["claimed"]:
         return _resolve_existing_claim(store, project_id, request_id, claim)
@@ -597,8 +666,16 @@ def handle_dispatch(store, service, lock_registry_factory, payload, request_crea
             f"repo_write.repo does not match project {project_id}'s registered repo",
         )
 
+    # Computed once, from the fully validated/normalized `clean` payload,
+    # after every content-shape and repo-identity check above has already
+    # passed -- see compute_request_fingerprint()'s own docstring for why
+    # this, not the Drive filename or request_id alone, is what actually
+    # proves two attempts under the same request_id are the SAME request.
+    fingerprint = compute_request_fingerprint(clean)
+
     if clean["retry_of_execution_id"] is not None:
-        return _handle_retry_dispatch(store, lock_registry_factory, project_id, request_id, clean["retry_of_execution_id"])
+        return _handle_retry_dispatch(store, lock_registry_factory, project_id, request_id,
+                                      clean["retry_of_execution_id"], fingerprint=fingerprint)
 
     requested_provider, requested_account_id = clean["provider"], clean["account_id"]
     if requested_account_id is not None:
@@ -613,11 +690,34 @@ def handle_dispatch(store, service, lock_registry_factory, payload, request_crea
     try:
         registry = lock_registry_factory(project_id, request_id)
         claim = claim_dispatch_request(registry, project_id, request_id, task_id, command_id, now_iso(),
-                                       request_created_at=request_created_at)
+                                       request_created_at=request_created_at, fingerprint=fingerprint)
     except DispatchIngressError:
         raise
     except Exception as exc:
         raise DispatchIngressError("idempotency_backend_unavailable", "could not establish request idempotency") from exc
+
+    if claim.get("identity_conflict"):
+        # This request_id was already durably claimed with a DIFFERENT
+        # fingerprint -- i.e. a different project_id/title/goal/repo_write/
+        # provider/account_id/priority. Two distinct Drive files can share a
+        # filename and a request_id (Drive does not enforce filename
+        # uniqueness) with materially different content; without this check
+        # the second, losing candidate would either be silently absorbed
+        # into the first claimant's already-created Task/Command (falling
+        # through to _resolve_existing_claim below, which only ever compares
+        # a narrower repo_write-only subset of fields, and only for
+        # repo_write requests) or -- worse -- could be misread as having
+        # redefined what the request_id means. Fail closed instead, with an
+        # explicit, distinct reason code so this is visible in the durable
+        # rejection record (manager.drive_dispatch_ingress.
+        # poll_drive_dispatch_requests()'s existing exception handling
+        # already records any DispatchIngressError this way, unchanged).
+        raise DispatchIngressError(
+            "request_identity_conflict",
+            f"request_id {request_id} was already claimed with different content (project_id/title/goal/"
+            "repo_write/provider/account_id/priority must match exactly for the same request_id to replay); "
+            "refusing to silently reinterpret or create a second Task/Command for it",
+        )
 
     is_repo_write = clean["repo_write"] is not None
     admission_version = ADMISSION_VERSION_V2_REPO_WRITE if is_repo_write else ADMISSION_VERSION

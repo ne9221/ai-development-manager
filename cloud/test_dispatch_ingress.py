@@ -1153,20 +1153,32 @@ class RepoWriteAdmissionIngressTests(unittest.TestCase):
         self.assertEqual("repo_identity_mismatch", ctx.exception.code)
 
     def test_replay_with_widened_allowed_paths_fails_closed(self):
+        """fix/request-identity-conflict-20260827: a real widened-allowed_paths
+        replay now carries a different canonical fingerprint than the
+        original claim, so cloud.dispatch_ingress's new, general identity
+        check (request_identity_conflict) fires before this repo_write-only
+        scope check (_repo_write_replay_matches) is ever reached -- the
+        underlying scenario this test guards is unchanged, only which check
+        catches it first. See RequestIdentityConflictTests below for the
+        dedicated fingerprint-conflict coverage, and _resolve_existing_claim's
+        own docstring for why the narrower check stays in place for legacy
+        fingerprint-less records."""
         self.call()
         widened = self.write_payload(repo_write={**self.write_payload()["repo_write"], "allowed_paths": ["manager/foo.py", "manager/bar.py"]})
         with self.assertRaises(DispatchIngressError) as ctx:
             self.call(widened)
-        self.assertEqual("request_replay_scope_mismatch", ctx.exception.code)
+        self.assertEqual("request_identity_conflict", ctx.exception.code)
         # The rejected replay must not have mutated the already-created Task.
         task = self.store.get("tasks", "p1", "dispatch-req-w1")
         self.assertEqual(["manager/foo.py"], task["allowed_paths"])
 
     def test_replay_with_different_baseline_head_fails_closed(self):
+        """See test_replay_with_widened_allowed_paths_fails_closed above:
+        now caught by the general identity-fingerprint check first."""
         self.call()
         with self.assertRaises(DispatchIngressError) as ctx:
             self.call(self.write_payload(repo_write={**self.write_payload()["repo_write"], "baseline_head": "b" * 40}))
-        self.assertEqual("request_replay_scope_mismatch", ctx.exception.code)
+        self.assertEqual("request_identity_conflict", ctx.exception.code)
 
     def test_replay_with_different_repo_rejected_as_identity_mismatch_before_replay_check(self):
         # A replay naming a different repo never reaches the replay-scope
@@ -1179,10 +1191,14 @@ class RepoWriteAdmissionIngressTests(unittest.TestCase):
         self.assertEqual("repo_identity_mismatch", ctx.exception.code)
 
     def test_replay_downgrading_to_read_only_fails_closed(self):
+        """See test_replay_with_widened_allowed_paths_fails_closed above:
+        now caught by the general identity-fingerprint check first (a
+        repo_write payload and a read-only payload for the same request_id
+        never produce the same fingerprint)."""
         self.call()
         with self.assertRaises(DispatchIngressError) as ctx:
             self.call(payload(request_id="req-w1", constraints={"read_only": True}))
-        self.assertEqual("request_replay_scope_mismatch", ctx.exception.code)
+        self.assertEqual("request_identity_conflict", ctx.exception.code)
 
     def test_replay_with_identical_repo_write_contract_is_idempotent(self):
         first = self.call()
@@ -1193,6 +1209,183 @@ class RepoWriteAdmissionIngressTests(unittest.TestCase):
         with self.assertRaises(DispatchIngressError) as ctx:
             self.call(self.write_payload(retry_of_execution_id="some-execution"))
         self.assertEqual("malformed_request", ctx.exception.code)
+
+
+class RequestIdentityConflictTests(unittest.TestCase):
+    """P0 fix/request-identity-conflict-20260827: manager.dispatch_requests.
+    claim_dispatch_request()/compute_request_fingerprint() must fail closed
+    with request_identity_conflict when the same request_id is submitted
+    with materially different content, rather than silently treating it as
+    an idempotent replay of the first payload. This reproduces, at the
+    handle_dispatch() level, the real production collision found for
+    global-crossproject-outlook-mail-v6-20260826-01: two distinct payloads
+    persisted under one request_id, ~10 minutes apart."""
+
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+        create_project(self.store, project())
+        self.registries = SharedMemoryRegistries()
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=quota_fixture())
+        self.quota_patch.start()
+
+    def tearDown(self):
+        self.quota_patch.stop()
+
+    def call(self, body):
+        return handle_dispatch(self.store, self.service, self.registries.factory, body)
+
+    def test_same_request_id_identical_payload_is_idempotent_pass(self):
+        """1."""
+        first = self.call(payload(request_id="req-c1"))
+        second = self.call(payload(request_id="req-c1"))
+        self.assertEqual(first, second)
+        self.assertTrue(second["accepted"])
+
+    def test_same_request_id_different_goal_fails_closed(self):
+        """2: this is the previously-uncovered gap -- the plain read-only
+        replay path (no repo_write involved at all) never compared title/
+        goal/priority/provider/account_id before this fix; a second,
+        different-content submission under the same request_id would have
+        been silently reported as accepted, matching the FIRST payload's
+        already-created Task, with no signal the caller's own (different)
+        goal was ever discarded."""
+        self.call(payload(request_id="req-c2", goal="Fix the regression in the parser"))
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-c2", goal="Something completely different"))
+        self.assertEqual("request_identity_conflict", ctx.exception.code)
+        # The rejected conflicting submission must never have mutated the
+        # already-created Task.
+        task = self.store.get("tasks", "p1", "dispatch-req-c2")
+        self.assertEqual("Fix the regression in the parser", task["source_context"]["goal"])
+
+    def test_same_request_id_different_title_fails_closed(self):
+        self.call(payload(request_id="req-c3", title="Original title"))
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-c3", title="Different title"))
+        self.assertEqual("request_identity_conflict", ctx.exception.code)
+
+    def test_same_request_id_different_priority_fails_closed(self):
+        self.call(payload(request_id="req-c4", priority="normal"))
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-c4", priority="urgent"))
+        self.assertEqual("request_identity_conflict", ctx.exception.code)
+
+    def test_same_request_id_different_preferred_provider_fails_closed(self):
+        self.call(payload(request_id="req-c5", provider="codex"))
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(payload(request_id="req-c5", provider="claude"))
+        self.assertEqual("request_identity_conflict", ctx.exception.code)
+
+    def test_repo_string_differs_still_caught_by_existing_repo_identity_check(self):
+        """4: a repo_write.repo that differs from the Project's own
+        registered repo is (and remains, unaffected by this fix)
+        unconditionally rejected by the pre-existing repo_identity_mismatch
+        check, for every submission -- not just replays -- since at most one
+        repo string can ever equal the Project's registered repo. Two
+        candidates for the same request_id can therefore never legitimately
+        disagree on repo_write.repo and both pass: whichever one names a
+        different repo than the Project's own fails here, every time,
+        before compute_request_fingerprint() or claim_dispatch_request() are
+        ever reached."""
+        write = payload(request_id="req-c6", constraints={"read_only": False},
+                        repo_write={"allowed_paths": ["a.py"], "baseline_head": "a" * 40,
+                                    "repo": "https://github.com/example/project"})
+        self.call(write)
+        conflicting_repo = payload(request_id="req-c6", constraints={"read_only": False},
+                                   repo_write={"allowed_paths": ["a.py"], "baseline_head": "a" * 40,
+                                               "repo": "https://github.com/example/OTHER"})
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(conflicting_repo)
+        self.assertEqual("repo_identity_mismatch", ctx.exception.code)
+
+    def test_different_allowed_paths_fails_closed_with_identity_conflict(self):
+        """3."""
+        base_write = payload(request_id="req-c7", constraints={"read_only": False},
+                             repo_write={"allowed_paths": ["a.py"], "baseline_head": "a" * 40,
+                                         "repo": "https://github.com/example/project"})
+        self.call(base_write)
+        widened = payload(request_id="req-c7", constraints={"read_only": False},
+                          repo_write={"allowed_paths": ["a.py", "b.py"], "baseline_head": "a" * 40,
+                                      "repo": "https://github.com/example/project"})
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(widened)
+        self.assertEqual("request_identity_conflict", ctx.exception.code)
+
+    def test_different_account_id_fails_closed(self):
+        registry_entries = [
+            {"account_id": "account-a", "enabled": True, "config_dir": r"C:\accounts\a\.claude"},
+            {"account_id": "account-b", "enabled": True, "config_dir": r"C:\accounts\b\.claude"},
+        ]
+        fresh = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        per_account_quota = {
+            "schema_version": "0.1.0", "generated_at": fresh,
+            "providers": [
+                {"provider": "claude", "account_id": account_id, "display_name": "claude", "collection_mode": "automatic",
+                 "source": "test", "source_type": "official", "confidence": "official", "last_updated": fresh,
+                 "status": "ok", "windows": [{"name": "primary", "remaining_percent": 90, "used_percent": 10, "resets_at": None}]}
+                for account_id in ("account-a", "account-b")
+            ],
+        }
+        with _registry_env(registry_entries), patch("manager.dispatcher.read_drive_status", return_value=per_account_quota):
+            self.call(payload(request_id="req-c8", provider="claude", account_id="account-a"))
+            with self.assertRaises(DispatchIngressError) as ctx:
+                self.call(payload(request_id="req-c8", provider="claude", account_id="account-b"))
+        self.assertEqual("request_identity_conflict", ctx.exception.code)
+
+    def test_fingerprint_ignores_request_created_at(self):
+        """created_at is deliberately excluded from the fingerprint (see
+        compute_request_fingerprint()'s docstring): purely additive SLA
+        evidence, never identity -- an otherwise-identical resubmission must
+        stay a legitimate idempotent replay regardless of request_created_at."""
+        body = payload(request_id="req-c9")
+        first = handle_dispatch(self.store, self.service, self.registries.factory, body,
+                                request_created_at="2026-08-26T17:27:22Z")
+        second = handle_dispatch(self.store, self.service, self.registries.factory, body,
+                                 request_created_at="2026-08-26T17:36:52Z")
+        self.assertEqual(first, second)
+
+    def test_legacy_claim_record_without_fingerprint_still_replays_via_existing_checks(self):
+        """7: existing normal idempotency must be unchanged for a claim
+        record that predates this fingerprint field entirely -- it can never
+        prove a conflict (see manager.dispatch_requests._fingerprint_conflict()),
+        so a legacy record must fall through to _resolve_existing_claim's
+        pre-existing behavior exactly as before this fix."""
+        registry = self.registries.factory("p1", "req-c10")
+        internal_task_id = "dispatch-req-c10"
+        result = dispatcher_dispatch(self.store, self.service, {
+            "project_id": "p1", "task_id": internal_task_id, "title": "Legacy title",
+            "task_type": "general", "complexity": "medium", "needs_repo_edit": False,
+            "source_context": {"origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": "req-c10",
+                               "goal": "Legacy goal", "admission_version": ADMISSION_VERSION},
+        })
+        update_task(self.store, "p1", internal_task_id, priority="normal", read_only=True,
+                   execution_policies=sorted(REQUIRED_TASK_POLICIES))
+        command = {
+            "command_id": internal_task_id, "project_id": "p1", "task_id": internal_task_id,
+            "provider": result["provider"], "account_id": result.get("account_id"),
+            "requested_provider": None, "requested_account_id": None,
+            "model": result["model"], "fallback_model": result["fallback_model"],
+            "mode": result["mode"], "effort": result["effort"], "selection_reason": result["selection_reason"],
+            "quota_evidence": result["quota_evidence"], "created_at": now_iso(), "status": "queued",
+            "execution_id": None, "claimed_at": None, "completed_at": None, "result": None,
+            "created_via": TRUSTED_INGRESS_ORIGIN, "admission_version": ADMISSION_VERSION, "request_id": "req-c10",
+        }
+        validate("command", command)
+        self.store.put("commands", "p1", internal_task_id, command)
+        # A pre-fingerprint claim record: no "fingerprint" key at all.
+        registry.document = {
+            "schema_version": "0.1.0", "project_id": "p1", "request_id": "req-c10",
+            "task_id": internal_task_id, "command_id": internal_task_id, "created_at": now_iso(),
+        }
+        registry.generation = 1
+        # A DIFFERENT-content replay cannot be proven a conflict against a
+        # fingerprint-less legacy record -- it must fall through exactly as
+        # it did before this fix (idempotent replay, matching the existing
+        # Task/Command's content, not the new payload's).
+        replay = self.call(payload(request_id="req-c10", goal="A totally different goal"))
+        self.assertTrue(replay["accepted"])
+        self.assertEqual(internal_task_id, replay["task_id"])
 
 
 if __name__ == "__main__":

@@ -73,12 +73,14 @@ def dispatch_request_registry(bucket, project_id, request_id, session=None):
     return GCSLockRegistry(bucket, dispatch_request_object_name(project_id, request_id), session=session)
 
 
-def _new_record(project_id, request_id, task_id, command_id, created_at, request_created_at=None):
+def _new_record(project_id, request_id, task_id, command_id, created_at, request_created_at=None, fingerprint=None):
     for name, value in (("project_id", project_id), ("request_id", request_id), ("task_id", task_id), ("command_id", command_id), ("created_at", created_at)):
         if not isinstance(value, str) or not value.strip():
             raise TaskError(f"dispatch request claim requires a non-empty {name}")
     if request_created_at is not None and (not isinstance(request_created_at, str) or not request_created_at.strip()):
         raise TaskError("dispatch request claim's request_created_at must be a non-empty string or None")
+    if fingerprint is not None and (not isinstance(fingerprint, str) or not fingerprint.strip()):
+        raise TaskError("dispatch request claim's fingerprint must be a non-empty string or None")
     return {
         "schema_version": DISPATCH_REQUEST_SCHEMA_VERSION,
         "project_id": project_id, "request_id": request_id,
@@ -116,6 +118,18 @@ def _new_record(project_id, request_id, task_id, command_id, created_at, request
         # transitioned yet, so this starts equal to the observation moment,
         # and only mark_dispatch_request_status() ever advances it.
         "status_updated_at": created_at,
+        # Canonical payload-identity fingerprint (see cloud.dispatch_ingress.
+        # compute_request_fingerprint()): an opaque digest of every field
+        # that defines what this request_id actually MEANS (project_id,
+        # title, goal, repo_write, preferred_provider, account_id,
+        # priority, ...). Written once, in this same create-if-absent
+        # write, and never touched again by a retry -- same durability
+        # contract as ingress_first_observed_at/request_created_at above.
+        # None means the caller passed no fingerprint (a non-ingress
+        # caller, e.g. the retry-linkage path or a legacy pre-fingerprint
+        # record) -- see claim_dispatch_request()'s docstring for why that
+        # can never itself prove or disprove an identity conflict.
+        "fingerprint": fingerprint,
     }
 
 
@@ -150,9 +164,18 @@ def _validate_record(document, project_id, request_id):
     request_created_at = document.get("request_created_at")
     if request_created_at is not None and (not isinstance(request_created_at, str) or not request_created_at.strip()):
         raise TaskError("malformed dispatch request record: invalid request_created_at")
+    # Additive, optional (see _new_record()): absent on every record written
+    # before this change -- that must read back as None (fingerprint
+    # genuinely unknown), never as a guessed/defaulted value, since a wrong
+    # guess here could either mask a real identity conflict or manufacture
+    # a false one.
+    fingerprint = document.get("fingerprint")
+    if fingerprint is not None and not isinstance(fingerprint, str):
+        raise TaskError("malformed dispatch request record: invalid fingerprint")
     return {**document, "status": status, "failure_reason": failure_reason,
             "ingress_first_observed_at": ingress_first_observed_at,
-            "status_updated_at": status_updated_at, "request_created_at": request_created_at}
+            "status_updated_at": status_updated_at, "request_created_at": request_created_at,
+            "fingerprint": fingerprint}
 
 
 def _resolve_conflict(registry, project_id, request_id):
@@ -165,7 +188,7 @@ def _resolve_conflict(registry, project_id, request_id):
     return {**_validate_record(current, project_id, request_id), "generation": generation}
 
 
-def _resolve_ambiguous(registry, record, attempts):
+def _resolve_ambiguous(registry, record, attempts, fingerprint=None):
     """create_if_absent raised something other than a definite 412 (timeout,
     connection error, 5xx mid-write): the server-side outcome of *this very
     call* is unknown. Re-read and self-recognize instead of assuming either
@@ -182,6 +205,13 @@ def _resolve_ambiguous(registry, record, attempts):
     only overwrites the same Drive file, it never produces a second one.
     Only a definite precondition failure (_resolve_conflict, a real 412)
     proves a distinct prior winner and returns `claimed: False`.
+
+    "Indistinguishable" above is about the (task_id, command_id) identity
+    only -- it says nothing about CONTENT. If the record found on re-read
+    carries a fingerprint that differs from `fingerprint` (this call's own
+    candidate), that is a genuine, provable identity conflict even though
+    `claimed` is still True here (the caller must check `identity_conflict`
+    itself, independent of `claimed` -- see claim_dispatch_request()).
     """
     for _ in range(attempts):
         try:
@@ -191,19 +221,35 @@ def _resolve_ambiguous(registry, record, attempts):
         if existing is None:
             try:
                 generation = registry.create_if_absent(record)
-                return {**record, "generation": generation, "claimed": True, "created_by_this_call": True}
+                return {**record, "generation": generation, "claimed": True, "created_by_this_call": True,
+                        "identity_conflict": False}
             except (RegistryConflict, TaskError):
                 continue
         else:
             current, generation, _ = existing
             # A timeout after create is intentionally not rollback-eligible:
             # the matching record could have been created by another caller.
-            return {**_validate_record(current, record["project_id"], record["request_id"]), "generation": generation, "claimed": True, "created_by_this_call": False}
+            resolved = _validate_record(current, record["project_id"], record["request_id"])
+            return {**resolved, "generation": generation, "claimed": True, "created_by_this_call": False,
+                    "identity_conflict": _fingerprint_conflict(resolved.get("fingerprint"), fingerprint)}
     raise TaskError("dispatch request ambiguous create outcome did not resolve after retries; failing closed")
 
 
+def _fingerprint_conflict(existing_fingerprint, incoming_fingerprint):
+    """True only when BOTH sides carry a real, non-None fingerprint and they
+    differ. A missing fingerprint on either side -- a legacy claim record
+    written before this field existed, or a caller (e.g. the retry-linkage
+    path) that computed none -- can never itself prove a conflict: absence
+    of evidence is not evidence of a mismatch, and guessing in either
+    direction would either mask a real conflict or manufacture a false one
+    for a perfectly legitimate legacy replay. See claim_dispatch_request()'s
+    docstring for how a caller must react to this."""
+    return (existing_fingerprint is not None and incoming_fingerprint is not None
+            and existing_fingerprint != incoming_fingerprint)
+
+
 def claim_dispatch_request(registry, project_id, request_id, task_id, command_id, created_at,
-                           attempts=DEFAULT_AMBIGUOUS_ATTEMPTS, request_created_at=None):
+                           attempts=DEFAULT_AMBIGUOUS_ATTEMPTS, request_created_at=None, fingerprint=None):
     """Atomically claim exactly one (task_id, command_id) identity for one
     external request_id.
 
@@ -226,15 +272,44 @@ def claim_dispatch_request(registry, project_id, request_id, task_id, command_id
     _new_record()). `request_created_at`, if given, is the request's own
     separately-declared created_at (e.g. from its Drive JSON body) -- purely
     additive evidence, never used as the SLA start point.
+
+    `fingerprint`, if given, is an opaque caller-computed digest of this
+    request_id's CONTENT (see cloud.dispatch_ingress.compute_request_
+    fingerprint()). Drive's own filename+request_id are NOT a proof of
+    identity by themselves: two distinct Drive files can carry the exact
+    same request_id with materially different content (different title,
+    goal, repo_write, provider, ...), and this primitive's own (task_id,
+    command_id) is deterministic from request_id alone, so without a content
+    fingerprint a second, different payload for the same request_id would be
+    indistinguishable from a legitimate retry of the first.
+
+    The returned dict always carries `identity_conflict` (bool). It is True
+    exactly when this call's own `fingerprint` differs from the fingerprint
+    already durably recorded under this request_id -- independent of
+    `claimed` (a real 412 conflict resolves `claimed: False` with a possible
+    identity_conflict; the ambiguous-retry self-recognition path can resolve
+    `claimed: True` with a possible identity_conflict too, since it may have
+    discovered a DIFFERENT prior claimant's record, not necessarily its own).
+    `identity_conflict` is always False when either side's fingerprint is
+    None (this call passed none, or the existing record predates this field)
+    -- see _fingerprint_conflict()'s own docstring for why that can never be
+    inferred as a conflict. A caller that cares about content identity
+    (cloud.dispatch_ingress.handle_dispatch()) MUST check `identity_conflict`
+    before trusting `claimed`/`created_by_this_call` for anything, and must
+    never create or reuse a Task/Command when it is True.
     """
-    record = _new_record(project_id, request_id, task_id, command_id, created_at, request_created_at=request_created_at)
+    record = _new_record(project_id, request_id, task_id, command_id, created_at,
+                         request_created_at=request_created_at, fingerprint=fingerprint)
     try:
         generation = registry.create_if_absent(record)
-        return {**record, "generation": generation, "claimed": True, "created_by_this_call": True}
+        return {**record, "generation": generation, "claimed": True, "created_by_this_call": True,
+                "identity_conflict": False}
     except RegistryConflict:
-        return {**_resolve_conflict(registry, project_id, request_id), "claimed": False, "created_by_this_call": False}
+        resolved = _resolve_conflict(registry, project_id, request_id)
+        return {**resolved, "claimed": False, "created_by_this_call": False,
+                "identity_conflict": _fingerprint_conflict(resolved.get("fingerprint"), fingerprint)}
     except TaskError:
-        return _resolve_ambiguous(registry, record, attempts)
+        return _resolve_ambiguous(registry, record, attempts, fingerprint=fingerprint)
 
 
 def release_dispatch_request_claim(registry, project_id, request_id, task_id, command_id, generation):

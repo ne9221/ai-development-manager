@@ -9,15 +9,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
+from unittest.mock import patch
+
 import manager.drive_dispatch_ingress as drive_dispatch_ingress
 from cloud.dispatch_ingress import DispatchIngressError
+from cloud.test_dispatch_ingress import SharedMemoryRegistries
 from manager.drive_dispatch_ingress import (
     DEFAULT_FAIRNESS_SLICES, DEFAULT_MAX_METADATA_PAGES, FOLDER_NAME, METADATA_FIELDS,
     _fairness_bucket_bounds, _fairness_rotation_slot, _modified_time_indicates_stale,
     _request_files, poll_drive_dispatch_requests, read_request, verify_ingress_folder,
 )
-from manager.tasks import MIME_FOLDER, MIME_JSON, TaskError
+from manager.tasks import DriveRecords, MIME_FOLDER, MIME_JSON, TaskError, create_project
+from manager.test_dispatcher import quota as quota_fixture
 from manager.test_task_claims import MemoryClaimRegistry
+from manager.test_tasks import FakeDriveService
 
 
 OWNER = "owner@example.com"
@@ -1004,6 +1009,151 @@ class DriveDispatchIngressBoundedTests(unittest.TestCase):
             del os.environ["ADM_DRIVE_DISPATCH_INGRESS_OWNER"]
         self.assertEqual(["req-0"], order)
         self.assertTrue(results[0]["accepted"])
+
+
+class SharedRejectionRegistries:
+    """Test double for a GCS-backed rejection_registry_factory: a fresh
+    wrapper per call, state shared per file_id -- mirroring how a real
+    dispatch_rejection_registry() always points at the same
+    `dispatch-rejections/<file_id>.json` object across separate
+    constructions."""
+    def __init__(self):
+        self.registries = {}
+
+    def factory(self, _bucket, file_id):
+        if file_id not in self.registries:
+            self.registries[file_id] = MemoryClaimRegistry()
+        return self.registries[file_id]
+
+
+class DriveIdentityConflictIntegrationTests(unittest.TestCase):
+    """P0 fix/request-identity-conflict-20260827: end-to-end proof, through
+    the REAL (unmocked) handle_dispatch(), that two Drive files sharing a
+    filename/request_id but carrying materially different content -- exactly
+    what was found live in production for global-crossproject-outlook-mail-
+    v6-20260826-01 (two distinct file_ids, one uploaded ~10 minutes after the
+    other, same request_id, different goal/allowed_paths) -- are handled
+    deterministically: exactly one Task/Command is ever created, and the
+    other candidate's own file_id carries a durable, explicit
+    request_identity_conflict rejection rather than being silently absorbed
+    or silently reinterpreted."""
+
+    def setUp(self):
+        self.store = DriveRecords(FakeDriveService())
+        create_project(self.store, {
+            "project_id": "ai-development-manager", "name": "ADM", "repo": "https://github.com/example/adm",
+            "default_branch": "main", "runtime_ssot": "Drive", "project_rules": [], "active_tasks": [],
+            "current_phase": "Phase 1", "important_constraints": [],
+        })
+        self.quota_patch = patch("manager.dispatcher.read_drive_status", return_value=quota_fixture())
+        self.quota_patch.start()
+
+    def tearDown(self):
+        self.quota_patch.stop()
+
+    def _poll(self, items):
+        service = MultiService(items)
+        registries = SharedMemoryRegistries()
+        rejections = SharedRejectionRegistries()
+        results = poll_drive_dispatch_requests(
+            self.store, service, "bucket", FOLDER_ID, OWNER, NOW,
+            # poll_drive_dispatch_requests's own registry_factory contract is
+            # (bucket, project_id, request_id) -- unlike handle_dispatch's
+            # inner lock_registry_factory(project_id, request_id), which is
+            # what SharedMemoryRegistries.factory (imported from
+            # cloud.test_dispatch_ingress) actually implements. Adapt here
+            # rather than duplicating that shared-state double.
+            registry_factory=lambda _bucket, project_id, request_id: registries.factory(project_id, request_id),
+            rejection_registry_factory=rejections.factory)
+        return results, rejections
+
+    def test_two_distinct_file_ids_same_request_id_different_content_is_deterministic(self):
+        """6: two Drive files, same name/request_id, distinct file IDs,
+        materially different goal -- exactly one wins (whichever this poll's
+        (deterministic, given fixed input ordering) scan reaches first), the
+        other is durably, visibly rejected under its OWN file_id with
+        request_identity_conflict, and re-running the identical poll again
+        produces the identical outcome (not a coin flip)."""
+        first_time = NOW - timedelta(minutes=10)
+        second_time = NOW - timedelta(minutes=1)
+        items = [
+            make_item("file-A", "collide-v6", first_time,
+                      extra={"title": "Add a comment to render()", "goal": "Add a short documentation comment only."}),
+            make_item("file-B", "collide-v6", second_time,
+                      extra={"title": "Fix usedTokens() whitespace bug", "goal": "Fix the multi-word token bug."}),
+        ]
+        results, rejections = self._poll(items)
+        self.assertEqual(2, len(results))
+
+        accepted = [r for r in results if r["accepted"]]
+        rejected = [r for r in results if not r["accepted"]]
+        self.assertEqual(1, len(accepted), "exactly one of the two colliding files must be admitted")
+        self.assertEqual(1, len(rejected), "the other must be rejected, never silently merged")
+
+        winner_file_id, loser_file_id = accepted[0]["file_id"], rejected[0]["file_id"]
+        self.assertEqual({"file-A", "file-B"}, {winner_file_id, loser_file_id})
+
+        # Exactly one Task/Command exists for the shared request_id, and its
+        # content belongs to whichever file actually won -- never a blend,
+        # never the loser's content silently substituted in.
+        task = self.store.get("tasks", "ai-development-manager", "dispatch-collide-v6")
+        winner_goal = task["source_context"]["goal"]
+        self.assertIn(winner_goal, ("Add a short documentation comment only.", "Fix the multi-word token bug."))
+
+        # The loser's own file_id carries a durable, explicit, correctly-
+        # reasoned rejection -- visible on its own identity, not folded into
+        # the winner's outcome and not silently dropped.
+        loser_rejection = rejections.registries[loser_file_id].document
+        self.assertIsNotNone(loser_rejection)
+        self.assertEqual("rejected", loser_rejection["status"])
+        self.assertEqual("request_identity_conflict", loser_rejection["reason_code"])
+        self.assertEqual(loser_file_id, loser_rejection["file_id"])
+        # The winner's own file_id must never have been rejected.
+        self.assertIsNone(rejections.registries.get(winner_file_id, MemoryClaimRegistry()).document)
+
+        # Determinism: an identical second poll of the exact same two
+        # candidates reproduces the exact same winner/loser split, not a
+        # fresh coin flip -- the durable GCS claim record (keyed only by
+        # request_id, not file_id) is what actually decides this, and it
+        # does not change between polls.
+        results2, _rejections2 = self._poll(items)
+        accepted2 = [r for r in results2 if r["accepted"]]
+        self.assertEqual(1, len(accepted2))
+        self.assertEqual(winner_file_id, accepted2[0]["file_id"])
+
+    def test_rejected_candidate_then_conflicting_valid_payload_is_visible_not_reinterpreted(self):
+        """5: a first candidate for a request_id is rejected for an unrelated
+        reason BEFORE ever reaching the idempotency claim (here: an unknown
+        project_id -- mirrors the live incident, where the losing file was
+        rejected for a repo-identity mismatch, one layer before the claim
+        registry). A second, different, VALID payload under the exact same
+        request_id then arrives and is legitimately admitted (nothing else
+        ever claimed that request_id first). This must remain fully visible
+        as two distinct outcomes -- the rejection durably recorded under its
+        own file_id with its own honest reason -- never silently collapsed
+        into "this request_id has always cleanly meant one thing."""
+        first_time = NOW - timedelta(minutes=10)
+        second_time = NOW - timedelta(minutes=1)
+        items = [
+            make_item("file-rejected", "collide-v6-partial", first_time,
+                      extra={"project_id": "not-a-registered-project"}),
+            make_item("file-valid", "collide-v6-partial", second_time,
+                      extra={"project_id": "ai-development-manager"}),
+        ]
+        results, rejections = self._poll(items)
+        by_file = {r["file_id"]: r for r in results}
+        self.assertFalse(by_file["file-rejected"]["accepted"])
+        self.assertTrue(by_file["file-valid"]["accepted"])
+
+        first_rejection = rejections.registries["file-rejected"].document
+        self.assertIsNotNone(first_rejection)
+        self.assertEqual("unknown_project", first_rejection["reason_code"])
+
+        task = self.store.get("tasks", "ai-development-manager", "dispatch-collide-v6-partial")
+        self.assertEqual("ai-development-manager", task["project_id"])
+        # The earlier rejection remains readable on its own file_id -- the
+        # later admission never erases or reclassifies it.
+        self.assertEqual("unknown_project", rejections.registries["file-rejected"].document["reason_code"])
 
 
 if __name__ == "__main__": unittest.main()

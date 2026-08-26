@@ -4,6 +4,7 @@ proven approach against an in-memory double of the GCS transport."""
 
 import threading
 import unittest
+from copy import deepcopy
 from unittest.mock import MagicMock
 
 from manager.dispatch_requests import (
@@ -234,6 +235,151 @@ class DispatchRequestClaimTests(unittest.TestCase):
         self.assertEqual("2026-08-16T00:00:00Z", status["ingress_first_observed_at"])
         self.assertEqual("2026-08-16T00:00:00Z", status["status_updated_at"])
         self.assertIsNone(status["request_created_at"])
+
+
+class ClaimFingerprintTests(unittest.TestCase):
+    """P0 fix/request-identity-conflict-20260827: claim_dispatch_request()'s
+    optional `fingerprint` parameter and the `identity_conflict` flag it
+    adds to every returned dict. See cloud.dispatch_ingress.
+    compute_request_fingerprint() for how a real caller computes this from
+    a validated payload; these tests exercise the low-level CAS primitive
+    directly with opaque fingerprint strings."""
+
+    def test_first_claim_with_fingerprint_reports_no_conflict(self):
+        registry = MemoryClaimRegistry()
+        result = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1",
+                                        "2026-08-24T00:00:00Z", fingerprint="fp-a")
+        self.assertTrue(result["claimed"])
+        self.assertFalse(result["identity_conflict"])
+        self.assertEqual("fp-a", result["fingerprint"])
+
+    def test_replay_with_identical_fingerprint_is_not_a_conflict(self):
+        """1: same request_id + same fingerprint => idempotent PASS."""
+        registry = MemoryClaimRegistry()
+        claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1",
+                               "2026-08-24T00:00:00Z", fingerprint="fp-a")
+        replay = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1",
+                                        "2026-08-24T00:00:05Z", fingerprint="fp-a")
+        self.assertFalse(replay["claimed"])
+        self.assertFalse(replay["identity_conflict"])
+
+    def test_replay_with_different_fingerprint_is_a_conflict(self):
+        """2/3/4 (generalized): same request_id + different fingerprint =>
+        identity_conflict True, claimed False -- the caller must never treat
+        this as success or fall through to normal replay resolution."""
+        registry = MemoryClaimRegistry()
+        claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1",
+                               "2026-08-24T00:00:00Z", fingerprint="fp-a")
+        conflicting = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1",
+                                             "2026-08-24T00:00:05Z", fingerprint="fp-b")
+        self.assertFalse(conflicting["claimed"])
+        self.assertTrue(conflicting["identity_conflict"])
+        # The winning claim's own fingerprint must remain the ORIGINAL,
+        # never overwritten by the conflicting attempt.
+        self.assertEqual("fp-a", conflicting["fingerprint"])
+
+    def test_legacy_record_without_fingerprint_never_reports_a_conflict(self):
+        """7: existing normal idempotency unchanged -- a claim record
+        written before this field existed has fingerprint=None, which can
+        never itself prove a conflict (see _fingerprint_conflict()'s own
+        docstring), regardless of what fingerprint a later caller passes."""
+        registry = MemoryClaimRegistry()
+        registry.document = {"schema_version": "0.1.0", "project_id": "p1", "request_id": "req-legacy",
+                              "task_id": "dispatch-req-legacy", "command_id": "dispatch-req-legacy",
+                              "created_at": "2026-08-16T00:00:00Z"}
+        registry.generation = 1
+        result = claim_dispatch_request(registry, "p1", "req-legacy", "dispatch-req-legacy",
+                                        "dispatch-req-legacy", "2026-08-24T00:00:00Z", fingerprint="fp-new")
+        self.assertFalse(result["claimed"])
+        self.assertFalse(result["identity_conflict"])
+        self.assertIsNone(result["fingerprint"])
+
+    def test_caller_with_no_fingerprint_never_reports_a_conflict(self):
+        """A caller that never computes a fingerprint at all (fingerprint=
+        None, the default -- e.g. any non-ingress caller of this primitive)
+        must behave exactly as before this fix: no conflict signal, ever."""
+        registry = MemoryClaimRegistry()
+        claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1",
+                               "2026-08-24T00:00:00Z", fingerprint="fp-a")
+        replay = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1",
+                                        "2026-08-24T00:00:05Z")
+        self.assertFalse(replay["claimed"])
+        self.assertFalse(replay["identity_conflict"])
+
+    def test_ambiguous_create_discovering_a_different_prior_claimant_is_a_conflict(self):
+        """The ambiguous-create self-recognition path (create_if_absent
+        raises a transport-level error whose real server-side outcome is
+        unknown, so the code re-reads to self-recognize) must also detect a
+        fingerprint mismatch when what it discovers on re-read is a
+        DIFFERENT prior claimant's record -- not just the definite-412 path
+        (MemoryClaimRegistry's create_if_absent always raises a definite
+        RegistryConflict, never an ambiguous error, once a document already
+        exists -- matching real GCS's own definite-412 behavior when the
+        server actually processes the precondition -- so a dedicated fake
+        registry is needed here to model a transport failure whose ambiguity
+        is genuine: the object already existed, but the client itself never
+        learned that). `claimed` is True in this branch (see
+        _resolve_ambiguous's own docstring for why), so a caller MUST check
+        identity_conflict independently of claimed, never only when claimed
+        is False."""
+        winner = claim_dispatch_request(MemoryClaimRegistry(), "p1", "req-1", "dispatch-req-1",
+                                        "dispatch-req-1", "2026-08-24T00:00:00Z", fingerprint="fp-a")
+        existing_record = {key: value for key, value in winner.items()
+                           if key not in ("generation", "claimed", "created_by_this_call", "identity_conflict")}
+
+        class AmbiguousCreateFindsOtherClaimant:
+            """create_if_absent always raises a transport-level TaskError
+            (as if the object already existed server-side but the response
+            never reached this client); read_if_exists always successfully
+            returns the real prior winner's record."""
+            def create_if_absent(self, _document):
+                raise TaskError("simulated ambiguous transport failure")
+
+            def read_if_exists(self):
+                return deepcopy(existing_record), 1, None
+
+        result = claim_dispatch_request(AmbiguousCreateFindsOtherClaimant(), "p1", "req-1", "dispatch-req-1",
+                                        "dispatch-req-1", "2026-08-24T00:05:00Z", fingerprint="fp-b")
+        self.assertTrue(result["claimed"])
+        self.assertTrue(result["identity_conflict"])
+        self.assertEqual("fp-a", result["fingerprint"])
+
+    def test_ambiguous_create_self_recognizing_own_success_is_never_a_conflict(self):
+        """The pre-existing "ambiguous create actually landed" case (this
+        call's OWN write succeeded server-side but the client saw a
+        transport error) must never be misread as a conflict against
+        itself: fingerprint round-trips identically."""
+        registry = MemoryClaimRegistry()
+        registry.ambiguous_queue.append(ConnectionError("simulated client timeout after server-side success"))
+        result = claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1", "dispatch-req-1",
+                                        "2026-08-24T00:00:00Z", fingerprint="fp-a")
+        self.assertTrue(result["claimed"])
+        self.assertFalse(result["identity_conflict"])
+
+    def test_two_concurrent_different_fingerprint_requests_have_one_claimant_and_one_conflict(self):
+        """6 (generalized to the primitive level): two concurrent
+        submissions of the same request_id with DIFFERENT fingerprints --
+        standing in for two distinct Drive file IDs racing each other --
+        resolve deterministically to exactly one claimant and exactly one
+        conflict, never two claimants and never a silent merge."""
+        for _ in range(20):
+            registry = MemoryClaimRegistry()
+            barrier = threading.Barrier(2)
+            results = []
+
+            def run(fp):
+                barrier.wait(timeout=2)
+                results.append(claim_dispatch_request(registry, "p1", "req-1", "dispatch-req-1",
+                                                       "dispatch-req-1", "2026-08-17T00:00:00Z", fingerprint=fp))
+
+            threads = [threading.Thread(target=run, args=(fp,)) for fp in ("fp-a", "fp-b")]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join(timeout=3)
+            self.assertEqual(2, len(results))
+            winners = [r for r in results if r["claimed"] and not r["identity_conflict"]]
+            conflicts = [r for r in results if r["identity_conflict"]]
+            self.assertEqual(1, len(winners))
+            self.assertEqual(1, len(conflicts))
 
 
 def _fake_session(status_code=200, items=None, raise_exc=None, next_page_token=None):
