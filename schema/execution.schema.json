@@ -138,6 +138,30 @@
       "description": "Bounded terminal cleanup audit; never contains a lease token."
     },
     "notes": {"type": "array", "items": {"type": "string"}},
-    "task_snapshot": {"type": "object"}
+    "task_snapshot": {"type": "object"},
+    "required_capabilities": {
+      "type": "array", "items": {"type": "string", "minLength": 1},
+      "description": "Named capabilities (e.g. writing-for-agents) the task classifier determined this task requires."
+    },
+    "resolved_capabilities": {
+      "type": "array", "items": {"type": "string", "minLength": 1},
+      "description": "Subset of required_capabilities actually available for the selected provider."
+    },
+    "provider_capability_availability": {
+      "type": "object",
+      "description": "Per-capability resolution detail for the selected provider (availability, mechanism, source version, verification, reason)."
+    },
+    "actual_capability_source_version": {
+      "type": ["string", "null"],
+      "description": "Pinned source ref/version of the capability actually used, if resolved."
+    },
+    "capability_resolution_status": {
+      "enum": ["not_required", "resolved", "partially_resolved", "unavailable", "unsupported_provider", null],
+      "description": "Outcome of capability resolution for this execution's provider."
+    },
+    "capability_fallback_reason": {
+      "type": ["string", "null"],
+      "description": "Truthful reason when a required capability could not be resolved for the provider; never fabricated success."
+    }
   }
 }

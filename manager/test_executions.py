@@ -633,4 +633,46 @@ class ListExecutionsBoundedTests(unittest.TestCase):
         self.assertIn(result["confidence"], ("low", "medium"))
 
 
+def agent_facing_task():
+    value = task()
+    value.update(task_id="t-agents-md", title="Update AGENTS.md with the new dispatch rule", scope=["AGENTS.md"])
+    return value
+
+
+class CapabilityWiringExecutionTests(unittest.TestCase):
+    """manager/capabilities.py wiring into reserve_execution(): capability
+    resolution evidence is recorded on the execution record itself, and the
+    idempotency comparison in reserve_execution() covers it like any other
+    expected field."""
+
+    def setUp(self):
+        self.store = MemoryStore()
+        create_task(self.store, agent_facing_task(), assign=False)
+        create_task(self.store, task(), assign=False)
+
+    def test_reserve_records_capability_evidence_for_agent_facing_task(self):
+        with patch("manager.executions.read_drive_status"):
+            reserved = reserve_execution(self.store, "p1", "t-agents-md", "reserved-caps", "codex", decision())
+        self.assertEqual(["writing-for-agents"], reserved["required_capabilities"])
+        self.assertEqual(["writing-for-agents"], reserved["resolved_capabilities"])
+        self.assertEqual("resolved", reserved["capability_resolution_status"])
+        self.assertEqual("0ab1b63a410a03d3627979a109c8695de27af954", reserved["actual_capability_source_version"])
+        self.assertIsNone(reserved["capability_fallback_reason"])
+        validate("execution", reserved)
+
+    def test_reserve_records_not_required_for_ordinary_task(self):
+        with patch("manager.executions.read_drive_status"):
+            reserved = reserve_execution(self.store, "p1", "t1", "reserved-ordinary", "codex", decision())
+        self.assertEqual([], reserved["required_capabilities"])
+        self.assertEqual([], reserved["resolved_capabilities"])
+        self.assertEqual("not_required", reserved["capability_resolution_status"])
+        validate("execution", reserved)
+
+    def test_reserve_idempotency_covers_capability_fields(self):
+        with patch("manager.executions.read_drive_status"):
+            first = reserve_execution(self.store, "p1", "t-agents-md", "reserved-caps-2", "codex", decision())
+            second = reserve_execution(self.store, "p1", "t-agents-md", "reserved-caps-2", "codex", decision())
+        self.assertEqual(first, second)
+
+
 if __name__ == "__main__": unittest.main()
