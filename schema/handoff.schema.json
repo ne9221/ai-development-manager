@@ -3,7 +3,7 @@
   "title": "AI Development Manager Handoff",
   "type": "object",
   "additionalProperties": false,
-  "required": ["handoff_id", "task_id", "project_id", "created_at", "from_provider", "to_provider", "from_session", "reason", "completed_work", "current_state", "files_changed", "commits", "tests", "known_issues", "do_not_touch", "next_action", "acceptance_criteria", "minimal_context", "feature_branch", "push_status", "worktree_path", "remote_sha"],
+  "required": ["handoff_id", "task_id", "project_id", "created_at", "from_provider", "to_provider", "from_session", "reason", "completed_work", "current_state", "files_changed", "commits", "tests", "known_issues", "do_not_touch", "next_action", "acceptance_criteria", "minimal_context", "feature_branch", "push_status", "worktree_path", "remote_sha", "test_evidence_status"],
   "properties": {
     "handoff_id": {"type": "string", "minLength": 1},
     "task_id": {"type": "string", "minLength": 1},
@@ -27,6 +27,7 @@
     "feature_branch": {"type": ["string", "null"], "description": "Repo-write terminal evidence: the actual pushed feature branch, verified against the remote; null when no such evidence exists."},
     "push_status": {"type": ["string", "null"], "description": "\"verified\" only when an independent remote readback proved the branch was pushed and matched the local final commit exactly; null when no such evidence exists."},
     "worktree_path": {"type": ["string", "null"], "description": "The isolated worktree path the repo-write execution actually ran in; null when no such evidence exists."},
-    "remote_sha": {"type": ["string", "null"], "description": "The remote branch's SHA at readback time, proven equal to the local final commit SHA; null when no such evidence exists."}
+    "remote_sha": {"type": ["string", "null"], "description": "The remote branch's SHA at readback time, proven equal to the local final commit SHA; null when no such evidence exists."},
+    "test_evidence_status": {"enum": ["unknown", "reported", null], "description": "\"reported\" only when a structured test/check evidence source was actually supplied; \"unknown\" when repo_write_evidence exists but no such source was available (an empty `tests` list must never be read as a verified absence of tests); null when no repo_write_evidence exists at all."}
   }
 }

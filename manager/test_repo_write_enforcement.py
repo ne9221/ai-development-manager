@@ -305,7 +305,7 @@ def test_capture_repo_write_evidence_verified_push(repo_with_origin):
     assert evidence == {
         "files_changed": ["manager/foo.py"], "commits": [final_sha], "final_commit_sha": final_sha,
         "branch": "main", "worktree_path": str(repo_with_origin["path"]), "push_status": "verified",
-        "remote_sha": final_sha, "tests": [],
+        "remote_sha": final_sha, "tests": [], "test_evidence_status": "unknown",
     }
 
 
@@ -348,3 +348,94 @@ def test_capture_repo_write_evidence_fails_closed_with_no_origin_configured(repo
 
     with pytest.raises(TaskError):
         capture_repo_write_evidence(repo["path"], repo["baseline"], "refs/heads/main", ["manager/foo.py"])
+
+
+# --- P0-1: fail-closed terminal success evidence (real change required) -----
+
+def test_capture_repo_write_evidence_fails_closed_on_baseline_only_push(repo_with_origin):
+    """Scenario A: provider pushes its feature branch, but it still points at
+    baseline_head -- nothing was ever committed. A remote readback alone
+    would call this "verified" (the pushed branch really does match local
+    HEAD); this must fail closed because HEAD never advanced past baseline
+    and there is no commit history at all."""
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    with pytest.raises(TaskError) as exc:
+        capture_repo_write_evidence(repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", [])
+    assert "refusing to record terminal success evidence" in str(exc.value).lower()
+
+
+def test_capture_repo_write_evidence_fails_closed_on_empty_commit_zero_files(repo_with_origin):
+    """Scenario B: provider makes and pushes an empty commit -- HEAD advances
+    and commit history is non-empty, but zero files actually changed. Must
+    still fail closed: a real change is required, not just a new commit
+    SHA."""
+    _git(repo_with_origin["path"], "commit", "--allow-empty", "-m", "empty commit, no real change")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    with pytest.raises(TaskError) as exc:
+        capture_repo_write_evidence(repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", [])
+    assert "files_changed" in str(exc.value).lower() or "changed file" in str(exc.value).lower()
+
+
+def test_capture_repo_write_evidence_fails_closed_on_uncommitted_change(repo_with_origin):
+    """Scenario C: provider modifies an allowed file but never commits it.
+    The change is real and visible (files_changed is non-empty), and the
+    branch may even have been pushed -- but since nothing was committed,
+    HEAD is still baseline_head and commit history is empty. Must fail
+    closed rather than accept an uncommitted working-tree edit as terminal
+    success evidence."""
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed but never committed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    with pytest.raises(TaskError) as exc:
+        capture_repo_write_evidence(
+            repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+        )
+    assert "commit" in str(exc.value).lower() or "baseline" in str(exc.value).lower()
+
+
+def test_capture_repo_write_evidence_real_commit_and_push_still_passes(repo_with_origin):
+    """Scenario D: a real, in-scope committed and pushed change must still
+    pass -- the new fail-closed checks must not regress the legitimate
+    success path."""
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("real change\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "commit", "-am", "real committed change")
+    final_sha = _git(repo_with_origin["path"], "rev-parse", "HEAD")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    evidence = capture_repo_write_evidence(
+        repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+    )
+    assert evidence["files_changed"] == ["manager/foo.py"]
+    assert evidence["commits"] == [final_sha]
+    assert evidence["final_commit_sha"] == final_sha
+    assert evidence["final_commit_sha"] != repo_with_origin["baseline"]
+    assert evidence["remote_sha"] == final_sha
+
+
+# --- P0-2: test evidence truth (unknown vs. reported, never fabricated) ----
+
+def test_capture_repo_write_evidence_test_status_unknown_when_not_supplied(repo_with_origin):
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "commit", "-am", "edit foo")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    evidence = capture_repo_write_evidence(
+        repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+    )
+    assert evidence["tests"] == []
+    assert evidence["test_evidence_status"] == "unknown"
+
+
+def test_capture_repo_write_evidence_test_status_reported_when_supplied(repo_with_origin):
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "commit", "-am", "edit foo")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    evidence = capture_repo_write_evidence(
+        repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+        test_evidence=["pytest manager/test_foo.py::test_x PASSED"],
+    )
+    assert evidence["tests"] == ["pytest manager/test_foo.py::test_x PASSED"]
+    assert evidence["test_evidence_status"] == "reported"

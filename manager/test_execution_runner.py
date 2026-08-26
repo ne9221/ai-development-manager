@@ -1195,8 +1195,9 @@ class WorkingDirectoryContractTests(unittest.TestCase):
             return dict(materialized_result)
 
         fake_evidence = {
-            "files_changed": [], "commits": [], "final_commit_sha": HEAD, "branch": "adm-worktree/p1/t1",
+            "files_changed": ["manager/executions.py"], "commits": [HEAD], "final_commit_sha": HEAD, "branch": "adm-worktree/p1/t1",
             "worktree_path": materialized, "push_status": "verified", "remote_sha": HEAD, "tests": [],
+            "test_evidence_status": "unknown",
         }
         with patch("manager.execution_runner.get_global_registry") as get_registry, \
              patch("manager.execution_runner.materialize_worktree", side_effect=fake_materialize) as materialize, \

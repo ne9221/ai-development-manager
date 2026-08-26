@@ -209,19 +209,39 @@ def capture_repo_write_evidence(working_directory, baseline_head: str, branch: s
     branch was actually pushed and exactly matches the local HEAD -- never a
     provider's self-reported "Commit SHA:"/"GitHub push status:" text.
 
+    A real, committed, in-scope change is required, never inferred from the
+    branch's mere existence on the remote: `files_changed` must be non-empty
+    (some real path actually changed), `commits` must be non-empty and its
+    final entry must equal `final_commit_sha` (the worktree actually
+    committed, not just edited its working tree), and `final_commit_sha` must
+    differ from `baseline_head` (HEAD actually advanced). A branch pushed
+    while still pointing at baseline_head, an empty commit with zero changed
+    files, and an uncommitted working-tree edit all fail closed here even
+    though a remote-readback query alone could not distinguish any of them
+    from a genuine push.
+
     `test_evidence` is preserved verbatim when the caller supplies it (e.g.
     from a provider's structured completion report); it is never inferred or
-    fabricated when omitted, so a missing test-evidence source stays an
-    empty list rather than a guessed one.
+    fabricated when omitted. `test_evidence_status` records whether a
+    structured test-evidence source was actually available ("reported") or
+    not ("unknown") -- an empty `tests` list is otherwise ambiguous between
+    "zero tests were required/run" and "nobody checked"; a caller must never
+    let a missing source read as a verified absence of tests.
 
     Raises TaskError -- never returns partial evidence with an unverified
-    push -- on any git or remote-readback failure, so a caller can downgrade
-    the execution to failed instead of ever persisting invented success
-    evidence.
+    push or an unadvanced/uncommitted/no-op HEAD -- on any such failure, so a
+    caller can downgrade the execution to failed instead of ever persisting
+    invented success evidence.
     """
+    if not files_changed:
+        raise TaskError("repo-write execution recorded no changed files; refusing to record terminal success evidence")
     commits = collect_commit_shas(working_directory, baseline_head, runner=runner)
+    if not commits:
+        raise TaskError("repo-write execution has no commits since baseline_head; refusing to record terminal success evidence")
     final_commit_sha = current_head_sha(working_directory, runner=runner)
-    if commits and commits[-1] != final_commit_sha:
+    if final_commit_sha == baseline_head:
+        raise TaskError("repo-write execution HEAD did not advance past baseline_head; refusing to record terminal success evidence")
+    if commits[-1] != final_commit_sha:
         raise TaskError("final commit SHA does not match the tip of the collected commit history")
     branch_short = branch[len("refs/heads/"):] if branch.startswith("refs/heads/") else branch
     readback = verify_remote_branch_matches(working_directory, branch_short, final_commit_sha, runner=runner)
@@ -230,4 +250,5 @@ def capture_repo_write_evidence(working_directory, baseline_head: str, branch: s
         "branch": branch_short, "worktree_path": str(working_directory),
         "push_status": "verified", "remote_sha": readback["remote_sha"],
         "tests": list(test_evidence) if test_evidence else [],
+        "test_evidence_status": "reported" if test_evidence is not None else "unknown",
     }

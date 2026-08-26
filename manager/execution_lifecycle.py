@@ -302,6 +302,7 @@ def _terminal_handoff(execution, task, status, summary, timestamp):
         "push_status": evidence["push_status"] if evidence else None,
         "worktree_path": evidence["worktree_path"] if evidence else None,
         "remote_sha": evidence["remote_sha"] if evidence else None,
+        "test_evidence_status": evidence["test_evidence_status"] if evidence else None,
     }
     if status == "completed":
         from manager.governance import execution_completion_report
