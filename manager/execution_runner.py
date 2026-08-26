@@ -19,12 +19,12 @@ from manager.claude_config_locks import acquire_claude_config_lock, release_clau
 from manager.codex_launcher import CodexLaunchError, CodexLauncher, LaunchRequest
 from manager.dispatcher import dispatch
 from manager.execution_lifecycle import enter_running_gate, terminalize_execution
-from manager.executions import MAX_HARD_TIMEOUT_SECONDS, heartbeat_execution, hard_timeout_seconds, link_execution_session, reserve_execution
+from manager.executions import MAX_HARD_TIMEOUT_SECONDS, heartbeat_execution, hard_timeout_seconds, link_execution_session, record_repo_write_evidence, reserve_execution
 from manager.gcs_lock_registry import GCSLockRegistry
 from manager.project_registry import get_global_registry, resolve_authoritative_working_directory_with_project
 from manager.quota_forecast import DEFAULT_MAX_AGE_MINUTES
 from manager.quota_reader import read_drive_status
-from manager.repo_write_enforcement import enforce_allowed_paths, is_bounded_repo_write_snapshot
+from manager.repo_write_enforcement import capture_repo_write_evidence, enforce_allowed_paths, is_bounded_repo_write_snapshot
 from manager.session_identity import manager_session_key
 from manager.task_claims import task_claim_registry
 from manager.tasks import DriveRecords, TaskError, update_task, validate
@@ -301,7 +301,7 @@ def _claude_account_auth_ready(account):
 def launch_task(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                 execution_id=None, model=None, timeout_seconds=None, quota_document=None, executions=None,
                 retry_count=0, retry_of_execution_id=None, on_running=None, provider="codex",
-                account_id=None, config_dir=None, claude_accounts=None, provenance=None):
+                account_id=None, config_dir=None, claude_accounts=None, provenance=None, test_evidence=None):
     """Dispatch, reserve, and run one ready task; callers supply real authorities.
 
     `provider` names which provider this launcher belongs to (the caller
@@ -388,14 +388,15 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
                            execution_id, dispatched["generated_prompt"], request,
                            access="read_only" if task["read_only"] else "production_write",
                            baseline_head=task.get("baseline_head"), on_running=on_running, provider=provider,
-                           account_id=account_id, config_dir=config_dir, provenance=provenance)
+                           account_id=account_id, config_dir=config_dir, provenance=provenance,
+                           test_evidence=test_evidence)
     return {"execution_id": execution_id, "dispatch": dispatched, **result}
 
 
 def run_execution(store, service, writer_registry, claim_registry, launcher,
                   project_id, task_id, execution_id, prompt, launch_request: LaunchRequest,
                   access="production_write", baseline_head=None, on_running=None, provider="codex",
-                  account_id=None, config_dir=None, provenance=None):
+                  account_id=None, config_dir=None, provenance=None, test_evidence=None):
     """Run one reserved execution through the reviewed lifecycle gates.
 
     ``provider_stopped`` is derived only after prepare-owned cleanup or after
@@ -408,6 +409,12 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
     keeps every existing CodexLauncher call (whose ``prepare(request)`` takes
     no such arguments) byte-for-byte identical to before these parameters
     existed.
+
+    ``test_evidence`` is preserved verbatim into a completed repo-write
+    execution's terminal evidence when the caller supplies it; this runner
+    has no transcript-parsing source for it today (see the "Full prompt,
+    transcript..." note above), so it defaults to None and stays an empty
+    list rather than ever being inferred from provider output.
     """
     gate = enter_running_gate(
         store, service, writer_registry, project_id, task_id, execution_id, provider, access,
@@ -511,10 +518,26 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
     # before terminalize_execution() ever persists "completed", so a
     # violation can never reach a successful completion or any future
     # commit/push step gated on that status.
+    # P0-A/P0-B (repo-write terminal success evidence + independent remote
+    # readback): a completed bounded repo-write execution's changed paths
+    # were already proven in-scope above; this additionally captures the
+    # real commit history/final HEAD and independently queries the actual
+    # remote to prove the feature branch was pushed and exactly matches
+    # that HEAD -- never trusting a provider's own "Commit SHA:"/"GitHub
+    # push status:" self-report. Any failure here (nothing committed,
+    # nothing pushed, a stale/mismatched remote) downgrades status to
+    # failed exactly like an allowed_paths violation, so a repo-write
+    # execution can never be persisted "completed" with fabricated or
+    # unverified success evidence.
     snapshot = execution["task_snapshot"]
     if status == "completed" and is_bounded_repo_write_snapshot(snapshot):
         try:
-            enforce_allowed_paths(snapshot["working_directory"], snapshot["baseline_head"], snapshot["allowed_paths"])
+            files_changed = enforce_allowed_paths(snapshot["working_directory"], snapshot["baseline_head"], snapshot["allowed_paths"])
+            evidence = capture_repo_write_evidence(
+                snapshot["working_directory"], snapshot["baseline_head"], snapshot["branch"], files_changed,
+                test_evidence=test_evidence,
+            )
+            record_repo_write_evidence(store, project_id, execution_id, evidence)
         except TaskError as exc:
             status = "failed"
             summary = f"{provider} turn rejected: {exc}"

@@ -267,6 +267,15 @@ def cleanup_execution(writer_registry, claim_registry, execution, claim_generati
 
 
 def _terminal_handoff(execution, task, status, summary, timestamp):
+    # repo_write_evidence is real, independently git/remote-verified success
+    # evidence attached to the execution before it terminalized (see
+    # manager.executions.record_repo_write_evidence / manager.
+    # repo_write_enforcement.capture_repo_write_evidence) -- never
+    # recomputed here and never fabricated: a status other than "completed",
+    # or a completed execution with no such evidence attached (a read-only
+    # or legacy task), leaves every evidence field empty/null exactly as
+    # before this evidence capture existed.
+    evidence = execution.get("repo_write_evidence") if status == "completed" else None
     handoff = {
         # A retry reuses the same execution_id as the attempt it retries (see
         # reserve_execution), so retry_count must be part of this id or two
@@ -284,8 +293,15 @@ def _terminal_handoff(execution, task, status, summary, timestamp):
         "completed_work": [summary] if status == "completed" else [], "current_state": status,
         "next_action": "" if status == "completed" else "Review outcome and decide whether to resume",
         "minimal_context": summary,
-        "files_changed": [], "commits": [], "tests": [], "known_issues": [], "do_not_touch": [],
+        "files_changed": list(evidence["files_changed"]) if evidence else [],
+        "commits": list(evidence["commits"]) if evidence else [],
+        "tests": list(evidence["tests"]) if evidence else [],
+        "known_issues": [], "do_not_touch": [],
         "acceptance_criteria": execution["task_snapshot"].get("acceptance_criteria", []),
+        "feature_branch": evidence["branch"] if evidence else None,
+        "push_status": evidence["push_status"] if evidence else None,
+        "worktree_path": evidence["worktree_path"] if evidence else None,
+        "remote_sha": evidence["remote_sha"] if evidence else None,
     }
     if status == "completed":
         from manager.governance import execution_completion_report

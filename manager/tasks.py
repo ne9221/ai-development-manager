@@ -363,6 +363,8 @@ def create_handoff(store, document):
     document.setdefault("created_at", now_iso())
     for key in ("completed_work", "files_changed", "commits", "tests", "known_issues", "do_not_touch", "acceptance_criteria"):
         document.setdefault(key, [])
+    for key in ("feature_branch", "push_status", "worktree_path", "remote_sha"):
+        document.setdefault(key, None)
     if document.get("reason") == "completed":
         task = store.get("tasks", document["project_id"], document["task_id"])
         validate_completion_report(document.get("completion_report"), task, store, document.get("from_provider"), document.get("from_session"))

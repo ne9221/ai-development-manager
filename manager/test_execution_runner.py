@@ -1194,20 +1194,28 @@ class WorkingDirectoryContractTests(unittest.TestCase):
             update_task(store_arg, "p1", "t1", **materialized_result)
             return dict(materialized_result)
 
+        fake_evidence = {
+            "files_changed": [], "commits": [], "final_commit_sha": HEAD, "branch": "adm-worktree/p1/t1",
+            "worktree_path": materialized, "push_status": "verified", "remote_sha": HEAD, "tests": [],
+        }
         with patch("manager.execution_runner.get_global_registry") as get_registry, \
              patch("manager.execution_runner.materialize_worktree", side_effect=fake_materialize) as materialize, \
-             patch("manager.execution_runner.enforce_allowed_paths", return_value=[]) as enforce:
+             patch("manager.execution_runner.enforce_allowed_paths", return_value=[]) as enforce, \
+             patch("manager.execution_runner.capture_repo_write_evidence", return_value=fake_evidence) as capture:
             # Slice D's actual allowed_paths enforcement (real git diff
-            # against an isolated worktree) is covered end-to-end in
-            # manager.test_repo_write_enforcement; this test's own concern is
-            # purely the working_directory wiring, so it stubs enforcement
-            # to a clean no-op rather than needing a real git repo here too.
+            # against an isolated worktree) and Slice D2's real commit/remote
+            # evidence capture are covered end-to-end in manager.
+            # test_repo_write_enforcement / manager.test_execution_runner's
+            # RealGitAllowedPathsEnforcementIntegrationTests; this test's own
+            # concern is purely the working_directory wiring, so both stub to
+            # a clean no-op rather than needing a real git repo here too.
             get_registry.return_value.get_project.return_value = fake_project
             result, launcher = self._launch(store)
 
         get_registry.return_value.get_project.assert_called_once_with("p1")
         materialize.assert_called_once()
         enforce.assert_called_once_with(materialized, HEAD, ["manager/executions.py"])
+        capture.assert_called_once_with(materialized, HEAD, "refs/heads/adm-worktree/p1/t1", [], test_evidence=None)
         self.assertEqual(materialized, launcher.request.working_directory)
         self.assertNotEqual(self.valid_dir, launcher.request.working_directory)
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
@@ -1367,6 +1375,16 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         self.worktree = root
         self.baseline_head = _git(root, "rev-parse", "HEAD")
 
+        # A disposable bare git remote (P0-B remote readback): "origin" is
+        # configured but deliberately empty until a test itself pushes to
+        # it, so a real `git ls-remote` genuinely proves whether/what was
+        # pushed rather than trusting anything the provider self-reports.
+        self.origin_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.origin_dir.cleanup)
+        self.origin = Path(self.origin_dir.name).resolve()
+        _git(self.origin, "init", "--bare")
+        _git(root, "remote", "add", "origin", str(self.origin))
+
         self.lock_home = tempfile.TemporaryDirectory()
         self.addCleanup(self.lock_home.cleanup)
         self._lock_home_patch = patch.dict(os.environ, {"AI_MANAGER_HOME": self.lock_home.name})
@@ -1440,7 +1458,11 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
     def test_in_scope_write_completes_normally(self):
         class InScopeLauncher(Launcher):
             def wait(self, running):
-                (Path(self.request.working_directory) / "manager" / "foo.py").write_text("edited\n", encoding="utf-8")
+                wd = self.request.working_directory
+                (Path(wd) / "manager" / "foo.py").write_text("edited\n", encoding="utf-8")
+                _git(wd, "add", "manager/foo.py")
+                _git(wd, "commit", "-m", "edit foo")
+                _git(wd, "push", "origin", "main")
                 return super().wait(running)
 
         store = self._store()
@@ -1448,6 +1470,73 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
 
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
         self.assertEqual("completed", store.get("tasks", "p1", "t1")["status"])
+
+        final_sha = _git(self.worktree, "rev-parse", "HEAD")
+        self.assertNotEqual(self.baseline_head, final_sha)
+        evidence = result["terminal"]["execution"]["repo_write_evidence"]
+        self.assertEqual(["manager/foo.py"], evidence["files_changed"])
+        self.assertEqual([final_sha], evidence["commits"])
+        self.assertEqual(final_sha, evidence["final_commit_sha"])
+        self.assertEqual("main", evidence["branch"])
+        self.assertEqual(str(self.worktree), evidence["worktree_path"])
+        self.assertEqual("verified", evidence["push_status"])
+        self.assertEqual(final_sha, evidence["remote_sha"])
+
+        handoff = store.get("handoffs", "p1", "t1-completed-exec-a-0")
+        self.assertEqual(["manager/foo.py"], handoff["files_changed"])
+        self.assertEqual([final_sha], handoff["commits"])
+        self.assertEqual("main", handoff["feature_branch"])
+        self.assertEqual("verified", handoff["push_status"])
+        self.assertEqual(str(self.worktree), handoff["worktree_path"])
+        self.assertEqual(final_sha, handoff["remote_sha"])
+
+    def test_completed_without_push_fails_closed_on_missing_remote_branch(self):
+        """P0-B: a provider that commits locally but never pushes must never
+        have its execution accepted as completed -- the remote branch simply
+        does not exist yet, and this is proven by a real `git ls-remote`
+        against the disposable bare origin, never inferred."""
+        class UnpushedLauncher(Launcher):
+            def wait(self, running):
+                wd = self.request.working_directory
+                (Path(wd) / "manager" / "foo.py").write_text("edited, never pushed\n", encoding="utf-8")
+                _git(wd, "add", "manager/foo.py")
+                _git(wd, "commit", "-m", "edit foo, never pushed")
+                return super().wait(running)
+
+        store = self._store()
+        result = self._launch(store, UnpushedLauncher())
+
+        self.assertEqual("failed", result["terminal"]["execution"]["status"])
+        self.assertNotEqual("completed", store.get("tasks", "p1", "t1")["status"])
+        self.assertIsNone(result["terminal"]["execution"].get("repo_write_evidence"))
+        handoff = store.get("handoffs", "p1", "t1-failed-exec-a-0")
+        self.assertEqual([], handoff["files_changed"])
+        self.assertEqual([], handoff["commits"])
+        self.assertIsNone(handoff["push_status"])
+
+    def test_completed_with_remote_sha_mismatch_fails_closed(self):
+        """P0-B: a stale/mismatched remote (the branch exists, but at a
+        different SHA than the worktree's real local final commit -- e.g. an
+        older push that a later local-only commit was never pushed on top
+        of) must never be accepted as a verified, fully-delivered push."""
+        class MismatchLauncher(Launcher):
+            def wait(self, running):
+                wd = self.request.working_directory
+                (Path(wd) / "manager" / "foo.py").write_text("first edit, pushed\n", encoding="utf-8")
+                _git(wd, "add", "manager/foo.py")
+                _git(wd, "commit", "-m", "first edit, pushed")
+                _git(wd, "push", "origin", "main")
+                (Path(wd) / "manager" / "foo.py").write_text("second edit, never pushed\n", encoding="utf-8")
+                _git(wd, "add", "manager/foo.py")
+                _git(wd, "commit", "-m", "second edit, never pushed")
+                return super().wait(running)
+
+        store = self._store()
+        result = self._launch(store, MismatchLauncher())
+
+        self.assertEqual("failed", result["terminal"]["execution"]["status"])
+        self.assertNotEqual("completed", store.get("tasks", "p1", "t1")["status"])
+        self.assertIsNone(result["terminal"]["execution"].get("repo_write_evidence"))
 
 
 if __name__ == "__main__":

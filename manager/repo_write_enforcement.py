@@ -19,12 +19,16 @@ outside allowed_paths.
 
 from __future__ import annotations
 
+import re
 import subprocess
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from manager.remote_readback import verify_remote_branch_matches
 from manager.tasks import TaskError
 from manager.trusted_ingress import REQUIRED_REPO_WRITE_TASK_POLICIES
 from manager.worktree_materializer import OWNER_MARKER_FILENAME
+
+SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 class AllowedPathsViolationError(TaskError):
@@ -173,3 +177,57 @@ def enforce_allowed_paths(working_directory, baseline_head: str, allowed_paths: 
     if violations:
         raise AllowedPathsViolationError(violations)
     return changed_paths
+
+
+def collect_commit_shas(working_directory, baseline_head: str, runner=subprocess.run) -> List[str]:
+    """Every commit SHA actually made in the isolated worktree since
+    `baseline_head`, oldest first, ending at the current HEAD -- never
+    derived from a provider's self-reported "Commit SHA:" text."""
+    result = _run(working_directory, "rev-list", "--reverse", f"{baseline_head}..HEAD", runner=runner)
+    if result.returncode != 0:
+        raise TaskError(f"git rev-list against baseline_head failed: {(result.stderr or '').strip()}")
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def current_head_sha(working_directory, runner=subprocess.run) -> str:
+    result = _run(working_directory, "rev-parse", "HEAD", runner=runner)
+    if result.returncode != 0:
+        raise TaskError(f"git rev-parse HEAD failed: {(result.stderr or '').strip()}")
+    sha = (result.stdout or "").strip()
+    if not SHA_PATTERN.match(sha):
+        raise TaskError(f"git rev-parse HEAD returned an unexpected value: {sha!r}")
+    return sha
+
+
+def capture_repo_write_evidence(working_directory, baseline_head: str, branch: str, files_changed: Sequence[str],
+                                test_evidence: Optional[Sequence[str]] = None, runner=subprocess.run) -> Dict[str, Any]:
+    """Build real, independently-verified terminal success evidence for a
+    completed repo-write execution (Global Hands-off Execution Layer, Slice
+    D2): the actual changed paths (already verified in-scope by
+    enforce_allowed_paths()), the actual commit SHAs and final HEAD made in
+    the isolated worktree, and independent remote-readback proof the feature
+    branch was actually pushed and exactly matches the local HEAD -- never a
+    provider's self-reported "Commit SHA:"/"GitHub push status:" text.
+
+    `test_evidence` is preserved verbatim when the caller supplies it (e.g.
+    from a provider's structured completion report); it is never inferred or
+    fabricated when omitted, so a missing test-evidence source stays an
+    empty list rather than a guessed one.
+
+    Raises TaskError -- never returns partial evidence with an unverified
+    push -- on any git or remote-readback failure, so a caller can downgrade
+    the execution to failed instead of ever persisting invented success
+    evidence.
+    """
+    commits = collect_commit_shas(working_directory, baseline_head, runner=runner)
+    final_commit_sha = current_head_sha(working_directory, runner=runner)
+    if commits and commits[-1] != final_commit_sha:
+        raise TaskError("final commit SHA does not match the tip of the collected commit history")
+    branch_short = branch[len("refs/heads/"):] if branch.startswith("refs/heads/") else branch
+    readback = verify_remote_branch_matches(working_directory, branch_short, final_commit_sha, runner=runner)
+    return {
+        "files_changed": list(files_changed), "commits": commits, "final_commit_sha": final_commit_sha,
+        "branch": branch_short, "worktree_path": str(working_directory),
+        "push_status": "verified", "remote_sha": readback["remote_sha"],
+        "tests": list(test_evidence) if test_evidence else [],
+    }

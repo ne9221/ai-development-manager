@@ -69,6 +69,30 @@ def heartbeat_execution(store, project_id, execution_id, event, at=None, provide
     return store.put("executions", project_id, execution_id, execution)
 
 
+def record_repo_write_evidence(store, project_id, execution_id, evidence):
+    """Persist real, independently-verified repo-write terminal evidence
+    (manager.repo_write_enforcement.capture_repo_write_evidence()) onto a
+    still-running execution, before it terminalizes.
+
+    This is deliberately attached to the execution record itself rather
+    than threaded as a fresh argument at terminalization time: persist_
+    terminal() carries every existing field on the running record forward
+    unchanged, so both a fresh terminalize_execution() call and any later
+    idempotent replay of the same terminal outcome derive the terminal
+    Handoff's evidence from data already attached to the execution, never
+    by recomputing it against a worktree that may no longer exist.
+    """
+    execution = store.get("executions", project_id, execution_id)
+    if execution.get("status") != "running":
+        raise TaskError("repo-write evidence can only be recorded on a running execution")
+    execution["repo_write_evidence"] = evidence
+    validate("execution", execution)
+    store.put("executions", project_id, execution_id, execution)
+    if store.get("executions", project_id, execution_id) != execution:
+        raise TaskError("repo-write evidence persistence verification failed")
+    return execution
+
+
 def quota_snapshot(document, provider_id):
     provider = next((item for item in document.get("providers", []) if item.get("provider") == provider_id), None)
     if not provider:

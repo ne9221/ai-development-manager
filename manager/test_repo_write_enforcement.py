@@ -8,7 +8,10 @@ import pytest
 from manager.repo_write_enforcement import (
     AllowedPathsViolationError,
     OWNER_MARKER_FILENAME,
+    capture_repo_write_evidence,
     collect_changed_paths,
+    collect_commit_shas,
+    current_head_sha,
     enforce_allowed_paths,
 )
 from manager.tasks import TaskError
@@ -256,3 +259,92 @@ def test_collect_changed_paths_excludes_owner_marker_via_mocked_runner():
 
     changed = collect_changed_paths("/fake/dir", "a" * 40, runner=fake_runner)
     assert changed == ["real/file.py"]
+
+
+# --- P0-A/P0-B: real commit history + independently-verified remote evidence -
+
+@pytest.fixture
+def repo_with_origin(repo):
+    origin = repo["path"].parent / "origin.git"
+    origin.mkdir()
+    _git(origin, "init", "--bare")
+    _git(repo["path"], "remote", "add", "origin", str(origin))
+    return {**repo, "origin": origin}
+
+
+def test_collect_commit_shas_empty_with_no_new_commits(repo):
+    assert collect_commit_shas(repo["path"], repo["baseline"]) == []
+
+
+def test_collect_commit_shas_oldest_first_ending_at_head(repo):
+    (repo["path"] / "manager" / "foo.py").write_text("first\n", encoding="utf-8")
+    _git(repo["path"], "commit", "-am", "first commit")
+    first_sha = _git(repo["path"], "rev-parse", "HEAD")
+    (repo["path"] / "manager" / "foo.py").write_text("second\n", encoding="utf-8")
+    _git(repo["path"], "commit", "-am", "second commit")
+    second_sha = _git(repo["path"], "rev-parse", "HEAD")
+
+    assert collect_commit_shas(repo["path"], repo["baseline"]) == [first_sha, second_sha]
+    assert current_head_sha(repo["path"]) == second_sha
+
+
+def test_current_head_sha_matches_rev_parse(repo):
+    assert current_head_sha(repo["path"]) == repo["baseline"]
+
+
+def test_capture_repo_write_evidence_verified_push(repo_with_origin):
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "commit", "-am", "edit foo")
+    final_sha = _git(repo_with_origin["path"], "rev-parse", "HEAD")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    evidence = capture_repo_write_evidence(
+        repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+    )
+
+    assert evidence == {
+        "files_changed": ["manager/foo.py"], "commits": [final_sha], "final_commit_sha": final_sha,
+        "branch": "main", "worktree_path": str(repo_with_origin["path"]), "push_status": "verified",
+        "remote_sha": final_sha, "tests": [],
+    }
+
+
+def test_capture_repo_write_evidence_preserves_supplied_test_evidence(repo_with_origin):
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "commit", "-am", "edit foo")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    evidence = capture_repo_write_evidence(
+        repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+        test_evidence=["pytest manager/test_foo.py::test_x PASSED"],
+    )
+    assert evidence["tests"] == ["pytest manager/test_foo.py::test_x PASSED"]
+
+
+def test_capture_repo_write_evidence_never_fabricates_tests_when_not_supplied(repo_with_origin):
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "commit", "-am", "edit foo")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    evidence = capture_repo_write_evidence(
+        repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+    )
+    assert evidence["tests"] == []
+
+
+def test_capture_repo_write_evidence_fails_closed_when_not_pushed(repo_with_origin):
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "commit", "-am", "edit foo, never pushed")
+
+    with pytest.raises(TaskError):
+        capture_repo_write_evidence(
+            repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+        )
+
+
+def test_capture_repo_write_evidence_fails_closed_with_no_origin_configured(repo):
+    (repo["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _git(repo["path"], "commit", "-am", "edit foo, no origin at all")
+
+    with pytest.raises(TaskError):
+        capture_repo_write_evidence(repo["path"], repo["baseline"], "refs/heads/main", ["manager/foo.py"])
