@@ -100,11 +100,13 @@ CAPABILITY_REGISTRY = {
                 "package_version": "1.2.3",
                 "scope": "user",
                 "source_ref": "0ab1b63a410a03d3627979a109c8695de27af954",
-                "verification": "live_session_verified",
+                "verification": "manually_verified_not_reproducible_2026-08-26",
                 "verification_note": (
-                    "A fresh `claude -p` process listed "
-                    "mattpocock-skills:writing-for-agents with the correct "
-                    "description."
+                    "One-time manual/operator-driven check, not an automated "
+                    "or CI-reproducible one (the `claude` CLI and a live "
+                    "account are not available in CI): on 2026-08-26 a fresh "
+                    "`claude -p` process listed mattpocock-skills:"
+                    "writing-for-agents with the correct description."
                 ),
             },
             "codex": {
@@ -114,8 +116,11 @@ CAPABILITY_REGISTRY = {
                 "package_version": None,
                 "scope": "user ($CODEX_HOME/skills)",
                 "source_ref": "0ab1b63a410a03d3627979a109c8695de27af954",
-                "verification": "live_session_verified",
+                "verification": "manually_verified_not_reproducible_2026-08-26",
                 "verification_note": (
+                    "One-time manual/operator-driven check, not an automated "
+                    "or CI-reproducible one (the `codex` CLI and a live "
+                    "account are not available in CI): on 2026-08-26 "
                     "`codex exec -s read-only` enumerated writing-for-agents "
                     "among its discovered skills with the correct "
                     "description."
@@ -154,6 +159,11 @@ CAPABILITY_REGISTRY = {
 # business-logic tasks that merely mention such a word in passing are not
 # misclassified. See manager/test_capabilities.py for the ordinary-task and
 # agent-facing-task classification tests.
+#
+# Every phrase-based (non-filename) alternative below accepts an optional
+# trailing "s" so that e.g. "task briefs", "handoff documents", or "agent
+# prompts" match the same as their singular forms - the previous version
+# only pluralized "governance ...s?", which was a false-negative bug.
 _AGENT_FACING_PATTERN = re.compile(
     r"(?i)(?:"
     r"\bAGENTS\.md\b"
@@ -163,16 +173,37 @@ _AGENT_FACING_PATTERN = re.compile(
     r"|\bAI-DEVELOPMENT-RULES(?:\.md)?\b"
     r"|\bPROJECT[- ]RULES(?:\.md)?\b"
     r"|\bcommon governance\b"
-    r"|\bgovernance (?:file|rule|document)s?\b"
-    r"|\bagent[- ]facing instruction\b"
-    r"|\bagent prompt\b"
-    r"|\bsystem instruction\b"
-    r"|\bsystem prompt\b"
-    r"|\btask brief\b"
-    r"|\bhandoff (?:document|template|schema|format)\b"
+    r"|\bagent[- ]facing instructions?\b"
+    r"|\bagent prompts?\b"
+    r"|\bsystem instructions?\b"
+    r"|\btask briefs?\b"
+    r"|\bhandoff (?:document|template|schema|format)s?\b"
     r"|\b(?:new |a |an |the )?skill(?:'s)? (?:SKILL\.md|definition|authoring|creation)\b"
+    r"|\b(?:write|writing|wrote|written|author|authoring|authored|create|creating|created|"
+    r"draft|drafting|drafted|revise|revising|revised|rewrite|rewriting|rewrote|"
+    r"add|adding|added|build|building|built)\s+(?:\w+\s+){0,3}?skills?(?:'s)?\b"
     r"|\bwriting-for-agents\b"
     r")"
+)
+
+# "governance <file|rule|document>" and "system prompt" are ordinary English
+# in plenty of ungoverned, non-agent contexts ("data governance rule",
+# "governance document viewer", "system prompt caching in the LLM client").
+# Unlike the always-fire alternatives above, these two only count as
+# agent-facing when the same text field also names actual AI-agent-instruction
+# context - "agent"/"AI"/"assistant"/"chatbot"/"skill" or one of this
+# codebase's own agent-config filenames. Note "LLM" deliberately does NOT
+# count as qualifying context: mentioning an LLM client is not the same as
+# writing agent instructions.
+_CONTEXT_GATED_PATTERN = re.compile(
+    r"(?i)(?:"
+    r"\bgovernance (?:file|rule|document)s?\b"
+    r"|\bsystem prompts?\b"
+    r")"
+)
+
+_CONTEXT_WORD_PATTERN = re.compile(
+    r"(?i)\b(?:agents?|AI|assistants?|chatbots?|skills?|AGENTS\.md|CLAUDE\.md|GEMINI\.md)\b"
 )
 
 
@@ -206,6 +237,13 @@ def is_agent_facing_task(task):
     are excluded instead by requiring the title/scope regex to name an
     actual Agent-facing document category, not a bare English word like
     "spec" or "handoff" used in its everyday sense.
+
+    A second, narrower signal handles two phrases ("governance
+    file/rule/document", "system prompt") that are ordinary English outside
+    an AI-agent context: they only count when the *same* text field also
+    names actual agent-instruction context (see ``_CONTEXT_WORD_PATTERN``),
+    so "add a data governance rule to the compliance module" or "add system
+    prompt caching to the LLM client" are correctly excluded.
     """
     if not isinstance(task, dict):
         return False
@@ -213,6 +251,8 @@ def is_agent_facing_task(task):
         return True
     for text in _task_text_fields(task):
         if _AGENT_FACING_PATTERN.search(text):
+            return True
+        if _CONTEXT_GATED_PATTERN.search(text) and _CONTEXT_WORD_PATTERN.search(text):
             return True
     return False
 

@@ -129,6 +129,53 @@ class TaskClassificationTests(unittest.TestCase):
         self.assertIn("claude", CAPABILITY_REGISTRY["writing-for-agents"]["providers"])
         self.assertEqual([], required_capabilities_for_task(ordinary_task()))
 
+    def test_plural_phrasing_of_agent_facing_categories_triggers(self):
+        # Regression coverage for a real false-negative bug found by an
+        # independent adversarial review: most alternatives in
+        # _AGENT_FACING_PATTERN lacked the "s?" pluralization that only the
+        # "governance" branch originally had, so plural phrasing of the same
+        # document categories silently fell through as ordinary tasks.
+        cases = [
+            agent_facing_task(title="Update the Codex system instructions", scope=[]),
+            agent_facing_task(title="Write the task briefs for phase 2 and phase 3", scope=[]),
+            agent_facing_task(title="Revise the handoff documents for the migration", scope=[]),
+            agent_facing_task(title="Rewrite all of the agent prompts used by the dispatcher", scope=[]),
+            agent_facing_task(title="Tighten the agent-facing instructions across the repo", scope=[]),
+            agent_facing_task(title="Write a new skill for the marketplace covering PDF export", scope=[]),
+        ]
+        for task in cases:
+            with self.subTest(title=task["title"]):
+                self.assertTrue(is_agent_facing_task(task))
+                self.assertEqual(["writing-for-agents"], required_capabilities_for_task(task))
+
+    def test_generic_governance_and_system_prompt_usage_does_not_false_positive(self):
+        # Regression coverage for a real false-positive bug found by the same
+        # review: bare "governance rule/document" and "system prompt" phrases
+        # matched even in ordinary, non-agent-instruction business/technical
+        # usage. These now require co-occurrence with actual AI-agent context
+        # (see _CONTEXT_WORD_PATTERN) in the same text field.
+        cases = [
+            ordinary_task(
+                task_type="business_logic",
+                title="Add a data governance rule to the compliance module",
+                scope=["manager/compliance.py"],
+            ),
+            ordinary_task(
+                task_type="implementation",
+                title="Implement the corporate governance document viewer feature",
+                scope=["manager/documents_viewer.py"],
+            ),
+            ordinary_task(
+                task_type="implementation",
+                title="Add system prompt caching to reduce latency in the LLM client",
+                scope=["manager/llm_client.py"],
+            ),
+        ]
+        for task in cases:
+            with self.subTest(title=task["title"]):
+                self.assertFalse(is_agent_facing_task(task))
+                self.assertEqual([], required_capabilities_for_task(task))
+
 
 class ProviderResolutionTests(unittest.TestCase):
     def test_supported_provider_resolves_available_with_pinned_version(self):
@@ -142,6 +189,26 @@ class ProviderResolutionTests(unittest.TestCase):
     def test_antigravity_verification_is_marked_structural_only(self):
         resolution = resolve_provider_capability("writing-for-agents", "antigravity")
         self.assertEqual("structural_documented_contract_only", resolution["verification"])
+
+    def test_claude_and_codex_verification_is_an_honest_non_reproducible_claim(self):
+        # Regression coverage for a real issue found by an independent
+        # adversarial review: the claude/codex entries used to hardcode the
+        # bare, unfalsifiable string "live_session_verified" with zero
+        # checked-in evidence anywhere in the repo, inconsistent with
+        # Antigravity's honestly-caveated entry. The value must now say
+        # plainly *how* it was established (manual, one-time, not CI
+        # reproducible) rather than reading as an automated per-execution
+        # check.
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider):
+                resolution = resolve_provider_capability("writing-for-agents", provider)
+                verification = resolution["verification"]
+                self.assertNotEqual("live_session_verified", verification)
+                self.assertIn("manually_verified", verification)
+                self.assertIn("not_reproducible", verification)
+                entry = CAPABILITY_REGISTRY["writing-for-agents"]["providers"][provider]
+                self.assertIn("One-time manual/operator-driven check", entry["verification_note"])
+                self.assertIn("not an automated or CI-reproducible one", entry["verification_note"])
 
     def test_unsupported_provider_reports_truthful_fallback_not_fabricated_success(self):
         resolution = resolve_provider_capability("writing-for-agents", "gemini_app")
