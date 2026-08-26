@@ -763,4 +763,44 @@ class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
         self.assertEqual("claude", res["recommended_provider"])
 
 
+class CapabilityWiringDispatcherTests(unittest.TestCase):
+    """manager/capabilities.py wiring into dispatch(): an Agent-facing task
+    resolves and advertises the capability advisory note (lower priority
+    than every requirement above it); an ordinary task never does."""
+
+    def setUp(self): self.store = MemoryStore(); create_project(self.store, project())
+
+    def dispatch_case(self, req=None, q=None, records=None): return dispatch(self.store, object(), req or request(), q or quota(), [] if records is None else records)
+
+    def test_agent_facing_task_resolves_capability_and_advertises_advisory_note(self):
+        result = self.dispatch_case(request(
+            task_id="agents-md-task", title="Update AGENTS.md with the new dispatch rule",
+            scope=["AGENTS.md"], preferred_provider="codex",
+        ))
+        self.assertEqual(["writing-for-agents"], result["required_capabilities"])
+        self.assertEqual(["writing-for-agents"], result["resolved_capabilities"])
+        self.assertEqual("resolved", result["capability_resolution_status"])
+        self.assertEqual("0ab1b63a410a03d3627979a109c8695de27af954", result["actual_capability_source_version"])
+        self.assertIn("Agent-facing-instruction authoring aid (lower priority than requirements above):", result["generated_prompt"])
+        self.assertIn("writing-for-agents", result["generated_prompt"])
+
+    def test_ordinary_task_never_requires_or_advertises_capability(self):
+        result = self.dispatch_case(request(task_id="ordinary-task", preferred_provider="codex"))
+        self.assertEqual([], result["required_capabilities"])
+        self.assertEqual([], result["resolved_capabilities"])
+        self.assertEqual("not_required", result["capability_resolution_status"])
+        self.assertNotIn("Agent-facing-instruction authoring aid", result["generated_prompt"])
+
+    def test_agent_facing_task_on_unsupported_provider_reports_truthful_fallback(self):
+        result = self.dispatch_case(request(
+            task_id="agents-md-gemini-task", title="Update AGENTS.md with the new dispatch rule",
+            scope=["AGENTS.md"], preferred_provider="gemini_app",
+        ), quota(codex=80, claude=None))
+        self.assertEqual(["writing-for-agents"], result["required_capabilities"])
+        self.assertEqual([], result["resolved_capabilities"])
+        self.assertEqual("unsupported_provider", result["capability_resolution_status"])
+        self.assertIsNotNone(result["capability_fallback_reason"])
+        self.assertNotIn("Agent-facing-instruction authoring aid", result["generated_prompt"])
+
+
 if __name__ == "__main__": unittest.main()
