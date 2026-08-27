@@ -54,6 +54,16 @@ def env(**overrides):
     return merged
 
 
+def _run_once_file_ingress_only(**kwargs):
+    """run_once() now also polls the Issue-based ingress every call (see
+    RunOnceBothIngressesTests / test_github_issue_dispatch_ingress.py for
+    that behavior on its own) -- these RunOnceTests exist to exercise the
+    file-based path in isolation, so they inject a no-op stub for
+    poll_issues unless a test explicitly overrides it."""
+    kwargs.setdefault("poll_issues", lambda *_args, **_kwargs: [])
+    return github_dispatch_watcher.run_once(**kwargs)
+
+
 class RunOnceTests(unittest.TestCase):
     def test_valid_request_calls_existing_poll_path_once(self):
         client = FakeGitHubClient([request()])
@@ -62,7 +72,7 @@ class RunOnceTests(unittest.TestCase):
                                      "status": "queued"})
         with patch.dict(os.environ, env(), clear=False), \
              patch("manager.github_dispatch_ingress.handle_dispatch", handler):
-            result = github_dispatch_watcher.run_once(
+            result = _run_once_file_ingress_only(
                 build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client)
         self.assertEqual("ok", result["status"])
         self.assertEqual(1, handler.call_count)
@@ -77,7 +87,7 @@ class RunOnceTests(unittest.TestCase):
         })
         with patch.dict(os.environ, env(), clear=False), \
              patch("manager.github_dispatch_ingress.handle_dispatch", handler):
-            result = github_dispatch_watcher.run_once(
+            result = _run_once_file_ingress_only(
                 build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client)
         self.assertEqual(2, handler.call_count)
         self.assertEqual(2, len(result["ingress"]))
@@ -90,7 +100,7 @@ class RunOnceTests(unittest.TestCase):
                                      "status": "queued"})
         with patch.dict(os.environ, env(), clear=False), \
              patch("manager.github_dispatch_ingress.handle_dispatch", handler):
-            result = github_dispatch_watcher.run_once(
+            result = _run_once_file_ingress_only(
                 build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client)
         self.assertEqual(1, handler.call_count)
         accepted = [item for item in result["ingress"] if item["accepted"]]
@@ -101,7 +111,7 @@ class RunOnceTests(unittest.TestCase):
     def test_missing_bucket_env_fails_closed(self):
         with patch.dict(os.environ, env(ADM_LOCK_GCS_BUCKET=""), clear=False):
             with self.assertRaises(TaskError):
-                github_dispatch_watcher.run_once(
+                _run_once_file_ingress_only(
                     build_service_fn=lambda: (_ for _ in ()).throw(AssertionError("must not build a Drive service")),
                     store_factory=FakeStore,
                     client_factory=lambda: (_ for _ in ()).throw(AssertionError("must not build a GitHub client")))
@@ -110,14 +120,14 @@ class RunOnceTests(unittest.TestCase):
         client = FakeGitHubClient([request()])
         with patch.dict(os.environ, env(ADM_GITHUB_DISPATCH_INGRESS_REPO=""), clear=False):
             with self.assertRaises(TaskError):
-                github_dispatch_watcher.run_once(
+                _run_once_file_ingress_only(
                     build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client)
 
     def test_missing_branch_env_fails_closed_via_existing_check(self):
         client = FakeGitHubClient([request()])
         with patch.dict(os.environ, env(ADM_GITHUB_DISPATCH_INGRESS_BRANCH=""), clear=False):
             with self.assertRaises(TaskError):
-                github_dispatch_watcher.run_once(
+                _run_once_file_ingress_only(
                     build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client)
 
     def test_missing_token_env_fails_closed(self):
@@ -130,7 +140,7 @@ class RunOnceTests(unittest.TestCase):
         with patch.dict(os.environ, env(ADM_GITHUB_DISPATCH_INGRESS_TOKEN=""), clear=False), \
              patch("manager.github_dispatch_client._resolve_token_via_git_credential_manager", return_value=None):
             with self.assertRaises(TaskError):
-                github_dispatch_watcher.run_once(
+                _run_once_file_ingress_only(
                     build_service_fn=lambda: object(), store_factory=FakeStore,
                     client_factory=github_dispatch_watcher.GitHubApiClient.default)
 
@@ -141,7 +151,7 @@ class RunOnceTests(unittest.TestCase):
         client = FakeGitHubClient([request()])
         with patch.dict(os.environ, env(), clear=False):
             with self.assertRaises(RuntimeError):
-                github_dispatch_watcher.run_once(build_service_fn=boom, store_factory=FakeStore,
+                _run_once_file_ingress_only(build_service_fn=boom, store_factory=FakeStore,
                                                  client_factory=lambda: client)
 
     def test_github_auth_failure_fails_closed(self):
@@ -150,7 +160,7 @@ class RunOnceTests(unittest.TestCase):
 
         with patch.dict(os.environ, env(), clear=False):
             with self.assertRaises(RuntimeError):
-                github_dispatch_watcher.run_once(build_service_fn=lambda: object(), store_factory=FakeStore,
+                _run_once_file_ingress_only(build_service_fn=lambda: object(), store_factory=FakeStore,
                                                  client_factory=boom)
 
     def test_duplicate_request_result_preserved_across_polls(self):
@@ -160,9 +170,9 @@ class RunOnceTests(unittest.TestCase):
                                      "status": "completed"})
         with patch.dict(os.environ, env(), clear=False), \
              patch("manager.github_dispatch_ingress.handle_dispatch", handler):
-            first = github_dispatch_watcher.run_once(
+            first = _run_once_file_ingress_only(
                 build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client)
-            second = github_dispatch_watcher.run_once(
+            second = _run_once_file_ingress_only(
                 build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client)
         self.assertEqual(first["ingress"], second["ingress"])
         self.assertEqual(2, handler.call_count)
@@ -179,6 +189,12 @@ class MainCliTests(unittest.TestCase):
              patch("manager.github_dispatch_watcher.build_service", lambda: object()), \
              patch("manager.github_dispatch_watcher.DriveRecords", FakeStore), \
              patch("manager.github_dispatch_watcher.GitHubApiClient.default", lambda: client):
+            # FakeGitHubClient.list_issues() returns [] by default -- the
+            # real poll_github_issue_dispatch_requests() runs unmocked here
+            # (main() binds its poll_issues default at definition time, so
+            # patching the module-level name would not reach it) and finds
+            # nothing, which is the correct, harmless outcome for a repo
+            # with no open dispatch-request issues.
             self.assertEqual(0, github_dispatch_watcher.main(["--once"]))
 
     def test_main_requires_once_flag(self):
@@ -259,38 +275,25 @@ class NoProviderLaunchAuthorityTests(unittest.TestCase):
              patch("manager.github_dispatch_ingress.handle_dispatch", handler), \
              patch("subprocess.Popen", side_effect=AssertionError("no process may be started")), \
              patch("os.startfile", side_effect=AssertionError("no process may be started"), create=True):
-            result = github_dispatch_watcher.run_once(
+            result = _run_once_file_ingress_only(
                 build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client)
         self.assertEqual("ok", result["status"])
 
 
-class RunOnceIssueIngressOptInTests(unittest.TestCase):
-    """The Issue-based ingress poll is additive and opt-in: it must never
-    run (and never even be attempted) unless ADM_GITHUB_DISPATCH_ISSUE_
-    ALLOWED_AUTHORS is actually configured, so an existing deployment that
-    only has the file-based ingress set up keeps behaving identically."""
+class RunOnceBothIngressesTests(unittest.TestCase):
+    """run_once() polls BOTH ingresses every call, sharing the same store/
+    service/bucket/client -- the Issue-based poll needs no new required
+    configuration since it defaults its author allowlist to the same
+    repo's own owner (see manager.github_issue_dispatch_ingress.
+    default_allowed_authors_from_repo())."""
 
-    def test_issue_poll_not_attempted_when_allowed_authors_unset(self):
-        client = FakeGitHubClient([request()])
-        handler = Mock(return_value={"accepted": True, "request_id": "gh-e2e-1",
-                                     "task_id": "dispatch-gh-e2e-1", "command_id": "dispatch-gh-e2e-1",
-                                     "status": "queued"})
-        issue_poll = Mock(side_effect=AssertionError("issue ingress must not run when opted out"))
-        with patch.dict(os.environ, env(), clear=False), \
-             patch("manager.github_dispatch_ingress.handle_dispatch", handler):
-            result = github_dispatch_watcher.run_once(
-                build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client,
-                poll_issues=issue_poll)
-        self.assertNotIn("issue_ingress", result)
-        self.assertEqual(0, issue_poll.call_count)
-
-    def test_issue_poll_attempted_and_merged_when_allowed_authors_set(self):
+    def test_issue_poll_is_always_attempted_and_merged(self):
         client = FakeGitHubClient([request()])
         handler = Mock(return_value={"accepted": True, "request_id": "gh-e2e-1",
                                      "task_id": "dispatch-gh-e2e-1", "command_id": "dispatch-gh-e2e-1",
                                      "status": "queued"})
         issue_poll = Mock(return_value=[{"issue_id": "1001", "accepted": True}])
-        with patch.dict(os.environ, env(ADM_GITHUB_DISPATCH_ISSUE_ALLOWED_AUTHORS="ne9221"), clear=False), \
+        with patch.dict(os.environ, env(), clear=False), \
              patch("manager.github_dispatch_ingress.handle_dispatch", handler):
             result = github_dispatch_watcher.run_once(
                 build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client,
@@ -298,6 +301,27 @@ class RunOnceIssueIngressOptInTests(unittest.TestCase):
         self.assertEqual(1, issue_poll.call_count)
         self.assertEqual([{"issue_id": "1001", "accepted": True}], result["issue_ingress"])
         self.assertTrue(result["ingress"][0]["accepted"])
+
+    def test_issue_poll_shares_the_same_store_service_bucket_client(self):
+        client = FakeGitHubClient([request()])
+        handler = Mock(return_value={"accepted": True, "request_id": "gh-e2e-1",
+                                     "task_id": "dispatch-gh-e2e-1", "command_id": "dispatch-gh-e2e-1",
+                                     "status": "queued"})
+        service = object()
+        seen = {}
+
+        def issue_poll(store, svc, bucket, cli, **_kwargs):
+            seen.update(store=store, service=svc, bucket=bucket, client=cli)
+            return []
+
+        with patch.dict(os.environ, env(), clear=False), \
+             patch("manager.github_dispatch_ingress.handle_dispatch", handler):
+            github_dispatch_watcher.run_once(
+                build_service_fn=lambda: service, store_factory=FakeStore, client_factory=lambda: client,
+                poll_issues=issue_poll)
+        self.assertIs(client, seen["client"])
+        self.assertEqual(BUCKET, seen["bucket"])
+        self.assertIs(service, seen["service"])
 
 
 if __name__ == "__main__":

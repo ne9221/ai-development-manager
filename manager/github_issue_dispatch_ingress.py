@@ -24,10 +24,15 @@ deterministic (task_id, command_id) = f"dispatch-{request_id}".
 Provenance: unlike a private Drive folder (single verifiable owner) or a
 dedicated file-ingress branch (repo-push access implies trust), an Issues
 tracker is reachable by anyone who can open issues on this repo. The
-non-negotiable extra check here is author identity: ALLOWED_AUTHORS_ENV
-must name the exact GitHub login(s) trusted to submit a dispatch request
-this way (fail closed if unset), checked against the issue's own `user.
-login` before the body is ever parsed as a candidate request.
+non-negotiable extra check here is author identity, checked against the
+issue's own `user.login` before the body is ever parsed as a candidate
+request. ALLOWED_AUTHORS_ENV, when set, names the exact GitHub login(s)
+trusted to submit a dispatch request this way and always wins outright;
+when unset, this defaults to the configured repo's own owner (see
+default_allowed_authors_from_repo()) -- the same implicit trust boundary
+the file-based ingress already relies on (push access to this repo), so
+turning this on for the repo owner needs no new required configuration.
+Fails closed only if neither resolves to anything at all.
 
 This module never launches a provider process and never imports/calls
 anything from manager.command_watcher -- exactly the same non-negotiable
@@ -69,10 +74,45 @@ def parse_allowed_authors(raw):
     """Comma-separated GitHub logins, case-insensitively compared (GitHub
     logins are themselves case-insensitive). Returns a frozenset; empty/
     unset input yields an empty frozenset, which the caller must treat as
-    "not configured" and fail closed on -- never as "allow everyone"."""
+    "not explicitly configured" -- resolve_allowed_authors() is what
+    decides what that means (default-to-repo-owner), never this function
+    on its own."""
     if not raw or not isinstance(raw, str):
         return frozenset()
     return frozenset(login.strip().lower() for login in raw.split(",") if login.strip())
+
+
+def default_allowed_authors_from_repo(repo):
+    """The sole built-in trust default when ALLOWED_AUTHORS_ENV is not
+    explicitly set: the repo's own owner (the "owner" segment of an
+    "owner/repo" identity string, e.g. "ne9221" from
+    "ne9221/ai-development-manager"). This is a deliberate, narrow default
+    -- not "allow everyone who can open an issue" -- chosen because the
+    repo owner is already the exact same trust boundary the file-based
+    ingress implicitly relies on (only someone with push access to this
+    repo can write a request file at all); defaulting to that same identity
+    here means no NEW required configuration (a second Scheduled Task
+    install/env var) is needed just to turn this ingress on for the
+    repo's own owner. An explicit ALLOWED_AUTHORS_ENV always overrides
+    this default outright, never merges with it."""
+    if not isinstance(repo, str) or "/" not in repo:
+        return frozenset()
+    owner = repo.split("/", 1)[0].strip().lower()
+    return frozenset({owner}) if owner else frozenset()
+
+
+def resolve_allowed_authors(repo, explicit=None, env_value=None):
+    """explicit (a caller-supplied frozenset/set/None) wins outright over
+    everything else -- used by tests and by any future caller that wants
+    total control. Otherwise: an explicitly configured ALLOWED_AUTHORS_ENV
+    (`env_value`) wins over the repo-owner default. Only when NEITHER is
+    set does this fall back to default_allowed_authors_from_repo(repo)."""
+    if explicit is not None:
+        return frozenset(login.strip().lower() for login in explicit)
+    configured = parse_allowed_authors(env_value)
+    if configured:
+        return configured
+    return default_allowed_authors_from_repo(repo)
 
 
 def _verify_repo_identity(client, repo):
@@ -160,9 +200,14 @@ def poll_github_issue_dispatch_requests(store, service, bucket, client, repo=Non
     - Provenance is repo identity (`_verify_repo_identity`) PLUS a required
       author allowlist (`allowed_authors` / ALLOWED_AUTHORS_ENV) checked
       per-issue in read_request() -- an Issues tracker has no equivalent of
-      "push access to a dedicated branch" as an implicit trust boundary, so
-      this module fails closed if no allowlist is configured at all, not
-      just if it happens to be empty.
+      "push access to a dedicated branch" as an implicit trust boundary.
+      An explicit ALLOWED_AUTHORS_ENV always wins; when unset, this
+      defaults to the configured repo's own owner (see
+      default_allowed_authors_from_repo()) -- the same implicit trust
+      boundary the file-based ingress already relies on, so no new
+      required configuration is needed just to use this for the repo
+      owner. This still fails closed (TaskError) in the one case neither
+      resolves anything (e.g. a malformed `repo` string with no "/").
     - Rejection records are keyed by the issue's own global `id` (stable,
       unique across the whole GitHub instance -- GitHub's analogue of the
       file-based ingress's blob `sha`), not by issue `number` (which is
@@ -174,10 +219,9 @@ def poll_github_issue_dispatch_requests(store, service, bucket, client, repo=Non
     repo = repo or os.environ.get(REPO_ENV)
     if not repo:
         raise TaskError(f"{REPO_ENV} is required")
-    allowed_authors = allowed_authors if allowed_authors is not None else parse_allowed_authors(
-        os.environ.get(ALLOWED_AUTHORS_ENV))
+    allowed_authors = resolve_allowed_authors(repo, explicit=allowed_authors, env_value=os.environ.get(ALLOWED_AUTHORS_ENV))
     if not allowed_authors:
-        raise TaskError(f"{ALLOWED_AUTHORS_ENV} is required")
+        raise TaskError(f"{ALLOWED_AUTHORS_ENV} is required (and {REPO_ENV}'s own owner could not be derived as a default)")
     _verify_repo_identity(client, repo)
     current = now or datetime.now(timezone.utc)
     if deadline is None:

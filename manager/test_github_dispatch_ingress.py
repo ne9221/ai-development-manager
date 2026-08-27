@@ -72,6 +72,15 @@ class FakeGitHubClient:
             raise GitHubNotFound("github_not_found", "no such branch")
         return {"name": branch}
 
+    def list_issues(self, repo, state="open", per_page=20):
+        # This fake is only ever seeded with file-ingress request entries,
+        # never issues -- callers of the Issue-based ingress use a separate
+        # fake (see test_github_issue_dispatch_ingress.FakeGitHubIssueClient).
+        # Returning [] here lets shared callers (e.g. github_dispatch_
+        # watcher.run_once(), which now polls both ingresses) exercise the
+        # real Issue-poll code path against an empty, harmless result.
+        return []
+
     def list_directory(self, repo, path, branch):
         self.list_directory_calls.append((repo, path, branch))
         if path != self.path or branch != self.branch:

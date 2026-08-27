@@ -38,19 +38,21 @@ closed instead of silently no-oping.
 
 It then ALSO performs one bounded poll of the Issue-based ingress
 (manager.github_issue_dispatch_ingress) using the SAME GitHub client/Drive
-service/store/GCS bucket -- added because some GitHub-write connectors
+service/store/GCS bucket/repo -- added because some GitHub-write connectors
 (confirmed: ChatGPT's) are granted Issues:write but denied Contents:write,
 so the file-based mechanism above is not reachable from them even against
 the same repo/credential. Reusing this same already-installed Scheduled
 Task for both, rather than installing a second one, keeps this additive
-rather than a second piece of scheduling infrastructure. Unlike the
-file-based poll, the Issue-based poll is OPT-IN: it only runs when
-manager.github_issue_dispatch_ingress.ALLOWED_AUTHORS_ENV is actually
-configured, so an existing deployment that has only ever set up the
-file-based ingress keeps working completely unchanged -- no new required
-configuration, no new failure mode, until an operator explicitly opts in.
-When configured, its own required-config/auth failures fail closed exactly
-like the file-based poll's.
+rather than a second piece of scheduling infrastructure. This poll needs
+NO new required configuration: it defaults its author-provenance allowlist
+to the SAME repo's own owner (manager.github_issue_dispatch_ingress.
+default_allowed_authors_from_repo()) -- the same implicit trust boundary
+the file-based ingress already relies on -- so an existing deployment that
+has only ever set up the file-based ingress gets this working
+automatically, with manager.github_issue_dispatch_ingress.ALLOWED_AUTHORS_ENV
+available as an explicit override when a different/wider allowlist is
+wanted. Its own config/auth failures fail closed exactly like the
+file-based poll's.
 """
 
 import argparse
@@ -61,7 +63,7 @@ import sys
 from collectors.publish_drive import build_service
 from manager.github_dispatch_client import GitHubApiClient
 from manager.github_dispatch_ingress import poll_github_dispatch_requests
-from manager.github_issue_dispatch_ingress import ALLOWED_AUTHORS_ENV, poll_github_issue_dispatch_requests
+from manager.github_issue_dispatch_ingress import poll_github_issue_dispatch_requests
 from manager.gcs_lock_registry import BUCKET_ENV
 from manager.tasks import DriveRecords, TaskError
 from manager.production_guard import RuntimeGuardError, require_runtime_guard
@@ -71,10 +73,9 @@ def run_once(build_service_fn=build_service, store_factory=DriveRecords, client_
             poll=poll_github_dispatch_requests, poll_issues=poll_github_issue_dispatch_requests):
     """Build the existing Drive service/store, resolve the existing GCS
     idempotency bucket, build the GitHub API client, and call
-    poll_github_dispatch_requests() exactly once, then --
-    only if manager.github_issue_dispatch_ingress.ALLOWED_AUTHORS_ENV is
-    configured -- poll_github_issue_dispatch_requests() exactly once too.
-    Raises TaskError (missing config) or whatever build_service_fn/
+    poll_github_dispatch_requests() then poll_github_issue_dispatch_
+    requests() exactly once each, sharing the same store/service/bucket/
+    client. Raises TaskError (missing config) or whatever build_service_fn/
     client_factory raise (auth failure) rather than silently no-oping; the
     caller decides how to turn that into a process exit status."""
     require_runtime_guard()
@@ -88,12 +89,14 @@ def run_once(build_service_fn=build_service, store_factory=DriveRecords, client_
     # requests()'s own existing defaulting + verify_ingress_repo() check --
     # that already fails closed (TaskError) on missing/invalid
     # ADM_GITHUB_DISPATCH_INGRESS_REPO / ADM_GITHUB_DISPATCH_INGRESS_BRANCH
-    # without this module reimplementing that check.
+    # without this module reimplementing that check. poll_issues() below
+    # resolves its own author allowlist from that same REPO_ENV (see
+    # manager.github_issue_dispatch_ingress.resolve_allowed_authors()) --
+    # by the time poll() above has succeeded, REPO_ENV is already proven
+    # valid, so no separate check is needed here.
     results = poll(store, service, bucket, client)
-    response = {"status": "ok", "ingress": results}
-    if os.environ.get(ALLOWED_AUTHORS_ENV):
-        response["issue_ingress"] = poll_issues(store, service, bucket, client)
-    return response
+    issue_results = poll_issues(store, service, bucket, client)
+    return {"status": "ok", "ingress": results, "issue_ingress": issue_results}
 
 
 def main(argv=None):

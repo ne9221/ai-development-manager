@@ -4,7 +4,8 @@ from unittest.mock import Mock, patch
 
 from manager.github_dispatch_client import GitHubApiError, GitHubNotFound
 from manager.github_issue_dispatch_ingress import (
-    ALLOWED_AUTHORS_ENV, parse_allowed_authors, poll_github_issue_dispatch_requests, read_request,
+    ALLOWED_AUTHORS_ENV, default_allowed_authors_from_repo, parse_allowed_authors,
+    poll_github_issue_dispatch_requests, read_request, resolve_allowed_authors,
 )
 from manager.tasks import TaskError
 from manager.test_task_claims import MemoryClaimRegistry
@@ -60,6 +61,32 @@ class ParseAllowedAuthorsTests(unittest.TestCase):
     def test_empty_or_none_yields_empty_frozenset(self):
         self.assertEqual(frozenset(), parse_allowed_authors(""))
         self.assertEqual(frozenset(), parse_allowed_authors(None))
+
+
+class DefaultAllowedAuthorsFromRepoTests(unittest.TestCase):
+    def test_extracts_owner_from_owner_repo_string(self):
+        self.assertEqual(frozenset({"ne9221"}), default_allowed_authors_from_repo("ne9221/ai-development-manager"))
+
+    def test_lowercases_owner(self):
+        self.assertEqual(frozenset({"ne9221"}), default_allowed_authors_from_repo("NE9221/ai-development-manager"))
+
+    def test_malformed_repo_string_yields_empty_frozenset(self):
+        self.assertEqual(frozenset(), default_allowed_authors_from_repo("not-a-repo-identity"))
+        self.assertEqual(frozenset(), default_allowed_authors_from_repo(None))
+
+
+class ResolveAllowedAuthorsTests(unittest.TestCase):
+    def test_explicit_argument_wins_over_everything(self):
+        result = resolve_allowed_authors(REPO, explicit={"someone-else"}, env_value="ne9221")
+        self.assertEqual(frozenset({"someone-else"}), result)
+
+    def test_env_value_wins_over_repo_owner_default(self):
+        result = resolve_allowed_authors(REPO, explicit=None, env_value="someone-else")
+        self.assertEqual(frozenset({"someone-else"}), result)
+
+    def test_falls_back_to_repo_owner_when_nothing_else_configured(self):
+        result = resolve_allowed_authors(REPO, explicit=None, env_value=None)
+        self.assertEqual(frozenset({"ne9221"}), result)
 
 
 class ReadRequestTests(unittest.TestCase):
@@ -199,6 +226,29 @@ class PollGithubIssueDispatchRequestsTests(unittest.TestCase):
             result = poll_github_issue_dispatch_requests(object(), object(), "bucket", client, REPO, now=NOW,
                                                           registry_factory=lambda *_args: object())
         self.assertTrue(result[0]["accepted"])
+
+    def test_repo_owner_default_used_with_zero_configuration(self):
+        # No allowed_authors kwarg, no ALLOWED_AUTHORS_ENV at all -- this
+        # must still work for the repo's own owner, since that owner is
+        # the same implicit trust boundary the file-based ingress already
+        # relies on (push access to this repo).
+        import json
+        client = FakeGitHubIssueClient([_issue(1, 1001, json.dumps(request()))])
+        handler = Mock(return_value={"accepted": True, "request_id": "gh-issue-1", "task_id": "dispatch-gh-issue-1",
+                                     "command_id": "dispatch-gh-issue-1", "status": "queued"})
+        with patch.dict("os.environ", {ALLOWED_AUTHORS_ENV: ""}, clear=False), \
+             patch("manager.github_issue_dispatch_ingress.handle_dispatch", handler):
+            result = poll_github_issue_dispatch_requests(object(), object(), "bucket", client, REPO, now=NOW,
+                                                          registry_factory=lambda *_args: object())
+        self.assertTrue(result[0]["accepted"])
+
+    def test_repo_owner_default_rejects_non_owner_author(self):
+        import json
+        client = FakeGitHubIssueClient([_issue(1, 1001, json.dumps(request()), author="random-stranger")])
+        with patch.dict("os.environ", {ALLOWED_AUTHORS_ENV: ""}, clear=False):
+            result = poll_github_issue_dispatch_requests(object(), object(), "bucket", client, REPO, now=NOW,
+                                                          registry_factory=lambda *_args: object())
+        self.assertFalse(result[0]["accepted"])
 
 
 if __name__ == "__main__":
