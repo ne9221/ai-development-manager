@@ -38,11 +38,14 @@ param(
     [Parameter(Mandatory=$true)][string]$IngressRepo,
     [string]$IngressBranch = "dispatch-requests",
     [string]$IngressPath = "dispatch-requests",
-    # A file containing the raw GitHub PAT -- see
+    # Optional: a file containing a raw GitHub PAT -- see
     # run_github_dispatch_ingress.ps1's own -GitHubTokenFile comment for why
     # this is a file path, never an inline secret value, on this installer's
-    # own command line.
-    [Parameter(Mandatory=$true)][string]$GitHubTokenFile,
+    # own command line. When omitted (preferred), the installed task relies
+    # on this machine's own `git credential` helper at runtime instead (see
+    # manager.github_dispatch_client.GitHubApiClient.default()) -- no PAT
+    # is created or persisted anywhere by this installer.
+    [string]$GitHubTokenFile,
     # The canonical idempotency bucket -- manager.gcs_lock_registry.
     # BUCKET_ENV ("ADM_LOCK_GCS_BUCKET"), the SAME bucket the Drive Dispatch
     # Ingress task and the Command Watcher already use.
@@ -86,7 +89,7 @@ if ($ExecutionTimeLimitMinutes -le 0) {
     Write-Error "EXECUTION_TIME_LIMIT_INVALID: -ExecutionTimeLimitMinutes must be a positive number of minutes: '$ExecutionTimeLimitMinutes'"
     exit 1
 }
-if (-not (Test-Path -LiteralPath $GitHubTokenFile -PathType Leaf)) {
+if ($GitHubTokenFile -and -not (Test-Path -LiteralPath $GitHubTokenFile -PathType Leaf)) {
     Write-Error "GITHUB_TOKEN_FILE_MISSING: GitHub PAT file not found at '$GitHubTokenFile'"
     exit 1
 }
@@ -117,7 +120,14 @@ if (-not $ClaudeAccountsConfig) {
 }
 
 $runner = Join-Path $RepositoryPath "manager\run_github_dispatch_ingress.ps1"
-$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -PythonDeps `"$PythonDeps`" -IngressRepo `"$IngressRepo`" -IngressBranch `"$IngressBranch`" -IngressPath `"$IngressPath`" -GitHubTokenFile `"$GitHubTokenFile`" -GcsBucket `"$GcsBucket`" -GoogleDriveToken `"$GoogleDriveToken`" -ClaudeAccountsConfig `"$ClaudeAccountsConfig`" -WorkspaceRoot `"$WorkspaceRoot`""
+$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"$PythonPath`" -RepositoryPath `"$RepositoryPath`" -ManagerHome `"$ManagerHome`" -PythonDeps `"$PythonDeps`" -IngressRepo `"$IngressRepo`" -IngressBranch `"$IngressBranch`" -IngressPath `"$IngressPath`""
+if ($GitHubTokenFile) {
+    # Only threaded through when explicitly given -- omitted entirely
+    # (the preferred production path) leaves the runner to resolve a
+    # token itself via this machine's own `git credential` helper.
+    $arguments += " -GitHubTokenFile `"$GitHubTokenFile`""
+}
+$arguments += " -GcsBucket `"$GcsBucket`" -GoogleDriveToken `"$GoogleDriveToken`" -ClaudeAccountsConfig `"$ClaudeAccountsConfig`" -WorkspaceRoot `"$WorkspaceRoot`""
 # Same "route through a generated hidden VBS wrapper" mechanism as the
 # Command Watcher and Drive Dispatch Ingress tasks -- WshShell.Run(cmd, 0,
 # True) sets the window style to hidden before the process is even created.

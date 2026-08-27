@@ -8,13 +8,19 @@ caller of this client's methods; every ADMISSION/validation decision lives
 there, never here.
 
 Real network calls only ever happen through GitHubApiClient.default(), which
-requires an explicit token (see TOKEN_ENV) -- this module never falls back
-to an unauthenticated call, and never logs or embeds the token anywhere
-except the one outgoing Authorization header.
+resolves a token from (in order) an explicit argument, TOKEN_ENV, or -- as a
+last resort -- this machine's own configured `git credential` helper (the
+same credential ADM host commit/push already authenticates with for this
+repo; see _resolve_token_via_git_credential_manager()). This module never
+falls back to an unauthenticated call, and never logs or embeds the token
+anywhere except the one outgoing Authorization header; the credential-helper
+fallback never writes anything to disk and keeps the resolved value in
+memory only.
 """
 
 import base64
 import os
+import subprocess
 
 from manager.tasks import TaskError
 
@@ -22,6 +28,37 @@ API_ROOT = "https://api.github.com"
 TOKEN_ENV = "ADM_GITHUB_DISPATCH_INGRESS_TOKEN"
 API_VERSION = "2022-11-28"
 REQUEST_TIMEOUT_SECONDS = 30
+_CREDENTIAL_HELPER_TIMEOUT_SECONDS = 10
+
+
+def _resolve_token_via_git_credential_manager():
+    """Fallback credential source, tried only when neither an explicit
+    token nor TOKEN_ENV is set: reuse whatever GitHub credential this
+    machine's own `git push`/`git fetch` already authenticates with via its
+    configured `git credential` helper (e.g. Git Credential Manager on
+    Windows) -- the same mechanism ADM host commit/push already relies on
+    for this same repo, never a new credential source. Resolved fresh on
+    every call and kept in memory only: never written to disk, never
+    logged, never included in any exception message. Returns None (not an
+    error) on any failure -- an unavailable/unconfigured helper, no stored
+    credential for github.com, or a malformed response -- so the caller
+    falls through to its own normal "no token" TaskError instead of this
+    optional fallback masking a real misconfiguration."""
+    try:
+        result = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            capture_output=True, text=True, timeout=_CREDENTIAL_HELPER_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("password="):
+            value = line[len("password="):].strip()
+            return value or None
+    return None
 
 
 class GitHubApiError(TaskError):
@@ -55,7 +92,7 @@ class GitHubApiClient:
 
     @classmethod
     def default(cls, token=None):
-        return cls(token or os.environ.get(TOKEN_ENV))
+        return cls(token or os.environ.get(TOKEN_ENV) or _resolve_token_via_git_credential_manager())
 
     def _headers(self):
         return {

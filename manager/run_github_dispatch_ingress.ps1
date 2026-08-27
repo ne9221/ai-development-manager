@@ -6,12 +6,18 @@ param(
     [Parameter(Mandatory=$true)][string]$IngressRepo,
     [string]$IngressBranch = "dispatch-requests",
     [string]$IngressPath = "dispatch-requests",
-    # A file containing the raw GitHub PAT, never the token value itself --
-    # mirrors run_drive_dispatch_ingress.ps1's own -GoogleDriveToken (a file
-    # path to the OAuth token JSON, not an inline secret) so a PAT is never
-    # visible in the Scheduled Task's stored Action string or in any process
-    # listing of this wrapper's own command line.
-    [Parameter(Mandatory=$true)][string]$GitHubTokenFile,
+    # Optional: a file containing a raw GitHub PAT, never the token value
+    # itself -- mirrors run_drive_dispatch_ingress.ps1's own
+    # -GoogleDriveToken (a file path, not an inline secret) so a PAT is
+    # never visible in the Scheduled Task's stored Action string or in any
+    # process listing of this wrapper's own command line. When omitted (the
+    # preferred production path on a machine that already has a working
+    # `git credential` helper), no token is exported here at all --
+    # manager.github_dispatch_client.GitHubApiClient.default() resolves one
+    # itself at call time via that same helper (the same credential ADM
+    # host commit/push already uses for this repo), kept in memory only and
+    # never written to disk by either this wrapper or the Python side.
+    [string]$GitHubTokenFile,
     # The canonical idempotency bucket -- manager.gcs_lock_registry.
     # BUCKET_ENV ("ADM_LOCK_GCS_BUCKET"), the SAME bucket env
     # manager.drive_dispatch_watcher/manager.command_watcher/cloud.app
@@ -89,23 +95,29 @@ $env:ADM_GITHUB_DISPATCH_INGRESS_REPO = $IngressRepo
 $env:ADM_GITHUB_DISPATCH_INGRESS_BRANCH = $IngressBranch
 $env:ADM_GITHUB_DISPATCH_INGRESS_PATH = $IngressPath
 
-# Required GitHub PAT -- read from a file, never taken as an inline
+# Optional GitHub PAT -- read from a file, never taken as an inline
 # parameter value, so it is never visible in the Scheduled Task's stored
-# Action string. Fails closed (exits before any Python invocation) if the
-# file is missing or empty; the raw token content is never echoed or
-# logged, only exported into this process's own environment for the child
-# Python process to read.
-if (-not (Test-Path -LiteralPath $GitHubTokenFile -PathType Leaf)) {
-    Write-Error "GITHUB_TOKEN_FILE_MISSING: GitHub PAT file not found at '$GitHubTokenFile'"
-    exit 1
+# Action string. When -GitHubTokenFile IS given, this fails closed (exits
+# before any Python invocation) if the file is missing or empty; the raw
+# token content is never echoed or logged, only exported into this
+# process's own environment for the child Python process to read. When
+# -GitHubTokenFile is NOT given (the preferred production path), this
+# block is skipped entirely and ADM_GITHUB_DISPATCH_INGRESS_TOKEN is left
+# unset -- manager.github_dispatch_client.GitHubApiClient.default() then
+# resolves a token itself via this machine's own `git credential` helper.
+if ($GitHubTokenFile) {
+    if (-not (Test-Path -LiteralPath $GitHubTokenFile -PathType Leaf)) {
+        Write-Error "GITHUB_TOKEN_FILE_MISSING: GitHub PAT file not found at '$GitHubTokenFile'"
+        exit 1
+    }
+    $githubToken = (Get-Content -LiteralPath $GitHubTokenFile -Raw).Trim()
+    if ([string]::IsNullOrWhiteSpace($githubToken)) {
+        Write-Error "GITHUB_TOKEN_FILE_EMPTY: GitHub PAT file at '$GitHubTokenFile' is empty"
+        exit 1
+    }
+    $env:ADM_GITHUB_DISPATCH_INGRESS_TOKEN = $githubToken
+    $githubToken = $null
 }
-$githubToken = (Get-Content -LiteralPath $GitHubTokenFile -Raw).Trim()
-if ([string]::IsNullOrWhiteSpace($githubToken)) {
-    Write-Error "GITHUB_TOKEN_FILE_EMPTY: GitHub PAT file at '$GitHubTokenFile' is empty"
-    exit 1
-}
-$env:ADM_GITHUB_DISPATCH_INGRESS_TOKEN = $githubToken
-$githubToken = $null
 
 # Required idempotency bucket config, exported under the canonical env name
 # manager.gcs_lock_registry.BUCKET_ENV already defines ("ADM_LOCK_GCS_BUCKET")
