@@ -15,6 +15,16 @@ provider claims it touched) and identifies every changed path -- modified,
 newly created, deleted, or renamed -- so a caller can fail the execution
 closed, before it is ever persisted as "completed", if any of them falls
 outside allowed_paths.
+
+Bootstrap architecture: this module also carries the ADM host's own git
+commit/push authority (`commit_and_push_repo_write_changes`). A repo-write
+provider (Codex, sandbox="workspace-write") only edits files and runs local
+checks inside its isolated worktree -- it is never expected or trusted to
+run `git commit`/`git push` itself. Once an execution's changed paths are
+proven in-scope, ADM stages exactly those admitted paths, commits, and
+pushes the isolated feature branch using its own git credentials/network;
+`capture_repo_write_evidence` then independently reads back the real remote
+to prove that push landed, exactly as before.
 """
 
 from __future__ import annotations
@@ -179,6 +189,37 @@ def enforce_allowed_paths(working_directory, baseline_head: str, allowed_paths: 
     return changed_paths
 
 
+def commit_and_push_repo_write_changes(working_directory, branch: str, files_changed: Sequence[str],
+                                       commit_message: str, runner=subprocess.run) -> str:
+    """ADM-host git authority for a completed repo-write execution (Bootstrap
+    architecture): the provider only edits files and runs local checks inside
+    its isolated worktree -- it never runs `git commit`/`git push` itself.
+    Once `enforce_allowed_paths()` has proven `files_changed` is real and
+    in-scope, this stages exactly those admitted paths (never `git add .`),
+    commits them on the worktree's already-isolated feature branch, and
+    pushes that exact branch to `origin` using the ADM host's own git
+    credentials/network -- never `main`, never a merge, never a force push.
+
+    Raises TaskError on any git failure (stage, commit, or push) so a failed
+    host-side commit/push can never be mistaken for success; the caller's
+    own `capture_repo_write_evidence()` performs the independent remote
+    readback afterward, against whatever this function actually pushed.
+    """
+    if not files_changed:
+        raise TaskError("commit_and_push_repo_write_changes requires a non-empty files_changed list")
+    branch_short = branch[len("refs/heads/"):] if branch.startswith("refs/heads/") else branch
+    add_result = _run(working_directory, "add", "--", *files_changed, runner=runner)
+    if add_result.returncode != 0:
+        raise TaskError(f"git add failed: {(add_result.stderr or '').strip()}")
+    commit_result = _run(working_directory, "commit", "-m", commit_message, runner=runner)
+    if commit_result.returncode != 0:
+        raise TaskError(f"git commit failed: {(commit_result.stderr or '').strip()}")
+    push_result = _run(working_directory, "push", "origin", f"HEAD:refs/heads/{branch_short}", runner=runner)
+    if push_result.returncode != 0:
+        raise TaskError(f"git push failed: {(push_result.stderr or '').strip()}")
+    return current_head_sha(working_directory, runner=runner)
+
+
 def collect_commit_shas(working_directory, baseline_head: str, runner=subprocess.run) -> List[str]:
     """Every commit SHA actually made in the isolated worktree since
     `baseline_head`, oldest first, ending at the current HEAD -- never
@@ -233,7 +274,10 @@ def capture_repo_write_evidence(working_directory, baseline_head: str, branch: s
         touched nothing real);
       - zero commits since baseline_head (a "baseline-only" branch: the
         worktree was never actually committed to, whether or not it was
-        pushed);
+        pushed) -- under the Bootstrap architecture this is caught earlier,
+        by execution_runner.py's own check before it ever calls
+        commit_and_push_repo_write_changes(), but this function re-proves it
+        independently rather than trusting that caller;
       - final_commit_sha == baseline_head (the same zero-new-commits case,
         checked directly rather than only inferred from an empty commit
         list, in case baseline_head itself ever becomes reachable again
