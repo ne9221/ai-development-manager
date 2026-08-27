@@ -121,7 +121,14 @@ class RunOnceTests(unittest.TestCase):
                     build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client)
 
     def test_missing_token_env_fails_closed(self):
-        with patch.dict(os.environ, env(ADM_GITHUB_DISPATCH_INGRESS_TOKEN=""), clear=False):
+        # Also stub out the Git Credential Manager fallback (see
+        # manager.github_dispatch_client._resolve_token_via_git_credential_
+        # manager) so this test proves "no token anywhere" fails closed
+        # deterministically -- without this, it would silently pass or fail
+        # depending on whether the machine running it happens to have a
+        # real github.com credential configured locally.
+        with patch.dict(os.environ, env(ADM_GITHUB_DISPATCH_INGRESS_TOKEN=""), clear=False), \
+             patch("manager.github_dispatch_client._resolve_token_via_git_credential_manager", return_value=None):
             with self.assertRaises(TaskError):
                 github_dispatch_watcher.run_once(
                     build_service_fn=lambda: object(), store_factory=FakeStore,
@@ -255,6 +262,42 @@ class NoProviderLaunchAuthorityTests(unittest.TestCase):
             result = github_dispatch_watcher.run_once(
                 build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client)
         self.assertEqual("ok", result["status"])
+
+
+class RunOnceIssueIngressOptInTests(unittest.TestCase):
+    """The Issue-based ingress poll is additive and opt-in: it must never
+    run (and never even be attempted) unless ADM_GITHUB_DISPATCH_ISSUE_
+    ALLOWED_AUTHORS is actually configured, so an existing deployment that
+    only has the file-based ingress set up keeps behaving identically."""
+
+    def test_issue_poll_not_attempted_when_allowed_authors_unset(self):
+        client = FakeGitHubClient([request()])
+        handler = Mock(return_value={"accepted": True, "request_id": "gh-e2e-1",
+                                     "task_id": "dispatch-gh-e2e-1", "command_id": "dispatch-gh-e2e-1",
+                                     "status": "queued"})
+        issue_poll = Mock(side_effect=AssertionError("issue ingress must not run when opted out"))
+        with patch.dict(os.environ, env(), clear=False), \
+             patch("manager.github_dispatch_ingress.handle_dispatch", handler):
+            result = github_dispatch_watcher.run_once(
+                build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client,
+                poll_issues=issue_poll)
+        self.assertNotIn("issue_ingress", result)
+        self.assertEqual(0, issue_poll.call_count)
+
+    def test_issue_poll_attempted_and_merged_when_allowed_authors_set(self):
+        client = FakeGitHubClient([request()])
+        handler = Mock(return_value={"accepted": True, "request_id": "gh-e2e-1",
+                                     "task_id": "dispatch-gh-e2e-1", "command_id": "dispatch-gh-e2e-1",
+                                     "status": "queued"})
+        issue_poll = Mock(return_value=[{"issue_id": "1001", "accepted": True}])
+        with patch.dict(os.environ, env(ADM_GITHUB_DISPATCH_ISSUE_ALLOWED_AUTHORS="ne9221"), clear=False), \
+             patch("manager.github_dispatch_ingress.handle_dispatch", handler):
+            result = github_dispatch_watcher.run_once(
+                build_service_fn=lambda: object(), store_factory=FakeStore, client_factory=lambda: client,
+                poll_issues=issue_poll)
+        self.assertEqual(1, issue_poll.call_count)
+        self.assertEqual([{"issue_id": "1001", "accepted": True}], result["issue_ingress"])
+        self.assertTrue(result["ingress"][0]["accepted"])
 
 
 if __name__ == "__main__":

@@ -129,6 +129,20 @@ class GitHubApiClient:
         missing directory path within an existing branch."""
         return self._get(f"{API_ROOT}/repos/{repo}/branches/{branch}")
 
+    def list_issues(self, repo, state="open", per_page=20):
+        """GET /repos/{owner}/{repo}/issues?state=...&per_page=...&sort=
+        created&direction=desc -- one bounded, newest-first page. Note the
+        Issues API also returns pull requests in the same listing; callers
+        must filter out any entry carrying a `pull_request` key (this
+        client returns the raw entries unfiltered -- that admission
+        decision belongs to the caller, exactly like list_directory()
+        returning raw shallow entries)."""
+        result = self._get(f"{API_ROOT}/repos/{repo}/issues",
+                           params={"state": state, "per_page": per_page, "sort": "created", "direction": "desc"})
+        if not isinstance(result, list):
+            raise GitHubApiError("github_malformed_response", "GitHub issues listing was not a list")
+        return result
+
     def list_directory(self, repo, path, branch):
         """GET /repos/{owner}/{repo}/contents/{path}?ref={branch}. Returns a
         list of shallow entries (name, path, sha, size, type) -- never file

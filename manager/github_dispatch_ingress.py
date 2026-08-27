@@ -160,6 +160,42 @@ def read_request(client, repo, path, branch, entry, now=None):
     return document
 
 
+def build_dispatch_payload(request):
+    """Turn one validated dispatch_request document (already schema-checked
+    by manager.tasks.validate("dispatch_request", ...)) into the payload
+    shape cloud.dispatch_ingress.handle_dispatch() expects. Shared verbatim
+    between every GitHub-based ingress mechanism (file-based here, and
+    manager.github_issue_dispatch_ingress's Issue-based counterpart) so this
+    security-sensitive mapping -- most notably the explicit-opt-in-by-key-
+    presence repo_write/read_only contract -- exists in exactly one place.
+
+    Explicit opt-in only, by KEY PRESENCE -- not `is not None` -- a request
+    is write-mode if and only if it names its own repo_write key.
+    schema/dispatch_request.schema.json's own repo_write.type is "object"
+    (not ["object", "null"]), so "repo_write": null already fails schema
+    validation before a document ever reaches here -- this dict membership
+    check is never actually asked to distinguish null from absence, but is
+    written as membership regardless so the security contract ("only two
+    valid states: absent, or a valid object") is legible here too, not just
+    enforced one layer up. There is deliberately no inference from
+    title/goal text and no server-side default to write mode."""
+    payload = {
+        "request_id": request["request_id"], "project_id": request["project_id"],
+        "title": request["title"], "goal": request["goal"],
+        "priority": request.get("priority") or "normal",
+    }
+    if "repo_write" in request:
+        payload["constraints"] = {"read_only": False}
+        payload["repo_write"] = request["repo_write"]
+    else:
+        payload["constraints"] = {"read_only": True}
+    if request.get("preferred_provider") is not None:
+        payload["provider"] = request["preferred_provider"]
+    if request.get("account_id") is not None:
+        payload["account_id"] = request["account_id"]
+    return payload
+
+
 def poll_github_dispatch_requests(store, service, bucket, client, repo=None, branch=None, path=None, now=None,
                                   registry_factory=dispatch_request_registry,
                                   rejection_registry_factory=dispatch_rejection_registry,
@@ -226,26 +262,7 @@ def poll_github_dispatch_requests(store, service, bucket, client, repo=None, bra
     def _handle_one(entry):
         try:
             request = read_request(client, repo, path, branch, entry, now=current)
-            payload = {
-                "request_id": request["request_id"], "project_id": request["project_id"],
-                "title": request["title"], "goal": request["goal"],
-                "priority": request.get("priority") or "normal",
-            }
-            # Same explicit-opt-in-by-key-presence contract as
-            # manager.drive_dispatch_ingress._handle_one() -- see that
-            # function's docstring for the full reasoning (schema forbids
-            # "repo_write": null, so this dict membership check never has to
-            # distinguish null from absence, but is written as membership
-            # anyway so the security contract stays legible here too).
-            if "repo_write" in request:
-                payload["constraints"] = {"read_only": False}
-                payload["repo_write"] = request["repo_write"]
-            else:
-                payload["constraints"] = {"read_only": True}
-            if request.get("preferred_provider") is not None:
-                payload["provider"] = request["preferred_provider"]
-            if request.get("account_id") is not None:
-                payload["account_id"] = request["account_id"]
+            payload = build_dispatch_payload(request)
             result = handle_dispatch(store, service, lambda project_id, request_id:
                                      registry_factory(bucket, project_id, request_id), payload,
                                      request_created_at=request.get("created_at"))
