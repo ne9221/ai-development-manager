@@ -199,6 +199,23 @@ def current_head_sha(working_directory, runner=subprocess.run) -> str:
     return sha
 
 
+def _empty_commits(working_directory, commits: Sequence[str], runner=subprocess.run) -> List[str]:
+    """Every commit SHA in `commits` whose own tree change is empty (e.g.
+    `git commit --allow-empty`, or a commit whose only change was later
+    reverted within the same range) -- checked individually via `git
+    diff-tree` rather than inferred from the aggregate baseline..HEAD diff,
+    since an aggregate diff can be non-empty even while one commit inside
+    the range contributed nothing real."""
+    empty = []
+    for sha in commits:
+        result = _run(working_directory, "diff-tree", "--no-commit-id", "--name-only", "-r", sha, runner=runner)
+        if result.returncode != 0:
+            raise TaskError(f"git diff-tree for commit {sha} failed: {(result.stderr or '').strip()}")
+        if not result.stdout.strip():
+            empty.append(sha)
+    return empty
+
+
 def capture_repo_write_evidence(working_directory, baseline_head: str, branch: str, files_changed: Sequence[str],
                                 test_evidence: Optional[Sequence[str]] = None, runner=subprocess.run) -> Dict[str, Any]:
     """Build real, independently-verified terminal success evidence for a
@@ -209,20 +226,45 @@ def capture_repo_write_evidence(working_directory, baseline_head: str, branch: s
     branch was actually pushed and exactly matches the local HEAD -- never a
     provider's self-reported "Commit SHA:"/"GitHub push status:" text.
 
+    Fails closed -- raises TaskError, never returns partial or fabricated
+    evidence -- on every one of these, so none of them can ever reach a
+    persisted "completed" execution:
+      - zero changed files (a provider-reported "completed" turn that
+        touched nothing real);
+      - zero commits since baseline_head (a "baseline-only" branch: the
+        worktree was never actually committed to, whether or not it was
+        pushed);
+      - final_commit_sha == baseline_head (the same zero-new-commits case,
+        checked directly rather than only inferred from an empty commit
+        list, in case baseline_head itself ever becomes reachable again
+        through some other ref manipulation);
+      - any individual commit in the range whose own tree diff is empty
+        (`git commit --allow-empty` or an equivalent no-op commit used to
+        manufacture the appearance of progress);
+      - a push that cannot be independently verified against the real
+        remote (manager.remote_readback.verify_remote_branch_matches).
+
     `test_evidence` is preserved verbatim when the caller supplies it (e.g.
     from a provider's structured completion report); it is never inferred or
-    fabricated when omitted, so a missing test-evidence source stays an
-    empty list rather than a guessed one.
-
-    Raises TaskError -- never returns partial evidence with an unverified
-    push -- on any git or remote-readback failure, so a caller can downgrade
-    the execution to failed instead of ever persisting invented success
-    evidence.
+    fabricated when omitted. The returned `tests_status` is itself honest
+    about that distinction -- "reported" only when the caller actually
+    supplied non-empty test_evidence, "not_provided" otherwise -- so nothing
+    downstream can read an empty `tests` list as "tests were verified" by
+    omission.
     """
     commits = collect_commit_shas(working_directory, baseline_head, runner=runner)
+    if not commits:
+        raise TaskError("repo-write execution recorded no commits since baseline_head (baseline-only branch)")
     final_commit_sha = current_head_sha(working_directory, runner=runner)
-    if commits and commits[-1] != final_commit_sha:
+    if commits[-1] != final_commit_sha:
         raise TaskError("final commit SHA does not match the tip of the collected commit history")
+    if final_commit_sha == baseline_head:
+        raise TaskError("final commit SHA matches baseline_head; no new commit was actually made")
+    if not files_changed:
+        raise TaskError("repo-write execution produced no changed files (zero real changes)")
+    empty_commits = _empty_commits(working_directory, commits, runner=runner)
+    if empty_commits:
+        raise TaskError(f"repo-write execution contains empty commit(s) with no tree changes: {empty_commits}")
     branch_short = branch[len("refs/heads/"):] if branch.startswith("refs/heads/") else branch
     readback = verify_remote_branch_matches(working_directory, branch_short, final_commit_sha, runner=runner)
     return {
@@ -230,4 +272,5 @@ def capture_repo_write_evidence(working_directory, baseline_head: str, branch: s
         "branch": branch_short, "worktree_path": str(working_directory),
         "push_status": "verified", "remote_sha": readback["remote_sha"],
         "tests": list(test_evidence) if test_evidence else [],
+        "tests_status": "reported" if test_evidence else "not_provided",
     }

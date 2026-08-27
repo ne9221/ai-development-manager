@@ -23,6 +23,22 @@ HEARTBEAT_INTERVAL_SECONDS = 60.0
 MAX_ERROR_CHARS = 1000
 MAX_STDERR_CHARS = 8192
 
+# The only two unattended sandbox/approval_policy profiles this launcher
+# understands. GOVERNED_REPO_WRITE is the narrowest Codex app-server
+# configuration that still allows unattended edits inside the cwd it was
+# given (LaunchRequest.working_directory, which for a genuine v2-repo-write
+# Task is always its own isolated worktree -- never the shared canonical
+# checkout, see manager.execution_runner._resolve_working_directory): the
+# built-in "workspace-write" sandbox itself is what refuses any write
+# outside that tree, this launcher never widens or disables it, and
+# approval_policy="never" means Codex is not expected to pause for
+# approval at all rather than this launcher blanket-approving whatever it
+# asks. Any other sandbox/approval_policy combination (including today's
+# legacy production_write default of both None, and the explicit
+# read-only profile) keeps the original fully-deny behavior below.
+GOVERNED_REPO_WRITE_SANDBOX = "workspace-write"
+GOVERNED_REPO_WRITE_APPROVAL = "never"
+
 
 class CodexLaunchError(RuntimeError):
     """A bounded, provider-protocol launch failure."""
@@ -133,6 +149,35 @@ def _rpc_error(error: Any) -> str:
     return f"code={code}; {safe_message}" if code is not None else safe_message
 
 
+def _blocked_file_change_reason(turn: dict) -> str | None:
+    """A `turn/completed` payload's own `status` field only reflects
+    Codex's protocol-level view of the turn (see codex app-server's
+    TurnStatus: completed/interrupted/failed/inProgress); it says nothing
+    about whether the workspace edit this turn existed to make was actually
+    denied along the way. A declined/failed FileChangeThreadItem
+    (`turn.items[].type == "fileChange"`, `.status in
+    ("declined", "failed")`, per the app-server's own PatchApplyStatus
+    enum) is real structured evidence of exactly that -- Codex's own
+    "decline" decision explicitly "continues the turn" rather than failing
+    it, which is how a blocked edit can otherwise still surface as
+    status="completed" here. Only fileChange items are inspected: a
+    declined commandExecution/exec approval is this launcher's own
+    deliberate, permanent policy (shell/escalated actions are never
+    auto-approved, governed repo-write mode or not -- see
+    _reply_to_server_request), not evidence the turn failed to do its job.
+    """
+    items = turn.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "fileChange":
+            continue
+        status = item.get("status")
+        if status in ("declined", "failed"):
+            return f"fileChange item {item.get('id')!r} ended with status {status!r}"[:MAX_ERROR_CHARS]
+    return None
+
+
 def _trusted_session_path(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -149,9 +194,10 @@ def _trusted_session_path(value: Any) -> str | None:
 
 
 class _AppServerClient:
-    def __init__(self, process: Any, timeout: float):
+    def __init__(self, process: Any, timeout: float, governed_repo_write: bool = False):
         self.process = process
         self.timeout = timeout
+        self.governed_repo_write = governed_repo_write
         self._responses: dict[int, queue.Queue] = {}
         self._notifications: queue.Queue = queue.Queue()
         self._lock = threading.Lock()
@@ -199,7 +245,24 @@ class _AppServerClient:
             self._fail(CodexLaunchError(classification, f"app-server closed stdout; exit_code={code}"))
 
     def _reply_to_server_request(self, message: dict):
-        """Deny unattended approval requests and reject unsupported callbacks."""
+        """Deny unattended approval requests and reject unsupported callbacks.
+
+        In governed repo-write mode (self.governed_repo_write, set only for a
+        LaunchRequest carrying the exact GOVERNED_REPO_WRITE_SANDBOX/
+        GOVERNED_REPO_WRITE_APPROVAL profile -- see manager.execution_runner,
+        which only ever selects it for a Task that already independently
+        proved repo_write_policy_satisfied()), a file-change/patch approval
+        is the one request class this launcher may accept on Codex's behalf:
+        it is exactly the "workspace edit" approval_policy="never" is meant
+        to avoid ever having to ask for, the built-in "workspace-write"
+        sandbox already confines it to the cwd this launcher itself chose
+        (the Task's own isolated worktree), and manager.repo_write_
+        enforcement independently re-verifies every actual changed path
+        against the Task's admitted allowed_paths afterward regardless.
+        Command-execution approvals are never auto-approved in any mode --
+        shell/escalated actions are outside what a workspace file edit
+        requires, so those keep being declined even here.
+        """
         method = message["method"]
         decisions = {
             "item/commandExecution/requestApproval": {"decision": "decline"},
@@ -207,6 +270,9 @@ class _AppServerClient:
             "execCommandApproval": {"decision": {"denied": {"rejection": "unattended approval denied"}}},
             "applyPatchApproval": {"decision": {"denied": {"rejection": "unattended approval denied"}}},
         }
+        if self.governed_repo_write:
+            decisions["item/fileChange/requestApproval"] = {"decision": "accept"}
+            decisions["applyPatchApproval"] = {"decision": "approved"}
         if method in decisions:
             response = {"id": message["id"], "result": decisions[method]}
         else:
@@ -320,7 +386,7 @@ class CodexLauncher:
         self.executable = executable
         self._popen = popen
 
-    def _spawn(self, timeout: float) -> _AppServerClient:
+    def _spawn(self, timeout: float, governed_repo_write: bool = False) -> _AppServerClient:
         executable = resolve_codex_executable(self.executable)
         native_executable = _windows_npm_native_binary(executable)
         command = [native_executable or executable, "app-server"]
@@ -333,7 +399,7 @@ class CodexLauncher:
             )
         except OSError as exc:
             raise CodexLaunchError("spawn_failed", "failed to start Codex app-server") from exc
-        return _AppServerClient(process, timeout)
+        return _AppServerClient(process, timeout, governed_repo_write=governed_repo_write)
 
     def prepare(self, request: LaunchRequest) -> PreparedLaunch:
         timeout = _timeout(request.timeout_seconds)
@@ -341,7 +407,10 @@ class CodexLauncher:
         cwd = Path(request.working_directory)
         if not cwd.is_absolute() or not cwd.is_dir():
             raise CodexLaunchError("invalid_request", "working_directory must be an existing absolute directory")
-        client = self._spawn(timeout)
+        governed_repo_write = (
+            request.sandbox == GOVERNED_REPO_WRITE_SANDBOX and request.approval_policy == GOVERNED_REPO_WRITE_APPROVAL
+        )
+        client = self._spawn(timeout, governed_repo_write)
         try:
             initialized = client.request("initialize", {"clientInfo": {
                 "name": "ai_development_manager", "title": "AI Development Manager", "version": "0.1.0"
@@ -419,6 +488,11 @@ class CodexLauncher:
                 continue
             status = turn.get("status")
             if status == "completed":
+                if client.governed_repo_write:
+                    blocked = _blocked_file_change_reason(turn)
+                    if blocked is not None:
+                        return LaunchOutcome("failed", running.prepared.thread_id, running.turn_id, utc_now(),
+                                             "file_change_blocked", blocked)
                 return LaunchOutcome("completed", running.prepared.thread_id, running.turn_id, utc_now())
             error = turn.get("error") if isinstance(turn.get("error"), dict) else {}
             detail = str(error.get("message") or f"turn ended with status {status}")[:MAX_ERROR_CHARS]

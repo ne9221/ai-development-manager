@@ -380,9 +380,30 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
                                    approval_policy="never" if task["read_only"] else None,
                                    timeout_seconds=RPC_TIMEOUT_SECONDS, turn_timeout_seconds=turn_timeout)
     else:
+        # P0-A: a genuinely admitted bounded repo-write Task (independently
+        # re-proven here via repo_write_policy_satisfied(), never trusted
+        # from task["read_only"] being merely False) is the one case beyond
+        # read_only this launcher understands an explicit sandbox/approval
+        # profile for -- CodexLauncher's GOVERNED_REPO_WRITE_SANDBOX/
+        # GOVERNED_REPO_WRITE_APPROVAL is the narrowest Codex app-server
+        # configuration that still allows it to edit files unattended
+        # (workspace-write is scoped to the cwd this launcher was given,
+        # which _resolve_working_directory() above already guarantees is
+        # the Task's own isolated worktree, never the shared canonical
+        # checkout). Any other write task (the legacy needs_repo_edit=True
+        # fallback that never went through v2-repo-write admission) keeps
+        # today's unspecified sandbox=None/approval_policy=None -- widening
+        # that to workspace-write here would hand Codex unattended write
+        # access to a checkout ADM's own allowed_paths enforcement was
+        # never built to gate.
+        if task["read_only"]:
+            sandbox, codex_approval_policy = "read-only", "never"
+        elif provider == "codex" and repo_write_policy_satisfied(task):
+            sandbox, codex_approval_policy = "workspace-write", "never"
+        else:
+            sandbox, codex_approval_policy = None, None
         request = LaunchRequest(working_directory, model=model, reasoning_effort=dispatched["effort"],
-                                sandbox="read-only" if task["read_only"] else None,
-                                approval_policy="never" if task["read_only"] else None,
+                                sandbox=sandbox, approval_policy=codex_approval_policy,
                                 timeout_seconds=RPC_TIMEOUT_SECONDS, turn_timeout_seconds=turn_timeout)
     result = run_execution(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                            execution_id, dispatched["generated_prompt"], request,

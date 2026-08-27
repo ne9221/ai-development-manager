@@ -90,7 +90,9 @@ class LauncherTests(unittest.TestCase):
         self.process = FakeProcess(handler)
         return CodexLauncher(executable=__file__, popen=lambda *args, **kwargs: self.process)
 
-    def request(self, timeout=0.3): return LaunchRequest(self.cwd, model="gpt-test", reasoning_effort="medium", timeout_seconds=timeout, turn_timeout_seconds=timeout)
+    def request(self, timeout=0.3, sandbox=None, approval_policy=None):
+        return LaunchRequest(self.cwd, model="gpt-test", reasoning_effort="medium", sandbox=sandbox,
+                             approval_policy=approval_policy, timeout_seconds=timeout, turn_timeout_seconds=timeout)
 
     def prepare(self, handler=happy_handler): return self.launcher(handler).prepare(self.request())
 
@@ -191,6 +193,118 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual("completed", launcher.wait(running).status)
         response = next(item for item in self.process.messages if item.get("id") == "approval-1")
         self.assertEqual({"decision": "decline"}, response["result"])
+
+    def test_read_only_profile_forwards_sandbox_and_approval_policy(self):
+        launcher = self.launcher()
+        launcher.prepare(self.request(sandbox="read-only", approval_policy="never"))
+        thread_start = next(item for item in self.process.messages if item["method"] == "thread/start")
+        self.assertEqual("read-only", thread_start["params"]["sandbox"])
+        self.assertEqual("never", thread_start["params"]["approvalPolicy"])
+
+    def test_governed_repo_write_forwards_workspace_write_sandbox(self):
+        launcher = self.launcher()
+        launcher.prepare(self.request(sandbox="workspace-write", approval_policy="never"))
+        thread_start = next(item for item in self.process.messages if item["method"] == "thread/start")
+        self.assertEqual("workspace-write", thread_start["params"]["sandbox"])
+        self.assertEqual("never", thread_start["params"]["approvalPolicy"])
+
+    def _approval_response(self, sandbox, approval_policy, method):
+        def handler(process, message):
+            happy_handler(process, message)
+            if message.get("method") == "turn/start":
+                process.stdout.put(json.dumps({"id": "approval-1", "method": method, "params": {}}) + "\n")
+            elif message.get("id") == "approval-1" and "method" not in message:
+                process.notify("turn/completed", {
+                    "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed", "items": []},
+                })
+        launcher = self.launcher(handler)
+        prepared = launcher.prepare(self.request(sandbox=sandbox, approval_policy=approval_policy))
+        running = launcher.start(prepared, "work")
+        launcher.wait(running)
+        return next(item for item in self.process.messages if item.get("id") == "approval-1")["result"]
+
+    def test_read_only_mode_still_declines_file_change_approval(self):
+        # P0-A test 1: read_only Codex still cannot modify the workspace --
+        # a file-change approval callback is declined exactly as before,
+        # regardless of the new governed repo-write branch existing.
+        self.assertEqual({"decision": "decline"},
+                         self._approval_response("read-only", "never", "item/fileChange/requestApproval"))
+
+    def test_read_only_mode_still_declines_legacy_apply_patch_approval(self):
+        self.assertEqual({"decision": {"denied": {"rejection": "unattended approval denied"}}},
+                         self._approval_response("read-only", "never", "applyPatchApproval"))
+
+    def test_legacy_none_profile_still_declines_file_change_approval(self):
+        # Today's unspecified legacy production_write profile (sandbox=None,
+        # approval_policy=None) must keep the original fully-deny behavior --
+        # only the exact GOVERNED_REPO_WRITE_SANDBOX/_APPROVAL profile opts
+        # into accepting file-change approvals.
+        self.assertEqual({"decision": "decline"},
+                         self._approval_response(None, None, "item/fileChange/requestApproval"))
+
+    def test_governed_repo_write_accepts_file_change_approval(self):
+        self.assertEqual({"decision": "accept"},
+                         self._approval_response("workspace-write", "never", "item/fileChange/requestApproval"))
+
+    def test_governed_repo_write_accepts_legacy_apply_patch_approval(self):
+        self.assertEqual({"decision": "approved"},
+                         self._approval_response("workspace-write", "never", "applyPatchApproval"))
+
+    def test_governed_repo_write_still_declines_command_execution_approval(self):
+        # Never blanket-approve shell/escalated actions, even in governed
+        # repo-write mode -- only file/patch changes are the "exact safe
+        # request class required for workspace edits".
+        self.assertEqual({"decision": "decline"},
+                         self._approval_response("workspace-write", "never", "item/commandExecution/requestApproval"))
+
+    def test_governed_repo_write_still_declines_legacy_exec_command_approval(self):
+        self.assertEqual({"decision": {"denied": {"rejection": "unattended approval denied"}}},
+                         self._approval_response("workspace-write", "never", "execCommandApproval"))
+
+    def test_governed_repo_write_declined_file_change_item_fails_completed_turn(self):
+        # P0-B: turn/completed's own status says "completed" (Codex's
+        # "decline" decision explicitly continues the turn rather than
+        # failing it), but a declined fileChange item is real structured
+        # evidence the workspace edit never actually landed -- this must
+        # never terminalize as a successful completion.
+        def handler(process, message):
+            happy_handler(process, message)
+            if message.get("method") == "turn/start":
+                process.stdout.put(json.dumps({
+                    "id": "approval-1", "method": "item/fileChange/requestApproval", "params": {},
+                }) + "\n")
+            elif message.get("id") == "approval-1" and "method" not in message:
+                process.notify("turn/completed", {
+                    "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed", "items": [
+                        {"id": "item-1", "type": "fileChange", "status": "declined", "changes": []},
+                    ]},
+                })
+        launcher = self.launcher(handler)
+        prepared = launcher.prepare(self.request(sandbox="workspace-write", approval_policy="never"))
+        running = launcher.start(prepared, "work")
+        outcome = launcher.wait(running)
+        self.assertEqual("failed", outcome.status)
+        self.assertEqual("file_change_blocked", outcome.failure_classification)
+        self.assertIn("item-1", outcome.failure_detail)
+
+    def test_non_governed_completed_turn_ignores_file_change_item_status(self):
+        # Outside governed repo-write mode (e.g. a read-only launch that
+        # never had item-level evidence checked before this change), a
+        # completed turn's status is trusted exactly as before -- this new
+        # check is scoped to governed repo-write launches only, so every
+        # existing non-repo-write test keeps its original behavior.
+        launcher = self.launcher()
+        running = launcher.start(launcher.prepare(self.request()), "work")
+        self.process.notify("turn/completed", {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed",
+                                                "items": [{"id": "item-1", "type": "fileChange", "status": "declined", "changes": []}]}})
+        self.assertEqual("completed", launcher.wait(running).status)
+
+    def test_governed_repo_write_completed_turn_with_accepted_file_change_stays_completed(self):
+        launcher = self.launcher()
+        running = launcher.start(launcher.prepare(self.request(sandbox="workspace-write", approval_policy="never")), "work")
+        self.process.notify("turn/completed", {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed",
+                                                "items": [{"id": "item-1", "type": "fileChange", "status": "completed", "changes": []}]}})
+        self.assertEqual("completed", launcher.wait(running).status)
 
     def test_unsupported_server_request_gets_bounded_jsonrpc_error(self):
         def handler(process, message):

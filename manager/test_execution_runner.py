@@ -1197,6 +1197,7 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         fake_evidence = {
             "files_changed": [], "commits": [], "final_commit_sha": HEAD, "branch": "adm-worktree/p1/t1",
             "worktree_path": materialized, "push_status": "verified", "remote_sha": HEAD, "tests": [],
+            "tests_status": "not_provided",
         }
         with patch("manager.execution_runner.get_global_registry") as get_registry, \
              patch("manager.execution_runner.materialize_worktree", side_effect=fake_materialize) as materialize, \
@@ -1219,6 +1220,31 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         self.assertEqual(materialized, launcher.request.working_directory)
         self.assertNotEqual(self.valid_dir, launcher.request.working_directory)
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
+        # P0-A: a Task that independently proves repo_write_policy_satisfied()
+        # (source_context.repo/allowed_paths/baseline_head/bounded-write
+        # policies, all present on self._repo_write_task()) launches Codex
+        # with the narrowest sandbox/approval profile that still allows
+        # unattended edits, never left at today's legacy sandbox=None.
+        self.assertEqual("workspace-write", launcher.request.sandbox)
+        self.assertEqual("never", launcher.request.approval_policy)
+
+    def test_legacy_write_task_without_repo_write_admission_keeps_unspecified_sandbox(self):
+        # A needs_repo_edit=True Task that never went through v2-repo-write
+        # admission (self._legacy_task()'s execution_policies=[] never
+        # satisfies REQUIRED_REPO_WRITE_TASK_POLICIES, and it carries no
+        # source_context/repo evidence either) must never be granted
+        # workspace-write -- that would hand Codex unattended write access
+        # to whatever working_directory this legacy fallback resolves to
+        # (here, the Project's own shared canonical working_directory),
+        # which ADM's allowed_paths enforcement was never built to gate. It
+        # keeps today's pre-existing sandbox=None/approval_policy=None.
+        store = self._store(project_working_directory=self.valid_dir)
+        launcher = Launcher()
+
+        self._launch(store, launcher=launcher)
+
+        self.assertIsNone(launcher.request.sandbox)
+        self.assertIsNone(launcher.request.approval_policy)
 
     def test_repo_write_task_materialization_failure_never_falls_back_to_canonical_checkout(self):
         from manager.worktree_materializer import WorktreeMaterializationError

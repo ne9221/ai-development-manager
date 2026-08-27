@@ -142,7 +142,7 @@
         {"type": "null"},
         {
           "type": "object", "additionalProperties": false,
-          "required": ["files_changed", "commits", "final_commit_sha", "branch", "worktree_path", "push_status", "remote_sha", "tests"],
+          "required": ["files_changed", "commits", "final_commit_sha", "branch", "worktree_path", "push_status", "remote_sha", "tests", "tests_status"],
           "properties": {
             "files_changed": {"type": "array", "items": {"type": "string"}},
             "commits": {"type": "array", "items": {"type": "string", "pattern": "^[0-9a-f]{40}$"}},
@@ -151,7 +151,8 @@
             "worktree_path": {"type": "string", "minLength": 1},
             "push_status": {"const": "verified"},
             "remote_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-            "tests": {"type": "array", "items": {"type": "string"}}
+            "tests": {"type": "array", "items": {"type": "string"}},
+            "tests_status": {"enum": ["reported", "not_provided"]}
           }
         }
       ],

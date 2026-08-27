@@ -302,6 +302,11 @@ def _terminal_handoff(execution, task, status, summary, timestamp):
         "push_status": evidence["push_status"] if evidence else None,
         "worktree_path": evidence["worktree_path"] if evidence else None,
         "remote_sha": evidence["remote_sha"] if evidence else None,
+        # Honest test-evidence status (P0-C): "reported" only when the
+        # execution actually supplied test_evidence to capture_repo_write_
+        # evidence(); an empty `tests` list must never be read downstream as
+        # "tests were run and verified" by omission alone.
+        "tests_status": evidence["tests_status"] if evidence else None,
     }
     if status == "completed":
         from manager.governance import execution_completion_report
