@@ -510,6 +510,14 @@ def build_daily_brief_vm(
 
     # Normalize input candidates
     normalized_input = current_doc_or_summary or {}
+    if isinstance(normalized_input, dict) and "accounts" in normalized_input and not normalized_input.get("accounts") and history:
+        # Preserve the last successful per-account snapshot when the live
+        # quota read failed upstream; forecast_daily_brief will mark it stale.
+        from manager.quota_reader import summarize_history
+
+        recovered = summarize_history(history, max_age_minutes=max_age_minutes, now=now)
+        if recovered.get("accounts"):
+            normalized_input = recovered
     if isinstance(normalized_input, dict):
         if not normalized_input.get("accounts") and normalized_input.get("providers"):
             normalized_input = normalized_input.get("providers")
@@ -917,17 +925,228 @@ def build_provider_truth(command: Optional[Dict[str, Any]], execution: Optional[
     """provider/account_id/model/mode from the most authoritative record
     available (command, then execution); any missing/blank field is the
     literal "UNKNOWN" string, never a guess or another record's value."""
-    source = command if isinstance(command, dict) else (execution if isinstance(execution, dict) else {})
+    records = [record for record in (command, execution) if isinstance(record, dict)]
 
     def _val(key: str) -> str:
-        value = source.get(key)
-        return value if isinstance(value, str) and value.strip() else UNKNOWN_LABEL
+        for record in records:
+            value = record.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return UNKNOWN_LABEL
 
     return {
         "provider": _val("provider"),
         "account_id": _val("account_id"),
         "model": _val("model"),
         "mode": _val("mode"),
+    }
+
+
+_DASHBOARD_LIFECYCLE_STATES = {
+    "queued", "waiting_scheduler", "waiting_provider", "running", "waiting_quota",
+    "waiting_approval", "blocked", "failed", "review_required", "completed",
+}
+
+
+def _first_value(records: Sequence[Optional[Dict[str, Any]]], keys: Sequence[str]) -> Any:
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for key in keys:
+            value = record.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _explicit_bool(records: Sequence[Optional[Dict[str, Any]]], keys: Sequence[str]) -> Optional[bool]:
+    value = _first_value(records, keys)
+    return value if isinstance(value, bool) else None
+
+
+def _last_real_event(records: Sequence[Optional[Dict[str, Any]]]) -> Optional[str]:
+    """Return event evidence, never a heartbeat/poll marker."""
+    noise = {"heartbeat", "provider_heartbeat", "poll", "polling", "status_poll"}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for key in ("last_real_event", "last_provider_event"):
+            value = record.get(key)
+            if isinstance(value, str) and value.strip() and value.strip().lower() not in noise:
+                return value
+    return None
+
+
+def _normalise_lifecycle_state(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    state = value.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "in_progress": "running", "claimed": "waiting_scheduler", "reserved": "waiting_scheduler",
+        "attention": "review_required", "cancelled": "failed", "interrupted": "failed",
+        "provider_wait": "waiting_provider", "quota_wait": "waiting_quota",
+        "approval": "waiting_approval", "review": "review_required",
+    }
+    state = aliases.get(state, state)
+    return state if state in _DASHBOARD_LIFECYCLE_STATES else None
+
+
+def classify_dashboard_lifecycle(
+    task: Optional[Dict[str, Any]],
+    command: Optional[Dict[str, Any]],
+    execution: Optional[Dict[str, Any]],
+) -> str:
+    """Map existing Task/Command/Execution states to the dashboard vocabulary.
+
+    This is a read-model mapping only. Explicit waiting states/reasons win;
+    polling timestamps are never treated as lifecycle events.
+    """
+    records = [execution, command, task]
+    explicit = _normalise_lifecycle_state(_first_value(records, (
+        "current_lifecycle_state", "lifecycle_state", "waiting_state", "current_state",
+    )))
+    if explicit:
+        return explicit
+
+    status = next((
+        _normalise_lifecycle_state(record.get("status"))
+        for record in records
+        if isinstance(record, dict) and _normalise_lifecycle_state(record.get("status"))
+    ), None)
+    if status in ("completed", "failed", "blocked", "review_required"):
+        return status
+
+    reason = _first_value(records, ("waiting_reason", "wait_reason", "blocker", "blocked_reason", "recovery_reason"))
+    reason_text = reason.lower() if isinstance(reason, str) else ""
+    if any(word in reason_text for word in ("quota", "rate limit", "rate_limit")):
+        return "waiting_quota"
+    if any(word in reason_text for word in ("approval", "human", "permission")):
+        return "waiting_approval"
+    if any(word in reason_text for word in ("provider", "session", "process")):
+        return "waiting_provider"
+
+    if status:
+        return status
+    return "review_required" if _explicit_bool(records, ("human_action_required", "needs_human_action", "requires_approval")) else "failed" if any(
+        isinstance(record, dict) and record.get("status") in ("failed", "interrupted", "cancelled")
+        for record in records
+    ) else UNKNOWN_LABEL.lower()
+
+
+def _progress_part(
+    record: Optional[Dict[str, Any]],
+    text_keys: Sequence[str],
+    percent_keys: Sequence[str],
+    completed_keys: Sequence[str],
+    total_keys: Sequence[str],
+    state_keys: Sequence[str],
+) -> Dict[str, Any]:
+    record = record if isinstance(record, dict) else {}
+    raw = _first_value((record,), text_keys)
+    raw_progress = raw if isinstance(raw, dict) else None
+    percent = _first_value((raw_progress, record), percent_keys)
+    completed = _first_value((raw_progress, record), completed_keys)
+    total = _first_value((raw_progress, record), total_keys)
+    if not isinstance(percent, (int, float)) or isinstance(percent, bool):
+        percent = None
+    if not isinstance(completed, (int, float)) or isinstance(completed, bool):
+        completed = None
+    if not isinstance(total, (int, float)) or isinstance(total, bool):
+        total = None
+    return {
+        "value": raw if isinstance(raw, str) else None,
+        "percent": percent,
+        "completed": completed,
+        "total": total,
+        "state": _first_value((record,), state_keys) or UNKNOWN_LABEL.lower(),
+        "source": next((key for key in text_keys + percent_keys + completed_keys + total_keys if key in record), None),
+    }
+
+
+def build_progress_truth(
+    project: Optional[Dict[str, Any]],
+    task: Optional[Dict[str, Any]],
+    milestone: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Expose only explicit progress fields already present in ADM records."""
+    task = task if isinstance(task, dict) else {}
+    project = project if isinstance(project, dict) else {}
+    milestone = milestone if isinstance(milestone, dict) else {}
+    task_part = _progress_part(
+        task, ("current_progress", "progress"), ("progress_percent", "progress_percentage", "percent", "percentage"),
+        ("progress_completed", "completed_steps", "completed"), ("progress_total", "total_steps", "total"),
+        ("status", "current_state"),
+    )
+    project_part = _progress_part(
+        project, ("overall_project_progress", "current_progress", "progress"),
+        ("overall_progress_percent", "progress_percent", "progress_percentage", "percent", "percentage"),
+        ("completed_projects", "progress_completed", "completed_steps", "completed"),
+        ("total_projects", "progress_total", "total_steps", "total"), ("current_phase", "status"),
+    )
+    milestone_part = _progress_part(
+        milestone or task, ("milestone_progress", "current_progress", "progress"),
+        ("milestone_progress_percent", "progress_percent", "progress_percentage", "percent", "percentage"),
+        ("milestone_completed", "progress_completed", "completed_steps", "completed"),
+        ("milestone_total", "progress_total", "total_steps", "total"), ("milestone", "milestone_id", "status"),
+    )
+    return {"task": task_part, "project": project_part, "milestone": milestone_part}
+
+
+def build_execution_truth(
+    task: Optional[Dict[str, Any]],
+    command: Optional[Dict[str, Any]],
+    execution: Optional[Dict[str, Any]],
+    now: datetime,
+    handoff: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build the dashboard's task-scoped execution read model from real fields."""
+    task = task if isinstance(task, dict) else {}
+    command = command if isinstance(command, dict) else {}
+    execution = execution if isinstance(execution, dict) else {}
+    handoff = handoff if isinstance(handoff, dict) else {}
+    records = [execution, command, task, handoff]
+    provider = build_provider_truth(command, execution)
+    provider["provider"] = provider["provider"] if provider["provider"] != UNKNOWN_LABEL else (
+        task.get("assigned_provider") or task.get("recommended_provider") or UNKNOWN_LABEL
+    )
+    provider["account_id"] = provider["account_id"] if provider["account_id"] != UNKNOWN_LABEL else task.get("account_id") or UNKNOWN_LABEL
+    provider["model"] = provider["model"] if provider["model"] != UNKNOWN_LABEL else (task.get("model") or (execution.get("task_snapshot") or {}).get("model") or UNKNOWN_LABEL)
+    provider["mode"] = provider["mode"] if provider["mode"] != UNKNOWN_LABEL else task.get("mode") or (execution.get("task_snapshot") or {}).get("mode") or UNKNOWN_LABEL
+
+    state = classify_dashboard_lifecycle(task, command, execution)
+    started_at = _first_value((execution,), ("started_at",))
+    finished_at = _first_value((execution,), ("finished_at", "completed_at"))
+    started = parse_time(started_at)
+    ended = parse_time(finished_at) if finished_at else now
+    elapsed_seconds = max(0.0, (ended - started).total_seconds()) if started and ended else None
+    if elapsed_seconds is None and isinstance(execution.get("elapsed_minutes"), (int, float)):
+        elapsed_seconds = max(0.0, float(execution["elapsed_minutes"]) * 60.0)
+
+    waiting_since = _first_value(records, ("waiting_since", "wait_started_at"))
+    waiting_reason = _first_value(records, ("waiting_reason", "wait_reason"))
+    blocker = _first_value(records, ("blocker", "blocked_reason", "recovery_reason", "terminal_reason"))
+    human_action_required = _explicit_bool(records, ("human_action_required", "needs_human_action", "requires_approval"))
+    if human_action_required is None and state == "waiting_approval":
+        human_action_required = True
+    last_real_event = _last_real_event((execution, command))
+    next_action = _first_value(records, ("next_automatic_action", "next_action"))
+    session_id = _first_value((execution, command), ("session_id", "provider_session_id", "conversation_id"))
+    return {
+        **provider,
+        "execution_id": execution.get("execution_id") or UNKNOWN_LABEL,
+        "session_id": session_id or UNKNOWN_LABEL,
+        "current_lifecycle_state": state,
+        "start_time": started_at,
+        "elapsed_runtime_seconds": elapsed_seconds,
+        "elapsed_runtime_minutes": None if elapsed_seconds is None else round(elapsed_seconds / 60.0, 3),
+        "waiting_since": waiting_since,
+        "waiting_reason": waiting_reason,
+        "blocker": blocker,
+        "human_action_required": human_action_required,
+        "last_real_event": last_real_event,
+        "last_real_event_at": _first_value((execution,), ("progress_updated_at", "event_at")),
+        "next_automatic_action": next_action,
+        "source": "execution" if execution else "task/command",
     }
 
 
@@ -951,9 +1170,20 @@ def build_quota_truth(
     explicitly "UNKNOWN", never borrowed from another account or provider."""
     unknown_row = {
         "found": False,
+        "provider": provider,
+        "account": account_id,
+        "account_id": account_id,
+        "status": "unknown",
         "five_hour_used_pct": None, "five_hour_remaining_pct": None, "five_hour_reset_at": None,
         "weekly_used_pct": None, "weekly_remaining_pct": None, "weekly_reset_at": None,
         "captured_at": None, "freshness": UNKNOWN_LABEL,
+        "freshness_state": "unknown",
+        "collected_at": None, "last_successful_collection_at": None, "updated_at": None,
+        "usage": {"five_hour": None, "weekly": None},
+        "remaining": {"five_hour": None, "weekly": None},
+        "reset_at": {"five_hour": None, "weekly": None},
+        "evidence": {"source": None, "source_type": None, "confidence": None},
+        "source": None,
         "formatted_five_hour_used": UNKNOWN_LABEL, "formatted_five_hour_remaining": UNKNOWN_LABEL,
         "formatted_five_hour_reset_at": UNKNOWN_LABEL,
         "formatted_weekly_used": UNKNOWN_LABEL, "formatted_weekly_remaining": UNKNOWN_LABEL,
@@ -968,8 +1198,30 @@ def build_quota_truth(
         return unknown_row
 
     freshness = "STALE" if vm.stale else "fresh"
+    if vm.stale:
+        status = "stale"
+        freshness_state = "stale"
+    elif vm.status in ("error", "failed"):
+        status = "error"
+        freshness_state = "error"
+    elif vm.overall_risk == "exhausted":
+        status = "exhausted"
+        freshness_state = "current"
+    elif not vm.has_reliable_quota or vm.five_hour_remaining_pct is None:
+        status = "unknown"
+        freshness_state = "unknown"
+    elif vm.dispatchable:
+        status = "available"
+        freshness_state = "current"
+    else:
+        status = "unavailable"
+        freshness_state = "current"
     return {
         "found": True,
+        "provider": vm.provider,
+        "account": vm.account_id,
+        "account_id": vm.account_id,
+        "status": status,
         "five_hour_used_pct": vm.five_hour_used_pct,
         "five_hour_remaining_pct": vm.five_hour_remaining_pct,
         "five_hour_reset_at": vm.five_hour_resets_at,
@@ -978,6 +1230,15 @@ def build_quota_truth(
         "weekly_reset_at": vm.weekly_resets_at if vm.has_weekly_window else None,
         "captured_at": vm.last_updated,
         "freshness": freshness,
+        "freshness_state": freshness_state,
+        "collected_at": vm.last_updated,
+        "last_successful_collection_at": vm.last_updated,
+        "updated_at": vm.last_updated,
+        "usage": {"five_hour": vm.five_hour_used_pct, "weekly": vm.weekly_used_pct if vm.has_weekly_window else None},
+        "remaining": {"five_hour": vm.five_hour_remaining_pct, "weekly": vm.weekly_remaining_pct if vm.has_weekly_window else None},
+        "reset_at": {"five_hour": vm.five_hour_resets_at, "weekly": vm.weekly_resets_at if vm.has_weekly_window else None},
+        "evidence": {"source": vm.source, "source_type": vm.source_type, "confidence": vm.confidence},
+        "source": vm.source,
         "formatted_five_hour_used": format_percent(vm.five_hour_used_pct),
         "formatted_five_hour_remaining": vm.formatted_five_hour_remaining,
         "formatted_five_hour_reset_at": vm.five_hour_resets_at or UNKNOWN_LABEL,
@@ -997,13 +1258,21 @@ def build_dispatch_truth_row(
     now: datetime,
     has_dispatch_request: bool = False,
     dispatch_request_status: Optional[Dict[str, Any]] = None,
+    milestone: Optional[Dict[str, Any]] = None,
+    handoff: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """One user-visible truth row: Project/Task/Provider/Account/Model/Mode/
     Dispatch State/Execution/Session, plus that account's Quota truth."""
     dispatch = compute_dispatch_state(task, command, execution, now, has_dispatch_request=has_dispatch_request,
                                       dispatch_request_status=dispatch_request_status)
-    provider_truth = build_provider_truth(command, execution)
-    quota = build_quota_truth(account_vms, provider_truth["provider"], provider_truth["account_id"])
+    execution_truth = build_execution_truth(task, command, execution, now, handoff=handoff)
+    progress_truth = build_progress_truth(project, task, milestone=milestone)
+    quota_account_id = execution_truth["account_id"]
+    if quota_account_id == UNKNOWN_LABEL and execution_truth["provider"] != UNKNOWN_LABEL:
+        # A null account_id is the canonical legacy/default account key. It
+        # is different from an unknown provider/account and must not prevent a
+        # real provider-level quota record from matching.
+        quota_account_id = None
 
     execution_id = execution.get("execution_id") if isinstance(execution, dict) else None
     session_id = None
@@ -1018,15 +1287,31 @@ def build_dispatch_truth_row(
         "project_name": project_name,
         "task_id": task.get("task_id") or UNKNOWN_LABEL,
         "task_title": task.get("title") or UNKNOWN_LABEL,
-        "provider": provider_truth["provider"],
-        "account_id": provider_truth["account_id"],
-        "model": provider_truth["model"],
-        "mode": provider_truth["mode"],
+        "provider": execution_truth["provider"],
+        "account": execution_truth["account_id"],
+        "account_id": execution_truth["account_id"],
+        "model": execution_truth["model"],
+        "mode": execution_truth["mode"],
         "dispatch_state": dispatch["state"],
         "dispatch_reason": dispatch["reason"],
-        "execution_id": execution_id or UNKNOWN_LABEL,
-        "session_id": session_id or UNKNOWN_LABEL,
-        "quota": quota,
+        "execution_id": execution_truth["execution_id"] if execution_truth["execution_id"] != UNKNOWN_LABEL else execution_id or UNKNOWN_LABEL,
+        "session_id": execution_truth["session_id"] if execution_truth["session_id"] != UNKNOWN_LABEL else session_id or UNKNOWN_LABEL,
+        "quota": build_quota_truth(account_vms, execution_truth["provider"], quota_account_id),
+        "execution": execution_truth,
+        "progress": progress_truth,
+        "current_progress": progress_truth["task"],
+        "project_progress": progress_truth["project"],
+        "milestone_progress": progress_truth["milestone"],
+        "current_lifecycle_state": execution_truth["current_lifecycle_state"],
+        "start_time": execution_truth["start_time"],
+        "elapsed_runtime_seconds": execution_truth["elapsed_runtime_seconds"],
+        "elapsed_runtime_minutes": execution_truth["elapsed_runtime_minutes"],
+        "waiting_since": execution_truth["waiting_since"],
+        "waiting_reason": execution_truth["waiting_reason"],
+        "blocker": execution_truth["blocker"],
+        "human_action_required": execution_truth["human_action_required"],
+        "last_real_event": execution_truth["last_real_event"],
+        "next_automatic_action": execution_truth["next_automatic_action"],
     }
 
 
@@ -1085,6 +1370,8 @@ def build_pretask_dispatch_truth_row(
             dispatch_request_status=dispatch_request_status,
         )
     project_name = (project.get("name") if isinstance(project, dict) else None) or project_id or UNKNOWN_LABEL
+    execution_truth = build_execution_truth(None, None, None, now)
+    progress_truth = build_progress_truth(project, None)
 
     return {
         "project_id": project_id or UNKNOWN_LABEL,
@@ -1105,6 +1392,21 @@ def build_pretask_dispatch_truth_row(
         "execution_id": UNKNOWN_LABEL,
         "session_id": UNKNOWN_LABEL,
         "quota": build_quota_truth(account_vms, UNKNOWN_LABEL, UNKNOWN_LABEL),
+        "execution": execution_truth,
+        "progress": progress_truth,
+        "current_progress": progress_truth["task"],
+        "project_progress": progress_truth["project"],
+        "milestone_progress": progress_truth["milestone"],
+        "current_lifecycle_state": execution_truth["current_lifecycle_state"],
+        "start_time": execution_truth["start_time"],
+        "elapsed_runtime_seconds": execution_truth["elapsed_runtime_seconds"],
+        "elapsed_runtime_minutes": execution_truth["elapsed_runtime_minutes"],
+        "waiting_since": execution_truth["waiting_since"],
+        "waiting_reason": execution_truth["waiting_reason"],
+        "blocker": execution_truth["blocker"],
+        "human_action_required": execution_truth["human_action_required"],
+        "last_real_event": execution_truth["last_real_event"],
+        "next_automatic_action": execution_truth["next_automatic_action"],
         "request_id": request_id,
         "pretask": True,
     }
@@ -1135,6 +1437,8 @@ def build_pretask_listing_truncated_row(
     a guess at any individual request's real status.
     """
     project_name = (project.get("name") if isinstance(project, dict) else None) or project_id or UNKNOWN_LABEL
+    execution_truth = build_execution_truth(None, None, None, datetime.now(timezone.utc))
+    progress_truth = build_progress_truth(project, None)
     return {
         "project_id": project_id or UNKNOWN_LABEL,
         "project_name": project_name,
@@ -1151,6 +1455,21 @@ def build_pretask_listing_truncated_row(
         "execution_id": UNKNOWN_LABEL,
         "session_id": UNKNOWN_LABEL,
         "quota": build_quota_truth(account_vms, UNKNOWN_LABEL, UNKNOWN_LABEL),
+        "execution": execution_truth,
+        "progress": progress_truth,
+        "current_progress": progress_truth["task"],
+        "project_progress": progress_truth["project"],
+        "milestone_progress": progress_truth["milestone"],
+        "current_lifecycle_state": execution_truth["current_lifecycle_state"],
+        "start_time": execution_truth["start_time"],
+        "elapsed_runtime_seconds": execution_truth["elapsed_runtime_seconds"],
+        "elapsed_runtime_minutes": execution_truth["elapsed_runtime_minutes"],
+        "waiting_since": execution_truth["waiting_since"],
+        "waiting_reason": execution_truth["waiting_reason"],
+        "blocker": execution_truth["blocker"],
+        "human_action_required": execution_truth["human_action_required"],
+        "last_real_event": execution_truth["last_real_event"],
+        "next_automatic_action": execution_truth["next_automatic_action"],
         "request_id": None,
         "pretask": True,
         "pretask_listing_truncated": True,

@@ -220,6 +220,26 @@ def summarize(document, max_age_minutes=60, now=None):
     }
 
 
+def summarize_history(snapshots, max_age_minutes=60, now=None):
+    """Summarize the newest per-account snapshots without erasing last truth.
+
+    Used only when the current Drive read fails. The resulting entries are
+    still age-checked by ``summarize`` and therefore become stale, never live,
+    merely because the dashboard refresh was attempted.
+    """
+    latest = {}
+    for item in snapshots or []:
+        if not isinstance(item, dict) or not item.get("provider"):
+            continue
+        timestamp = parse_time(item.get("observed_at") or item.get("last_updated"))
+        key = (item.get("provider"), item.get("account_id"))
+        prior = latest.get(key)
+        prior_timestamp = parse_time((prior or {}).get("observed_at") or (prior or {}).get("last_updated"))
+        if prior is None or (timestamp is not None and (prior_timestamp is None or timestamp >= prior_timestamp)):
+            latest[key] = item
+    return summarize({"generated_at": None, "providers": list(latest.values())}, max_age_minutes=max_age_minutes, now=now)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-age-minutes", type=float, default=60)
