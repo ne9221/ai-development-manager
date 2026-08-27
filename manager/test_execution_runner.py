@@ -1195,27 +1195,33 @@ class WorkingDirectoryContractTests(unittest.TestCase):
             return dict(materialized_result)
 
         fake_evidence = {
-            "files_changed": [], "commits": [], "final_commit_sha": HEAD, "branch": "adm-worktree/p1/t1",
-            "worktree_path": materialized, "push_status": "verified", "remote_sha": HEAD, "tests": [],
+            "files_changed": ["manager/executions.py"], "commits": [HEAD], "final_commit_sha": HEAD,
+            "branch": "adm-worktree/p1/t1", "worktree_path": materialized, "push_status": "verified",
+            "remote_sha": HEAD, "tests": [],
         }
         with patch("manager.execution_runner.get_global_registry") as get_registry, \
              patch("manager.execution_runner.materialize_worktree", side_effect=fake_materialize) as materialize, \
-             patch("manager.execution_runner.enforce_allowed_paths", return_value=[]) as enforce, \
+             patch("manager.execution_runner.enforce_allowed_paths", return_value=["manager/executions.py"]) as enforce, \
+             patch("manager.execution_runner.commit_and_push_repo_write_changes", return_value=HEAD) as commit_and_push, \
              patch("manager.execution_runner.capture_repo_write_evidence", return_value=fake_evidence) as capture:
             # Slice D's actual allowed_paths enforcement (real git diff
             # against an isolated worktree) and Slice D2's real commit/remote
             # evidence capture are covered end-to-end in manager.
             # test_repo_write_enforcement / manager.test_execution_runner's
             # RealGitAllowedPathsEnforcementIntegrationTests; this test's own
-            # concern is purely the working_directory wiring, so both stub to
-            # a clean no-op rather than needing a real git repo here too.
+            # concern is purely the working_directory wiring, so all three
+            # stub to a clean no-op rather than needing a real git repo here
+            # too.
             get_registry.return_value.get_project.return_value = fake_project
             result, launcher = self._launch(store)
 
         get_registry.return_value.get_project.assert_called_once_with("p1")
         materialize.assert_called_once()
         enforce.assert_called_once_with(materialized, HEAD, ["manager/executions.py"])
-        capture.assert_called_once_with(materialized, HEAD, "refs/heads/adm-worktree/p1/t1", [], test_evidence=None)
+        commit_and_push.assert_called_once_with(
+            materialized, "refs/heads/adm-worktree/p1/t1", ["manager/executions.py"], "codex repo_write: t1/exec-a")
+        capture.assert_called_once_with(
+            materialized, HEAD, "refs/heads/adm-worktree/p1/t1", ["manager/executions.py"], test_evidence=None)
         self.assertEqual(materialized, launcher.request.working_directory)
         self.assertNotEqual(self.valid_dir, launcher.request.working_directory)
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
@@ -1439,9 +1445,9 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         self.assertNotEqual("completed", store.get("tasks", "p1", "t1")["status"])
 
     def test_out_of_scope_write_blocks_downstream_success_style_hook(self):
-        """No future commit/push step -- represented here by a stub only a
-        genuinely successful launch_task() call would be free to invoke --
-        can ever run after an out-of-scope write."""
+        """ADM host's real commit_and_push_repo_write_changes() -- represented
+        here by a stub only a genuinely successful launch_task() call would
+        be free to invoke -- can never run after an out-of-scope write."""
         class OutOfScopeLauncher(Launcher):
             def wait(self, running):
                 (Path(self.request.working_directory) / "escaped.py").write_text("hacked\n", encoding="utf-8")
@@ -1456,13 +1462,16 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         self.assertEqual([], commit_and_push_calls)
 
     def test_in_scope_write_completes_normally(self):
+        """Bootstrap architecture: the provider only edits the file -- it
+        never runs `git add`/`git commit`/`git push` itself. ADM host
+        performs the real commit and push after verifying the edit is
+        in-scope; this is the same completed outcome the old
+        provider-self-commits shape used to produce, but now with ADM (not
+        the provider) as the git authority."""
         class InScopeLauncher(Launcher):
             def wait(self, running):
                 wd = self.request.working_directory
                 (Path(wd) / "manager" / "foo.py").write_text("edited\n", encoding="utf-8")
-                _git(wd, "add", "manager/foo.py")
-                _git(wd, "commit", "-m", "edit foo")
-                _git(wd, "push", "origin", "main")
                 return super().wait(running)
 
         store = self._store()
@@ -1490,53 +1499,53 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         self.assertEqual(str(self.worktree), handoff["worktree_path"])
         self.assertEqual(final_sha, handoff["remote_sha"])
 
-    def test_completed_without_push_fails_closed_on_missing_remote_branch(self):
-        """P0-B: a provider that commits locally but never pushes must never
-        have its execution accepted as completed -- the remote branch simply
-        does not exist yet, and this is proven by a real `git ls-remote`
-        against the disposable bare origin, never inferred."""
-        class UnpushedLauncher(Launcher):
-            def wait(self, running):
-                wd = self.request.working_directory
-                (Path(wd) / "manager" / "foo.py").write_text("edited, never pushed\n", encoding="utf-8")
-                _git(wd, "add", "manager/foo.py")
-                _git(wd, "commit", "-m", "edit foo, never pushed")
-                return super().wait(running)
-
+    def test_no_changes_fails_closed_without_committing_or_pushing(self):
+        """Bootstrap architecture P0 (Minimum Success Contract: real
+        files_changed must be non-empty): a provider that ran but never
+        touched any file must never reach ADM's commit/push step at all --
+        proven here by asserting nothing landed on the disposable bare
+        origin and the worktree's local HEAD never moved past baseline,
+        never merely by a mocked call count."""
         store = self._store()
-        result = self._launch(store, UnpushedLauncher())
+        result = self._launch(store, Launcher())
 
         self.assertEqual("failed", result["terminal"]["execution"]["status"])
         self.assertNotEqual("completed", store.get("tasks", "p1", "t1")["status"])
         self.assertIsNone(result["terminal"]["execution"].get("repo_write_evidence"))
+        self.assertEqual(self.baseline_head, _git(self.worktree, "rev-parse", "HEAD"))
+        ls_remote = subprocess.run(["git", "ls-remote", "origin", "refs/heads/main"],
+                                   cwd=str(self.worktree), capture_output=True, text=True)
+        self.assertEqual("", ls_remote.stdout.strip())
         handoff = store.get("handoffs", "p1", "t1-failed-exec-a-0")
         self.assertEqual([], handoff["files_changed"])
         self.assertEqual([], handoff["commits"])
         self.assertIsNone(handoff["push_status"])
 
-    def test_completed_with_remote_sha_mismatch_fails_closed(self):
-        """P0-B: a stale/mismatched remote (the branch exists, but at a
-        different SHA than the worktree's real local final commit -- e.g. an
-        older push that a later local-only commit was never pushed on top
-        of) must never be accepted as a verified, fully-delivered push."""
-        class MismatchLauncher(Launcher):
+    def test_host_push_failure_fails_closed_when_remote_is_unreachable(self):
+        """Bootstrap architecture: ADM host owns the git push, so a push
+        failure (here: origin has been repointed at a nonexistent path,
+        simulating an unreachable/misconfigured remote) must fail the
+        execution closed -- even though ADM's own commit succeeded locally
+        first, proving the commit and push steps are independently
+        observable, not a single all-or-nothing illusion."""
+        _git(self.worktree, "remote", "set-url", "origin", str(self.origin) + "-does-not-exist")
+
+        class InScopeLauncher(Launcher):
             def wait(self, running):
                 wd = self.request.working_directory
-                (Path(wd) / "manager" / "foo.py").write_text("first edit, pushed\n", encoding="utf-8")
-                _git(wd, "add", "manager/foo.py")
-                _git(wd, "commit", "-m", "first edit, pushed")
-                _git(wd, "push", "origin", "main")
-                (Path(wd) / "manager" / "foo.py").write_text("second edit, never pushed\n", encoding="utf-8")
-                _git(wd, "add", "manager/foo.py")
-                _git(wd, "commit", "-m", "second edit, never pushed")
+                (Path(wd) / "manager" / "foo.py").write_text("edited\n", encoding="utf-8")
                 return super().wait(running)
 
         store = self._store()
-        result = self._launch(store, MismatchLauncher())
+        result = self._launch(store, InScopeLauncher())
 
         self.assertEqual("failed", result["terminal"]["execution"]["status"])
         self.assertNotEqual("completed", store.get("tasks", "p1", "t1")["status"])
         self.assertIsNone(result["terminal"]["execution"].get("repo_write_evidence"))
+        # ADM's commit step ran and succeeded (local HEAD moved past
+        # baseline) even though the subsequent push failed -- the execution
+        # is still correctly downgraded to failed rather than completed.
+        self.assertNotEqual(self.baseline_head, _git(self.worktree, "rev-parse", "HEAD"))
 
 
 if __name__ == "__main__":

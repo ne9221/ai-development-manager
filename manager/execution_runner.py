@@ -24,7 +24,7 @@ from manager.gcs_lock_registry import GCSLockRegistry
 from manager.project_registry import get_global_registry, resolve_authoritative_working_directory_with_project
 from manager.quota_forecast import DEFAULT_MAX_AGE_MINUTES
 from manager.quota_reader import read_drive_status
-from manager.repo_write_enforcement import capture_repo_write_evidence, enforce_allowed_paths, is_bounded_repo_write_snapshot
+from manager.repo_write_enforcement import capture_repo_write_evidence, commit_and_push_repo_write_changes, enforce_allowed_paths, is_bounded_repo_write_snapshot
 from manager.session_identity import manager_session_key
 from manager.task_claims import task_claim_registry
 from manager.tasks import DriveRecords, TaskError, update_task, validate
@@ -380,9 +380,16 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
                                    approval_policy="never" if task["read_only"] else None,
                                    timeout_seconds=RPC_TIMEOUT_SECONDS, turn_timeout_seconds=turn_timeout)
     else:
+        # Bootstrap architecture: a bounded repo_write Codex run is always
+        # explicitly launched with sandbox="workspace-write" (never left as
+        # None, which would silently fall through to whatever sandbox is
+        # ambient/default for this Codex install -- potentially
+        # "danger-full-access") and approvalPolicy="never" (the launcher's
+        # own unattended-approval-deny handler in codex_launcher.py stays as
+        # defense in depth). Read-only tasks are unchanged.
         request = LaunchRequest(working_directory, model=model, reasoning_effort=dispatched["effort"],
-                                sandbox="read-only" if task["read_only"] else None,
-                                approval_policy="never" if task["read_only"] else None,
+                                sandbox="read-only" if task["read_only"] else "workspace-write",
+                                approval_policy="never",
                                 timeout_seconds=RPC_TIMEOUT_SECONDS, turn_timeout_seconds=turn_timeout)
     result = run_execution(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                            execution_id, dispatched["generated_prompt"], request,
@@ -519,20 +526,30 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
     # violation can never reach a successful completion or any future
     # commit/push step gated on that status.
     # P0-A/P0-B (repo-write terminal success evidence + independent remote
-    # readback): a completed bounded repo-write execution's changed paths
-    # were already proven in-scope above; this additionally captures the
-    # real commit history/final HEAD and independently queries the actual
-    # remote to prove the feature branch was pushed and exactly matches
-    # that HEAD -- never trusting a provider's own "Commit SHA:"/"GitHub
-    # push status:" self-report. Any failure here (nothing committed,
-    # nothing pushed, a stale/mismatched remote) downgrades status to
-    # failed exactly like an allowed_paths violation, so a repo-write
+    # readback), extended by the Bootstrap architecture (ADM host commit/push
+    # authority): a completed bounded repo-write execution's changed paths
+    # are proven in-scope first; a provider is never trusted to have run
+    # `git commit`/`git push` itself (Codex now launches sandbox=
+    # "workspace-write" -- it can edit files and run local checks, nothing
+    # more), so ADM stages exactly those admitted paths, commits, and pushes
+    # the isolated feature branch here, using its own git credentials/
+    # network. capture_repo_write_evidence() then independently queries the
+    # actual remote to prove that exact push landed -- never trusting any
+    # provider or host-side self-report. Any failure at any step (no real
+    # changes to commit, an out-of-scope path, a failed commit/push, a
+    # stale/mismatched remote) downgrades status to failed, so a repo-write
     # execution can never be persisted "completed" with fabricated or
     # unverified success evidence.
     snapshot = execution["task_snapshot"]
     if status == "completed" and is_bounded_repo_write_snapshot(snapshot):
         try:
             files_changed = enforce_allowed_paths(snapshot["working_directory"], snapshot["baseline_head"], snapshot["allowed_paths"])
+            if not files_changed:
+                raise TaskError(f"{provider} repo-write execution produced no file changes to commit")
+            commit_and_push_repo_write_changes(
+                snapshot["working_directory"], snapshot["branch"], files_changed,
+                f"{provider} repo_write: {task_id}/{execution_id}",
+            )
             evidence = capture_repo_write_evidence(
                 snapshot["working_directory"], snapshot["baseline_head"], snapshot["branch"], files_changed,
                 test_evidence=test_evidence,

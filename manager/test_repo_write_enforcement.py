@@ -11,6 +11,7 @@ from manager.repo_write_enforcement import (
     capture_repo_write_evidence,
     collect_changed_paths,
     collect_commit_shas,
+    commit_and_push_repo_write_changes,
     current_head_sha,
     enforce_allowed_paths,
 )
@@ -348,3 +349,77 @@ def test_capture_repo_write_evidence_fails_closed_with_no_origin_configured(repo
 
     with pytest.raises(TaskError):
         capture_repo_write_evidence(repo["path"], repo["baseline"], "refs/heads/main", ["manager/foo.py"])
+
+
+# --- Bootstrap architecture: ADM host commit/push authority ----------------
+#
+# The provider (Codex, sandbox="workspace-write") only edits files and runs
+# local checks in its isolated worktree; it never runs `git commit`/`git
+# push` itself. commit_and_push_repo_write_changes() is the ADM host's own
+# git authority, exercised after enforce_allowed_paths() has already proven
+# the changed paths are real and in-scope.
+
+def test_commit_and_push_stages_only_admitted_paths_and_pushes_feature_branch(repo_with_origin):
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("host committed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "checkout", "-b", "feature/adm-host-commit")
+
+    final_sha = commit_and_push_repo_write_changes(
+        repo_with_origin["path"], "refs/heads/feature/adm-host-commit", ["manager/foo.py"],
+        "codex repo_write: t1/exec-a",
+    )
+
+    assert final_sha == _git(repo_with_origin["path"], "rev-parse", "HEAD")
+    assert final_sha != repo_with_origin["baseline"]
+    log = _git(repo_with_origin["path"], "log", "-1", "--format=%s")
+    assert log == "codex repo_write: t1/exec-a"
+    remote_sha = _git(repo_with_origin["path"], "ls-remote", "origin", "refs/heads/feature/adm-host-commit").split()[0]
+    assert remote_sha == final_sha
+
+
+def test_commit_and_push_never_stages_unadmitted_paths(repo_with_origin):
+    """Only the exact admitted files_changed list is ever staged -- never
+    `git add .` -- so an unrelated dirty file in the worktree is neither
+    committed nor pushed."""
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("admitted change\n", encoding="utf-8")
+    (repo_with_origin["path"] / "other" / "bar.py").write_text("unrelated dirty file\n", encoding="utf-8")
+
+    commit_and_push_repo_write_changes(
+        repo_with_origin["path"], "refs/heads/main", ["manager/foo.py"], "codex repo_write: t1/exec-a",
+    )
+
+    status = _git(repo_with_origin["path"], "status", "--porcelain", "--", "other/bar.py")
+    assert status == "M other/bar.py"
+
+
+def test_commit_and_push_requires_non_empty_files_changed():
+    with pytest.raises(TaskError):
+        commit_and_push_repo_write_changes("/fake/dir", "refs/heads/main", [], "message")
+
+
+def test_commit_and_push_fails_closed_on_git_add_failure():
+    def fake_runner(command, **kwargs):
+        if "add" in command:
+            return subprocess.CompletedProcess(command, 128, "", "fatal: pathspec did not match any files")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with pytest.raises(TaskError):
+        commit_and_push_repo_write_changes("/fake/dir", "refs/heads/main", ["manager/missing.py"], "message",
+                                           runner=fake_runner)
+
+
+def test_commit_and_push_fails_closed_on_git_commit_failure():
+    def fake_runner(command, **kwargs):
+        if "commit" in command:
+            return subprocess.CompletedProcess(command, 1, "", "nothing to commit")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with pytest.raises(TaskError):
+        commit_and_push_repo_write_changes("/fake/dir", "refs/heads/main", ["manager/foo.py"], "message",
+                                           runner=fake_runner)
+
+
+def test_commit_and_push_fails_closed_on_git_push_failure(repo):
+    (repo["path"] / "manager" / "foo.py").write_text("no origin configured\n", encoding="utf-8")
+
+    with pytest.raises(TaskError):
+        commit_and_push_repo_write_changes(repo["path"], "refs/heads/main", ["manager/foo.py"], "message")
