@@ -14,6 +14,7 @@ from manager.worktree_materializer import (
     WorktreeMaterializationError,
     compute_worktree_identity,
     compute_worktree_path,
+    ensure_canonical_checkout,
     materialize_worktree,
 )
 
@@ -474,6 +475,80 @@ def test_cross_task_reuse_still_forbidden_and_leaves_foreign_worktree_untouched(
     assert dirty_file.exists()
     assert dirty_file.read_text(encoding="utf-8") == "must survive a rejected cross-task call\n"
     assert foreign_marker_path.exists()
+
+
+class TestEnsureCanonicalCheckout:
+    """P0 regression: a registered project's resolved canonical working_
+    directory (workspace_root + relative_path) can legitimately not exist
+    on disk yet -- a freshly registered project, or a workspace_root
+    rebuilt on a new machine -- which used to fail every repo-write task
+    for that project forever with no automatic recovery. ensure_canonical_
+    checkout() self-heals that by cloning fresh from the project's own
+    registered repo.canonical_url."""
+
+    def test_skips_when_path_already_exists(self, tmp_path, project):
+        existing = tmp_path / "already-here"
+        existing.mkdir()
+
+        def must_not_run(*args, **kwargs):
+            raise AssertionError("must not attempt a clone when the path already exists")
+
+        ensure_canonical_checkout(str(existing), project, runner=must_not_run)
+
+    def test_clones_fresh_when_missing(self, canonical_repo, project, tmp_path):
+        target = tmp_path / "fresh-checkout"
+        assert not target.exists()
+        cloneable_project = dataclasses.replace(project, repo={"canonical_url": str(canonical_repo["path"])})
+
+        ensure_canonical_checkout(str(target), cloneable_project)
+
+        assert target.is_dir()
+        assert (target / ".git").exists()
+        assert _git(target, "rev-parse", "HEAD") == canonical_repo["head2"]
+
+    def test_fails_closed_when_project_not_yet_verified(self, tmp_path, project):
+        missing = tmp_path / "missing"
+        unresolved_project = dataclasses.replace(project, resolution_status="unresolved")
+
+        with pytest.raises(WorktreeMaterializationError) as exc:
+            ensure_canonical_checkout(str(missing), unresolved_project)
+
+        assert exc.value.code == "canonical_checkout_missing"
+        assert not missing.exists()
+
+    def test_fails_closed_when_no_canonical_url(self, tmp_path, project):
+        missing = tmp_path / "missing"
+        no_repo_project = dataclasses.replace(project, repo=None)
+
+        with pytest.raises(WorktreeMaterializationError) as exc:
+            ensure_canonical_checkout(str(missing), no_repo_project)
+
+        assert exc.value.code == "canonical_checkout_missing"
+
+    def test_fails_closed_on_clone_failure(self, tmp_path, project):
+        missing = tmp_path / "missing"
+        bad_url_project = dataclasses.replace(project, repo={"canonical_url": str(tmp_path / "not-a-real-repo")})
+
+        with pytest.raises(WorktreeMaterializationError) as exc:
+            ensure_canonical_checkout(str(missing), bad_url_project)
+
+        assert exc.value.code == "canonical_checkout_clone_failed"
+        assert not missing.exists()
+
+    def test_fails_closed_when_clone_reports_success_but_path_still_missing(self, tmp_path, project):
+        """Defense in depth: even if the clone process itself reports exit
+        code 0, this must still verify the path really exists afterward
+        before treating the checkout as ready."""
+        missing = tmp_path / "missing"
+        cloneable_project = dataclasses.replace(project, repo={"canonical_url": "https://example.invalid/repo.git"})
+
+        def fake_runner(*args, **kwargs):
+            return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
+
+        with pytest.raises(WorktreeMaterializationError) as exc:
+            ensure_canonical_checkout(str(missing), cloneable_project, runner=fake_runner)
+
+        assert exc.value.code == "canonical_checkout_clone_failed"
 
 
 def test_dirty_canonical_checkout_not_modified_on_rejected_call(canonical_repo, project):

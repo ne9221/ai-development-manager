@@ -398,6 +398,151 @@ def read_dispatch_rejection_status(registry, file_id):
             "created_at": document["created_at"], "generation": generation}
 
 
+def annotate_partial_identity(exc, document):
+    """Best-effort-attach `.partial_request_id`/`.partial_project_id` onto
+    an exception raised while validating an already-successfully-JSON-
+    parsed ingress request body (see each ingress module's read_request()),
+    so the caller's rejection handler can durably index the rejection by
+    (project_id, request_id) via record_dispatch_rejection_by_request() --
+    without this, a schema-invalid-but-otherwise-well-formed request (the
+    common case: an extra/renamed field) is only ever discoverable via its
+    ingress source's own file/blob/issue id, which no caller holding just
+    the request_id can look up (see dispatch_rejection_by_request_object_
+    name()'s docstring for the full incident this closes).
+
+    `document` here is UNVALIDATED, caller-declared content -- it may have
+    failed schema validation for exactly the field this reads, or for any
+    other reason. Only a plain non-empty string is ever trusted as a
+    partial identity; anything else (missing, wrong type, empty) leaves the
+    corresponding attribute None, and the caller must treat these as
+    non-authoritative discovery hints only, never as proof the request
+    actually belongs to that project_id (safe_id() sanitizes them before
+    they are ever used to build a GCS object path -- see
+    dispatch_rejection_by_request_object_name()). Returns `exc` for
+    call-site chaining (`raise annotate_partial_identity(exc, document)`
+    would re-raise the SAME exception object, so callers instead call this
+    inside an `except ... as exc: raise` re-raise of that same `exc`, or
+    simply call it for its side effect before re-raising)."""
+    request_id = document.get("request_id") if isinstance(document, dict) else None
+    project_id = document.get("project_id") if isinstance(document, dict) else None
+    exc.partial_request_id = request_id if isinstance(request_id, str) and request_id.strip() else None
+    exc.partial_project_id = project_id if isinstance(project_id, str) and project_id.strip() else None
+    return exc
+
+
+def dispatch_rejection_by_request_object_name(project_id, request_id):
+    """Canonical, collision-free object key for a rejection record indexed
+    by (project_id, request_id) instead of the ingress source's own file
+    identifier -- a SEPARATE mirror namespace from both
+    dispatch_request_object_name() and dispatch_rejection_object_name().
+
+    This exists to close a real durable-admission gap: a request rejected
+    before it ever reached the (project_id, request_id)-scoped claim
+    registry (malformed JSON, schema-invalid payload, unverifiable
+    provenance, ...) was previously discoverable ONLY via its ingress
+    source's own file identifier (a Drive file id / GitHub blob sha / issue
+    id) -- something no caller holding just the request_id (the normal
+    case: a ChatGPT-originated request, a Dashboard row, an audit script)
+    ever has. resolve_dispatch_status_for_request() is the canonical
+    request_id-keyed status query surface; without this mirror it silently
+    reported "no evidence" (indistinguishable from "never received at all")
+    for exactly this class of request, even though a full rejection reason
+    was already sitting in GCS the whole time under a key nobody without
+    the file id could ever look up."""
+    return f"dispatch-rejections-by-request/{safe_id(project_id)}/{safe_id(request_id)}.json"
+
+
+def dispatch_rejection_by_request_registry(bucket, project_id, request_id, session=None):
+    return GCSLockRegistry(bucket, dispatch_rejection_by_request_object_name(project_id, request_id), session=session)
+
+
+def _validate_rejection_by_request_record(document, project_id, request_id):
+    if (not isinstance(document, dict)
+            or document.get("schema_version") != DISPATCH_REJECTION_SCHEMA_VERSION
+            or document.get("status") != "rejected"):
+        raise TaskError("malformed dispatch rejection-by-request record")
+    if document.get("project_id") != project_id or document.get("request_id") != request_id:
+        raise TaskError("malformed dispatch rejection-by-request record: identity does not match the lookup key")
+    if not isinstance(document.get("reason_code"), str) or not document["reason_code"].strip():
+        raise TaskError("malformed dispatch rejection-by-request record: missing reason_code")
+    if not isinstance(document.get("created_at"), str) or not document["created_at"].strip():
+        raise TaskError("malformed dispatch rejection-by-request record: missing created_at")
+    message = document.get("message")
+    if message is not None and not isinstance(message, str):
+        raise TaskError("malformed dispatch rejection-by-request record: message must be a string or null")
+    return document
+
+
+def record_dispatch_rejection_by_request(registry, project_id, request_id, file_id, reason_code, message, created_at):
+    """Best-effort mirror of record_dispatch_rejection(), indexed by
+    (project_id, request_id) instead of the ingress source's own file
+    identifier -- see dispatch_rejection_by_request_object_name()'s
+    docstring for why this exists. Only ever called when a rejected
+    request's own body could be parsed far enough to recover a plausible
+    request_id/project_id (see each ingress module's read_request()
+    annotating a raised TaskError with `.partial_request_id`/
+    `.partial_project_id` for exactly this purpose) -- a candidate that
+    never parsed that far (bad JSON, wrong MIME, unverifiable provenance
+    before any body is even read) has no request_id to index by at all,
+    and remains discoverable only via the existing file/blob/issue-id-keyed
+    record. `project_id`/`request_id` here are UNVALIDATED, caller-declared
+    values (the same trust level as file_id in record_dispatch_rejection) --
+    safe_id() (via dispatch_rejection_by_request_object_name(), used to
+    build `registry`'s own object key) is what keeps them from ever
+    escaping their own path segment; this call never treats them as a
+    known/registered project_id or as claim authority.
+
+    Idempotent: the same (project_id, request_id) only ever needs one
+    current verdict -- a request rejected here that is later corrected and
+    successfully re-ingested just stops being reached from any rejection
+    path at all; a stale prior rejection record is a harmless historical
+    artifact exactly as record_dispatch_rejection() already documents for
+    its own namespace.
+
+    Best-effort observability, matching record_dispatch_rejection()'s own
+    contract: any backend failure here is swallowed (returns None) rather
+    than raised, since a caller here is already inside the exception-
+    handling path for the REAL rejection -- this call recording that
+    rejection durably a second way must never itself become a masking
+    failure."""
+    if not isinstance(reason_code, str) or not reason_code.strip():
+        raise TaskError("record_dispatch_rejection_by_request requires a non-empty reason_code")
+    document = {
+        "schema_version": DISPATCH_REJECTION_SCHEMA_VERSION, "project_id": project_id, "request_id": request_id,
+        "file_id": file_id, "status": "rejected", "reason_code": reason_code,
+        "message": (message[:MAX_REJECTION_MESSAGE_LENGTH] if isinstance(message, str) else None),
+        "created_at": created_at,
+    }
+    try:
+        existing = registry.read_if_exists()
+    except Exception:
+        return None
+    try:
+        if existing is None:
+            registry.create_if_absent(document)
+        else:
+            _, generation, _ = existing
+            registry.compare_and_swap(generation, document)
+    except Exception:
+        return None
+    return document
+
+
+def read_dispatch_rejection_status_by_request(registry, project_id, request_id):
+    """Best-effort read of one (project_id, request_id)'s durable
+    rejection-before-claim truth (see record_dispatch_rejection_by_request).
+    Returns None when no such record exists (never rejected this way, or
+    never even seen) -- distinct from a malformed record (fails closed),
+    matching read_dispatch_rejection_status()'s own contract exactly."""
+    existing = registry.read_if_exists()
+    if existing is None:
+        return None
+    document, generation, _ = existing
+    document = _validate_rejection_by_request_record(document, project_id, request_id)
+    return {"status": "rejected", "reason_code": document["reason_code"], "message": document["message"],
+            "created_at": document["created_at"], "file_id": document.get("file_id"), "generation": generation}
+
+
 def read_dispatch_request_status(registry, project_id, request_id):
     """Best-effort read of one request_id's current durable claim-record
     truth -- status/failure_reason/task_id/command_id/created_at -- for any
@@ -423,7 +568,8 @@ def read_dispatch_request_status(registry, project_id, request_id):
     }
 
 
-def resolve_dispatch_status_for_request(store, registry, project_id, request_id):
+def resolve_dispatch_status_for_request(store, registry, project_id, request_id, bucket=None,
+                                        rejection_registry_factory=dispatch_rejection_by_request_registry):
     """Canonical status resolution for one ingress request_id -- Task/
     Command truth when a Task already exists, otherwise the durable ingress-
     acceptance claim record's own truth. This is the single query surface
@@ -433,6 +579,16 @@ def resolve_dispatch_status_for_request(store, registry, project_id, request_id)
     request_id -- it never fabricates NONE for a request that was actually
     received: if no Task exists yet, the claim record's accepted/dispatched/
     failed truth is returned instead of silence.
+
+    `bucket`, if given, additionally consults the (project_id, request_id)-
+    keyed rejection mirror (see dispatch_rejection_by_request_object_name())
+    when no claim record exists at all -- closing the durable-admission gap
+    where a request rejected BEFORE ever reaching the claim registry
+    (malformed JSON, schema-invalid payload, unverifiable provenance, ...)
+    was previously indistinguishable from "never received", because its
+    only durable evidence lived under a Drive-file-id/blob-sha/issue-id key
+    this call's caller never has. Omitting `bucket` (the default) preserves
+    every existing caller's exact prior behavior.
 
     Deterministic (task_id, command_id) = f"dispatch-{request_id}" mirrors
     cloud.dispatch_ingress.handle_dispatch()'s own identity scheme exactly,
@@ -471,6 +627,12 @@ def resolve_dispatch_status_for_request(store, registry, project_id, request_id)
     except TaskError:
         status = None
         read_failed = True
+    if status is None and not read_failed and bucket:
+        try:
+            rejection_registry = rejection_registry_factory(bucket, project_id, request_id)
+            status = read_dispatch_rejection_status_by_request(rejection_registry, project_id, request_id)
+        except TaskError:
+            read_failed = True
     return {"task": None, "command": None, "task_id": task_id, "command_id": command_id,
             "dispatch_request_status": status, "dispatch_request_read_failed": read_failed}
 
@@ -537,6 +699,51 @@ def list_recent_dispatch_request_ids(bucket, project_id, session=None, max_resul
     """
     if not bucket or not project_id:
         return {"request_ids": [], "truncated": False}
+    result = _bounded_recent_object_ids(bucket, f"dispatch-requests/{safe_id(project_id)}/", session=session,
+                                        max_results=max_results, page_size=page_size, page_budget=page_budget)
+    return {"request_ids": result["ids"], "truncated": result["truncated"]}
+
+
+def list_recent_dispatch_rejected_request_ids(bucket, project_id, session=None,
+                                              max_results=DEFAULT_RECENT_REQUEST_LIST_LIMIT,
+                                              page_size=DEFAULT_RECENT_LISTING_PAGE_SIZE,
+                                              page_budget=DEFAULT_RECENT_LISTING_PAGE_BUDGET):
+    """Same bounded, recency-corrected discovery contract as
+    list_recent_dispatch_request_ids() (see its docstring for the full
+    RECENCY CORRECTNESS / BOUNDEDNESS / truncated rationale, which applies
+    here unchanged), scoped to the dispatch-rejections-by-request/
+    {project_id}/ namespace instead of dispatch-requests/{project_id}/.
+
+    This exists because a request rejected before it ever reached the
+    claim registry (see dispatch_rejection_by_request_object_name()) never
+    appears under list_recent_dispatch_request_ids()'s own prefix at all --
+    without this, a Dashboard (or any other caller) that only ever scans
+    the claim-record namespace can NEVER discover such a request exists,
+    even by request_id, unless it already knows to ask for that exact id.
+    A caller wanting complete pre-Task visibility should union this with
+    list_recent_dispatch_request_ids()'s own result and resolve each id via
+    resolve_dispatch_status_for_request(..., bucket=bucket) exactly as
+    before -- a name appearing here still proves nothing about current
+    status by itself, matching that function's own "discovery only, never
+    truth" contract."""
+    if not bucket or not project_id:
+        return {"request_ids": [], "truncated": False}
+    result = _bounded_recent_object_ids(bucket, f"dispatch-rejections-by-request/{safe_id(project_id)}/",
+                                        session=session, max_results=max_results, page_size=page_size,
+                                        page_budget=page_budget)
+    return {"request_ids": result["ids"], "truncated": result["truncated"]}
+
+
+def _bounded_recent_object_ids(bucket, prefix, session=None, max_results=DEFAULT_RECENT_REQUEST_LIST_LIMIT,
+                               page_size=DEFAULT_RECENT_LISTING_PAGE_SIZE,
+                               page_budget=DEFAULT_RECENT_LISTING_PAGE_BUDGET):
+    """Shared bounded, recency-corrected GCS prefix scan underlying both
+    list_recent_dispatch_request_ids() and
+    list_recent_dispatch_rejected_request_ids() -- see the former's
+    docstring for the full rationale (GCS Objects.list has no server-side
+    recency ordering; this corrects for that within a hard page budget).
+    Returns {"ids": [...], "truncated": bool} of each matching object's
+    trailing path segment (after `prefix`, ".json" suffix stripped)."""
     if session is None:
         try:
             import google.auth
@@ -544,8 +751,7 @@ def list_recent_dispatch_request_ids(bucket, project_id, session=None, max_resul
             credentials, _ = google.auth.default(scopes=[GCS_SCOPE])
             session = AuthorizedSession(credentials)
         except Exception:
-            return {"request_ids": [], "truncated": True}
-    prefix = f"dispatch-requests/{safe_id(project_id)}/"
+            return {"ids": [], "truncated": True}
     encoded_bucket = quote(bucket, safe="")
     list_url = f"https://storage.googleapis.com/storage/v1/b/{encoded_bucket}/o"
 
@@ -589,5 +795,5 @@ def list_recent_dispatch_request_ids(bucket, project_id, session=None, max_resul
             truncated = True
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
-    request_ids = [request_id for _, request_id in candidates[:max_results]]
-    return {"request_ids": request_ids, "truncated": truncated}
+    ids = [item_id for _, item_id in candidates[:max_results]]
+    return {"ids": ids, "truncated": truncated}

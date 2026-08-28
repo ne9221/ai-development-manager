@@ -711,7 +711,15 @@ def _dispatch_request_state(dispatch_request_status: Optional[Dict[str, Any]]) -
     if not isinstance(dispatch_request_status, dict):
         return None
     status = dispatch_request_status.get("status")
-    reason = dispatch_request_status.get("failure_reason") or dispatch_request_status.get("reason_code")
+    # `failure_reason` (claim-record FAILED) is the richest evidence when
+    # present. A REJECTED-before-claim record has no `failure_reason` at
+    # all -- its detail lives in `message` (e.g. the exact schema
+    # validation error), with `reason_code` as only a coarse bucket
+    # ("ingress_rejected") -- so `message` is preferred over the bare code
+    # whenever both are available, rather than showing a user a generic
+    # code when the actual, specific reason was already captured.
+    reason = (dispatch_request_status.get("failure_reason") or dispatch_request_status.get("message")
+              or dispatch_request_status.get("reason_code"))
     if status in ("accepted", "dispatched"):
         return {"state": DISPATCH_STATE_ACCEPTED, "reason": "dispatch request accepted; no task record found yet"}
     if status == "failed":

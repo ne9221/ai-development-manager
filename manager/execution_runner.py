@@ -30,7 +30,7 @@ from manager.task_claims import task_claim_registry
 from manager.tasks import DriveRecords, TaskError, update_task, validate
 from manager.trusted_ingress import repo_write_policy_satisfied
 from manager.worktree_locks import link_session as link_writer_session
-from manager.worktree_materializer import materialize_worktree, verify_checkout_repo_identity
+from manager.worktree_materializer import ensure_canonical_checkout, materialize_worktree, verify_checkout_repo_identity
 from manager.production_guard import ProductionPathGuardError, RuntimeGuardError, assert_not_production_path, require_runtime_guard
 
 
@@ -192,18 +192,55 @@ def _materialize_repo_write_working_directory(store, task):
     every ordinary production task also carries) must launch inside its own
     deterministic, isolated git worktree -- never the project's single shared
     canonical checkout, which every other task (read-only or otherwise) also
-    reads. Resolution
-    goes through the Global Project Registry (manager.project_registry,
-    Slice B) rather than any hardcoded machine path; any failure here (wrong
-    repo, invalid/mismatched baseline, ownership conflict, ...) propagates
-    and must never fall through to the canonical-checkout fallback below.
+    reads. Resolution goes through the Global Project Registry (manager.
+    project_registry, Slice B) rather than any hardcoded machine path; any
+    failure here (wrong repo, invalid/mismatched baseline, ownership
+    conflict, ...) propagates and must never fall through to the
+    canonical-checkout fallback below.
+
+    `canonical_checkout` -- the SHARED clone this worktree branches off of --
+    is resolved via resolve_authoritative_working_directory_with_project(),
+    the SAME registry-first resolver _resolve_working_directory() already
+    uses for non-repo-write tasks below, NOT the raw, unmaintained Drive
+    Project record literal this used to read directly. That literal is
+    exactly the "registry says X, Drive project record still says Y (or
+    null)" drift class that left a registered project (e.g. one whose
+    registry entry correctly points at workspace_root + its relative_path)
+    permanently unable to admit any repo-write task: this function raised
+    "no canonical working_directory" even though the registry had a
+    perfectly good, resolvable answer the whole time -- see
+    fix/direct-dispatch-working-directory-authority-p0-20260822 R2, which
+    fixed this exact drift for the read-only path but never for this one.
+    `drive_project.get("working_directory")` is kept only as the same
+    narrow not-yet-registered-project fallback that resolver already
+    documents.
+
+    Once resolved, ensure_canonical_checkout() self-heals a registered-but-
+    never-yet-cloned checkout (see its own docstring), then
+    verify_checkout_repo_identity() proves whatever is on disk is actually
+    the right repo before any worktree is ever branched off it -- both
+    checks the read-only path already applies to its own resolved value.
     """
     project_id = task["project_id"]
     project = get_global_registry().get_project(project_id)
     drive_project = store.get("projects", project_id, project_id)
-    canonical_checkout = drive_project.get("working_directory")
+    canonical_checkout, registry_project = resolve_authoritative_working_directory_with_project(
+        project_id, drive_project.get("working_directory")
+    )
     if not isinstance(canonical_checkout, str) or not canonical_checkout.strip():
         raise TaskError(f"project {project_id!r} has no canonical working_directory to materialize a worktree from")
+    if not os.path.isabs(canonical_checkout):
+        raise TaskError(
+            f"project {project_id!r}'s canonical working_directory must be an absolute path: {canonical_checkout!r}")
+    if registry_project is not None:
+        ensure_canonical_checkout(canonical_checkout, registry_project)
+    if not os.path.isdir(canonical_checkout):
+        raise TaskError(
+            f"project {project_id!r}'s canonical working_directory does not exist or is not a directory: "
+            f"{canonical_checkout!r}"
+        )
+    if registry_project is not None:
+        verify_checkout_repo_identity(canonical_checkout, registry_project)
     workspace_root = os.environ.get("ADM_WORKTREE_WORKSPACE_ROOT") or str(Path(canonical_checkout).parent / "adm-worktrees")
     result = materialize_worktree(store, project, task, canonical_checkout, workspace_root)
     return result["working_directory"]

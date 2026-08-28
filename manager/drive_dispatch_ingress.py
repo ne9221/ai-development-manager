@@ -6,7 +6,10 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
-from manager.dispatch_requests import dispatch_rejection_registry, dispatch_request_registry, record_dispatch_rejection
+from manager.dispatch_requests import (
+    annotate_partial_identity, dispatch_rejection_by_request_registry, dispatch_rejection_registry,
+    dispatch_request_registry, record_dispatch_rejection, record_dispatch_rejection_by_request,
+)
 from manager.tasks import MIME_FOLDER, MIME_JSON, TaskError, now_iso, validate
 
 
@@ -254,20 +257,31 @@ def read_request(service, folder_id, expected_owner, metadata, now=None):
         document = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TaskError("Drive request is not valid UTF-8 JSON") from exc
-    validate("dispatch_request", document)
-    if metadata.get("name") != f'{document["request_id"]}.json':
-        raise TaskError("Drive request filename does not match request_id")
-    created = datetime.fromisoformat(document["created_at"].replace("Z", "+00:00"))
-    current = now or datetime.now(timezone.utc)
-    age = (current - created.astimezone(timezone.utc)).total_seconds()
-    if age < -300 or age > MAX_AGE_SECONDS:
-        raise TaskError("Drive request is stale or future-dated")
+    # Everything from here on validates an already-successfully-parsed
+    # `document` -- any TaskError raised in this block is annotated with
+    # partial_request_id/partial_project_id (best-effort, never trusted as
+    # claim authority) so the caller's rejection handler can still durably
+    # index this rejection by (project_id, request_id), not only by this
+    # Drive file's own id (see annotate_partial_identity()'s docstring for
+    # the visibility gap this closes).
+    try:
+        validate("dispatch_request", document)
+        if metadata.get("name") != f'{document["request_id"]}.json':
+            raise TaskError("Drive request filename does not match request_id")
+        created = datetime.fromisoformat(document["created_at"].replace("Z", "+00:00"))
+        current = now or datetime.now(timezone.utc)
+        age = (current - created.astimezone(timezone.utc)).total_seconds()
+        if age < -300 or age > MAX_AGE_SECONDS:
+            raise TaskError("Drive request is stale or future-dated")
+    except TaskError as exc:
+        raise annotate_partial_identity(exc, document) from exc
     return document
 
 
 def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expected_owner=None, now=None,
                                  registry_factory=dispatch_request_registry,
                                  rejection_registry_factory=dispatch_rejection_registry,
+                                 rejection_by_request_registry_factory=dispatch_rejection_by_request_registry,
                                  max_candidates=DEFAULT_MAX_CANDIDATES_PER_POLL,
                                  recent_candidates=DEFAULT_RECENT_CANDIDATES,
                                  deadline=None, time_budget_seconds=DEFAULT_TIME_BUDGET_SECONDS,
@@ -470,6 +484,22 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
                     # Best-effort only (see docstring): never let a failure
                     # to durably record the rejection mask the real
                     # rejection outcome this poll already produced below.
+                    pass
+            # Mirror the same rejection by (project_id, request_id), when
+            # read_request() managed to recover a plausible identity before
+            # failing (see annotate_partial_identity()) -- so a caller
+            # holding only the request_id (the normal case) can still
+            # discover this rejection via resolve_dispatch_status_for_
+            # request(), not only via this Drive file's own id. Best-effort,
+            # same as the file_id-keyed record above.
+            partial_request_id = getattr(exc, "partial_request_id", None)
+            partial_project_id = getattr(exc, "partial_project_id", None)
+            if partial_request_id and partial_project_id:
+                try:
+                    record_dispatch_rejection_by_request(
+                        rejection_by_request_registry_factory(bucket, partial_project_id, partial_request_id),
+                        partial_project_id, partial_request_id, file_id, reason_code, str(exc), now_iso())
+                except Exception:
                     pass
             results.append({"file_id": file_id, "accepted": False})
 

@@ -47,7 +47,10 @@ import time
 from datetime import datetime, timezone
 
 from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
-from manager.dispatch_requests import dispatch_rejection_registry, dispatch_request_registry, record_dispatch_rejection
+from manager.dispatch_requests import (
+    annotate_partial_identity, dispatch_rejection_by_request_registry, dispatch_rejection_registry,
+    dispatch_request_registry, record_dispatch_rejection, record_dispatch_rejection_by_request,
+)
 from manager.github_dispatch_client import GitHubApiClient, GitHubApiError, GitHubNotFound
 from manager.tasks import TaskError, now_iso, validate
 
@@ -149,14 +152,24 @@ def read_request(client, repo, path, branch, entry, now=None):
         document = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TaskError("GitHub request is not valid UTF-8 JSON") from exc
-    validate("dispatch_request", document)
-    if entry["name"] != f'{document["request_id"]}.json':
-        raise TaskError("GitHub request filename does not match request_id")
-    created = datetime.fromisoformat(document["created_at"].replace("Z", "+00:00"))
-    current = now or datetime.now(timezone.utc)
-    age = (current - created.astimezone(timezone.utc)).total_seconds()
-    if age < -300 or age > MAX_AGE_SECONDS:
-        raise TaskError("GitHub request is stale or future-dated")
+    # See manager.drive_dispatch_ingress.read_request()'s identical
+    # annotate_partial_identity() wrapping for why: a TaskError raised past
+    # this point is validating an already-successfully-parsed `document`,
+    # so it is annotated with partial_request_id/partial_project_id (never
+    # trusted as claim authority) for the caller's rejection handler to
+    # durably index by (project_id, request_id) too, not only by this
+    # file's own blob sha.
+    try:
+        validate("dispatch_request", document)
+        if entry["name"] != f'{document["request_id"]}.json':
+            raise TaskError("GitHub request filename does not match request_id")
+        created = datetime.fromisoformat(document["created_at"].replace("Z", "+00:00"))
+        current = now or datetime.now(timezone.utc)
+        age = (current - created.astimezone(timezone.utc)).total_seconds()
+        if age < -300 or age > MAX_AGE_SECONDS:
+            raise TaskError("GitHub request is stale or future-dated")
+    except TaskError as exc:
+        raise annotate_partial_identity(exc, document) from exc
     return document
 
 
@@ -199,6 +212,7 @@ def build_dispatch_payload(request):
 def poll_github_dispatch_requests(store, service, bucket, client, repo=None, branch=None, path=None, now=None,
                                   registry_factory=dispatch_request_registry,
                                   rejection_registry_factory=dispatch_rejection_registry,
+                                  rejection_by_request_registry_factory=dispatch_rejection_by_request_registry,
                                   max_candidates=DEFAULT_MAX_CANDIDATES_PER_POLL,
                                   deadline=None, time_budget_seconds=DEFAULT_TIME_BUDGET_SECONDS):
     """Bounded, fault-isolated poll of the GitHub dispatch-requests ingress
@@ -279,6 +293,18 @@ def poll_github_dispatch_requests(store, service, bucket, client, repo=None, bra
                     # established contract: never let a failure to durably
                     # record the rejection mask the real rejection outcome
                     # this poll already produced below.
+                    pass
+            # Mirror by (project_id, request_id) too, when read_request()
+            # recovered a plausible identity (see manager.drive_dispatch_
+            # ingress's identical handler for the full rationale).
+            partial_request_id = getattr(exc, "partial_request_id", None)
+            partial_project_id = getattr(exc, "partial_project_id", None)
+            if partial_request_id and partial_project_id:
+                try:
+                    record_dispatch_rejection_by_request(
+                        rejection_by_request_registry_factory(bucket, partial_project_id, partial_request_id),
+                        partial_project_id, partial_request_id, file_id, reason_code, str(exc), now_iso())
+                except Exception:
                     pass
             results.append({"file_id": file_id, "accepted": False})
 

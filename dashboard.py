@@ -16,6 +16,7 @@ from manager.quota_history import get_default_quota_history_store
 from manager.gcs_lock_registry import BUCKET_ENV
 from manager.dispatch_requests import (
     list_recent_dispatch_request_ids,
+    list_recent_dispatch_rejected_request_ids,
     resolve_dispatch_status_for_request,
     dispatch_request_registry,
 )
@@ -359,12 +360,29 @@ def load_pretask_dispatch_requests(project_ids):
             )
         except Exception:
             listing = {"request_ids": [], "truncated": True}
-        request_ids = listing.get("request_ids", [])
+        # Also discover requests rejected BEFORE they ever reached the claim
+        # registry (malformed JSON, schema-invalid payload, unverifiable
+        # provenance, ...) -- these never appear under list_recent_dispatch_
+        # request_ids()'s own claim-record namespace at all, so without this
+        # a rejected-before-claim request stayed invisible here even though
+        # resolve_dispatch_status_for_request(..., bucket=bucket) below can
+        # now resolve its real REJECTED status once its request_id is known.
+        try:
+            rejected_listing = list_recent_dispatch_rejected_request_ids(
+                bucket, project_id, max_results=PRETASK_DISPATCH_REQUEST_LIMIT,
+            )
+        except Exception:
+            rejected_listing = {"request_ids": [], "truncated": True}
+        request_ids = list(dict.fromkeys(
+            list(listing.get("request_ids", [])) + list(rejected_listing.get("request_ids", []))
+        ))
+        truncated = bool(listing.get("truncated", False)) or bool(rejected_listing.get("truncated", False))
         rows = []
         for request_id in request_ids:
             try:
                 registry = dispatch_request_registry(bucket, project_id, request_id)
-                resolved = resolve_dispatch_status_for_request(resolve_store, registry, project_id, request_id)
+                resolved = resolve_dispatch_status_for_request(
+                    resolve_store, registry, project_id, request_id, bucket=bucket)
             except Exception:
                 continue
             if resolved.get("task") is not None:
@@ -374,7 +392,7 @@ def load_pretask_dispatch_requests(project_ids):
                 "dispatch_request_status": resolved.get("dispatch_request_status"),
                 "dispatch_request_read_failed": resolved.get("dispatch_request_read_failed", False),
             })
-        out[project_id] = {"rows": rows, "truncated": bool(listing.get("truncated", False))}
+        out[project_id] = {"rows": rows, "truncated": truncated}
     return out
 
 

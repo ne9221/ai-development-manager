@@ -278,6 +278,54 @@ class DriveDispatchIngressTests(unittest.TestCase):
                 self.assertEqual(expected_reason_code, registry.document["reason_code"])
                 self.assertIsNotNone(registry.document["message"])
 
+    def test_schema_rejected_request_with_recoverable_identity_is_mirrored_by_request_id(self):
+        """P0 regression -- reproduces the real 2026-08-28 incident
+        (adm-worktree-materialization-repair-20260828-0445): a request whose
+        JSON parses fine and carries a real request_id/project_id, but fails
+        schema validation for an UNRELATED reason (extra properties like
+        needs_repo_edit/task_type/complexity/expected_minutes/parallelizable
+        that schema/dispatch_request.schema.json's additionalProperties:
+        false rejects), must be durably discoverable by (project_id,
+        request_id) alone -- not only via the Drive file's own id, which no
+        caller holding just the request_id (the normal case) ever has.
+        Before this fix, resolve_dispatch_status_for_request(project_id,
+        request_id) reported None for this exact case forever, identical to
+        "this request was never received"."""
+        document = request(needs_repo_edit=True, task_type="implementation")
+        service = Service(document)
+        file_rejection_registry = MemoryClaimRegistry()
+        by_request_registry = MemoryClaimRegistry()
+        result = poll_drive_dispatch_requests(
+            object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+            rejection_registry_factory=lambda _bucket, _file_id: file_rejection_registry,
+            rejection_by_request_registry_factory=lambda _bucket, _project_id, _request_id: by_request_registry)
+        self.assertFalse(result[0]["accepted"])
+        # The pre-existing file_id-keyed record still exists (unchanged
+        # contract) ...
+        self.assertEqual("rejected", file_rejection_registry.document["status"])
+        # ... AND the NEW (project_id, request_id)-keyed mirror now exists
+        # too, carrying the identical reason/message, discoverable by a
+        # caller that only ever knew the request_id.
+        self.assertIsNotNone(by_request_registry.document)
+        self.assertEqual("rejected", by_request_registry.document["status"])
+        self.assertEqual(document["project_id"], by_request_registry.document["project_id"])
+        self.assertEqual(document["request_id"], by_request_registry.document["request_id"])
+        self.assertIn("Additional properties", by_request_registry.document["message"])
+
+    def test_rejection_without_recoverable_identity_is_never_mirrored_by_request(self):
+        """Malformed JSON (or any failure before request_id/project_id could
+        ever be recovered) has nothing safe to index a by-request mirror
+        under -- the by-request registry factory must never even be
+        invoked, and this stays discoverable solely via the existing
+        file_id-keyed record."""
+        service = Service(b"{broken")
+        by_request_registry = Mock()
+        poll_drive_dispatch_requests(
+            object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+            rejection_registry_factory=lambda _bucket, _file_id: MemoryClaimRegistry(),
+            rejection_by_request_registry_factory=lambda *a, **k: by_request_registry)
+        by_request_registry.read_if_exists.assert_not_called()
+
     def test_malformed_request_rejection_recording_is_idempotent_across_polls(self):
         """The same still-malformed file, re-scanned across separate polls
         (it is never trashed/archived -- see poll_drive_dispatch_requests's

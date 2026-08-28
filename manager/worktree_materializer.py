@@ -309,6 +309,85 @@ def _ensure_physical_worktree(canonical_checkout, worktree_path: Path, branch: s
     _write_owner_marker(worktree_path, owner)
 
 
+DEFAULT_CANONICAL_CLONE_TIMEOUT_SECONDS = 300
+
+
+def ensure_canonical_checkout(canonical_checkout, project, runner=subprocess.run,
+                              timeout=DEFAULT_CANONICAL_CLONE_TIMEOUT_SECONDS) -> None:
+    """Self-heal a registered project's canonical, shared checkout: if the
+    resolved workspace-relative path (Global Project Registry Slice B --
+    workspace_root + working_directory_policy.relative_path) does not exist
+    on disk AT ALL yet, clone it fresh from the project's own registered
+    repo.canonical_url, rather than requiring a human to have manually
+    pre-created/symlinked it there first.
+
+    This closes a real incident class: the registry can correctly name
+    where a project's checkout belongs while nothing has ever actually put
+    a real git checkout there (e.g. a newly registered project, or a
+    workspace_root moved/rebuilt on a fresh machine) -- every repo-write
+    task for that project then failed WorktreeMaterializationError
+    ("no canonical working_directory to materialize a worktree from" /
+    "does not exist") forever, with no automatic recovery, indistinguishable
+    from a genuine registry misconfiguration.
+
+    Deliberately narrow and fail-closed:
+    - Never touches an already-existing path -- existence alone is enough
+      to skip this entirely. verify_checkout_repo_identity() remains the
+      sole authority on whether an existing path is actually the right
+      repo; this function only ever creates a checkout that was not there
+      before, never fetches/pulls/resets an existing one (a stale or wrong
+      existing checkout is out of scope here -- that is
+      verify_checkout_repo_identity()'s and the caller's own
+      baseline-lineage check's job).
+    - Only ever clones for a project whose registry entry is itself already
+      `resolution_status == "verified"` -- an "unresolved" entry's own
+      canonical_url is explicitly documented (project_registry.json) as not
+      yet SSOT-verified, so auto-cloning from it could silently materialize
+      the wrong repository; that case fails closed with a clear reason
+      instead of guessing.
+    - A single bounded `git clone` (default 300s timeout, overridable for
+      tests), never retried in a loop here -- the caller's own retry of the
+      whole dispatch is what re-attempts this on a later tick.
+    - Fails closed (WorktreeMaterializationError) on any failure: missing
+      canonical_url, clone non-zero exit, timeout, or the cloned path still
+      not existing/not a directory afterward -- never silently continues
+      with a half-cloned or missing checkout.
+    """
+    path = Path(canonical_checkout)
+    if path.exists():
+        return
+    if getattr(project, "resolution_status", None) != "verified":
+        raise WorktreeMaterializationError(
+            "canonical_checkout_missing",
+            f"project {project.project_id!r}'s canonical working_directory {canonical_checkout!r} does not exist, "
+            f"and its registry entry is not resolution_status=='verified' "
+            f"({getattr(project, 'resolution_status', None)!r}); refusing to auto-clone from an unverified repo.canonical_url",
+        )
+    repo_url = getattr(project, "repo_url", None)
+    if not isinstance(repo_url, str) or not repo_url.strip():
+        raise WorktreeMaterializationError(
+            "canonical_checkout_missing",
+            f"project {project.project_id!r}'s canonical working_directory {canonical_checkout!r} does not exist, "
+            "and the project has no registered repo.canonical_url to clone it from",
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = runner(["git", "clone", repo_url, str(path)], text=True, encoding="utf-8", errors="replace",
+                        capture_output=True, timeout=timeout)
+    except Exception as exc:
+        raise WorktreeMaterializationError(
+            "canonical_checkout_clone_failed",
+            f"cloning project {project.project_id!r}'s canonical checkout from {repo_url!r} into "
+            f"{canonical_checkout!r} raised: {exc}",
+        ) from exc
+    if result.returncode != 0 or not path.is_dir():
+        raise WorktreeMaterializationError(
+            "canonical_checkout_clone_failed",
+            f"cloning project {project.project_id!r}'s canonical checkout from {repo_url!r} into "
+            f"{canonical_checkout!r} failed: {(result.stderr or '').strip()}",
+        )
+
+
 def verify_checkout_repo_identity(checkout_path, project, runner=subprocess.run) -> None:
     """Verify that `checkout_path` is a real git checkout whose `origin`
     remote matches `project`'s registered repo identity.

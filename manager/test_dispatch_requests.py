@@ -8,8 +8,9 @@ from unittest.mock import MagicMock
 
 from manager.dispatch_requests import (
     DEFAULT_RECENT_REQUEST_LIST_LIMIT, DispatchRequestClaimConflict, claim_dispatch_request,
-    dispatch_request_object_name, list_recent_dispatch_request_ids, mark_dispatch_request_status,
-    read_dispatch_request_status, release_dispatch_request_claim, resolve_dispatch_status_for_request,
+    dispatch_request_object_name, list_recent_dispatch_request_ids, list_recent_dispatch_rejected_request_ids,
+    mark_dispatch_request_status, read_dispatch_request_status, read_dispatch_rejection_status_by_request,
+    record_dispatch_rejection_by_request, release_dispatch_request_claim, resolve_dispatch_status_for_request,
 )
 from manager.tasks import DriveRecords, TaskError, create_project
 from manager.test_task_claims import AmbiguousThenUnreadableRegistry, MemoryClaimRegistry
@@ -459,6 +460,85 @@ class ResolveDispatchStatusReadFailureTests(unittest.TestCase):
         resolved = resolve_dispatch_status_for_request(store, registry, "p1", "req-z")
         self.assertIsNotNone(resolved["task"])
         self.assertFalse(resolved["dispatch_request_read_failed"])
+
+
+class DispatchRejectionByRequestTests(unittest.TestCase):
+    """P0 regression: adm-worktree-materialization-repair-20260828-0445 was
+    durably rejected (extra schema fields) but was invisible to any caller
+    holding only its request_id, because the ONLY durable evidence lived
+    under a Drive-file-id-keyed rejection record no request_id-based lookup
+    could ever find -- resolve_dispatch_status_for_request(project_id,
+    request_id) silently reported None, indistinguishable from "never
+    received at all". These tests cover the (project_id, request_id)-keyed
+    mirror that closes that gap."""
+
+    def _project_store(self):
+        store = DriveRecords(FakeDriveService())
+        create_project(store, {"project_id": "p1", "name": "P1", "repo": "r", "default_branch": "main",
+                               "runtime_ssot": "Drive", "project_rules": [], "active_tasks": [],
+                               "current_phase": "Phase 1", "important_constraints": []})
+        return store
+
+    def test_record_and_read_round_trip(self):
+        registry = MemoryClaimRegistry()
+        record_dispatch_rejection_by_request(
+            registry, "p1", "req-rejected", "drive-file-123", "ingress_rejected",
+            "invalid dispatch_request: Additional properties are not allowed ('task_type' was unexpected)",
+            "2026-08-27T20:42:06Z")
+        status = read_dispatch_rejection_status_by_request(registry, "p1", "req-rejected")
+        self.assertEqual("rejected", status["status"])
+        self.assertEqual("ingress_rejected", status["reason_code"])
+        self.assertIn("Additional properties", status["message"])
+        self.assertEqual("drive-file-123", status["file_id"])
+
+    def test_read_returns_none_when_never_rejected(self):
+        registry = MemoryClaimRegistry()
+        self.assertIsNone(read_dispatch_rejection_status_by_request(registry, "p1", "req-never"))
+
+    def test_resolve_dispatch_status_finds_rejection_by_request_id_alone(self):
+        """The exact incident: no claim record was ever created (rejected
+        before claim), but the caller still holds only the request_id --
+        resolve_dispatch_status_for_request() must now surface REJECTED
+        truth via the by-request mirror when `bucket`/a rejection registry
+        factory is supplied, instead of silently returning None."""
+        store = self._project_store()
+        claim_registry = MemoryClaimRegistry()
+        rejection_registry = MemoryClaimRegistry()
+        record_dispatch_rejection_by_request(
+            rejection_registry, "p1", "adm-worktree-materialization-repair-20260828-0445", "drive-file-999",
+            "ingress_rejected", "invalid dispatch_request: Additional properties are not allowed", "2026-08-27T20:42:06Z")
+        resolved = resolve_dispatch_status_for_request(
+            store, claim_registry, "p1", "adm-worktree-materialization-repair-20260828-0445",
+            bucket="fake-bucket", rejection_registry_factory=lambda bucket, project_id, request_id: rejection_registry)
+        self.assertIsNone(resolved["task"])
+        self.assertFalse(resolved["dispatch_request_read_failed"])
+        self.assertIsNotNone(resolved["dispatch_request_status"])
+        self.assertEqual("rejected", resolved["dispatch_request_status"]["status"])
+        self.assertIn("Additional properties", resolved["dispatch_request_status"]["message"])
+
+    def test_resolve_dispatch_status_without_bucket_preserves_prior_behavior(self):
+        """Omitting `bucket` (every pre-existing caller) must behave exactly
+        as before this fix -- no rejection-by-request lookup is attempted at
+        all, even if one exists."""
+        store = self._project_store()
+        claim_registry = MemoryClaimRegistry()
+        resolved = resolve_dispatch_status_for_request(store, claim_registry, "p1", "req-never-seen")
+        self.assertIsNone(resolved["dispatch_request_status"])
+        self.assertFalse(resolved["dispatch_request_read_failed"])
+
+    def test_claimed_request_never_consults_rejection_mirror(self):
+        """A request that WAS successfully claimed must resolve from the
+        claim record alone -- the rejection-by-request mirror is never even
+        consulted when claim status is already known."""
+        store = self._project_store()
+        claim_registry = MemoryClaimRegistry()
+        claim_dispatch_request(claim_registry, "p1", "req-ok", "dispatch-req-ok", "dispatch-req-ok", "2026-08-24T00:00:00Z")
+        rejection_registry = MagicMock()
+        resolved = resolve_dispatch_status_for_request(
+            store, claim_registry, "p1", "req-ok", bucket="fake-bucket",
+            rejection_registry_factory=lambda bucket, project_id, request_id: rejection_registry)
+        self.assertEqual("accepted", resolved["dispatch_request_status"]["status"])
+        rejection_registry.read_if_exists.assert_not_called()
 
 
 if __name__ == "__main__":

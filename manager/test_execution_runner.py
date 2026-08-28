@@ -11,7 +11,9 @@ from manager.claude_account_selector import AccountSelectionError
 from manager.claude_config_locks import ConfigLockBusyError, acquire_claude_config_lock, canonical_config_dir
 from manager.claude_launcher import ClaudeLaunchError
 from manager.codex_launcher import CodexLaunchError, LaunchOutcome, LaunchRequest
-from manager.execution_runner import _resolve_working_directory, _stopped, launch_task, run_execution
+from manager.execution_runner import (
+    _materialize_repo_write_working_directory, _resolve_working_directory, _stopped, launch_task, run_execution,
+)
 from manager.production_guard import RuntimeGuardError, mark_production_path
 from manager import provenance
 from manager.task_claims import check_task_execution_claim
@@ -1271,6 +1273,128 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         self.assertEqual([], launcher.events)
         with self.assertRaises((TaskError, KeyError)):
             store.get("executions", "p1", "exec-a")
+
+    # -- P0 regression (2026-08-28): _materialize_repo_write_working_directory
+    # used to read the raw, unmaintained Drive Project record's own
+    # `working_directory` literal directly -- nothing keeps that literal
+    # synchronized with the Global Project Registry's own workspace_root +
+    # relative_path resolution (see
+    # fix/direct-dispatch-working-directory-authority-p0-20260822 R2, which
+    # fixed this exact drift class for the READ-ONLY path via
+    # resolve_authoritative_working_directory_with_project(), but never for
+    # this repo-write worktree-materialization path). A registered project
+    # whose Drive record's working_directory was null/stale (the real
+    # incident: outlook-mail) failed WorktreeMaterializationError forever
+    # ("no canonical working_directory") even though the registry had a
+    # perfectly resolvable answer via ADM_WORKSPACE_ROOT the whole time. --
+
+    def _fake_registry_project(self, relative_path="myproj", repo_url=REPO, resolution_status="verified"):
+        from manager.project_registry import ProjectMetadata
+        return ProjectMetadata(
+            project_id="p1", display_name="Project", aliases=(), repo={"canonical_url": repo_url},
+            default_branch="main", baseline_resolution_policy={}, common_governance={}, project_rules={},
+            working_directory_policy={"relative_path": relative_path, "env_var": "ADM_WORKSPACE_ROOT"},
+            isolation_policy={"mode": "worktree_per_task"}, provider_restrictions={},
+            protected_paths=(), default_write_boundaries=("*",), pointer_rules={},
+            status="enabled", resolution_status=resolution_status,
+        )
+
+    def test_repo_write_materialization_uses_registry_not_stale_drive_literal(self):
+        """The exact incident: the Drive project record's working_directory
+        is None (never synchronized), but the project IS registered and
+        ADM_WORKSPACE_ROOT is set -- materialize_worktree() must be called
+        with the registry-resolved path (workspace_root/relative_path), not
+        fail with "no canonical working_directory to materialize a worktree
+        from" just because the Drive literal was empty."""
+        workspace_root = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace_root.cleanup)
+        resolved_checkout = Path(workspace_root.name) / "myproj"
+        resolved_checkout.mkdir()
+
+        store = MemoryStore()
+        create_project(store, self._project(None))  # working_directory: null, exactly like the incident
+        create_task(store, self._repo_write_task(), assign=False)
+        fake_project = self._fake_registry_project()
+
+        with patch("manager.execution_runner.get_global_registry") as get_registry, \
+             patch("manager.project_registry.get_global_registry") as get_registry_inner, \
+             patch.dict(os.environ, {"ADM_WORKSPACE_ROOT": workspace_root.name}), \
+             patch("manager.execution_runner.ensure_canonical_checkout") as ensure_checkout, \
+             patch("manager.execution_runner.verify_checkout_repo_identity") as verify_identity, \
+             patch("manager.execution_runner.materialize_worktree") as materialize:
+            get_registry.return_value.get_project.return_value = fake_project
+            get_registry_inner.return_value.get_project.return_value = fake_project
+            materialize.return_value = {"working_directory": str(resolved_checkout), "branch": "refs/heads/x",
+                                        "worktree_id": "p1--t1", "baseline_head": HEAD}
+            _materialize_repo_write_working_directory(store, store.get("tasks", "p1", "t1"))
+
+        materialize.assert_called_once()
+        called_canonical_checkout = materialize.call_args[0][3]
+        self.assertEqual(str(resolved_checkout), called_canonical_checkout)
+        ensure_checkout.assert_called_once_with(str(resolved_checkout), fake_project)
+        verify_identity.assert_called_once_with(str(resolved_checkout), fake_project)
+
+    def test_repo_write_materialization_self_heals_missing_canonical_checkout(self):
+        """The registry resolves a canonical_checkout path that has never
+        actually been cloned to disk yet (a freshly registered project, or a
+        workspace_root rebuilt on a new machine) -- ensure_canonical_checkout
+        must be given the chance to clone it before existence is checked,
+        rather than this failing closed just because nothing pre-created the
+        directory by hand."""
+        workspace_root = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace_root.cleanup)
+        never_created = Path(workspace_root.name) / "myproj"
+        self.assertFalse(never_created.exists())
+
+        store = MemoryStore()
+        create_project(store, self._project(None))
+        create_task(store, self._repo_write_task(), assign=False)
+        fake_project = self._fake_registry_project()
+
+        def fake_ensure_checkout(canonical_checkout, project):
+            # Simulate a successful self-heal clone actually creating the directory.
+            Path(canonical_checkout).mkdir(parents=True)
+
+        with patch("manager.execution_runner.get_global_registry") as get_registry, \
+             patch("manager.project_registry.get_global_registry") as get_registry_inner, \
+             patch.dict(os.environ, {"ADM_WORKSPACE_ROOT": workspace_root.name}), \
+             patch("manager.execution_runner.ensure_canonical_checkout", side_effect=fake_ensure_checkout) as ensure_checkout, \
+             patch("manager.execution_runner.verify_checkout_repo_identity"), \
+             patch("manager.execution_runner.materialize_worktree") as materialize:
+            get_registry.return_value.get_project.return_value = fake_project
+            get_registry_inner.return_value.get_project.return_value = fake_project
+            materialize.return_value = {"working_directory": str(never_created), "branch": "refs/heads/x",
+                                        "worktree_id": "p1--t1", "baseline_head": HEAD}
+            _materialize_repo_write_working_directory(store, store.get("tasks", "p1", "t1"))
+
+        ensure_checkout.assert_called_once_with(str(never_created), fake_project)
+        materialize.assert_called_once()
+        self.assertTrue(never_created.is_dir())
+
+    def test_repo_write_materialization_still_fails_closed_when_checkout_missing_after_self_heal(self):
+        """If ensure_canonical_checkout() cannot make the directory exist
+        (e.g. an unregistered/unresolved project it refuses to clone for),
+        this must still fail closed with a clear reason -- never silently
+        proceed to materialize_worktree() against a nonexistent path."""
+        workspace_root = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace_root.cleanup)
+        never_created = Path(workspace_root.name) / "myproj"
+
+        store = MemoryStore()
+        create_project(store, self._project(None))
+        create_task(store, self._repo_write_task(), assign=False)
+        fake_project = self._fake_registry_project()
+
+        with patch("manager.execution_runner.get_global_registry") as get_registry, \
+             patch("manager.project_registry.get_global_registry") as get_registry_inner, \
+             patch.dict(os.environ, {"ADM_WORKSPACE_ROOT": workspace_root.name}), \
+             patch("manager.execution_runner.ensure_canonical_checkout"), \
+             patch("manager.execution_runner.materialize_worktree") as materialize:
+            get_registry.return_value.get_project.return_value = fake_project
+            get_registry_inner.return_value.get_project.return_value = fake_project
+            with self.assertRaises(TaskError):
+                _materialize_repo_write_working_directory(store, store.get("tasks", "p1", "t1"))
+        materialize.assert_not_called()
 
     # -- B3: missing everywhere fails closed --
 

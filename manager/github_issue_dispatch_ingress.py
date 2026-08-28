@@ -51,7 +51,10 @@ import time
 from datetime import datetime, timezone
 
 from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
-from manager.dispatch_requests import dispatch_rejection_registry, dispatch_request_registry, record_dispatch_rejection
+from manager.dispatch_requests import (
+    annotate_partial_identity, dispatch_rejection_by_request_registry, dispatch_rejection_registry,
+    dispatch_request_registry, record_dispatch_rejection, record_dispatch_rejection_by_request,
+)
 from manager.github_dispatch_client import GitHubApiError
 from manager.github_dispatch_ingress import REPO_ENV, build_dispatch_payload
 from manager.tasks import TaskError, now_iso, validate
@@ -164,18 +167,28 @@ def read_request(issue, allowed_authors, now=None):
     if not isinstance(author, str) or author.strip().lower() not in allowed_authors:
         raise TaskError("GitHub issue author is not an allowed dispatch requester")
     document = _extract_json_document(issue.get("body"))
-    validate("dispatch_request", document)
-    created = datetime.fromisoformat(document["created_at"].replace("Z", "+00:00"))
-    current = now or datetime.now(timezone.utc)
-    age = (current - created.astimezone(timezone.utc)).total_seconds()
-    if age < -300 or age > MAX_AGE_SECONDS:
-        raise TaskError("GitHub issue dispatch request is stale or future-dated")
+    # See manager.drive_dispatch_ingress.read_request()'s identical
+    # annotate_partial_identity() wrapping for why: this validates an
+    # already-successfully-parsed `document`, so a TaskError raised here is
+    # annotated with partial_request_id/partial_project_id for the
+    # caller's rejection handler to durably index by (project_id,
+    # request_id) too, not only by this issue's own global id.
+    try:
+        validate("dispatch_request", document)
+        created = datetime.fromisoformat(document["created_at"].replace("Z", "+00:00"))
+        current = now or datetime.now(timezone.utc)
+        age = (current - created.astimezone(timezone.utc)).total_seconds()
+        if age < -300 or age > MAX_AGE_SECONDS:
+            raise TaskError("GitHub issue dispatch request is stale or future-dated")
+    except TaskError as exc:
+        raise annotate_partial_identity(exc, document) from exc
     return document
 
 
 def poll_github_issue_dispatch_requests(store, service, bucket, client, repo=None, allowed_authors=None, now=None,
                                         registry_factory=dispatch_request_registry,
                                         rejection_registry_factory=dispatch_rejection_registry,
+                                        rejection_by_request_registry_factory=dispatch_rejection_by_request_registry,
                                         max_candidates=DEFAULT_MAX_CANDIDATES_PER_POLL,
                                         issues_per_page=DEFAULT_ISSUES_PER_PAGE,
                                         deadline=None, time_budget_seconds=DEFAULT_TIME_BUDGET_SECONDS):
@@ -249,6 +262,18 @@ def poll_github_issue_dispatch_requests(store, service, bucket, client, repo=Non
                     # established contract: never let a failure to durably
                     # record the rejection mask the real rejection outcome
                     # this poll already produced below.
+                    pass
+            # Mirror by (project_id, request_id) too, when read_request()
+            # recovered a plausible identity (see manager.drive_dispatch_
+            # ingress's identical handler for the full rationale).
+            partial_request_id = getattr(exc, "partial_request_id", None)
+            partial_project_id = getattr(exc, "partial_project_id", None)
+            if partial_request_id and partial_project_id:
+                try:
+                    record_dispatch_rejection_by_request(
+                        rejection_by_request_registry_factory(bucket, partial_project_id, partial_request_id),
+                        partial_project_id, partial_request_id, issue_id, reason_code, str(exc), now_iso())
+                except Exception:
                     pass
             results.append({"issue_id": issue_id, "accepted": False})
 
