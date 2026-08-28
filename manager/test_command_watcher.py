@@ -2411,4 +2411,67 @@ class WaitingQuotaPromotionTests(unittest.TestCase):
             store.get("commands", "p1", "t1")
 
 
+class WaitingQuotaSweepStarvationTests(unittest.TestCase):
+    """Live-reproduced 2026-08-28 (BLOCKER 3 acceptance testing): a project
+    whose command backlog alone fills MAX_COMMANDS_PER_POLL (stale
+    `attention` recovery-check records, each with a dangling execution_id --
+    exactly the real production shape observed: 9 attention + 2 queued
+    Commands dating back to 2026-08-13..22, still unresolved) must never
+    starve that SAME project's own waiting_quota sweep. Before this fix,
+    poll_once()'s inner command loop did `return results` the moment the
+    global results cap filled -- exiting poll_once() entirely and skipping
+    the waiting_quota block below for the rest of the tick, for this
+    project AND every later-rotated one, for as long as that backlog
+    persisted (which, live, was indefinitely: the same stale commands
+    refill the cap every single tick)."""
+
+    ALLOWLIST = frozenset({("p1", "t1")})
+
+    def test_a_full_stale_attention_backlog_never_blocks_this_projects_own_promotion(self):
+        store = Store()
+        create_project(store, project())
+        waiting_task = task(read_only=True)
+        waiting_task.update(
+            recommended_provider=None, quota_evidence={},
+            source_context={"origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": "req-starvation",
+                             "goal": "test", "admission_version": "1.0"},
+        )
+        create_task(store, waiting_task, assign=False)
+
+        # MAX_COMMANDS_PER_POLL + 1 stale attention commands, unrelated to
+        # t1, each with a dangling execution_id -- the exact real
+        # production shape (a recovery/backlog record with no live
+        # execution behind it any more) that alone fills the shared
+        # per-tick command budget. The "+1" matters: the buggy `return
+        # results` this test guards against is only ever reached on the
+        # cap-check *before* processing what WOULD be a 5th command --
+        # exactly MAX_COMMANDS_PER_POLL commands lets the for loop simply
+        # exhaust itself without ever re-checking the cap, which would make
+        # this test pass even against the unfixed code (confirmed live
+        # while writing this test).
+        for i in range(MAX_COMMANDS_PER_POLL + 1):
+            cmd_id = f"cmd-stale-{i}"
+            store.put("commands", "p1", cmd_id, command(
+                command_id=cmd_id, task_id=f"stale-task-{i}", status="attention",
+                execution_id=f"command-{cmd_id}",
+            ))
+
+        with patch("manager.command_watcher.read_drive_status", return_value=fresh_quota_fixture(80, 90)):
+            results = poll_once(store, object(), allowlist=self.ALLOWLIST,
+                                claim_factory=CommandWatcherTests.claim_factory,
+                                health_check=lambda: True, quota_check=lambda service: True)
+
+        # The stale backlog alone consumed the whole command-processing
+        # budget, exactly as intended -- this fix does not weaken that cap.
+        self.assertEqual(MAX_COMMANDS_PER_POLL, len(results))
+        for entry in results:
+            self.assertEqual("attention", entry["status"])
+        # ...but the waiting_quota Task on this SAME project was still
+        # promoted to a real Command this same tick, not starved.
+        promoted = store.get("commands", "p1", "t1")
+        self.assertEqual("codex", promoted["provider"])
+        self.assertEqual("queued", promoted["status"])
+        self.assertEqual("req-starvation", promoted.get("request_id"))
+
+
 if __name__ == "__main__": unittest.main()

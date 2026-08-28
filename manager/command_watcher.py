@@ -994,7 +994,26 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         if commands is not None:
             for command in _prioritized_commands(commands):
                 if len(results) == MAX_COMMANDS_PER_POLL:
-                    return results
+                    # Global command-processing budget reached -- but this
+                    # must never also skip the waiting_quota sweep below,
+                    # neither for this project nor any later one this poll:
+                    # that is a separate, independently-bounded budget
+                    # (MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL). Before this
+                    # fix, `return results` here exited poll_once() entirely
+                    # the moment a project's own stale attention/queued
+                    # command backlog (>= MAX_COMMANDS_PER_POLL of them, on
+                    # its own, before any other project is even reached)
+                    # filled the cap -- live-reproduced starving a genuine
+                    # new waiting_quota Task on that same project from ever
+                    # being promoted, tick after tick, for as long as that
+                    # backlog persisted. `break` still stops processing
+                    # MORE commands this poll (every later project's own
+                    # command loop hits this same check on its first
+                    # iteration and breaks immediately too, so the total
+                    # command-processing budget is still exactly as bounded
+                    # as before), it just no longer skips anyone's
+                    # waiting_quota sweep.
+                    break
                 if time.monotonic() >= deadline:
                     return results
                 results.append(process_command(store, service, command, allowlist=allowlist,
