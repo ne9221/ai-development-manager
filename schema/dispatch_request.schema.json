@@ -10,6 +10,7 @@
     "title": {"type": "string", "minLength": 1, "maxLength": 300},
     "goal": {"type": "string", "minLength": 1, "maxLength": 4000},
     "preferred_provider": {"type": ["string", "null"], "enum": ["codex", "claude", "antigravity", null]},
+    "local_action": {"type": "string", "enum": ["OPEN_EXISTING_ADM_UI"]},
     "account_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 200},
     "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
     "created_at": {"type": "string", "format": "date-time"},
@@ -23,5 +24,6 @@
         "repo": {"type": "string"}
       }
     }
-  }
+  },
+  "not": {"required": ["local_action", "repo_write"]}
 }

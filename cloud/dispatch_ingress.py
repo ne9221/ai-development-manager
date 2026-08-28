@@ -77,7 +77,7 @@ from manager.claude_account_selector import load_claude_accounts
 from manager.dispatch_requests import claim_dispatch_request, mark_dispatch_request_status
 from manager.dispatcher import dispatch as dispatcher_dispatch
 from manager.executions import MAX_RETRY_COUNT, linked_command_for_execution, list_executions, retry_eligible
-from manager.tasks import TaskError, now_iso, update_task, validate
+from manager.tasks import TaskError, create_task, now_iso, update_task, validate
 from manager.trusted_ingress import (
     ADMISSION_VERSION, ADMISSION_VERSION_V2_REPO_WRITE, REQUIRED_REPO_WRITE_TASK_POLICIES,
     REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN,
@@ -85,12 +85,13 @@ from manager.trusted_ingress import (
 
 
 ALLOWED_FIELDS = {"request_id", "project_id", "title", "goal", "priority", "constraints",
-                   "provider", "account_id", "retry_of_execution_id", "repo_write"}
+                   "provider", "account_id", "retry_of_execution_id", "repo_write", "local_action"}
 ALLOWED_CONSTRAINT_FIELDS = {"read_only"}
 ALLOWED_PRIORITIES = {"low", "normal", "high", "urgent"}
 # Matches schema/command.schema.json's provider enum -- the only providers
 # the Command Watcher can actually launch today.
 ALLOWED_PROVIDERS = {"codex", "claude", "antigravity"}
+ALLOWED_LOCAL_ACTIONS = {"OPEN_EXISTING_ADM_UI"}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 # Matches schema/command.schema.json's execution_id pattern exactly (longer
 # max length than the other ingress ids).
@@ -242,6 +243,11 @@ def validate_dispatch_payload(payload):
     if not isinstance(read_only, bool):
         raise DispatchIngressError("malformed_request", "constraints.read_only must be a boolean")
     repo_write_payload = payload.get("repo_write")
+    local_action = payload.get("local_action")
+    if local_action is not None and local_action not in ALLOWED_LOCAL_ACTIONS:
+        raise DispatchIngressError("malformed_request", f"local_action must be one of {sorted(ALLOWED_LOCAL_ACTIONS)}")
+    if local_action is not None and repo_write_payload is not None:
+        raise DispatchIngressError("malformed_request", "local_action cannot be combined with repo_write")
     if read_only is not True:
         # v1 Safe Auto-Admission only ever creates disposable read-only
         # tasks -- the caller cannot opt out of read_only, not even
@@ -302,6 +308,7 @@ def validate_dispatch_payload(payload):
         "request_id": request_id, "project_id": project_id, "title": title.strip(),
         "goal": goal.strip(), "priority": priority, "read_only": read_only, "repo_write": repo_write,
         "provider": provider, "account_id": account_id, "retry_of_execution_id": retry_of_execution_id,
+        "local_action": local_action,
     }
 
 
@@ -620,6 +627,7 @@ def handle_dispatch(store, service, lock_registry_factory, payload, request_crea
         raise DispatchIngressError("idempotency_backend_unavailable", "could not establish request idempotency") from exc
 
     is_repo_write = clean["repo_write"] is not None
+    local_action = clean["local_action"]
     admission_version = ADMISSION_VERSION_V2_REPO_WRITE if is_repo_write else ADMISSION_VERSION
 
     def create():
@@ -651,6 +659,32 @@ def handle_dispatch(store, service, lock_registry_factory, payload, request_crea
                 **({"repo": clean["repo_write"]["repo"]} if is_repo_write else {}),
             },
         }
+        if local_action is not None:
+            task = create_task(store, {
+                **internal_request,
+                "expected_minutes": 20,
+                "needs_repo_edit": False,
+                "source_context": internal_request["source_context"],
+            }, service=service, assign=False)
+            if task_id not in project.get("active_tasks", []):
+                project.setdefault("active_tasks", []).append(task_id)
+                store.put("projects", project_id, project_id, project)
+            update_task(store, project_id, task_id, priority=clean["priority"], read_only=True,
+                        execution_policies=sorted(REQUIRED_TASK_POLICIES))
+            command = {
+                "command_id": command_id, "project_id": project_id, "task_id": task_id,
+                "provider": "codex", "action": local_action, "account_id": None,
+                "requested_provider": None, "requested_account_id": None,
+                "model": None, "fallback_model": None, "mode": None, "effort": None,
+                "selection_reason": [], "quota_evidence": None, "created_at": now_iso(), "status": "queued",
+                "execution_id": None, "claimed_at": None, "completed_at": None, "result": None,
+                "created_via": TRUSTED_INGRESS_ORIGIN, "admission_version": ADMISSION_VERSION,
+                "request_id": request_id,
+            }
+            validate("command", command)
+            store.put("commands", project_id, command_id, command)
+            return {"accepted": True, "request_id": request_id, "task_id": task_id,
+                    "command_id": command_id, "status": "queued"}
         if requested_provider is not None:
             # preferred_provider short-circuits manager.dispatcher's quota-based
             # recommendation outright (`selected = request.get("preferred_provider")

@@ -67,6 +67,30 @@ class DispatchIngressTests(unittest.TestCase):
     def call(self, body=None):
         return handle_dispatch(self.store, self.service, self.registries.factory, body if body is not None else payload())
 
+    def test_local_action_creates_codex_command_without_provider_selection(self):
+        with patch("cloud.dispatch_ingress.dispatcher_dispatch") as dispatch_mock:
+            result = self.call(payload(request_id="local-action-1", local_action="OPEN_EXISTING_ADM_UI"))
+        dispatch_mock.assert_not_called()
+        task = self.store.get("tasks", "p1", result["task_id"])
+        command = self.store.get("commands", "p1", result["command_id"])
+        self.assertIs(False, task["needs_repo_edit"])
+        self.assertEqual("codex", command["provider"])
+        self.assertEqual("OPEN_EXISTING_ADM_UI", command["action"])
+        validate("command", command)
+
+    def test_local_action_and_repo_write_are_rejected(self):
+        with self.assertRaises(DispatchIngressError):
+            self.call(payload(request_id="local-action-write", local_action="OPEN_EXISTING_ADM_UI",
+                              constraints={"read_only": False}, repo_write={
+                                  "allowed_paths": ["manager/foo.py"], "baseline_head": "a" * 40,
+                                  "repo": "https://github.com/example/project"}))
+
+    def test_dispatch_request_schema_rejects_unknown_local_action(self):
+        bad = payload(request_id="local-action-schema", local_action="UNKNOWN")
+        bad["created_at"] = "2026-08-28T00:00:00Z"
+        with self.assertRaises(TaskError):
+            validate("dispatch_request", bad)
+
     def test_valid_request_creates_queued_task_and_command(self):
         result = self.call()
         self.assertEqual({"accepted": True, "request_id": "req-1", "task_id": "dispatch-req-1",
