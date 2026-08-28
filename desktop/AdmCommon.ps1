@@ -7,6 +7,7 @@
 $AdmSupervisorTask = "AI Development Manager - Session Center Supervisor"
 $AdmWatcherTask = "AI Development Manager - Command Watcher"
 $AdmSessionCenterUrl = "http://127.0.0.1:8765"
+$AdmDashboardUrl = "http://127.0.0.1:8501"
 $AdmManagerHome = if ($env:AI_MANAGER_HOME) { $env:AI_MANAGER_HOME } else { Join-Path $env:USERPROFILE ".ai-development-manager" }
 $AdmRuntimePath = Join-Path $AdmManagerHome "runtime"
 $AdmWatcherMaintenancePath = Join-Path $AdmRuntimePath "watcher-maintenance.json"
@@ -45,6 +46,94 @@ function Get-AdmSessionCenterHealth {
         }
     }
     return [PSCustomObject]@{ Listening = $listening; Session = $session }
+}
+
+function Get-AdmDashboardHealth {
+    # Read-only probe of the Streamlit Operations Dashboard (Start-Dashboard.ps1,
+    # port 8501). Mirrors Get-AdmSessionCenterHealth's real-network, short-timeout
+    # shape so callers (including this file's own Pester coverage, which already
+    # exercises Get-AdmSessionCenterHealth unmocked) get the same behavior.
+    param([string]$Url = $AdmDashboardUrl)
+    $listening = $false
+    try {
+        $res = Invoke-WebRequest -Uri "$Url/_stcore/health" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+        if ($res.StatusCode -eq 200) {
+            $listening = $true
+        }
+    } catch {
+        try {
+            $res = Invoke-WebRequest -Uri "$Url/" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+            if ($res.StatusCode -ge 200 -and $res.StatusCode -lt 400) {
+                $listening = $true
+            }
+        } catch {
+            $listening = $false
+        }
+    }
+    return [PSCustomObject]@{ Listening = $listening; Url = $Url }
+}
+
+function Start-AdmBackgroundProcess {
+    # Thin wrapper around the static [System.Diagnostics.Process]::Start call
+    # so Pester (which can only mock cmdlets/functions, never a static .NET
+    # method invocation -- see Set-AdmPersistentUserEnvironmentVariable above
+    # for the same pattern) can intercept this in tests instead of a test run
+    # silently launching a real hidden PowerShell/Streamlit process on
+    # whatever machine runs the test suite.
+    param([Parameter(Mandatory = $true)]$StartInfo)
+    return [System.Diagnostics.Process]::Start($StartInfo)
+}
+
+function Start-AdmDashboardBackground {
+    # Idempotent: no-ops (returns $true immediately) if the Dashboard is
+    # already listening, so this can be called on every launcher invocation
+    # without ever risking a duplicate Streamlit process or a duplicate
+    # browser tab (duplicate-tab avoidance is the caller's job when opening a
+    # browser window; this function only ensures the backend process exists).
+    param(
+        [string]$RepositoryPath = $(Split-Path -Parent $PSScriptRoot)
+    )
+    $dashHealth = Get-AdmDashboardHealth
+    if ($dashHealth.Listening) {
+        return $true
+    }
+
+    $startDashboardScript = Join-Path $PSScriptRoot "Start-Dashboard.ps1"
+    if (-not (Test-Path -LiteralPath $startDashboardScript)) {
+        return $false
+    }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "powershell.exe"
+    $psi.Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$startDashboardScript`" -RepositoryPath `"$RepositoryPath`""
+    $psi.WorkingDirectory = $RepositoryPath
+    $psi.CreateNoWindow = $true
+    $psi.UseShellExecute = $false
+    try {
+        Start-AdmBackgroundProcess -StartInfo $psi | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Wait-AdmDashboardReady {
+    # Bounded readiness poll after Start-AdmDashboardBackground launches a
+    # fresh Streamlit process -- streamlit takes a few seconds to bind its
+    # port, so opening the browser immediately after Process.Start would race
+    # a blank/connection-refused tab. Never blocks longer than the bound.
+    param(
+        [int]$TimeoutSeconds = 20,
+        [int]$PollIntervalMilliseconds = 500
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ((Get-AdmDashboardHealth).Listening) {
+            return $true
+        }
+        Start-Sleep -Milliseconds $PollIntervalMilliseconds
+    }
+    return (Get-AdmDashboardHealth).Listening
 }
 
 function Confirm-AdmTaskEnabled {

@@ -65,6 +65,11 @@ Describe "ADM watcher maintenance sentinel" {
         # isolated test coverage below. It must never run for real just
         # because these tests exercise Start-ADM.ps1 end-to-end.
         Mock Set-AdmWorkspacePointer {}
+        # Same reasoning for the Dashboard backend: these sentinel tests must
+        # never spawn a real hidden Streamlit process or block on a real
+        # readiness poll just because they invoke Start-ADM.ps1 end-to-end.
+        Mock Start-AdmBackgroundProcess {}
+        Mock Wait-AdmDashboardReady { $true }
         Mock Get-ScheduledTask {
             param($TaskName)
             if ($TaskName -eq $global:admTestWatcher) { return New-TestWscriptTask $global:admTestWatcher $global:admTestWatcherVbs $global:admTestWatcherState }
@@ -357,5 +362,74 @@ Describe "Watcher hidden-VBS (wscript.exe) identity guard" {
     It "the production launcher shape stays wscript.exe (hidden), never a directly-registered powershell.exe" {
         $helperContent = Get-Content -Raw (Join-Path $here "..\manager\AdmHiddenLaunch.ps1")
         $helperContent | Should Match 'New-ScheduledTaskAction -Execute "wscript\.exe"'
+    }
+}
+
+Describe "ADM Dashboard backend auto-launch" {
+    # Mocks the underlying Invoke-WebRequest cmdlet (not the local
+    # Get-AdmDashboardHealth wrapper): a real, freshly re-dot-sourced custom
+    # function mocked only via a NESTED call (never called directly first
+    # from the It body) does not reliably pick up a fresh per-It Mock under
+    # this machine's Pester 3.4 -- confirmed by isolated repro. Mocking the
+    # built-in cmdlet one layer down sidesteps that and matches how the rest
+    # of this file already mocks cmdlets (Get-ScheduledTask, etc.) rather
+    # than intermediate custom functions.
+    BeforeEach {
+        . (Join-Path $here "AdmCommon.ps1")
+    }
+
+    It "Get-AdmDashboardHealth reports listening on a 200 from /_stcore/health" {
+        Mock Invoke-WebRequest { [PSCustomObject]@{ StatusCode = 200 } }
+        (Get-AdmDashboardHealth).Listening | Should Be $true
+    }
+
+    It "Get-AdmDashboardHealth reports not listening when both probes fail" {
+        Mock Invoke-WebRequest { throw "connection refused" }
+        (Get-AdmDashboardHealth).Listening | Should Be $false
+    }
+
+    It "Start-AdmDashboardBackground: no-ops when listening, launches when not, surfaces a launch failure" {
+        # All three Start-AdmBackgroundProcess scenarios live in one It,
+        # re-Mocking sequentially, rather than three separate Its: a fresh
+        # per-It Mock of this particular custom function (unlike the
+        # Invoke-WebRequest cmdlet mocks above) does not reliably bind on
+        # its first nested-call invocation after a BeforeEach re-dot-source
+        # under this machine's Pester 3.4 -- confirmed by isolated repro,
+        # and confirmed unsafe to get wrong: a silently-unmocked Assert
+        # failure here means the real static Process.Start launches a real
+        # hidden PowerShell/Streamlit process. Sequential re-Mock within a
+        # single It does not hit that quirk.
+        Mock Invoke-WebRequest { [PSCustomObject]@{ StatusCode = 200 } }
+        Mock Start-AdmBackgroundProcess {}
+        Start-AdmDashboardBackground -RepositoryPath $repository | Should Be $true
+        Assert-MockCalled Start-AdmBackgroundProcess -Times 0 -Exactly -Scope It
+
+        Mock Invoke-WebRequest { throw "connection refused" }
+        Mock Start-AdmBackgroundProcess {}
+        Start-AdmDashboardBackground -RepositoryPath $repository | Should Be $true
+        Assert-MockCalled Start-AdmBackgroundProcess -Times 1 -Exactly -Scope It -ParameterFilter {
+            $StartInfo.FileName -eq "powershell.exe" -and
+            $StartInfo.Arguments -match [regex]::Escape((Join-Path $here "Start-Dashboard.ps1")) -and
+            $StartInfo.Arguments -match [regex]::Escape($repository)
+        }
+
+        Mock Start-AdmBackgroundProcess { throw "boom" }
+        Start-AdmDashboardBackground -RepositoryPath $repository | Should Be $false
+    }
+
+    It "Wait-AdmDashboardReady returns true immediately once the Dashboard reports listening" {
+        Mock Invoke-WebRequest { [PSCustomObject]@{ StatusCode = 200 } }
+        Mock Start-Sleep {}
+        Wait-AdmDashboardReady -TimeoutSeconds 5 | Should Be $true
+        Assert-MockCalled Start-Sleep -Times 0 -Exactly
+    }
+
+    It "Wait-AdmDashboardReady gives up and returns false once the bound elapses" {
+        Mock Invoke-WebRequest { throw "connection refused" }
+        Mock Start-Sleep {}
+        $start = Get-Date
+        $result = Wait-AdmDashboardReady -TimeoutSeconds 1 -PollIntervalMilliseconds 10
+        $result | Should Be $false
+        ((Get-Date) - $start).TotalSeconds | Should BeLessThan 5
     }
 }

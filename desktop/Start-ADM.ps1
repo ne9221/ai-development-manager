@@ -1,9 +1,11 @@
 # One-click ADM start: confirm the two production Scheduled Tasks are
 # enabled, kick one immediate cycle of each (safe/idempotent -- both tasks
 # already have MultipleInstances=IgnoreNew, so this never starts a second
-# concurrent run if one is already in progress), then show status and open
-# either the live Session Center dashboard (if an AI execution is currently
-# active) or a static status page (if idle -- the normal state).
+# concurrent run if one is already in progress), ensure the Streamlit
+# Operations Dashboard backend is running, then open either the live Session
+# Center dashboard (if an AI execution is currently active), the Operations
+# Dashboard (the normal, idle-state view), or -- only if the Dashboard
+# backend could not be confirmed -- a static status page as last resort.
 #
 # Never creates/modifies a Scheduled Task definition, never touches
 # execution lifecycle, launchers, or credentials.
@@ -51,8 +53,14 @@ $html = New-AdmStatusHtml -SupervisorStatus $supervisorStatus -WatcherStatus $wa
 $statusPath = Join-Path $env:TEMP "adm-status.html"
 $html | Out-File -FilePath $statusPath -Encoding utf8
 
+$dashboardAlreadyListening = (Get-AdmDashboardHealth).Listening
+$dashboardLaunchAttempted = Start-AdmDashboardBackground -RepositoryPath $repository
+$dashboardReady = $dashboardAlreadyListening -or ($dashboardLaunchAttempted -and (Wait-AdmDashboardReady))
+
 if ($sessionCenter.Listening) {
     Start-Process "$AdmSessionCenterUrl/"
+} elseif ($dashboardReady) {
+    Start-Process "$AdmDashboardUrl/"
 } else {
     Start-Process $statusPath
 }
