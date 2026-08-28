@@ -12,6 +12,7 @@ from collectors.publish_drive import build_service
 from manager.codex_launcher import CodexLauncher, process_identity_state
 from manager.execution_lifecycle import terminalize_execution
 from manager.execution_runner import launch_task
+from manager.open_existing_adm_ui import focus_existing_adm_ui
 from manager.executions import cancel_reserved_execution, execution_health, prepare_task_retry
 from manager.gcs_lock_registry import GCSLockRegistry
 from manager.quota_reader import read_drive_status, summarize
@@ -293,6 +294,14 @@ def process_command(store, service, command, launcher_factory=CodexLauncher, wri
         return _attention(store, command, None, "allowlisted_task_missing_or_invalid")
     if not _policy_satisfied(candidate_task):
         return _attention(store, command, None, "allowlisted_task_policy_not_satisfied")
+    if command.get("action") == "OPEN_EXISTING_ADM_UI":
+        claimed = _claimed(command)
+        _write(store, claimed)
+        result = focus_existing_adm_ui()
+        final = _terminal(claimed, result["status"], _result(
+            result["status"], claimed["execution_id"], error_kind=result.get("error_kind")))
+        _write(store, final)
+        return {"status": final["status"], "execution_id": claimed["execution_id"], "error_kind": result.get("error_kind")}
     if not health_check():
         # Transient/recoverable, not a policy problem: leave queued untouched,
         # no write, so this is retried automatically on the next poll.

@@ -273,6 +273,30 @@ class CommandWatcherTests(unittest.TestCase):
         runner.assert_called_once()
         self.assertEqual("completed", result["status"])
 
+    def test_open_existing_adm_ui_is_governed_and_does_not_launch_codex(self):
+        focus = Mock(return_value={"status": "completed", "window_title": "ADM Unified Operations Dashboard"})
+        launch = Mock()
+        with patch("manager.command_watcher.focus_existing_adm_ui", focus), patch("manager.command_watcher.launch_task", launch):
+            result = process_command(self.store, object(), command(action="OPEN_EXISTING_ADM_UI"),
+                                     claim_factory=self.claim_factory, allowlist=self.ALLOWLIST,
+                                     health_check=lambda: False, quota_check=lambda service: False)
+        self.assertEqual("completed", result["status"])
+        focus.assert_called_once_with()
+        launch.assert_not_called()
+        stored = self.store.get("commands", "p1", "cmd-1")
+        self.assertEqual("completed", stored["status"])
+        self.assertEqual("completed", stored["result"]["status"])
+
+    def test_open_existing_adm_ui_failure_is_persisted_closed(self):
+        focus = Mock(return_value={"status": "failed", "error_kind": "adm_dashboard_not_running"})
+        with patch("manager.command_watcher.focus_existing_adm_ui", focus):
+            result = process_command(self.store, object(), command(action="OPEN_EXISTING_ADM_UI"),
+                                     claim_factory=self.claim_factory, allowlist=self.ALLOWLIST)
+        self.assertEqual({"status": "failed", "execution_id": "command-cmd-1", "error_kind": "adm_dashboard_not_running"}, result)
+        stored = self.store.get("commands", "p1", "cmd-1")
+        self.assertEqual("failed", stored["status"])
+        self.assertEqual("adm_dashboard_not_running", stored["result"]["error_kind"])
+
     def test_session_center_unhealthy_blocks_new_launch_but_never_touches_running_authority(self):
         self.store.put("commands", "p1", "cmd-1", command())
         launch = Mock()

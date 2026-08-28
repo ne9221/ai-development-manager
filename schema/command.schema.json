@@ -9,6 +9,7 @@
     "project_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
     "task_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,160}$"},
     "provider": {"const": "codex"},
+    "action": {"enum": ["OPEN_EXISTING_ADM_UI"]},
     "model": {"type": ["string", "null"], "maxLength": 200},
     "fallback_model": {"type": ["string", "null"], "maxLength": 200},
     "mode": {"type": ["string", "null"], "maxLength": 80},
