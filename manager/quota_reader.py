@@ -3,11 +3,13 @@
 
 import argparse
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 from collectors.publish_drive import FOLDER_ID, FILE_NAME, build_service
 from jsonschema import Draft202012Validator, FormatChecker
+from manager.acceptance_gate import apply_controlled_unavailability
 
 
 EXPECTED_PROVIDERS = {
@@ -60,7 +62,14 @@ def read_drive_status(service=None, folder_id=FOLDER_ID, schema_path=None, valid
         document = json.loads(raw.decode("utf-8"))
         if validate_document:
             validate_status(document, schema_path)
-        return document
+        # Controlled acceptance gate (see manager.acceptance_gate's own
+        # docstring): a no-op for every real caller on every real machine,
+        # since it only ever does anything when a local file exists under
+        # AI_MANAGER_HOME that nothing reachable from Drive/GitHub ingress
+        # or the MCP adapter can create. Applied after validate_status()
+        # above (the real fetched document must itself validate cleanly) so
+        # this can never mask a real schema problem in the actual SSOT.
+        return apply_controlled_unavailability(document, os.environ.get("AI_MANAGER_HOME"))
     except QuotaReaderError:
         raise
     except Exception as exc:
