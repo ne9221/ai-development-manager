@@ -1,0 +1,30 @@
+[
+  {
+    "component": "quota_refresh",
+    "cycle": 1,
+    "killed_pid": 9076,
+    "failure_detected_at": 1787951097.129131,
+    "recovery_started_at": null,
+    "healthy_at": null,
+    "recovery_seconds": null,
+    "within_target": null,
+    "new_invocation_id": null,
+    "duplicate_overlap_detected": false,
+    "status": "recovery_timeout",
+    "notes": "no fresh completed invocation within 180s of kill"
+  },
+  {
+    "component": "session_center_supervisor",
+    "cycle": 1,
+    "killed_pid": 21216,
+    "failure_detected_at": 1787951278.502428,
+    "recovery_started_at": 1787951337.1177318,
+    "healthy_at": null,
+    "recovery_seconds": null,
+    "within_target": null,
+    "new_invocation_id": null,
+    "duplicate_overlap_detected": false,
+    "status": "recovery_timeout",
+    "notes": "no fresh completed invocation within 180s of kill"
+  }
+]
