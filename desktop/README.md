@@ -11,9 +11,14 @@ execution lifecycle, launchers, or credentials.
 - `Start-ADM.ps1` / `Start-ADM.vbs` -- confirm the Session Center Supervisor and
   Command Watcher Scheduled Tasks are enabled, kick one immediate cycle of
   each (safe: both tasks already use `MultipleInstances=IgnoreNew`, so this
-  can never start a duplicate concurrent run), then open either the live
+  can never start a duplicate concurrent run), ensure the Streamlit
+  Operations Dashboard backend is running, then open either the live
   Session Center dashboard (`http://127.0.0.1:8765/`, if an AI execution is
-  currently active) or a static status page (if idle -- the normal state).
+  currently active), the Operations Dashboard (`http://127.0.0.1:8501/`, the
+  normal idle-state view), or -- only if the Dashboard backend could not be
+  confirmed -- a static status page as last resort. This is the script the
+  Startup/Desktop/Start Menu shortcuts point at, so a normal login brings up
+  the live Dashboard with no manual steps.
 - `ADM-Status.ps1` / `ADM-Status.vbs` -- read-only version: same status view,
   never enables/triggers/disables anything. Safe to run at any time.
 - `Stop-ADM.ps1` -- disables both Scheduled Tasks so no *new* work is picked
