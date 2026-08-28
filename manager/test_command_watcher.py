@@ -2253,5 +2253,52 @@ class WaitingQuotaPromotionTests(unittest.TestCase):
         found = _enumerate_waiting_quota_tasks(store, "p1")
         self.assertEqual([], found)
 
+    def test_promotion_must_not_discard_real_completed_execution_history(self):
+        """CONFIRMED BUG (parallel-validation review of 7f2e91f):
+        _promote_waiting_quota_task() calls
+        `dispatcher_dispatch(store, service, request, quota_document, history or [])`
+        -- `history` is a parameter of this function that poll_once() (its
+        only real caller) never actually supplies, so this is always
+        `dispatcher_dispatch(..., quota_document, [])`. That `[]` lands
+        positionally in manager.dispatcher.dispatch()'s 5th parameter,
+        `executions`. Because `[]` is not None, dispatch() takes
+        `history = executions` (dispatcher.py ~line 198) instead of calling
+        its own `list_executions(store, project_id)` -- silently discarding
+        this project's REAL completed-execution history for every
+        promotion, no matter how much matching history actually exists.
+        Every promoted Command's `quota_evidence[provider][
+        "historical_estimate"]` is therefore always the "No matching
+        completed executions" fallback (confidence "none", sample_count 0)
+        -- fabricated evidence surfaced straight to the Dashboard, which is
+        exactly the class of bug DASHBOARD_TRUTH_CONNECTED exists to
+        eliminate. (Provider selection/eligibility itself is unaffected --
+        manager.assignment.decide() scores purely off live quota + the
+        task's own expected_minutes, never off historical_estimate -- so
+        this is a truth/evidence bug, not a mis-routing bug.)
+
+        Fix: don't pass a 5th positional argument at all (or pass explicit
+        `executions=None`) so dispatch() takes its normal
+        list_executions(store, project_id) path, exactly like every other
+        real dispatch() caller. The dead `history=None` parameter on
+        _promote_waiting_quota_task can then be removed entirely -- nothing
+        ever supplies it.
+
+        This test currently FAILS on 7f2e91f, proving the bug."""
+        store = self.store_with_waiting_quota_task()
+        real_history = [{
+            "provider": "codex", "mode": "code", "effort": "medium", "status": "completed",
+            "elapsed_minutes": 42,
+            "task_snapshot": {"task_type": "implementation", "complexity": "medium", "needs_repo_edit": True},
+            "quota_delta": {"status": "known", "windows": [{"name": "primary", "status": "known", "used_percent_delta": 3}]},
+        }]
+        [waiting_task] = _enumerate_waiting_quota_tasks(store, "p1")
+        fresh = fresh_quota_fixture(80, 90)
+        with patch("manager.dispatcher.list_executions", return_value=real_history) as mock_list_executions:
+            promoted = _promote_waiting_quota_task(store, object(), waiting_task, fresh)
+        mock_list_executions.assert_called_once()
+        historical = promoted["quota_evidence"]["codex"]["historical_estimate"]
+        self.assertEqual(1, historical["sample_count"])
+        self.assertEqual(42, historical["estimated_minutes"])
+
 
 if __name__ == "__main__": unittest.main()
