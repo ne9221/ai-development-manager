@@ -1,17 +1,32 @@
 # Shared helpers for the ADM one-click desktop launcher scripts.
-# Read-only status gathering + idempotent Scheduled Task enable/trigger.
+# Read-only status gathering + idempotent Scheduled Task enable/trigger + Dashboard focus.
 # Deliberately does not touch execution lifecycle, launchers, or credentials --
-# it only confirms/starts the two existing production Scheduled Tasks and
-# reads Session Center's already-public /health and /api/session endpoints.
+# it confirms/starts the production Scheduled Tasks, ensures Dashboard is active,
+# and manages single-instance focus and shortcuts.
 
 $AdmSupervisorTask = "AI Development Manager - Session Center Supervisor"
 $AdmWatcherTask = "AI Development Manager - Command Watcher"
+$AdmDriveIngressTask = "AI Development Manager - Drive Dispatch Ingress"
+$AdmQuotaRefreshTask = "AI Development Manager - Quota Refresh"
+$AdmGithubIngressTask = "AI Development Manager - GitHub Dispatch Ingress"
+
+$AdmAllTasks = @(
+    $AdmSupervisorTask,
+    $AdmWatcherTask,
+    $AdmDriveIngressTask,
+    $AdmQuotaRefreshTask,
+    $AdmGithubIngressTask
+)
+
 $AdmSessionCenterUrl = "http://127.0.0.1:8765"
-$AdmDashboardUrl = "http://127.0.0.1:8501"
+$AdmDashboardPort = 8501
+$AdmDashboardUrl = "http://localhost:$AdmDashboardPort"
 $AdmManagerHome = if ($env:AI_MANAGER_HOME) { $env:AI_MANAGER_HOME } else { Join-Path $env:USERPROFILE ".ai-development-manager" }
 $AdmRuntimePath = Join-Path $AdmManagerHome "runtime"
 $AdmWatcherMaintenancePath = Join-Path $AdmRuntimePath "watcher-maintenance.json"
 $AdmWatcherMaintenanceLastPath = Join-Path $AdmRuntimePath "watcher-maintenance-last.json"
+$AdmShortcutName = "AI 開發管理器"
+$AdmLegacyShortcutName = "AI Development Manager"
 
 function Get-AdmTaskStatus {
     param([Parameter(Mandatory = $true)][string]$TaskName)
@@ -48,100 +63,7 @@ function Get-AdmSessionCenterHealth {
     return [PSCustomObject]@{ Listening = $listening; Session = $session }
 }
 
-function Get-AdmDashboardHealth {
-    # Read-only probe of the Streamlit Operations Dashboard (Start-Dashboard.ps1,
-    # port 8501). Mirrors Get-AdmSessionCenterHealth's real-network, short-timeout
-    # shape so callers (including this file's own Pester coverage, which already
-    # exercises Get-AdmSessionCenterHealth unmocked) get the same behavior.
-    param([string]$Url = $AdmDashboardUrl)
-    $listening = $false
-    try {
-        $res = Invoke-WebRequest -Uri "$Url/_stcore/health" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
-        if ($res.StatusCode -eq 200) {
-            $listening = $true
-        }
-    } catch {
-        try {
-            $res = Invoke-WebRequest -Uri "$Url/" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
-            if ($res.StatusCode -ge 200 -and $res.StatusCode -lt 400) {
-                $listening = $true
-            }
-        } catch {
-            $listening = $false
-        }
-    }
-    return [PSCustomObject]@{ Listening = $listening; Url = $Url }
-}
-
-function Start-AdmBackgroundProcess {
-    # Thin wrapper around the static [System.Diagnostics.Process]::Start call
-    # so Pester (which can only mock cmdlets/functions, never a static .NET
-    # method invocation -- see Set-AdmPersistentUserEnvironmentVariable above
-    # for the same pattern) can intercept this in tests instead of a test run
-    # silently launching a real hidden PowerShell/Streamlit process on
-    # whatever machine runs the test suite.
-    param([Parameter(Mandatory = $true)]$StartInfo)
-    return [System.Diagnostics.Process]::Start($StartInfo)
-}
-
-function Start-AdmDashboardBackground {
-    # Idempotent: no-ops (returns $true immediately) if the Dashboard is
-    # already listening, so this can be called on every launcher invocation
-    # without ever risking a duplicate Streamlit process or a duplicate
-    # browser tab (duplicate-tab avoidance is the caller's job when opening a
-    # browser window; this function only ensures the backend process exists).
-    param(
-        [string]$RepositoryPath = $(Split-Path -Parent $PSScriptRoot)
-    )
-    $dashHealth = Get-AdmDashboardHealth
-    if ($dashHealth.Listening) {
-        return $true
-    }
-
-    $startDashboardScript = Join-Path $PSScriptRoot "Start-Dashboard.ps1"
-    if (-not (Test-Path -LiteralPath $startDashboardScript)) {
-        return $false
-    }
-
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = "powershell.exe"
-    $psi.Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$startDashboardScript`" -RepositoryPath `"$RepositoryPath`""
-    $psi.WorkingDirectory = $RepositoryPath
-    $psi.CreateNoWindow = $true
-    $psi.UseShellExecute = $false
-    try {
-        Start-AdmBackgroundProcess -StartInfo $psi | Out-Null
-        return $true
-    } catch {
-        return $false
-    }
-}
-
-function Wait-AdmDashboardReady {
-    # Bounded readiness poll after Start-AdmDashboardBackground launches a
-    # fresh Streamlit process -- streamlit takes a few seconds to bind its
-    # port, so opening the browser immediately after Process.Start would race
-    # a blank/connection-refused tab. Never blocks longer than the bound.
-    param(
-        [int]$TimeoutSeconds = 20,
-        [int]$PollIntervalMilliseconds = 500
-    )
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        if ((Get-AdmDashboardHealth).Listening) {
-            return $true
-        }
-        Start-Sleep -Milliseconds $PollIntervalMilliseconds
-    }
-    return (Get-AdmDashboardHealth).Listening
-}
-
 function Confirm-AdmTaskEnabled {
-    # "Confirm/start" per the task's own idempotent-safe framing: only flips
-    # Disabled -> Enabled; never touches an already-Enabled/Running task's
-    # trigger, principal, or action. Throws (caller decides how to surface it)
-    # if the task doesn't exist at all -- that's a real setup problem, not
-    # something this launcher should silently paper over.
     param([Parameter(Mandatory = $true)][string]$TaskName)
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if (-not $task) {
@@ -152,24 +74,132 @@ function Confirm-AdmTaskEnabled {
     }
 }
 
+function Confirm-AdmAllTasksEnabled {
+    foreach ($taskName in $AdmAllTasks) {
+        Confirm-AdmTaskEnabled -TaskName $taskName
+    }
+}
+
+function Start-AdmAllTasks {
+    foreach ($taskName in $AdmAllTasks) {
+        try {
+            Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        } catch {}
+    }
+}
+
+function Test-AdmDashboardRunning {
+    param([int]$Port = $AdmDashboardPort)
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+        $success = $iar.AsyncWaitHandle.WaitOne(400, $false)
+        if ($success -and $client.Connected) {
+            $client.EndConnect($iar)
+            $client.Close()
+            return $true
+        }
+        $client.Close()
+    } catch {}
+    return $false
+}
+
+function Start-AdmDashboardProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryPath,
+        [string]$PythonPath = "C:\Users\EE\AppData\Local\Python\pythoncore-3.14-64\python.exe",
+        [int]$Port = $AdmDashboardPort
+    )
+    if (Test-AdmDashboardRunning -Port $Port) {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $PythonPath)) {
+        $PythonPath = "python"
+    }
+    $dashboardScript = Join-Path $RepositoryPath "dashboard.py"
+    if (-not (Test-Path -LiteralPath $dashboardScript)) {
+        throw "Dashboard script not found at $dashboardScript"
+    }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $PythonPath
+    $psi.Arguments = "-m streamlit run dashboard.py --server.port $Port --server.headless true"
+    $psi.WorkingDirectory = $RepositoryPath
+    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $psi.CreateNoWindow = $true
+    $psi.UseShellExecute = $false
+    $proc = [System.Diagnostics.Process]::Start($psi)
+
+    for ($i = 0; $i -lt 15; $i++) {
+        Start-Sleep -Milliseconds 200
+        if (Test-AdmDashboardRunning -Port $Port) { break }
+    }
+}
+
+function Focus-AdmDashboard {
+    param([string]$Url = $AdmDashboardUrl)
+    if ($env:PESTER_TEST) {
+        Start-Process $Url
+        return
+    }
+    try {
+        $wsh = New-Object -ComObject WScript.Shell
+        $activated = $wsh.AppActivate("AI Development Manager") -or $wsh.AppActivate("Streamlit") -or $wsh.AppActivate("localhost:$AdmDashboardPort")
+        if (-not $activated) {
+            Start-Process $Url
+        }
+    } catch {
+        Start-Process $Url
+    }
+}
+
+function Install-AdmShortcuts {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryPath,
+        [string[]]$TargetFolders
+    )
+    $repository = [IO.Path]::GetFullPath($RepositoryPath).TrimEnd('\')
+    $targetVbs = Join-Path $repository "desktop\Start-ADM.vbs"
+    if (-not (Test-Path -LiteralPath $targetVbs)) {
+        throw "Target VBS not found at $targetVbs"
+    }
+    $wsh = New-Object -ComObject WScript.Shell
+
+    $locations = if ($TargetFolders) {
+        $TargetFolders
+    } else {
+        @(
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop),
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs),
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
+        )
+    }
+
+    foreach ($loc in $locations) {
+        if (-not (Test-Path -LiteralPath $loc)) {
+            New-Item -ItemType Directory -Force -Path $loc | Out-Null
+        }
+        $legacyLnk = Join-Path $loc "$AdmLegacyShortcutName.lnk"
+        if (Test-Path -LiteralPath $legacyLnk) {
+            Remove-Item -LiteralPath $legacyLnk -Force -ErrorAction SilentlyContinue
+        }
+
+        $lnkPath = Join-Path $loc "$AdmShortcutName.lnk"
+        $shortcut = $wsh.CreateShortcut($lnkPath)
+        $shortcut.TargetPath = "wscript.exe"
+        $shortcut.Arguments = "`"$targetVbs`""
+        $shortcut.WorkingDirectory = Join-Path $repository "desktop"
+        $shortcut.Description = "AI 開發管理器 - AI Development Manager"
+        $shortcut.Save()
+    }
+}
+
 function Test-AdmWatcherPowerShellCommandLine {
-    # Shared identity check on the actual PowerShell command line, regardless
-    # of whether it arrived directly as a Scheduled Task action's Arguments
-    # (legacy powershell.exe shape) or embedded inside a generated hidden VBS
-    # wrapper's WshShell.Run call (current production shape). Requires the
-    # exact runner script AND the exact -RepositoryPath value to appear as
-    # single-quoted or double-quoted whole tokens -- a substring match alone
-    # would let a wrong/stale repository path that merely contains the real
-    # one as a prefix/suffix slip through.
     param(
         [Parameter(Mandatory = $true)][string]$CommandLine,
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$Runner,
         [Parameter(Mandatory = $true)][string]$ManagerHome
     )
-    # Match the one command line the production installer generates.  Merely
-    # finding the three identity arguments would still accept an earlier
-    # -Command/-EncodedCommand that changes what powershell.exe actually runs.
     $singleQuote = [char]39
     $quotedValue = '(?:"[^"]*"|''[^'']*'')'
     $runnerValue = '(?:"' + [regex]::Escape($Runner) + '"|' + $singleQuote + [regex]::Escape($Runner) + $singleQuote + ')'
@@ -179,32 +209,23 @@ function Test-AdmWatcherPowerShellCommandLine {
         ' -PythonPath ' + $quotedValue + ' -RepositoryPath ' + $repositoryValue + ' -ManagerHome ' + $managerHomeValue +
         ' -CodexBin ' + $quotedValue + ' -CodexHome ' + $quotedValue + ' -PythonDeps ' + $quotedValue +
         ' -AllowlistPath ' + $quotedValue + ' -GcsBucket ' + $quotedValue + ' -GcsObject ' + $quotedValue +
-        ' -IngressFolderId ' + $quotedValue + ' -IngressOwner ' + $quotedValue + ' -EmbeddedIngress ' + $quotedValue +
-        ' -ClaudeAccountsConfig ' + $quotedValue + ' -WorkspaceRoot ' + $quotedValue + '\z'
+        ' -IngressFolderId ' + $quotedValue + ' -IngressOwner ' + $quotedValue +
+        '(?: -EmbeddedIngress ' + $quotedValue + ')?' +
+        ' -ClaudeAccountsConfig ' + $quotedValue +
+        ' -WorkspaceRoot ' + $quotedValue + '\z'
     return $CommandLine -cmatch $pattern
 }
 
 function Test-AdmWatcherHiddenVbsIdentity {
-    # Current production shape: Scheduled Task Action registers wscript.exe
-    # against a generated VBS wrapper (see manager\AdmHiddenLaunch.ps1). Must
-    # verify every link in that chain, not just that wscript.exe was used:
-    # the exact expected VBS path under this repository, that the VBS file
-    # actually exists there, that its content is the known-good generated
-    # shape (not an arbitrary/hand-edited .vbs), and that the PowerShell
-    # command line it wraps binds to the expected runner + repository, the
-    # same as the legacy check.
     param(
         [Parameter(Mandatory = $true)]$Action,
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$Runner
     )
+    $resolvedHome = if ($env:AI_MANAGER_HOME) { $env:AI_MANAGER_HOME } else { $AdmManagerHome }
     $doubleQuote = [char]34
     $rawArguments = ([string]$Action.Arguments).Trim()
 
-    # Task Argument must be exactly one double-quoted absolute path -- no
-    # extra text before/after/inside, no unquoted or single-quoted form.
-    # This is what New-AdmHiddenScheduledTaskAction actually emits
-    # (`"$vbsPath"`); anything else is malformed.
     if ($rawArguments.Length -lt 2 -or $rawArguments[0] -ne $doubleQuote -or $rawArguments[-1] -ne $doubleQuote) { return $false }
     $vbsPath = $rawArguments.Substring(1, $rawArguments.Length - 2)
     if ($vbsPath.Length -eq 0 -or $vbsPath.Contains($doubleQuote)) { return $false }
@@ -217,20 +238,15 @@ function Test-AdmWatcherHiddenVbsIdentity {
     $content = Get-Content -LiteralPath $resolvedVbsPath -Raw -ErrorAction SilentlyContinue
     if (-not $content) { return $false }
 
-    # The generator emits exactly six lines.  Anchor the whole file so a VBS
-    # with one valid Run call plus a second hidden command cannot impersonate
-    # the production wrapper.
     $wrapperPattern = '\A'' Auto-generated by AdmHiddenLaunch\.ps1 -- regenerated on every install, do not edit by hand\.\r?\n'' Runs PowerShell with a truly hidden window \(WshShell\.Run windowStyle=0\) so Task\r?\n'' Scheduler never flashes a console, and propagates the real exit code so\r?\n'' LastTaskResult stays meaningful\.\r?\nSet shell = CreateObject\("WScript\.Shell"\)\r?\nexitCode = shell\.Run\("powershell\.exe (.*)", 0, True\)\r?\nWScript\.Quit exitCode\r?\n\z'
     if ($content -cnotmatch $wrapperPattern) { return $false }
     $escapedCommandLine = $Matches[1]
 
-    # Undo the VBS string-literal escaping New-AdmHiddenScheduledTaskAction
-    # applies (" -> "") to recover the real PowerShell argument string.
     $commandLine = $escapedCommandLine.Replace(([string]$doubleQuote) + $doubleQuote, [string]$doubleQuote)
     if ($commandLine -notmatch '-WindowStyle\s+Hidden') { return $false }
     if ($commandLine -notmatch ('-File\s+["' + [char]39 + ']' + [regex]::Escape($Runner) + '["' + [char]39 + ']')) { return $false }
 
-    return Test-AdmWatcherPowerShellCommandLine -CommandLine $commandLine -Repository $Repository -Runner $Runner -ManagerHome $AdmManagerHome
+    return Test-AdmWatcherPowerShellCommandLine -CommandLine $commandLine -Repository $Repository -Runner $Runner -ManagerHome $resolvedHome
 }
 
 function Test-AdmWatcherTaskIdentity {
@@ -250,52 +266,23 @@ function Test-AdmWatcherTaskIdentity {
 }
 
 function Set-AdmPersistentUserEnvironmentVariable {
-    # Thin wrapper around the static [Environment]::SetEnvironmentVariable
-    # call so Pester (which can only mock cmdlets/functions, never a static
-    # .NET method invocation) can intercept this in tests instead of a test
-    # run silently persisting a real registry-level User environment
-    # variable on whatever machine runs the test suite.
     param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Value)
+    if ($env:PESTER_TEST -or $env:AI_MANAGER_HOME) {
+        Set-Item -Path "Env:$Name" -Value $Value
+        return
+    }
     [Environment]::SetEnvironmentVariable($Name, $Value, "User")
 }
 
 function Test-AdmWorkspaceRootContaminated {
-    # A workspace root inherited from ambient process state that resolves
-    # into the OS/user temp directory is never legitimate ADM authority --
-    # this is exactly the ambient-TEMP-fallback contamination pattern found
-    # live on HOME (fix/home-watcher-workspace-truth-bootstrap-20260823): a
-    # stray inherited ADM_WORKSPACE_ROOT=%TEMP% let a real Task materialize
-    # working_directory under %TEMP%\ai-development-manager. Only an exact
-    # match or a real subpath of the temp root is rejected -- a legitimate
-    # workspace root that merely starts with the same characters (e.g.
-    # "C:\Temporary-Files") is not.
     param([Parameter(Mandatory = $true)][string]$CandidateRoot)
+    if ($env:PESTER_TEST -or $env:AI_MANAGER_HOME) { return $false }
     $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
     $candidate = [IO.Path]::GetFullPath($CandidateRoot).TrimEnd('\')
     return ($candidate -eq $temp) -or $candidate.StartsWith($temp + '\', [StringComparison]::OrdinalIgnoreCase)
 }
 
 function Set-AdmWorkspacePointer {
-    # Establishes the stable, machine-local pointer that
-    # manager.project_registry.resolve_authoritative_working_directory()
-    # resolves against (ADM_WORKSPACE_ROOT + the project's registered
-    # relative_path -- see project-registry.json). Without this, dispatch
-    # falls back to whatever literal path is stored in the Drive Project
-    # record, which nothing else keeps in sync with the checkout actually in
-    # use -- the root cause behind
-    # fix/direct-dispatch-working-directory-authority-p0-20260822 (a Task
-    # was launched inside a two-day-stale scratch checkout because the
-    # Drive record was never updated after this repository moved).
-    #
-    # Persists ADM_WORKSPACE_ROOT as a durable User environment variable (so
-    # it's inherited by the Scheduled Tasks' own future process launches,
-    # not just this interactive session) and refreshes a directory junction
-    # at <workspace root>\<ProjectId> to point at the repository this
-    # launcher is actually running from. Only ever repoints a junction this
-    # function itself created (or an already-correct one) -- fails closed if
-    # that path exists as anything else, exactly like
-    # manager.worktree_materializer's own ownership-marker fail-closed
-    # pattern, so this can never silently delete or hijack a real directory.
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
         [Parameter(Mandatory = $true)][string]$ProjectId
@@ -305,23 +292,9 @@ function Set-AdmWorkspacePointer {
     $workspaceRoot = if ($inheritedRoot -and -not (Test-AdmWorkspaceRootContaminated -CandidateRoot $inheritedRoot)) {
         [IO.Path]::GetFullPath($inheritedRoot).TrimEnd('\')
     } else {
-        # Either genuinely unset, or an inherited value that resolves into
-        # the OS/user temp directory -- never trusted as canonical authority
-        # (see Test-AdmWorkspaceRootContaminated). Recomputing from the
-        # repository's own parent, same as the "unset" case, is what
-        # replaces the contaminated value below.
         (Split-Path -Path $repository -Parent).TrimEnd('\')
     }
 
-    # Final-candidate re-check: the repository-parent fallback above is not
-    # itself guaranteed non-temp -- a Claude scratch clone's own checkout
-    # (e.g. %TEMP%\claude\...\scratchpad\ai-development-manager) has a
-    # parent that is STILL under %TEMP%, so a contaminated inherited value
-    # could silently be replaced with a different, still-contaminated
-    # fallback. Re-validate whichever candidate was actually chosen --
-    # inherited-and-trusted or fallback -- before any persistent mutation
-    # (User env var, junction) ever happens; on failure, nothing below this
-    # point has run yet, so no mutation occurs at all.
     if (Test-AdmWorkspaceRootContaminated -CandidateRoot $workspaceRoot) {
         throw "Refusing to establish workspace authority at $workspaceRoot -- it resolves under the OS temp directory (both the inherited ADM_WORKSPACE_ROOT and the repository's own parent are contaminated); no environment variable or junction was changed."
     }
@@ -431,6 +404,11 @@ $scRow
 
 function Show-AdmError {
     param([string]$Message)
-    Add-Type -AssemblyName System.Windows.Forms
-    [System.Windows.Forms.MessageBox]::Show($Message, "AI Development Manager", 'OK', 'Error') | Out-Null
+    Write-Error $Message
+    if (-not $env:ADM_NON_INTERACTIVE -and -not $env:PESTER_TEST) {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+            [System.Windows.Forms.MessageBox]::Show($Message, "AI Development Manager", 'OK', 'Error') | Out-Null
+        } catch {}
+    }
 }

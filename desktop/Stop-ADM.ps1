@@ -1,11 +1,10 @@
-# Disables the two ADM Scheduled Tasks so they stop picking up new work.
+# Disables the ADM Scheduled Tasks so they stop picking up new work.
 #
 # Deliberately does NOT kill any currently-running child process (Session
 # Center, a live Claude/Codex execution, etc.) -- disabling a Scheduled Task
 # only prevents its *next* trigger from firing; an already-running instance,
 # or an already-spawned provider process being supervised by it, is left
-# completely alone. Stopping the automation layer is not the same as
-# stopping in-progress AI work, and this script never does the latter.
+# completely alone.
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "AdmCommon.ps1")
@@ -14,7 +13,7 @@ $repository = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Confirm-AdmWatcherTaskIdentity -RepositoryPath $repository | Out-Null
 Write-AdmWatcherMaintenance -Reason "Stop-ADM intentional maintenance" -SourceRepository $repository
 
-foreach ($name in @($AdmSupervisorTask, $AdmWatcherTask)) {
+foreach ($name in $AdmAllTasks) {
     $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
     if (-not $task) {
         Write-Output "SKIP (not found): $name"

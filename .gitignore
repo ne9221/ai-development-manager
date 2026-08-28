@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 venv/
 manager/generated/
+
+.adm-production-runtime.json

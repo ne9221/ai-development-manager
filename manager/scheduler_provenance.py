@@ -43,6 +43,45 @@ def _path(manager_home, invocation_id):
     return Path(manager_home) / "runtime" / "scheduler-invocations" / f"{invocation_id}.json"
 
 
+def _heartbeat_path(manager_home):
+    return Path(manager_home) / "runtime" / "component-heartbeat.json"
+
+
+def write_heartbeat(manager_home, component, status, task_name=None):
+    """O(1) last-tick marker per component, overwritten every call -- a
+    separate, cheap-to-read complement to the append-only per-invocation
+    history in runtime/scheduler-invocations/ (which has grown to
+    MAX_RECORDS=10000 files and is not something a per-tick health check
+    should ever have to scan). manager.runtime_supervisor is the sole
+    reader; a missing/malformed file means "no heartbeat observed yet",
+    never an error, since this is diagnostic liveness evidence, not SSOT."""
+    path = _heartbeat_path(manager_home)
+    try:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        data[component] = {"status": status[:40], "task_name": task_name, "updated_at": now_iso()}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(path.suffix + ".tmp")
+        temp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        temp.replace(path)
+    except OSError:
+        # Best-effort only -- a heartbeat write failure must never abort or
+        # mask the real scheduled-task outcome finish() is recording.
+        pass
+
+
+def read_heartbeats(manager_home):
+    try:
+        data = json.loads(_heartbeat_path(manager_home).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def _write(path, record):
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
@@ -255,6 +294,9 @@ def finish(manager_home, context, status):
     except (OSError, ValueError):
         return
     record.update(ended_at=now_iso(), status=status[:40]); _write(path, record)
+    component = record.get("component")
+    if isinstance(component, str) and component:
+        write_heartbeat(manager_home, component, status, task_name=record.get("task_name"))
 
 
 def command_origin(context=None):

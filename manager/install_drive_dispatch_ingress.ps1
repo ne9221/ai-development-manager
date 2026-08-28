@@ -135,18 +135,19 @@ $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $RepositoryPath -Wrap
 # Every 1 minute, starting 1 minute from install time -- matches the
 # Command Watcher's own cadence, since Drive dispatch requests should be
 # picked up promptly, and this task is cheap enough to poll that often.
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
+$logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
 
 # -MultipleInstances IgnoreNew: if a tick is still running when the next
 # one fires, the new one is skipped rather than stacking concurrent
 # pollers. -Hidden keeps the Task itself out of the default Task Scheduler
 # view. -ExecutionTimeLimit bounds a stuck/hanging poll so it can never run
 # indefinitely and starve later ticks.
-$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes $ExecutionTimeLimitMinutes)
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes $ExecutionTimeLimitMinutes) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 $principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
 
 # -Force: registering an already-existing $TaskName updates it in place
 # rather than erroring or creating a second Task under the same name --
 # safe reinstall/update behavior, no duplicate Scheduled Tasks.
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($logon, $repeat) -Settings $settings -Principal $principal -Force | Out-Null
 Write-Output "Installed scheduled task: $TaskName"

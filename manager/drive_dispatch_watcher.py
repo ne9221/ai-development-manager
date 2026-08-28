@@ -37,6 +37,7 @@ import sys
 from collectors.publish_drive import build_service
 from manager.drive_dispatch_ingress import poll_drive_dispatch_requests
 from manager.gcs_lock_registry import BUCKET_ENV
+from manager.runtime_supervisor import try_check_and_recover
 from manager.tasks import DriveRecords, TaskError
 from manager.production_guard import RuntimeGuardError, require_runtime_guard
 
@@ -84,13 +85,20 @@ def main(argv=None):
     except TaskError as exc:
         _print_safe_failure(exc, "Drive dispatch ingress configuration or validation error")
         finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, "failed")
+        try_check_and_recover(os.environ.get("AI_MANAGER_HOME", "."))
         return 1
     except Exception as exc:
         _print_safe_failure(exc, "Drive dispatch ingress poll failed")
         finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, "failed")
+        try_check_and_recover(os.environ.get("AI_MANAGER_HOME", "."))
         return 1
     print(json.dumps(result, separators=(",", ":")))
     finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, "completed")
+    # Best-effort, bounded, debounced runtime self-heal sweep -- see
+    # manager.runtime_supervisor's module docstring for why this call site
+    # (rather than a dedicated Scheduled Task) is what makes the sweep
+    # independent of any single component's own health. Never raises.
+    try_check_and_recover(os.environ.get("AI_MANAGER_HOME", "."))
     return 0
 
 

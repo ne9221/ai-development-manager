@@ -254,7 +254,16 @@ def read_request(service, folder_id, expected_owner, metadata, now=None):
     if not isinstance(raw, bytes) or len(raw) != size or len(raw) > MAX_FILE_BYTES:
         raise TaskError("Drive request content verification failed")
     try:
-        document = json.loads(raw.decode("utf-8"))
+        # "utf-8-sig" strips a leading UTF-8 byte-order-mark if present and
+        # is otherwise identical to "utf-8" -- several real submitters
+        # (confirmed live: ChatGPT-originated Drive uploads) write a BOM
+        # prefix, which plain "utf-8" decodes into a literal U+FEFF before
+        # `{`, causing json.loads() to reject every such file forever
+        # (Drive files are immutable once written, and every poll re-reads
+        # the same bytes) with the same generic "not valid UTF-8 JSON"
+        # message as truly malformed content. RFC 8259 SS8.1 explicitly
+        # permits ignoring a BOM rather than treating it as an error.
+        document = json.loads(raw.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TaskError("Drive request is not valid UTF-8 JSON") from exc
     # Everything from here on validates an already-successfully-parsed

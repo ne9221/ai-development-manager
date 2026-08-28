@@ -21,7 +21,7 @@ if ($GcsBucket) { $arguments += " -GcsBucket `"$GcsBucket`"" }
 $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $RepositoryPath -WrapperName "session-center-supervisor" -PowerShellArguments $arguments
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
-$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 $principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($logon, $repeat) -Settings $settings -Principal $principal -Force | Out-Null
 Write-Output "Installed scheduled task: $TaskName"

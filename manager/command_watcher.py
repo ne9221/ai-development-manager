@@ -21,6 +21,7 @@ from manager.gcs_lock_registry import GCSLockRegistry
 from manager.governance import validate_task_enforcement
 from manager.quota_reader import read_drive_status, summarize
 from manager.runtime_bridge import all_projects
+from manager.runtime_supervisor import try_check_and_recover
 from manager.task_claims import check_task_execution_claim, task_claim_registry
 from manager.tasks import DriveRecords, TaskError, now_iso, validate
 from manager.trusted_ingress import (
@@ -1155,6 +1156,7 @@ def main(argv=None):
             print(json.dumps({"status": "unavailable"}, separators=(",", ":")))
         if args.once:
             finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, status)
+            try_check_and_recover(os.environ.get("AI_MANAGER_HOME", "."))
             return 0
         time.sleep(args.interval_seconds)
 

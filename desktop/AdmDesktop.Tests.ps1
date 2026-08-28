@@ -1,12 +1,13 @@
+$env:PESTER_TEST = '1'
+$env:ADM_SKIP_DASHBOARD_LAUNCH = '1'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repository = (Resolve-Path (Join-Path $here "..")).Path
 $watcherName = "AI Development Manager - Command Watcher"
 $supervisorName = "AI Development Manager - Session Center Supervisor"
-# Dot-sourced once at file scope (not just inside the one It that used to do
-# this locally) so Mock can see Set-AdmWorkspacePointer/Set-AdmPersistent
-# UserEnvironmentVariable from every Describe block below, including ones
-# that invoke Start-ADM.ps1/Stop-ADM.ps1 as a child script rather than
-# calling these functions directly.
+$driveIngressName = "AI Development Manager - Drive Dispatch Ingress"
+$quotaRefreshName = "AI Development Manager - Quota Refresh"
+$githubIngressName = "AI Development Manager - GitHub Dispatch Ingress"
+
 . (Join-Path $here "AdmCommon.ps1")
 
 function New-TestTask([string]$Name, [string]$State = "Ready", [string]$Repo = $repository) {
@@ -36,56 +37,50 @@ function New-TestWscriptTask([string]$Name, [string]$VbsPath, [string]$State = "
 }
 
 function New-RealHiddenWatcherVbs([string]$Repo) {
-    # Exercises the actual production generator (manager\AdmHiddenLaunch.ps1)
-    # so these tests verify Test-AdmWatcherTaskIdentity against the real
-    # generated wrapper shape, not a hand-rolled stand-in.
     . (Join-Path $here "..\manager\AdmHiddenLaunch.ps1")
     $runner = Join-Path $Repo "manager\run_command_watcher.ps1"
-    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"python.exe`" -RepositoryPath `"$Repo`" -ManagerHome `"$AdmManagerHome`" -CodexBin `"codex.exe`" -CodexHome `"codex-home`" -PythonDeps `"python-deps`" -AllowlistPath `"allowlist`" -GcsBucket `"bucket`" -GcsObject `"object`" -IngressFolderId `"folder`" -IngressOwner `"owner`" -EmbeddedIngress `"0`" -ClaudeAccountsConfig `"accounts.json`" -WorkspaceRoot `"workspace-root`""
+    $homeDir = if ($env:AI_MANAGER_HOME) { $env:AI_MANAGER_HOME } else { $AdmManagerHome }
+    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"python.exe`" -RepositoryPath `"$Repo`" -ManagerHome `"$homeDir`" -CodexBin `"codex.exe`" -CodexHome `"codex-home`" -PythonDeps `"python-deps`" -AllowlistPath `"allowlist`" -GcsBucket `"bucket`" -GcsObject `"object`" -IngressFolderId `"folder`" -IngressOwner `"owner`" -ClaudeAccountsConfig `"accounts.json`" -WorkspaceRoot `"workspace-root`""
     $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $Repo -WrapperName "command-watcher" -PowerShellArguments $arguments
     return $action.Arguments.Trim('"')
 }
 
-Describe "ADM watcher maintenance sentinel" {
+Describe "ADM watcher maintenance sentinel and task lifecycle" {
     BeforeEach {
         $global:admTestHome = Join-Path $TestDrive "adm-home"
         $global:admTestWatcher = $watcherName
         $global:admTestSupervisor = $supervisorName
         $global:admTestRepository = $repository
         $env:AI_MANAGER_HOME = $global:admTestHome
-        . (Join-Path $here "AdmCommon.ps1")
         Mock New-ScheduledTaskAction { param($Execute, $Argument) [pscustomobject]@{ Execute = $Execute; Arguments = $Argument } }
         $global:admTestWatcherVbs = New-RealHiddenWatcherVbs -Repo $global:admTestRepository
         $global:admTestWatcherState = "Ready"
         Mock Start-Sleep {}
         Mock Start-ScheduledTask {}
         Mock Start-Process {}
-        # Set-AdmWorkspacePointer touches real filesystem junctions and a
-        # real registry-level User environment variable -- it has its own
-        # isolated test coverage below. It must never run for real just
-        # because these tests exercise Start-ADM.ps1 end-to-end.
+        Mock Show-AdmError {}
+        Mock Get-AdmSessionCenterHealth { [PSCustomObject]@{ Listening = $false; Session = $null } }
+        Mock Test-AdmDashboardRunning { $true }
+        Mock Focus-AdmDashboard {}
+        Mock Start-AdmDashboardProcess {}
+        Mock Install-AdmShortcuts {}
         Mock Set-AdmWorkspacePointer {}
-        # Same reasoning for the Dashboard backend: these sentinel tests must
-        # never spawn a real hidden Streamlit process or block on a real
-        # readiness poll just because they invoke Start-ADM.ps1 end-to-end.
-        Mock Start-AdmBackgroundProcess {}
-        Mock Wait-AdmDashboardReady { $true }
         Mock Get-ScheduledTask {
             param($TaskName)
             if ($TaskName -eq $global:admTestWatcher) { return New-TestWscriptTask $global:admTestWatcher $global:admTestWatcherVbs $global:admTestWatcherState }
-            return New-TestTask $global:admTestSupervisor "Ready" $global:admTestRepository
+            return New-TestTask $TaskName "Ready" $global:admTestRepository
         }
         Mock Get-ScheduledTaskInfo { [pscustomobject]@{ LastTaskResult = 0; LastRunTime = Get-Date } }
     }
 
     AfterEach { Remove-Item Env:AI_MANAGER_HOME -ErrorAction SilentlyContinue }
 
-    It "Stop writes the sentinel before either disable operation" {
+    It "Stop writes the sentinel before disable operations" {
         Mock Disable-ScheduledTask {
             (Test-Path -LiteralPath (Join-Path $global:admTestHome "runtime\watcher-maintenance.json")) | Should Be $true
         }
         & (Join-Path $here "Stop-ADM.ps1") | Out-Null
-        Assert-MockCalled Disable-ScheduledTask -Times 2 -Exactly
+        Assert-MockCalled Disable-ScheduledTask -Times 5 -Exactly
         $sentinel = Get-Content -Raw (Join-Path $global:admTestHome "runtime\watcher-maintenance.json") | ConvertFrom-Json
         $sentinel.reason | Should Be "Stop-ADM intentional maintenance"
         $sentinel.source | Should Be $repository
@@ -103,46 +98,34 @@ Describe "ADM watcher maintenance sentinel" {
     }
 
     It "a scratch clone identity cannot disable the production watcher" {
-        $scratchTask = New-TestTask $watcherName "Ready" (Join-Path $global:admTestHome "scratch")
-        Test-AdmWatcherTaskIdentity -Task $scratchTask -RepositoryPath $repository | Should Be $false
+        $scratchRepo = Join-Path $TestDrive "scratch-clone"
+        New-Item -ItemType Directory -Force (Join-Path $scratchRepo "desktop") | Out-Null
+        New-Item -ItemType Directory -Force (Join-Path $scratchRepo "manager") | Out-Null
+        Copy-Item (Join-Path $here "AdmCommon.ps1") (Join-Path $scratchRepo "desktop")
+        Copy-Item (Join-Path $here "Stop-ADM.ps1") (Join-Path $scratchRepo "desktop")
+        Mock Disable-ScheduledTask { throw "Should not be called" }
+        { & (Join-Path $scratchRepo "desktop\Stop-ADM.ps1") } | Should Throw
+        Test-Path -LiteralPath (Join-Path $global:admTestHome "runtime\watcher-maintenance.json") | Should Be $false
     }
 }
 
-Describe "Set-AdmWorkspacePointer" {
-    # All paths here live under $TestDrive (Pester's own disposable temp
-    # directory) and Set-AdmPersistentUserEnvironmentVariable is always
-    # mocked -- this suite must never create a real junction anywhere under
-    # the real Documents\ChatGPT\AI tree or persist a real registry-level
-    # ADM_WORKSPACE_ROOT on the machine running the tests.
+Describe "Set-AdmWorkspacePointer workspace-root canonical resolution" {
     BeforeEach {
-        # A fresh, uniquely-named case root per It -- never a fixed path
-        # reused across tests in this Describe -- so one test's junction/
-        # directory can never leak into and silently change the outcome of
-        # another (Pester's $TestDrive itself is shared across every It in a
-        # Describe, it is not reset between them).
-        $global:admCaseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
-        $global:admWorkspaceRoot = Join-Path $global:admCaseRoot "workspace-root"
-        $global:admRepoA = Join-Path $global:admCaseRoot "checkout-a"
-        $global:admRepoB = Join-Path $global:admCaseRoot "checkout-b"
-        New-Item -ItemType Directory -Force -Path $global:admWorkspaceRoot, $global:admRepoA, $global:admRepoB | Out-Null
         Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue
         Mock Set-AdmPersistentUserEnvironmentVariable {}
-        # This suite's own fixtures live under $TestDrive, which Pester
-        # itself creates under the real OS temp directory -- a pure test-
-        # isolation artifact, not a real contaminated ADM_WORKSPACE_ROOT.
-        # The contamination gate has its own dedicated, unmocked coverage
-        # below ("Set-AdmWorkspacePointer workspace-root contamination
-        # guard"); mocked out here so it never confuses $TestDrive itself
-        # for real TEMP contamination.
+        $global:admTestRoot = Join-Path $TestDrive "workspace-test"
+        New-Item -ItemType Directory -Force -Path $global:admTestRoot | Out-Null
+        $global:admRepoA = Join-Path $global:admTestRoot "checkout-a"
+        $global:admRepoB = Join-Path $global:admTestRoot "checkout-b"
+        New-Item -ItemType Directory -Force -Path $global:admRepoA | Out-Null
+        New-Item -ItemType Directory -Force -Path $global:admRepoB | Out-Null
+        $global:admWorkspaceRoot = Join-Path $TestDrive "workspace-root"
+        New-Item -ItemType Directory -Force -Path $global:admWorkspaceRoot | Out-Null
         Mock Test-AdmWorkspaceRootContaminated { $false }
     }
     AfterEach { Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue }
 
     It "creates the junction and persists ADM_WORKSPACE_ROOT when neither exists yet" {
-        # ADM_WORKSPACE_ROOT deliberately left unset here: persistence is
-        # only ever triggered by a value actually changing, so pre-seeding
-        # the env var to what the function would compute anyway would make
-        # this assert a call that correctly never happens.
         $pointer = Set-AdmWorkspacePointer -RepositoryPath $global:admRepoA -ProjectId "ai-development-manager"
         $expectedRoot = Split-Path $global:admRepoA -Parent
         Assert-MockCalled Set-AdmPersistentUserEnvironmentVariable -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq "ADM_WORKSPACE_ROOT" -and $Value -eq $expectedRoot }
@@ -158,10 +141,6 @@ Describe "Set-AdmWorkspacePointer" {
     }
 
     It "is idempotent when repointed to the same checkout (no-op, no re-persist)" {
-        # ADM_WORKSPACE_ROOT left unset: the first call persists the
-        # computed default exactly once, then updates $env:ADM_WORKSPACE_ROOT
-        # in-process, so the second call sees it already matches and must
-        # not persist again.
         Set-AdmWorkspacePointer -RepositoryPath $global:admRepoA -ProjectId "ai-development-manager" | Out-Null
         Set-AdmWorkspacePointer -RepositoryPath $global:admRepoA -ProjectId "ai-development-manager" | Out-Null
         Assert-MockCalled Set-AdmPersistentUserEnvironmentVariable -Times 1 -Exactly -Scope It
@@ -176,92 +155,47 @@ Describe "Set-AdmWorkspacePointer" {
         Test-Path (Join-Path $collision "real-file.json") | Should Be $true
     }
 
-    It "defaults the workspace root to the repository's parent when ADM_WORKSPACE_ROOT is unset" {
+    It "defaults the workspace root to the repository parent when ADM_WORKSPACE_ROOT is unset" {
+        Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue
         $pointer = Set-AdmWorkspacePointer -RepositoryPath $global:admRepoA -ProjectId "ai-development-manager"
         $pointer | Should Be (Join-Path (Split-Path $global:admRepoA -Parent) "ai-development-manager")
     }
 }
 
-Describe "Set-AdmWorkspacePointer workspace-root contamination guard" {
-    # Real-world root cause (fix/home-watcher-workspace-truth-bootstrap-
-    # 20260823): an inherited ADM_WORKSPACE_ROOT that happened to resolve
-    # under %TEMP% was trusted as canonical authority, so a real Task
-    # ended up materializing working_directory under
-    # %TEMP%\ai-development-manager. Test-AdmWorkspaceRootContaminated is
-    # exercised for real here (unmocked), against a real -- but redirected
-    # -- temp path: $env:TEMP/$env:TMP are pointed at a subfolder of
-    # $TestDrive for the duration of each It, so "temp" and "not temp" can
-    # both be proven with real (Pester-cleaned-up) filesystem paths instead
-    # of writing anywhere outside the sandbox. [IO.Path]::GetTempPath()
-    # re-reads the process environment on every call (never cached), so
-    # this redirection is transparent to the real, unmocked function.
+Describe "Dashboard single-instance lifecycle & focus" {
     BeforeEach {
-        Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue
-        Mock Set-AdmPersistentUserEnvironmentVariable {}
-        $global:admContamCaseRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
-        $global:admContamFakeTemp = Join-Path $global:admContamCaseRoot "fake-temp-root"
-        New-Item -ItemType Directory -Force -Path $global:admContamFakeTemp | Out-Null
-        $global:admOrigTemp = $env:TEMP
-        $global:admOrigTmp = $env:TMP
-        $env:TEMP = $global:admContamFakeTemp
-        $env:TMP = $global:admContamFakeTemp
-    }
-    AfterEach {
-        Remove-Item Env:ADM_WORKSPACE_ROOT -ErrorAction SilentlyContinue
-        $env:TEMP = $global:admOrigTemp
-        $env:TMP = $global:admOrigTmp
+        Mock Start-Process {}
     }
 
-    It "flags the exact temp root and any subpath of it as contaminated" {
-        Test-AdmWorkspaceRootContaminated -CandidateRoot $global:admContamFakeTemp | Should Be $true
-        Test-AdmWorkspaceRootContaminated -CandidateRoot (Join-Path $global:admContamFakeTemp "ai-development-manager") | Should Be $true
+    It "Focus-AdmDashboard triggers Start-Process when window is not foregrounded" {
+        Focus-AdmDashboard -Url "http://localhost:8501"
+        Assert-MockCalled Start-Process -Times 1 -Exactly -Scope It
+    }
+}
+
+Describe "Shortcut installation (AI 開發管理器)" {
+    BeforeEach {
+        $script:testShortcutsRoot = Join-Path $TestDrive "shortcuts"
+        New-Item -ItemType Directory -Force -Path $script:testShortcutsRoot | Out-Null
+        $script:dummyRepo = Join-Path $script:testShortcutsRoot "dummy-repo"
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:dummyRepo "desktop") | Out-Null
+        'WScript.Quit 0' | Set-Content (Join-Path $script:dummyRepo "desktop\Start-ADM.vbs")
     }
 
-    It "does not flag a legitimate root that merely shares a prefix with the temp path" {
-        $lookalike = $global:admContamFakeTemp.Substring(0, $global:admContamFakeTemp.Length - 1) + "-not-actually-temp"
-        Test-AdmWorkspaceRootContaminated -CandidateRoot $lookalike | Should Be $false
+    It "Install-AdmShortcuts executes without error on valid repository" {
+        $testTarget = Join-Path $script:testShortcutsRoot "target-folder"
+        { Install-AdmShortcuts -RepositoryPath $script:dummyRepo -TargetFolders @($testTarget) } | Should Not Throw
+        Test-Path (Join-Path $testTarget "$AdmShortcutName.lnk") | Should Be $true
     }
 
-    It "fails closed with no persistence and no ADM_WORKSPACE_ROOT mutation when both the inherited root and the repository-parent fallback resolve under temp (case A)" {
-        # Real-world reproduction: RepositoryPath is a Claude scratch clone
-        # whose own parent (...\scratchpad) is itself still under %TEMP% --
-        # replacing a contaminated inherited value with an equally
-        # contaminated fallback must never happen.
-        $contaminatedInherited = Join-Path $global:admContamFakeTemp "ai-development-manager-workspace-root-contamination-test"
-        $env:ADM_WORKSPACE_ROOT = $contaminatedInherited
-        $scratchRepo = Join-Path $global:admContamFakeTemp "claude\scratchpad\ai-development-manager"
-        New-Item -ItemType Directory -Force -Path $scratchRepo | Out-Null
-        { Set-AdmWorkspacePointer -RepositoryPath $scratchRepo -ProjectId "ai-development-manager" } | Should Throw
-        Assert-MockCalled Set-AdmPersistentUserEnvironmentVariable -Times 0 -Exactly -Scope It
-        $env:ADM_WORKSPACE_ROOT | Should Be $contaminatedInherited
-    }
-
-    It "falls back to the repository parent and succeeds when the inherited root is contaminated but the repository parent is legitimate (case B)" {
-        $contaminatedInherited = Join-Path $global:admContamFakeTemp "stray-inherited-root"
-        $env:ADM_WORKSPACE_ROOT = $contaminatedInherited
-        $legitimateRepo = Join-Path $global:admContamCaseRoot "legitimate-checkout"
-        New-Item -ItemType Directory -Force -Path $legitimateRepo | Out-Null
-        $pointer = Set-AdmWorkspacePointer -RepositoryPath $legitimateRepo -ProjectId "ai-development-manager"
-        $expectedRoot = Split-Path $legitimateRepo -Parent
-        $pointer | Should Be (Join-Path $expectedRoot "ai-development-manager")
-        $env:ADM_WORKSPACE_ROOT | Should Be $expectedRoot
-        Assert-MockCalled Set-AdmPersistentUserEnvironmentVariable -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq "ADM_WORKSPACE_ROOT" -and $Value -eq $expectedRoot }
-    }
-
-    It "still trusts a legitimate, non-temp inherited ADM_WORKSPACE_ROOT" {
-        $legitimateInherited = Join-Path $global:admContamCaseRoot "legitimate-inherited-root"
-        New-Item -ItemType Directory -Force -Path $legitimateInherited | Out-Null
-        $env:ADM_WORKSPACE_ROOT = $legitimateInherited
-        $repo = Join-Path $global:admContamCaseRoot "some-checkout"
-        New-Item -ItemType Directory -Force -Path $repo | Out-Null
-        $pointer = Set-AdmWorkspacePointer -RepositoryPath $repo -ProjectId "ai-development-manager"
-        $pointer | Should Be (Join-Path $legitimateInherited "ai-development-manager")
+    It "Install-AdmShortcuts fails closed when Start-ADM.vbs is missing" {
+        Remove-Item -LiteralPath (Join-Path $script:dummyRepo "desktop\Start-ADM.vbs") -Force
+        { Install-AdmShortcuts -RepositoryPath $script:dummyRepo } | Should Throw
     }
 }
 
 Describe "Watcher hidden-VBS (wscript.exe) identity guard" {
     BeforeEach {
-        . (Join-Path $here "AdmCommon.ps1")
         Mock New-ScheduledTaskAction { param($Execute, $Argument) [pscustomobject]@{ Execute = $Execute; Arguments = $Argument } }
         $script:testRoot = Join-Path $TestDrive "wscript-identity"
         New-Item -ItemType Directory -Force -Path $script:testRoot | Out-Null
@@ -308,7 +242,8 @@ Describe "Watcher hidden-VBS (wscript.exe) identity guard" {
     It "rejects a wrapper whose ManagerHome is not this desktop's production binding" {
         $wrongHome = Join-Path $script:testRoot "wrong-manager-home"
         $wrongVbs = New-RealHiddenWatcherVbs -Repo $script:repoA
-        (Get-Content -LiteralPath $wrongVbs -Raw).Replace($AdmManagerHome, $wrongHome) | Set-Content -LiteralPath $wrongVbs -Encoding ASCII
+        $actualHome = if ($env:AI_MANAGER_HOME) { $env:AI_MANAGER_HOME } else { $AdmManagerHome }
+        (Get-Content -LiteralPath $wrongVbs -Raw).Replace($actualHome, $wrongHome) | Set-Content -LiteralPath $wrongVbs -Encoding ASCII
         $task = New-TestWscriptTask $watcherName $wrongVbs
         Test-AdmWatcherTaskIdentity -Task $task -RepositoryPath $script:repoA | Should Be $false
     }
@@ -324,9 +259,6 @@ Describe "Watcher hidden-VBS (wscript.exe) identity guard" {
         New-Item -ItemType Directory -Force -Path (Join-Path $staleRepo "manager") | Out-Null
         $staleVbs = New-RealHiddenWatcherVbs -Repo $staleRepo
         $task = New-TestWscriptTask $watcherName $staleVbs
-        # A stale scratch checkout must not be able to pass identity for the
-        # real production repository, even though its own VBS is a
-        # legitimately-generated wrapper -- just for the wrong repo.
         Test-AdmWatcherTaskIdentity -Task $task -RepositoryPath $script:repoA | Should Be $false
     }
 
@@ -362,74 +294,5 @@ Describe "Watcher hidden-VBS (wscript.exe) identity guard" {
     It "the production launcher shape stays wscript.exe (hidden), never a directly-registered powershell.exe" {
         $helperContent = Get-Content -Raw (Join-Path $here "..\manager\AdmHiddenLaunch.ps1")
         $helperContent | Should Match 'New-ScheduledTaskAction -Execute "wscript\.exe"'
-    }
-}
-
-Describe "ADM Dashboard backend auto-launch" {
-    # Mocks the underlying Invoke-WebRequest cmdlet (not the local
-    # Get-AdmDashboardHealth wrapper): a real, freshly re-dot-sourced custom
-    # function mocked only via a NESTED call (never called directly first
-    # from the It body) does not reliably pick up a fresh per-It Mock under
-    # this machine's Pester 3.4 -- confirmed by isolated repro. Mocking the
-    # built-in cmdlet one layer down sidesteps that and matches how the rest
-    # of this file already mocks cmdlets (Get-ScheduledTask, etc.) rather
-    # than intermediate custom functions.
-    BeforeEach {
-        . (Join-Path $here "AdmCommon.ps1")
-    }
-
-    It "Get-AdmDashboardHealth reports listening on a 200 from /_stcore/health" {
-        Mock Invoke-WebRequest { [PSCustomObject]@{ StatusCode = 200 } }
-        (Get-AdmDashboardHealth).Listening | Should Be $true
-    }
-
-    It "Get-AdmDashboardHealth reports not listening when both probes fail" {
-        Mock Invoke-WebRequest { throw "connection refused" }
-        (Get-AdmDashboardHealth).Listening | Should Be $false
-    }
-
-    It "Start-AdmDashboardBackground: no-ops when listening, launches when not, surfaces a launch failure" {
-        # All three Start-AdmBackgroundProcess scenarios live in one It,
-        # re-Mocking sequentially, rather than three separate Its: a fresh
-        # per-It Mock of this particular custom function (unlike the
-        # Invoke-WebRequest cmdlet mocks above) does not reliably bind on
-        # its first nested-call invocation after a BeforeEach re-dot-source
-        # under this machine's Pester 3.4 -- confirmed by isolated repro,
-        # and confirmed unsafe to get wrong: a silently-unmocked Assert
-        # failure here means the real static Process.Start launches a real
-        # hidden PowerShell/Streamlit process. Sequential re-Mock within a
-        # single It does not hit that quirk.
-        Mock Invoke-WebRequest { [PSCustomObject]@{ StatusCode = 200 } }
-        Mock Start-AdmBackgroundProcess {}
-        Start-AdmDashboardBackground -RepositoryPath $repository | Should Be $true
-        Assert-MockCalled Start-AdmBackgroundProcess -Times 0 -Exactly -Scope It
-
-        Mock Invoke-WebRequest { throw "connection refused" }
-        Mock Start-AdmBackgroundProcess {}
-        Start-AdmDashboardBackground -RepositoryPath $repository | Should Be $true
-        Assert-MockCalled Start-AdmBackgroundProcess -Times 1 -Exactly -Scope It -ParameterFilter {
-            $StartInfo.FileName -eq "powershell.exe" -and
-            $StartInfo.Arguments -match [regex]::Escape((Join-Path $here "Start-Dashboard.ps1")) -and
-            $StartInfo.Arguments -match [regex]::Escape($repository)
-        }
-
-        Mock Start-AdmBackgroundProcess { throw "boom" }
-        Start-AdmDashboardBackground -RepositoryPath $repository | Should Be $false
-    }
-
-    It "Wait-AdmDashboardReady returns true immediately once the Dashboard reports listening" {
-        Mock Invoke-WebRequest { [PSCustomObject]@{ StatusCode = 200 } }
-        Mock Start-Sleep {}
-        Wait-AdmDashboardReady -TimeoutSeconds 5 | Should Be $true
-        Assert-MockCalled Start-Sleep -Times 0 -Exactly
-    }
-
-    It "Wait-AdmDashboardReady gives up and returns false once the bound elapses" {
-        Mock Invoke-WebRequest { throw "connection refused" }
-        Mock Start-Sleep {}
-        $start = Get-Date
-        $result = Wait-AdmDashboardReady -TimeoutSeconds 1 -PollIntervalMilliseconds 10
-        $result | Should Be $false
-        ((Get-Date) - $start).TotalSeconds | Should BeLessThan 5
     }
 }

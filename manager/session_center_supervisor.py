@@ -367,6 +367,8 @@ def main(argv=None):
     print(json.dumps(result))
     finish(os.environ.get("AI_MANAGER_HOME", "."), invocation,
            "failed" if result.get("status") == "unavailable" else "completed")
+    from manager.runtime_supervisor import try_check_and_recover
+    try_check_and_recover(os.environ.get("AI_MANAGER_HOME", "."))
     return 0
 
 
