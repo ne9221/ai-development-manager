@@ -1,10 +1,46 @@
-"""Focus an already-running ADM Dashboard window; never launch one."""
+"""Focus or open the ADM Dashboard without creating duplicate services."""
 
 import ctypes
 import os
+import socket
+import subprocess
+import time
+from pathlib import Path
 
 
-TITLE_MARKERS = ("ADM Unified Operations Dashboard", "localhost:8501")
+DASHBOARD_PORT = 8501
+DASHBOARD_URL = f"http://localhost:{DASHBOARD_PORT}/"
+DASHBOARD_LAUNCHER = Path(__file__).resolve().parent.parent / "desktop" / "Start-Dashboard.ps1"
+TITLE_MARKERS = ("ADM Unified Operations Dashboard", f"localhost:{DASHBOARD_PORT}")
+START_TIMEOUT_SECONDS = 15.0
+POLL_INTERVAL_SECONDS = 0.5
+
+
+def _port_open(host="127.0.0.1", port=DASHBOARD_PORT):
+    try:
+        with socket.create_connection((host, port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _open_browser(url=DASHBOARD_URL):
+    if os.name == "nt":
+        os.startfile(url)
+    else:
+        import webbrowser
+        webbrowser.open(url)
+
+
+def _spawn_dashboard():
+    flags = 0
+    if os.name == "nt":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    return subprocess.Popen(
+        ["powershell.exe", "-NoProfile", "-Non-Interactive", "-ExecutionPolicy", "Bypass",
+         "-File", str(DASHBOARD_LAUNCHER), "-Port", str(DASHBOARD_PORT)],
+        creationflags=flags, close_fds=True,
+    )
 
 
 class _User32:
@@ -39,9 +75,24 @@ class _User32:
         self.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
         return bool(self.user32.SetForegroundWindow(hwnd))
 
+    def port_open(self):
+        return _port_open()
+
+    def spawn_dashboard(self):
+        return _spawn_dashboard()
+
+    def open_browser(self):
+        return _open_browser()
+
+    def monotonic(self):
+        return time.monotonic()
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
 
 def focus_existing_adm_ui(api=None):
-    """Return a bounded result suitable for a command result record."""
+    """Focus, open, or start the Dashboard; each invocation opens at most once."""
     try:
         api = api or _User32()
         if not api.interactive():
@@ -51,6 +102,21 @@ def focus_existing_adm_ui(api=None):
                 if api.focus(hwnd):
                     return {"status": "completed", "window_title": title}
                 return {"status": "failed", "error_kind": "dashboard_focus_denied"}
-        return {"status": "failed", "error_kind": "adm_dashboard_not_running"}
+        if api.port_open():
+            api.open_browser()
+            return {"status": "completed", "window_title": "ADM Dashboard"}
+
+        try:
+            api.spawn_dashboard()
+        except Exception:
+            return {"status": "failed", "error_kind": "dashboard_start_failed"}
+
+        deadline = api.monotonic() + START_TIMEOUT_SECONDS
+        while api.monotonic() < deadline:
+            if api.port_open():
+                api.open_browser()
+                return {"status": "completed", "window_title": "ADM Dashboard"}
+            api.sleep(POLL_INTERVAL_SECONDS)
+        return {"status": "failed", "error_kind": "dashboard_start_timeout"}
     except Exception:
         return {"status": "failed", "error_kind": "desktop_unavailable"}
