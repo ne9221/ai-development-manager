@@ -17,7 +17,21 @@
     "current_state": {"type": "string"},
     "files_changed": {"type": "array", "items": {"type": "string"}},
     "commits": {"type": "array", "items": {"type": "string"}},
-    "tests": {"type": "array", "items": {"type": "string"}},
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["command", "exit_code", "output_summary", "started_at", "completed_at"],
+        "properties": {
+          "command": {"type": "string", "minLength": 1},
+          "exit_code": {"type": ["integer", "null"]},
+          "output_summary": {"type": "string"},
+          "started_at": {"type": "string", "format": "date-time"},
+          "completed_at": {"type": "string", "format": "date-time"},
+          "timed_out": {"type": "boolean"}
+        }
+      }
+    },
     "known_issues": {"type": "array", "items": {"type": "string"}},
     "do_not_touch": {"type": "array", "items": {"type": "string"}},
     "next_action": {"type": "string"},
@@ -28,6 +42,6 @@
     "push_status": {"type": ["string", "null"], "description": "\"verified\" only when an independent remote readback proved the branch was pushed and matched the local final commit exactly; null when no such evidence exists."},
     "worktree_path": {"type": ["string", "null"], "description": "The isolated worktree path the repo-write execution actually ran in; null when no such evidence exists."},
     "remote_sha": {"type": ["string", "null"], "description": "The remote branch's SHA at readback time, proven equal to the local final commit SHA; null when no such evidence exists."},
-    "tests_status": {"type": ["string", "null"], "enum": ["reported", "not_provided", null], "description": "\"reported\" only when the execution actually supplied real test_evidence; \"not_provided\" when it did not (an empty `tests` list is never itself proof tests were run); null when no repo-write evidence exists at all."}
+    "tests_status": {"type": ["string", "null"], "enum": ["passed", "failed", "not_required", null], "description": "\"passed\"/\"failed\" from ADM independently running the Task's own declared validation_command in the isolated worktree and reading its real exit code -- never a provider's self-report; \"not_required\" when the Task declared no validation_command; null when no repo-write evidence exists at all."}
   }
 }

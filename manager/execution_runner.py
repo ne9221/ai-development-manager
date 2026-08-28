@@ -338,7 +338,7 @@ def _claude_account_auth_ready(account):
 def launch_task(store, service, writer_registry, claim_registry, launcher, project_id, task_id,
                 execution_id=None, model=None, timeout_seconds=None, quota_document=None, executions=None,
                 retry_count=0, retry_of_execution_id=None, on_running=None, provider="codex",
-                account_id=None, config_dir=None, claude_accounts=None, provenance=None, test_evidence=None):
+                account_id=None, config_dir=None, claude_accounts=None, provenance=None):
     """Dispatch, reserve, and run one ready task; callers supply real authorities.
 
     `provider` names which provider this launcher belongs to (the caller
@@ -448,15 +448,14 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
                            execution_id, dispatched["generated_prompt"], request,
                            access="read_only" if task["read_only"] else "production_write",
                            baseline_head=task.get("baseline_head"), on_running=on_running, provider=provider,
-                           account_id=account_id, config_dir=config_dir, provenance=provenance,
-                           test_evidence=test_evidence)
+                           account_id=account_id, config_dir=config_dir, provenance=provenance)
     return {"execution_id": execution_id, "dispatch": dispatched, **result}
 
 
 def run_execution(store, service, writer_registry, claim_registry, launcher,
                   project_id, task_id, execution_id, prompt, launch_request: LaunchRequest,
                   access="production_write", baseline_head=None, on_running=None, provider="codex",
-                  account_id=None, config_dir=None, provenance=None, test_evidence=None):
+                  account_id=None, config_dir=None, provenance=None):
     """Run one reserved execution through the reviewed lifecycle gates.
 
     ``provider_stopped`` is derived only after prepare-owned cleanup or after
@@ -470,11 +469,12 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
     no such arguments) byte-for-byte identical to before these parameters
     existed.
 
-    ``test_evidence`` is preserved verbatim into a completed repo-write
-    execution's terminal evidence when the caller supplies it; this runner
-    has no transcript-parsing source for it today (see the "Full prompt,
-    transcript..." note above), so it defaults to None and stays an empty
-    list rather than ever being inferred from provider output.
+    A completed bounded repo-write execution's test evidence is never taken
+    from the provider's own transcript/self-report: see
+    manager.repo_write_enforcement.capture_repo_write_evidence(), called
+    below with the Task's own declared `validation_command` (from
+    `execution["task_snapshot"]`) -- this runner independently runs that
+    command itself and reads its real exit code.
     """
     gate = enter_running_gate(
         store, service, writer_registry, project_id, task_id, execution_id, provider, access,
@@ -605,9 +605,23 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
             )
             evidence = capture_repo_write_evidence(
                 snapshot["working_directory"], snapshot["baseline_head"], snapshot["branch"], files_changed,
-                test_evidence=test_evidence,
+                validation_command=snapshot.get("validation_command"),
             )
+            # Evidence (including a failed validation_command's real
+            # command/exit_code/output) is always persisted here, before any
+            # status downgrade below -- a required validation that failed is
+            # never silently discarded, and it is never conflated with the
+            # commit/push/scope failures above (those raise TaskError and
+            # skip evidence recording entirely, since there is no real
+            # evidence to record when the commit/push itself never
+            # succeeded).
             record_repo_write_evidence(store, project_id, execution_id, evidence)
+            if evidence["tests_status"] == "failed":
+                status = "failed"
+                failed_test = evidence["tests"][-1] if evidence["tests"] else {}
+                summary = (f"{provider} required validation failed: "
+                          f"{failed_test.get('command')!r} exited {failed_test.get('exit_code')}"
+                          + (" (timed out)" if failed_test.get("timed_out") else ""))
         except TaskError as exc:
             status = "failed"
             summary = f"{provider} turn rejected: {exc}"

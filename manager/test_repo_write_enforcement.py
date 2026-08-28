@@ -2,6 +2,7 @@
 """Tests for runtime allowed_paths enforcement against real git state (Slice D)."""
 
 import subprocess
+import sys
 
 import pytest
 
@@ -306,20 +307,31 @@ def test_capture_repo_write_evidence_verified_push(repo_with_origin):
     assert evidence == {
         "files_changed": ["manager/foo.py"], "commits": [final_sha], "final_commit_sha": final_sha,
         "branch": "main", "worktree_path": str(repo_with_origin["path"]), "push_status": "verified",
-        "remote_sha": final_sha, "tests": [], "tests_status": "not_provided",
+        "remote_sha": final_sha, "tests": [], "tests_status": "not_required",
     }
 
 
-def test_capture_repo_write_evidence_preserves_supplied_test_evidence(repo_with_origin):
+def test_capture_repo_write_evidence_runs_validation_command_and_records_a_pass(repo_with_origin):
+    """ADM independently runs the Task's own declared validation_command
+    itself (never a provider self-report) and records the real command,
+    exit code, and output."""
     (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
     _git(repo_with_origin["path"], "commit", "-am", "edit foo")
     _git(repo_with_origin["path"], "push", "origin", "main")
 
+    command = f'{sys.executable} -c "print(123); import sys; sys.exit(0)"'
     evidence = capture_repo_write_evidence(
         repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
-        test_evidence=["pytest manager/test_foo.py::test_x PASSED"],
+        validation_command=command,
     )
-    assert evidence["tests"] == ["pytest manager/test_foo.py::test_x PASSED"]
+    assert evidence["tests_status"] == "passed"
+    assert len(evidence["tests"]) == 1
+    result = evidence["tests"][0]
+    assert result["command"] == command
+    assert result["exit_code"] == 0
+    assert "123" in result["output_summary"]
+    assert result["timed_out"] is False
+    assert result["started_at"] and result["completed_at"]
 
 
 def test_capture_repo_write_evidence_never_fabricates_tests_when_not_supplied(repo_with_origin):
@@ -416,7 +428,10 @@ def test_capture_repo_write_evidence_fails_closed_on_uncommitted_change(repo_wit
         )
 
 
-def test_capture_repo_write_evidence_tests_status_is_not_provided_when_omitted(repo_with_origin):
+def test_capture_repo_write_evidence_tests_status_is_not_required_when_no_validation_command(repo_with_origin):
+    """A Task that declared no validation_command is never gated on tests --
+    tests_status must say so explicitly, not fall back to a value that
+    could be misread as "tests were skipped/missing"."""
     (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
     _git(repo_with_origin["path"], "commit", "-am", "edit foo")
     _git(repo_with_origin["path"], "push", "origin", "main")
@@ -424,20 +439,38 @@ def test_capture_repo_write_evidence_tests_status_is_not_provided_when_omitted(r
     evidence = capture_repo_write_evidence(
         repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
     )
-    assert evidence["tests_status"] == "not_provided"
+    assert evidence["tests_status"] == "not_required"
     assert evidence["tests"] == []
 
 
-def test_capture_repo_write_evidence_tests_status_is_reported_when_supplied(repo_with_origin):
+def test_capture_repo_write_evidence_tests_status_is_failed_on_nonzero_exit(repo_with_origin):
     (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
     _git(repo_with_origin["path"], "commit", "-am", "edit foo")
     _git(repo_with_origin["path"], "push", "origin", "main")
 
+    command = f'{sys.executable} -c "import sys; print(\'boom\'); sys.exit(1)"'
     evidence = capture_repo_write_evidence(
         repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
-        test_evidence=["pytest manager/test_foo.py::test_x PASSED"],
+        validation_command=command,
     )
-    assert evidence["tests_status"] == "reported"
+    assert evidence["tests_status"] == "failed"
+    assert evidence["tests"][0]["exit_code"] == 1
+    assert "boom" in evidence["tests"][0]["output_summary"]
+
+
+def test_capture_repo_write_evidence_tests_status_is_failed_on_timeout(repo_with_origin):
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "commit", "-am", "edit foo")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    command = f'{sys.executable} -c "import time; time.sleep(5)"'
+    evidence = capture_repo_write_evidence(
+        repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+        validation_command=command, validation_timeout_seconds=1,
+    )
+    assert evidence["tests_status"] == "failed"
+    assert evidence["tests"][0]["timed_out"] is True
+    assert evidence["tests"][0]["exit_code"] is None
 
 
 # --- Bootstrap architecture: ADM host commit/push authority ----------------

@@ -87,7 +87,7 @@ def handoff_input(reason="provider switch"):
         "handoff_id": "phase-5-codex-claude", "task_id": "phase-5", "project_id": "ai-development-manager",
         "from_provider": "codex", "to_provider": "claude", "from_session": "session-a", "reason": reason,
         "completed_work": ["Schemas implemented"], "current_state": "Tests pending", "files_changed": ["schema/task.schema.json"],
-        "commits": [], "tests": ["unit tests pending"], "known_issues": [], "do_not_touch": ["Phase 1-4.5 collectors"],
+        "commits": [], "tests": [], "known_issues": [], "do_not_touch": ["Phase 1-4.5 collectors"],
         "next_action": "Run Drive round trip", "acceptance_criteria": ["Drive round trip passes"],
         "minimal_context": "Phase 5 schemas and manager are implemented; validate Drive persistence next."
     }

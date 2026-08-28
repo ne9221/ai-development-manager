@@ -21,7 +21,8 @@
       "properties": {
         "allowed_paths": {"type": "array", "minItems": 1, "items": {"type": "string"}},
         "baseline_head": {"type": "string"},
-        "repo": {"type": "string"}
+        "repo": {"type": "string"},
+        "validation_command": {"type": "string", "minLength": 1, "maxLength": 500}
       }
     }
   },

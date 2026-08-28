@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -1199,7 +1200,7 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         fake_evidence = {
             "files_changed": ["manager/executions.py"], "commits": [HEAD], "final_commit_sha": HEAD,
             "branch": "adm-worktree/p1/t1", "worktree_path": materialized, "push_status": "verified",
-            "remote_sha": HEAD, "tests": [], "tests_status": "not_provided",
+            "remote_sha": HEAD, "tests": [], "tests_status": "not_required",
         }
         with patch("manager.execution_runner.get_global_registry") as get_registry, \
              patch("manager.execution_runner.materialize_worktree", side_effect=fake_materialize) as materialize, \
@@ -1223,7 +1224,7 @@ class WorkingDirectoryContractTests(unittest.TestCase):
         commit_and_push.assert_called_once_with(
             materialized, "refs/heads/adm-worktree/p1/t1", ["manager/executions.py"], "codex repo_write: t1/exec-a")
         capture.assert_called_once_with(
-            materialized, HEAD, "refs/heads/adm-worktree/p1/t1", ["manager/executions.py"], test_evidence=None)
+            materialized, HEAD, "refs/heads/adm-worktree/p1/t1", ["manager/executions.py"], validation_command=None)
         self.assertEqual(materialized, launcher.request.working_directory)
         self.assertNotEqual(self.valid_dir, launcher.request.working_directory)
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
@@ -1546,8 +1547,8 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         self._lock_home_patch.start()
         self.addCleanup(self._lock_home_patch.stop)
 
-    def _repo_write_task(self):
-        return {
+    def _repo_write_task(self, validation_command=None):
+        task = {
             "task_id": "t1", "project_id": "p1", "title": "Bounded write task", "task_type": "implementation",
             "complexity": "medium", "expected_minutes": 20, "needs_repo_edit": True,
             "needs_research": False, "needs_browser": False, "parallelizable": False,
@@ -1557,15 +1558,18 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
             "allowed_paths": ["manager/foo.py"],
             "execution_policies": ["disposable", "bounded_repo_write", "no_external_writes"],
         }
+        if validation_command is not None:
+            task["validation_command"] = validation_command
+        return task
 
-    def _store(self):
+    def _store(self, validation_command=None):
         store = MemoryStore()
         create_project(store, {
             "project_id": "p1", "name": "Project", "repo": REPO, "default_branch": "main",
             "runtime_ssot": "Drive", "project_rules": [], "active_tasks": ["t1"],
             "current_phase": "Phase 3C", "important_constraints": [],
         })
-        create_task(store, self._repo_write_task(), assign=False)
+        create_task(store, self._repo_write_task(validation_command=validation_command), assign=False)
         return store
 
     def _launch(self, store, launcher):
@@ -1647,6 +1651,106 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         self.assertEqual("verified", handoff["push_status"])
         self.assertEqual(str(self.worktree), handoff["worktree_path"])
         self.assertEqual(final_sha, handoff["remote_sha"])
+
+    def test_validation_command_passing_still_completes(self):
+        """(A) A Task that declares a validation_command and that command's
+        real exit code is 0: completion is allowed, and the real command's
+        evidence (not a provider self-report) is what gets persisted."""
+        class InScopeLauncher(Launcher):
+            def wait(self, running):
+                wd = self.request.working_directory
+                (Path(wd) / "manager" / "foo.py").write_text("edited\n", encoding="utf-8")
+                return super().wait(running)
+
+        command = f'{sys.executable} -c "print(\'validation ran\'); import sys; sys.exit(0)"'
+        store = self._store(validation_command=command)
+        result = self._launch(store, InScopeLauncher())
+
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+        self.assertEqual("completed", store.get("tasks", "p1", "t1")["status"])
+        evidence = result["terminal"]["execution"]["repo_write_evidence"]
+        self.assertEqual("passed", evidence["tests_status"])
+        self.assertEqual(1, len(evidence["tests"]))
+        self.assertEqual(command, evidence["tests"][0]["command"])
+        self.assertEqual(0, evidence["tests"][0]["exit_code"])
+        self.assertIn("validation ran", evidence["tests"][0]["output_summary"])
+        handoff = store.get("handoffs", "p1", "t1-completed-exec-a-0")
+        self.assertEqual("passed", handoff["tests_status"])
+        self.assertEqual(1, len(handoff["tests"]))
+
+    def test_validation_command_failing_blocks_completion_but_preserves_evidence(self):
+        """(B/C) A Task that declares a validation_command whose real exit
+        code is nonzero must never be persisted as completed -- but the
+        real command/exit_code/output evidence must still be recorded, not
+        discarded, so the failure is auditable rather than silently missing.
+        This is the exact regression the live E2E dispatch this session
+        proved was NOT enforced before this fix (tests_status:
+        "not_provided" on a "completed" execution, even though the
+        dispatched goal explicitly asked the provider to run tests first)."""
+        class InScopeLauncher(Launcher):
+            def wait(self, running):
+                wd = self.request.working_directory
+                (Path(wd) / "manager" / "foo.py").write_text("edited\n", encoding="utf-8")
+                return super().wait(running)
+
+        command = f'{sys.executable} -c "import sys; print(\'test failure\'); sys.exit(1)"'
+        store = self._store(validation_command=command)
+        result = self._launch(store, InScopeLauncher())
+
+        self.assertEqual("failed", result["terminal"]["execution"]["status"])
+        self.assertNotEqual("completed", store.get("tasks", "p1", "t1")["status"])
+        # The real commit was still made and pushed -- ADM's commit/push
+        # authority runs before validation, so a failed validation still
+        # leaves a real, inspectable branch behind; only the terminal
+        # *status* is gated, never the underlying git evidence.
+        final_sha = _git(self.worktree, "rev-parse", "HEAD")
+        self.assertNotEqual(self.baseline_head, final_sha)
+        evidence = result["terminal"]["execution"]["repo_write_evidence"]
+        self.assertEqual("failed", evidence["tests_status"])
+        self.assertEqual(1, evidence["tests"][0]["exit_code"])
+        self.assertIn("test failure", evidence["tests"][0]["output_summary"])
+        self.assertEqual("verified", evidence["push_status"])
+        handoff = store.get("handoffs", "p1", "t1-failed-exec-a-0")
+        self.assertEqual("failed", handoff["tests_status"])
+        self.assertIn("required validation failed", result["terminal"]["execution"]["notes"][-1])
+
+    def test_no_validation_command_is_never_blocked_by_test_enforcement(self):
+        """(D) A Task that declares no validation_command at all must behave
+        exactly as before this fix -- never gated on test outcome."""
+        class InScopeLauncher(Launcher):
+            def wait(self, running):
+                wd = self.request.working_directory
+                (Path(wd) / "manager" / "foo.py").write_text("edited\n", encoding="utf-8")
+                return super().wait(running)
+
+        store = self._store(validation_command=None)
+        result = self._launch(store, InScopeLauncher())
+
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+        evidence = result["terminal"]["execution"]["repo_write_evidence"]
+        self.assertEqual("not_required", evidence["tests_status"])
+        self.assertEqual([], evidence["tests"])
+
+    def test_validation_command_is_a_generalized_shell_command_not_hardcoded_to_pytest(self):
+        """(E) Nothing in the enforcement path is specific to pytest or any
+        one ecosystem -- a multi-step shell chain (as a real project's own
+        `npm test`/`node --test`/custom validation script would be) runs
+        exactly the same way."""
+        class InScopeLauncher(Launcher):
+            def wait(self, running):
+                wd = self.request.working_directory
+                (Path(wd) / "manager" / "foo.py").write_text("edited\n", encoding="utf-8")
+                return super().wait(running)
+
+        marker = f'{sys.executable} -c "print(1)"'
+        command = f'{marker} && {marker} && {marker}'
+        store = self._store(validation_command=command)
+        result = self._launch(store, InScopeLauncher())
+
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+        evidence = result["terminal"]["execution"]["repo_write_evidence"]
+        self.assertEqual("passed", evidence["tests_status"])
+        self.assertEqual(command, evidence["tests"][0]["command"])
 
     def test_no_changes_fails_closed_without_committing_or_pushing(self):
         """Bootstrap architecture P0 (Minimum Success Contract: real

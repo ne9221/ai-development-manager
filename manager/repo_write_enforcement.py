@@ -25,6 +25,22 @@ proven in-scope, ADM stages exactly those admitted paths, commits, and
 pushes the isolated feature branch using its own git credentials/network;
 `capture_repo_write_evidence` then independently reads back the real remote
 to prove that push landed, exactly as before.
+
+Test-evidence enforcement (P0, 2026-08-28): a provider's own claim to have
+run tests before committing was never verified or even captured -- a live
+E2E proved a "completed" repo-write execution could carry `tests_status:
+"not_provided"` and still be treated as durably done. `capture_repo_write_
+evidence` now runs a Task's own declared `validation_command` itself (a
+caller-supplied, project-agnostic shell command -- never hardcoded to one
+ecosystem's test runner) directly in the isolated worktree, after the real
+commit/push above, and records the real command, exit code, bounded output,
+and timestamps -- never a provider's self-report. A Task with no
+validation_command is `tests_status: "not_required"` and is never gated on
+it. A Task WITH one is never marked "completed" by manager.execution_runner
+when that command's real exit code is nonzero (or it times out) -- see that
+module's own status-downgrade logic, which reads this function's returned
+`tests_status` rather than treating any repo-write evidence as automatic
+success.
 """
 
 from __future__ import annotations
@@ -34,7 +50,7 @@ import subprocess
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from manager.remote_readback import verify_remote_branch_matches
-from manager.tasks import TaskError
+from manager.tasks import TaskError, now_iso
 from manager.trusted_ingress import REQUIRED_REPO_WRITE_TASK_POLICIES
 from manager.worktree_materializer import OWNER_MARKER_FILENAME
 
@@ -257,8 +273,60 @@ def _empty_commits(working_directory, commits: Sequence[str], runner=subprocess.
     return empty
 
 
+DEFAULT_VALIDATION_TIMEOUT_SECONDS = 600
+MAX_VALIDATION_OUTPUT_CHARS = 4000
+
+
+def _run_validation_command(working_directory, command: str, runner=subprocess.run,
+                            timeout_seconds: int = DEFAULT_VALIDATION_TIMEOUT_SECONDS) -> Dict[str, Any]:
+    """Independently run a Task's own declared validation_command in the
+    isolated worktree and capture real, bounded evidence of the outcome --
+    never a provider's self-report of having run it. Deliberately generic
+    (a plain shell command string, `shell=True`): pytest, `npm test`,
+    `node --test`, or any project-defined validation script all work the
+    same way, so this never hardcodes one ecosystem's test runner. The
+    caller treats a nonzero exit_code OR timed_out=True as failure; output
+    is combined stdout+stderr, truncated to the last
+    MAX_VALIDATION_OUTPUT_CHARS characters so a runaway or noisy test suite
+    can never bloat a persisted Drive record.
+
+    Any failure to even launch/complete the command at all -- not just a
+    timeout, but e.g. the shell interpreter itself being unavailable, a
+    permissions error, or any other OS-level failure -- is captured here as
+    exit_code=None and reported to the caller exactly like a failed run
+    (never re-raised): a validation_command that could not be proven to have
+    passed must never be silently read downstream as "no evidence" and
+    fall through to a completed status by omission."""
+    started_at = now_iso()
+    try:
+        result = runner(command, cwd=str(working_directory), shell=True, text=True,
+                        encoding="utf-8", errors="replace", capture_output=True, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or "") + (exc.stderr or "") if isinstance(exc.stdout, str) or isinstance(exc.stderr, str) else ""
+        return {
+            "command": command, "exit_code": None,
+            "output_summary": (output[-MAX_VALIDATION_OUTPUT_CHARS:] if output
+                               else f"validation_command timed out after {timeout_seconds}s"),
+            "started_at": started_at, "completed_at": now_iso(), "timed_out": True,
+        }
+    except Exception as exc:
+        return {
+            "command": command, "exit_code": None,
+            "output_summary": f"validation_command could not be run: {exc}"[-MAX_VALIDATION_OUTPUT_CHARS:],
+            "started_at": started_at, "completed_at": now_iso(), "timed_out": False,
+        }
+    output = (result.stdout or "") + (result.stderr or "")
+    return {
+        "command": command, "exit_code": result.returncode,
+        "output_summary": output[-MAX_VALIDATION_OUTPUT_CHARS:],
+        "started_at": started_at, "completed_at": now_iso(), "timed_out": False,
+    }
+
+
 def capture_repo_write_evidence(working_directory, baseline_head: str, branch: str, files_changed: Sequence[str],
-                                test_evidence: Optional[Sequence[str]] = None, runner=subprocess.run) -> Dict[str, Any]:
+                                validation_command: Optional[str] = None,
+                                validation_timeout_seconds: int = DEFAULT_VALIDATION_TIMEOUT_SECONDS,
+                                runner=subprocess.run) -> Dict[str, Any]:
     """Build real, independently-verified terminal success evidence for a
     completed repo-write execution (Global Hands-off Execution Layer, Slice
     D2): the actual changed paths (already verified in-scope by
@@ -288,13 +356,19 @@ def capture_repo_write_evidence(working_directory, baseline_head: str, branch: s
       - a push that cannot be independently verified against the real
         remote (manager.remote_readback.verify_remote_branch_matches).
 
-    `test_evidence` is preserved verbatim when the caller supplies it (e.g.
-    from a provider's structured completion report); it is never inferred or
-    fabricated when omitted. The returned `tests_status` is itself honest
-    about that distinction -- "reported" only when the caller actually
-    supplied non-empty test_evidence, "not_provided" otherwise -- so nothing
-    downstream can read an empty `tests` list as "tests were verified" by
-    omission.
+    `validation_command`, when the Task declared one, is run by THIS
+    function itself in the isolated worktree (_run_validation_command) --
+    never taken from a provider's self-report -- and the real exit code
+    (or a timeout) determines `tests_status`: "passed"/"failed". A Task
+    with no validation_command gets `tests_status: "not_required"` and
+    `tests: []`, and is never gated on test outcome at all -- this function
+    still raises on the commit/push checks above regardless of
+    validation_command, but never raises merely because a declared
+    validation failed; the caller (manager.execution_runner) is the one
+    that reads the returned tests_status and decides whether that downgrades
+    the execution's own terminal status, so the real command/exit_code/
+    output evidence is always persisted (via record_repo_write_evidence)
+    even when validation failed, never discarded by an exception.
     """
     commits = collect_commit_shas(working_directory, baseline_head, runner=runner)
     if not commits:
@@ -311,10 +385,18 @@ def capture_repo_write_evidence(working_directory, baseline_head: str, branch: s
         raise TaskError(f"repo-write execution contains empty commit(s) with no tree changes: {empty_commits}")
     branch_short = branch[len("refs/heads/"):] if branch.startswith("refs/heads/") else branch
     readback = verify_remote_branch_matches(working_directory, branch_short, final_commit_sha, runner=runner)
+    if validation_command:
+        test_result = _run_validation_command(working_directory, validation_command, runner=runner,
+                                              timeout_seconds=validation_timeout_seconds)
+        tests = [test_result]
+        tests_status = "failed" if test_result["timed_out"] or test_result["exit_code"] != 0 else "passed"
+    else:
+        tests = []
+        tests_status = "not_required"
     return {
         "files_changed": list(files_changed), "commits": commits, "final_commit_sha": final_commit_sha,
         "branch": branch_short, "worktree_path": str(working_directory),
         "push_status": "verified", "remote_sha": readback["remote_sha"],
-        "tests": list(test_evidence) if test_evidence else [],
-        "tests_status": "reported" if test_evidence else "not_provided",
+        "tests": tests,
+        "tests_status": tests_status,
     }

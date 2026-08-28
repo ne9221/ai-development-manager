@@ -271,11 +271,19 @@ def _terminal_handoff(execution, task, status, summary, timestamp):
     # evidence attached to the execution before it terminalized (see
     # manager.executions.record_repo_write_evidence / manager.
     # repo_write_enforcement.capture_repo_write_evidence) -- never
-    # recomputed here and never fabricated: a status other than "completed",
-    # or a completed execution with no such evidence attached (a read-only
-    # or legacy task), leaves every evidence field empty/null exactly as
-    # before this evidence capture existed.
-    evidence = execution.get("repo_write_evidence") if status == "completed" else None
+    # recomputed here and never fabricated. Its mere presence on `execution`
+    # is itself sufficient proof it is real: record_repo_write_evidence() is
+    # the only writer of this field, and it is only ever called with
+    # capture_repo_write_evidence()'s return value, which either raises
+    # (nothing gets recorded -- a read-only/legacy task, or a genuine
+    # commit/push failure, correctly leaves every evidence field empty/null)
+    # or is fully git/remote-verified. Since 2026-08-28 that includes a
+    # "failed" execution whose commit/push succeeded but whose declared
+    # validation_command's real exit code was nonzero -- gating this on
+    # status == "completed" would silently drop exactly the test-failure
+    # evidence (real command/exit_code/output) a handoff's "Review outcome
+    # and decide whether to resume" exists to carry forward.
+    evidence = execution.get("repo_write_evidence")
     handoff = {
         # A retry reuses the same execution_id as the attempt it retries (see
         # reserve_execution), so retry_count must be part of this id or two
@@ -302,10 +310,14 @@ def _terminal_handoff(execution, task, status, summary, timestamp):
         "push_status": evidence["push_status"] if evidence else None,
         "worktree_path": evidence["worktree_path"] if evidence else None,
         "remote_sha": evidence["remote_sha"] if evidence else None,
-        # Honest test-evidence status (P0-C): "reported" only when the
-        # execution actually supplied test_evidence to capture_repo_write_
-        # evidence(); an empty `tests` list must never be read downstream as
-        # "tests were run and verified" by omission alone.
+        # Honest test-evidence status (P0-C, hardened 2026-08-28): "passed"/
+        # "failed" only from ADM independently running the Task's own
+        # declared validation_command in the isolated worktree and reading
+        # its real exit code -- never a provider's self-report; "not_required"
+        # when the Task declared no validation_command. An empty `tests` list
+        # must never be read downstream as "tests were run and verified" by
+        # omission alone -- see manager.repo_write_enforcement.capture_repo_
+        # write_evidence().
         "tests_status": evidence["tests_status"] if evidence else None,
     }
     if status == "completed":

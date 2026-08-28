@@ -108,9 +108,17 @@ MAX_GOAL_LENGTH = 4000
 # name *what* the caller wants touched, not grant itself write policies
 # directly (ALLOWED_REPO_WRITE_FIELDS makes it impossible to smuggle any
 # other field in).
-ALLOWED_REPO_WRITE_FIELDS = {"allowed_paths", "baseline_head", "repo"}
+REQUIRED_REPO_WRITE_FIELDS = {"allowed_paths", "baseline_head", "repo"}
+# validation_command is the one optional repo_write field: a caller-declared,
+# project-agnostic shell command (never hardcoded to pytest/npm/etc.) that
+# manager.repo_write_enforcement.capture_repo_write_evidence() independently
+# runs itself in the isolated worktree once the commit lands -- see that
+# module's docstring for why nothing here ever trusts a provider's own
+# self-report of having run tests.
+ALLOWED_REPO_WRITE_FIELDS = REQUIRED_REPO_WRITE_FIELDS | {"validation_command"}
 MAX_ALLOWED_PATH_ENTRIES = 100
 MAX_ALLOWED_PATH_LENGTH = 300
+MAX_VALIDATION_COMMAND_LENGTH = 500
 # repo-relative POSIX-style path segments only: letters/digits/._- and `/`
 # as separator. No leading `/`, no `\`, no drive letter, no glob metachar
 # (`*?[]`), no `..`/`.` segment, no `.git` segment -- this pattern already
@@ -195,9 +203,12 @@ def _validate_repo_write_request(value):
     cleaned form. This only validates shape/safety of what the caller
     named; handle_dispatch() separately cross-checks `repo` against the
     Project's own registered repo before trusting it as identity evidence."""
-    if not isinstance(value, dict) or set(value) != ALLOWED_REPO_WRITE_FIELDS:
+    if (not isinstance(value, dict) or not set(value) <= ALLOWED_REPO_WRITE_FIELDS
+            or not REQUIRED_REPO_WRITE_FIELDS <= set(value)):
         raise DispatchIngressError(
-            "malformed_repo_write", f"repo_write must be an object containing exactly {sorted(ALLOWED_REPO_WRITE_FIELDS)}")
+            "malformed_repo_write",
+            f"repo_write must be an object containing {sorted(REQUIRED_REPO_WRITE_FIELDS)} "
+            f"and optionally {sorted(ALLOWED_REPO_WRITE_FIELDS - REQUIRED_REPO_WRITE_FIELDS)}")
     allowed_paths = value.get("allowed_paths")
     if not isinstance(allowed_paths, list) or not allowed_paths:
         raise DispatchIngressError("empty_allowed_paths", "repo_write.allowed_paths must be a non-empty list of repo-relative paths")
@@ -215,7 +226,16 @@ def _validate_repo_write_request(value):
     repo = value.get("repo")
     if not isinstance(repo, str) or not repo.strip() or not REPO_IDENTITY_PATTERN.match(repo):
         raise DispatchIngressError("missing_repo_identity", "repo_write.repo must be a non-empty repo identity string")
-    return {"allowed_paths": list(allowed_paths), "baseline_head": baseline_head, "repo": repo}
+    cleaned = {"allowed_paths": list(allowed_paths), "baseline_head": baseline_head, "repo": repo}
+    if "validation_command" in value:
+        validation_command = value.get("validation_command")
+        if (not isinstance(validation_command, str) or not validation_command.strip()
+                or len(validation_command) > MAX_VALIDATION_COMMAND_LENGTH):
+            raise DispatchIngressError(
+                "invalid_validation_command",
+                f"repo_write.validation_command must be a non-empty string of at most {MAX_VALIDATION_COMMAND_LENGTH} characters")
+        cleaned["validation_command"] = validation_command.strip()
+    return cleaned
 
 
 def validate_dispatch_payload(payload):
@@ -416,16 +436,17 @@ def _mark_retry_failure(registry, project_id, request_id, generation, reason):
 def _repo_write_replay_matches(task, requested_repo_write):
     """Same request_id, resubmitted with a repo_write shape: this must be a
     pure idempotent replay of the *original* contract, never a channel to
-    widen (or otherwise change) allowed_paths/baseline_head/repo, and never
-    a way to escalate a request_id originally admitted read-only into a
-    write one. Any difference at all -- not just a widening -- fails
-    closed, since a request_id is only ever supposed to name one fixed
-    request."""
+    widen (or otherwise change) allowed_paths/baseline_head/repo/
+    validation_command, and never a way to escalate a request_id originally
+    admitted read-only into a write one. Any difference at all -- not just a
+    widening -- fails closed, since a request_id is only ever supposed to
+    name one fixed request."""
     if task.get("read_only") is not False:
         return False
     return (sorted(task.get("allowed_paths") or []) == sorted(requested_repo_write["allowed_paths"])
             and task.get("baseline_head") == requested_repo_write["baseline_head"]
-            and (task.get("source_context") or {}).get("repo") == requested_repo_write["repo"])
+            and (task.get("source_context") or {}).get("repo") == requested_repo_write["repo"]
+            and task.get("validation_command") == requested_repo_write.get("validation_command"))
 
 
 def _resolve_existing_claim(store, project_id, request_id, claim, clean=None):
@@ -744,7 +765,9 @@ def handle_dispatch(store, service, lock_registry_factory, payload, request_crea
         # (task_policy_satisfied for v1, repo_write_policy_satisfied for
         # v2-repo-write) the Command Watcher re-checks independently before
         # ever launching it. v2-repo-write additionally stamps allowed_paths/
-        # baseline_head -- the Task's own bounded-write evidence.
+        # baseline_head/validation_command -- the Task's own bounded-write
+        # evidence (validation_command is optional and stays None when the
+        # caller did not declare one).
         if is_repo_write:
             # working_directory=None here is deliberate and load-bearing: dispatcher_
             # dispatch() above already snapshotted *some* working_directory onto
@@ -759,7 +782,8 @@ def handle_dispatch(store, service, lock_registry_factory, payload, request_crea
             # isolation_policy (worktree_per_task).
             update_task(store, project_id, task_id, clear=("working_directory",), priority=clean["priority"],
                         read_only=False, execution_policies=sorted(REQUIRED_REPO_WRITE_TASK_POLICIES),
-                        allowed_paths=clean["repo_write"]["allowed_paths"], baseline_head=clean["repo_write"]["baseline_head"])
+                        allowed_paths=clean["repo_write"]["allowed_paths"], baseline_head=clean["repo_write"]["baseline_head"],
+                        validation_command=clean["repo_write"].get("validation_command"))
         else:
             update_task(store, project_id, task_id, priority=clean["priority"],
                         read_only=True, execution_policies=sorted(REQUIRED_TASK_POLICIES))

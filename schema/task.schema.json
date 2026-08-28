@@ -25,6 +25,7 @@
     "baseline_head": {"type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
     "worktree_id": {"type": ["string", "null"]},
     "allowed_paths": {"type": "array", "items": {"type": "string"}},
+    "validation_command": {"type": ["string", "null"], "minLength": 1, "maxLength": 500, "description": "Caller-declared, project-agnostic shell command (pytest, npm test, node --test, a custom script -- never hardcoded to one ecosystem) that a v2-repo-write execution's completion gate independently runs itself, in the isolated worktree, after commit -- never trusting a provider's self-report. null means no validation was requested for this Task; that Task's completion is never gated on tests_status."},
     "read_only": {"type": "boolean"},
     "preferred_provider": {"type": ["string", "null"]},
     "excluded_provider": {"type": ["string", "null"]},

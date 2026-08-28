@@ -151,12 +151,26 @@
             "worktree_path": {"type": "string", "minLength": 1},
             "push_status": {"const": "verified"},
             "remote_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-            "tests": {"type": "array", "items": {"type": "string"}},
-            "tests_status": {"enum": ["reported", "not_provided"]}
+            "tests": {
+              "type": "array",
+              "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["command", "exit_code", "output_summary", "started_at", "completed_at"],
+                "properties": {
+                  "command": {"type": "string", "minLength": 1},
+                  "exit_code": {"type": ["integer", "null"]},
+                  "output_summary": {"type": "string"},
+                  "started_at": {"type": "string", "format": "date-time"},
+                  "completed_at": {"type": "string", "format": "date-time"},
+                  "timed_out": {"type": "boolean"}
+                }
+              }
+            },
+            "tests_status": {"enum": ["passed", "failed", "not_required"]}
           }
         }
       ],
-      "description": "Real, independently git-verified repo-write terminal success evidence (Global Hands-off Execution Layer, Slice D2); only ever set on a completed bounded repo-write execution whose push was proven equal to the remote by direct query, never fabricated."
+      "description": "Real, independently git-verified repo-write terminal success evidence (Global Hands-off Execution Layer, Slice D2); only ever set on a completed bounded repo-write execution whose push was proven equal to the remote by direct query, never fabricated. `tests`/`tests_status` are likewise never a provider's self-report -- when the Task declares a validation_command, ADM runs it itself in the isolated worktree and records the real command, exit_code, bounded output, and timestamps; `tests_status` is \"not_required\" only when the Task declared no validation_command at all, \"passed\"/\"failed\" from the real exit code (a timeout counts as failed) otherwise -- never inferred from provider narration."
     },
     "notes": {"type": "array", "items": {"type": "string"}},
     "task_snapshot": {"type": "object"}
