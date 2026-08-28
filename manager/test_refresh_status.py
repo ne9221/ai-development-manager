@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -10,7 +11,8 @@ from manager import refresh_status
 from manager.refresh_status import RefreshError, refresh, runtime_lock
 
 
-def provider(name, windows=None, updated="2026-08-09T00:00:00Z"):
+def provider(name, windows=None, updated=None):
+    updated = updated or datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     return {
         "provider": name,
         "display_name": name.title(),
@@ -47,7 +49,7 @@ class RefreshTests(unittest.TestCase):
             service=object(), runtime_path=self.base / "status.json", log_path=self.base / "refresh.log",
             lock_path=self.base / "refresh.lock", claude_path=self.base / "missing.json",
             reader=lambda **_: deepcopy(old),
-            codex_collector=lambda **_: ({}, {"providers": [provider("codex", new_window, "2026-08-09T01:00:00Z")]}),
+            codex_collector=lambda **_: ({}, {"providers": [provider("codex", new_window)]}),
             publisher=lambda service, path: published.append(json.loads(path.read_text())) or {"action": "updated", "id": "1"},
         )
         defaults.update(overrides)
