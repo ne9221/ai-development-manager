@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import patch
 
-from manager.open_existing_adm_ui import focus_existing_adm_ui
+from manager.open_existing_adm_ui import DASHBOARD_LAUNCHER, DASHBOARD_PORT, _spawn_dashboard, focus_existing_adm_ui
 
 
 class FakeApi:
@@ -37,11 +38,18 @@ class OpenExistingAdmUiTests(unittest.TestCase):
         self.assertEqual(0, api.spawned)
         self.assertEqual(1, api.opened)
 
-    def test_starts_service_then_opens_browser(self):
+    def test_starts_service_but_never_opens_a_second_browser_tab(self):
+        """P0 regression: desktop/Start-Dashboard.ps1 runs Streamlit with
+        --server.headless false, which makes Streamlit's OWN startup
+        sequence open a browser tab once it is ready. Calling
+        api.open_browser() again here would open a second tab for a cold
+        start, violating the "never more than one new browser window"
+        contract -- this state must spawn and wait for the port, but never
+        call open_browser() itself."""
         api = FakeApi(ports=(False, False, True))
         self.assertEqual("completed", focus_existing_adm_ui(api)["status"])
         self.assertEqual(1, api.spawned)
-        self.assertEqual(1, api.opened)
+        self.assertEqual(0, api.opened)
 
     def test_fails_closed_when_service_never_becomes_reachable(self):
         api = FakeApi(ports=(False,))
@@ -52,6 +60,35 @@ class OpenExistingAdmUiTests(unittest.TestCase):
     def test_fails_closed_when_focus_is_denied(self):
         api = FakeApi(windows=((7, "ADM Unified Operations Dashboard"),), focused=False)
         self.assertEqual("dashboard_focus_denied", focus_existing_adm_ui(api)["error_kind"])
+
+
+class SpawnDashboardArgsTests(unittest.TestCase):
+    """P0 regression: the real _spawn_dashboard() PowerShell argument list is
+    never exercised by FakeApi-based tests above (they inject a fake
+    spawn_dashboard() entirely) -- a real invalid-flag typo here
+    (-Non-Interactive instead of -NonInteractive) would make powershell.exe
+    itself fail immediately, before ever reaching Start-Dashboard.ps1, and
+    every FakeApi test would still report "completed" regardless, since
+    they never build or run the real argument list at all. Verified live on
+    this machine: `powershell.exe -Non-Interactive ...` errors with "term
+    not recognized" and never runs the target script."""
+
+    def test_spawn_uses_valid_powershell_flags_and_launcher_path(self):
+        with patch("manager.open_existing_adm_ui.subprocess.Popen") as popen:
+            _spawn_dashboard()
+        args = popen.call_args.args[0]
+        self.assertEqual("powershell.exe", args[0])
+        # Every flag must be one PowerShell actually recognizes -- no
+        # extra/misplaced hyphens.
+        self.assertIn("-NoProfile", args)
+        self.assertIn("-NonInteractive", args)
+        self.assertNotIn("-Non-Interactive", args)
+        self.assertIn("-ExecutionPolicy", args)
+        self.assertIn("Bypass", args)
+        self.assertIn("-File", args)
+        self.assertIn(str(DASHBOARD_LAUNCHER), args)
+        self.assertIn("-Port", args)
+        self.assertIn(str(DASHBOARD_PORT), args)
 
 
 if __name__ == "__main__": unittest.main()

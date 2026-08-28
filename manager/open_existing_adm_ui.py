@@ -37,7 +37,7 @@ def _spawn_dashboard():
     if os.name == "nt":
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     return subprocess.Popen(
-        ["powershell.exe", "-NoProfile", "-Non-Interactive", "-ExecutionPolicy", "Bypass",
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
          "-File", str(DASHBOARD_LAUNCHER), "-Port", str(DASHBOARD_PORT)],
         creationflags=flags, close_fds=True,
     )
@@ -111,10 +111,16 @@ def focus_existing_adm_ui(api=None):
         except Exception:
             return {"status": "failed", "error_kind": "dashboard_start_failed"}
 
+        # desktop/Start-Dashboard.ps1 runs Streamlit with --server.headless
+        # false, which makes Streamlit's own startup sequence open a browser
+        # tab itself once it is ready -- calling api.open_browser() here too
+        # would open a SECOND tab for a genuine cold start, violating the
+        # "never more than one new browser window per invocation" contract.
+        # Only the already-running-service branch above (state 2) needs an
+        # explicit open, since nothing else is about to open one for it.
         deadline = api.monotonic() + START_TIMEOUT_SECONDS
         while api.monotonic() < deadline:
             if api.port_open():
-                api.open_browser()
                 return {"status": "completed", "window_title": "ADM Dashboard"}
             api.sleep(POLL_INTERVAL_SECONDS)
         return {"status": "failed", "error_kind": "dashboard_start_timeout"}
