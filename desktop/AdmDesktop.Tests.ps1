@@ -41,7 +41,7 @@ function New-RealHiddenWatcherVbs([string]$Repo) {
     # generated wrapper shape, not a hand-rolled stand-in.
     . (Join-Path $here "..\manager\AdmHiddenLaunch.ps1")
     $runner = Join-Path $Repo "manager\run_command_watcher.ps1"
-    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"python.exe`" -RepositoryPath `"$Repo`" -ManagerHome `"$AdmManagerHome`" -CodexBin `"codex.exe`" -CodexHome `"codex-home`" -PythonDeps `"python-deps`" -AllowlistPath `"allowlist`" -GcsBucket `"bucket`" -GcsObject `"object`" -IngressFolderId `"folder`" -IngressOwner `"owner`" -ClaudeAccountsConfig `"accounts.json`" -WorkspaceRoot `"workspace-root`""
+    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -PythonPath `"python.exe`" -RepositoryPath `"$Repo`" -ManagerHome `"$AdmManagerHome`" -CodexBin `"codex.exe`" -CodexHome `"codex-home`" -PythonDeps `"python-deps`" -AllowlistPath `"allowlist`" -GcsBucket `"bucket`" -GcsObject `"object`" -IngressFolderId `"folder`" -IngressOwner `"owner`" -EmbeddedIngress `"0`" -ClaudeAccountsConfig `"accounts.json`" -WorkspaceRoot `"workspace-root`""
     $action = New-AdmHiddenScheduledTaskAction -RepositoryPath $Repo -WrapperName "command-watcher" -PowerShellArguments $arguments
     return $action.Arguments.Trim('"')
 }

@@ -179,8 +179,8 @@ function Test-AdmWatcherPowerShellCommandLine {
         ' -PythonPath ' + $quotedValue + ' -RepositoryPath ' + $repositoryValue + ' -ManagerHome ' + $managerHomeValue +
         ' -CodexBin ' + $quotedValue + ' -CodexHome ' + $quotedValue + ' -PythonDeps ' + $quotedValue +
         ' -AllowlistPath ' + $quotedValue + ' -GcsBucket ' + $quotedValue + ' -GcsObject ' + $quotedValue +
-        ' -IngressFolderId ' + $quotedValue + ' -IngressOwner ' + $quotedValue + ' -ClaudeAccountsConfig ' + $quotedValue +
-        ' -WorkspaceRoot ' + $quotedValue + '\z'
+        ' -IngressFolderId ' + $quotedValue + ' -IngressOwner ' + $quotedValue + ' -EmbeddedIngress ' + $quotedValue +
+        ' -ClaudeAccountsConfig ' + $quotedValue + ' -WorkspaceRoot ' + $quotedValue + '\z'
     return $CommandLine -cmatch $pattern
 }
 
