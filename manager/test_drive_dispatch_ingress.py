@@ -326,6 +326,42 @@ class DriveDispatchIngressTests(unittest.TestCase):
             rejection_by_request_registry_factory=lambda *a, **k: by_request_registry)
         by_request_registry.read_if_exists.assert_not_called()
 
+    def test_malformed_json_is_still_mirrored_by_request_id_alone_via_filename(self):
+        """The live incident this closes: request_id (recovered from the
+        Drive filename, which the ingress contract already requires to
+        equal f"{request_id}.json") IS safe to mirror even when project_id
+        is not -- unlike the by-request mirror above (which needs BOTH and
+        is correctly never invoked here), so a caller holding only
+        request_id can still discover this rejection instead of it looking
+        identical to "never received"."""
+        service = Service(b"{broken")
+        id_only_registry = MemoryClaimRegistry()
+        result = poll_drive_dispatch_requests(
+            object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+            rejection_registry_factory=lambda _bucket, _file_id: MemoryClaimRegistry(),
+            rejection_by_request_id_only_registry_factory=lambda _bucket, _request_id: id_only_registry)
+        self.assertFalse(result[0]["accepted"])
+        self.assertIsNotNone(id_only_registry.document)
+        self.assertEqual("rejected", id_only_registry.document["status"])
+        self.assertEqual("drive-e2e-1", id_only_registry.document["request_id"])
+        self.assertEqual("request-file", id_only_registry.document["file_id"])
+
+    def test_richer_by_request_mirror_suppresses_the_id_only_one(self):
+        """Once request_id AND project_id are both recoverable (the common
+        case -- a document that parses but fails a later check), only the
+        richer (project_id, request_id)-keyed mirror is written; the
+        id-only mirror's factory must never even be invoked."""
+        document = request(preferred_provider="gemini")
+        service = Service(document)
+        id_only_registry = Mock()
+        result = poll_drive_dispatch_requests(
+            object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+            rejection_registry_factory=lambda _bucket, _file_id: MemoryClaimRegistry(),
+            rejection_by_request_registry_factory=lambda *a, **k: MemoryClaimRegistry(),
+            rejection_by_request_id_only_registry_factory=lambda *a, **k: id_only_registry)
+        self.assertFalse(result[0]["accepted"])
+        id_only_registry.read_if_exists.assert_not_called()
+
     def test_malformed_request_rejection_recording_is_idempotent_across_polls(self):
         """The same still-malformed file, re-scanned across separate polls
         (it is never trashed/archived -- see poll_drive_dispatch_requests's

@@ -543,6 +543,102 @@ def read_dispatch_rejection_status_by_request(registry, project_id, request_id):
             "created_at": document["created_at"], "file_id": document.get("file_id"), "generation": generation}
 
 
+def dispatch_rejection_by_request_id_only_object_name(request_id):
+    """Canonical object key for a rejection so early (unreadable bytes, not
+    valid UTF-8, not valid JSON) that no document body was ever parsed --
+    project_id lives only inside that body, so it is never recoverable at
+    this stage, unlike request_id (recovered from the Drive filename, which
+    every ingress source's own contract already requires to equal
+    f"{request_id}.json" -- see annotate_partial_identity_from_filename()).
+    A SEPARATE namespace from dispatch_rejection_by_request_object_name()
+    (which is keyed by (project_id, request_id) and requires both): this
+    one is keyed by request_id alone, precisely for the case that mirror
+    cannot cover."""
+    return f"dispatch-rejections-by-request-id/{safe_id(request_id)}.json"
+
+
+def dispatch_rejection_by_request_id_only_registry(bucket, request_id, session=None):
+    return GCSLockRegistry(bucket, dispatch_rejection_by_request_id_only_object_name(request_id), session=session)
+
+
+def _validate_rejection_by_request_id_only_record(document, request_id):
+    if (not isinstance(document, dict)
+            or document.get("schema_version") != DISPATCH_REJECTION_SCHEMA_VERSION
+            or document.get("status") != "rejected"):
+        raise TaskError("malformed dispatch rejection-by-request-id record")
+    if document.get("request_id") != request_id:
+        raise TaskError("malformed dispatch rejection-by-request-id record: identity does not match the lookup key")
+    if not isinstance(document.get("reason_code"), str) or not document["reason_code"].strip():
+        raise TaskError("malformed dispatch rejection-by-request-id record: missing reason_code")
+    if not isinstance(document.get("created_at"), str) or not document["created_at"].strip():
+        raise TaskError("malformed dispatch rejection-by-request-id record: missing created_at")
+    message = document.get("message")
+    if message is not None and not isinstance(message, str):
+        raise TaskError("malformed dispatch rejection-by-request-id record: message must be a string or null")
+    return document
+
+
+def record_dispatch_rejection_by_request_id_only(registry, request_id, file_id, reason_code, message, created_at):
+    """Best-effort mirror of record_dispatch_rejection_by_request(), for a
+    failure too early to have recovered project_id at all. Same idempotent/
+    best-effort/never-masks-the-real-outcome contract as every other
+    rejection recorder in this module."""
+    if not isinstance(reason_code, str) or not reason_code.strip():
+        raise TaskError("record_dispatch_rejection_by_request_id_only requires a non-empty reason_code")
+    document = {
+        "schema_version": DISPATCH_REJECTION_SCHEMA_VERSION, "request_id": request_id,
+        "file_id": file_id, "status": "rejected", "reason_code": reason_code,
+        "message": (message[:MAX_REJECTION_MESSAGE_LENGTH] if isinstance(message, str) else None),
+        "created_at": created_at,
+    }
+    try:
+        existing = registry.read_if_exists()
+    except Exception:
+        return None
+    try:
+        if existing is None:
+            registry.create_if_absent(document)
+        else:
+            _, generation, _ = existing
+            registry.compare_and_swap(generation, document)
+    except Exception:
+        return None
+    return document
+
+
+def read_dispatch_rejection_status_by_request_id_only(registry, request_id):
+    """Best-effort read of one request_id's (project_id-unknown) rejection
+    truth -- see record_dispatch_rejection_by_request_id_only(). Returns
+    None when no such record exists, matching every other reader here."""
+    existing = registry.read_if_exists()
+    if existing is None:
+        return None
+    document, generation, _ = existing
+    document = _validate_rejection_by_request_id_only_record(document, request_id)
+    return {"status": "rejected", "reason_code": document["reason_code"], "message": document["message"],
+            "created_at": document["created_at"], "file_id": document.get("file_id"), "generation": generation}
+
+
+def annotate_partial_identity_from_filename(exc, metadata):
+    """Best-effort request_id recovery for a failure so early (unreadable
+    bytes, not valid UTF-8, not valid JSON) that no document was ever
+    parsed to read request_id from via annotate_partial_identity(). Every
+    ingress source's own contract already requires the Drive filename to
+    equal f"{request_id}.json" once a document DOES parse (checked in
+    read_request()) -- this reuses that same contract as the only signal
+    available before parsing. `metadata` here is Drive's own file
+    metadata, already verified as provenance-legitimate (correct owner,
+    folder, non-trashed, JSON mimetype) by the time this is called -- never
+    the request body itself, which is exactly what failed to parse. Sets
+    `.partial_request_id_unscoped` (never `.partial_project_id` -- that
+    lives only inside the unparseable body). Returns `exc` for call-site
+    chaining, matching annotate_partial_identity()'s own contract."""
+    name = metadata.get("name") if isinstance(metadata, dict) else None
+    candidate = name[:-len(".json")] if isinstance(name, str) and name.endswith(".json") and len(name) > 5 else None
+    exc.partial_request_id_unscoped = candidate if candidate and candidate.strip() else None
+    return exc
+
+
 def read_dispatch_request_status(registry, project_id, request_id):
     """Best-effort read of one request_id's current durable claim-record
     truth -- status/failure_reason/task_id/command_id/created_at -- for any
@@ -569,7 +665,8 @@ def read_dispatch_request_status(registry, project_id, request_id):
 
 
 def resolve_dispatch_status_for_request(store, registry, project_id, request_id, bucket=None,
-                                        rejection_registry_factory=dispatch_rejection_by_request_registry):
+                                        rejection_registry_factory=dispatch_rejection_by_request_registry,
+                                        rejection_id_only_registry_factory=dispatch_rejection_by_request_id_only_registry):
     """Canonical status resolution for one ingress request_id -- Task/
     Command truth when a Task already exists, otherwise the durable ingress-
     acceptance claim record's own truth. This is the single query surface
@@ -631,6 +728,17 @@ def resolve_dispatch_status_for_request(store, registry, project_id, request_id,
         try:
             rejection_registry = rejection_registry_factory(bucket, project_id, request_id)
             status = read_dispatch_rejection_status_by_request(rejection_registry, project_id, request_id)
+        except TaskError:
+            read_failed = True
+    # Final fallback: a rejection so early (unreadable bytes, not valid
+    # UTF-8, not valid JSON) that project_id was never recoverable at all
+    # -- see annotate_partial_identity_from_filename()'s docstring. Only
+    # reached when every richer signal above found nothing, so this can
+    # never mask a real Task/claim/project-scoped-rejection truth.
+    if status is None and not read_failed and bucket:
+        try:
+            id_only_registry = rejection_id_only_registry_factory(bucket, request_id)
+            status = read_dispatch_rejection_status_by_request_id_only(id_only_registry, request_id)
         except TaskError:
             read_failed = True
     return {"task": None, "command": None, "task_id": task_id, "command_id": command_id,

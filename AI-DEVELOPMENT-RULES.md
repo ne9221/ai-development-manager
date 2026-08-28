@@ -1,7 +1,7 @@
 # AI Development Rules
 
-version: 0.1.4
-last_updated: 2026-08-19
+version: 0.1.5
+last_updated: 2026-08-29
 
 Single source of truth for cross-project AI-development rules. This document
 governs how AI coding tools (ChatGPT, Claude Code, Codex, Antigravity,
@@ -99,6 +99,26 @@ is not described as enforcement.
     whose prompt is missing one. See the Rule Enforcement Matrix in
     `README.md` for exactly which rules are Enforced (code + test) versus
     Documented-only.
+18. The canonical production checkout (the physical directory the live
+    Scheduled Tasks actually run from -- `manager.production_guard`'s
+    production marker lives inside it, keyed to that exact path) must never
+    be used as a development workspace. Any AI editing ADM's own source
+    must clone/branch into an isolated worktree or scratch clone, make and
+    test changes there, and only commit + `manager.provenance
+    capture-tested`/`activate` back onto the canonical checkout as one
+    atomic, already-tested step -- never mid-edit. This is not merely a
+    convenience convention: `manager.provenance.verify_running()` requires
+    a CLEAN working tree (`is_checkout_clean()`) on every single tick of
+    every Scheduled Task (Command Watcher, Drive/GitHub Dispatch Ingress,
+    Session Center Supervisor), fail-closed. A dirty canonical checkout --
+    even from legitimate, in-progress, well-intentioned work -- stops the
+    entire live runtime from processing anything for as long as it stays
+    dirty, with no new scheduler-invocation evidence produced meanwhile
+    (live-observed and independently confirmed twice: by this session and
+    by a separate parallel session, both editing the canonical checkout
+    directly during the same incident this rule closes). Partial/WIP
+    changes belong in the isolated clone/branch until they are ready to
+    land as a whole, tested commit.
 
 ## Changelog
 
@@ -114,3 +134,8 @@ is not described as enforcement.
 - 0.1.4 (2026-08-19): Distinguished documented policy from mechanical
   enforcement and linked the canonical mandatory-rule source and dispatch /
   completion gates.
+- 0.1.5 (2026-08-29): Added rule 18: the canonical production checkout must
+  never be a development workspace, after a live incident where in-place
+  edits there (from two separate concurrent AI sessions) left it dirty and
+  fail-closed the entire runtime via manager.provenance's own clean-tree
+  requirement.

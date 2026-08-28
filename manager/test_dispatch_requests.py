@@ -7,10 +7,12 @@ import unittest
 from unittest.mock import MagicMock
 
 from manager.dispatch_requests import (
-    DEFAULT_RECENT_REQUEST_LIST_LIMIT, DispatchRequestClaimConflict, claim_dispatch_request,
-    dispatch_request_object_name, list_recent_dispatch_request_ids, list_recent_dispatch_rejected_request_ids,
-    mark_dispatch_request_status, read_dispatch_request_status, read_dispatch_rejection_status_by_request,
-    record_dispatch_rejection_by_request, release_dispatch_request_claim, resolve_dispatch_status_for_request,
+    DEFAULT_RECENT_REQUEST_LIST_LIMIT, DispatchRequestClaimConflict, annotate_partial_identity_from_filename,
+    claim_dispatch_request, dispatch_request_object_name, list_recent_dispatch_request_ids,
+    list_recent_dispatch_rejected_request_ids, mark_dispatch_request_status, read_dispatch_request_status,
+    read_dispatch_rejection_status_by_request, read_dispatch_rejection_status_by_request_id_only,
+    record_dispatch_rejection_by_request, record_dispatch_rejection_by_request_id_only,
+    release_dispatch_request_claim, resolve_dispatch_status_for_request,
 )
 from manager.tasks import DriveRecords, TaskError, create_project
 from manager.test_task_claims import AmbiguousThenUnreadableRegistry, MemoryClaimRegistry
@@ -539,6 +541,118 @@ class DispatchRejectionByRequestTests(unittest.TestCase):
             rejection_registry_factory=lambda bucket, project_id, request_id: rejection_registry)
         self.assertEqual("accepted", resolved["dispatch_request_status"]["status"])
         rejection_registry.read_if_exists.assert_not_called()
+
+
+class AnnotatePartialIdentityFromFilenameTests(unittest.TestCase):
+    """P0 fix: a failure BEFORE any document body ever parses (unreadable
+    bytes, not valid UTF-8, not valid JSON -- the real live incident: a
+    UTF-8 BOM-prefixed ChatGPT upload) previously left annotate_partial_
+    identity() with nothing to read request_id/project_id from at all, so
+    the rejection was only ever discoverable via this Drive file's own id
+    -- indistinguishable from "never received" to any caller (the normal
+    case) holding only request_id. Drive's OWN filename==request_id.json
+    contract (already enforced once a document DOES parse) is the only
+    identity signal available this early."""
+
+    def test_recovers_request_id_from_conforming_filename(self):
+        exc = TaskError("Drive request is not valid UTF-8 JSON")
+        annotate_partial_identity_from_filename(exc, {"name": "adm-p0-immediate-dispatch-wakeup-20260829.json"})
+        self.assertEqual("adm-p0-immediate-dispatch-wakeup-20260829", exc.partial_request_id_unscoped)
+
+    def test_non_json_filename_recovers_nothing(self):
+        exc = TaskError("x")
+        annotate_partial_identity_from_filename(exc, {"name": "not-a-json-file.txt"})
+        self.assertIsNone(exc.partial_request_id_unscoped)
+
+    def test_missing_or_malformed_metadata_recovers_nothing(self):
+        for metadata in (None, {}, {"name": None}, {"name": ""}, {"name": ".json"}):
+            with self.subTest(metadata=metadata):
+                exc = TaskError("x")
+                annotate_partial_identity_from_filename(exc, metadata)
+                self.assertIsNone(exc.partial_request_id_unscoped)
+
+    def test_returns_the_same_exception_for_call_site_chaining(self):
+        exc = TaskError("x")
+        self.assertIs(exc, annotate_partial_identity_from_filename(exc, {"name": "r.json"}))
+
+
+class DispatchRejectionByRequestIdOnlyTests(unittest.TestCase):
+    """The live incident this closes: 3 real ChatGPT-submitted Drive
+    requests carried a UTF-8 BOM, decoded successfully (harmlessly, as a
+    literal U+FEFF) but failed json.loads() before request_id/project_id
+    were ever parseable -- so even though the BOM decode bug is now fixed
+    separately, ANY future truly-malformed-JSON submission would still be
+    invisible to a request_id-only query without this mirror."""
+
+    def _project_store(self):
+        store = DriveRecords(FakeDriveService())
+        create_project(store, {"project_id": "p1", "name": "P1", "repo": "r", "default_branch": "main",
+                               "runtime_ssot": "Drive", "project_rules": [], "active_tasks": [],
+                               "current_phase": "Phase 1", "important_constraints": []})
+        return store
+
+    def test_record_and_read_round_trip(self):
+        registry = MemoryClaimRegistry()
+        record_dispatch_rejection_by_request_id_only(
+            registry, "adm-p0-immediate-dispatch-wakeup-20260829", "drive-file-abc", "ingress_rejected",
+            "Drive request is not valid UTF-8 JSON", "2026-08-28T20:43:50Z")
+        status = read_dispatch_rejection_status_by_request_id_only(registry, "adm-p0-immediate-dispatch-wakeup-20260829")
+        self.assertEqual("rejected", status["status"])
+        self.assertEqual("ingress_rejected", status["reason_code"])
+        self.assertIn("not valid UTF-8", status["message"])
+        self.assertEqual("drive-file-abc", status["file_id"])
+
+    def test_read_returns_none_when_never_rejected(self):
+        registry = MemoryClaimRegistry()
+        self.assertIsNone(read_dispatch_rejection_status_by_request_id_only(registry, "req-never"))
+
+    def test_resolve_dispatch_status_finds_rejection_via_id_only_mirror_as_last_resort(self):
+        """No claim record and no project-scoped rejection record exist at
+        all (project_id was never recoverable) -- resolve_dispatch_status_
+        for_request() must still surface REJECTED truth via this final
+        fallback rather than silently returning None, matching the
+        project-scoped mirror's own contract one level down."""
+        store = self._project_store()
+        claim_registry = MemoryClaimRegistry()
+        empty_by_request_registry = MemoryClaimRegistry()
+        id_only_registry = MemoryClaimRegistry()
+        record_dispatch_rejection_by_request_id_only(
+            id_only_registry, "adm-p0-immediate-dispatch-wakeup-20260829", "drive-file-abc", "ingress_rejected",
+            "Drive request is not valid UTF-8 JSON", "2026-08-28T20:43:50Z")
+        resolved = resolve_dispatch_status_for_request(
+            store, claim_registry, "p1", "adm-p0-immediate-dispatch-wakeup-20260829", bucket="fake-bucket",
+            rejection_registry_factory=lambda bucket, project_id, request_id: empty_by_request_registry,
+            rejection_id_only_registry_factory=lambda bucket, request_id: id_only_registry)
+        self.assertIsNone(resolved["task"])
+        self.assertFalse(resolved["dispatch_request_read_failed"])
+        self.assertIsNotNone(resolved["dispatch_request_status"])
+        self.assertEqual("rejected", resolved["dispatch_request_status"]["status"])
+
+    def test_project_scoped_rejection_takes_priority_over_id_only_mirror(self):
+        """When BOTH mirrors have a record (rare -- would require the same
+        request_id to fail once pre-parse and once post-parse), the richer,
+        project-scoped one must win; the id-only mirror is a last resort,
+        never consulted otherwise."""
+        store = self._project_store()
+        claim_registry = MemoryClaimRegistry()
+        by_request_registry = MemoryClaimRegistry()
+        id_only_registry = MagicMock()
+        record_dispatch_rejection_by_request(
+            by_request_registry, "p1", "req-both", "drive-file-1", "ingress_rejected", "schema-level rejection",
+            "2026-08-28T00:00:00Z")
+        resolved = resolve_dispatch_status_for_request(
+            store, claim_registry, "p1", "req-both", bucket="fake-bucket",
+            rejection_registry_factory=lambda bucket, project_id, request_id: by_request_registry,
+            rejection_id_only_registry_factory=lambda bucket, request_id: id_only_registry)
+        self.assertEqual("schema-level rejection", resolved["dispatch_request_status"]["message"])
+        id_only_registry.read_if_exists.assert_not_called()
+
+    def test_resolve_dispatch_status_without_bucket_never_consults_id_only_mirror(self):
+        store = self._project_store()
+        claim_registry = MemoryClaimRegistry()
+        resolved = resolve_dispatch_status_for_request(store, claim_registry, "p1", "req-never-seen")
+        self.assertIsNone(resolved["dispatch_request_status"])
+        self.assertFalse(resolved["dispatch_request_read_failed"])
 
 
 if __name__ == "__main__":

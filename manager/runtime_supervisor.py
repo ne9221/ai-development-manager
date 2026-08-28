@@ -52,6 +52,28 @@ Design constraints (see the P0 runtime self-heal brief this closes):
   heartbeat (manager.scheduler_provenance.read_heartbeats -- catches "it's
   enabled but has stopped actually ticking", the failure mode a bare
   Enabled/Disabled check cannot see at all).
+- Detection+action latency target: with SWEEP_MIN_INTERVAL_SECONDS=20 and
+  HEARTBEAT_MAX_AGE_SECONDS=150 (see their own comments), a component that
+  stops heartbeating is typically caught and nudged within 150-170s of its
+  last real tick, not "wait for its own next scheduled trigger" (naturally
+  ~60-120s, but unbounded if that trigger itself is what's stuck). This is
+  a genuine improvement, not "seconds-level": a lower heartbeat threshold
+  would catch a real crash faster, but a `/Run` on a task Task Scheduler
+  believes is Running is a silent no-op regardless of how fast it's
+  issued -- see `_task_status_is_running()`.
+- A WEDGED process (still running, Status=Running, but hung/not making
+  progress) is a genuinely different failure shape this module does NOT
+  fix: neither a natural Task Scheduler retrigger nor this module's own
+  `/Run` can do anything while MultipleInstances=IgnoreNew sees an
+  instance already "Running" -- both are silently ignored. This case is
+  reported as `heartbeat_stale_process_possibly_wedged` (human_required,
+  no remediation attempted) rather than either claiming a fix that cannot
+  work or silently reporting healthy. Actually recovering from this would
+  require verifying process identity and killing it first (the same
+  pattern manager.session_center_supervisor.kill() already uses for its
+  own child) -- deliberately out of scope for this slice: killing the
+  wrong process, or a real provider mid-turn, is a much higher-risk
+  mistake than a slower recovery.
 """
 
 from __future__ import annotations
@@ -66,14 +88,28 @@ from manager import health_evidence, scheduler_provenance
 from manager.dashboard_core import ServiceHealthViewModel, parse_scheduled_task_health
 
 SCHTASKS_TIMEOUT_SECONDS = 10
-SWEEP_MIN_INTERVAL_SECONDS = 90
+# With 4 independently-scheduled ~60s components each calling
+# try_check_and_recover() at their own tail, a real sweep becomes eligible
+# roughly every SWEEP_MIN_INTERVAL_SECONDS regardless of which one happens
+# to trigger it -- lower means faster detection, at the cost of running
+# the sweep (a schtasks /Query per component + one quota Drive read) more
+# often. 20s keeps that cost trivial while getting worst-case
+# detection+action latency close to HEARTBEAT_MAX_AGE_SECONDS itself
+# rather than adding a second multi-minute debounce on top of it.
+SWEEP_MIN_INTERVAL_SECONDS = 20
 RECOVERY_COOLDOWN_SECONDS = 300
-# Generous relative to the real observed ~45-90s tick cadence (including
-# occasional multi-minute ticks while a real provider turn is in flight --
-# see the Command Watcher "LastTaskResult stale while a real PID is alive"
-# precedent) without being so long a genuinely dead component sits
-# unnoticed for an unreasonable time.
-HEARTBEAT_MAX_AGE_SECONDS = 300
+# The dominant term in real detection latency (see module docstring's
+# "immediate recovery" goal) -- lower catches a real crash faster, at the
+# cost of more false-positive "degraded" evidence entries whenever a
+# legitimately busy tick (e.g. Command Watcher synchronously babysitting a
+# real multi-minute provider turn -- a real, observed pattern) simply
+# hasn't reached finish() yet. That false-positive cost is bounded and
+# safe, not harmful: MultipleInstances=IgnoreNew makes the resulting
+# `/Run` on an already-running task a documented no-op (see
+# recover_scheduled_task), so a false positive costs one noisy evidence
+# entry, never a duplicate launch. 150s is roughly 2x the real observed
+# ~45-90s tick cadence.
+HEARTBEAT_MAX_AGE_SECONDS = 150
 
 # component -> real Windows Scheduled Task name. Fixed, hardcoded: this
 # module only ever Enables/Runs a task that already exists under one of
@@ -103,6 +139,12 @@ EVIDENCE_COMPONENT = {
     "github_dispatch_ingress": "github_dispatch_ingress",
     "session_center_supervisor": "session_center",
 }
+# degraded_reasons with no safe auto-recovery action (see _component_state):
+# a Disabled task is a deliberate human action never auto-reversed, and a
+# heartbeat-stale-but-Status=Running task is a possibly-wedged process a
+# bare `/Run` cannot fix (IgnoreNew silently ignores it). Both are still
+# reported degraded/human_required, never silently downgraded to healthy.
+NO_AUTO_ACTION_DEGRADED_REASONS = frozenset({"scheduled_task_disabled", "heartbeat_stale_process_possibly_wedged"})
 
 
 def _sweep_marker_path(manager_home):
@@ -221,6 +263,25 @@ def recover_scheduled_task(task_name, runner=subprocess.run):
     return "attempted"
 
 
+def _task_status_is_running(task_output):
+    """Parse schtasks' own `Status:` line (distinct from `Scheduled Task
+    State:`, which is Enabled/Disabled -- see parse_scheduled_task_health).
+    Used only to decide whether a `/Run` nudge could possibly do anything:
+    if Task Scheduler itself already believes an instance is Running,
+    MultipleInstances=IgnoreNew guarantees `/Run` is a silent no-op, same
+    as a real new scheduled trigger would be -- so a stale heartbeat
+    combined with Status=Running is a DIFFERENT failure shape (a wedged/
+    hung process Task Scheduler has not noticed exited) that this module
+    cannot fix by triggering another run; it can only surface it."""
+    if not isinstance(task_output, str):
+        return False
+    for line in task_output.splitlines():
+        line = line.strip()
+        if line.startswith("Status:"):
+            return line.split(":", 1)[1].strip() == "Running"
+    return False
+
+
 def _component_state(component, now, task_output, heartbeats):
     """Combine the two independent signals conservatively: a Disabled task
     always wins (that alone proves nothing is ticking), otherwise fall
@@ -240,6 +301,12 @@ def _component_state(component, now, task_output, heartbeats):
     if age_seconds is not None and age_seconds <= HEARTBEAT_MAX_AGE_SECONDS:
         return "healthy", None, None, health
     if age_seconds is not None:
+        if _task_status_is_running(task_output):
+            # A `/Run` here would be silently ignored (see
+            # _task_status_is_running's docstring) -- report honestly as
+            # a distinct, no-safe-auto-action failure shape rather than
+            # claiming a remediation this module cannot actually perform.
+            return ("degraded", "heartbeat_stale_process_possibly_wedged", None, health)
         return "degraded", "heartbeat_stale", "scheduled_task_heartbeat_stale_restart", health
     if not health.found:
         return "unknown", "no_heartbeat_and_task_query_failed", None, health
@@ -310,8 +377,13 @@ def check_and_recover(manager_home, *, now=None, runner=subprocess.run, service_
             else:
                 remediation_result = "skipped_cooldown"
         evidence_component = EVIDENCE_COMPONENT[component]
+        no_auto_action = checked["degraded_reason"] in NO_AUTO_ACTION_DEGRADED_REASONS
         if checked["degraded_reason"] == "scheduled_task_disabled":
             unresolved_blocker = f"{checked['task_name']} is Disabled -- restart via the Tray, not auto-recovered"
+        elif checked["degraded_reason"] == "heartbeat_stale_process_possibly_wedged":
+            unresolved_blocker = (f"{checked['task_name']} shows Status=Running but its heartbeat is stale -- "
+                                  "a `/Run` trigger would be silently ignored (MultipleInstances=IgnoreNew); "
+                                  "the process may be wedged and needs manual investigation/kill")
         elif checked["state"] == "unknown":
             unresolved_blocker = checked["health"].detail
         else:
@@ -320,7 +392,7 @@ def check_and_recover(manager_home, *, now=None, runner=subprocess.run, service_
             health_evidence.record(
                 store_path, evidence_component, state=checked["state"],
                 degraded_reason=checked["degraded_reason"],
-                last_remediation=checked["degraded_reason"] if checked["degraded_reason"] == "scheduled_task_disabled"
+                last_remediation=checked["degraded_reason"] if no_auto_action
                 else (checked["remediation_reason"] if remediation_result else None),
                 remediation_result=remediation_result,
                 unresolved_blocker=unresolved_blocker,

@@ -7,8 +7,9 @@ from datetime import datetime, timedelta, timezone
 
 from cloud.dispatch_ingress import DispatchIngressError, handle_dispatch
 from manager.dispatch_requests import (
-    annotate_partial_identity, dispatch_rejection_by_request_registry, dispatch_rejection_registry,
-    dispatch_request_registry, record_dispatch_rejection, record_dispatch_rejection_by_request,
+    annotate_partial_identity, annotate_partial_identity_from_filename, dispatch_rejection_by_request_id_only_registry,
+    dispatch_rejection_by_request_registry, dispatch_rejection_registry, dispatch_request_registry,
+    record_dispatch_rejection, record_dispatch_rejection_by_request, record_dispatch_rejection_by_request_id_only,
 )
 from manager.tasks import MIME_FOLDER, MIME_JSON, TaskError, now_iso, validate
 
@@ -265,7 +266,15 @@ def read_request(service, folder_id, expected_owner, metadata, now=None):
         # permits ignoring a BOM rather than treating it as an error.
         document = json.loads(raw.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise TaskError("Drive request is not valid UTF-8 JSON") from exc
+        # No document ever parsed here, so annotate_partial_identity()
+        # (which reads request_id/project_id OUT of a parsed document) has
+        # nothing to work with. metadata's provenance (owner/folder/
+        # trashed/mimeType) is already verified above, so the Drive
+        # filename itself is a safe, if partial, identity signal -- see
+        # annotate_partial_identity_from_filename()'s docstring for why
+        # project_id specifically is never recoverable at this stage.
+        raise annotate_partial_identity_from_filename(
+            TaskError("Drive request is not valid UTF-8 JSON"), metadata) from exc
     # Everything from here on validates an already-successfully-parsed
     # `document` -- any TaskError raised in this block is annotated with
     # partial_request_id/partial_project_id (best-effort, never trusted as
@@ -291,6 +300,7 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
                                  registry_factory=dispatch_request_registry,
                                  rejection_registry_factory=dispatch_rejection_registry,
                                  rejection_by_request_registry_factory=dispatch_rejection_by_request_registry,
+                                 rejection_by_request_id_only_registry_factory=dispatch_rejection_by_request_id_only_registry,
                                  max_candidates=DEFAULT_MAX_CANDIDATES_PER_POLL,
                                  recent_candidates=DEFAULT_RECENT_CANDIDATES,
                                  deadline=None, time_budget_seconds=DEFAULT_TIME_BUDGET_SECONDS,
@@ -525,6 +535,21 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
                         partial_project_id, partial_request_id, file_id, reason_code, str(exc), now_iso())
                 except Exception:
                     pass
+            else:
+                # project_id was never recoverable (failure predates any
+                # document parse -- see annotate_partial_identity_from_
+                # filename()), but request_id alone often still is, from
+                # the Drive filename. Only reached when the fully-scoped
+                # mirror above could not be written, so this never
+                # duplicates or overrides that richer record.
+                partial_request_id_unscoped = getattr(exc, "partial_request_id_unscoped", None)
+                if partial_request_id_unscoped:
+                    try:
+                        record_dispatch_rejection_by_request_id_only(
+                            rejection_by_request_id_only_registry_factory(bucket, partial_request_id_unscoped),
+                            partial_request_id_unscoped, file_id, reason_code, str(exc), now_iso())
+                    except Exception:
+                        pass
             results.append({"file_id": file_id, "accepted": False})
 
     def _scan(metadata_list, budget):

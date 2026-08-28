@@ -10,8 +10,9 @@ from manager import health_evidence, scheduler_provenance
 from manager.dashboard_core import ServiceHealthViewModel
 from manager.runtime_supervisor import (
     HEARTBEAT_MAX_AGE_SECONDS, RECOVERY_COOLDOWN_SECONDS, SWEEP_MIN_INTERVAL_SECONDS, TASK_NAMES,
-    _component_state, _cooldown_ok, _record_recovery_attempt, _should_run_sweep, check_and_recover,
-    check_heartbeat_component, check_quota, query_scheduled_task, recover_scheduled_task, try_check_and_recover,
+    _component_state, _cooldown_ok, _record_recovery_attempt, _should_run_sweep, _task_status_is_running,
+    check_and_recover, check_heartbeat_component, check_quota, query_scheduled_task, recover_scheduled_task,
+    try_check_and_recover,
 )
 
 
@@ -89,10 +90,45 @@ class ComponentStateTests(unittest.TestCase):
         self.assertEqual("unknown", state)
         self.assertFalse(health.found)
 
+    def test_stale_heartbeat_with_status_running_is_wedged_not_recoverable(self):
+        """A `/Run` on a task Task Scheduler already believes is Running
+        would be a silent no-op (MultipleInstances=IgnoreNew) -- this must
+        be reported as a distinct, no-safe-action failure shape, never as
+        an ordinary recoverable heartbeat_stale."""
+        stale_at = NOW - timedelta(seconds=HEARTBEAT_MAX_AGE_SECONDS + 60)
+        heartbeats = {"command_watcher": {"updated_at": stale_at.isoformat()}}
+        task_output = "Status: Running\nScheduled Task State: Enabled"
+        state, reason, remediation, _ = _component_state("command_watcher", NOW, task_output, heartbeats)
+        self.assertEqual("degraded", state)
+        self.assertEqual("heartbeat_stale_process_possibly_wedged", reason)
+        self.assertIsNone(remediation)
+
     def test_task_query_failed_but_heartbeat_fresh_is_still_healthy(self):
         heartbeats = {"command_watcher": {"updated_at": (NOW - timedelta(seconds=10)).isoformat()}}
         state, _, _, _ = _component_state("command_watcher", NOW, None, heartbeats)
         self.assertEqual("healthy", state)
+
+
+class TaskStatusIsRunningTests(unittest.TestCase):
+    def test_status_running_is_true(self):
+        self.assertTrue(_task_status_is_running("Status: Running\nScheduled Task State: Enabled"))
+
+    def test_status_ready_is_false(self):
+        self.assertFalse(_task_status_is_running("Status: Ready\nScheduled Task State: Enabled"))
+
+    def test_missing_status_line_is_false(self):
+        self.assertFalse(_task_status_is_running("Scheduled Task State: Enabled"))
+
+    def test_none_output_is_false(self):
+        self.assertFalse(_task_status_is_running(None))
+
+    def test_only_first_status_line_counts(self):
+        # Real schtasks /FO LIST /V output can repeat "Status:" style
+        # labels for unrelated fields in some locales/versions -- only the
+        # FIRST "Status:" line (Task Scheduler's own top-level status) is
+        # authoritative, matching parse_scheduled_task_health's own
+        # first-match convention for Status:/Scheduled Task State:.
+        self.assertTrue(_task_status_is_running("Status: Running\nSomething Status: Ready"))
 
 
 class CooldownTests(unittest.TestCase):

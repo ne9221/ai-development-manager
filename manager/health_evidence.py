@@ -88,6 +88,13 @@ HUMAN_REQUIRED_REMEDIATIONS = frozenset({
     # policy to every Scheduled-Task-backed component, not only Command
     # Watcher.
     "scheduled_task_disabled",
+    # A stale heartbeat combined with the Scheduled Task's own Status still
+    # showing "Running" means Task Scheduler has not noticed the process
+    # exited -- MultipleInstances=IgnoreNew makes a `/Run` nudge a silent
+    # no-op in this exact case, so there is no safe auto-action; the
+    # process may be genuinely wedged and needs a human to investigate/
+    # kill it. See manager.runtime_supervisor._task_status_is_running().
+    "heartbeat_stale_process_possibly_wedged",
 })
 
 
