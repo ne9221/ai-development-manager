@@ -715,17 +715,28 @@ def handle_dispatch(store, service, lock_registry_factory, payload, request_crea
         # Defense in depth: the explicit request was already validated above,
         # but never trust that dispatcher_dispatch() actually honored it --
         # fail closed on any mismatch instead of silently persisting a Command
-        # for a different provider/account than what was requested.
-        if requested_provider is not None and result["provider"] != requested_provider:
-            raise DispatchIngressError(
-                "dispatch_state_inconsistent",
-                f"requested provider {requested_provider!r} but dispatcher resolved {result['provider']!r}",
-            )
-        if requested_account_id is not None and result.get("account_id") != requested_account_id:
-            raise DispatchIngressError(
-                "dispatch_state_inconsistent",
-                f"requested account_id {requested_account_id!r} but dispatcher resolved {result.get('account_id')!r}",
-            )
+        # for a different provider/account than what was requested. Exempt
+        # only the waiting_quota outcome: dispatcher.dispatch() there
+        # honestly reports provider=None (DASHBOARD_TRUTH_CONNECTED gate 1 --
+        # no eligible provider yet, including when the caller's own explicit
+        # preferred_provider has no reliable quota right now) rather than
+        # ever resolving a DIFFERENT provider than requested -- that is not
+        # the "silently substituted" case this check exists to catch, and
+        # the original preference is durably preserved on the Task itself
+        # (see manager.dispatcher.dispatch()'s own preferred_provider/
+        # account_id persistence) for the watcher's later promotion sweep to
+        # honor once quota recovers.
+        if not result.get("waiting_quota"):
+            if requested_provider is not None and result["provider"] != requested_provider:
+                raise DispatchIngressError(
+                    "dispatch_state_inconsistent",
+                    f"requested provider {requested_provider!r} but dispatcher resolved {result['provider']!r}",
+                )
+            if requested_account_id is not None and result.get("account_id") != requested_account_id:
+                raise DispatchIngressError(
+                    "dispatch_state_inconsistent",
+                    f"requested account_id {requested_account_id!r} but dispatcher resolved {result.get('account_id')!r}",
+                )
 
         # read_only and execution_policies are forced here, server-side, from a
         # fixed policy set -- never from clean/payload -- so this Task always

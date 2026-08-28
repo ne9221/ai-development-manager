@@ -262,26 +262,41 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
     }
     if request.get("account_id") is not None:
         task_input["account_id"] = request["account_id"]
+    # Durably preserve the caller's own explicit preference/exclusion on the
+    # Task record itself (not just used transiently for this one call) --
+    # required so a later re-dispatch of this exact Task (a scheduler
+    # re-tick, or manager.command_watcher's own waiting_quota promotion
+    # sweep) re-evaluates the SAME originally-requested provider, never
+    # silently falls back to unconstrained automatic routing just because
+    # the in-memory `request` dict that carried it is long gone.
+    if request.get("preferred_provider") is not None:
+        task_input["preferred_provider"] = request["preferred_provider"]
+    if request.get("excluded_provider") is not None:
+        task_input["excluded_provider"] = request["excluded_provider"]
     estimates = {provider: estimate({**task_input, "provider": provider, "mode": CAPABILITIES[provider]["mode"], "effort": "high" if task_input.get("complexity") == "high" else "medium"}, history) for provider in CAPABILITIES}
     decision = decide(task_input, quota, estimates=estimates)
     selected = request.get("preferred_provider") or decision["recommended_provider"] or next(iter(decision["alternatives"]), None)
     excluded = request.get("excluded_provider")
     if selected == excluded:
         selected = next((item for item in decision["alternatives"] if item != excluded), None)
-    if selected not in CAPABILITIES:
-        # No automatically-eligible provider exists right now (every
-        # provider's quota is stale/unreliable/exhausted, or excluded down
-        # to nothing, and the caller did not pin a preferred_provider). This
-        # must never delete or lose the caller's request: quota state gates
-        # *provider selection*, never *Task admission* (DASHBOARD_TRUTH_
-        # CONNECTED gate 1). The Task is still created (or, if one already
-        # exists for this identity, left untouched -- a re-tick must not
-        # clobber a previously-assigned recommended_provider just because
-        # this particular call's quota snapshot happened to be stale) with
+
+    def _admit_waiting_quota(reasons):
+        # No eligible provider exists right now -- either automatic routing
+        # found nothing (every provider's quota stale/unreliable/exhausted,
+        # or excluded down to nothing, no preferred_provider given), or the
+        # caller's own explicit preferred_provider="claude" turned out to
+        # have no reliable quota. Either way this must never delete or lose
+        # the caller's request: quota state gates *provider selection*,
+        # never *Task admission* (DASHBOARD_TRUTH_CONNECTED gate 1). The
+        # Task is still created (or, if one already exists for this
+        # identity, left untouched -- a re-tick must not clobber a
+        # previously-assigned recommended_provider just because this
+        # particular call's quota snapshot happened to be stale) with
         # recommended_provider left None, so the request stays durably
         # visible for the Dashboard and eligible for automatic re-dispatch
         # on a later scheduler tick once quota recovers, instead of raising
         # before any record of it ever existed.
+        nonlocal task
         if not task:
             task_input.update(recommended_provider=None, mode=None, effort=decision["recommended_effort"], quota_evidence=decision["quota_evidence"])
             persist_task = request.get("persist_task", True)
@@ -289,7 +304,7 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
             if persist_task and task["task_id"] not in project["active_tasks"]:
                 project["active_tasks"].append(task["task_id"]); store.put("projects", project["project_id"], project["project_id"], project)
         validate_task_enforcement(task)
-        reason = next(iter(decision["reasons"]), "no provider has fresh reliable quota")
+        reason = next(iter(reasons), "no provider has fresh reliable quota")
         warnings = [item for item in [decision.get("warning")] if item]
         warnings.append(f"Task admitted; automatic provider selection is waiting on quota recovery ({reason})")
         return {
@@ -303,6 +318,9 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
             "warnings": warnings, "generated_prompt": None,
             "task_id": task["task_id"], "waiting_quota": True,
         }
+
+    if selected not in CAPABILITIES:
+        return _admit_waiting_quota(decision["reasons"])
     alternatives = [item for item in [decision["recommended_provider"], *decision["alternatives"]] if item and item not in (selected, excluded)]
     selected_estimate = estimates[selected]
     if decision["recommended_mode"] == "split_task" and not selected_estimate["split_recommended"]:
@@ -352,7 +370,15 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
     # provider is separately quota-gated before launch and may have just
     # reselected its actual Claude account using live local auth evidence.
     if request.get("preferred_provider") == "claude" and not request.get("provider_is_assigned") and not eligibility_quota.get("has_usable_quota", eligibility_quota["has_reliable_quota"]):
-        raise TaskError("preferred Claude provider has no reliable quota")
+        # Same DASHBOARD_TRUTH_CONNECTED gate 1 contract as the automatic-
+        # routing "no eligible provider" branch above: an explicit
+        # preference that turns out to have no reliable quota right now
+        # must still admit the Task as waiting_quota, never raise and lose
+        # it. A caller that genuinely needs a hard failure on an invalid
+        # preference (e.g. execution_runner.launch_task()'s forced re-
+        # dispatch of an already-selected provider) sets
+        # provider_is_assigned=True, which this check already exempts.
+        return _admit_waiting_quota([f"preferred Claude provider ({account_id or 'automatic account'}) has no reliable quota"])
 
     # Scoped quota and forecast evidence for selected provider/account
     selected_evidence = {

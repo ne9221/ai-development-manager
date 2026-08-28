@@ -534,6 +534,55 @@ class DispatchIngressTests(unittest.TestCase):
         self.assertEqual("queued", replay["status"])
         self.assertEqual(command["command_id"], replay["command_id"])
 
+    def test_explicit_preferred_provider_waiting_quota_is_also_promoted_by_the_next_tick(self):
+        """CONFIRMED BUG (parallel-validation finding 1): the explicit
+        preferred_provider="claude" path had its own, separate "no eligible
+        provider" raise (manager.dispatcher.dispatch()'s "preferred Claude
+        provider has no reliable quota" TaskError) that round 1 of this
+        fix never closed -- only the no-preference automatic-routing path
+        was fixed. A caller that explicitly asked for claude while quota
+        was stale/exhausted would still lose the Task entirely. This proves
+        the SAME full closed loop as the automatic-routing case for the
+        explicit-preference path too: admitted as waiting_quota (never
+        raises), promoted by the watcher's natural tick once quota
+        recovers, and the promoted Command still honors the original
+        explicit provider request (requested_provider="claude") -- not a
+        different, silently-substituted provider -- with no duplicate
+        Command created on a second tick."""
+        stale = quota_fixture(updated="2020-01-01T00:00:00Z")
+        request = payload(request_id="req-preferred-waiting-quota", provider="claude")
+        with patch("manager.dispatcher.read_drive_status", return_value=stale):
+            admitted = self.call(request)
+        self.assertEqual("waiting_quota", admitted["status"])
+        self.assertIsNone(admitted["command_id"])
+        task = self.store.get("tasks", "p1", admitted["task_id"])
+        self.assertIsNone(task["recommended_provider"])
+        self.assertEqual("claude", task.get("preferred_provider"))
+        with self.assertRaises(TaskError):
+            self.store.get("commands", "p1", admitted["task_id"])
+
+        fresh = quota_fixture(80, 90)
+        with patch("manager.command_watcher.read_drive_status", return_value=fresh):
+            poll_once(self.store, self.service, allowlist=frozenset({("p1", admitted["task_id"])}))
+
+        command = self.store.get("commands", "p1", admitted["task_id"])
+        self.assertEqual("claude", command["provider"])
+        self.assertEqual("claude", command.get("requested_provider"))
+        self.assertEqual("queued", command["status"])
+
+        # The promoted Task is no longer even discoverable as waiting_quota
+        # (its own recommended_provider is now persisted) -- a second
+        # natural tick's sweep step has nothing left to re-promote, so it
+        # can never create a duplicate/second command for this identity.
+        # (A second poll_once() call with the SAME allowlist would also
+        # feed the now-queued Command into the ordinary, unrelated launch
+        # pipeline -- a separate concern already covered by this file's own
+        # test_queued_command_is_recognized_by_command_watcher_and_left_alone
+        # -- so this checks the sweep's own idempotency in isolation.)
+        from manager.command_watcher import _enumerate_waiting_quota_tasks
+        self.assertEqual([], _enumerate_waiting_quota_tasks(self.store, "p1"))
+        self.assertEqual(command, self.store.get("commands", "p1", admitted["task_id"]))
+
     def test_queued_command_is_recognized_by_command_watcher_and_left_alone(self):
         """The Command Watcher must recognize the record contract this
         ingress writes, and -- with no static allowlist entry and no

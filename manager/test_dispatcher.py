@@ -1,7 +1,7 @@
 import json
 import unittest
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from manager.dispatcher import dispatch, request_ok
@@ -178,10 +178,17 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual("codex", result["provider"])
 
     def test_explicit_unreliable_provider_is_not_substituted(self):
+        """DASHBOARD_TRUTH_CONNECTED gate 1: an explicit preferred_provider
+        with no reliable quota must never be silently substituted with a
+        different provider, AND must never lose the Task -- it is admitted
+        as waiting_quota instead of raising, exactly like the automatic-
+        routing "no eligible provider" case."""
         document = quota(80, 90)
         next(item for item in document["providers"] if item["provider"] == "claude")["last_updated"] = "2020-01-01T00:00:00Z"
-        with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
-            self.dispatch_case(request(preferred_provider="claude"), document)
+        result = self.dispatch_case(request(preferred_provider="claude"), document)
+        self.assertIsNone(result["provider"])
+        self.assertNotEqual("codex", result["provider"])
+        self.assertTrue(result["waiting_quota"])
 
     def test_account_id_selects_matching_claude_account_quota(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
@@ -199,13 +206,45 @@ class DispatcherTests(unittest.TestCase):
 
     def test_account_id_reliability_not_laundered_across_accounts(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="unknown", b_remaining=None)
-        with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
-            self.dispatch_case(request(title="Unreliable account B", preferred_provider="claude", account_id="claude-b"), doc)
+        result = self.dispatch_case(request(title="Unreliable account B", preferred_provider="claude", account_id="claude-b"), doc)
+        self.assertIsNone(result["provider"])
+        self.assertTrue(result["waiting_quota"])
 
     def test_account_id_does_not_silently_switch_stale_to_fresh(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=70, a_updated="2020-01-01T00:00:00Z", b_confidence="official", b_remaining=40, b_updated="2026-08-09T05:00:00Z")
-        with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
-            self.dispatch_case(request(title="Stale account A", preferred_provider="claude", account_id="claude-a"), doc)
+        result = self.dispatch_case(request(title="Stale account A", preferred_provider="claude", account_id="claude-a"), doc)
+        self.assertIsNone(result["provider"])
+        self.assertTrue(result["waiting_quota"])
+
+    def test_stale_account_recovers_automatically_once_a_fresh_reading_lands(self):
+        """DASHBOARD_TRUTH_CONNECTED gate 5 (stale -> recovery), controlled/
+        isolated fixture: the SAME account_id, first with a collector
+        reading frozen 3 hours old (refused), then with a fresh reading
+        (accepted) -- proving routing self-recovers automatically from a
+        genuine stale condition the instant fresh data is available again,
+        with no other code path or manual override involved. account-b
+        stays fresh and eligible throughout, proving the stale condition on
+        account-a never contaminates account-b's own independent
+        eligibility (the same non-cross-wiring property gate 2 requires)."""
+        stale_3h_ago = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        fresh_now = datetime.now(timezone.utc).isoformat()
+        doc_stale = two_claude_accounts(a_confidence="official", a_remaining=70, a_updated=stale_3h_ago,
+                                        b_confidence="official", b_remaining=40, b_updated=fresh_now)
+        stale_result = self.dispatch_case(request(title="Stale then recovered", preferred_provider="claude", account_id="claude-a"), doc_stale)
+        self.assertIsNone(stale_result["provider"])
+        self.assertTrue(stale_result["waiting_quota"])
+        # account-b, fresh throughout, was never affected by account-a's staleness.
+        b_result = self.dispatch_case(request(title="B unaffected by A's staleness", preferred_provider="claude", account_id="claude-b"), doc_stale)
+        self.assertEqual("claude-b", b_result["account_id"])
+
+        # The collector produces a fresh reading for account-a again --
+        # nothing else changes about the request.
+        recovered_now = datetime.now(timezone.utc).isoformat()
+        doc_recovered = two_claude_accounts(a_confidence="official", a_remaining=65, a_updated=recovered_now,
+                                            b_confidence="official", b_remaining=40, b_updated=fresh_now)
+        recovered = self.dispatch_case(request(title="Stale then recovered", preferred_provider="claude", account_id="claude-a"), doc_recovered)
+        self.assertEqual("claude-a", recovered["account_id"])
+        self.assertIn("65% remaining", recovered["quota_summary"])
 
     def test_automatic_claude_uses_provider_eligibility_without_pinning_an_account(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=70, a_updated="2020-01-01T00:00:00Z", b_confidence="official", b_remaining=40, b_updated=datetime.now(timezone.utc).isoformat())
@@ -224,8 +263,9 @@ class DispatcherTests(unittest.TestCase):
         distinct unknown/unavailable entry -- never another account's or the
         legacy representative's real numbers laundered onto it."""
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
-        with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
-            self.dispatch_case(request(title="Missing account", preferred_provider="claude", account_id="claude-does-not-exist"), doc)
+        result = self.dispatch_case(request(title="Missing account", preferred_provider="claude", account_id="claude-does-not-exist"), doc)
+        self.assertIsNone(result["provider"])
+        self.assertTrue(result["waiting_quota"])
 
     def test_account_id_matched_quota_evidence_reflects_that_account_not_legacy_representative(self):
         """Same evidence-integrity property, for the already-matched-account
@@ -265,8 +305,9 @@ class DispatcherTests(unittest.TestCase):
 
     def test_all_claude_accounts_unknown_no_fabricated_selection(self):
         doc = two_claude_accounts(a_confidence="unknown", a_remaining=None, b_confidence="unknown", b_remaining=None)
-        with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
-            self.dispatch_case(request(title="All unknown", preferred_provider="claude"), doc)
+        result = self.dispatch_case(request(title="All unknown", preferred_provider="claude"), doc)
+        self.assertIsNone(result["provider"])
+        self.assertTrue(result["waiting_quota"])
 
     def test_account_identity_shown_without_credentials(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)

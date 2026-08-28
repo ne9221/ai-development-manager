@@ -43,6 +43,15 @@ class Store:
     def list_projects(self): return [self.get("projects", "p1", "p1")]
     def list_records(self, area, project_id):
         return [deepcopy(value) for (record_area, project, _), value in self.records.items() if record_area == area and project == project_id]
+    def project_folder(self, area, project_id, create=True):
+        # Real DriveRecords.project_folder() resolves (and, when create is
+        # True, lazily materializes) the on-disk folder an area's records
+        # live under; manager.executions.list_executions() calls this with
+        # create=False purely to detect "no folder yet at all" and
+        # short-circuit to []. This in-memory double has no folder concept
+        # to fail to find, so it always "succeeds" -- list_records() below
+        # already independently returns [] for an empty area regardless.
+        return f"{area}/{project_id}"
     def latest(self, area, project_id, task_id):
         items = [value for (record_area, project, _), value in self.records.items()
                  if record_area == area and project == project_id and value.get("task_id") == task_id]
@@ -2252,6 +2261,154 @@ class WaitingQuotaPromotionTests(unittest.TestCase):
         store.put("tasks", "p1", "t1", stored)
         found = _enumerate_waiting_quota_tasks(store, "p1")
         self.assertEqual([], found)
+
+    def test_promotion_must_not_discard_real_completed_execution_history(self):
+        """CONFIRMED BUG (parallel-validation review of 7f2e91f):
+        _promote_waiting_quota_task() used to call
+        `dispatcher_dispatch(store, service, request, quota_document, history or [])`
+        -- `history` was a parameter of this function that poll_once() (its
+        only real caller) never actually supplied, so this was always
+        `dispatcher_dispatch(..., quota_document, [])`. That `[]` landed
+        positionally in manager.dispatcher.dispatch()'s 5th parameter,
+        `executions`. Because `[]` is not None, dispatch() took
+        `history = executions` (dispatcher.py's own `if executions is not
+        None:` branch) instead of calling its own
+        `list_executions(store, project_id)` -- silently discarding this
+        project's REAL completed-execution history for every promotion, no
+        matter how much matching history actually existed. Every promoted
+        Command's `quota_evidence[provider]["historical_estimate"]` was
+        therefore always the "No matching completed executions" fallback
+        (confidence "none", sample_count 0) -- fabricated evidence surfaced
+        straight to the Dashboard, exactly the class of bug
+        DASHBOARD_TRUTH_CONNECTED exists to eliminate. (Provider selection/
+        eligibility itself was unaffected -- manager.assignment.decide()
+        scores purely off live quota + the task's own expected_minutes,
+        never off historical_estimate -- so this was a truth/evidence bug,
+        not a mis-routing bug.)
+
+        Fix: _promote_waiting_quota_task() no longer passes `executions` at
+        all -- it passes `history_deadline` instead, so dispatch() takes
+        its normal bounded list_executions_bounded()/list_executions()
+        path, exactly like every other real dispatch() caller. The dead
+        `history=None` parameter was removed entirely -- nothing ever
+        supplied it."""
+        store = self.store_with_waiting_quota_task()
+        real_history = [{
+            "provider": "codex", "mode": "code", "effort": "medium", "status": "completed",
+            "elapsed_minutes": 42,
+            "task_snapshot": {"task_type": "implementation", "complexity": "medium", "needs_repo_edit": True},
+            "quota_delta": {"status": "known", "windows": [{"name": "primary", "status": "known", "used_percent_delta": 3}]},
+        }]
+        [waiting_task] = _enumerate_waiting_quota_tasks(store, "p1")
+        fresh = fresh_quota_fixture(80, 90)
+        # Patched at its real call site: manager.dispatcher.dispatch()'s
+        # history_deadline path calls manager.executions.list_executions_
+        # bounded(), which -- for this fake Store (no list_records_bounded)
+        # -- falls back to calling list_executions() using ITS OWN
+        # manager.executions module-global name, not manager.dispatcher's
+        # separately-imported reference; patching the latter would not
+        # intercept this call at all.
+        with patch("manager.executions.list_executions", return_value=real_history) as mock_list_executions:
+            promoted = _promote_waiting_quota_task(store, object(), waiting_task, fresh)
+        mock_list_executions.assert_called_once()
+        historical = promoted["quota_evidence"]["codex"]["historical_estimate"]
+        self.assertEqual(1, historical["sample_count"])
+        self.assertEqual(42, historical["estimated_minutes"])
+
+    def test_promotion_persists_recommended_provider_onto_the_task(self):
+        """CONFIRMED BUG (parallel-validation finding 3): after successfully
+        creating a Command, the Task's own recommended_provider/mode/effort
+        were never persisted back onto the Task record -- every later tick
+        would re-discover the same already-promoted Task via
+        _enumerate_waiting_quota_tasks() (recommended_provider still None)
+        and redo a wasted Command-existence Drive lookup forever, and
+        anything reading the Task record directly (not joined with its
+        Command) would keep seeing stale waiting_quota truth after the
+        Task was actually already running."""
+        store = self.store_with_waiting_quota_task()
+        [waiting_task] = _enumerate_waiting_quota_tasks(store, "p1")
+        fresh = fresh_quota_fixture(80, 90)
+        promoted = _promote_waiting_quota_task(store, object(), waiting_task, fresh)
+        self.assertIsNotNone(promoted)
+        task_after = store.get("tasks", "p1", "t1")
+        self.assertEqual(promoted["provider"], task_after["recommended_provider"])
+        self.assertEqual(promoted.get("mode"), task_after["mode"])
+        self.assertEqual(promoted.get("effort"), task_after["effort"])
+        # No longer even discoverable as waiting_quota on a later tick.
+        self.assertEqual([], _enumerate_waiting_quota_tasks(store, "p1"))
+
+    def test_promotion_restores_original_preferred_provider_and_account_id(self):
+        """CONFIRMED BUG (parallel-validation finding 4): the rebuilt
+        re-dispatch request dropped the original caller's preferred_
+        provider/excluded_provider/account_id entirely, and the promoted
+        Command's requested_provider/requested_account_id were hardcoded to
+        None regardless of what was actually originally requested --
+        breaking provenance continuity between the original dispatch
+        intent and the promoted Command. A caller who explicitly asked for
+        Claude account-b specifically must still get account-b honored on
+        promotion, not a silently different automatic selection, and the
+        Command's own requested_provider/requested_account_id must reflect
+        that original ask, not a fabricated None."""
+        store = Store()
+        create_project(store, project())
+        waiting_task = task(read_only=True)
+        waiting_task.update(
+            recommended_provider=None, quota_evidence={}, preferred_provider="claude", account_id="account-b",
+            source_context={"origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": "req-preferred-wq",
+                             "goal": "test", "admission_version": "1.0"},
+        )
+        create_task(store, waiting_task, assign=False)
+        [waiting] = _enumerate_waiting_quota_tasks(store, "p1")
+        self.assertEqual("claude", waiting.get("preferred_provider"))
+        self.assertEqual("account-b", waiting.get("account_id"))
+
+        fresh = {"schema_version": "0.1.0", "generated_at": now_iso(), "providers": [
+            {"provider": "claude", "account_id": "account-a", "display_name": "Claude Code", "collection_mode": "automatic",
+             "source": "test", "source_type": "official", "confidence": "official", "last_updated": now_iso(), "status": "ok",
+             "windows": [{"name": "five_hour", "remaining_percent": 95, "used_percent": 5, "resets_at": None}]},
+            {"provider": "claude", "account_id": "account-b", "display_name": "Claude Code", "collection_mode": "automatic",
+             "source": "test", "source_type": "official", "confidence": "official", "last_updated": now_iso(), "status": "ok",
+             "windows": [{"name": "five_hour", "remaining_percent": 60, "used_percent": 40, "resets_at": None}]},
+            {"provider": "codex", "display_name": "Codex", "collection_mode": "automatic", "source": "test",
+             "source_type": "official", "confidence": "official", "last_updated": now_iso(), "status": "ok",
+             "windows": [{"name": "primary", "remaining_percent": 80, "used_percent": 20, "resets_at": None}]},
+        ]}
+        promoted = _promote_waiting_quota_task(store, object(), waiting, fresh)
+        self.assertEqual("claude", promoted["provider"])
+        self.assertEqual("account-b", promoted["account_id"])
+        self.assertEqual("claude", promoted["requested_provider"])
+        self.assertEqual("account-b", promoted["requested_account_id"])
+
+    def test_promotion_still_refuses_when_the_restored_preferred_provider_remains_unavailable(self):
+        """The other half of finding 4's own caution: restoring the
+        original preference must never bypass an actually-unavailable
+        provider. If the originally-requested account is STILL unreliable
+        at promotion time, this must stay a no-op (still waiting_quota) --
+        never force a launch, and never silently substitute a different,
+        available provider the caller never asked for."""
+        store = Store()
+        create_project(store, project())
+        waiting_task = task(read_only=True)
+        waiting_task.update(
+            recommended_provider=None, quota_evidence={}, preferred_provider="claude", account_id="account-b",
+            source_context={"origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": "req-still-stale",
+                             "goal": "test", "admission_version": "1.0"},
+        )
+        create_task(store, waiting_task, assign=False)
+        [waiting] = _enumerate_waiting_quota_tasks(store, "p1")
+
+        still_stale = {"schema_version": "0.1.0", "generated_at": "2020-01-01T00:00:00Z", "providers": [
+            {"provider": "claude", "account_id": "account-b", "display_name": "Claude Code", "collection_mode": "automatic",
+             "source": "test", "source_type": "official", "confidence": "official", "last_updated": "2020-01-01T00:00:00Z", "status": "ok",
+             "windows": [{"name": "five_hour", "remaining_percent": 60, "used_percent": 40, "resets_at": None}]},
+            {"provider": "codex", "display_name": "Codex", "collection_mode": "automatic", "source": "test",
+             "source_type": "official", "confidence": "official", "last_updated": now_iso(), "status": "ok",
+             "windows": [{"name": "primary", "remaining_percent": 80, "used_percent": 20, "resets_at": None}]},
+        ]}
+        result = _promote_waiting_quota_task(store, object(), waiting, still_stale)
+        self.assertIsNone(result)
+        with self.assertRaises(TaskError):
+            store.get("commands", "p1", "t1")
 
 
 if __name__ == "__main__": unittest.main()

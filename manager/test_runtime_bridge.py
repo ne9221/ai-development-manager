@@ -107,8 +107,9 @@ class RuntimeBridgeTests(unittest.TestCase):
         self.assertNotIn("Ponytail minimal-change preference", research)
 
     def test_preferred_and_excluded(self):
-        with self.assertRaisesRegex(TaskError, "preferred Claude provider has no reliable quota"):
-            self.call({"project_id": "adm", "user_request": "Research design", "task_type": "research", "complexity": "medium", "preferred_provider": "claude"}, quota(50, None))
+        preferred_unreliable = self.call({"project_id": "adm", "user_request": "Research design", "task_type": "research", "complexity": "medium", "preferred_provider": "claude"}, quota(50, None))
+        self.assertIsNone(preferred_unreliable["provider"])
+        self.assertTrue(preferred_unreliable["waiting_quota"])
         excluded = self.call({"project_id": "adm", "user_request": "Implement second bridge", "task_type": "implementation", "complexity": "medium", "excluded_provider": "codex"}, quota(90, 80))
         self.assertNotEqual("codex", excluded["recommended_provider"])
 

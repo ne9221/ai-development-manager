@@ -732,7 +732,19 @@ def _enumerate_waiting_quota_tasks(store, project_id, deadline=None):
             and task.get("status") not in ("completed", "cancelled", "blocked")]
 
 
-def _promote_waiting_quota_task(store, service, task, quota_document, history=None):
+# DASHBOARD_TRUTH_CONNECTED gate 3: how long one waiting_quota promotion
+# attempt's own historical-estimate lookup (manager.dispatcher.dispatch()'s
+# list_executions_bounded() call) may take, mirroring cloud.dispatch_ingress.
+# INGRESS_DISPATCH_HISTORY_BUDGET_SECONDS's identical purpose for the
+# original admission path. Deliberately smaller than that 15s ingress
+# budget: up to MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL promotions can run in
+# one poll_once() tick sharing the same overall POLL_TIME_BUDGET_SECONDS=40s
+# budget as command processing, so each individual promotion's own history
+# lookup must stay small.
+WAITING_QUOTA_PROMOTION_HISTORY_BUDGET_SECONDS = 5.0
+
+
+def _promote_waiting_quota_task(store, service, task, quota_document):
     """Re-attempt automatic provider selection for one Task that
     manager.dispatcher.dispatch() previously admitted with no eligible
     provider (recommended_provider=None, a real quota_evidence assignment
@@ -741,6 +753,21 @@ def _promote_waiting_quota_task(store, service, task, quota_document, history=No
     own identical evidence check). Reuses the SAME task_id (dispatch()
     finds the existing Task and never creates a duplicate) and, only if a
     real provider is now eligible, creates exactly one Command for it.
+
+    The re-dispatch request restores the ORIGINAL caller's own dispatch
+    intent from the Task record itself -- preferred_provider,
+    excluded_provider, account_id, needs_repo_edit -- rather than falling
+    back to unconstrained automatic routing. This matters for provenance
+    continuity (the promoted Command's requested_provider/requested_
+    account_id must still reflect what was actually asked for, not
+    fabricated None) and for correctness: a caller who explicitly asked for
+    one specific (still-unavailable) provider must keep waiting for THAT
+    provider, never be silently rerouted to a different one just because
+    this sweep re-ran automatic selection instead. Live quota truth is
+    still the hard gate either way -- dispatcher.dispatch() itself refuses
+    (returns waiting_quota again, no Command) if the restored preference is
+    still not actually eligible; restoring the preference never bypasses
+    that.
 
     command_id is set to task_id: cloud.dispatch_ingress.py's original
     admission always reserves `task_id = command_id = f"dispatch-{request_
@@ -766,7 +793,14 @@ def _promote_waiting_quota_task(store, service, task, quota_document, history=No
     existing accepted Drive-record-creation race class (see the Drive
     Execution reservation race backlog note) -- the window for two
     concurrent sweeps to both decide to promote the same Task; a real fix
-    for that whole class of race is out of this task's scope."""
+    for that whole class of race is out of this task's scope.
+
+    On success, the Task's own recommended_provider/mode/effort are also
+    persisted (manager.tasks.update_task()) to reflect the real outcome --
+    without this, a Task stays permanently misclassified as still-waiting
+    (recommended_provider still None) even after promotion, forcing every
+    later tick to needlessly re-discover and re-check it via a wasted
+    Command-existence lookup forever."""
     project_id, task_id = task["project_id"], task["task_id"]
     if task.get("source_context", {}).get("origin") != TRUSTED_INGRESS_ORIGIN:
         return None
@@ -780,8 +814,27 @@ def _promote_waiting_quota_task(store, service, task, quota_document, history=No
         "project_id": project_id, "task_id": task_id, "title": task["title"],
         "task_type": task.get("task_type") or "general", "complexity": task.get("complexity", "medium"),
         "expected_minutes": task.get("expected_minutes") or 20,
+        "needs_repo_edit": task.get("needs_repo_edit", True),
     }
-    result = dispatcher_dispatch(store, service, request, quota_document, history or [])
+    if task.get("preferred_provider"):
+        request["preferred_provider"] = task["preferred_provider"]
+    if task.get("excluded_provider"):
+        request["excluded_provider"] = task["excluded_provider"]
+    if task.get("account_id"):
+        request["account_id"] = task["account_id"]
+    # Deliberately no `executions` argument here (never `[]`): passing `[]`
+    # positionally would make dispatch() treat "already have the data,
+    # nothing to look up" (executions is not None) and silently discard
+    # this project's real completed-execution history, fabricating
+    # quota_evidence[provider]["historical_estimate"] as "no matching
+    # completed executions" even when real history exists -- a Dashboard
+    # Truth violation caught by parallel validation of this same function.
+    # history_deadline instead makes dispatch() call its own bounded
+    # list_executions_bounded(store, project_id, ...), the same real,
+    # bounded history lookup cloud.dispatch_ingress.py's original admission
+    # already uses.
+    result = dispatcher_dispatch(store, service, request, quota_document,
+                                 history_deadline=time.monotonic() + WAITING_QUOTA_PROMOTION_HISTORY_BUDGET_SECONDS)
     if result.get("waiting_quota") or not result.get("provider"):
         return None  # still no eligible provider this tick
     try:
@@ -792,7 +845,7 @@ def _promote_waiting_quota_task(store, service, task, quota_document, history=No
     command = {
         "command_id": task_id, "project_id": project_id, "task_id": task_id,
         "provider": result["provider"], "account_id": result.get("account_id"),
-        "requested_provider": None, "requested_account_id": None,
+        "requested_provider": task.get("preferred_provider"), "requested_account_id": task.get("account_id"),
         "model": result.get("model"), "fallback_model": result.get("fallback_model"),
         "mode": result.get("mode"), "effort": result.get("effort"), "selection_reason": result.get("selection_reason", []),
         "quota_evidence": result.get("quota_evidence"), "created_at": now_iso(), "status": "queued",
@@ -811,6 +864,9 @@ def _promote_waiting_quota_task(store, service, task, quota_document, history=No
         command["request_id"] = source_context["external_request_id"]
     validate("command", command)
     store.put("commands", project_id, task_id, command)
+    from manager.tasks import update_task
+    update_task(store, project_id, task_id, recommended_provider=result["provider"],
+               mode=result.get("mode"), effort=result.get("effort"))
     return command
 
 
