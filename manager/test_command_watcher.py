@@ -13,7 +13,8 @@ from unittest.mock import Mock, patch
 from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_creation_identity
 from manager.command_watcher import (
-    CLAIM_TIMEOUT_SECONDS, MAX_COMMANDS_PER_POLL, MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL, PROVIDER_RUNTIMES,
+    CLAIM_TIMEOUT_SECONDS, MAX_COMMANDS_PER_POLL, MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL, PHASE_1_TIME_BUDGET_SECONDS,
+    POLL_TIME_BUDGET_SECONDS, PROVIDER_RUNTIMES,
     REQUIRED_TASK_POLICIES, _provider_state, _enumerate_waiting_quota_tasks, _promote_waiting_quota_task,
     _prioritized_commands, claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist,
     poll_once, process_command, provider_quota_reliable, resolve_provider_runtime,
@@ -2591,6 +2592,89 @@ class WaitingQuotaSweepStarvationTests(unittest.TestCase):
                      health_check=lambda: True, quota_check=lambda service: True)
 
         self.assertEqual(["waiting", "commands"], call_order)
+
+
+class Phase1BudgetCapTests(unittest.TestCase):
+    """Covers a real P0 (2026-08-29): before PHASE_1_TIME_BUDGET_SECONDS
+    existed, Phase 1's waiting_quota sweep shared the tick's FULL deadline
+    with Phase 2. Live-reproduced: a single project's waiting_quota Task
+    enumeration alone took 20+ real seconds under real Drive latency
+    against a backlog grown over a long session, leaving under 10s of the
+    40s tick budget for Phase 2 -- below WATCHER_DISCOVERY_TIMEOUT_SECONDS'
+    own per-request safety margin, so Phase 2's command discovery returned
+    zero records EVERY tick, indefinitely, even though the project sat at
+    rotation position 2 of 10 with nothing ahead of it. A claimed Command
+    long past its claim timeout, and a genuinely queued Command, both sat
+    frozen for hours while ticks kept completing successfully (exit 0),
+    never once touching either. Capping Phase 1 to its own sub-budget
+    guarantees Phase 2 a real floor regardless of how expensive any single
+    project's waiting_quota sweep turns out to be."""
+
+    ALLOWLIST = frozenset({("p1", "t1"), ("p1", "t2")})
+
+    def test_an_expensive_phase1_sweep_still_leaves_phase2_a_real_floor(self):
+        store = Store()
+        create_project(store, project())
+        waiting_task = task(read_only=True)
+        waiting_task.update(
+            recommended_provider=None, quota_evidence={},
+            source_context={"origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": "req-phase1-slow",
+                             "goal": "test", "admission_version": "1.0"},
+        )
+        create_task(store, waiting_task, assign=False)
+        second_task = {**task(read_only=True), "task_id": "t2",
+                      "execution_policies": sorted(REQUIRED_TASK_POLICIES)}
+        create_task(store, second_task, assign=False)
+        store.put("commands", "p1", "cmd-2", command(command_id="cmd-2", task_id="t2"))
+
+        state = {"now": 0.0}
+
+        def fake_monotonic():
+            return state["now"]
+
+        def slow_enumerate_waiting_quota_tasks(discovery_store, project_id, deadline=None):
+            # Simulate the live-reproduced cost: one project's own
+            # waiting_quota enumeration alone burns well past Phase 1's
+            # own sub-budget, real seconds under real Drive latency.
+            state["now"] += PHASE_1_TIME_BUDGET_SECONDS + 5
+            return []
+
+        runner = Mock(side_effect=lambda *a, **k: (k["on_running"](None), CommandWatcherTests.complete(a[7]))[1])
+        with patch("manager.command_watcher.time.monotonic", side_effect=fake_monotonic), \
+             patch("manager.command_watcher._enumerate_waiting_quota_tasks",
+                   side_effect=slow_enumerate_waiting_quota_tasks), \
+             patch("manager.command_watcher.launch_task", runner):
+            results = poll_once(store, object(), allowlist=self.ALLOWLIST, deadline=POLL_TIME_BUDGET_SECONDS,
+                                claim_factory=CommandWatcherTests.claim_factory,
+                                health_check=lambda: True, quota_check=lambda service: True)
+
+        # Phase 1's own sub-budget was blown through by a single project --
+        # confirmed by the fake clock having advanced well past
+        # PHASE_1_TIME_BUDGET_SECONDS already.
+        self.assertGreater(state["now"], PHASE_1_TIME_BUDGET_SECONDS)
+        # ...yet Phase 2 still ran, in the SAME tick, because it checks
+        # against the tick's full deadline, not Phase 1's shorter one.
+        self.assertEqual(1, len(results))
+        self.assertEqual("completed", results[0]["status"])
+        runner.assert_called_once()
+
+    def test_phase1_deadline_never_exceeds_an_already_tight_caller_supplied_deadline(self):
+        """A caller-supplied deadline tighter than PHASE_1_TIME_BUDGET_SECONDS
+        (e.g. a test, or a tick with little budget left for some other
+        reason) must still be respected exactly -- phase1_deadline is a
+        min(), never an extension of whatever the real deadline already
+        was."""
+        store = Store()
+        create_project(store, project())
+        store.put("commands", "p1", "cmd-1", command())
+
+        results = poll_once(store, object(), allowlist=frozenset({("p1", "t1")}),
+                            deadline=time.monotonic() - 1,
+                            claim_factory=CommandWatcherTests.claim_factory,
+                            health_check=lambda: True, quota_check=lambda service: True)
+
+        self.assertEqual([], results)
+        self.assertEqual("queued", store.get("commands", "p1", "cmd-1")["status"])
 
 
 if __name__ == "__main__": unittest.main()

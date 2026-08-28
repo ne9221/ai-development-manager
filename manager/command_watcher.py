@@ -712,6 +712,28 @@ def _enumerate_commands(store, project_id, deadline=None):
 # already are.
 MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL = 4
 
+# Real P0 (2026-08-29): Phase 1 (the waiting_quota sweep, see poll_once())
+# used to share the tick's full POLL_TIME_BUDGET_SECONDS deadline with
+# Phase 2 (regular command processing) -- fine when each project's sweep is
+# cheap, but live-reproduced with a project whose Task backlog had grown
+# large over a long session: enumerating that ONE project's waiting_quota
+# Tasks alone took 20+ real seconds, leaving under 10s of the 40s budget
+# for Phase 2 -- below WATCHER_DISCOVERY_TIMEOUT_SECONDS's own per-request
+# safety margin, so Phase 2's command discovery returned zero records
+# EVERY tick, indefinitely, even for a project reached early in rotation
+# with nothing ahead of it. A claimed Command past its claim timeout, and a
+# genuinely queued Command, both sat frozen for hours as a result -- ticks
+# kept completing successfully (exit 0), just never touching either.
+# Capping Phase 1 to its own shorter sub-budget guarantees Phase 2 a real
+# floor (POLL_TIME_BUDGET_SECONDS - PHASE_1_TIME_BUDGET_SECONDS, currently
+# 25s) regardless of how expensive any project's waiting_quota sweep turns
+# out to be -- Phase 1 already tolerates being cut off mid-sweep (nothing
+# it does is destructive; an unreached project's waiting_quota Tasks are
+# simply picked up on a later tick, same guarantee as before this cap
+# existed), so bounding it costs nothing but promotion latency under a
+# large backlog, in exchange for Phase 2 never again starving completely.
+PHASE_1_TIME_BUDGET_SECONDS = 15
+
 
 def _enumerate_waiting_quota_tasks(store, project_id, deadline=None):
     """Deadline-aware, bounded-hydration enumeration of one project's
@@ -1005,16 +1027,21 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     # contract several other tests and callers already depend on -- this
     # fix's scope is closing the starvation gap, not changing that timing.
     just_promoted = set()
+    # Own, shorter sub-deadline (never later than the tick's real deadline,
+    # e.g. an already-tight caller-supplied deadline in a test) -- see
+    # PHASE_1_TIME_BUDGET_SECONDS's docstring for why Phase 1 must never
+    # again be allowed to consume the whole tick budget on its own account.
+    phase1_deadline = min(deadline, time.monotonic() + PHASE_1_TIME_BUDGET_SECONDS)
 
     for project_id in project_ids:
-        if promotions_this_poll >= MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL or time.monotonic() >= deadline:
+        if promotions_this_poll >= MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL or time.monotonic() >= phase1_deadline:
             break
         try:
-            waiting_tasks = _enumerate_waiting_quota_tasks(discovery_store, project_id, deadline=deadline)
+            waiting_tasks = _enumerate_waiting_quota_tasks(discovery_store, project_id, deadline=phase1_deadline)
         except TaskError:
             continue
         for task in waiting_tasks:
-            if promotions_this_poll >= MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL or time.monotonic() >= deadline:
+            if promotions_this_poll >= MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL or time.monotonic() >= phase1_deadline:
                 break
             quota_document = sweep_quota()
             if quota_document is None:
