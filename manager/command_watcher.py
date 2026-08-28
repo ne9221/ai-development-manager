@@ -1061,8 +1061,27 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
                 break
             if time.monotonic() >= deadline:
                 return results
-            results.append(process_command(store, service, command, allowlist=allowlist,
-                                           origin_context=origin_context, **factories))
+            try:
+                results.append(process_command(store, service, command, allowlist=allowlist,
+                                               origin_context=origin_context, **factories))
+            except Exception as exc:
+                # One command's processing must never take the rest of this
+                # project's queue -- or any later-rotated project's -- down
+                # with it. Before this isolation existed, an uncaught
+                # exception here propagated straight out of poll_once() and
+                # was only ever caught by main()'s top-level `except
+                # Exception`, which discards the whole tick's results and
+                # retries next minute -- with the SAME command still first
+                # in _prioritized_commands() order (claimed/running always
+                # sort ahead of queued), so a command that reliably threw
+                # once reliably threw on every subsequent tick too,
+                # indefinitely starving every other command in the same
+                # project behind it. Recording the failure here and moving
+                # on to the next command keeps that guarantee real: a
+                # single bad record's blast radius is itself, not its
+                # neighbors.
+                results.append({"status": "error", "project_id": project_id,
+                                "command_id": command["command_id"], "error": repr(exc)})
     return results
 
 

@@ -1640,6 +1640,63 @@ class PollOnceTimeBudgetTests(unittest.TestCase):
         self.assertLess(POLL_TIME_BUDGET_SECONDS, 60)
 
 
+class PollOncePerCommandIsolationTests(unittest.TestCase):
+    """Covers a real P0: before this isolation existed, an uncaught
+    exception raised while processing ONE command propagated straight out
+    of poll_once() (the Phase 2 loop had no per-command try/except),
+    aborting the entire tick. Because _prioritized_commands() always sorts
+    claimed/running ahead of queued, a command that reliably threw on every
+    attempt would reliably abort the tick before any LATER command in the
+    same project -- or any later-rotated project -- was ever reached,
+    starving them indefinitely. main()'s own top-level `except Exception`
+    catches the escaped exception but discards the whole tick's results
+    with no detail beyond a generic {"status": "unavailable"}, so this
+    failure mode is invisible to Scheduled Task LastTaskResult monitoring
+    and repeats identically forever. Live-observed: a genuinely queued
+    Command sat unclaimed for many hours in a project whose only "claimed"
+    Command (sorted first) could not be reconciled on any natural tick,
+    even though every individual step of that reconciliation independently
+    proved correct under isolated inspection."""
+
+    ALLOWLIST = frozenset({("p1", "t1")})
+
+    def setUp(self):
+        self.store = CommandWatcherTests.allowlist_compliant_store()
+
+    def test_one_commands_exception_does_not_abort_the_rest_of_the_tick(self):
+        self.store.put("commands", "p1", "cmd-broken",
+                       command(command_id="cmd-broken", status="claimed", execution_id="exec-missing",
+                              claimed_at="2020-01-01T00:00:00Z"))
+        self.store.put("commands", "p1", "cmd-2", command(command_id="cmd-2"))
+
+        real_process_command = process_command
+
+        def flaky_process_command(store, service, cmd, **kwargs):
+            if cmd["command_id"] == "cmd-broken":
+                raise RuntimeError("boom")
+            return real_process_command(store, service, cmd, **kwargs)
+
+        runner = Mock(side_effect=lambda *a, **k: (k["on_running"](None), CommandWatcherTests.complete(a[7]))[1])
+        with patch("manager.command_watcher.process_command", side_effect=flaky_process_command), \
+             patch("manager.command_watcher.launch_task", runner):
+            results = poll_once(self.store, object(), allowlist=self.ALLOWLIST,
+                                 claim_factory=CommandWatcherTests.claim_factory,
+                                 health_check=lambda: True, quota_check=lambda service: True)
+
+        statuses = {r.get("command_id"): r.get("status") for r in results if isinstance(r, dict)}
+        # cmd-broken's own exception is recorded in this tick's results, not
+        # allowed to propagate out of poll_once() uncaught.
+        self.assertEqual("error", statuses.get("cmd-broken"))
+        # cmd-2, sorted right after it in the same project, still got
+        # processed in the SAME tick -- proving isolation, not just that a
+        # later tick would eventually retry it.
+        self.assertEqual("completed", self.store.get("commands", "p1", "cmd-2")["status"])
+        # cmd-broken itself is untouched by the failed attempt -- still
+        # exactly as claimed as before, available for a real fix or a later
+        # tick to reconcile, no partial/corrupt state written.
+        self.assertEqual("claimed", self.store.get("commands", "p1", "cmd-broken")["status"])
+
+
 class CommandProcessingPriorityTests(unittest.TestCase):
     """Covers the P0 fix for a real production trace: a stale `attention`
     Command sitting ahead of a genuinely actionable `queued` Command in
