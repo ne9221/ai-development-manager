@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ne9221/ai-development-manager/schema/quota_history.schema.json",
+  "title": "AI Development Manager - Quota History v0.1",
+  "description": "Bounded time-series store of quota telemetry snapshots for rate calculation and forecasting.",
+  "type": "object",
+  "required": ["schema_version", "updated_at", "snapshots"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "0.1.0"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "snapshots": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/quota_snapshot" }
+    }
+  },
+  "$defs": {
+    "quota_snapshot": {
+      "type": "object",
+      "required": [
+        "provider",
+        "observed_at",
+        "source",
+        "source_type",
+        "confidence",
+        "status",
+        "windows"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "account_id": {
+          "type": ["string", "null"]
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "last_updated": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "source": {
+          "type": "string"
+        },
+        "source_type": {
+          "type": "string",
+          "enum": ["official", "local_estimate", "manual"]
+        },
+        "confidence": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "windows": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/window" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "window": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "duration_minutes": {
+          "type": ["integer", "null"]
+        },
+        "used_percent": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "remaining_percent": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "resets_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

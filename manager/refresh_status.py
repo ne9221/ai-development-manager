@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Refresh automatic quota providers and publish one validated Drive SSOT."""
+"""Single-writer refresh worker that updates runtime and Drive status."""
 
+import argparse
 import json
 import os
 import sys
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,8 +16,7 @@ from collectors.publish_drive import build_service, sync_drive
 from manager.quota_reader import read_drive_status, validate_status
 
 
-ROOT = Path(__file__).parents[1]
-SCHEMA = ROOT / "schema" / "status.schema.json"
+SCHEMA = Path(__file__).parents[1] / "schema" / "status.schema.json"
 
 
 class RefreshError(RuntimeError):
@@ -66,16 +67,27 @@ def runtime_lock(path):
 
 
 def replace_provider(document, provider):
+    """Replace the entry matching (provider, account_id), not provider alone,
+    so publishing one Claude account's snapshot never wipes another
+    account's entry. account_id=None (the single/legacy-account case,
+    including every non-Claude provider such as codex) behaves exactly as
+    before this field existed."""
     provider_id = provider["provider"]
-    document["providers"] = [item for item in document["providers"] if item.get("provider") != provider_id]
+    account_id = provider.get("account_id")
+    document["providers"] = [
+        item for item in document["providers"]
+        if not (item.get("provider") == provider_id and item.get("account_id") == account_id)
+    ]
     document["providers"].append(provider)
 
 
-def claude_snapshot(path):
+def claude_snapshot(path, account_id=None):
     if not path.is_file():
         return None
     captured = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-    return normalize_claude(json.loads(path.read_text(encoding="utf-8-sig")), captured_at=captured)
+    provider = normalize_claude(json.loads(path.read_text(encoding="utf-8-sig")), captured_at=captured)
+    provider["account_id"] = account_id
+    return provider
 
 
 def write_atomic(path, document):
@@ -85,9 +97,16 @@ def write_atomic(path, document):
     temporary.replace(path)
 
 
-def refresh(*, service, runtime_path, log_path, lock_path, claude_path,
+def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_accounts=None,
             reader=read_drive_status, codex_collector=collect_codex,
-            publisher=sync_drive, validator=validate_status):
+            publisher=sync_drive, validator=validate_status, history_store=None):
+    """`claude_path` remains the single/legacy-account payload path (account_id=None),
+    unchanged from before. `claude_accounts`, if given, is an additional
+    {account_id: path} mapping for extra Claude accounts; each is captured,
+    logged, and published independently under its own (provider="claude",
+    account_id=...) key -- one account's missing/stale payload never
+    overwrites or blocks another's, and omitting claude_accounts entirely
+    reproduces today's single-account behavior byte-for-byte."""
     with runtime_lock(lock_path):
         log_line(log_path, "refresh start")
         try:
@@ -96,6 +115,18 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path,
             log_line(log_path, f"Drive read failure: {type(exc).__name__}")
             raise RefreshError("could not read Drive runtime SSOT") from exc
 
+        # Initialize history store if not explicitly disabled (history_store=False)
+        resolved_history_store = None
+        if history_store is not False:
+            if history_store is not None:
+                resolved_history_store = history_store
+            else:
+                try:
+                    from manager.quota_history import QuotaHistoryStore
+                    resolved_history_store = QuotaHistoryStore(runtime_path.parent / "quota_history.json")
+                except Exception as exc:
+                    log_line(log_path, f"history store init warning: {type(exc).__name__}")
+
         outcomes = {}
         try:
             _, codex_document = codex_collector(timeout=20)
@@ -103,25 +134,44 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path,
             replace_provider(document, codex)
             outcomes["codex"] = "success"
             log_line(log_path, "provider codex success")
+            if resolved_history_store is not None and codex.get("windows"):
+                try:
+                    resolved_history_store.append_snapshot({**codex, "observed_at": now_iso()})
+                    log_line(log_path, "quota history codex recorded")
+                except Exception as exc:
+                    log_line(log_path, f"quota history codex warning: {type(exc).__name__}")
         except Exception as exc:
             outcomes["codex"] = "unavailable"
             log_line(log_path, f"provider codex unavailable: {type(exc).__name__}")
 
-        try:
-            claude = claude_snapshot(claude_path)
-            existing = next((item for item in document["providers"] if item.get("provider") == "claude"), None)
-            if claude and claude["windows"]:
-                if not existing or claude["last_updated"] > existing.get("last_updated", ""):
-                    replace_provider(document, claude)
-                    outcomes["claude"] = "success"
+        accounts = {None: claude_path, **(claude_accounts or {})}
+        for account_id, path in accounts.items():
+            outcome_key = "claude" if account_id is None else f"claude:{account_id}"
+            try:
+                claude = claude_snapshot(path, account_id=account_id)
+                existing = next(
+                    (item for item in document["providers"]
+                     if item.get("provider") == "claude" and item.get("account_id") == account_id),
+                    None,
+                )
+                if claude and claude["windows"]:
+                    if not existing or claude["last_updated"] > existing.get("last_updated", ""):
+                        replace_provider(document, claude)
+                        outcomes[outcome_key] = "success"
+                        if resolved_history_store is not None:
+                            try:
+                                resolved_history_store.append_snapshot({**claude, "observed_at": now_iso()})
+                                log_line(log_path, f"quota history {outcome_key} recorded")
+                            except Exception as exc:
+                                log_line(log_path, f"quota history {outcome_key} warning: {type(exc).__name__}")
+                    else:
+                        outcomes[outcome_key] = "unchanged"
                 else:
-                    outcomes["claude"] = "unchanged"
-            else:
-                outcomes["claude"] = "unavailable"
-            log_line(log_path, f"provider claude {outcomes['claude']}")
-        except Exception as exc:
-            outcomes["claude"] = "unavailable"
-            log_line(log_path, f"provider claude unavailable: {type(exc).__name__}")
+                    outcomes[outcome_key] = "unavailable"
+                log_line(log_path, f"provider {outcome_key} {outcomes[outcome_key]}")
+            except Exception as exc:
+                outcomes[outcome_key] = "unavailable"
+                log_line(log_path, f"provider {outcome_key} unavailable: {type(exc).__name__}")
 
         document["generated_at"] = now_iso()
         try:
@@ -142,6 +192,23 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path,
         return {"providers": outcomes, "publish": result, "document": document}
 
 
+def _additional_claude_accounts():
+    """Optional {account_id: payload_path} mapping for extra Claude accounts,
+    read from CLAUDE_STATUSLINE_PAYLOADS as a JSON object of account_id ->
+    path strings. Absent/empty/unset reproduces today's single-account
+    behavior exactly (empty dict, merged with nothing)."""
+    raw = os.environ.get("CLAUDE_STATUSLINE_PAYLOADS")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RefreshError(f"CLAUDE_STATUSLINE_PAYLOADS must be a JSON object: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RefreshError("CLAUDE_STATUSLINE_PAYLOADS must be a JSON object of account_id -> path")
+    return {account_id: Path(path) for account_id, path in parsed.items()}
+
+
 def main():
     home = Path(os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
     try:
@@ -151,6 +218,7 @@ def main():
             log_path=home / "logs" / "refresh.log",
             lock_path=home / "refresh.lock",
             claude_path=Path(os.environ.get("CLAUDE_STATUSLINE_PAYLOAD", Path.home() / ".claude" / "statusline-payload.json")),
+            claude_accounts=_additional_claude_accounts(),
         )
         print(f"REFRESHED Drive status.json ({result['publish']['action']})")
         return 0
