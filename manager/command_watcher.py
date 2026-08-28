@@ -974,52 +974,41 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         return sweep_quota_document[0] or None
 
     project_ids = _rotated_project_ids(_enumerate_project_ids(discovery_store, deadline=deadline))
+
+    # Phase 1 (2026-08-28 P0 fix): the waiting_quota sweep runs for EVERY
+    # rotated project FIRST, entirely before the (potentially much more
+    # expensive) regular command-processing loop below touches any project.
+    # Live-reproduced root cause this closes: with enough real registered
+    # projects (a live HOME machine had 10, most of them old smoke/E2E test
+    # projects from prior sessions), cumulative per-project discovery
+    # overhead alone -- 1-8 real seconds each, just to enumerate commands or
+    # tasks -- can consume the ENTIRE POLL_TIME_BUDGET_SECONDS budget before
+    # a project unlucky enough to land in a late rotation position is ever
+    # reached at all, in either loop. A genuinely new waiting_quota Task
+    # then never gets promoted on ANY natural tick, indefinitely, purely
+    # because of how many OTHER projects exist and where this one happened
+    # to rotate to -- confirmed live (a real waiting_quota Task sat
+    # unpromoted for 70+ minutes across real ticks even after the separate
+    # MAX_COMMANDS_PER_POLL starvation fix above). Promotion itself is
+    # comparatively cheap (a bounded dispatch() re-attempt, never a real
+    # provider launch), so giving it first claim on the shared budget --
+    # still bounded by its own MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL cap,
+    # never unbounded -- lets it reliably complete for every rotated
+    # project before the backlog-heavy command loop gets a chance to
+    # exhaust the deadline on its own account.
+    # (project_id, command_id) pairs this SAME tick's Phase 1 just created.
+    # Phase 2 below must never process one of these -- command_id == task_id
+    # for every promotion (see _promote_waiting_quota_task's own docstring),
+    # so a fresh Phase 2 enumeration would otherwise see it immediately and
+    # attempt to launch it in the same tick it was promoted, breaking the
+    # existing "promoted this tick, launched on a later natural tick"
+    # contract several other tests and callers already depend on -- this
+    # fix's scope is closing the starvation gap, not changing that timing.
+    just_promoted = set()
+
     for project_id in project_ids:
-        if time.monotonic() >= deadline:
-            break
-        try:
-            commands = _enumerate_commands(discovery_store, project_id, deadline=deadline)
-        except TaskError:
-            # Preserves this function's exact prior behavior for command
-            # processing (nothing gets processed for this project this
-            # tick on any enumeration failure) -- but, unlike the old bare
-            # `continue` this replaced, must not also skip the independent
-            # waiting_quota sweep below. In particular, a project that has
-            # never had a single Command written to it yet has no COMMANDS
-            # Drive folder at all -- list_records_bounded()/list_records()
-            # raise TaskError("Drive folder not found") for that completely
-            # normal case, not a real error, and that must never suppress
-            # this same project's first-ever promotion.
-            commands = None
-        if commands is not None:
-            for command in _prioritized_commands(commands):
-                if len(results) == MAX_COMMANDS_PER_POLL:
-                    # Global command-processing budget reached -- but this
-                    # must never also skip the waiting_quota sweep below,
-                    # neither for this project nor any later one this poll:
-                    # that is a separate, independently-bounded budget
-                    # (MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL). Before this
-                    # fix, `return results` here exited poll_once() entirely
-                    # the moment a project's own stale attention/queued
-                    # command backlog (>= MAX_COMMANDS_PER_POLL of them, on
-                    # its own, before any other project is even reached)
-                    # filled the cap -- live-reproduced starving a genuine
-                    # new waiting_quota Task on that same project from ever
-                    # being promoted, tick after tick, for as long as that
-                    # backlog persisted. `break` still stops processing
-                    # MORE commands this poll (every later project's own
-                    # command loop hits this same check on its first
-                    # iteration and breaks immediately too, so the total
-                    # command-processing budget is still exactly as bounded
-                    # as before), it just no longer skips anyone's
-                    # waiting_quota sweep.
-                    break
-                if time.monotonic() >= deadline:
-                    return results
-                results.append(process_command(store, service, command, allowlist=allowlist,
-                                               origin_context=origin_context, **factories))
         if promotions_this_poll >= MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL or time.monotonic() >= deadline:
-            continue
+            break
         try:
             waiting_tasks = _enumerate_waiting_quota_tasks(discovery_store, project_id, deadline=deadline)
         except TaskError:
@@ -1031,10 +1020,49 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             if quota_document is None:
                 break  # quota unavailable this tick -- do not attempt more promotions
             try:
-                if _promote_waiting_quota_task(store, service, task, quota_document) is not None:
+                promoted = _promote_waiting_quota_task(store, service, task, quota_document)
+                if promoted is not None:
                     promotions_this_poll += 1
+                    just_promoted.add((project_id, promoted["command_id"]))
             except TaskError:
                 continue
+
+    # Phase 2: regular command processing, same rotated project order,
+    # using whatever budget remains after Phase 1 above.
+    for project_id in project_ids:
+        if time.monotonic() >= deadline:
+            break
+        try:
+            commands = _enumerate_commands(discovery_store, project_id, deadline=deadline)
+        except TaskError:
+            # A project that has never had a single Command written to it
+            # yet has no COMMANDS Drive folder at all --
+            # list_records_bounded()/list_records() raise TaskError("Drive
+            # folder not found") for that completely normal case, not a
+            # real error; nothing here needs any per-project fallback
+            # beyond skipping this project's own command processing (Phase
+            # 1's waiting_quota sweep above is already independent of this
+            # loop entirely, unlike before this restructure).
+            continue
+        for command in _prioritized_commands(commands):
+            if (project_id, command["command_id"]) in just_promoted:
+                continue  # promoted this same tick -- launches on a later natural tick, not this one
+            if len(results) == MAX_COMMANDS_PER_POLL:
+                # Global command-processing budget reached. `break` (not
+                # `return`) only stops processing MORE commands for THIS
+                # project -- every later-rotated project's own command loop
+                # hits this same check on its first iteration and breaks
+                # immediately too (the shared `results` list is still full),
+                # so the total command-processing budget stays exactly as
+                # bounded as before this fix. Phase 1 above has already run
+                # to completion for every project regardless, so this can
+                # never again starve anyone's waiting_quota sweep the way
+                # the pre-fix combined single-pass loop did.
+                break
+            if time.monotonic() >= deadline:
+                return results
+            results.append(process_command(store, service, command, allowlist=allowlist,
+                                           origin_context=origin_context, **factories))
     return results
 
 

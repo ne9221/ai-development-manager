@@ -1602,16 +1602,23 @@ class PollOnceTimeBudgetTests(unittest.TestCase):
     def test_deadline_never_interrupts_a_command_already_started(self):
         self.store.put("commands", "p1", "cmd-1", command())
         self.store.put("commands", "p1", "cmd-2", command(command_id="cmd-2"))
-        calls = {"n": 0}
+        state = {"started": 0}
 
         def fake_monotonic():
-            calls["n"] += 1
-            # Call 1: project-level check (before cmd-1 is even looked at) -- under budget.
-            # Call 2: command-level check, before cmd-1 -- still under budget, cmd-1 starts.
-            # Call 3+: command-level check, before cmd-2 -- budget now spent.
-            return 0.0 if calls["n"] <= 2 else 100.0
+            # Under budget for every check up through (and including) the
+            # one that lets cmd-1 start; past-deadline for every check
+            # afterward, regardless of exactly how many time.monotonic()
+            # calls Phase 1's waiting_quota sweep (which runs first, across
+            # all projects, before any command is even looked at) happens
+            # to make -- a call-count-based mock would be brittle against
+            # that phase's own internal check count.
+            return 100.0 if state["started"] >= 1 else 0.0
 
-        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        def instrumented_runner(*args, **kwargs):
+            state["started"] += 1
+            return (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1]
+
+        runner = Mock(side_effect=instrumented_runner)
         with patch("manager.command_watcher.launch_task", runner), \
              patch("manager.command_watcher.time.monotonic", side_effect=fake_monotonic):
             results = poll_once(self.store, object(), allowlist=self.ALLOWLIST, deadline=50.0,
@@ -1722,17 +1729,21 @@ class PollOnceProcessesQueuedBeforeStaleAttentionTests(unittest.TestCase):
         ))
         self.store.put("commands", "p1", "cmd-queued", command(command_id="cmd-queued"))
 
-        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
-        calls = {"n": 0}
+        state = {"started": 0}
+
+        def instrumented_runner(*args, **kwargs):
+            state["started"] += 1
+            return (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1]
+
+        runner = Mock(side_effect=instrumented_runner)
 
         def fake_monotonic():
-            # Simulate enumeration having already consumed most of the
-            # budget: the project-level and first command-level checks pass
-            # (call 1-2), but the SECOND command-level check (i.e. any
-            # attempt to start a second process_command() this tick) is
-            # already past deadline.
-            calls["n"] += 1
-            return 0.0 if calls["n"] <= 2 else 100.0
+            # Under budget through the check that lets cmd-queued start;
+            # past-deadline for every check after that -- robust against
+            # exactly how many time.monotonic() calls Phase 1's
+            # waiting_quota sweep (all projects, before any command is
+            # looked at) happens to make, unlike a hardcoded call count.
+            return 100.0 if state["started"] >= 1 else 0.0
 
         with patch("manager.command_watcher.launch_task", runner), \
              patch("manager.command_watcher.time.monotonic", side_effect=fake_monotonic):
@@ -1763,12 +1774,16 @@ class PollOnceProcessesQueuedBeforeStaleAttentionTests(unittest.TestCase):
         ))
         self.store.put("commands", "p1", "cmd-queued", command(command_id="cmd-queued"))
 
-        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
-        calls = {"n": 0}
+        state = {"started": 0}
+
+        def instrumented_runner(*args, **kwargs):
+            state["started"] += 1
+            return (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1]
+
+        runner = Mock(side_effect=instrumented_runner)
 
         def fake_monotonic():
-            calls["n"] += 1
-            return 0.0 if calls["n"] <= 2 else 100.0
+            return 100.0 if state["started"] >= 1 else 0.0
 
         with patch("manager.command_watcher.launch_task", runner), \
              patch("manager.command_watcher.time.monotonic", side_effect=fake_monotonic):
@@ -2472,6 +2487,53 @@ class WaitingQuotaSweepStarvationTests(unittest.TestCase):
         self.assertEqual("codex", promoted["provider"])
         self.assertEqual("queued", promoted["status"])
         self.assertEqual("req-starvation", promoted.get("request_id"))
+
+    def test_waiting_quota_enumeration_happens_before_any_command_enumeration(self):
+        """Structural lock-in of the fix's actual mechanism (not just its
+        observable effect above): Phase 1's waiting_quota sweep must
+        complete for every rotated project BEFORE Phase 2 ever calls
+        _enumerate_commands for any project -- this is what protects a
+        late-rotated project's own promotion from cumulative discovery cost
+        piling up in front of it (live-reproduced: with enough real
+        registered projects, that cumulative cost alone can exhaust the
+        entire poll budget). A call-order regression here would silently
+        reopen the starvation window even if the other two tests above
+        still happened to pass in their own narrower shapes."""
+        store = Store()
+        create_project(store, project())
+        waiting_task = task(read_only=True)
+        waiting_task.update(
+            recommended_provider=None, quota_evidence={},
+            source_context={"origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": "req-order",
+                             "goal": "test", "admission_version": "1.0"},
+        )
+        create_task(store, waiting_task, assign=False)
+        store.put("commands", "p1", "cmd-attn", command(
+            command_id="cmd-attn", task_id="stale-task", status="attention",
+            execution_id="command-cmd-attn",
+        ))
+
+        import manager.command_watcher as cw_module
+        call_order = []
+        orig_enum_commands = cw_module._enumerate_commands
+        orig_enum_waiting = cw_module._enumerate_waiting_quota_tasks
+
+        def traced_commands(*a, **k):
+            call_order.append("commands")
+            return orig_enum_commands(*a, **k)
+
+        def traced_waiting(*a, **k):
+            call_order.append("waiting")
+            return orig_enum_waiting(*a, **k)
+
+        with patch("manager.command_watcher.read_drive_status", return_value=fresh_quota_fixture(80, 90)), \
+             patch("manager.command_watcher._enumerate_commands", traced_commands), \
+             patch("manager.command_watcher._enumerate_waiting_quota_tasks", traced_waiting):
+            poll_once(store, object(), allowlist=self.ALLOWLIST,
+                     claim_factory=CommandWatcherTests.claim_factory,
+                     health_check=lambda: True, quota_check=lambda service: True)
+
+        self.assertEqual(["waiting", "commands"], call_order)
 
 
 if __name__ == "__main__": unittest.main()
