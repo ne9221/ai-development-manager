@@ -329,6 +329,45 @@ function Confirm-AdmWatcherTaskIdentity {
     return $task
 }
 
+# Fail-closed guard for Pester test files (AdmDesktop.Tests.ps1) that
+# exercise New-AdmHiddenScheduledTaskAction against a caller-supplied
+# repository path. That helper has a REAL, unmocked side effect of writing
+# "$Repository\manager\generated\<WrapperName>.vbs" to disk -- for the
+# Command Watcher this is exactly the file the real, live Scheduled Task
+# reads its launch arguments from on every tick. If a test suite is ever
+# invoked directly against the checkout that IS the real production Command
+# Watcher's own checkout (instead of an isolated scratch clone, per this
+# project's established workflow), exercising that helper would silently
+# overwrite the live launcher file with test/placeholder arguments and break
+# the real Scheduled Task on its very next tick -- invisibly, since the
+# Task's own registered Action (a fixed "wscript.exe <vbs path>") never
+# changes; only the vbs file's content does.
+#
+# Detects that condition by reading the REAL, currently-registered
+# $WatcherTaskName task and checking whether its actual vbs path already
+# resolves to "$Repository\manager\generated\command-watcher.vbs" -- if so,
+# this checkout IS that task's live binding, and no test in this file may
+# run against it.
+function Assert-AdmNotProductionCheckoutForTests {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$WatcherTaskName
+    )
+    $realTask = Get-ScheduledTask -TaskName $WatcherTaskName -ErrorAction SilentlyContinue
+    if (-not $realTask -or @($realTask.Actions).Count -ne 1) { return }
+    $realAction = @($realTask.Actions)[0]
+    if (-not [string]::Equals([string]$realAction.Execute, "wscript.exe", [StringComparison]::OrdinalIgnoreCase)) { return }
+    $rawRealArgs = ([string]$realAction.Arguments).Trim()
+    $doubleQuote = [char]34
+    if ($rawRealArgs.Length -lt 2 -or $rawRealArgs[0] -ne $doubleQuote -or $rawRealArgs[-1] -ne $doubleQuote) { return }
+    $realVbsPath = $rawRealArgs.Substring(1, $rawRealArgs.Length - 2)
+    if (-not (Test-Path -LiteralPath $realVbsPath -PathType Leaf)) { return }
+    $thisSuiteWouldWrite = Join-Path $Repository "manager\generated\command-watcher.vbs"
+    if ([IO.Path]::GetFullPath($realVbsPath) -eq [IO.Path]::GetFullPath($thisSuiteWouldWrite)) {
+        throw "PESTER_PRODUCTION_CHECKOUT_GUARD: refusing to run this test suite -- this checkout ('$Repository') is the real '$WatcherTaskName' task's own live checkout (its registered Scheduled Task action already points at the exact generated vbs path this suite would overwrite: '$realVbsPath'). Run this suite from an isolated scratch clone instead, never against the live production checkout."
+    }
+}
+
 function Write-AdmWatcherMaintenance {
     param(
         [Parameter(Mandatory = $true)][string]$Reason,

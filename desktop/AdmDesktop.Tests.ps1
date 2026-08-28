@@ -10,6 +10,17 @@ $githubIngressName = "AI Development Manager - GitHub Dispatch Ingress"
 
 . (Join-Path $here "AdmCommon.ps1")
 
+# Fail-closed production-checkout guard, evaluated at discovery time (before
+# any `Mock Get-ScheduledTask` below can shadow the real cmdlet, and before
+# any BeforeEach in this file runs). This suite exercises New-RealHiddenWatcherVbs
+# / New-AdmHiddenScheduledTaskAction against `$repository` (this file's own
+# checkout root) -- those helpers have a REAL, unmocked side effect of writing
+# `$repository\manager\generated\command-watcher.vbs` to disk, which is exactly
+# the file the real, live Command Watcher Scheduled Task reads its launch
+# arguments from on every tick. See Assert-AdmNotProductionCheckoutForTests in
+# AdmCommon.ps1 for the check itself and its dedicated regression tests.
+Assert-AdmNotProductionCheckoutForTests -Repository $repository -WatcherTaskName $watcherName
+
 function New-TestTask([string]$Name, [string]$State = "Ready", [string]$Repo = $repository) {
     [pscustomobject]@{
         TaskName = $Name
@@ -294,5 +305,52 @@ Describe "Watcher hidden-VBS (wscript.exe) identity guard" {
     It "the production launcher shape stays wscript.exe (hidden), never a directly-registered powershell.exe" {
         $helperContent = Get-Content -Raw (Join-Path $here "..\manager\AdmHiddenLaunch.ps1")
         $helperContent | Should Match 'New-ScheduledTaskAction -Execute "wscript\.exe"'
+    }
+}
+
+Describe "Assert-AdmNotProductionCheckoutForTests -- refuses to run test suites that would overwrite a live watcher launcher" {
+    BeforeEach {
+        $script:guardRoot = Join-Path $TestDrive ([Guid]::NewGuid().ToString("N"))
+        $script:guardRealRepo = Join-Path $script:guardRoot "real-production-checkout"
+        $script:guardOtherRepo = Join-Path $script:guardRoot "unrelated-checkout"
+        $script:guardVbsDir = Join-Path $script:guardRealRepo "manager\generated"
+        New-Item -ItemType Directory -Force -Path $script:guardVbsDir | Out-Null
+        New-Item -ItemType Directory -Force -Path $script:guardOtherRepo | Out-Null
+        $script:guardVbsPath = Join-Path $script:guardVbsDir "command-watcher.vbs"
+        Set-Content -LiteralPath $script:guardVbsPath -Value "' placeholder generated content" -Encoding ASCII
+    }
+
+    It "throws when the real registered task's vbs already lives at this exact repository's generated path (the incident this guard exists to prevent)" {
+        Mock Get-ScheduledTask {
+            [pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = "wscript.exe"; Arguments = "`"$script:guardVbsPath`"" }) }
+        }
+        { Assert-AdmNotProductionCheckoutForTests -Repository $script:guardRealRepo -WatcherTaskName $watcherName } | Should Throw "PESTER_PRODUCTION_CHECKOUT_GUARD"
+    }
+
+    It "does not throw when the registered task's vbs points at a different repository" {
+        Mock Get-ScheduledTask {
+            [pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = "wscript.exe"; Arguments = "`"$script:guardVbsPath`"" }) }
+        }
+        { Assert-AdmNotProductionCheckoutForTests -Repository $script:guardOtherRepo -WatcherTaskName $watcherName } | Should Not Throw
+    }
+
+    It "does not throw when no Command Watcher task is registered at all" {
+        Mock Get-ScheduledTask { $null }
+        { Assert-AdmNotProductionCheckoutForTests -Repository $script:guardRealRepo -WatcherTaskName $watcherName } | Should Not Throw
+    }
+
+    It "does not throw when the registered task's vbs path no longer exists on disk" {
+        Remove-Item -LiteralPath $script:guardVbsPath -Force
+        Mock Get-ScheduledTask {
+            [pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = "wscript.exe"; Arguments = "`"$script:guardVbsPath`"" }) }
+        }
+        { Assert-AdmNotProductionCheckoutForTests -Repository $script:guardRealRepo -WatcherTaskName $watcherName } | Should Not Throw
+    }
+
+    It "does not throw for a legacy directly-registered powershell.exe action (not wscript.exe)" {
+        Mock Get-ScheduledTask {
+            [pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = "powershell.exe"; Arguments = "-File `"$script:guardVbsPath`"" }) }
+        }
+        { Assert-AdmNotProductionCheckoutForTests -Repository $script:guardRealRepo -WatcherTaskName $watcherName } | Should Not Throw
     }
 }
