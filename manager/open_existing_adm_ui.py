@@ -61,6 +61,7 @@ class _User32:
         if os.name != "nt":
             raise RuntimeError("interactive Windows desktop is unavailable")
         self.user32 = ctypes.windll.user32
+        self.kernel32 = ctypes.windll.kernel32
 
     def interactive(self):
         # A desktop handle proves this process has an interactive input desktop.
@@ -85,8 +86,31 @@ class _User32:
         return found
 
     def focus(self, hwnd):
+        # SetForegroundWindow() alone is denied by Windows' foreground-lock
+        # when called from a process that does not itself currently own
+        # keyboard focus -- which is exactly this caller's situation, since
+        # it runs from a hidden Scheduled Task process, never the
+        # user's own foreground app. Confirmed live: this whole action
+        # would otherwise return dashboard_focus_denied on every single
+        # invocation in real production use, making "already open -> focus"
+        # never actually work. AttachThreadInput() is the standard,
+        # documented Win32 workaround (used by taskbars, alt-tab switchers,
+        # and countless other legitimate foreground-window callers): briefly
+        # share input state with whichever thread currently owns the
+        # foreground so this process is treated as if it does too, for the
+        # duration of the SetForegroundWindow() call only.
         self.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        return bool(self.user32.SetForegroundWindow(hwnd))
+        foreground_hwnd = self.user32.GetForegroundWindow()
+        current_thread_id = self.kernel32.GetCurrentThreadId()
+        foreground_thread_id = self.user32.GetWindowThreadProcessId(foreground_hwnd, None) if foreground_hwnd else 0
+        attached = False
+        if foreground_thread_id and foreground_thread_id != current_thread_id:
+            attached = bool(self.user32.AttachThreadInput(current_thread_id, foreground_thread_id, True))
+        try:
+            return bool(self.user32.SetForegroundWindow(hwnd))
+        finally:
+            if attached:
+                self.user32.AttachThreadInput(current_thread_id, foreground_thread_id, False)
 
     def port_open(self):
         return _port_open()
