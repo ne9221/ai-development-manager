@@ -32,6 +32,22 @@ class OpenExistingAdmUiTests(unittest.TestCase):
     def test_fails_closed_without_interactive_desktop(self):
         self.assertEqual("no_interactive_desktop", focus_existing_adm_ui(FakeApi(False))["error_kind"])
 
+    def test_focuses_existing_window_with_the_real_observed_localized_title(self):
+        """P0 regression, discovered via a real production E2E: the actual
+        MainWindowTitle observed on this desktop is "ADM 營運儀表板 - Google
+        Chrome" -- NOT dashboard.py's own English page_title
+        ("ADM Unified Operations Dashboard"), almost certainly because this
+        desktop's Chrome window is a pinned app-mode/PWA shortcut under a
+        custom Traditional-Chinese name, independent of the page's own
+        <title> tag. Without this marker, every invocation failed to
+        recognize its own previously-opened window and opened an unbounded
+        number of duplicate tabs on this exact machine instead of focusing
+        the existing one -- true idempotency (invoking twice in a row opens
+        only one tab total) depends on this."""
+        api = FakeApi(windows=((7, "ADM 營運儀表板 - Google Chrome"),))
+        self.assertEqual("completed", focus_existing_adm_ui(api)["status"])
+        self.assertEqual([7], api.focused)
+
     def test_opens_browser_for_running_service_without_window(self):
         api = FakeApi(ports=(True,))
         self.assertEqual("completed", focus_existing_adm_ui(api)["status"])

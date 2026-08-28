@@ -11,7 +11,20 @@ from pathlib import Path
 DASHBOARD_PORT = 8501
 DASHBOARD_URL = f"http://localhost:{DASHBOARD_PORT}/"
 DASHBOARD_LAUNCHER = Path(__file__).resolve().parent.parent / "desktop" / "Start-Dashboard.ps1"
-TITLE_MARKERS = ("ADM Unified Operations Dashboard", f"localhost:{DASHBOARD_PORT}")
+# "ADM 營運儀表板" is the real observed MainWindowTitle on this production
+# desktop -- confirmed live: a Chrome window opened against the Dashboard's
+# own dashboard.py st.set_page_config(page_title="ADM Unified Operations
+# Dashboard") reports MainWindowTitle "ADM 營運儀表板 - Google Chrome", not
+# the English page_title string at all (almost certainly a Chrome app-mode/
+# PWA shortcut pinned under a custom Traditional-Chinese name by whoever set
+# up this desktop, independent of the page's own <title> tag -- Windows
+# reports the SHORTCUT's/app-window's own title, not the page's). Without
+# this marker, every invocation on this machine failed to recognize its own
+# previously-opened window and opened an unbounded number of duplicate tabs
+# instead of focusing the existing one. Kept alongside the English markers
+# (never replacing them) since a different desktop/locale may still show
+# the literal page_title or URL instead.
+TITLE_MARKERS = ("ADM Unified Operations Dashboard", f"localhost:{DASHBOARD_PORT}", "ADM 營運儀表板")
 START_TIMEOUT_SECONDS = 15.0
 POLL_INTERVAL_SECONDS = 0.5
 
