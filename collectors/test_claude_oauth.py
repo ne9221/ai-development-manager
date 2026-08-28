@@ -303,7 +303,7 @@ class ClaudeCliRefreshBridgeTests(unittest.TestCase):
             # effect of the preflight -- ADM only re-reads the file, it never
             # writes it.
             _write_credentials(self.base_a, token="fresh-token-from-cli")
-            return _FakeCompletedProcess(0, json.dumps({"loggedIn": True}))
+            return _FakeCompletedProcess(0, "ok")
 
         seen_tokens = []
 
@@ -326,7 +326,7 @@ class ClaudeCliRefreshBridgeTests(unittest.TestCase):
         def cli_run(argv, **kwargs):
             cli_calls.append((argv, kwargs))
             _write_credentials(self.base_a, token="fresh-token-from-cli")
-            return _FakeCompletedProcess(0, json.dumps({"loggedIn": True}))
+            return _FakeCompletedProcess(0, "ok")
 
         seen_tokens = []
         call_count = {"n": 0}
@@ -347,30 +347,42 @@ class ClaudeCliRefreshBridgeTests(unittest.TestCase):
         self.assertIn("fresh-token-from-cli", seen_tokens[1])
         self.assertEqual("ok", provider["status"])
 
-    # 4. CLI reports loggedIn=true but token unchanged after preflight ->
-    #    AUTH_REFRESH_NOT_PERSISTED.
-    def test_4_logged_in_but_unchanged_fails_not_persisted(self):
+    # 4. CLI refresh completion exits 0 (succeeded) but the on-disk token is
+    #    unchanged afterward -> AUTH_REFRESH_NOT_PERSISTED. This is the
+    #    exact real-production case that motivated this whole design:
+    #    `claude auth status --json` always "succeeds" (exit 0) yet never
+    #    touches the credentials file -- this collector must never mistake
+    #    that for a real refresh.
+    def test_4_completion_succeeds_but_unchanged_fails_not_persisted(self):
         _write_credentials(self.base_a, token="stale-token")
 
         def cli_run(argv, **kwargs):
-            # Reports success but does not touch the credentials file at all.
-            return _FakeCompletedProcess(0, json.dumps({"loggedIn": True}))
+            # Reports success but does not touch the credentials file at all
+            # -- exactly what `claude auth status --json` does in real
+            # production, confirmed live.
+            return _FakeCompletedProcess(0, "ok")
 
         with self.assertRaises(AuthRefreshNotPersistedError):
             collect(str(self.base_a), "account-a", opener=self._always_401_opener(), cli_run=cli_run)
 
-    # 5. CLI reports loggedIn=false -> fails closed.
-    def test_5_logged_out_fails_closed(self):
+    # 5. CLI refresh completion exits non-zero (e.g. genuinely logged out) ->
+    #    fails closed as AUTH_REFRESH_NOT_PERSISTED, never a generic
+    #    CollectorError -- an unambiguous "the CLI ran and said no" is not
+    #    the same uncertainty class as "the CLI invocation itself never
+    #    completed" (see test_6a).
+    def test_5_nonzero_exit_fails_closed(self):
         _write_credentials(self.base_a, token="stale-token")
 
         def cli_run(argv, **kwargs):
-            return _FakeCompletedProcess(1, json.dumps({"loggedIn": False}))
+            return _FakeCompletedProcess(1, "")
 
         with self.assertRaises(AuthRefreshNotPersistedError):
             collect(str(self.base_a), "account-a", opener=self._always_401_opener(), cli_run=cli_run)
 
-    # 6. CLI subprocess result malformed / times out / unexpected nonzero
-    #    exit -> fails closed (a distinct, non-looping CollectorError).
+    # 6. CLI invocation itself never completes (times out / OS error) ->
+    #    fails closed as a generic CollectorError, distinct from the clean
+    #    non-zero-exit case above -- an uncertain outcome must never be
+    #    mistaken for a clear "no".
     def test_6a_cli_timeout_fails_closed(self):
         _write_credentials(self.base_a, token="stale-token")
 
@@ -380,23 +392,37 @@ class ClaudeCliRefreshBridgeTests(unittest.TestCase):
         with self.assertRaises(CollectorError):
             collect(str(self.base_a), "account-a", opener=self._always_401_opener(), cli_run=cli_run)
 
-    def test_6b_cli_malformed_output_fails_closed(self):
+    # 6c. Any non-zero exit code (not just 1) still resolves to the same
+    #     unambiguous "did not refresh" outcome -- there is no longer a
+    #     separate "unexpected exit code" error class, since this module no
+    #     longer parses the completion's stdout as structured status at all.
+    def test_6c_any_nonzero_exit_fails_closed(self):
         _write_credentials(self.base_a, token="stale-token")
 
         def cli_run(argv, **kwargs):
-            return _FakeCompletedProcess(0, "not json{{{")
+            return _FakeCompletedProcess(2, "ok")
 
-        with self.assertRaises(CollectorError):
+        with self.assertRaises(AuthRefreshNotPersistedError):
             collect(str(self.base_a), "account-a", opener=self._always_401_opener(), cli_run=cli_run)
 
-    def test_6c_cli_unexpected_exit_code_fails_closed(self):
-        _write_credentials(self.base_a, token="stale-token")
+    # 6d. P0 regression -- the real production bug: the refresh completion
+    #     invokes a real prompt (`-p "ok"`), never `auth status --json`
+    #     (confirmed live to never persist a refreshed token even when the
+    #     stored token had been expired for over 5 days).
+    def test_6d_invokes_real_completion_not_auth_status(self):
+        _write_credentials(self.base_a, token="stale-token", expires_at=_far_past_ms())
+        seen_argv = []
 
         def cli_run(argv, **kwargs):
-            return _FakeCompletedProcess(2, json.dumps({"loggedIn": True}))
+            seen_argv.append(argv)
+            _write_credentials(self.base_a, token="fresh-token", expires_at=_far_future_ms())
+            return _FakeCompletedProcess(0, "ok")
 
-        with self.assertRaises(CollectorError):
-            collect(str(self.base_a), "account-a", opener=self._always_401_opener(), cli_run=cli_run)
+        collect(str(self.base_a), "account-a", opener=self._usage_opener(), cli_run=cli_run)
+        self.assertEqual(1, len(seen_argv))
+        self.assertNotIn("auth", seen_argv[0])
+        self.assertNotIn("status", seen_argv[0])
+        self.assertIn("-p", seen_argv[0])
 
     # 7. account-a's real default (config_dir=None, i.e. the plain ~/.claude
     #    account with no CLAUDE_CONFIG_DIR override) invokes the CLI with
@@ -407,7 +433,7 @@ class ClaudeCliRefreshBridgeTests(unittest.TestCase):
 
         def cli_run(argv, **kwargs):
             seen_envs.append(kwargs.get("env"))
-            return _FakeCompletedProcess(1, json.dumps({"loggedIn": False}))
+            return _FakeCompletedProcess(1, "")
 
         from collectors.claude_oauth import _refresh_access_token_via_cli
         with self.assertRaises(AuthRefreshNotPersistedError):
@@ -424,7 +450,7 @@ class ClaudeCliRefreshBridgeTests(unittest.TestCase):
         def cli_run(argv, **kwargs):
             seen_envs.append(kwargs.get("env"))
             _write_credentials(self.base_b, token="fresh-token-b")
-            return _FakeCompletedProcess(0, json.dumps({"loggedIn": True}))
+            return _FakeCompletedProcess(0, "ok")
 
         collect(config_dir_b, "account-b", opener=self._401_then_success_opener(), cli_run=cli_run)
         self.assertEqual(1, len(seen_envs))
@@ -457,7 +483,7 @@ class ClaudeCliRefreshBridgeTests(unittest.TestCase):
                     self.assertEqual(expected_config_dir, env["CLAUDE_CONFIG_DIR"])
                     touched_paths.append(env["CLAUDE_CONFIG_DIR"])
                 _write_credentials(Path(expected_config_dir), token=new_token)
-                return _FakeCompletedProcess(0, json.dumps({"loggedIn": True}))
+                return _FakeCompletedProcess(0, "ok")
             return cli_run_inner
 
         collect(str(self.base_a), "account-a", opener=self._401_then_success_opener(),
@@ -513,7 +539,7 @@ class ClaudeCliRefreshBridgeTests(unittest.TestCase):
         def cli_run(argv, **kwargs):
             call_count["n"] += 1
             _write_credentials(self.base_a, token="fresh-token", expires_at=_far_future_ms())
-            return _FakeCompletedProcess(0, json.dumps({"loggedIn": True}))
+            return _FakeCompletedProcess(0, "ok")
 
         collect(str(self.base_a), "account-a", opener=self._usage_opener(), cli_run=cli_run)
         self.assertEqual(1, call_count["n"])
@@ -528,7 +554,7 @@ class ClaudeCliRefreshBridgeTests(unittest.TestCase):
         def cli_run(argv, **kwargs):
             cli_calls["n"] += 1
             _write_credentials(self.base_a, token="fresh-token-still-rejected")
-            return _FakeCompletedProcess(0, json.dumps({"loggedIn": True}))
+            return _FakeCompletedProcess(0, "ok")
 
         call_count = {"n": 0}
 
@@ -566,7 +592,7 @@ class ClaudeCliRefreshBridgeTests(unittest.TestCase):
         _write_credentials(self.base_a, token=secret_stale)
 
         def cli_run(argv, **kwargs):
-            return _FakeCompletedProcess(1, json.dumps({"loggedIn": False}))
+            return _FakeCompletedProcess(1, "")
 
         def opener(request, timeout=None):
             auth = request.get_header("Authorization") or ""

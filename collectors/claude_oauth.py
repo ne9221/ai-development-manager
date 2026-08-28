@@ -18,17 +18,35 @@ refresh protocol itself and never reads or uses the stored refresh
 material directly -- the Claude CLI is the sole credential authority.
 When the stored access token looks clearly expired, or the usage endpoint
 itself rejects it with HTTP 401, this module runs one bounded,
-non-interactive `claude auth status --json` preflight against the exact
-account's own environment, then re-reads the credentials file to see
-whether the CLI actually persisted a newer access token. Only when a
-genuinely different/fresher token is now on disk does it retry the usage
-GET, and only once. If the CLI preflight cannot be confirmed to have
-persisted a fresh token -- whether it reports not-logged-in, reports
-logged-in without changing anything on disk, or the preflight itself
-fails/times out/returns something unparseable -- this fails closed
-(AuthRefreshNotPersistedError for the two "checked, nothing new" cases,
-CollectorError for a broken preflight) rather than looping or reusing a
-stale token.
+non-interactive real completion (`claude -p "ok"`, the smallest possible
+real prompt) against the exact account's own environment, then re-reads
+the credentials file to see whether the CLI actually persisted a newer
+access token as a side effect. Only when a genuinely different/fresher
+token is now on disk does it retry the usage GET, and only once.
+
+This is deliberately NOT `claude auth status --json` (an earlier version
+of this module used that instead) -- confirmed live, on both real
+production accounts, after their access tokens had been expired for 33
+hours and 137 hours respectively: `claude auth status --json` reports
+`loggedIn: true` and returns instantly, but never touches the on-disk
+`accessToken`/`expiresAt` at all, even once. It appears to be a lightweight
+local check (whatever session/login state it inspects is evidently
+distinct from the specific OAuth access token this collector needs), never
+an operation that exercises the CLI's real token-refresh path. Only an
+ACTUAL API-invoking completion was confirmed, live, to make the CLI
+perform its internal OAuth refresh (via the stored refresh_token, which
+this module still never touches directly) and persist a new access token
+to disk -- this is the real, necessary cost of a working refresh: one
+minimal real completion, spent only when the token has already been
+confirmed stale/rejected, not on every poll.
+
+If this bounded real completion cannot be confirmed to have persisted a
+fresh token -- whether the CLI invocation itself exits non-zero (times
+out, errors, or reports the account is not actually logged in) or exits
+cleanly yet leaves the on-disk token/expiry completely unchanged -- this
+fails closed (AuthRefreshNotPersistedError for the two "ran, nothing new"
+cases, CollectorError for the invocation itself never completing) rather
+than looping, guessing, or reusing a stale token.
 
 Security contract: neither the access token nor the on-disk credential
 material this module reads is ever placed in a return value, log line, or
@@ -54,7 +72,16 @@ from typing import Any, Callable, Optional
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
-AUTH_PREFLIGHT_TIMEOUT_SECONDS = 10.0
+# A real API round trip (unlike the old `claude auth status --json` check)
+# needs meaningfully more time than a local-only status read; bounded, but
+# generous enough that ordinary network/API latency doesn't spuriously
+# fail-close a genuinely working refresh.
+AUTH_PREFLIGHT_TIMEOUT_SECONDS = 30.0
+# Deliberately the smallest real completion that still exercises the CLI's
+# actual API-authenticated path -- this is spent (a small amount of real
+# usage quota) only when the access token has already been confirmed
+# stale/rejected, never on every ordinary poll.
+CLI_REFRESH_PROMPT = "ok"
 
 
 class CollectorError(RuntimeError):
@@ -72,15 +99,15 @@ class AuthStaleError(CollectorError):
 
 
 class AuthRefreshNotPersistedError(CollectorError):
-    """The Claude CLI auth preflight ran, but re-reading the credentials
-    file afterward shows no new/fresher access token was actually
-    persisted (either the CLI reported not-logged-in, or it reported
-    logged-in yet left the on-disk token/expiry unchanged). ADM never
-    calls the Anthropic OAuth refresh endpoint itself and never treats the
-    stored refresh material as usable credential authority on its own --
-    when the CLI (the sole refresh authority) doesn't produce a fresh
-    token, this fails closed instead of retrying in a loop or reusing the
-    stale token."""
+    """The bounded CLI refresh completion ran, but re-reading the
+    credentials file afterward shows no new/fresher access token was
+    actually persisted (either the completion itself exited non-zero, or
+    it exited cleanly yet left the on-disk token/expiry unchanged). ADM
+    never calls the Anthropic OAuth refresh endpoint itself and never
+    treats the stored refresh material as usable credential authority on
+    its own -- when the CLI (the sole refresh authority) doesn't produce a
+    fresh token, this fails closed instead of retrying in a loop or
+    reusing the stale token."""
 
     def __init__(self):
         super().__init__("AUTH_REFRESH_NOT_PERSISTED")
@@ -186,52 +213,47 @@ def _cli_env(config_dir: Optional[str]) -> Optional[dict]:
     return env
 
 
-def run_auth_preflight(config_dir: Optional[str], timeout: float = AUTH_PREFLIGHT_TIMEOUT_SECONDS,
-                        run: Callable[..., Any] = subprocess.run,
-                        executable: Optional[str] = None) -> bool:
-    """Runs one bounded, non-interactive `claude auth status --json` against
-    the exact account environment, and returns only the `loggedIn` boolean
-    it reports. This never performs a refresh itself -- it only asks the
-    CLI to report status; whatever internal refresh logic the CLI may run
-    on its own is entirely up to the CLI. Raises CollectorError on anything
-    that isn't an unambiguous loggedIn result (timeout, OS error, unexpected
-    exit code, unparseable output, or an inconsistent exit-code/body
-    combination) so an uncertain check is never mistaken for a clear
-    answer. Never logs or returns anything from the subprocess output other
-    than this one boolean."""
+def run_auth_refresh(config_dir: Optional[str], timeout: float = AUTH_PREFLIGHT_TIMEOUT_SECONDS,
+                     run: Callable[..., Any] = subprocess.run,
+                     executable: Optional[str] = None) -> bool:
+    """Runs one bounded, non-interactive real completion (`claude -p
+    "ok"`) against the exact account environment, and returns whether that
+    invocation itself completed successfully (exit code 0). See this
+    module's own docstring for why this real completion -- not `claude
+    auth status --json` -- is what actually exercises the CLI's
+    token-refresh path; confirmed live on real production accounts.
+
+    This never performs the OAuth refresh itself -- it only asks the CLI
+    to complete one minimal real prompt; whatever internal refresh logic
+    the CLI runs as a side effect of that real, authenticated API call is
+    entirely up to the CLI. Raises CollectorError only when the invocation
+    itself could not be judged at all (timeout, OS error) so an uncertain
+    outcome is never mistaken for a clear answer -- a clean non-zero exit
+    (the CLI ran and reported it could not complete the prompt, e.g.
+    genuinely logged out) is a normal, unambiguous `False`, not an
+    exception. Never logs or returns the real completion's own output
+    text -- only this one boolean."""
     exe = _cli_executable(executable)
     env = _cli_env(config_dir)
     try:
-        completed = run([exe, "auth", "status", "--json"], capture_output=True,
+        completed = run([exe, "-p", CLI_REFRESH_PROMPT], capture_output=True,
                          text=True, timeout=timeout, env=env, shell=False)
     except subprocess.TimeoutExpired as exc:
-        raise CollectorError("claude auth preflight timed out") from None
+        raise CollectorError("claude cli refresh timed out") from None
     except OSError as exc:
-        raise CollectorError("claude auth preflight failed to start") from None
-
-    if completed.returncode not in (0, 1):
-        raise CollectorError("claude auth preflight exited with unexpected code")
-    try:
-        payload = json.loads(completed.stdout)
-    except (json.JSONDecodeError, ValueError):
-        raise CollectorError("claude auth preflight returned unparseable output") from None
-    logged_in = payload.get("loggedIn") if isinstance(payload, dict) else None
-    if not isinstance(logged_in, bool):
-        raise CollectorError("claude auth preflight returned an unexpected shape")
-    if (completed.returncode, logged_in) not in ((0, True), (1, False)):
-        raise CollectorError("claude auth preflight returned an inconsistent result")
-    return logged_in
+        raise CollectorError("claude cli refresh failed to start") from None
+    return completed.returncode == 0
 
 
 def _refresh_access_token_via_cli(config_dir: Optional[str], pre_oauth: dict, timeout: float,
                                    run: Callable[..., Any], executable: Optional[str]) -> str:
-    """Runs exactly one CLI auth preflight, then re-reads the credentials
-    file and returns the new access token only if it genuinely changed
-    (token value or expiry) from what was on disk before the preflight.
-    Otherwise raises AuthRefreshNotPersistedError -- never falls back to
-    the stale token, never loops."""
-    logged_in = run_auth_preflight(config_dir, timeout=timeout, run=run, executable=executable)
-    if not logged_in:
+    """Runs exactly one CLI refresh completion, then re-reads the
+    credentials file and returns the new access token only if it genuinely
+    changed (token value or expiry) from what was on disk before the
+    completion. Otherwise raises AuthRefreshNotPersistedError -- never
+    falls back to the stale token, never loops."""
+    succeeded = run_auth_refresh(config_dir, timeout=timeout, run=run, executable=executable)
+    if not succeeded:
         raise AuthRefreshNotPersistedError()
 
     post_oauth = _read_oauth_section(config_dir)
