@@ -44,6 +44,23 @@ def fake_dispatch(store, service, request, quota_document, history):
     return {"recommended_provider": provider, "mode": "code" if provider == "codex" else "analysis", "effort": "medium", "estimated_minutes": request["expected_minutes"], "split_recommended": split, "phase_count": 3 if split else 1, "alternatives": alternatives, "quota_summary": "short", "warnings": [], "generated_prompt": f"dispatcher:{request['task_id']}:{provider}"}
 
 
+def fake_dispatch_with_waiting_quota(waiting_task_id):
+    """Reproduces the real manager.dispatcher.dispatch() waiting_quota
+    contract (recommended_provider=None, no generated_prompt) for one named
+    task, falling back to the normal fake_dispatch() for every other task in
+    the same batch."""
+    def inner(store, service, request, quota_document, history):
+        if request["task_id"] == waiting_task_id:
+            return {"recommended_provider": None, "provider": None, "mode": None, "effort": "medium",
+                    "estimated_minutes": None, "split_recommended": None, "phase_count": None,
+                    "alternatives": [], "quota_summary": "no provider has usable quota",
+                    "warnings": ["Task admitted; automatic provider selection is waiting on quota recovery "
+                                 "(no provider has fresh reliable quota)"],
+                    "generated_prompt": None, "waiting_quota": True}
+        return fake_dispatch(store, service, request, quota_document, history)
+    return inner
+
+
 class SchedulerTests(unittest.TestCase):
     def setUp(self): self.store = MemoryStore(); create_project(self.store, project())
 
@@ -90,6 +107,26 @@ class SchedulerTests(unittest.TestCase):
         low = create_task(self.store, task("low"), assign=False)
         reset = schedule(self.store, object(), "p1", [low], quota(codex=10, reset=(NOW+timedelta(minutes=10)).isoformat()), [], NOW, fake_dispatch)
         self.assertEqual("defer_until_reset", reset["deferred_tasks"][0]["recommendation"])
+
+    def test_waiting_quota_task_does_not_crash_batch_and_is_deferred_with_reason(self):
+        """DASHBOARD_TRUTH_CONNECTED gate 1: manager.dispatcher.dispatch() can
+        now return recommended_provider=None (waiting_quota) instead of
+        raising when no provider is currently eligible. Before this fix,
+        reset_defer() unconditionally looked up quota["providers"] by
+        result["recommended_provider"] -- a None provider made that lookup
+        raise StopIteration, crashing the *entire* batch, including
+        unrelated tasks that did have an eligible provider."""
+        stuck = create_task(self.store, task("stuck"), assign=False)
+        ok = create_task(self.store, task("ok", task_type="architecture", needs_repo_edit=False, read_only=True), assign=False)
+        result = schedule(self.store, object(), "p1", [stuck, ok], quota(), [], NOW,
+                          fake_dispatch_with_waiting_quota("stuck"))
+        scheduled_ids = {item["task_id"] for batch in result["execution_batches"] for item in batch["tasks"]}
+        self.assertIn("ok", scheduled_ids)
+        self.assertNotIn("stuck", scheduled_ids)
+        deferred_ids = {item["task_id"] for item in result["deferred_tasks"]}
+        self.assertIn("stuck", deferred_ids)
+        stuck_entry = next(item for item in result["deferred_tasks"] if item["task_id"] == "stuck")
+        self.assertIn("waiting on quota recovery", stuck_entry["reason"])
 
     def test_split_preferred_and_excluded(self):
         big = self.make(task("big", expected_minutes=45, preferred_provider="claude"))

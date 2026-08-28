@@ -78,9 +78,19 @@ class RuntimeBridgeTests(unittest.TestCase):
         self.assertNotIn("sensitive", json.dumps(continued))
 
     def test_status_split_stale_unknown_and_safety(self):
+        """DASHBOARD_TRUTH_CONNECTED gate 1: quota state must never block
+        Task admission. Stale quota (every provider's last_updated 2 hours
+        old) used to make dispatch() raise "no eligible provider" before any
+        Task was created; now the Task is durably admitted as waiting_quota
+        instead, and the secret in the task's own constraints never leaks
+        into the (now absent) generated prompt or any other returned field."""
         create_task(self.store, task(expected_minutes=45, constraints=["token=sensitive", "Task scope is narrow"]), assign=False); self.store.records[("projects", "adm", "adm")]["active_tasks"] = ["t1"]
-        with self.assertRaisesRegex(TaskError, "no eligible provider"):
-            self.call({"project_id": "adm", "task_id": "t1", "user_request": "进度状态"}, quota(updated=NOW-timedelta(hours=2)))
+        result = self.call({"project_id": "adm", "task_id": "t1", "user_request": "进度状态"}, quota(updated=NOW-timedelta(hours=2)))
+        self.assertIsNone(result["provider"])
+        self.assertTrue(result["waiting_quota"])
+        self.assertIsNone(result["generated_prompt"])
+        blob = json.dumps(result)
+        self.assertNotIn("token=sensitive", blob)
 
     def test_shared_project_task_rule_priority_in_prompt(self):
         create_task(self.store, task(), assign=False); self.store.records[("projects", "adm", "adm")]["active_tasks"] = ["t1"]

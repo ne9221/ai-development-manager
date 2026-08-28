@@ -676,6 +676,14 @@ DISPATCH_STATE_BLOCKED = "BLOCKED"
 DISPATCH_STATE_CANCELLED = "CANCELLED"
 DISPATCH_STATE_REJECTED = "REJECTED"
 DISPATCH_STATE_UNKNOWN = "UNKNOWN"
+# DASHBOARD_TRUTH_CONNECTED gate 1/3: a Task manager.dispatcher.dispatch()
+# (or manager.tasks.create_task()'s own assign=True path) admitted but could
+# not automatically assign a provider to, because none currently has usable
+# quota. Quota state gates provider *selection*, never Task *admission* --
+# this state makes that wait visible instead of the request silently
+# vanishing (the pre-fix behavior: dispatch() raised before any Task/Command
+# record ever existed).
+DISPATCH_STATE_WAITING_QUOTA = "WAITING_QUOTA"
 
 # Maps manager.dashboard_core.determine_execution_state()'s execution-level
 # vocabulary onto the Dispatch Truth state a *terminal* execution proves,
@@ -811,6 +819,17 @@ def compute_dispatch_state(
             return {"state": DISPATCH_STATE_COMPLETED, "reason": "task completed with no command record"}
         if task_status == "cancelled":
             return {"state": DISPATCH_STATE_CANCELLED, "reason": "task cancelled with no command record"}
+        if task.get("recommended_provider") is None and task.get("quota_evidence") is not None:
+            # recommended_provider is only ever left None *after* an actual
+            # automatic-assignment attempt recorded quota_evidence for it
+            # (manager.dispatcher.dispatch()'s waiting_quota branch, or
+            # manager.tasks.create_task()'s own assign=True path) -- real,
+            # durable evidence that provider selection was attempted and
+            # found nothing eligible, not a guess and not merely "not yet
+            # dispatched" (which is the plain SUBMITTED/ACCEPTED case below).
+            return {"state": DISPATCH_STATE_WAITING_QUOTA,
+                    "reason": "task admitted; no provider currently has usable quota (automatic provider "
+                               "selection is waiting on quota recovery)"}
         request_state = _dispatch_request_state(dispatch_request_status)
         if request_state is not None and request_state["state"] in (DISPATCH_STATE_ACCEPTED, DISPATCH_STATE_FAILED):
             return request_state

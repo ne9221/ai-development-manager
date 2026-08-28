@@ -488,6 +488,21 @@ def _resolve_existing_claim(store, project_id, request_id, claim, clean=None):
                     "command_id": command_id, "status": command.get("status", "queued")}
         if attempt + 1 < CLAIM_VERIFICATION_ATTEMPTS:
             time.sleep(CLAIM_VERIFICATION_DELAY_SECONDS)
+    # No Command showed up within the bounded retry window. Before treating
+    # this as ambiguous/incomplete (the conservative fail-closed default for
+    # a write that could still be genuinely in flight), check for the one
+    # case that is durably, definitely NOT in flight: manager.dispatcher.
+    # dispatch() admitted this exact Task (DASHBOARD_TRUTH_CONNECTED gate 1)
+    # but found no provider with usable quota, and by construction never
+    # creates a Command in that same call -- so its absence here is expected
+    # steady-state truth, not a race, and must be reported as the real
+    # waiting_quota status rather than a spurious "dispatch_incomplete"
+    # failure on every replay of this request_id until quota recovers.
+    task = _fetch_if_exists(store, "tasks", project_id, task_id)
+    if (task is not None and task.get("recommended_provider") is None
+            and task.get("source_context", {}).get("external_request_id") == request_id):
+        return {"accepted": True, "request_id": request_id, "task_id": task_id,
+                "command_id": None, "status": "waiting_quota"}
     raise DispatchIngressError(
         "dispatch_incomplete",
         f"request {request_id} was claimed but its Task/Command was never confirmed created; "
@@ -737,6 +752,22 @@ def handle_dispatch(store, service, lock_registry_factory, payload, request_crea
         else:
             update_task(store, project_id, task_id, priority=clean["priority"],
                         read_only=True, execution_policies=sorted(REQUIRED_TASK_POLICIES))
+
+        if result.get("waiting_quota"):
+            # manager.dispatcher.dispatch() admitted the Task (DASHBOARD_TRUTH_
+            # CONNECTED gate 1: quota state gates provider *selection*, never
+            # Task *admission* -- see that function's own docstring) but found
+            # no provider with usable quota right now. No Command is created
+            # for this identity yet: manager.dashboard_core.
+            # compute_dispatch_state() reports this exact combination (a Task
+            # with recommended_provider=None and no Command record) as
+            # WAITING_QUOTA, and a later automatic retry (once quota recovers)
+            # re-attempts dispatch for this same (task_id, command_id) identity
+            # and promotes it to a real Command then -- this call must not be
+            # treated as an ingress failure just because no provider was
+            # eligible yet.
+            return {"accepted": True, "request_id": request_id, "task_id": task_id,
+                    "command_id": None, "status": "waiting_quota"}
 
         command = {
             "command_id": command_id, "project_id": project_id, "task_id": task_id,

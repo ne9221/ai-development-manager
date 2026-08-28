@@ -121,6 +121,18 @@ def schedule(store, service, project_id, tasks, quota_document=None, executions=
                 continue
             result = dispatched(task)
             provider = result["recommended_provider"]
+            if provider is None:
+                # DASHBOARD_TRUTH_CONNECTED gate 1: manager.dispatcher.dispatch()
+                # now admits the Task even when no provider currently has
+                # usable quota (waiting_quota) instead of raising -- this must
+                # not crash batch scheduling (reset_defer() below assumes a
+                # real provider name) nor silently drop the task from
+                # `pending`; it is deferred with the real reason, exactly like
+                # an unresolved dependency or a scope conflict, and retried on
+                # the next round in case another task's scheduling changes
+                # nothing relevant (quota does not change mid-batch).
+                prior_reasons[task_id] = next(iter(result.get("warnings", [])), "no provider has usable quota")
+                continue
             if provider in used_providers and not task.get("preferred_provider"):
                 alternative = next((item for item in result["alternatives"] if item not in used_providers and item != task.get("excluded_provider") and capability(task, item) >= capability(task, provider) - 1), None)
                 if alternative:

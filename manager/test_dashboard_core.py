@@ -30,6 +30,7 @@ from manager.dashboard_core import (
     DISPATCH_STATE_FAILED,
     DISPATCH_STATE_REJECTED,
     DISPATCH_STATE_UNKNOWN,
+    DISPATCH_STATE_WAITING_QUOTA,
     compute_dispatch_state,
     build_provider_truth,
     build_quota_truth,
@@ -732,6 +733,30 @@ class VisibleDispatchTruthGateTests(unittest.TestCase):
         result = compute_dispatch_state(self.task(status="ready"), None, None, self.now, has_dispatch_request=True)
         self.assertEqual(result["state"], DISPATCH_STATE_ACCEPTED)
         self.assertNotEqual(result["state"], DISPATCH_STATE_RUNNING)
+
+    # DASHBOARD_TRUTH_CONNECTED gate 1/3: a Task admitted with no eligible
+    # provider (manager.dispatcher.dispatch()'s waiting_quota branch) must
+    # render as its own honest WAITING_QUOTA state, not fold into the plain
+    # "not yet dispatched" SUBMITTED bucket -- the two mean different things
+    # (dispatch was never attempted vs. dispatch was attempted and found
+    # nothing eligible) and only the real distinguishing evidence
+    # (recommended_provider explicitly None + a recorded quota_evidence
+    # attempt) may be used to tell them apart, never a guess.
+    def test_waiting_quota_task_is_not_submitted_and_not_running(self):
+        result = compute_dispatch_state(
+            self.task(status="ready", recommended_provider=None, quota_evidence={}),
+            None, None, self.now,
+        )
+        self.assertEqual(result["state"], DISPATCH_STATE_WAITING_QUOTA)
+        self.assertNotEqual(result["state"], DISPATCH_STATE_SUBMITTED)
+        self.assertNotEqual(result["state"], DISPATCH_STATE_RUNNING)
+
+    def test_task_never_dispatched_at_all_stays_submitted_not_waiting_quota(self):
+        # No quota_evidence recorded at all -- provider selection was never
+        # even attempted yet, so this is ordinary SUBMITTED, not a quota
+        # wait.
+        result = compute_dispatch_state(self.task(status="ready"), None, None, self.now)
+        self.assertEqual(result["state"], DISPATCH_STATE_SUBMITTED)
 
     # queued/claimed must not display as running either.
     def test_queued_and_claimed_are_not_running(self):

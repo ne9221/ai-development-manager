@@ -142,22 +142,46 @@ class DispatchIngressTests(unittest.TestCase):
         command = self.store.get("commands", "p1", result["command_id"])
         self.assertEqual("codex", command["provider"])
 
-    def test_no_eligible_provider_releases_claim_for_same_request_id_retry(self):
+    def test_no_eligible_provider_admits_task_as_waiting_quota_without_a_command(self):
+        """DASHBOARD_TRUTH_CONNECTED gate 1: quota state must never block
+        Task *admission*, only provider *selection*. Before this fix,
+        dispatch() raised TaskError("no eligible provider") and this
+        uncaught exception propagated straight out of handle_dispatch() --
+        the request was never admitted as a Task at all when every
+        provider's quota was stale/unreliable. Now the Task is durably
+        created with recommended_provider left None; no Command is created
+        in the same call (manager.dispatcher.dispatch()'s own contract: a
+        Command requires a real, non-null provider by schema, so creating
+        one here would mean fabricating a provider). Both the initial
+        response and a same-request_id replay report the honest
+        "waiting_quota" status instead of raising or losing the request.
+        Automatically promoting this Task to a real Command once quota
+        recovers (a scheduler-tick retry sweep) is a separate,
+        not-yet-built mechanism -- see the follow-up note on
+        manager.dispatcher.dispatch()'s new branch."""
         stale = quota_fixture(updated="2020-01-01T00:00:00Z")
         request = payload(request_id="req-no-eligible")
         with patch("manager.dispatcher.read_drive_status", return_value=stale):
-            with self.assertRaisesRegex(TaskError, "no eligible provider"):
-                self.call(request)
-        for area in ("tasks", "commands"):
-            with self.assertRaises(TaskError):
-                self.store.get(area, "p1", "dispatch-req-no-eligible")
-        fresh_codex = quota_fixture(80, 90)
-        next(item for item in fresh_codex["providers"] if item["provider"] == "claude")["last_updated"] = "2020-01-01T00:00:00Z"
-        with patch("manager.dispatcher.read_drive_status", return_value=fresh_codex):
             result = self.call(request)
+        self.assertTrue(result["accepted"])
+        self.assertEqual("waiting_quota", result["status"])
+        self.assertIsNone(result["command_id"])
         self.assertEqual("dispatch-req-no-eligible", result["task_id"])
-        command = self.store.get("commands", "p1", result["command_id"])
-        self.assertEqual("codex", command["provider"])
+        task = self.store.get("tasks", "p1", "dispatch-req-no-eligible")
+        self.assertIsNone(task["recommended_provider"])
+        with self.assertRaises(TaskError):
+            self.store.get("commands", "p1", "dispatch-req-no-eligible")
+
+        # A same-request_id replay is idempotent truth, not a fresh dispatch
+        # attempt: it must keep reporting waiting_quota (never raise
+        # "dispatch_incomplete" just because no Command exists yet), even
+        # once quota happens to be fresh again at replay time -- this call
+        # alone never re-invokes dispatcher.dispatch().
+        fresh = quota_fixture(80, 90)
+        with patch("manager.dispatcher.read_drive_status", return_value=fresh):
+            replay = self.call(request)
+        self.assertEqual("waiting_quota", replay["status"])
+        self.assertIsNone(replay["command_id"])
 
     def test_failure_before_task_creation_marks_failed_truth_and_stays_retryable(self):
         """P0 dispatch-two-tick-final: a definite (created_by_this_call),
@@ -260,17 +284,30 @@ class DispatchIngressTests(unittest.TestCase):
         self.store.get("commands", "p1", "dispatch-req-concurrent-retry")
 
     def test_ambiguous_claim_is_never_rolled_back(self):
+        """The dispatch-request claim registry may report an ambiguous
+        outcome for its own CAS write (e.g. a network timeout after the
+        server-side write actually landed) -- this must never be treated as
+        "never happened" and rolled back. Combined with DASHBOARD_TRUTH_
+        CONNECTED gate 1 (quota state must never block Task admission), the
+        claim resolves durably and the Task is admitted as waiting_quota on
+        this same call -- no separate failed-claim retry is even needed
+        here, unlike before this fix where dispatch() itself raised
+        "no eligible provider" and the request durably failed instead."""
         request = payload(request_id="req-ambiguous-no-provider")
         registry = self.registries.factory("p1", "req-ambiguous-no-provider")
         registry.ambiguous_queue.append(ConnectionError("timeout after create"))
         stale = quota_fixture(updated="2020-01-01T00:00:00Z")
         with patch("manager.dispatcher.read_drive_status", return_value=stale):
-            with self.assertRaisesRegex(TaskError, "no eligible provider"):
-                self.call(request)
+            result = self.call(request)
+        self.assertTrue(result["accepted"])
+        self.assertEqual("waiting_quota", result["status"])
         self.assertIsNotNone(registry.document)
-        with self.assertRaises(DispatchIngressError) as ctx:
-            self.call(request)
-        self.assertEqual("dispatch_incomplete", ctx.exception.code)
+        self.assertEqual("dispatched", registry.document["status"])
+        # A same-request_id replay is idempotent and consistent, never a
+        # second, conflicting claim.
+        replay = self.call(request)
+        self.assertEqual(result["task_id"], replay["task_id"])
+        self.assertEqual("waiting_quota", replay["status"])
 
     def test_read_only_constraint_defaults_true_when_omitted(self):
         result = self.call(payload(request_id="req-ro", constraints={}))

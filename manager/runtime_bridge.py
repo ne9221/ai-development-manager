@@ -371,6 +371,7 @@ def runtime_bridge(store, service, request, quota_document=None, executions=None
         "split_recommended": result.get("split_recommended", False), "alternatives": result.get("alternatives", []), "quota_summary": result.get("quota_summary"),
         "quota_freshness": provider_quota["freshness"] if provider_quota else "unknown", "warnings": warnings,
         "next_action": next_action, "generated_prompt": result.get("generated_prompt"), "execution_batches": batches,
+        "waiting_quota": result.get("waiting_quota", False),
     })
 
 

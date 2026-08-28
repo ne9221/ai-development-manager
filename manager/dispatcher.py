@@ -269,7 +269,40 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
     if selected == excluded:
         selected = next((item for item in decision["alternatives"] if item != excluded), None)
     if selected not in CAPABILITIES:
-        raise TaskError("no eligible provider")
+        # No automatically-eligible provider exists right now (every
+        # provider's quota is stale/unreliable/exhausted, or excluded down
+        # to nothing, and the caller did not pin a preferred_provider). This
+        # must never delete or lose the caller's request: quota state gates
+        # *provider selection*, never *Task admission* (DASHBOARD_TRUTH_
+        # CONNECTED gate 1). The Task is still created (or, if one already
+        # exists for this identity, left untouched -- a re-tick must not
+        # clobber a previously-assigned recommended_provider just because
+        # this particular call's quota snapshot happened to be stale) with
+        # recommended_provider left None, so the request stays durably
+        # visible for the Dashboard and eligible for automatic re-dispatch
+        # on a later scheduler tick once quota recovers, instead of raising
+        # before any record of it ever existed.
+        if not task:
+            task_input.update(recommended_provider=None, mode=None, effort=decision["recommended_effort"], quota_evidence=decision["quota_evidence"])
+            persist_task = request.get("persist_task", True)
+            task = create_task(store, task_input, service, assign=False, persist=persist_task)
+            if persist_task and task["task_id"] not in project["active_tasks"]:
+                project["active_tasks"].append(task["task_id"]); store.put("projects", project["project_id"], project["project_id"], project)
+        validate_task_enforcement(task)
+        reason = next(iter(decision["reasons"]), "no provider has fresh reliable quota")
+        warnings = [item for item in [decision.get("warning")] if item]
+        warnings.append(f"Task admitted; automatic provider selection is waiting on quota recovery ({reason})")
+        return {
+            "recommended_provider": None, "provider": None, "account_id": None,
+            "model": request.get("model"), "fallback_model": request.get("fallback_model"),
+            "mode": None, "effort": decision["recommended_effort"],
+            "selection_reason": decision["reasons"], "quota_evidence": decision["quota_evidence"],
+            "provider_availability": None,
+            "estimated_minutes": None, "split_recommended": None, "phase_count": None,
+            "alternatives": [], "quota_summary": "no provider has usable quota",
+            "warnings": warnings, "generated_prompt": None,
+            "task_id": task["task_id"], "waiting_quota": True,
+        }
     alternatives = [item for item in [decision["recommended_provider"], *decision["alternatives"]] if item and item not in (selected, excluded)]
     selected_estimate = estimates[selected]
     if decision["recommended_mode"] == "split_task" and not selected_estimate["split_recommended"]:
@@ -379,6 +412,7 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
         "provider_availability": provider_quota.get("availability"),
         "estimated_minutes": selected_estimate["estimated_minutes"], "split_recommended": selected_estimate["split_recommended"], "phase_count": selected_estimate["suggested_phases"],
         "alternatives": alternatives, "quota_summary": summary, "warnings": warnings, "generated_prompt": generated,
+        "task_id": task["task_id"], "waiting_quota": False,
     }
 
 

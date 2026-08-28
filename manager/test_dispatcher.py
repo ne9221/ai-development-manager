@@ -1,3 +1,4 @@
+import json
 import unittest
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -125,9 +126,50 @@ class DispatcherTests(unittest.TestCase):
         small = self.dispatch_case(request(title="Small task", expected_minutes=20), records=history(14))
         self.assertFalse(small["split_recommended"]); self.assertEqual(1, small["phase_count"])
 
-    def test_zero_samples_stale_quota_and_secret_redaction(self):
-        with self.assertRaisesRegex(TaskError, "no eligible provider"):
-            self.dispatch_case(request(title="Secret task", constraints=["token=sensitive-value", "credential:private"]), quota(updated="2020-01-01T00:00:00Z"))
+    def test_all_providers_unavailable_still_admits_the_task_as_waiting_quota(self):
+        """DASHBOARD_TRUTH_CONNECTED gate 1: quota state must never block Task
+        *admission* -- only provider *selection*. Before this fix, dispatch()
+        raised TaskError("no eligible provider") before ever calling
+        create_task(), so a request arriving while every provider's quota was
+        stale/exhausted was silently lost -- no Task, no visible record, no
+        way for a later scheduler tick to retry it once quota recovered.
+        Reproduces the real shape with a fully stale quota document (every
+        provider's last_updated far in the past)."""
+        result = self.dispatch_case(
+            request(title="Secret task", constraints=["token=sensitive-value", "credential:private"]),
+            quota(updated="2020-01-01T00:00:00Z"),
+        )
+        self.assertIsNone(result["provider"])
+        self.assertIsNone(result["recommended_provider"])
+        self.assertIsNone(result["generated_prompt"])
+        self.assertTrue(result["waiting_quota"])
+        self.assertTrue(any("waiting on quota recovery" in warning for warning in result["warnings"]))
+        # The Task itself is durably admitted -- not lost -- with no provider
+        # assigned yet, so a later automatic retry can find and promote it.
+        task = self.store.get("tasks", "p1", result["task_id"])
+        self.assertIsNone(task["recommended_provider"])
+        # Secret redaction: nothing in the returned result (no prompt was
+        # even generated) leaks the raw constraint secrets.
+        blob = json.dumps(result)
+        for forbidden in ("sensitive-value", "credential:private"):
+            self.assertNotIn(forbidden, blob)
+
+    def test_all_providers_unavailable_reuses_an_existing_task_without_overwriting_it(self):
+        """A second dispatch() call for a task that already exists (e.g. a
+        scheduler re-tick) must not clobber a previously-assigned
+        recommended_provider just because quota is momentarily stale on this
+        call -- it still reports waiting_quota, but the durable Task record
+        is left untouched."""
+        create_task(self.store, {
+            "task_id": "already-assigned", "project_id": "p1", "title": "Fix regression",
+            "task_type": "implementation", "complexity": "medium", "expected_minutes": 20,
+            "recommended_provider": "codex", "mode": "code", "effort": "medium",
+        }, service=object(), assign=False)
+        result = self.dispatch_case(request(task_id="already-assigned"), quota(updated="2020-01-01T00:00:00Z"))
+        self.assertIsNone(result["provider"])
+        self.assertTrue(result["waiting_quota"])
+        task = self.store.get("tasks", "p1", "already-assigned")
+        self.assertEqual("codex", task["recommended_provider"])
 
     def test_automatic_routing_selects_only_fresh_reliable_provider(self):
         document = quota(80, 90)
