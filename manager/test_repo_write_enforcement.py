@@ -9,6 +9,7 @@ import pytest
 from manager.repo_write_enforcement import (
     AllowedPathsViolationError,
     OWNER_MARKER_FILENAME,
+    _resolve_validation_command,
     capture_repo_write_evidence,
     collect_changed_paths,
     collect_commit_shas,
@@ -471,6 +472,105 @@ def test_capture_repo_write_evidence_tests_status_is_failed_on_timeout(repo_with
     assert evidence["tests_status"] == "failed"
     assert evidence["tests"][0]["timed_out"] is True
     assert evidence["tests"][0]["exit_code"] is None
+
+
+# --- Real P0 (2026-08-29): deterministic validation runtime ----------------
+#
+# Live-reproduced: a real repo-write execution's validation_command
+# ("python -m pytest ...") genuinely ran -- real command, real exit_code,
+# real output, exactly as this architecture is designed to produce -- but
+# failed with ModuleNotFoundError because the bare "python" in the command
+# resolved, via subprocess.run(shell=True)'s own ambient PATH lookup, to a
+# DIFFERENT interpreter than the one the Watcher's own -PythonPath/
+# -PythonDeps configuration was built for (an ABI mismatch: -PythonDeps'
+# native extension was compiled for the pinned interpreter's Python version,
+# not whatever "python" happened to be first on PATH). The enforcement
+# itself was never dishonest; the ambient interpreter resolution was simply
+# not deterministic. These tests cover the fix: a bare python/python3/py
+# leading token in validation_command is resolved to sys.executable --
+# already the single authoritative interpreter for this purpose, since the
+# entire Watcher process tree (and everything it calls in-process,
+# including this function) is itself launched via the pinned -PythonPath
+# interpreter, with -PythonDeps exported as this same process's PYTHONPATH.
+
+def test_resolve_validation_command_substitutes_bare_python_token():
+    resolved, executable = _resolve_validation_command("python -m pytest -q")
+    assert executable == sys.executable
+    assert resolved == f'"{sys.executable}" -m pytest -q'
+
+
+def test_resolve_validation_command_substitutes_python3_and_py_tokens():
+    resolved3, exe3 = _resolve_validation_command("python3 script.py")
+    assert exe3 == sys.executable
+    assert resolved3 == f'"{sys.executable}" script.py'
+
+    resolved_py, exe_py = _resolve_validation_command("py -3 script.py")
+    assert exe_py == sys.executable
+    assert resolved_py == f'"{sys.executable}" -3 script.py'
+
+
+def test_resolve_validation_command_leaves_explicit_interpreter_path_unchanged():
+    """A command that already names an explicit interpreter (e.g. a Task
+    author who deliberately wants a project virtualenv's own python) must
+    never be rewritten -- only a genuinely bare, ambiguous leading token is."""
+    explicit = f"{sys.executable} -m pytest -q"
+    resolved, executable = _resolve_validation_command(explicit)
+    assert resolved == explicit
+    assert executable is None
+
+
+def test_resolve_validation_command_leaves_non_python_commands_unchanged():
+    """Node/npm/arbitrary shell commands are untouched -- no existing
+    authoritative resolver for other ecosystems exists in this codebase to
+    reuse, so this deliberately does not invent one."""
+    for command in ("npm test", "node --test", "pytest -q", "./run-checks.sh"):
+        resolved, executable = _resolve_validation_command(command)
+        assert resolved == command
+        assert executable is None
+
+
+def test_capture_repo_write_evidence_resolves_bare_python_and_records_executable(repo_with_origin):
+    """End-to-end: a bare "python" validation_command (no absolute path --
+    exactly the real-world shape a Task author would naturally write) is
+    the ORIGINAL string in the persisted evidence's "command" field (what
+    was actually declared), but ran against sys.executable, recorded
+    separately in "executable" -- deterministic and auditable, not silently
+    dependent on whatever the spawned shell's ambient PATH resolved."""
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "commit", "-am", "edit foo")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    bare_command = "python -c \"print(123)\""
+    evidence = capture_repo_write_evidence(
+        repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+        validation_command=bare_command,
+    )
+    assert evidence["tests_status"] == "passed"
+    result = evidence["tests"][0]
+    assert result["command"] == bare_command
+    assert result["executable"] == sys.executable
+    assert result["exit_code"] == 0
+    assert "123" in result["output_summary"]
+
+
+def test_capture_repo_write_evidence_fails_closed_on_missing_interpreter(repo_with_origin, monkeypatch):
+    """A configured interpreter that cannot actually be launched (wrong or
+    missing) must fail closed -- exit_code=None, tests_status="failed" --
+    never silently fall through to a completed status."""
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "commit", "-am", "edit foo")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    monkeypatch.setattr(sys, "executable", str(repo_with_origin["path"] / "no-such-interpreter.exe"))
+    evidence = capture_repo_write_evidence(
+        repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+        validation_command="python -c \"print(1)\"",
+    )
+    # The exact exit_code the shell reports for "command not found" varies
+    # (cmd.exe returns nonzero rather than raising) -- what must hold
+    # regardless is that this never reads as success.
+    assert evidence["tests_status"] == "failed"
+    assert evidence["tests"][0]["exit_code"] != 0
 
 
 # --- Bootstrap architecture: ADM host commit/push authority ----------------

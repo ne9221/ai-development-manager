@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from manager.remote_readback import verify_remote_branch_matches
@@ -276,6 +277,58 @@ def _empty_commits(working_directory, commits: Sequence[str], runner=subprocess.
 DEFAULT_VALIDATION_TIMEOUT_SECONDS = 600
 MAX_VALIDATION_OUTPUT_CHARS = 4000
 
+# Real P0 (2026-08-29): a validation_command's leading "python"/"python3"/"py"
+# token used to resolve via subprocess.run(shell=True)'s own ambient PATH
+# lookup -- ordinary, deterministic-*looking* behavior that is in fact NOT
+# deterministic across contexts: live-reproduced with a real repo-write
+# execution whose validation genuinely ran (real command, real exit_code,
+# real output -- the enforcement itself worked exactly as designed) but
+# failed with `ModuleNotFoundError: No module named 'rpds.rpds'` because the
+# shell's ambient "python" resolved to a DIFFERENT, ABI-incompatible
+# interpreter (a system-wide Python 3.14) than the one the Watcher's own
+# -PythonPath/-PythonDeps configuration was built for (a pinned Python 3.12
+# runtime, whose PYTHONPATH-referenced deps ship a cp312-only native
+# extension). Nothing about the failure was dishonest -- it was real,
+# structured, truthful evidence of a real failure -- but the failure itself
+# was an artifact of ambient PATH resolution, not of the code being
+# validated.
+#
+# Fix: substitute that leading token with sys.executable -- the interpreter
+# ACTUALLY running this code, right now, in this process -- rather than
+# whatever a spawned shell's PATH happens to resolve "python" to. This is
+# already the single authoritative interpreter for the purpose: the entire
+# Watcher process tree (manager.command_watcher --once, everything it calls
+# in-process including this function) is itself launched via the pinned
+# -PythonPath interpreter (see run_command_watcher.ps1), with -PythonDeps
+# exported as this same process's PYTHONPATH -- so sys.executable and the
+# inherited environment are, by construction, always the exact
+# ABI-compatible pair the installer configured, with no new registry,
+# config surface, or per-project override needed. This holds identically
+# whether this code is reached from the real Scheduled Task, a provider's
+# own subprocess, or an interactive shell test -- sys.executable always
+# correctly names whichever interpreter is actually executing it, so all
+# three resolve to the same contract without coordination.
+#
+# Deliberately narrow: only a bare python/python3/py leading token is
+# substituted. A non-Python validation_command (`npm test`, `node --test`,
+# an arbitrary shell script) is passed through completely unchanged --
+# there is no existing authoritative resolver for other ecosystems in this
+# codebase to reuse, and inventing one with no real project driving it
+# would be speculative, not a real fix for a real, reproduced defect.
+_PYTHON_LEADING_TOKEN_RE = re.compile(r"^(\s*)(python3|python|py)(?=\s|$)", re.IGNORECASE)
+
+
+def _resolve_validation_command(command: str) -> tuple[str, Optional[str]]:
+    """Return (resolved_command, executable_used). executable_used is
+    sys.executable when the command's leading token was a bare Python
+    interpreter name, else None (command returned unchanged)."""
+    match = _PYTHON_LEADING_TOKEN_RE.match(command)
+    if not match:
+        return command, None
+    leading_ws, token = match.group(1), match.group(2)
+    rest = command[match.end():]
+    return f'{leading_ws}"{sys.executable}"{rest}', sys.executable
+
 
 def _run_validation_command(working_directory, command: str, runner=subprocess.run,
                             timeout_seconds: int = DEFAULT_VALIDATION_TIMEOUT_SECONDS) -> Dict[str, Any]:
@@ -290,6 +343,14 @@ def _run_validation_command(working_directory, command: str, runner=subprocess.r
     MAX_VALIDATION_OUTPUT_CHARS characters so a runaway or noisy test suite
     can never bloat a persisted Drive record.
 
+    A leading bare python/python3/py token is resolved to sys.executable
+    first -- see _resolve_validation_command's docstring/comment above for
+    why this is the deterministic, already-authoritative interpreter rather
+    than whatever the spawned shell's ambient PATH would otherwise pick.
+    `command` in the returned evidence is the ORIGINAL, human-declared
+    string (what the Task actually asked for); `executable` records what
+    was actually substituted in, or None when nothing was.
+
     Any failure to even launch/complete the command at all -- not just a
     timeout, but e.g. the shell interpreter itself being unavailable, a
     permissions error, or any other OS-level failure -- is captured here as
@@ -298,26 +359,27 @@ def _run_validation_command(working_directory, command: str, runner=subprocess.r
     passed must never be silently read downstream as "no evidence" and
     fall through to a completed status by omission."""
     started_at = now_iso()
+    resolved_command, executable = _resolve_validation_command(command)
     try:
-        result = runner(command, cwd=str(working_directory), shell=True, text=True,
+        result = runner(resolved_command, cwd=str(working_directory), shell=True, text=True,
                         encoding="utf-8", errors="replace", capture_output=True, timeout=timeout_seconds)
     except subprocess.TimeoutExpired as exc:
         output = (exc.stdout or "") + (exc.stderr or "") if isinstance(exc.stdout, str) or isinstance(exc.stderr, str) else ""
         return {
-            "command": command, "exit_code": None,
+            "command": command, "executable": executable, "exit_code": None,
             "output_summary": (output[-MAX_VALIDATION_OUTPUT_CHARS:] if output
                                else f"validation_command timed out after {timeout_seconds}s"),
             "started_at": started_at, "completed_at": now_iso(), "timed_out": True,
         }
     except Exception as exc:
         return {
-            "command": command, "exit_code": None,
+            "command": command, "executable": executable, "exit_code": None,
             "output_summary": f"validation_command could not be run: {exc}"[-MAX_VALIDATION_OUTPUT_CHARS:],
             "started_at": started_at, "completed_at": now_iso(), "timed_out": False,
         }
     output = (result.stdout or "") + (result.stderr or "")
     return {
-        "command": command, "exit_code": result.returncode,
+        "command": command, "executable": executable, "exit_code": result.returncode,
         "output_summary": output[-MAX_VALIDATION_OUTPUT_CHARS:],
         "started_at": started_at, "completed_at": now_iso(), "timed_out": False,
     }
