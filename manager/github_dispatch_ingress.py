@@ -206,6 +206,16 @@ def build_dispatch_payload(request):
         payload["provider"] = request["preferred_provider"]
     if request.get("account_id") is not None:
         payload["account_id"] = request["account_id"]
+    # Same explicit-opt-in-by-key-presence posture as repo_write above.
+    # schema/dispatch_request.schema.json's own `not: {required:
+    # [local_action, repo_write]}` rule already makes these mutually
+    # exclusive before this function is ever reached. Without this line, a
+    # local_action request submitted through either GitHub ingress lane
+    # silently fell through cloud.dispatch_ingress.handle_dispatch() as an
+    # ordinary provider-dispatch request instead (the same gap found live
+    # via the Drive ingress lane's own real E2E).
+    if request.get("local_action") is not None:
+        payload["local_action"] = request["local_action"]
     return payload
 
 

@@ -423,6 +423,44 @@ class DriveDispatchIngressTests(unittest.TestCase):
         self.assertEqual({"read_only": True}, payload["constraints"])
         self.assertNotIn("repo_write", payload)
 
+    def test_local_action_forwarded_to_handle_dispatch(self):
+        """P0 regression: a real ChatGPT-facing OPEN_EXISTING_ADM_UI request
+        silently fell through as an ordinary provider-dispatch request
+        instead of the local-action fast path, because this module's own
+        request->payload mapping never forwarded the `local_action` key at
+        all -- cloud.dispatch_ingress.handle_dispatch() only ever saw
+        local_action=None (its own default), even though the Drive request
+        body genuinely carried it and schema validation had already accepted
+        it. Discovered live via a real production E2E, not a unit test."""
+        service = Service(request(local_action="OPEN_EXISTING_ADM_UI"))
+        handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1", "task_id": "dispatch-drive-e2e-1",
+                                     "command_id": "dispatch-drive-e2e-1", "status": "queued"})
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            result = poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                                  registry_factory=lambda *_args: object())
+        self.assertTrue(result[0]["accepted"])
+        payload = handler.call_args.args[3]
+        self.assertEqual("OPEN_EXISTING_ADM_UI", payload["local_action"])
+        # A local_action request is neither read_only nor repo_write -- it
+        # carries no constraints/repo_write field at all in this mapping;
+        # cloud.dispatch_ingress.handle_dispatch() itself decides read_only
+        # for the Task it creates in the local_action branch.
+        self.assertEqual({"read_only": True}, payload["constraints"])
+        self.assertNotIn("repo_write", payload)
+
+    def test_no_local_action_key_omits_it_from_payload(self):
+        """An ordinary request (no local_action field at all) must never
+        gain a local_action key, not even null -- same explicit-opt-in-by-
+        key-presence contract as repo_write."""
+        service = Service(request())
+        handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1", "task_id": "dispatch-drive-e2e-1",
+                                     "command_id": "dispatch-drive-e2e-1", "status": "queued"})
+        with unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                         registry_factory=lambda *_args: object())
+        payload = handler.call_args.args[3]
+        self.assertNotIn("local_action", payload)
+
     def test_explicit_valid_repo_write_forwarded_exactly(self):
         """2: a well-shaped repo_write is forwarded to handle_dispatch()
         verbatim, unmodified, alongside constraints.read_only: false."""

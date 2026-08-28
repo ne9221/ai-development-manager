@@ -463,6 +463,21 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
                 payload["provider"] = request["preferred_provider"]
             if request.get("account_id") is not None:
                 payload["account_id"] = request["account_id"]
+            # Same explicit-opt-in-by-key-presence posture as repo_write above:
+            # a request names its own local_action key or it does not (never
+            # inferred from title/goal text). schema/dispatch_request.
+            # schema.json's own `not: {required: [local_action, repo_write]}`
+            # rule already makes these two mutually exclusive before this
+            # line is ever reached, so this is never asked to arbitrate a
+            # conflict between them. Without this line, a Drive-submitted
+            # local_action request silently fell through cloud.dispatch_
+            # ingress.handle_dispatch() as an ordinary provider-dispatch
+            # request instead (local_action defaulting to None there) --
+            # discovered live via a real ChatGPT-facing OPEN_EXISTING_ADM_UI
+            # E2E that unexpectedly went through full quota/provider
+            # selection instead of the local-action fast path.
+            if request.get("local_action") is not None:
+                payload["local_action"] = request["local_action"]
             # SLA evidence only (see cloud.dispatch_ingress.handle_dispatch()'s
             # own docstring) -- the request body's own declared created_at,
             # threaded through as a separate argument rather than a payload
