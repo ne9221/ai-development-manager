@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
@@ -134,23 +135,18 @@ class CheckQuotaTests(unittest.TestCase):
         self.assertIsNone(result["providers"])
 
     def test_reachable_returns_provider_summaries(self):
+        # Patch manager.quota_reader.read_drive_status directly rather than
+        # faking the full Drive service -> schema-validated document chain
+        # (check_quota() calls it with validate_document's real default of
+        # True, matching production -- a hand-rolled fake document would
+        # need to satisfy the full status.schema.json to reach this path).
         document = {"generated_at": NOW.isoformat(), "providers": [
             {"provider": "codex", "display_name": "Codex", "status": "ok", "source_type": "official",
              "confidence": "official", "source": "codex_cli_auth_json", "last_updated": NOW.isoformat(),
              "windows": [{"remaining_percent": 80.0}]},
         ]}
-
-        class FakeFiles:
-            def list(self, **_kwargs):
-                return Mock(execute=Mock(return_value={"files": [{"id": "f1"}]}))
-            def get_media(self, fileId):
-                return Mock(execute=Mock(return_value=json.dumps(document).encode()))
-
-        class FakeService:
-            def files(self):
-                return FakeFiles()
-
-        result = check_quota(service_factory=lambda: FakeService())
+        with unittest.mock.patch("manager.quota_reader.read_drive_status", return_value=document):
+            result = check_quota(service_factory=lambda: object())
         self.assertTrue(result["drive_reachable"])
         self.assertIsInstance(result["providers"], list)
 
@@ -186,8 +182,10 @@ class CheckAndRecoverIntegrationTests(unittest.TestCase):
                               "session_center_supervisor"):
                 self.assertEqual("healthy", results[component]["state"], component)
                 self.assertIsNone(results[component]["remediation_result"])
-            # No /Run should ever fire for a healthy component.
-            self.assertEqual(0, runner.call_count)
+            # /Query (health check) is expected every sweep; /Run (recovery)
+            # must never fire for an already-healthy component.
+            run_calls = [call for call in runner.call_args_list if "/Run" in call.args[0]]
+            self.assertEqual([], run_calls)
 
     def test_disabled_task_never_triggers_a_run_call(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -242,9 +240,14 @@ class CheckAndRecoverIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             def exploding_runner(*_args, **_kwargs):
                 raise RuntimeError("simulated failure")
-            # Should not raise despite every internal check failing.
-            result = try_check_and_recover(directory, now=NOW, runner=exploding_runner)
-            self.assertIsInstance(result, dict)  # still completes: schtasks failures are caught internally
+            def exploding_quota_factory():
+                raise RuntimeError("simulated quota failure")
+            # Should not raise despite every internal check failing -- an
+            # injected runner/service_factory can raise anything, and this
+            # module's whole contract is "never raise into the caller".
+            result = try_check_and_recover(directory, now=NOW, runner=exploding_runner,
+                                           service_factory=exploding_quota_factory)
+            self.assertIsInstance(result, dict)  # still completes: every failure is caught internally
 
     def test_try_check_and_recover_is_debounced_across_calls(self):
         with tempfile.TemporaryDirectory() as directory:

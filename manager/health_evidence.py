@@ -210,7 +210,7 @@ def task_health_evidence(component: str, health, *, last_remediation: str | None
         "degraded_reason": None if state != "degraded" else health.detail,
         "last_remediation": last_remediation,
         "remediation_result": remediation_result,
-        "unresolved_blocker": None if state != "degraded" else f"{health.name} Scheduled Task is disabled or not found",
+        "unresolved_blocker": None if state != "degraded" else f"{component} Scheduled Task is disabled or not found",
         "observed_pid": None,
         "observed_port": None,
         "timestamp": utc_iso(),

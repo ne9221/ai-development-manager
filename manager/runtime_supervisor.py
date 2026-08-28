@@ -63,7 +63,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from manager import health_evidence, scheduler_provenance
-from manager.dashboard_core import parse_scheduled_task_health
+from manager.dashboard_core import ServiceHealthViewModel, parse_scheduled_task_health
 
 SCHTASKS_TIMEOUT_SECONDS = 10
 SWEEP_MIN_INTERVAL_SECONDS = 90
@@ -193,7 +193,7 @@ def query_scheduled_task(task_name, runner=subprocess.run):
             ["schtasks", "/Query", "/TN", task_name, "/FO", "LIST", "/V"],
             capture_output=True, text=True, timeout=SCHTASKS_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.SubprocessError):
+    except Exception:  # noqa: BLE001 -- see recover_scheduled_task's own comment
         return None
     if result.returncode != 0:
         return None
@@ -212,7 +212,9 @@ def recover_scheduled_task(task_name, runner=subprocess.run):
     try:
         run = runner(["schtasks", "/Run", "/TN", task_name],
                      capture_output=True, text=True, timeout=SCHTASKS_TIMEOUT_SECONDS)
-    except (OSError, subprocess.SubprocessError) as exc:
+    except Exception as exc:  # noqa: BLE001 -- an injected/custom runner can raise anything;
+        # this module's whole contract is "never raise into the caller", so
+        # ANY runner failure must degrade to a reported outcome, not a crash.
         return f"error:{type(exc).__name__}"
     if run.returncode != 0:
         return f"run_failed:{run.returncode}"
@@ -345,8 +347,15 @@ def check_and_recover(manager_home, *, now=None, runner=subprocess.run, service_
         # Same "never auto-recover a Disabled task" policy as every other
         # component (see module docstring) -- staleness alone does not
         # justify a bare `/Run`, which would bypass a deliberate Disable.
-        quota_task_health = parse_scheduled_task_health(
-            TASK_NAMES["quota_refresh"], query_scheduled_task(TASK_NAMES["quota_refresh"], runner=runner))
+        # Defensive like the heartbeat-component loop above: a schtasks
+        # failure here must not blow up the whole sweep and discard the
+        # heartbeat-component results already computed above it.
+        try:
+            quota_task_health = parse_scheduled_task_health(
+                TASK_NAMES["quota_refresh"], query_scheduled_task(TASK_NAMES["quota_refresh"], runner=runner))
+        except Exception:  # pragma: no cover -- defensive
+            quota_task_health = ServiceHealthViewModel(name=TASK_NAMES["quota_refresh"], found=False,
+                                                       detail="query failed", status_label="Unknown")
         quota_task_disabled = quota_task_health.found and quota_task_health.status_label == "Offline"
         if any_stale and quota_task_disabled:
             any_stale = False  # surfaced via unresolved_blocker below instead of a remediation attempt
