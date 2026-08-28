@@ -13,7 +13,8 @@ from unittest.mock import Mock, patch
 from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_creation_identity
 from manager.command_watcher import (
-    CLAIM_TIMEOUT_SECONDS, MAX_COMMANDS_PER_POLL, PROVIDER_RUNTIMES, REQUIRED_TASK_POLICIES, _provider_state,
+    CLAIM_TIMEOUT_SECONDS, MAX_COMMANDS_PER_POLL, MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL, PROVIDER_RUNTIMES,
+    REQUIRED_TASK_POLICIES, _provider_state, _enumerate_waiting_quota_tasks, _promote_waiting_quota_task,
     _prioritized_commands, claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist,
     poll_once, process_command, provider_quota_reliable, resolve_provider_runtime,
 )
@@ -22,7 +23,8 @@ from manager.executions import execution_health, heartbeat_execution, reserve_ex
 from manager.scheduler_provenance import command_origin
 from manager.task_claims import TaskClaimConflict
 from manager.tasks import TaskError, create_project, create_task, now_iso, validate
-from manager.trusted_ingress import ADMISSION_VERSION_V2_REPO_WRITE, REQUIRED_REPO_WRITE_TASK_POLICIES
+from manager.test_dispatcher import quota as fresh_quota_fixture
+from manager.trusted_ingress import ADMISSION_VERSION_V2_REPO_WRITE, REQUIRED_REPO_WRITE_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN
 from manager.test_execution_lifecycle import project, task
 from manager.test_execution_lifecycle import quota_document
 from manager.test_execution_runner import AccountAwareClaudeStyleLauncher
@@ -41,6 +43,11 @@ class Store:
     def list_projects(self): return [self.get("projects", "p1", "p1")]
     def list_records(self, area, project_id):
         return [deepcopy(value) for (record_area, project, _), value in self.records.items() if record_area == area and project == project_id]
+    def latest(self, area, project_id, task_id):
+        items = [value for (record_area, project, _), value in self.records.items()
+                 if record_area == area and project == project_id and value.get("task_id") == task_id]
+        if not items: raise TaskError("no handoff")
+        return max(items, key=lambda item: item["created_at"])
 
 
 def command(**changes):
@@ -2156,6 +2163,95 @@ class WindowsWatcherEmbeddedIngressWiringTests(unittest.TestCase):
             path = manager / name
             if path.exists():
                 self.assertNotIn("EmbeddedIngress", path.read_text(encoding="utf-8"))
+
+
+class WaitingQuotaPromotionTests(unittest.TestCase):
+    """DASHBOARD_TRUTH_CONNECTED gate 1/4: the retry sweep that promotes a
+    waiting_quota Task (manager.dispatcher.dispatch()'s own admission fix --
+    a Task admitted with recommended_provider=None because no provider had
+    usable quota at admission time) into a real Command once quota
+    recovers, hooked into poll_once()'s own already-scheduled tick instead
+    of a separate mechanism."""
+
+    ALLOWLIST = frozenset({("p1", "t1")})
+
+    @staticmethod
+    def claim_factory(*_args): return object()
+
+    def store_with_waiting_quota_task(self, request_id="req-wq"):
+        store = Store()
+        create_project(store, project())
+        waiting_task = task(read_only=True)
+        waiting_task.update(
+            recommended_provider=None, quota_evidence={},
+            source_context={"origin": TRUSTED_INGRESS_ORIGIN, "external_request_id": request_id,
+                             "goal": "test", "admission_version": "1.0"},
+        )
+        create_task(store, waiting_task, assign=False)
+        return store
+
+    def poll(self, store):
+        return poll_once(store, object(), allowlist=self.ALLOWLIST, claim_factory=self.claim_factory,
+                          health_check=lambda: True, quota_check=lambda service: True)
+
+    def test_waiting_quota_task_is_promoted_to_a_command_on_the_next_natural_tick(self):
+        store = self.store_with_waiting_quota_task()
+        with patch("manager.command_watcher.read_drive_status", return_value=fresh_quota_fixture(80, 90)):
+            self.poll(store)
+        promoted = store.get("commands", "p1", "t1")
+        self.assertEqual("codex", promoted["provider"])
+        self.assertEqual("queued", promoted["status"])
+        self.assertEqual("t1", promoted["task_id"])
+        # Same Task identity throughout -- never a duplicate Task.
+        self.assertEqual("t1", store.get("tasks", "p1", "t1")["task_id"])
+        self.assertEqual("req-wq", promoted.get("request_id"))
+        self.assertEqual("1.0", promoted.get("admission_version"))
+
+    def test_promotion_is_idempotent_and_never_double_creates_a_command(self):
+        """Two repeated sweep attempts for the same identity must produce
+        exactly one Command -- never a duplicate write once a Command
+        already exists for this identity (the known Drive-record-creation
+        race class this function's own docstring calls out). Calls
+        _promote_waiting_quota_task() directly (not poll_once()) so this
+        isolates the sweep's own idempotency from the separate, unrelated
+        fact that a newly-queued Command also becomes eligible for the
+        ordinary process_command() launch pipeline on next tick -- covered
+        by test_waiting_quota_task_is_promoted_to_a_command_on_the_next_natural_tick
+        already proving the promotion itself happens on a real poll_once()
+        tick."""
+        store = self.store_with_waiting_quota_task()
+        [waiting_task] = _enumerate_waiting_quota_tasks(store, "p1")
+        fresh = fresh_quota_fixture(80, 90)
+        first = _promote_waiting_quota_task(store, object(), waiting_task, fresh)
+        self.assertIsNotNone(first)
+        second = _promote_waiting_quota_task(store, object(), waiting_task, fresh)
+        self.assertIsNone(second)  # no-op: a Command already exists for this identity
+        self.assertEqual(first, store.get("commands", "p1", "t1"))
+
+    def test_scheduler_batch_path_tasks_are_never_swept(self):
+        """Only Tasks admitted via the trusted Direct Dispatch ingress carry
+        the task_id == command_id identity contract this sweep relies on --
+        a Task with no source_context.origin at all (e.g. a manual
+        task-create/scheduler.py batch task) must never be promoted by this
+        mechanism; its own caller already sees a waiting_quota dispatcher
+        result directly."""
+        store = Store()
+        create_project(store, project())
+        plain = task(read_only=True)
+        plain.update(recommended_provider=None, quota_evidence={})
+        create_task(store, plain, assign=False)
+        with patch("manager.command_watcher.read_drive_status", return_value=fresh_quota_fixture(80, 90)):
+            self.poll(store)
+        with self.assertRaises(TaskError):
+            store.get("commands", "p1", "t1")
+
+    def test_completed_or_cancelled_tasks_are_never_swept(self):
+        store = self.store_with_waiting_quota_task()
+        stored = store.get("tasks", "p1", "t1")
+        stored["status"] = "completed"
+        store.put("tasks", "p1", "t1", stored)
+        found = _enumerate_waiting_quota_tasks(store, "p1")
+        self.assertEqual([], found)
 
 
 if __name__ == "__main__": unittest.main()

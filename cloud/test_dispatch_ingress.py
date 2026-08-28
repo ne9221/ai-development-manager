@@ -489,6 +489,51 @@ class DispatchIngressTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(command_before, self.store.get("commands", "p1", "dispatch-req-idem"))
 
+    def test_waiting_quota_task_is_promoted_by_the_next_real_command_watcher_tick(self):
+        """DASHBOARD_TRUTH_CONNECTED gate 1/4, full closed-loop proof: a
+        request admitted as waiting_quota (every provider stale at
+        admission time) is durably visible with no Command, is promoted to
+        a real, queued Command by manager.command_watcher.poll_once()'s own
+        retry sweep on the very next natural tick once quota recovers (no
+        manual dispatch() re-invocation), and a same-request_id replay of
+        the ORIGINAL ingress call afterward correctly finds the promoted
+        Command instead of the "dispatch_incomplete" false failure a naive
+        replay would otherwise report forever. Uses the real DriveRecords/
+        FakeDriveService this class's setUp already wires (not a plain
+        dict test double) so this also exercises the real "COMMANDS Drive
+        folder does not exist yet" path poll_once()'s command enumeration
+        hits for a project's first-ever Command -- a real bug the plain
+        dict test doubles used elsewhere in this file cannot reproduce,
+        caught only by running this against DriveRecords directly."""
+        stale = quota_fixture(updated="2020-01-01T00:00:00Z")
+        request = payload(request_id="req-sweep-e2e")
+        with patch("manager.dispatcher.read_drive_status", return_value=stale):
+            admitted = self.call(request)
+        self.assertEqual("waiting_quota", admitted["status"])
+        self.assertIsNone(admitted["command_id"])
+        with self.assertRaises(TaskError):
+            self.store.get("commands", "p1", admitted["task_id"])
+
+        fresh = quota_fixture(80, 90)
+        with patch("manager.command_watcher.read_drive_status", return_value=fresh):
+            poll_once(self.store, self.service, allowlist=frozenset({("p1", admitted["task_id"])}))
+
+        command = self.store.get("commands", "p1", admitted["task_id"])
+        self.assertEqual("queued", command["status"])
+        self.assertIn(command["provider"], ("codex", "claude"))
+        # Same Task identity throughout -- promotion never creates a
+        # duplicate Task, and the original Task's own real evidence
+        # (dispatched via manager.dashboard_core.compute_dispatch_state())
+        # is what the Dashboard renders as QUEUED now, not WAITING_QUOTA.
+        from manager.dashboard_core import compute_dispatch_state
+        task = self.store.get("tasks", "p1", admitted["task_id"])
+        now = datetime.now(timezone.utc)
+        self.assertEqual("QUEUED", compute_dispatch_state(task, command, None, now)["state"])
+
+        replay = self.call(request)
+        self.assertEqual("queued", replay["status"])
+        self.assertEqual(command["command_id"], replay["command_id"])
+
     def test_queued_command_is_recognized_by_command_watcher_and_left_alone(self):
         """The Command Watcher must recognize the record contract this
         ingress writes, and -- with no static allowlist entry and no

@@ -703,6 +703,117 @@ def _enumerate_commands(store, project_id, deadline=None):
     return store.list_records("commands", project_id)
 
 
+# DASHBOARD_TRUTH_CONNECTED gate 1/4: how many waiting_quota Tasks one
+# poll_once() tick will attempt to promote into a real Command. Bounded
+# exactly like MAX_COMMANDS_PER_POLL, for the same reason -- a project with
+# many waiting_quota Tasks must not be able to consume the whole poll
+# budget re-attempting dispatch() for all of them in one tick; the rest are
+# simply picked up on a later natural tick, same as deferred Commands
+# already are.
+MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL = 4
+
+
+def _enumerate_waiting_quota_tasks(store, project_id, deadline=None):
+    """Deadline-aware, bounded-hydration enumeration of one project's
+    waiting_quota Tasks -- the exact mirror of _enumerate_commands() above,
+    generic DriveRecords.list_records_bounded()/list_records() over the
+    "tasks" area instead of "commands". Filtering to the real waiting_quota
+    signature (see _promote_waiting_quota_task()'s docstring for why
+    recommended_provider is None AND quota_evidence is not None is the only
+    non-guessed way to identify it) happens here, once, so callers never
+    duplicate that evidence check."""
+    if hasattr(store, "list_records_bounded"):
+        tasks = store.list_records_bounded("tasks", project_id, deadline=deadline,
+                                            single_request_worst_case=WATCHER_DISCOVERY_TIMEOUT_SECONDS)
+    else:
+        tasks = store.list_records("tasks", project_id)
+    return [task for task in tasks
+            if task.get("recommended_provider") is None and task.get("quota_evidence") is not None
+            and task.get("status") not in ("completed", "cancelled", "blocked")]
+
+
+def _promote_waiting_quota_task(store, service, task, quota_document, history=None):
+    """Re-attempt automatic provider selection for one Task that
+    manager.dispatcher.dispatch() previously admitted with no eligible
+    provider (recommended_provider=None, a real quota_evidence assignment
+    attempt recorded -- the waiting_quota state DASHBOARD_TRUTH_CONNECTED
+    gate 1 requires; see manager.dashboard_core.compute_dispatch_state()'s
+    own identical evidence check). Reuses the SAME task_id (dispatch()
+    finds the existing Task and never creates a duplicate) and, only if a
+    real provider is now eligible, creates exactly one Command for it.
+
+    command_id is set to task_id: cloud.dispatch_ingress.py's original
+    admission always reserves `task_id = command_id = f"dispatch-{request_
+    id}"` for a Direct Dispatch request (see its own handle_dispatch()) --
+    reusing that same identity here (rather than inventing a new command_id
+    scheme) means a same-request_id ingress replay that polls for that
+    exact reserved command_id finds the promoted Command once this runs,
+    instead of permanently reporting waiting_quota. Only Tasks admitted via
+    that trusted ingress path (source_context.origin ==
+    TRUSTED_INGRESS_ORIGIN) carry this identity contract; anything else
+    (manager.scheduler.schedule()'s own batch path, a manual `task-create`
+    CLI/adm_create_task Task) is out of scope for this sweep -- their own
+    callers already observe a waiting_quota dispatcher result directly and
+    can act on it themselves.
+
+    A Command is a required, non-null `provider` field by schema (see
+    schema/command.schema.json) -- never created speculatively -- so this
+    is a strict no-op (returns None) whenever dispatch() still reports
+    waiting_quota this tick, or when a Command already exists for this
+    identity (idempotent: a later tick, or another concurrent sweep, may
+    already have promoted it). The existence check immediately before the
+    write narrows -- it does not fully close, matching this codebase's
+    existing accepted Drive-record-creation race class (see the Drive
+    Execution reservation race backlog note) -- the window for two
+    concurrent sweeps to both decide to promote the same Task; a real fix
+    for that whole class of race is out of this task's scope."""
+    project_id, task_id = task["project_id"], task["task_id"]
+    if task.get("source_context", {}).get("origin") != TRUSTED_INGRESS_ORIGIN:
+        return None
+    try:
+        store.get("commands", project_id, task_id)
+        return None  # already promoted
+    except TaskError:
+        pass
+    from manager.dispatcher import dispatch as dispatcher_dispatch
+    request = {
+        "project_id": project_id, "task_id": task_id, "title": task["title"],
+        "task_type": task.get("task_type") or "general", "complexity": task.get("complexity", "medium"),
+        "expected_minutes": task.get("expected_minutes") or 20,
+    }
+    result = dispatcher_dispatch(store, service, request, quota_document, history or [])
+    if result.get("waiting_quota") or not result.get("provider"):
+        return None  # still no eligible provider this tick
+    try:
+        store.get("commands", project_id, task_id)
+        return None  # a concurrent sweep already won -- do not overwrite it
+    except TaskError:
+        pass
+    command = {
+        "command_id": task_id, "project_id": project_id, "task_id": task_id,
+        "provider": result["provider"], "account_id": result.get("account_id"),
+        "requested_provider": None, "requested_account_id": None,
+        "model": result.get("model"), "fallback_model": result.get("fallback_model"),
+        "mode": result.get("mode"), "effort": result.get("effort"), "selection_reason": result.get("selection_reason", []),
+        "quota_evidence": result.get("quota_evidence"), "created_at": now_iso(), "status": "queued",
+        "execution_id": None, "claimed_at": None, "completed_at": None, "result": None,
+        "created_via": TRUSTED_INGRESS_ORIGIN,
+    }
+    # admission_version/request_id are non-nullable (plain "string") in
+    # schema/command.schema.json, unlike requested_provider/
+    # requested_account_id above -- only stamp them when the originating
+    # Task's own source_context actually recorded a real value, rather than
+    # ever writing an explicit null a validator would reject.
+    source_context = task.get("source_context", {})
+    if isinstance(source_context.get("admission_version"), str) and source_context["admission_version"]:
+        command["admission_version"] = source_context["admission_version"]
+    if isinstance(source_context.get("external_request_id"), str) and source_context["external_request_id"]:
+        command["request_id"] = source_context["external_request_id"]
+    validate("command", command)
+    store.put("commands", project_id, task_id, command)
+    return command
+
+
 _COMMAND_PRIORITY = {"claimed": 0, "running": 0, "queued": 1, "attention": 2}
 
 
@@ -789,6 +900,23 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     if discovery_store is None:
         discovery_store = store
     results = []
+    # DASHBOARD_TRUTH_CONNECTED gate 1/4: waiting_quota Task promotion is
+    # this tick's OWN natural retry -- lazily fetched at most once per
+    # poll_once() call (never per-project/per-task) and reused across every
+    # promotion attempted this tick, so a project with no waiting_quota
+    # Tasks at all never pays for a quota read it doesn't need, and every
+    # promotion decided in the same tick sees one consistent snapshot.
+    sweep_quota_document = []  # 0 or 1 element: lazily-cached quota_document, or [False] once a read fails
+    promotions_this_poll = 0
+
+    def sweep_quota():
+        if not sweep_quota_document:
+            try:
+                sweep_quota_document.append(read_drive_status(service=service))
+            except Exception:
+                sweep_quota_document.append(False)
+        return sweep_quota_document[0] or None
+
     project_ids = _rotated_project_ids(_enumerate_project_ids(discovery_store, deadline=deadline))
     for project_id in project_ids:
         if time.monotonic() >= deadline:
@@ -796,14 +924,42 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         try:
             commands = _enumerate_commands(discovery_store, project_id, deadline=deadline)
         except TaskError:
+            # Preserves this function's exact prior behavior for command
+            # processing (nothing gets processed for this project this
+            # tick on any enumeration failure) -- but, unlike the old bare
+            # `continue` this replaced, must not also skip the independent
+            # waiting_quota sweep below. In particular, a project that has
+            # never had a single Command written to it yet has no COMMANDS
+            # Drive folder at all -- list_records_bounded()/list_records()
+            # raise TaskError("Drive folder not found") for that completely
+            # normal case, not a real error, and that must never suppress
+            # this same project's first-ever promotion.
+            commands = None
+        if commands is not None:
+            for command in _prioritized_commands(commands):
+                if len(results) == MAX_COMMANDS_PER_POLL:
+                    return results
+                if time.monotonic() >= deadline:
+                    return results
+                results.append(process_command(store, service, command, allowlist=allowlist,
+                                               origin_context=origin_context, **factories))
+        if promotions_this_poll >= MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL or time.monotonic() >= deadline:
             continue
-        for command in _prioritized_commands(commands):
-            if len(results) == MAX_COMMANDS_PER_POLL:
-                return results
-            if time.monotonic() >= deadline:
-                return results
-            results.append(process_command(store, service, command, allowlist=allowlist,
-                                           origin_context=origin_context, **factories))
+        try:
+            waiting_tasks = _enumerate_waiting_quota_tasks(discovery_store, project_id, deadline=deadline)
+        except TaskError:
+            continue
+        for task in waiting_tasks:
+            if promotions_this_poll >= MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL or time.monotonic() >= deadline:
+                break
+            quota_document = sweep_quota()
+            if quota_document is None:
+                break  # quota unavailable this tick -- do not attempt more promotions
+            try:
+                if _promote_waiting_quota_task(store, service, task, quota_document) is not None:
+                    promotions_this_poll += 1
+            except TaskError:
+                continue
     return results
 
 
