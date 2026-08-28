@@ -1,0 +1,13 @@
+{
+  "request_id": "gh-ingress-e2e-20260828-225142",
+  "project_id": "outlook-mail",
+  "title": "GitHub ingress E2E acceptance marker (Command Watcher exit-1 fix verification)",
+  "goal": "Append exactly one short comment line to the end of tests/PHASE1_ACCEPTANCE_CHECKLIST.md noting that this file was touched by a GitHub-dispatch-ingress end-to-end acceptance test verifying the Command Watcher exit-1 fix (fix/pester-watcher-vbs-isolation-20260829-v2, activated at 018b60428085a27ce21b6bfc1b9caeab066ecc4e) on 2026-08-29, with the request_id for traceability. Do not modify any other file or any other part of this file.",
+  "priority": "normal",
+  "created_at": "2026-08-28T22:51:42Z",
+  "repo_write": {
+    "allowed_paths": ["tests/PHASE1_ACCEPTANCE_CHECKLIST.md"],
+    "baseline_head": "ff4ab5bb77582f56c6f2bd7091cf8bf952d67fe2",
+    "repo": "ne9221/excel-mail-generator"
+  }
+}
