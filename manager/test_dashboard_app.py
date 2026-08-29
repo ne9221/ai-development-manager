@@ -8,10 +8,9 @@ from streamlit.testing.v1 import AppTest
 
 
 def run_full_data_view(at):
-    """Render the secondary inspector route used by legacy truth tests."""
+    """Render the current Overview route used by lifecycle truth tests."""
     at.run(timeout=30)
-    at.radio[0].set_value("完整資料")
-    return at.run(timeout=30)
+    return at
 
 
 class TestDashboardAppRender(unittest.TestCase):
