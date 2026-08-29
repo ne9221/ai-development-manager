@@ -101,6 +101,53 @@ class BoundedEvidenceStoreTests(unittest.TestCase):
         self.assertEqual("execution-1", evidence["execution"]["execution_id"])
         self.assertFalse(evidence["provider_output"]["observed"])
 
+    def test_collect_round_refreshes_canonical_terminal_records(self):
+        initial_task = {"task_id": "task-1", "project_id": "project-1", "status": "running"}
+        final_task = {"task_id": "task-1", "project_id": "project-1", "status": "completed"}
+        initial_command = {
+            "command_id": "command-1", "task_id": "task-1", "project_id": "project-1",
+            "status": "running", "execution_id": "execution-1", "provider": "codex",
+        }
+        final_command = {**initial_command, "status": "completed"}
+        execution = {
+            "execution_id": "execution-1", "task_id": "task-1", "status": "completed",
+            "completed_at": "2026-08-29T19:51:04Z", "provider": "codex",
+            "provider_evidence": {"present": True, "pid": 1234, "host": "test-host"},
+            "cleanup_evidence": {"task_claim_release": "released", "writer_release": "not_required"},
+        }
+
+        class Store:
+            def __init__(self):
+                self.reads = 0
+
+            def get(self, area, project_id, name):
+                self.reads += 1
+                if area == "tasks":
+                    return initial_task if self.reads == 1 else final_task
+                if area == "commands":
+                    return initial_command if self.reads == 2 else final_command
+                if area == "executions":
+                    return execution
+                raise RuntimeError("unexpected record")
+
+        store = Store()
+        with patch("manager.run_live_stability_gate_c.live_store", return_value=(store, object())), \
+             patch("manager.run_live_stability_gate_c.build_service", return_value=object()), \
+             patch("manager.run_live_stability_gate_c.DriveRecords", return_value=store), \
+             patch("manager.run_live_stability_gate_c.dispatch_request_registry", return_value=object()), \
+             patch("manager.run_live_stability_gate_c.collect_evidence", return_value={
+                 "project_id": "project-1", "request_id": "request-1", "ids": {},
+             }), \
+             patch("manager.run_live_stability_gate_c.RUN_STARTED_AT", "2026-08-29T19:00:00Z", create=True), \
+             patch("manager.run_live_stability_gate_c._terminal_state", return_value=("COMPLETED", "done")):
+            evidence = collect_round(1, "request-1", {"task_id": "task-1", "command_id": "command-1"})
+
+        self.assertEqual("completed", evidence["terminal"]["command_status"])
+        self.assertEqual("completed", evidence["terminal"]["execution_status"])
+        self.assertEqual("released", evidence["terminal"]["task_claim_release"])
+        self.assertEqual("not_required", evidence["terminal"]["writer_release"])
+        self.assertTrue(evidence["dashboard_truth"]["matches"])
+
 
 if __name__ == "__main__":
     unittest.main()

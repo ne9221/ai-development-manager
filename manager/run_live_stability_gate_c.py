@@ -252,12 +252,38 @@ def collect_round(round_number: int, request_id: str, receipt):
                 "observed_at": terminal,
                 "verification_method": "provider_result_summary",
             }
+            # collect_evidence() is intentionally a bounded independent read,
+            # but the Task/Command snapshot above may predate their terminal
+            # updates. Refresh the canonical records before deriving the
+            # terminal state; otherwise a real completed lifecycle is recorded
+            # as UNKNOWN/false by the acceptance adapter.
+            try:
+                task = store.get("tasks", PROJECT_ID, task_id)
+                command = store.get("commands", PROJECT_ID, receipt["command_id"])
+                if command.get("execution_id"):
+                    execution = store.get("executions", PROJECT_ID, command["execution_id"])
+            except Exception as exc:  # transient read; retain the observed terminal execution
+                last_error = type(exc).__name__
             state, reason = _terminal_state(task, command, execution)
+            cleanup = execution.get("cleanup_evidence") or {}
+            evidence["terminal"] = {
+                "state": state,
+                "command_status": command.get("status"),
+                "execution_status": execution.get("status"),
+                "cleanup_evidence": cleanup,
+                "task_claim_release": cleanup.get("task_claim_release"),
+                "writer_release": cleanup.get("writer_release"),
+            }
             evidence["dashboard_truth"] = {
                 "observed": True,
                 "backend_status": "COMPLETED" if execution.get("status") == "completed" else str(state).upper(),
                 "dashboard_status": "COMPLETED" if execution.get("status") == "completed" else str(state).upper(),
-                "matches": execution.get("status") == "completed" and state == "COMPLETED",
+                "matches": (
+                    task.get("status") == "completed"
+                    and command.get("status") == "completed"
+                    and execution.get("status") == "completed"
+                    and state == "COMPLETED"
+                ),
                 "observed_at": utc_now(),
                 "state_reason": reason,
             }
