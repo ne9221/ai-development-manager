@@ -191,7 +191,7 @@ def load_infra_health(active_executions=None):
 
 # Page Configuration
 st.set_page_config(
-    page_title="ADM Unified Operations Dashboard",
+    page_title="AI 開發管理器｜工作台",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -201,14 +201,14 @@ st.set_page_config(
 # below remain unchanged; this layer only improves hierarchy and scan speed.
 st.markdown("""
 <style>
-    :root { --adm-bg: #0b1220; --adm-panel: #111b2e; --adm-panel-2: #16243b; --adm-line: #263955; --adm-text: #e6edf7; --adm-muted: #91a4bd; --adm-blue: #62a0ff; --adm-green: #42d392; --adm-amber: #f2b84b; --adm-red: #ff6b78; }
+    :root { --adm-bg: #f4f6f3; --adm-panel: #ffffff; --adm-panel-2: #eef3ef; --adm-line: #dce5df; --adm-text: #1d2b25; --adm-muted: #6d7d73; --adm-blue: #2f7d68; --adm-green: #2f8f6b; --adm-amber: #b7791f; --adm-red: #c94b4b; }
     .stApp {
         background: var(--adm-bg);
         color: var(--adm-text);
-        font-family: "Segoe UI", "Microsoft JhengHei", sans-serif;
+        font-family: "Aptos", "Segoe UI", "Microsoft JhengHei", sans-serif;
     }
     [data-testid="stHeader"] { background: transparent; }
-    [data-testid="stSidebar"] { background: #0d1728; border-right: 1px solid var(--adm-line); }
+    [data-testid="stSidebar"] { background: #eaf0eb; border-right: 1px solid var(--adm-line); }
     [data-testid="stSidebar"] .stMarkdown { color: var(--adm-muted); }
     h1, h2, h3 { letter-spacing: -0.025em; }
     h1 { font-size: 2.35rem !important; margin-bottom: .2rem !important; }
@@ -217,16 +217,16 @@ st.markdown("""
     .glass-card {
         background: var(--adm-panel);
         border: 1px solid var(--adm-line);
-        border-radius: 10px;
+        border-radius: 16px;
         padding: 18px 20px;
         margin-bottom: 14px;
-        box-shadow: 0 10px 30px rgba(0,0,0,.12);
+        box-shadow: 0 8px 24px rgba(39,66,51,.06);
     }
-    .hero-card { background: linear-gradient(115deg, #13284a 0%, #102037 58%, #142238 100%); border: 1px solid #315580; border-radius: 12px; padding: 24px 26px; margin: 1rem 0 1.25rem; }
+    .hero-card { background: #1e332b; border: 1px solid #2c5140; border-radius: 20px; padding: 26px 28px; margin: 1rem 0 1.25rem; }
     .hero-kicker, .metric-label { color: var(--adm-muted); font-size: .72rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
     .hero-title { font-size: 1.8rem; font-weight: 750; margin: .45rem 0 .35rem; }
-    .hero-copy { color: #b8c8dc; font-size: .98rem; }
-    .hero-next { border-left: 2px solid var(--adm-blue); padding-left: 14px; color: #dbe7f7; }
+    .hero-copy { color: #c7d9ce; font-size: .98rem; }
+    .hero-next { border-left: 2px solid #75c9a5; padding-left: 14px; color: #e2eee6; }
     .hero-next strong { color: white; }
     .metric-value { font-size: 2rem; font-weight: 750; color: var(--adm-blue); line-height: 1.1; margin-top: .35rem; }
     .metric-card { min-height: 96px; }
@@ -269,6 +269,21 @@ st.markdown("""
     .priority-high { color: var(--adm-amber); font-weight: bold; }
     .priority-normal { color: var(--adm-blue); }
     .priority-low { color: var(--adm-muted); }
+    .workbench-section { margin: 2rem 0 1rem; }
+    .section-kicker { color: var(--adm-muted); font-size: .72rem; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
+    .section-title { font-size: 1.35rem; font-weight: 750; margin: .25rem 0 1rem; }
+    .active-card { background: #fff; border: 1px solid var(--adm-line); border-radius: 16px; padding: 17px 19px; min-height: 132px; box-shadow: 0 8px 24px rgba(39,66,51,.05); }
+    .active-card h3 { margin: 0 0 .65rem; font-size: 1.05rem; }
+    .active-meta, .quota-meta { color: var(--adm-muted); font-size: .84rem; line-height: 1.65; }
+    .quota-card { background: #fff; border: 1px solid var(--adm-line); border-radius: 16px; padding: 17px; display: flex; gap: 15px; align-items: center; min-height: 140px; }
+    .quota-ring { width: 82px; height: 82px; border-radius: 50%; display: grid; place-items: center; flex: 0 0 auto; }
+    .quota-ring-inner { width: 58px; height: 58px; border-radius: 50%; background: #fff; display: grid; place-items: center; color: var(--adm-text); font-size: .72rem; font-weight: 750; text-align: center; line-height: 1.1; }
+    .quota-ring.single { background: conic-gradient(var(--adm-blue) calc(var(--pct) * 1%), #e5ece7 0); }
+    .quota-ring.double { background: conic-gradient(var(--adm-blue) calc(var(--outer) * 1%), #e5ece7 0); }
+    .quota-ring.double .quota-ring-inner { background: conic-gradient(#79b99c calc(var(--inner) * 1%), #edf2ee 0); border: 6px solid #fff; }
+    .quota-ring.double .quota-ring-inner span { background: #fff; border-radius: 50%; padding: 7px 4px; }
+    .quota-number { font-size: 1.6rem; font-weight: 800; letter-spacing: -.04em; }
+    .quiet-note { color: var(--adm-muted); font-size: .82rem; }
     @media (max-width: 768px) { .block-container { padding: 1.25rem .9rem 3rem; } h1 { font-size: 1.8rem !important; } .hero-card { padding: 18px; } }
 </style>
 """, unsafe_allow_html=True)
@@ -1064,6 +1079,7 @@ st.caption("營運控制台 · 即時任務、執行狀態與配額")
 # Sidebar Refresh & Status
 with st.sidebar:
     st.header("控制台")
+    _view = st.radio("檢視", ["首頁工作台", "完整資料"], label_visibility="visible")
     if st.button("立即同步資料", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -1129,6 +1145,64 @@ for col, label, value, klass in (
 ):
     with col:
         st.markdown(f'<div class="glass-card metric-card"><div class="metric-label">{label}</div><div class="metric-value {klass}">{value}</div></div>', unsafe_allow_html=True)
+
+# Workbench home: the first paint is intentionally a decision surface. The
+# existing lifecycle tables and technical inspectors remain below this point
+# for the secondary views, while HOME shows only proven active work and quota.
+st.markdown('<div class="workbench-section"><div class="section-kicker">現在正在做</div><div class="section-title">活動中的真實任務</div></div>', unsafe_allow_html=True)
+if not _quick_active:
+    st.markdown('<div class="active-card"><h3>目前沒有已證實執行中的任務</h3><div class="active-meta">系統會在取得 provider session evidence 後才標記為執行中。</div></div>', unsafe_allow_html=True)
+else:
+    _task_by_id = {t.get("task_id"): t for t in all_tasks}
+    _active_cards = []
+    for _execution in _quick_active[:3]:
+        _task = _task_by_id.get(_execution.get("task_id"), {})
+        _title = _task.get("title") or (_execution.get("task_snapshot") or {}).get("title") or "未命名任務"
+        _provider = _execution.get("provider") or "未知 provider"
+        _account = _execution.get("account_id") or "未標示帳戶"
+        _phase = _execution.get("last_provider_event") or "執行中，等待下一個進度訊號"
+        _blocker = _execution.get("blocker") or _task.get("blocker") or "目前沒有已知阻塞"
+        _active_cards.append(f'''<div class="active-card"><h3>{_title}</h3><div class="active-meta"><b>{_provider}</b> · {_account}<br>階段：{_phase}<br>阻塞：{_blocker}</div></div>''')
+    st.markdown('<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px">' + ''.join(_active_cards) + '</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="workbench-section"><div class="section-kicker">資源餘額</div><div class="section-title">Quota · 剩餘與重置</div></div>', unsafe_allow_html=True)
+if not daily_brief_vm.accounts:
+    st.markdown('<div class="active-card"><h3>尚無可用的 quota 資料</h3><div class="active-meta">目前沒有已接入且可驗證的 AI provider。</div></div>', unsafe_allow_html=True)
+else:
+    _quota_cards = []
+    for _card in daily_brief_vm.accounts:
+        _outer = max(0, min(100, float(_card.five_hour_remaining_pct))) if _card.five_hour_remaining_pct is not None else 0
+        _inner = max(0, min(100, float(_card.weekly_remaining_pct))) if _card.weekly_remaining_pct is not None else 0
+        _has_week = _card.has_weekly_window and _card.weekly_remaining_pct is not None
+        _ring = (f'<div class="quota-ring double" style="--outer:{_outer};--inner:{_inner}"><div class="quota-ring-inner"><span>{_inner:.0f}%<br>每週</span></div></div>'
+                 if _has_week else f'<div class="quota-ring single" style="--pct:{_outer}"><div class="quota-ring-inner">{_outer:.0f}%<br>5H</div></div>')
+        _fresh = "已過期" if _card.stale else "最新"
+        _fresh_class = "state-attention" if _card.stale else "state-running"
+        _weekly_line = f'每週 {_card.formatted_weekly_remaining} · 重置 {_card.weekly_resets_at or "—"}<br>' if _has_week else ''
+        _quota_cards.append(f'''<div class="quota-card">{_ring}<div><div class="quota-number">{_card.card_title}</div><div class="quota-meta"><b>5H {_card.formatted_five_hour_remaining}</b> · 重置 {_card.five_hour_resets_at or "—"}<br>{_weekly_line}<span class="{_fresh_class}">{_fresh}</span></div></div></div>''')
+    st.markdown('<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(285px,1fr));gap:14px">' + ''.join(_quota_cards) + '</div>', unsafe_allow_html=True)
+    st.caption("外圈為 5H；有真實 weekly window 時，內圈為每週。未有資料的窗口不會被推算。")
+
+st.markdown('<div class="workbench-section"><div class="section-kicker">下一步</div><div class="section-title">今日重點</div></div>', unsafe_allow_html=True)
+_next_steps = []
+for _task in all_tasks:
+    if _task.get("task_id") in {e.get("task_id") for e in _quick_active}:
+        continue
+    _next = _task.get("next_action")
+    if _next and _next not in _next_steps:
+        _next_steps.append(_next)
+for _warning in (daily_brief_vm.telemetry_warnings or []):
+    if _warning not in _next_steps:
+        _next_steps.append(_warning)
+if _next_steps:
+    st.markdown("\n".join(f"- {item}" for item in _next_steps[:4]))
+else:
+    st.markdown("目前沒有需要立即處理的事項。")
+
+# ponytail: keep the dense legacy inspectors available to the existing
+# Streamlit route while stopping the HOME first paint here.
+if _view == "首頁工作台":
+    st.stop()
 
 # =====================================================================
 # P0: User-visible lifecycle truth (Task + Command + Execution)
