@@ -395,8 +395,12 @@ def load_pretask_dispatch_requests(project_ids):
 
 # Recent-first reads keep the HOME view bounded; the manual sync button clears
 # this short cache immediately when the user needs a fresh lifecycle state.
-@st.cache_data(ttl=60)
 def load_all_data():
+    # This result intentionally contains the live dashboard view-model graph.
+    # Streamlit's pickle-backed cache rejects some production Drive/runtime
+    # values even though the graph is valid for this render. Keep the live
+    # read fail-soft and let the smaller, JSON-shaped loaders below retain
+    # their bounded caches.
     load_started = time.perf_counter()
     now = datetime.now(timezone.utc)
     all_warnings = []
