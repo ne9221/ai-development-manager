@@ -972,7 +972,7 @@ st.markdown(f"""
             建議使用：<span style="color: #58a6ff;">{daily_brief_vm.recommended_display_name}</span>
         </span>
         <span class="badge {action_badge_class}" style="font-size: 0.85rem; padding: 6px 14px;">
-            ACTION: {action_label}
+            建議動作：{action_label}
         </span>
     </div>
     <div style="font-size: 0.95rem; line-height: 1.5; color: #e6edf3; margin-bottom: 10px;">
