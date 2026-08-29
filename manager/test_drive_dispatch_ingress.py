@@ -1,6 +1,7 @@
 import ast
 import inspect
 import json
+import os
 import re
 import time
 import unittest
@@ -13,7 +14,7 @@ import manager.drive_dispatch_ingress as drive_dispatch_ingress
 from cloud.dispatch_ingress import DispatchIngressError
 from manager.drive_dispatch_ingress import (
     DEFAULT_FAIRNESS_SLICES, DEFAULT_MAX_METADATA_PAGES, FOLDER_NAME, METADATA_FIELDS,
-    _fairness_bucket_bounds, _fairness_rotation_slot, _modified_time_indicates_stale,
+    _canonicalize_repo_write_baseline, _fairness_bucket_bounds, _fairness_rotation_slot, _modified_time_indicates_stale,
     _request_files, poll_drive_dispatch_requests, read_request, verify_ingress_folder,
 )
 from manager.tasks import MIME_FOLDER, MIME_JSON, TaskError
@@ -512,6 +513,25 @@ class DriveDispatchIngressTests(unittest.TestCase):
         payload = handler.call_args.args[3]
         self.assertEqual({"read_only": False}, payload["constraints"])
         self.assertEqual(self.VALID_REPO_WRITE, payload["repo_write"])
+
+    def test_abbreviated_repo_write_baseline_expands_from_running_commit(self):
+        full_baseline = "80138e1" + "a" * 33
+        short_request = {**self.VALID_REPO_WRITE, "baseline_head": "80138e1"}
+        service = Service(request(project_id="outlook-mail", repo_write=short_request))
+        handler = Mock(return_value={"accepted": True, "request_id": "drive-e2e-1",
+                                     "task_id": "dispatch-drive-e2e-1",
+                                     "command_id": "dispatch-drive-e2e-1", "status": "queued"})
+        with unittest.mock.patch.dict(os.environ, {"ADM_ACTIVATED_GIT_SHA": full_baseline}, clear=False), \
+             unittest.mock.patch("manager.drive_dispatch_ingress.handle_dispatch", handler):
+            poll_drive_dispatch_requests(object(), service, "bucket", FOLDER_ID, OWNER, NOW,
+                                         registry_factory=lambda *_args: object())
+        self.assertEqual(full_baseline, handler.call_args.args[3]["repo_write"]["baseline_head"])
+
+    def test_abbreviated_baseline_without_matching_running_commit_stays_rejected(self):
+        short_request = {**self.VALID_REPO_WRITE, "baseline_head": "80138e1"}
+        with unittest.mock.patch.dict(os.environ, {"ADM_ACTIVATED_GIT_SHA": "f" * 40}, clear=False):
+            canonical = _canonicalize_repo_write_baseline(request(repo_write=short_request))
+        self.assertEqual("80138e1", canonical["repo_write"]["baseline_head"])
 
     def _assert_repo_write_rejected_without_dispatch(self, repo_write):
         service = Service(request(repo_write=repo_write))

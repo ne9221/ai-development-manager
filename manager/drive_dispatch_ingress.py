@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -57,6 +58,7 @@ DEFAULT_FAIRNESS_SLICE_CANDIDATES = 5
 # correctness assumption -- see the "conditional bounded-load guarantee"
 # note in poll_drive_dispatch_requests's docstring.
 ASSUMED_POLL_INTERVAL_SECONDS = 60
+SHORT_BASELINE_HEAD_PATTERN = re.compile(r"^[0-9a-f]{7,39}$")
 
 
 def _identity_matches(identity, expected):
@@ -296,6 +298,20 @@ def read_request(service, folder_id, expected_owner, metadata, now=None):
     return document
 
 
+def _canonicalize_repo_write_baseline(document):
+    """Expand a short baseline only against the verified running commit."""
+    repo_write = document.get("repo_write") if isinstance(document, dict) else None
+    baseline = repo_write.get("baseline_head") if isinstance(repo_write, dict) else None
+    activated = os.environ.get("ADM_ACTIVATED_GIT_SHA")
+    if (not isinstance(baseline, str) or not SHORT_BASELINE_HEAD_PATTERN.fullmatch(baseline)
+            or not isinstance(activated, str)
+            or not re.fullmatch(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$", activated)
+            or not activated.startswith(baseline)):
+        return document
+    document["repo_write"] = {**repo_write, "baseline_head": activated}
+    return document
+
+
 def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expected_owner=None, now=None,
                                  registry_factory=dispatch_request_registry,
                                  rejection_registry_factory=dispatch_rejection_registry,
@@ -446,6 +462,7 @@ def poll_drive_dispatch_requests(store, service, bucket, folder_id=None, expecte
         downloads_used += 1
         try:
             request = read_request(service, folder_id, expected_owner, metadata, now=current)
+            request = _canonicalize_repo_write_baseline(request)
             payload = {
                 "request_id": request["request_id"], "project_id": request["project_id"],
                 "title": request["title"], "goal": request["goal"],
