@@ -30,12 +30,38 @@ class AppServer:
         if not executable:
             raise CollectorError("codex CLI not found in PATH")
         command = [executable, "app-server"]
-        if executable.lower().endswith((".cmd", ".bat")):
-            command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", f'""{executable}" app-server"']
+        # A `.cmd`/`.bat` resolution (the real shape of an npm-installed
+        # `codex` on Windows -- e.g. `codex.cmd`) is not a native PE
+        # executable; Windows can only launch it through cmd.exe as the
+        # interpreter. The previous approach hand-built that cmd.exe /C
+        # invocation itself (`cmd.exe /d /s /c '""<exe>" app-server"'`) --
+        # but that hand-quoted STRING was then passed as one element of
+        # this Popen's argv LIST with shell=False, so Python's own
+        # list2cmdline() quoted/escaped it a SECOND time before CreateProcess
+        # ever saw it, corrupting the quote structure cmd.exe's own /C
+        # heuristic expects. Live-reproduced: a real installed `codex.cmd`
+        # failed 100% of the time with "'""...codex.cmd" app-server"' is
+        # not recognized as an internal or external command" -- the process
+        # never even started.
+        #
+        # The fix is to never hand-build a cmd.exe wrapper string at all:
+        # shell=True on Windows lets Python itself run
+        # `list2cmdline(command)` exactly ONCE, correctly, then hands that
+        # single correctly-quoted string to cmd.exe -- verified live to
+        # produce a real JSON-RPC response from `codex app-server`, including
+        # for a `.cmd` path. This is gated to os.name == "nt" AND a
+        # `.cmd`/`.bat` executable specifically: shell=True has a DIFFERENT,
+        # unsafe meaning on POSIX (only the first list element reaches the
+        # program; the rest become arguments to the shell itself, not to the
+        # program) -- shell=False (today's existing, already-working
+        # behavior) is kept for every other case: a real .exe/native binary
+        # on Windows, and the entire POSIX path.
+        use_shell = os.name == "nt" and executable.lower().endswith((".cmd", ".bat"))
         try:
             self.process = subprocess.Popen(
                 command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, encoding="utf-8", bufsize=1,
+                shell=use_shell,
             )
         except OSError as exc:
             raise CollectorError(f"failed to start codex app-server: {exc}") from exc

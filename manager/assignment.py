@@ -18,6 +18,13 @@ CAPABILITIES = {
         "task_types": {"implementation": 2, "debugging": 3, "testing": 1, "research": 4, "architecture": 4},
         "traits": {"needs_repo_edit": 1, "needs_research": 3, "needs_browser": 0},
         "mode": "analysis",
+        # ClaudeLauncher v1 only supports the read-only safe profile
+        # (manager/claude_launcher.py's _READ_ONLY_SANDBOX/_READ_ONLY_APPROVAL
+        # check) -- it cannot execute a repo-write turn at all, so it must
+        # never be ranked as a candidate for one. This is a hard capability
+        # fact about the launcher, not a scoring preference; see
+        # `repo_write_capable` below and decide()'s own filter.
+        "repo_write_capable": False,
     },
     "antigravity": {
         "task_types": {"implementation": 1, "debugging": 1, "testing": 1, "research": 1, "architecture": 1},
@@ -55,13 +62,27 @@ def decide(task, quota, now=None, estimates=None):
     now = now or datetime.now(timezone.utc)
     estimates = estimates or {}
     expected = task.get("expected_minutes", 20)
+    # A repo-write task (needs_repo_edit=True, the default -- see
+    # manager/dispatcher.py's task_input construction) requires a launcher
+    # that can actually execute an unattended write turn. This is a hard
+    # eligibility gate, checked BEFORE quota (so an incompatible provider's
+    # quota is never even consulted) and before scoring (so it can never
+    # win purely on quota/task-type score) -- routing order is task
+    # requirements -> capability compatibility -> quota reliability ->
+    # score/rank, never "quota score wins, capability discovered at launch
+    # time" (see manager/claude_launcher.py's unsupported_policy fail-close,
+    # which this filter exists to make unreachable for routing purposes).
+    needs_write = task.get("needs_repo_edit", True)
     ranked = []
     warnings = []
     for provider in quota["providers"]:
+        config = CAPABILITIES[provider["provider"]]
+        if needs_write and not config.get("repo_write_capable", True):
+            warnings.append(f"{provider['display_name']} does not support repo-write tasks (capability mismatch)")
+            continue
         if not provider.get("has_usable_quota", provider["has_reliable_quota"]):
             warnings.append(f"{provider['display_name']} quota is {provider['status']} or stale")
             continue
-        config = CAPABILITIES[provider["provider"]]
         score = config["task_types"].get(task.get("task_type", "implementation"), 0)
         for trait, weight in config["traits"].items():
             if task.get(trait, False):

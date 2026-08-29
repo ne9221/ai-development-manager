@@ -319,6 +319,22 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
             "task_id": task["task_id"], "waiting_quota": True,
         }
 
+    # A repo-write task can still reach `selected` here via an EXPLICIT
+    # preferred_provider (which bypasses decide()'s own ranking/filter
+    # entirely, see `selected = request.get("preferred_provider") or ...`
+    # above) or via the Command Watcher's re-dispatch replay of an
+    # already-assigned provider (manager.execution_runner._dispatch_request,
+    # provider_is_assigned=True). Unlike the quota-reliability guard below
+    # -- which intentionally exempts provider_is_assigned, since quota can
+    # genuinely change between the original dispatch and a later relaunch
+    # -- capability incompatibility is static and can never become true
+    # later, so it is never exempted: an incompatible provider must never
+    # reach the launch phase, whether chosen automatically, requested
+    # explicitly, or replayed from an already-assigned Command.
+    if (selected in CAPABILITIES and task_input.get("needs_repo_edit", True)
+            and not CAPABILITIES[selected].get("repo_write_capable", True)):
+        return _admit_waiting_quota([f"{selected} does not support repo-write tasks (capability mismatch)"])
+
     if selected not in CAPABILITIES:
         return _admit_waiting_quota(decision["reasons"])
     alternatives = [item for item in [decision["recommended_provider"], *decision["alternatives"]] if item and item not in (selected, excluded)]

@@ -37,7 +37,13 @@ def task_input(**changes):
     value = {
         "task_id": "governance-proof", "project_id": "p1", "title": "Prove governance",
         "task_type": "implementation", "complexity": "medium", "expected_minutes": 20,
-        "needs_repo_edit": True, "needs_research": True, "scope": ["Implement the proof"],
+        # False: this test proves governance-rule injection renders for
+        # EVERY dispatch provider including Claude (see the loop below) --
+        # a repo-write task would correctly capability-filter Claude out
+        # before ever reaching prompt generation (ClaudeLauncher v1 only
+        # supports the read-only profile), which is a different concern
+        # this test isn't about.
+        "needs_repo_edit": False, "needs_research": True, "scope": ["Implement the proof"],
         "constraints": [], "acceptance_criteria": ["Tests pass"], "source_context": {},
     }
     value.update(changes)

@@ -53,8 +53,14 @@ class ManagerTest(unittest.TestCase):
         self.assertEqual("codex", result["recommended_provider"])
 
     def test_automatic_routing_keeps_fresh_claude_when_codex_is_stale(self):
+        # needs_repo_edit=False, matching this test class's other
+        # Claude-eligible scenarios above: ClaudeLauncher v1 only supports
+        # the read-only profile, so a repo-write task would correctly
+        # capability-filter Claude out regardless of quota freshness --
+        # this test is specifically about quota-freshness routing, not
+        # repo-write capability.
         result = decide(
-            self.task(),
+            self.task(needs_repo_edit=False),
             quota(provider("codex", 90, NOW - timedelta(hours=2)), provider("claude", 20)),
             NOW,
         )

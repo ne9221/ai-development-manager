@@ -59,7 +59,13 @@ class RuntimeBridgeTests(unittest.TestCase):
     def test_new_task_current_quota_provider_alternatives_and_json(self):
         result = self.call({"project_id": "ADM", "user_request": "Implement runtime bridge", "task_type": "implementation", "complexity": "medium"}, quota(80, 60))
         self.assertEqual("new_task", result["request_type"]); self.assertEqual("codex", result["recommended_provider"])
-        self.assertTrue(result["alternatives"]); self.assertEqual("fresh", result["quota_freshness"]); self.assertIn("80% remaining", result["quota_summary"])
+        # A brand-new runtime_bridge task always defaults to needs_repo_edit=True
+        # (see runtime_bridge.py's own dispatch_request construction) --
+        # Claude is correctly capability-filtered out of `alternatives`
+        # here (ClaudeLauncher v1 only supports the read-only profile), so
+        # codex (the sole repo-write-capable provider with usable quota in
+        # this fixture) legitimately has none.
+        self.assertEqual([], result["alternatives"]); self.assertEqual("fresh", result["quota_freshness"]); self.assertIn("80% remaining", result["quota_summary"])
         self.assertIsInstance(json.loads(json.dumps(result)), dict); self.assertIn("推荐：codex", human_summary(result))
 
     def test_read_only_new_task_does_not_write_runtime_records(self):

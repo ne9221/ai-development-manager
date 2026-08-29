@@ -95,7 +95,7 @@ class DispatcherTests(unittest.TestCase):
     def test_identity_header_round_trips_canonical_task_for_codex_and_claude(self):
         for provider, task_id in (("codex", "canonical-task-id"), ("claude", "canonical_task_id")):
             with self.subTest(provider=provider):
-                result = self.dispatch_case(request(task_id=task_id, title="Conversation label differs", preferred_provider=provider), quota(80, 80))
+                result = self.dispatch_case(request(task_id=task_id, title="Conversation label differs", preferred_provider=provider, needs_repo_edit=False), quota(80, 80))
                 prompt = result["generated_prompt"]
                 expected = {"ai": provider.title(), "project": "p1", "task": task_id, "conversation": "not supplied"}
                 self.assertEqual(expected, parse_identity_header(prompt))
@@ -185,34 +185,34 @@ class DispatcherTests(unittest.TestCase):
         routing "no eligible provider" case."""
         document = quota(80, 90)
         next(item for item in document["providers"] if item["provider"] == "claude")["last_updated"] = "2020-01-01T00:00:00Z"
-        result = self.dispatch_case(request(preferred_provider="claude"), document)
+        result = self.dispatch_case(request(preferred_provider="claude", needs_repo_edit=False), document)
         self.assertIsNone(result["provider"])
         self.assertNotEqual("codex", result["provider"])
         self.assertTrue(result["waiting_quota"])
 
     def test_account_id_selects_matching_claude_account_quota(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
-        result_a = self.dispatch_case(request(title="Account A", preferred_provider="claude", account_id="claude-a"), doc)
+        result_a = self.dispatch_case(request(title="Account A", preferred_provider="claude", needs_repo_edit=False, account_id="claude-a"), doc)
         self.assertIn("claude-a", result_a["quota_summary"]); self.assertIn("90% remaining", result_a["quota_summary"])
-        result_b = self.dispatch_case(request(title="Account B", preferred_provider="claude", account_id="claude-b"), doc)
+        result_b = self.dispatch_case(request(title="Account B", preferred_provider="claude", needs_repo_edit=False, account_id="claude-b"), doc)
         self.assertIn("claude-b", result_b["quota_summary"]); self.assertIn("40% remaining", result_b["quota_summary"])
         self.assertNotIn("90% remaining", result_b["quota_summary"])
 
     def test_account_id_selection_is_order_independent(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
         doc_swapped = dict(doc); doc_swapped["providers"] = list(reversed(doc["providers"]))
-        result = self.dispatch_case(request(title="Account B swapped", preferred_provider="claude", account_id="claude-b"), doc_swapped)
+        result = self.dispatch_case(request(title="Account B swapped", preferred_provider="claude", needs_repo_edit=False, account_id="claude-b"), doc_swapped)
         self.assertIn("claude-b", result["quota_summary"]); self.assertIn("40% remaining", result["quota_summary"])
 
     def test_account_id_reliability_not_laundered_across_accounts(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="unknown", b_remaining=None)
-        result = self.dispatch_case(request(title="Unreliable account B", preferred_provider="claude", account_id="claude-b"), doc)
+        result = self.dispatch_case(request(title="Unreliable account B", preferred_provider="claude", needs_repo_edit=False, account_id="claude-b"), doc)
         self.assertIsNone(result["provider"])
         self.assertTrue(result["waiting_quota"])
 
     def test_account_id_does_not_silently_switch_stale_to_fresh(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=70, a_updated="2020-01-01T00:00:00Z", b_confidence="official", b_remaining=40, b_updated="2026-08-09T05:00:00Z")
-        result = self.dispatch_case(request(title="Stale account A", preferred_provider="claude", account_id="claude-a"), doc)
+        result = self.dispatch_case(request(title="Stale account A", preferred_provider="claude", needs_repo_edit=False, account_id="claude-a"), doc)
         self.assertIsNone(result["provider"])
         self.assertTrue(result["waiting_quota"])
 
@@ -230,11 +230,11 @@ class DispatcherTests(unittest.TestCase):
         fresh_now = datetime.now(timezone.utc).isoformat()
         doc_stale = two_claude_accounts(a_confidence="official", a_remaining=70, a_updated=stale_3h_ago,
                                         b_confidence="official", b_remaining=40, b_updated=fresh_now)
-        stale_result = self.dispatch_case(request(title="Stale then recovered", preferred_provider="claude", account_id="claude-a"), doc_stale)
+        stale_result = self.dispatch_case(request(title="Stale then recovered", preferred_provider="claude", needs_repo_edit=False, account_id="claude-a"), doc_stale)
         self.assertIsNone(stale_result["provider"])
         self.assertTrue(stale_result["waiting_quota"])
         # account-b, fresh throughout, was never affected by account-a's staleness.
-        b_result = self.dispatch_case(request(title="B unaffected by A's staleness", preferred_provider="claude", account_id="claude-b"), doc_stale)
+        b_result = self.dispatch_case(request(title="B unaffected by A's staleness", preferred_provider="claude", needs_repo_edit=False, account_id="claude-b"), doc_stale)
         self.assertEqual("claude-b", b_result["account_id"])
 
         # The collector produces a fresh reading for account-a again --
@@ -242,14 +242,14 @@ class DispatcherTests(unittest.TestCase):
         recovered_now = datetime.now(timezone.utc).isoformat()
         doc_recovered = two_claude_accounts(a_confidence="official", a_remaining=65, a_updated=recovered_now,
                                             b_confidence="official", b_remaining=40, b_updated=fresh_now)
-        recovered = self.dispatch_case(request(title="Stale then recovered", preferred_provider="claude", account_id="claude-a"), doc_recovered)
+        recovered = self.dispatch_case(request(title="Stale then recovered", preferred_provider="claude", needs_repo_edit=False, account_id="claude-a"), doc_recovered)
         self.assertEqual("claude-a", recovered["account_id"])
         self.assertIn("65% remaining", recovered["quota_summary"])
 
     def test_automatic_claude_uses_provider_eligibility_without_pinning_an_account(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=70, a_updated="2020-01-01T00:00:00Z", b_confidence="official", b_remaining=40, b_updated=datetime.now(timezone.utc).isoformat())
         next(item for item in doc["providers"] if item["provider"] == "codex")["last_updated"] = "2020-01-01T00:00:00Z"
-        result = self.dispatch_case(request(title="Fresh Claude sibling", preferred_provider="claude", task_type="architecture"), doc)
+        result = self.dispatch_case(request(title="Fresh Claude sibling", preferred_provider="claude", needs_repo_edit=False, task_type="architecture"), doc)
         self.assertEqual("claude", result["provider"])
         self.assertEqual("claude-b", result["account_id"])
         self.assertEqual(["claude-b"], result["provider_availability"]["eligible_account_ids"])
@@ -263,7 +263,7 @@ class DispatcherTests(unittest.TestCase):
         distinct unknown/unavailable entry -- never another account's or the
         legacy representative's real numbers laundered onto it."""
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
-        result = self.dispatch_case(request(title="Missing account", preferred_provider="claude", account_id="claude-does-not-exist"), doc)
+        result = self.dispatch_case(request(title="Missing account", preferred_provider="claude", needs_repo_edit=False, account_id="claude-does-not-exist"), doc)
         self.assertIsNone(result["provider"])
         self.assertTrue(result["waiting_quota"])
 
@@ -273,7 +273,7 @@ class DispatcherTests(unittest.TestCase):
         own data, never the provider-level legacy representative's (which can
         be a different real account's numbers)."""
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
-        result_b = self.dispatch_case(request(title="Account B evidence", preferred_provider="claude", account_id="claude-b"), doc)
+        result_b = self.dispatch_case(request(title="Account B evidence", preferred_provider="claude", needs_repo_edit=False, account_id="claude-b"), doc)
         claude_evidence = result_b["quota_evidence"]["claude"]
         self.assertEqual(40, claude_evidence["windows"][0]["remaining_percent"])
 
@@ -284,17 +284,17 @@ class DispatcherTests(unittest.TestCase):
         lookup, so the result is the deliberate last-wins record -- not
         whichever duplicate happened to come first."""
         doc = duplicate_claude_account(first_remaining=12, second_remaining=47)
-        result = self.dispatch_case(request(title="Duplicate account record", preferred_provider="claude", account_id="claude-a"), doc)
+        result = self.dispatch_case(request(title="Duplicate account record", preferred_provider="claude", needs_repo_edit=False, account_id="claude-a"), doc)
         self.assertIn("47% remaining", result["quota_summary"])
         self.assertNotIn("12% remaining", result["quota_summary"])
         doc_swapped = duplicate_claude_account(first_remaining=47, second_remaining=12)
-        result_swapped = self.dispatch_case(request(title="Duplicate account record swapped", preferred_provider="claude", account_id="claude-a"), doc_swapped)
+        result_swapped = self.dispatch_case(request(title="Duplicate account record swapped", preferred_provider="claude", needs_repo_edit=False, account_id="claude-a"), doc_swapped)
         self.assertIn("12% remaining", result_swapped["quota_summary"])
         self.assertNotIn("47% remaining", result_swapped["quota_summary"])
 
     def test_no_account_id_keeps_legacy_provider_level_behavior(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
-        result = self.dispatch_case(request(title="Legacy path", preferred_provider="claude"), doc)
+        result = self.dispatch_case(request(title="Legacy path", preferred_provider="claude", needs_repo_edit=False), doc)
         self.assertIn("claude-a", result["quota_summary"]); self.assertNotIn("claude-b", result["quota_summary"])
         self.assertIn("90% remaining", result["quota_summary"])
 
@@ -305,13 +305,13 @@ class DispatcherTests(unittest.TestCase):
 
     def test_all_claude_accounts_unknown_no_fabricated_selection(self):
         doc = two_claude_accounts(a_confidence="unknown", a_remaining=None, b_confidence="unknown", b_remaining=None)
-        result = self.dispatch_case(request(title="All unknown", preferred_provider="claude"), doc)
+        result = self.dispatch_case(request(title="All unknown", preferred_provider="claude", needs_repo_edit=False), doc)
         self.assertIsNone(result["provider"])
         self.assertTrue(result["waiting_quota"])
 
     def test_account_identity_shown_without_credentials(self):
         doc = two_claude_accounts(a_confidence="official", a_remaining=90, b_confidence="official", b_remaining=40)
-        result = self.dispatch_case(request(title="Attribution only", preferred_provider="claude", account_id="claude-a"), doc)
+        result = self.dispatch_case(request(title="Attribution only", preferred_provider="claude", needs_repo_edit=False, account_id="claude-a"), doc)
         for blob in (result["quota_summary"], result["generated_prompt"]):
             self.assertIn("claude-a", blob)
             for forbidden in ("config_dir", "token", "credential", "CLAUDE_CONFIG_DIR"):
@@ -635,7 +635,7 @@ class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
     # 1. A fresh 80%, B fresh 20% -> A prioritized
     def test_fresh_a_80_b_20_selects_a(self):
         doc = self.make_fresh_doc(a_rem=80.0, b_rem=20.0)
-        res = dispatch(self.store, object(), request(title="Quota test", preferred_provider="claude"), doc, [])
+        res = dispatch(self.store, object(), request(title="Quota test", preferred_provider="claude", needs_repo_edit=False), doc, [])
         self.assertEqual("claude-a", res["account_id"])
         self.assertIn("claude-a", res["quota_summary"])
         self.assertIn("80", res["quota_summary"])
@@ -653,7 +653,7 @@ class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
             "provider": "claude", "account_id": "claude-a", "last_updated": (now - timedelta(hours=1)).isoformat(),
             "windows": [{"name": "five_hour", "remaining_percent": 90.0, "resets_at": reset_soon.isoformat()}],
         }
-        res = dispatch(self.store, object(), request(title="Waste risk test", preferred_provider="claude"), doc, [h_a])
+        res = dispatch(self.store, object(), request(title="Waste risk test", preferred_provider="claude", needs_repo_edit=False), doc, [h_a])
         self.assertEqual("claude-a", res["account_id"])
         self.assertIn("claude-a", res["quota_summary"])
 
@@ -673,14 +673,14 @@ class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
             "provider": "claude", "account_id": "claude-b", "last_updated": (now - timedelta(hours=1)).isoformat(),
             "windows": [{"name": "five_hour", "remaining_percent": 45.0, "resets_at": reset_time.isoformat()}],
         }
-        res = dispatch(self.store, object(), request(title="Exhaust test", preferred_provider="claude"), doc, [h_a, h_b])
+        res = dispatch(self.store, object(), request(title="Exhaust test", preferred_provider="claude", needs_repo_edit=False), doc, [h_a, h_b])
         self.assertEqual("claude-b", res["account_id"])
         self.assertIn("claude-b", res["quota_summary"])
 
     # 4. A stale 90%, B fresh 40% -> selects B
     def test_stale_a_90_fresh_b_40_selects_b(self):
         doc = self.make_fresh_doc(a_rem=90.0, b_rem=40.0, a_stale=True, b_stale=False)
-        res = dispatch(self.store, object(), request(title="Stale test", preferred_provider="claude"), doc, [])
+        res = dispatch(self.store, object(), request(title="Stale test", preferred_provider="claude", needs_repo_edit=False), doc, [])
         self.assertEqual("claude-b", res["account_id"])
         self.assertIn("claude-b", res["quota_summary"])
         self.assertNotIn("90", res["quota_summary"])
@@ -688,7 +688,7 @@ class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
     # 5. A remaining=None, B fresh 40% -> selects B
     def test_unknown_a_fresh_b_selects_b(self):
         doc = self.make_fresh_doc(a_rem=None, b_rem=40.0, a_conf="unknown", b_conf="official")
-        res = dispatch(self.store, object(), request(title="Unknown test", preferred_provider="claude"), doc, [])
+        res = dispatch(self.store, object(), request(title="Unknown test", preferred_provider="claude", needs_repo_edit=False), doc, [])
         self.assertEqual("claude-b", res["account_id"])
         self.assertIn("claude-b", res["quota_summary"])
 
@@ -696,7 +696,7 @@ class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
     def test_insufficient_history_fallback_to_current_quota(self):
         doc = self.make_fresh_doc(a_rem=80.0, b_rem=20.0)
         # Empty execution history
-        res = dispatch(self.store, object(), request(title="No history test", preferred_provider="claude"), doc, [])
+        res = dispatch(self.store, object(), request(title="No history test", preferred_provider="claude", needs_repo_edit=False), doc, [])
         self.assertEqual("claude-a", res["account_id"])
 
     # 7. A auth unavailable (disabled) -> cannot be selected
@@ -747,13 +747,13 @@ class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
                 {"name": "seven_day", "remaining_percent": 61.0, "resets_at": reset_week.isoformat()},
             ],
         }
-        res = dispatch(self.store, object(), request(title="Multi-window test", preferred_provider="claude"), doc, [h_a, h_b])
+        res = dispatch(self.store, object(), request(title="Multi-window test", preferred_provider="claude", needs_repo_edit=False), doc, [h_a, h_b])
         self.assertEqual("claude-b", res["account_id"])
 
     # 10. Selected account's quota_evidence cannot reference another account
     def test_selected_account_quota_evidence_isolated(self):
         doc = self.make_fresh_doc(a_rem=85.0, b_rem=15.0)
-        res = dispatch(self.store, object(), request(title="Isolation test", preferred_provider="claude"), doc, [])
+        res = dispatch(self.store, object(), request(title="Isolation test", preferred_provider="claude", needs_repo_edit=False), doc, [])
         self.assertEqual("claude-a", res["account_id"])
         evidence = res["quota_evidence"]["claude"]
         self.assertEqual("claude-a", evidence.get("account_id"))
@@ -792,7 +792,7 @@ class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
         from unittest.mock import patch
         doc = self.make_fresh_doc(a_rem=80.0, b_rem=20.0)
         with patch("manager.quota_forecast.forecast_account", side_effect=RuntimeError("forecast math failure")):
-            res = dispatch(self.store, object(), request(title="Exception fallback test", preferred_provider="claude"), doc, [])
+            res = dispatch(self.store, object(), request(title="Exception fallback test", preferred_provider="claude", needs_repo_edit=False), doc, [])
             self.assertIn(res["recommended_provider"], ("claude", "codex"))
             self.assertIn("quota_evidence", res)
 
@@ -807,7 +807,7 @@ class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
             "provider": "claude", "account_id": "claude-a", "last_updated": (now - timedelta(hours=1)).isoformat(),
             "windows": [{"name": "five_hour", "remaining_percent": 65.0, "resets_at": reset_time.isoformat()}],
         }
-        res = dispatch(self.store, object(), request(title="P2 test", preferred_provider="claude"), doc, [h_a])
+        res = dispatch(self.store, object(), request(title="P2 test", preferred_provider="claude", needs_repo_edit=False), doc, [h_a])
         fc_info = res["quota_evidence"]["claude"].get("forecast", {})
         self.assertEqual(ActionRecommendation.SUGGEST_CONSUME.value, fc_info.get("overall_action_recommendation"))
         self.assertEqual(RiskStatus.CONSUME_FASTER.value, fc_info.get("overall_risk_status"))
@@ -830,7 +830,7 @@ class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
         }
         store.append_snapshot(h_a)
 
-        res = dispatch(self.store, object(), request(title="Store routing test", preferred_provider="claude"), doc, [], history_store=store)
+        res = dispatch(self.store, object(), request(title="Store routing test", preferred_provider="claude", needs_repo_edit=False), doc, [], history_store=store)
         self.assertEqual("claude-a", res["account_id"])
         self.assertIn("claude-a", res["quota_summary"])
 
@@ -841,9 +841,74 @@ class QuotaAwareRoutingDispatcherTests(unittest.TestCase):
                 raise IOError("storage unreachable")
 
         doc = self.make_fresh_doc(a_rem=80.0, b_rem=20.0)
-        res = dispatch(self.store, object(), request(title="Broken store test", preferred_provider="claude"), doc, [], history_store=BrokenHistoryStore())
+        res = dispatch(self.store, object(), request(title="Broken store test", preferred_provider="claude", needs_repo_edit=False), doc, [], history_store=BrokenHistoryStore())
         self.assertEqual("claude-a", res["account_id"])
         self.assertEqual("claude", res["recommended_provider"])
+
+
+class ProviderCapabilityRoutingTests(unittest.TestCase):
+    """ClaudeLauncher v1 only supports the read-only safe profile
+    (manager/claude_launcher.py) -- a repo-write task must never be routed
+    to Claude, whether by automatic ranking or an explicit/replayed
+    preference, and must never crash into a doomed Execution when Claude
+    is the only capability-eligible-by-score provider but incompatible."""
+
+    def setUp(self): self.store = MemoryStore(); create_project(self.store, project())
+
+    def dispatch_case(self, req=None, q=None, records=None):
+        return dispatch(self.store, object(), req or request(), q or quota(), [] if records is None else records)
+
+    def test_read_only_task_claude_is_eligible(self):
+        result = self.dispatch_case(request(title="Read-only", needs_repo_edit=False), quota(codex=None, claude=90))
+        self.assertEqual(result["recommended_provider"], "claude")
+
+    def test_repo_write_task_excludes_claude_from_ranking_entirely(self):
+        # Claude has excellent quota, codex has none -- if capability
+        # filtering didn't exclude Claude before scoring, it would win
+        # here on quota score alone. It must never even be considered.
+        result = self.dispatch_case(request(title="Repo-write excludes claude"), quota(codex=None, claude=99))
+        self.assertIsNone(result["recommended_provider"])
+        self.assertTrue(result["waiting_quota"])
+        self.assertNotIn("claude", result["alternatives"])
+        self.assertNotIn("claude", result["quota_evidence"])
+
+    def test_repo_write_task_selects_codex_when_compatible_and_fresh(self):
+        result = self.dispatch_case(request(title="Repo-write picks codex"), quota(codex=80, claude=99))
+        self.assertEqual(result["recommended_provider"], "codex")
+
+    def test_repo_write_no_compatible_provider_is_truthful_waiting_not_doomed_execution(self):
+        result = self.dispatch_case(request(title="No compatible provider"), quota(codex=None, claude=90))
+        self.assertIsNone(result["recommended_provider"])
+        self.assertTrue(result["waiting_quota"])
+        self.assertIsNone(result["generated_prompt"])
+        self.assertIn("Task admitted; automatic provider selection is waiting on quota recovery",
+                      "; ".join(result["warnings"]))
+
+    def test_explicit_preferred_claude_for_repo_write_is_waiting_not_silently_launched(self):
+        result = self.dispatch_case(
+            request(title="Explicit claude repo-write", preferred_provider="claude"),
+            quota(codex=None, claude=99),
+        )
+        self.assertIsNone(result["recommended_provider"])
+        self.assertTrue(result["waiting_quota"])
+
+    def test_replayed_provider_is_assigned_does_not_exempt_capability_gate(self):
+        # Mirrors manager.execution_runner._dispatch_request()'s re-dispatch
+        # replay of an already-assigned Command's provider (provider_is_
+        # assigned=True). Unlike quota reliability, which IS exempted there
+        # because quota can genuinely change between dispatch and replay,
+        # capability incompatibility is static and must never be exempted.
+        req = request(title="Replay claude repo-write", preferred_provider="claude", provider_is_assigned=True)
+        result = self.dispatch_case(req, quota(codex=None, claude=99))
+        self.assertIsNone(result["recommended_provider"])
+        self.assertTrue(result["waiting_quota"])
+
+    def test_capability_filtering_happens_before_quota_scoring(self):
+        # Claude's quota IS usable here -- the capability-mismatch warning
+        # must still fire, proving the filter isn't gated behind (or
+        # short-circuited by) the quota-usability check.
+        result = self.dispatch_case(request(title="Capability precedes quota"), quota(codex=None, claude=90))
+        self.assertIn("does not support repo-write tasks (capability mismatch)", "; ".join(result["warnings"]))
 
 
 if __name__ == "__main__": unittest.main()
