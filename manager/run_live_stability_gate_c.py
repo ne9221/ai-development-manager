@@ -27,6 +27,8 @@ REPO = "https://github.com/ne9221/ai-development-manager"
 BASELINE = "7365ca2ac84a765e6635a3194f778dfc62136e51"
 BUCKET = "adm-lock-smoke-551449082603-20260813-0147"
 ALLOWED_PATHS = ["manager/test_dispatch_10round_acceptance.py"]
+EVIDENCE_REQUEST_TIMEOUT_SECONDS = 10
+EVIDENCE_AREA_BUDGET_SECONDS = 30
 
 
 def utc_now() -> str:
@@ -36,6 +38,21 @@ def utc_now() -> str:
 def live_store():
     service = build_service()
     return DriveRecords(service), service
+
+
+class BoundedEvidenceStore:
+    """Read-only acceptance view that cannot hang on historical hydration."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def list_records(self, area, project_id):
+        return self._store.list_records_bounded(
+            area,
+            project_id,
+            deadline=time.monotonic() + EVIDENCE_AREA_BUDGET_SECONDS,
+            single_request_worst_case=EVIDENCE_REQUEST_TIMEOUT_SECONDS,
+        )
 
 
 def provider_for(round_number: int) -> tuple[str, str | None]:
@@ -105,7 +122,16 @@ def collect_round(round_number: int, request_id: str, receipt):
             terminal = execution.get("completed_at") or execution.get("finished_at")
             outcome = execution.get("terminal_reason") or ""
             provider_ok = execution.get("status") == "completed" and outcome.endswith("turn completed")
-            evidence = collect_evidence(store, PROJECT_ID, request_id, acceptance_run_started_at=RUN_STARTED_AT)
+            evidence_service = build_service(timeout=EVIDENCE_REQUEST_TIMEOUT_SECONDS)
+            evidence_store = BoundedEvidenceStore(DriveRecords(evidence_service))
+            evidence_registry = dispatch_request_registry(BUCKET, PROJECT_ID, request_id)
+            evidence = collect_evidence(
+                evidence_store,
+                PROJECT_ID,
+                request_id,
+                dispatch_request_registry=evidence_registry,
+                acceptance_run_started_at=RUN_STARTED_AT,
+            )
             evidence["provider_output"] = {
                 "observed": bool(execution.get("provider_evidence")) and bool(terminal),
                 "matched_expected": provider_ok,
