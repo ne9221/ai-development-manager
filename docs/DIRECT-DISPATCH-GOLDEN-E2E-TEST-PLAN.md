@@ -111,6 +111,11 @@ manual path still works, not that hands-off dispatch does.
 
 ## Relationship to the automated test suite
 
+For the C-line repeated acceptance run, use
+[`STABILITY-GATE-C-10-ROUND-HARNESS.md`](STABILITY-GATE-C-10-ROUND-HARNESS.md).
+It keeps this plan's live checkpoints as the evidence contract, then evaluates
+ten fresh rounds with bounded per-round evidence and no retry/cherry-pick path.
+
 Every checkpoint above already has unit/integration coverage that does not
 require live infra or a real provider (see the full suite: 813 passed as of
 this writing):
