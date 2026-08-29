@@ -3,6 +3,7 @@ import inspect
 import json
 import os
 import re
+import subprocess
 import time
 import unittest
 from copy import deepcopy
@@ -533,9 +534,20 @@ class DriveDispatchIngressTests(unittest.TestCase):
 
     def test_abbreviated_repo_write_baseline_without_matching_activation_stays_rejected(self):
         short_request = {**self.VALID_REPO_WRITE, "baseline_head": "80138e1"}
-        with unittest.mock.patch.dict(os.environ, {"ADM_ACTIVATED_GIT_SHA": "f" * 40}, clear=False):
+        no_resolution = subprocess.CompletedProcess([], 0, stdout="f" * 40)
+        with unittest.mock.patch.dict(os.environ, {"ADM_ACTIVATED_GIT_SHA": "f" * 40}, clear=False), \
+             unittest.mock.patch("manager.drive_dispatch_ingress.subprocess.run", return_value=no_resolution):
             canonical = _canonicalize_repo_write_baseline(request(repo_write=short_request))
         self.assertEqual("80138e1", canonical["repo_write"]["baseline_head"])
+
+    def test_abbreviated_repo_write_baseline_resolves_from_verified_checkout_history(self):
+        full_baseline = "80138e1" + "b" * 33
+        short_request = {**self.VALID_REPO_WRITE, "baseline_head": "80138e1"}
+        resolved = subprocess.CompletedProcess([], 0, stdout=full_baseline + "\n")
+        with unittest.mock.patch.dict(os.environ, {"ADM_ACTIVATED_GIT_SHA": "f" * 40}, clear=False), \
+             unittest.mock.patch("manager.drive_dispatch_ingress.subprocess.run", return_value=resolved):
+            canonical = _canonicalize_repo_write_baseline(request(repo_write=short_request))
+        self.assertEqual(full_baseline, canonical["repo_write"]["baseline_head"])
 
     def _assert_repo_write_rejected_without_dispatch(self, repo_write):
         service = Service(request(repo_write=repo_write))

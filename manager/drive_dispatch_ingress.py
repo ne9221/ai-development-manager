@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -299,24 +300,42 @@ def read_request(service, folder_id, expected_owner, metadata, now=None):
 
 
 def _canonicalize_repo_write_baseline(document):
-    """Expand a Drive request's abbreviated baseline only against the
-    wrapper's already-verified production commit.
+    """Expand a Drive request's abbreviated baseline only in the
+    provenance-verified production checkout.
 
     ChatGPT's Drive schema historically accepted any string for
     repo_write.baseline_head, while the canonical admission and Task schemas
     require a full commit id. A short id is safe to accept here only when it
-    is a prefix of the exact activated SHA supplied by the provenance-gated
-    production wrapper; arbitrary prefixes and missing provenance remain
-    rejected by cloud.dispatch_ingress.
+    resolves to one full commit in the exact checkout already verified by the
+    production wrapper. This permits a request to name the activated commit's
+    predecessor while still rejecting arbitrary prefixes and missing
+    provenance in cloud.dispatch_ingress.
     """
     repo_write = document.get("repo_write") if isinstance(document, dict) else None
     baseline = repo_write.get("baseline_head") if isinstance(repo_write, dict) else None
     activated = os.environ.get("ADM_ACTIVATED_GIT_SHA")
-    if (not isinstance(baseline, str) or not SHORT_BASELINE_HEAD_PATTERN.fullmatch(baseline)
-            or not isinstance(activated, str) or not re.fullmatch(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$", activated)
-            or not activated.startswith(baseline)):
+    if not isinstance(baseline, str) or not SHORT_BASELINE_HEAD_PATTERN.fullmatch(baseline):
         return document
-    document["repo_write"] = {**repo_write, "baseline_head": activated}
+    resolved = None
+    if (isinstance(activated, str)
+            and re.fullmatch(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$", activated)
+            and activated.startswith(baseline)):
+        resolved = activated
+    else:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--verify", "--end-of-options", f"{baseline}^{{commit}}"],
+                cwd=os.getcwd(), capture_output=True, text=True, timeout=5, check=True,
+            )
+            candidate = result.stdout.strip()
+            if (re.fullmatch(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$", candidate)
+                    and candidate.startswith(baseline)):
+                resolved = candidate
+        except (OSError, subprocess.SubprocessError):
+            resolved = None
+    if resolved is None:
+        return document
+    document["repo_write"] = {**repo_write, "baseline_head": resolved}
     return document
 
 
