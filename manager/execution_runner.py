@@ -52,6 +52,7 @@ MAX_TURN_TIMEOUT_SECONDS = float(MAX_HARD_TIMEOUT_SECONDS)
 # already fixes for Command enumeration (see its own docstring: a real HOME
 # project's Command history alone took 141.66s to hydrate unbounded).
 DISPATCH_HISTORY_BUDGET_SECONDS = 15.0
+DISPATCH_HISTORY_REQUEST_TIMEOUT_SECONDS = 10.0
 
 
 def task_turn_timeout(expected_minutes, override=None):
@@ -400,9 +401,16 @@ def launch_task(store, service, writer_registry, claim_registry, launcher, proje
             "(claude_accounts=None); refusing to launch against an unvalidated account instead of "
             "falling back to ambient/default Claude config"
         )
+    execution_history_store = None
+    if executions is None:
+        # Historical execution samples are advisory only. Give that read path
+        # its own short transport so the normal lifecycle store's 45-second
+        # timeout cannot overrun the bounded claimed -> reserve budget.
+        execution_history_store = DriveRecords(build_service(timeout=DISPATCH_HISTORY_REQUEST_TIMEOUT_SECONDS))
     dispatched = dispatch(store, service, _dispatch_request(task, provider, account_id), quota_document, executions,
                           history_deadline=(time.monotonic() + DISPATCH_HISTORY_BUDGET_SECONDS)
-                          if executions is None else None)
+                          if executions is None else None,
+                          execution_history_store=execution_history_store)
     if dispatched["recommended_provider"] != provider:
         raise TaskError(f"dispatch did not select {provider}")
     execution_id = execution_id or f"{task_id}-{uuid.uuid4().hex[:12]}"

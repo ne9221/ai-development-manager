@@ -485,9 +485,10 @@ class DispatcherTests(unittest.TestCase):
         that exact deadline forwarded through."""
         captured = {}
 
-        def fake_bounded(store, project_id, deadline=None):
+        def fake_bounded(store, project_id, deadline=None, single_request_worst_case=None):
             captured["project_id"] = project_id
             captured["deadline"] = deadline
+            captured["single_request_worst_case"] = single_request_worst_case
             return []
 
         with mock.patch("manager.dispatcher.list_executions_bounded", side_effect=fake_bounded) as bounded, \
@@ -498,6 +499,20 @@ class DispatcherTests(unittest.TestCase):
         unbounded.assert_not_called()
         self.assertEqual("p1", captured["project_id"])
         self.assertEqual(42.5, captured["deadline"])
+        self.assertEqual(10.0, captured["single_request_worst_case"])
+
+    def test_dispatch_uses_short_execution_history_store_when_supplied(self):
+        captured = {}
+        history_store = object()
+
+        def fake_bounded(store, project_id, deadline=None, single_request_worst_case=None):
+            captured["store"] = store
+            return []
+
+        with mock.patch("manager.dispatcher.list_executions_bounded", side_effect=fake_bounded):
+            dispatch(self.store, object(), request(task_id="short-history-store-task"), quota(),
+                     executions=None, history_deadline=42.5, execution_history_store=history_store)
+        self.assertIs(history_store, captured["store"])
 
     def test_dispatch_explicit_executions_bypasses_bounded_lookup_even_with_deadline(self):
         """An explicitly supplied `executions` list (every existing test/

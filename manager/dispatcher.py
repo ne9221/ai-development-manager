@@ -165,7 +165,7 @@ def _read_drive_status_bounded(service, timeout_seconds):
 
 
 def dispatch(store, service, request, quota_document=None, executions=None, history_store=None, history_deadline=None,
-             quota_timeout_seconds=None):
+             quota_timeout_seconds=None, execution_history_store=None):
     """`history_deadline`, if given, is a `time.monotonic()` value forwarded to
     manager.executions.list_executions_bounded() for the historical-estimate
     lookup below, instead of the unbounded list_executions() -- see that
@@ -175,6 +175,12 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
     (every existing test/caller that passes its own history list). Defaults
     to None, reproducing this function's exact unbounded behavior for every
     existing caller that does not pass it.
+
+    `execution_history_store`, if given, is a separate Drive-backed store with
+    a short transport timeout for the historical lookup above. This matters on
+    the real claimed -> reserved path: the lifecycle store keeps its normal
+    45-second write/read timeout, while historical hydration must not inherit
+    that timeout and turn a 15-second budget into an unbounded-looking stall.
 
     `quota_timeout_seconds`, if given, bounds the read_drive_status() call
     below via _read_drive_status_bounded() -- a slow/hanging quota read can
@@ -198,7 +204,10 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
     if executions is not None:
         history = executions
     elif history_deadline is not None:
-        history = list_executions_bounded(store, request["project_id"], deadline=history_deadline)
+        history = list_executions_bounded(
+            execution_history_store or store, request["project_id"], deadline=history_deadline,
+            single_request_worst_case=10.0,
+        )
     else:
         history = list_executions(store, request["project_id"])
 

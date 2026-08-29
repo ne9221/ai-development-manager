@@ -306,9 +306,11 @@ class RunnerTests(unittest.TestCase):
         launcher = Launcher()
         captured = {}
 
-        def capturing_dispatch(store, service, request, quota_document=None, executions=None, history_deadline=None):
+        def capturing_dispatch(store, service, request, quota_document=None, executions=None, history_deadline=None,
+                               execution_history_store=None):
             captured["executions"] = executions
             captured["history_deadline"] = history_deadline
+            captured["execution_history_store"] = execution_history_store
             return {"recommended_provider": "codex", "quota_evidence": {"source": "test"},
                    "mode": "auto", "effort": "medium", "generated_prompt": "bounded task"}
 
@@ -322,6 +324,7 @@ class RunnerTests(unittest.TestCase):
 
         self.assertIsNone(captured["executions"])
         self.assertIsNotNone(captured["history_deadline"])
+        self.assertIsNotNone(captured["execution_history_store"])
         # Bounded to roughly DISPATCH_HISTORY_BUDGET_SECONDS from now -- never
         # unbounded (None) and never absurdly far in the future.
         self.assertGreaterEqual(captured["history_deadline"], before + DISPATCH_HISTORY_BUDGET_SECONDS - 1.0)
@@ -336,9 +339,11 @@ class RunnerTests(unittest.TestCase):
         launcher = Launcher()
         captured = {}
 
-        def capturing_dispatch(store, service, request, quota_document=None, executions=None, history_deadline=None):
+        def capturing_dispatch(store, service, request, quota_document=None, executions=None, history_deadline=None,
+                               execution_history_store=None):
             captured["executions"] = executions
             captured["history_deadline"] = history_deadline
+            captured["execution_history_store"] = execution_history_store
             return {"recommended_provider": "codex", "quota_evidence": {"source": "test"},
                    "mode": "auto", "effort": "medium", "generated_prompt": "bounded task"}
 
@@ -349,6 +354,7 @@ class RunnerTests(unittest.TestCase):
             launch_task(store, object(), None, MemoryClaimRegistry(), launcher, "p1", "t1", "exec-precomputed",
                        executions=[])
         self.assertEqual([], captured["executions"])
+        self.assertIsNone(captured["execution_history_store"])
         self.assertIsNone(captured["history_deadline"])
 
     def test_launch_task_resolves_claude_account_registry_and_threads_it_to_launcher(self):
@@ -396,7 +402,8 @@ class RunnerTests(unittest.TestCase):
         }]}
         captured = {}
 
-        def fake_dispatch(store, service, request, quota_document=None, executions=None, history_deadline=None):
+        def fake_dispatch(store, service, request, quota_document=None, executions=None, history_deadline=None,
+                          execution_history_store=None):
             captured["request"] = request
             return {
                 "recommended_provider": "claude", "quota_evidence": {"source": "test"}, "mode": "auto", "effort": "medium",
