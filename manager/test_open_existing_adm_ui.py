@@ -5,13 +5,21 @@ from manager.open_existing_adm_ui import DASHBOARD_LAUNCHER, DASHBOARD_PORT, _sp
 
 
 class FakeApi:
-    def __init__(self, interactive=True, windows=(), focused=True, ports=()):
+    def __init__(self, interactive=True, windows=(), focused=True, ports=(), windows_after_open=None):
         self._interactive, self._windows, self._focused = interactive, windows, focused
         self._ports = list(ports)
+        # Simulates a Dashboard-titled window only becoming enumerable
+        # AFTER a real browser open/spawn actually happened -- real window
+        # creation is asynchronous relative to ShellExecute/Popen returning.
+        # None means "never appears", the exact live-discovered bug shape.
+        self._windows_after_open = windows_after_open
         self.focused, self.spawned, self.opened, self.now = [], 0, 0, 0
 
     def interactive(self): return self._interactive
-    def windows(self): return self._windows
+    def windows(self):
+        if self._windows_after_open is not None and (self.opened or self.spawned):
+            return self._windows_after_open
+        return self._windows
     def focus(self, hwnd):
         self.focused.append(hwnd)
         return self._focused
@@ -49,10 +57,28 @@ class OpenExistingAdmUiTests(unittest.TestCase):
         self.assertEqual([7], api.focused)
 
     def test_opens_browser_for_running_service_without_window(self):
-        api = FakeApi(ports=(True,))
-        self.assertEqual("completed", focus_existing_adm_ui(api)["status"])
+        api = FakeApi(ports=(True,), windows_after_open=((9, "ADM Unified Operations Dashboard"),))
+        result = focus_existing_adm_ui(api)
+        self.assertEqual("completed", result["status"])
         self.assertEqual(0, api.spawned)
         self.assertEqual(1, api.opened)
+        self.assertEqual([9], api.focused)
+
+    def test_fails_closed_when_opened_tab_never_becomes_a_visible_window(self):
+        """P0 regression, live-discovered 2026-08-29: a real natural
+        production dispatch's AUTO_OPEN_ADM call reported "completed" (port
+        8501 was genuinely listening, api.open_browser() was genuinely
+        called) but no Dashboard-titled window ever actually existed on the
+        real desktop afterward -- os.startfile()'s new tab was opened, but
+        Windows' foreground-lock silently kept it out of view, and nothing
+        ever confirmed the user could actually see it. "the backend is
+        listening" must never again be reported as "completed" on its own;
+        a real, focusable window must actually be found."""
+        api = FakeApi(ports=(True,))
+        result = focus_existing_adm_ui(api)
+        self.assertEqual("dashboard_window_not_found", result["error_kind"])
+        self.assertEqual(1, api.opened)
+        self.assertEqual([], api.focused)
 
     def test_starts_service_but_never_opens_a_second_browser_tab(self):
         """P0 regression: desktop/Start-Dashboard.ps1 runs Streamlit with
@@ -62,10 +88,12 @@ class OpenExistingAdmUiTests(unittest.TestCase):
         start, violating the "never more than one new browser window"
         contract -- this state must spawn and wait for the port, but never
         call open_browser() itself."""
-        api = FakeApi(ports=(False, False, True))
-        self.assertEqual("completed", focus_existing_adm_ui(api)["status"])
+        api = FakeApi(ports=(False, False, True), windows_after_open=((9, "ADM Unified Operations Dashboard"),))
+        result = focus_existing_adm_ui(api)
+        self.assertEqual("completed", result["status"])
         self.assertEqual(1, api.spawned)
         self.assertEqual(0, api.opened)
+        self.assertEqual([9], api.focused)
 
     def test_fails_closed_when_service_never_becomes_reachable(self):
         api = FakeApi(ports=(False,))

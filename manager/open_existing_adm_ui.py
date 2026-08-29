@@ -128,20 +128,60 @@ class _User32:
         time.sleep(seconds)
 
 
+def _find_matching_window(api):
+    for hwnd, title in api.windows():
+        if any(marker.casefold() in title.casefold() for marker in TITLE_MARKERS):
+            return hwnd, title
+    return None, None
+
+
+def _wait_for_window_and_focus(api, timeout_seconds=START_TIMEOUT_SECONDS):
+    """Poll for a Dashboard-titled top-level window to appear and actively
+    focus it via api.focus() (AttachThreadInput + SetForegroundWindow), the
+    same real foreground-lock workaround used for an already-open window.
+
+    P0 regression (2026-08-29 live E2E): a fresh os.startfile()/ShellExecute
+    browser open -- whether a new tab in an already-running browser, or a
+    brand-new browser process a cold Streamlit start triggers itself -- is
+    NOT guaranteed to steal foreground focus from whatever app the user is
+    currently using; Windows' own foreground-lock applies to ShellExecute-
+    launched windows exactly like it does to SetForegroundWindow() calls.
+    Confirmed live: after a real dispatch's on_running callback ran this
+    function's OLD unconditional "opened -> completed" version, port 8501
+    was genuinely listening but no Dashboard-titled window existed anywhere
+    on the real desktop afterward -- "completed" was reported even though
+    the user could never actually see it, exactly the failure mode
+    AUTO_OPEN_ADM exists to prevent (a live backend is not the same thing
+    as a visible window). This waits for the real window to actually
+    appear, then runs it through the exact same focus() call an
+    already-open window gets, and only reports "completed" once that
+    succeeds -- never merely because the action of opening a tab/process was
+    attempted."""
+    deadline = api.monotonic() + timeout_seconds
+    while api.monotonic() < deadline:
+        hwnd, title = _find_matching_window(api)
+        if hwnd is not None:
+            if api.focus(hwnd):
+                return {"status": "completed", "window_title": title}
+            return {"status": "failed", "error_kind": "dashboard_focus_denied"}
+        api.sleep(POLL_INTERVAL_SECONDS)
+    return {"status": "failed", "error_kind": "dashboard_window_not_found"}
+
+
 def focus_existing_adm_ui(api=None):
     """Focus, open, or start the Dashboard; each invocation opens at most once."""
     try:
         api = api or _User32()
         if not api.interactive():
             return {"status": "failed", "error_kind": "no_interactive_desktop"}
-        for hwnd, title in api.windows():
-            if any(marker.casefold() in title.casefold() for marker in TITLE_MARKERS):
-                if api.focus(hwnd):
-                    return {"status": "completed", "window_title": title}
-                return {"status": "failed", "error_kind": "dashboard_focus_denied"}
+        hwnd, title = _find_matching_window(api)
+        if hwnd is not None:
+            if api.focus(hwnd):
+                return {"status": "completed", "window_title": title}
+            return {"status": "failed", "error_kind": "dashboard_focus_denied"}
         if api.port_open():
             api.open_browser()
-            return {"status": "completed", "window_title": "ADM Dashboard"}
+            return _wait_for_window_and_focus(api)
 
         try:
             api.spawn_dashboard()
@@ -158,7 +198,7 @@ def focus_existing_adm_ui(api=None):
         deadline = api.monotonic() + START_TIMEOUT_SECONDS
         while api.monotonic() < deadline:
             if api.port_open():
-                return {"status": "completed", "window_title": "ADM Dashboard"}
+                return _wait_for_window_and_focus(api)
             api.sleep(POLL_INTERVAL_SECONDS)
         return {"status": "failed", "error_kind": "dashboard_start_timeout"}
     except Exception:
