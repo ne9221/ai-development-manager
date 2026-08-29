@@ -1,0 +1,9 @@
+{
+  "request_id": "gh-ingress-e2e-auto-open-refocus-20260829-092333",
+  "project_id": "ai-development-manager",
+  "title": "GitHub ingress E2E: AUTO_OPEN_ADM real visible-window fix verification",
+  "goal": "Local action only: bring the ADM Operations Dashboard to the front of the real interactive desktop so its visibility can be independently confirmed. No repository is touched by this request.",
+  "priority": "normal",
+  "created_at": "2026-08-29T09:23:33Z",
+  "local_action": "OPEN_EXISTING_ADM_UI"
+}
