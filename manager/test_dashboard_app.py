@@ -79,11 +79,12 @@ class TestDashboardAppRender(unittest.TestCase):
 
         self.assertFalse(at.exception, f"App crashed on remaining_percent=None: {at.exception}")
 
-        # Verify UI Semantic: display "Percentage not reported"
+        # Verify UI semantic: keep the truthful Traditional Chinese fallback
+        # when the provider did not report a percentage.
         info_messages = [el.value for el in at.info]
         self.assertTrue(
-            any("Percentage not reported" in msg for msg in info_messages),
-            f"Expected 'Percentage not reported' in info messages: {info_messages}"
+            any("尚未回報百分比" in msg for msg in info_messages),
+            f"Expected the missing-percentage fallback in info messages: {info_messages}"
         )
 
         # Verify progress bar is not drawn for None
@@ -242,7 +243,7 @@ class TestDashboardAppRender(unittest.TestCase):
         df = at.table[0].value
         self.assertEqual(len(df), 1)
         self.assertEqual(df.iloc[0]["Provider Session"], "—")
-        self.assertEqual(df.iloc[0]["Current Progress"], "—")
+        self.assertEqual(df.iloc[0]["目前進度"], "—")
         self.assertEqual(df.iloc[0]["Model/Mode/Effort"], "— / — / —")
 
     @patch("manager.tasks.DriveRecords")

@@ -194,70 +194,66 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Dark Mode custom CSS Injection for Rich Glassmorphism Aesthetics
+# Traditional Chinese operations-console styling. The data and truth builders
+# below remain unchanged; this layer only improves hierarchy and scan speed.
 st.markdown("""
 <style>
-    /* Main body background & font family */
+    :root { --adm-bg: #0b1220; --adm-panel: #111b2e; --adm-panel-2: #16243b; --adm-line: #263955; --adm-text: #e6edf7; --adm-muted: #91a4bd; --adm-blue: #62a0ff; --adm-green: #42d392; --adm-amber: #f2b84b; --adm-red: #ff6b78; }
     .stApp {
-        background-color: #0d1117;
-        color: #c9d1d9;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        background: var(--adm-bg);
+        color: var(--adm-text);
+        font-family: "Segoe UI", "Microsoft JhengHei", sans-serif;
     }
-
-    /* Sleek glass card */
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stSidebar"] { background: #0d1728; border-right: 1px solid var(--adm-line); }
+    [data-testid="stSidebar"] .stMarkdown { color: var(--adm-muted); }
+    h1, h2, h3 { letter-spacing: -0.025em; }
+    h1 { font-size: 2.35rem !important; margin-bottom: .2rem !important; }
+    h2 { margin-top: 2rem !important; }
+    .block-container { max-width: 1480px; padding-top: 2.5rem; padding-bottom: 4rem; }
     .glass-card {
-        background: rgba(22, 27, 34, 0.85);
-        border: 1px solid #30363d;
-        border-radius: 12px;
-        padding: 18px 22px;
-        margin-bottom: 18px;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+        background: var(--adm-panel);
+        border: 1px solid var(--adm-line);
+        border-radius: 10px;
+        padding: 18px 20px;
+        margin-bottom: 14px;
+        box-shadow: 0 10px 30px rgba(0,0,0,.12);
     }
-
-    /* Highlight recommendation card */
+    .hero-card { background: linear-gradient(115deg, #13284a 0%, #102037 58%, #142238 100%); border: 1px solid #315580; border-radius: 12px; padding: 24px 26px; margin: 1rem 0 1.25rem; }
+    .hero-kicker, .metric-label { color: var(--adm-muted); font-size: .72rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+    .hero-title { font-size: 1.8rem; font-weight: 750; margin: .45rem 0 .35rem; }
+    .hero-copy { color: #b8c8dc; font-size: .98rem; }
+    .hero-next { border-left: 2px solid var(--adm-blue); padding-left: 14px; color: #dbe7f7; }
+    .hero-next strong { color: white; }
+    .metric-value { font-size: 2rem; font-weight: 750; color: var(--adm-blue); line-height: 1.1; margin-top: .35rem; }
+    .metric-card { min-height: 96px; }
+    .state-running { color: var(--adm-green) !important; }
+    .state-attention { color: var(--adm-red) !important; }
+    .state-waiting { color: var(--adm-amber) !important; }
+    .state-idle { color: var(--adm-muted) !important; }
     .recommendation-card {
-        background: linear-gradient(135deg, rgba(22, 27, 34, 0.95), rgba(30, 41, 59, 0.9));
-        border: 1px solid #388bfd;
-        border-radius: 12px;
+        background: var(--adm-panel);
+        border: 1px solid var(--adm-line);
+        border-radius: 10px;
         padding: 20px 24px;
-        margin-bottom: 22px;
-        box-shadow: 0 4px 18px rgba(56, 139, 253, 0.15);
+        margin-bottom: 18px;
     }
-
-    /* Metrics section */
-    .metric-value {
-        font-size: 1.8rem;
-        font-weight: 700;
-        color: #58a6ff;
-    }
-    .metric-label {
-        font-size: 0.85rem;
-        color: #8b949e;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-
-    /* Status Badges */
     .badge {
         display: inline-block;
         padding: 4px 10px;
-        border-radius: 12px;
+        border-radius: 999px;
         font-size: 0.75rem;
         font-weight: 600;
         text-transform: uppercase;
         margin-right: 5px;
         margin-bottom: 4px;
     }
-    .badge-ok { background-color: #1f6feb; color: #ffffff; }
-    .badge-running { background-color: #238636; color: #ffffff; }
-    .badge-waiting { background-color: #d29922; color: #ffffff; }
-    .badge-attention { background-color: #d29922; color: #ffffff; }
-    .badge-danger { background-color: #f85149; color: #ffffff; }
-    .badge-stale { background-color: #da3633; color: #ffffff; }
-    .badge-fresh { background-color: #238636; color: #ffffff; }
-    .badge-unknown { background-color: #484f58; color: #ffffff; }
-    .badge-official { background-color: #388bfd; color: #ffffff; }
-    .badge-manual { background-color: #6e7681; color: #ffffff; }
+    .badge-ok { background-color: #245ca8; color: #ffffff; }
+    .badge-running, .badge-fresh { background-color: #176b4e; color: #ffffff; }
+    .badge-waiting, .badge-attention { background-color: #8a5a16; color: #ffffff; }
+    .badge-danger, .badge-stale { background-color: #8d2938; color: #ffffff; }
+    .badge-unknown, .badge-manual { background-color: #43536b; color: #ffffff; }
+    .badge-official { background-color: #245ca8; color: #ffffff; }
 
     /* Action Badges */
     .badge-action-consume { background-color: #2ea043; color: #ffffff; font-weight: bold; }
@@ -266,10 +262,11 @@ st.markdown("""
     .badge-action-hold { background-color: #da3633; color: #ffffff; font-weight: bold; }
 
     /* Priorities */
-    .priority-urgent { color: #f85149; font-weight: bold; }
-    .priority-high { color: #db6d28; font-weight: bold; }
-    .priority-normal { color: #58a6ff; }
-    .priority-low { color: #8b949e; }
+    .priority-urgent { color: var(--adm-red); font-weight: bold; }
+    .priority-high { color: var(--adm-amber); font-weight: bold; }
+    .priority-normal { color: var(--adm-blue); }
+    .priority-low { color: var(--adm-muted); }
+    @media (max-width: 768px) { .block-container { padding: 1.25rem .9rem 3rem; } h1 { font-size: 1.8rem !important; } .hero-card { padding: 18px; } }
 </style>
 """, unsafe_allow_html=True)
 
@@ -546,22 +543,22 @@ def _refresh_dashboard_automatically():
 
 _refresh_dashboard_automatically()
 
-st.title("🤖 ADM Unified Operations Dashboard")
-st.caption("AI Operations Command Center — Multi-Account Telemetry, Forecast & Execution Monitor")
+st.title("AI 開發管理器")
+st.caption("營運控制台 · 即時任務、執行狀態與配額")
 
 # Sidebar Refresh & Status
 with st.sidebar:
-    st.header("Control Panel")
-    if st.button("🔄 Sync with Google Drive", use_container_width=True):
+    st.header("控制台")
+    if st.button("立即同步資料", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
     st.markdown("---")
-    st.markdown("### Runtime Status")
-    st.info("Read-only execution monitoring active. Local Drive token is valid.")
+    st.markdown("### 執行環境")
+    st.info("唯讀監控中。資料來源為 Google Drive runtime SSOT。")
 
     st.markdown("---")
-    st.caption("Dashboard refreshes automatically every 60 seconds. Sync clears the cache immediately.")
+    st.caption("每 60 秒自動更新。手動同步會立即清除快取。")
 
 # Load Data
 data = load_all_data()
@@ -585,10 +582,43 @@ load_duration_seconds = data.get("load_duration_seconds")
 
 now = datetime.now(timezone.utc)
 
+# 首屏摘要：只使用已載入的真實 lifecycle records，不創造執行中的假象。
+_quick_active = [e for e in all_executions if e.get("status") not in {"completed", "failed", "interrupted", "cancelled"}
+                 and determine_execution_state(e, now) == "running" and not is_execution_stale(e, now)]
+_quick_attention = [e for e in all_executions if e.get("status") in {"failed", "interrupted", "cancelled"}
+                    or is_execution_stale(e, now)]
+_quick_queued = [c for c in all_commands if c.get("status") in {"queued", "claimed", "submitted"}]
+_quick_task = next((t for t in all_tasks if t.get("task_id") in {e.get("task_id") for e in _quick_active}), None)
+_quick_state = "執行中" if _quick_active else ("需要處理" if _quick_attention else ("等待接單" if _quick_queued else "目前閒置"))
+_quick_state_class = "state-running" if _quick_active else ("state-attention" if _quick_attention else ("state-waiting" if _quick_queued else "state-idle"))
+_quick_owner = (_quick_active[0].get("provider") if _quick_active else None) or ("尚未分派" if _quick_queued else "無")
+_quick_title = (_quick_task or {}).get("title") or ("已有 request，尚未建立 Task" if _quick_queued else "沒有已證實執行中的任務")
+_quick_progress = (_quick_active[0].get("last_provider_event") if _quick_active else None) or ("等待 lifecycle promotion" if _quick_queued else "下一步：檢查最新任務或手動同步")
+
+st.markdown(f"""
+<section class="hero-card" aria-label="目前營運摘要">
+  <div class="hero-kicker">目前營運狀態 · 最後讀取 {load_duration_seconds}s</div>
+  <div class="hero-title"><span class="{_quick_state_class}">{_quick_state}</span></div>
+  <div class="hero-copy"><strong>誰在做：</strong>{_quick_owner}　 <strong>Task：</strong>{_quick_title}</div>
+  <div class="hero-next"><strong>目前進度 / 下一步</strong><br>{_quick_progress}</div>
+</section>
+""", unsafe_allow_html=True)
+
+st.markdown("### 一眼掌握")
+m0, m1, m2, m3 = st.columns(4)
+for col, label, value, klass in (
+    (m0, "正在執行", len(_quick_active), "state-running"),
+    (m1, "需要處理", len(_quick_attention), "state-attention"),
+    (m2, "等待接單", len(_quick_queued), "state-waiting"),
+    (m3, "可用配額帳戶", f"{sum(1 for a in daily_brief_vm.accounts if a.has_reliable_quota)} / {len(daily_brief_vm.accounts)}", "state-running"),
+):
+    with col:
+        st.markdown(f'<div class="glass-card metric-card"><div class="metric-label">{label}</div><div class="metric-value {klass}">{value}</div></div>', unsafe_allow_html=True)
+
 # =====================================================================
 # P0: User-visible lifecycle truth (Task + Command + Execution)
 # =====================================================================
-st.header("📡 Current Execution Visibility")
+st.header("即時任務可視性")
 tasks_by_id = {task.get("task_id"): task for task in all_tasks if task.get("task_id")}
 commands_by_task = {}
 for command in all_commands:
@@ -624,27 +654,27 @@ for task_id in dict.fromkeys([*tasks_by_id, *commands_by_task, *executions_by_ta
         category = "Active"
     snapshot = execution.get("task_snapshot") or {}
     visibility_rows.append({
-        "Class": category,
+        "類別": {"Active": "執行中", "Queued": "等待接單", "Attention": "需要處理", "Completed": "已完成"}[category],
         "AI": execution.get("provider") or command.get("provider") or task.get("assigned_provider") or task.get("recommended_provider") or "—",
-        "Task title": task.get("title") or snapshot.get("title") or "—",
-        "Task status": task.get("status") or "—",
-        "Command status": command_status or "—",
-        "Execution status": execution_status or "—",
-        "Session ID": execution.get("provider_session_id") or execution.get("session_id") or (command.get("result") or {}).get("session_id") or "—",
-        "Task ID": task_id or "—",
-        "Model / mode": f"{execution.get('model') or command.get('model') or snapshot.get('model') or '—'} / {execution.get('mode') or command.get('mode') or snapshot.get('mode') or task.get('mode') or '—'}",
-        "Working directory": task.get("working_directory") or snapshot.get("working_directory") or "—",
-        "Started at": execution.get("started_at") or execution.get("reserved_at") or command.get("claimed_at") or "—",
-        "Last updated": execution.get("heartbeat_at") or execution.get("completed_at") or task.get("updated_at") or command.get("completed_at") or command.get("created_at") or "—",
+        "任務名稱": task.get("title") or snapshot.get("title") or "未知",
+        "任務狀態": task.get("status") or "未知",
+        "指令狀態": command_status or "未知",
+        "執行狀態": execution_status or "未知",
+        "Session ID": execution.get("provider_session_id") or execution.get("session_id") or (command.get("result") or {}).get("session_id") or "未知",
+        "Task ID": task_id or "未知",
+        "模型 / 模式": f"{execution.get('model') or command.get('model') or snapshot.get('model') or '未知'} / {execution.get('mode') or command.get('mode') or snapshot.get('mode') or task.get('mode') or '未知'}",
+        "工作目錄": task.get("working_directory") or snapshot.get("working_directory") or "未知",
+        "開始時間": execution.get("started_at") or execution.get("reserved_at") or command.get("claimed_at") or "未知",
+        "最後更新": execution.get("heartbeat_at") or execution.get("completed_at") or task.get("updated_at") or command.get("completed_at") or command.get("created_at") or "未知",
     })
 
-visibility_rows.sort(key=lambda row: row["Last updated"], reverse=True)
-visibility_rows.sort(key=lambda row: {"Active": 0, "Queued": 1, "Attention": 2, "Completed": 3}[row["Class"]])
+visibility_rows.sort(key=lambda row: row["最後更新"], reverse=True)
+visibility_rows.sort(key=lambda row: {"執行中": 0, "等待接單": 1, "需要處理": 2, "已完成": 3}[row["類別"]])
 if visibility_rows:
     st.dataframe(pd.DataFrame(visibility_rows), use_container_width=True, hide_index=True)
 else:
-    st.info("No recent HOME Task / Command / Execution records found.")
-st.caption(f"Showing the {RECENT_RECORD_LIMIT} most recently modified records per lifecycle type for `{DASHBOARD_PROJECT_ID}`. Drive load: {load_duration_seconds}s. Dashboard refreshes automatically every {AUTO_REFRESH_INTERVAL_SECONDS} seconds; Sync is available for an immediate refresh.")
+    st.info("目前沒有最近的 Task、Command 或 Execution 紀錄。")
+st.caption(f"顯示專案 `{DASHBOARD_PROJECT_ID}` 各 lifecycle 類型最近 {RECENT_RECORD_LIMIT} 筆；每 {AUTO_REFRESH_INTERVAL_SECONDS} 秒自動更新。")
 
 # =====================================================================
 # Visible Dispatch Truth Gate: stricter, task-provider-account-quota-bound
@@ -656,7 +686,7 @@ st.caption(f"Showing the {RECENT_RECORD_LIMIT} most recently modified records pe
 # manager/dashboard_core.py's compute_dispatch_state()/build_quota_truth()
 # for the full contract.
 # =====================================================================
-st.header("🔎 Visible Dispatch Truth Gate")
+st.header("派工真實狀態")
 
 _dispatch_commands_by_task = {}
 for _cmd in all_commands:
@@ -748,9 +778,9 @@ provenance_gate = compute_provenance_gate(provenance_vm)
 overall_gate = compute_overall_visible_dispatch_gate(dispatch_gate, provenance_gate)
 
 if overall_gate["result"] == "PASS":
-    st.success("VISIBLE DISPATCH GATE: PASS")
+    st.success("派工真實狀態：通過")
 else:
-    st.error("VISIBLE DISPATCH GATE: FAIL")
+    st.error("派工真實狀態：未通過")
     with st.expander(f"Reasons ({len(overall_gate['reasons'])})", expanded=True):
         for _reason in overall_gate["reasons"]:
             st.write(f"- {_reason}")
@@ -776,7 +806,7 @@ with st.expander("🧬 Production Provenance (Dashboard vs. Watcher runtime iden
         st.error(provenance_vm.match_detail)
 
 if not _dispatch_rows:
-    st.info("No tasks to show.")
+    st.info("目前沒有可顯示的任務。")
 else:
     for _row in _dispatch_rows:
         _state = _row["dispatch_state"]
@@ -822,28 +852,28 @@ m1, m2, m3, m4 = st.columns(4)
 with m1:
     st.markdown(f"""
     <div class="glass-card">
-        <div class="metric-label">Running Tasks</div>
+        <div class="metric-label">正在執行</div>
         <div class="metric-value">{summary_metrics['running_tasks_count']}</div>
     </div>
     """, unsafe_allow_html=True)
 with m2:
     st.markdown(f"""
     <div class="glass-card">
-        <div class="metric-label">Blocked Tasks</div>
+        <div class="metric-label">需要處理</div>
         <div class="metric-value">{summary_metrics['blocked_tasks_count']}</div>
     </div>
     """, unsafe_allow_html=True)
 with m3:
     st.markdown(f"""
     <div class="glass-card">
-        <div class="metric-label">Active Sessions</div>
+        <div class="metric-label">活躍 Session</div>
         <div class="metric-value">{summary_metrics['active_sessions_count']}</div>
     </div>
     """, unsafe_allow_html=True)
 with m4:
     st.markdown(f"""
     <div class="glass-card">
-        <div class="metric-label">Reliable Quotas</div>
+        <div class="metric-label">可靠配額</div>
         <div class="metric-value">{reliable_count} / {total_accounts_count}</div>
     </div>
     """, unsafe_allow_html=True)
@@ -851,7 +881,7 @@ with m4:
 # =====================================================================
 # Section: Watcher & Session Center Health
 # =====================================================================
-st.header("🩺 Watcher & Session Center Health")
+st.header("系統健康狀態")
 health_status_badge = {
     "Online": "badge-fresh",
     "Offline": "badge-danger",
@@ -875,14 +905,14 @@ try:
             </div>
             """, unsafe_allow_html=True)
 except Exception as health_exc:
-    st.warning(f"Could not evaluate Watcher/Session Center health: {health_exc}")
+    st.warning(f"無法評估 Watcher 或 Session Center 健康狀態：{health_exc}")
 
 st.markdown("---")
 
 # =====================================================================
 # Section A: Today's AI Recommendation (Daily Brief)
 # =====================================================================
-st.header("🎯 Today's AI Recommendation")
+st.header("今日派工建議")
 
 action_badge_class = {
     "consume": "badge-action-consume",
@@ -905,9 +935,9 @@ truth_line_html = ""
 if recommended_card is not None:
     truth_line_html = f"""
     <div style="font-size: 0.85rem; color: #8b949e; margin-bottom: 10px;">
-        Primary quota: <b>{recommended_card.formatted_five_hour_remaining}</b> &nbsp;|&nbsp;
-        Extra credits: <b>{recommended_card.formatted_extra_credits}</b> &nbsp;|&nbsp;
-        Effective availability: <b>{recommended_card.formatted_effective_availability}</b>
+        主要配額：<b>{recommended_card.formatted_five_hour_remaining}</b> &nbsp;|&nbsp;
+        額外額度：<b>{recommended_card.formatted_extra_credits}</b> &nbsp;|&nbsp;
+        實際可用：<b>{recommended_card.formatted_effective_availability}</b>
     </div>
     """
 
@@ -915,19 +945,19 @@ st.markdown(f"""
 <div class="recommendation-card">
     <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
         <span style="font-size: 1.25rem; font-weight: 700; color: #ffffff;">
-            Recommended: <span style="color: #58a6ff;">{daily_brief_vm.recommended_display_name}</span>
+            建議使用：<span style="color: #58a6ff;">{daily_brief_vm.recommended_display_name}</span>
         </span>
         <span class="badge {action_badge_class}" style="font-size: 0.85rem; padding: 6px 14px;">
             ACTION: {action_label}
         </span>
     </div>
     <div style="font-size: 0.95rem; line-height: 1.5; color: #e6edf3; margin-bottom: 10px;">
-        <b>Reason:</b> {daily_brief_vm.reason}
+        <b>原因：</b> {daily_brief_vm.reason}
     </div>
     {truth_line_html}
     <div style="font-size: 0.85rem; color: #8b949e;">
-        ⏳ <b>Nearest Cycle Reset:</b> {daily_brief_vm.nearest_reset_countdown} &nbsp;|&nbsp;
-        Generated at: <code>{daily_brief_vm.generated_at}</code>
+        <b>最近重置倒數：</b> {daily_brief_vm.nearest_reset_countdown} &nbsp;|&nbsp;
+        產生時間：<code>{daily_brief_vm.generated_at}</code>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -943,7 +973,7 @@ st.markdown("---")
 # =====================================================================
 # Section B: Provider / Account Quota Center (Multi-Account)
 # =====================================================================
-st.header("⚡ Provider & Account Quota Center")
+st.header("Provider 與帳戶配額")
 accounts_list = daily_brief_vm.accounts
 
 if not accounts_list:
@@ -990,29 +1020,29 @@ else:
                 """, unsafe_allow_html=True)
 
                 # 5-Hour Quota Display
-                st.markdown("#### 5-Hour Window")
+                st.markdown("#### 五小時配額窗")
                 if card.stale:
-                    st.warning(f"Stale Quota (Remaining: {card.formatted_five_hour_remaining})")
+                    st.warning(f"配額資料已過期（剩餘：{card.formatted_five_hour_remaining}）")
                 elif card.five_hour_remaining_pct is not None:
                     try:
                         rem_val = float(card.five_hour_remaining_pct)
                         st.progress(rem_val / 100.0)
                         used_text = f"{card.five_hour_used_pct:.1f}%" if card.five_hour_used_pct is not None else "—"
-                        st.write(f"Remaining: **{card.formatted_five_hour_remaining}** (Used: {used_text})")
+                        st.write(f"剩餘：**{card.formatted_five_hour_remaining}**（已使用：{used_text}）")
                     except (ValueError, TypeError):
-                        st.write(f"Remaining: **Unknown**")
+                        st.write("剩餘：**未知**")
                 else:
                     used_text = f"{card.five_hour_used_pct:.1f}%" if card.five_hour_used_pct is not None else "—"
-                    st.info(f"Percentage not reported (Used: {used_text})")
+                    st.info(f"尚未回報百分比（已使用：{used_text}）")
 
                 # 5-Hour Forecast Details
-                st.write(f"• **Reset Clock**: `{card.formatted_five_hour_countdown}`")
-                st.write(f"• **Burn Rate**: `{card.formatted_five_hour_burn_rate}`")
-                st.write(f"• **Projected at Reset**: `{card.formatted_five_hour_projected}`")
+                st.write(f"• **重置倒數**：`{card.formatted_five_hour_countdown}`")
+                st.write(f"• **消耗速度**：`{card.formatted_five_hour_burn_rate}`")
+                st.write(f"• **重置時預估**：`{card.formatted_five_hour_projected}`")
 
                 # Weekly Quota Display (if exists)
                 if card.has_weekly_window:
-                    st.markdown("#### Weekly Window")
+                    st.markdown("#### 每週配額窗")
                     w_used_text = f"{card.weekly_used_pct:.1f}%" if card.weekly_used_pct is not None else "—"
                     st.write(f"• **Remaining**: **{card.formatted_weekly_remaining}** (Used: {w_used_text})")
                     st.write(f"• **Reset**: `{card.formatted_weekly_countdown}`")
@@ -1029,9 +1059,9 @@ else:
                 st.write(f"• **Effective Availability**: `{card.formatted_effective_availability}`")
 
                 # Metadata / Telemetry
-                st.caption(f"Source: `{card.source}` ({card.source_type}) | Confidence: `{card.confidence}`")
-                st.caption(f"Last updated: {card.last_updated or 'never'}")
-                st.caption(f"Reset time: `{card.five_hour_resets_at or 'UNKNOWN'}`")
+                st.caption(f"來源：`{card.source}`（{card.source_type}）｜可信度：`{card.confidence}`")
+                st.caption(f"最後更新：{card.last_updated or '尚未更新'}")
+                st.caption(f"重置時間：`{card.five_hour_resets_at or '未知'}`")
 
                 if card.warning_reason:
                     st.caption(f"ℹ️ *{card.warning_reason}*")
@@ -1045,9 +1075,9 @@ st.markdown("---")
 # =====================================================================
 # Section C: Running & Active Executions Table
 # =====================================================================
-st.header("🔄 Running & Active Executions")
+st.header("執行中的任務")
 if not execution_candidates:
-    st.info("No active AI executions running currently.")
+    st.info("目前沒有已證實正在執行的 AI 任務。")
 else:
     exec_rows = []
     for exe in execution_candidates:
@@ -1086,7 +1116,7 @@ else:
             "Model/Mode/Effort": f"{model} / {mode} / {effort}",
             "Provider Session": session_id,
             "State": ui_state.upper(),
-            "Current Progress": progress,
+            "目前進度": progress,
             "Heartbeat": hb_at,
             "Elapsed": elapsed_str,
             "Expected": expected_str,
@@ -1100,7 +1130,7 @@ st.markdown("---")
 # =====================================================================
 # Section D: Task Board (Tabs for columns)
 # =====================================================================
-st.header("📋 Task Board")
+st.header("任務佇列")
 task_board_tasks = []
 for task in all_tasks:
     board_task = dict(task)
@@ -1112,16 +1142,16 @@ for task in all_tasks:
 board = map_task_board(task_board_tasks, active_executions_dict, now)
 
 tab_in_progress, tab_ready, tab_blocked, tab_completed = st.tabs([
-    f"🚀 In Progress ({len(board['In progress'])})",
-    f"📥 Ready ({len(board['Ready'])})",
-    f"⚠️ Blocked / Attention ({len(board['Blocked / Attention'])})",
-    f"✅ Completed ({len(board['Completed'])})"
+    f"執行中 ({len(board['In progress'])})",
+    f"待接單 ({len(board['Ready'])})",
+    f"需要處理 ({len(board['Blocked / Attention'])})",
+    f"已完成 ({len(board['Completed'])})"
 ])
 
 
 def render_task_cards(tasks):
     if not tasks:
-        st.write("No tasks in this category.")
+        st.write("這個分類目前沒有任務。")
         return
 
     for t in tasks:
@@ -1137,11 +1167,11 @@ def render_task_cards(tasks):
         <div class="glass-card">
             <h4>{title} <small style="color:#8b949e;">({task_id} in {project_id})</small></h4>
             <p>
-                Priority: <span class="priority-{priority}">{priority.upper()}</span> |
-                AI: <b>{provider}</b>
+                優先級：<span class="priority-{priority}">{priority.upper()}</span>｜
+                AI：<b>{provider}</b>
             </p>
-            <p>Progress: <i>{progress}</i></p>
-            <p><b>Next Action:</b> {next_action}</p>
+            <p>進度：<i>{progress}</i></p>
+            <p><b>下一步：</b> {next_action}</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1160,14 +1190,14 @@ st.markdown("---")
 # =====================================================================
 # Section E: Session & Handoff Inspector
 # =====================================================================
-st.header("🔍 Session & Handoff Detail Inspector")
+st.header("Task 詳情與交接")
 all_task_ids = [(t.get("project_id"), t.get("task_id"), t.get("title")) for t in all_tasks]
 
 if not all_task_ids:
-    st.info("No tasks available to inspect.")
+    st.info("目前沒有可檢視的任務。")
 else:
     selected_option = st.selectbox(
-        "Select Task to Inspect",
+        "選擇要檢視的 Task",
         options=all_task_ids,
         format_func=lambda x: f"[{x[0]}] {x[1]} - {x[2]}"
     )
@@ -1200,13 +1230,13 @@ else:
         col1, col2 = st.columns(2)
 
         with col1:
-            st.subheader("Task Details")
-            st.write(f"**Status**: `{task.get('status')}`")
-            st.write(f"**Recommended Provider**: `{task.get('recommended_provider')}`")
-            st.write(f"**Assigned Provider**: `{task.get('assigned_provider')}`")
-            st.write(f"**Next Action**: {task.get('next_action')}")
-            st.write(f"**CWD**: `{task.get('working_directory')}`")
-            st.write(f"**Branch**: `{task.get('branch')}`")
+            st.subheader("Task 詳情")
+            st.write(f"**狀態**：`{task.get('status')}`")
+            st.write(f"**建議 Provider**：`{task.get('recommended_provider')}`")
+            st.write(f"**指派 Provider**：`{task.get('assigned_provider')}`")
+            st.write(f"**下一步**：{task.get('next_action')}")
+            st.write(f"**工作目錄**：`{task.get('working_directory')}`")
+            st.write(f"**分支**：`{task.get('branch')}`")
 
             # Check for the exact task-scoped execution (any status, not just
             # "active") -- this is the record select_task_execution proved
@@ -1229,7 +1259,7 @@ else:
                 st.write("No command or execution record found for this task.")
 
         with col2:
-            st.subheader("Latest Handoff")
+            st.subheader("最新交接")
             if ho:
                 st.write(f"Handoff ID: `{ho.get('handoff_id')}`")
                 st.write(f"Created At: `{ho.get('created_at')}`")
