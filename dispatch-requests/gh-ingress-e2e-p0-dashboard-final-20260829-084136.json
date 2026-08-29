@@ -1,0 +1,15 @@
+{
+  "request_id": "gh-ingress-e2e-p0-dashboard-final-20260829-084136",
+  "project_id": "outlook-mail",
+  "title": "GitHub ingress E2E: no-change success contract + Dashboard live visibility + AUTO_OPEN_ADM natural proof",
+  "goal": "Verify that README.md still documents the safety invariant that this tool only ever calls Outlook's Save, never Send (the exact phrase '永不呼叫 Send' should still appear in README.md). Run the declared validation_command yourself to check this. If the invariant is already correctly documented (the validation_command passes), do NOT modify any file at all -- report that verification passed and no change was needed. Only edit README.md, and only within allowed_paths, if the validation_command actually fails, i.e. the invariant is genuinely missing or has been weakened -- in that case restore the exact phrase and re-verify.",
+  "priority": "normal",
+  "created_at": "2026-08-29T08:41:36Z",
+  "repo_write": {
+    "allowed_paths": ["README.md"],
+    "baseline_head": "ff4ab5bb77582f56c6f2bd7091cf8bf952d67fe2",
+    "repo": "ne9221/excel-mail-generator",
+    "validation_command": "powershell -NoProfile -Command \"if ((Get-Content README.md -Raw) -match '永不呼叫 Send') { exit 0 } else { exit 1 }\"",
+    "allow_no_change_success": true
+  }
+}
