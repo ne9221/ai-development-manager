@@ -242,9 +242,9 @@ class TestDashboardAppRender(unittest.TestCase):
         # Verify executions table renders with fallback values
         df = at.table[0].value
         self.assertEqual(len(df), 1)
-        self.assertEqual(df.iloc[0]["Provider Session"], "—")
+        self.assertEqual(df.iloc[0]["Provider 工作階段"], "—")
         self.assertEqual(df.iloc[0]["目前進度"], "—")
-        self.assertEqual(df.iloc[0]["Model/Mode/Effort"], "— / — / —")
+        self.assertEqual(df.iloc[0]["模型 / 模式 / 努力程度"], "— / — / —")
 
     @patch("manager.tasks.DriveRecords")
     @patch("manager.quota_reader.read_drive_status")
@@ -327,12 +327,12 @@ class TestDashboardAppRender(unittest.TestCase):
 
         self.assertFalse(at.exception, f"App crashed with healthy Claude execution: {at.exception}")
 
-        # Verify UI Semantic: health is "✅ OK" and state is "RUNNING"
+        # Verify UI semantics: health is normal and state is RUNNING.
         df = at.table[0].value
         self.assertEqual(len(df), 1)
-        self.assertEqual(df.iloc[0]["State"], "RUNNING")
-        self.assertEqual(df.iloc[0]["Health"], "✅ OK")
-        self.assertEqual(df.iloc[0]["Account"], "account-a")
+        self.assertEqual(df.iloc[0]["狀態"], "RUNNING")
+        self.assertEqual(df.iloc[0]["健康度"], "✅ 正常")
+        self.assertEqual(df.iloc[0]["帳戶"], "account-a")
 
     @patch("manager.tasks.DriveRecords")
     @patch("manager.quota_reader.read_drive_status")
@@ -417,7 +417,7 @@ class TestDashboardAppRender(unittest.TestCase):
         # Execution must be found (task-scoped, terminal status included) --
         # not the pre-fix "No active execution."
         self.assertIn("exec-task-1", text_dump)
-        self.assertNotIn("No command or execution record found", text_dump)
+        self.assertNotIn("此 Task 沒有 Command 或 Execution 紀錄", text_dump)
         # Handoff must be found on-demand -- not the pre-fix "No handoff
         # records found for this task." even though a real handoff exists.
         self.assertTrue(
