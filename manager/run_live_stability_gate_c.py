@@ -24,7 +24,7 @@ from manager.tasks import DriveRecords, build_service
 
 PROJECT_ID = "ai-development-manager"
 REPO = "https://github.com/ne9221/ai-development-manager"
-BASELINE = "9f4cdd927cc233bee30425adf00a1cfde6372bed"
+BASELINE = "7365ca2ac84a765e6635a3194f778dfc62136e51"
 BUCKET = "adm-lock-smoke-551449082603-20260813-0147"
 ALLOWED_PATHS = ["manager/test_dispatch_10round_acceptance.py"]
 
