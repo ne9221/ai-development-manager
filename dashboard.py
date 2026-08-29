@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import json
+import html
 import subprocess
 import time
 import urllib.request
@@ -11,6 +12,7 @@ import pandas as pd
 
 from collectors.publish_drive import build_service
 from manager.tasks import DriveRecords
+from manager.overview import read_overview
 from manager.quota_reader import read_drive_status, summarize
 from manager.quota_history import get_default_quota_history_store
 from manager.gcs_lock_registry import BUCKET_ENV
@@ -22,6 +24,7 @@ from manager.dispatch_requests import (
 )
 from manager.dashboard_core import (
     parse_time,
+    TERMINAL_EXECUTION_STATUSES,
     determine_execution_state,
     is_execution_stale,
     get_global_summary,
@@ -395,7 +398,7 @@ def load_pretask_dispatch_requests(project_ids):
 
 # Recent-first reads keep the HOME view bounded; the manual sync button clears
 # this short cache immediately when the user needs a fresh lifecycle state.
-def load_all_data():
+def load_all_data(include_all_projects=False):
     # This result intentionally contains the live dashboard view-model graph.
     # Streamlit's pickle-backed cache rejects some production Drive/runtime
     # values even though the graph is valid for this render. Keep the live
@@ -439,8 +442,11 @@ def load_all_data():
         # smoke projects stay in Drive but are not allowed to block first paint.
         projects = []
         try:
-            project = store.get("projects", DASHBOARD_PROJECT_ID, DASHBOARD_PROJECT_ID)
-            projects = [project] if isinstance(project, dict) and project.get("project_id") else store.list_projects()
+            if include_all_projects:
+                projects = store.list_projects()
+            else:
+                project = store.get("projects", DASHBOARD_PROJECT_ID, DASHBOARD_PROJECT_ID)
+                projects = [project] if isinstance(project, dict) and project.get("project_id") else store.list_projects()
         except Exception as p_exc:
             try:
                 projects = store.list_projects()
@@ -450,6 +456,10 @@ def load_all_data():
         all_tasks = []
         all_commands = []
         all_executions = []
+        all_handoffs = []
+        all_sessions = []
+        overview = None
+        overview_error = None
         handoffs_dict = {}
         sessions_dict = {}
         # Per-(area, project_id) folder-level read status/error, so a real
@@ -488,8 +498,20 @@ def load_all_data():
             all_warnings.extend(t_result["warnings"])
             read_status[("tasks", p_id)] = (t_result["status"], t_result["error"])
 
+            if include_all_projects:
+                for area, target in (("handoffs", all_handoffs), ("sessions", all_sessions)):
+                    result = fetch_project_records(store, area, p_id, RECENT_RECORD_LIMIT)
+                    target.extend(result["records"])
+                    all_warnings.extend(result["warnings"])
+                    read_status[(area, p_id)] = (result["status"], result["error"])
+
             # Historical handoff/session detail is intentionally deferred from
             # the P0 first paint. Session identity is authoritative on Execution.
+
+        try:
+            overview = read_overview(store, DASHBOARD_PROJECT_ID)
+        except Exception as exc:
+            overview_error = summarize_drive_read_error(exc)
 
         return {
             "success": True,
@@ -499,6 +521,10 @@ def load_all_data():
             "all_tasks": all_tasks,
             "all_commands": all_commands,
             "all_executions": all_executions,
+            "all_handoffs": all_handoffs,
+            "all_sessions": all_sessions,
+            "overview": overview,
+            "overview_error": overview_error,
             "handoffs_dict": handoffs_dict,
             "sessions_dict": sessions_dict,
             "read_status": read_status,
@@ -517,6 +543,10 @@ def load_all_data():
             "all_tasks": [],
             "all_commands": [],
             "all_executions": [],
+            "all_handoffs": [],
+            "all_sessions": [],
+            "overview": None,
+            "overview_error": None,
             "handoffs_dict": {},
             "sessions_dict": {},
             "read_status": {},
@@ -524,6 +554,482 @@ def load_all_data():
             "warnings": all_warnings + [str(e)],
             "error": str(e)
         }
+
+# UI v3: the home screen is a small operational brief. Detail data stays on
+# explicit secondary routes so the first paint answers the operator's first
+# questions without turning the dashboard into a history table.
+NAV_OVERVIEW = "總覽"
+NAV_PROJECTS = "Projects"
+NAV_TASKS = "Tasks"
+NAV_SESSIONS = "Sessions"
+NAV_HISTORY = "History"
+NAV_QUOTA = "Quota"
+NAV_LOGS = "Logs"
+NAV_OPTIONS = [NAV_OVERVIEW, NAV_PROJECTS, NAV_TASKS, NAV_SESSIONS, NAV_HISTORY, NAV_QUOTA, NAV_LOGS]
+NAV_QUERY_VALUES = {
+    NAV_OVERVIEW: "overview",
+    NAV_PROJECTS: "projects",
+    NAV_TASKS: "tasks",
+    NAV_SESSIONS: "sessions",
+    NAV_HISTORY: "history",
+    NAV_QUOTA: "quota",
+    NAV_LOGS: "logs",
+}
+
+
+def _ui_text(value, fallback="未知"):
+    if value is None or value == "":
+        return fallback
+    return html.escape(str(value))
+
+
+def _ui_state(value):
+    labels = {
+        "running": "執行中", "in_progress": "執行中", "reserved": "已保留",
+        "queued": "排隊中", "claimed": "已接單", "submitted": "已送出",
+        "ready": "待執行", "waiting": "等待中", "blocked": "已阻塞",
+        "failed": "失敗", "interrupted": "已中斷", "cancelled": "已取消",
+        "completed": "已完成", "finishing": "收尾中", "correlating": "關聯中",
+    }
+    return labels.get(str(value or "").casefold(), _ui_text(value))
+
+
+def _ui_time(value):
+    parsed = parse_time(value)
+    return parsed.astimezone().strftime("%m/%d %H:%M") if parsed else "未知"
+
+
+def _ui_record_time(record):
+    return (record.get("updated_at") or record.get("heartbeat_at") or record.get("completed_at")
+            or record.get("started_at") or record.get("created_at") or record.get("reserved_at") or "")
+
+
+def _ui_active_executions(executions, now):
+    return [
+        execution for execution in executions
+        if execution.get("status") not in TERMINAL_EXECUTION_STATUSES
+        and determine_execution_state(execution, now) == "running"
+        and not is_execution_stale(execution, now)
+    ]
+
+
+def _ui_task_for_execution(execution, tasks):
+    return next((task for task in tasks if task.get("project_id") == execution.get("project_id")
+                  and task.get("task_id") == execution.get("task_id")), {})
+
+
+def _ui_quota_status(card):
+    if card.stale:
+        return "STALE"
+    if str(card.status or "unknown").casefold() != "ok":
+        return str(card.status or "UNKNOWN").upper()
+    if card.five_hour_remaining_pct is None:
+        return "UNKNOWN"
+    return "OK"
+
+
+def _render_quota_card(card, compact=False):
+    st.markdown(f"### {_ui_text(card.card_title)}")
+    status = _ui_quota_status(card)
+    st.caption(f"狀態：{status}  |  Provider：{_ui_text(card.provider)}")
+    if status == "STALE":
+        st.warning(f"{_ui_text(card.card_title)} 配額資料為 STALE，不能用目前數字做派工判定。")
+    elif status == "ERROR":
+        st.error(f"{_ui_text(card.card_title)} 配額來源回報 ERROR，不能用目前數字做派工判定。")
+    elif status == "UNKNOWN" or card.five_hour_remaining_pct is None:
+        st.info("尚未回報百分比：UNKNOWN（不等於 0%）")
+    else:
+        st.progress(max(0.0, min(1.0, float(card.five_hour_remaining_pct) / 100.0)))
+        st.write(f"五小時剩餘：**{card.formatted_five_hour_remaining}**")
+
+    st.write(f"重置：`{card.formatted_five_hour_countdown or '未知'}`")
+    if card.has_weekly_window:
+        st.write(f"每週剩餘：**{card.formatted_weekly_remaining}**，重置 `{card.formatted_weekly_countdown}`")
+    if not compact:
+        st.caption(f"來源：`{_ui_text(card.source)}`，可信度：`{_ui_text(card.confidence)}`")
+        st.caption(f"最後更新：`{_ui_text(card.last_updated)}`")
+        st.caption(f"重置時間：`{card.five_hour_resets_at or '未知'}`")
+        if card.extra_credits_available is not None:
+            st.write(f"額外額度：`{_ui_text(card.formatted_extra_credits)}`")
+        st.write(f"實際可用性：`{_ui_text(card.formatted_effective_availability)}`")
+        if card.warning_reason:
+            st.caption(f"提示：{_ui_text(card.warning_reason)}")
+
+
+def _render_execution_snapshot(data):
+    executions = [
+        execution for execution in data.get("all_executions", [])
+        if execution.get("status") not in TERMINAL_EXECUTION_STATUSES
+    ][:3]
+    if not executions:
+        return
+    rows = []
+    now = datetime.now(timezone.utc)
+    for execution in executions:
+        snapshot = execution.get("task_snapshot") or {}
+        rows.append({
+            "任務": execution.get("task_id") or "未知",
+            "AI 提供者": execution.get("provider") or "未知",
+            "帳戶": execution.get("account_id") or "未知",
+            "狀態": determine_execution_state(execution, now).upper(),
+            "目前進度": execution.get("last_provider_event") or "—",
+            "Provider 工作階段": execution.get("provider_session_id") or execution.get("session_id") or "—",
+            "模型 / 模式 / 努力程度": f"{execution.get('model') or snapshot.get('model') or '—'} / {execution.get('mode') or snapshot.get('mode') or '—'} / {execution.get('effort') or snapshot.get('effort') or '—'}",
+            "健康度": "⚠️ 需要處理" if is_execution_stale(execution, now) else "✅ 正常",
+        })
+    st.table(pd.DataFrame(rows))
+
+
+def _render_dispatch_snapshot(data):
+    projects = {project.get("project_id"): project for project in data.get("projects", []) if project.get("project_id")}
+    commands = {}
+    for command in data.get("all_commands", []):
+        key = (command.get("project_id"), command.get("task_id"))
+        if key not in commands or (command.get("created_at") or "") >= (commands[key].get("created_at") or ""):
+            commands[key] = command
+    executions = {execution.get("execution_id"): execution for execution in data.get("all_executions", []) if execution.get("execution_id")}
+    rows = []
+    for task in data.get("all_tasks", []):
+        command = commands.get((task.get("project_id"), task.get("task_id")))
+        execution = executions.get(command.get("execution_id")) if command else None
+        rows.append(build_dispatch_truth_row(
+            projects.get(task.get("project_id")), task, command, execution,
+            getattr(data.get("daily_brief_vm"), "accounts", []), datetime.now(timezone.utc),
+        ))
+
+    pretask = load_pretask_dispatch_requests(tuple(sorted(projects)))
+    for project_id, listing in pretask.items():
+        for request in listing.get("rows", []):
+            rows.append(build_pretask_dispatch_truth_row(
+                projects.get(project_id), project_id, request["request_id"],
+                request.get("dispatch_request_status"), getattr(data.get("daily_brief_vm"), "accounts", []),
+                datetime.now(timezone.utc), dispatch_request_read_failed=request.get("dispatch_request_read_failed", False),
+            ))
+        if listing.get("truncated"):
+            rows.append(build_pretask_listing_truncated_row(
+                projects.get(project_id), project_id, getattr(data.get("daily_brief_vm"), "accounts", []),
+            ))
+
+    if not rows:
+        return
+    st.header("派工狀態")
+    for row in rows[:6]:
+        request_id = row.get("request_id")
+        identifier = f" request {request_id}" if request_id else ""
+        title = row.get("task_title") or row.get("task_id") or "未知任務"
+        st.markdown(f"**{_ui_text(row.get('dispatch_state'))}**{identifier} {_ui_text(title)}：{_ui_text(row.get('dispatch_reason'))}")
+
+
+def _render_task_detail(data):
+    tasks = data.get("all_tasks", [])
+    if not tasks:
+        return
+    task = tasks[0]
+    project_id, task_id = task.get("project_id"), task.get("task_id")
+    command = select_task_command(data.get("all_commands", []), project_id, task_id)
+    execution = select_task_execution(data.get("all_executions", []), project_id, task_id, command=command)
+    handoff_result = load_task_handoff_from_store(project_id, task_id)
+    handoff = select_task_handoff(
+        handoff_result.get("records", []), project_id, task_id,
+        execution=execution, command=command,
+    )
+    with st.expander("Task 詳情", expanded=False):
+        st.markdown(f"**{_ui_text(task.get('title') or task_id)}** · 狀態：{_ui_state(task.get('status'))}")
+        st.markdown(f"Execution ID：`{_ui_text((execution or {}).get('execution_id'))}`")
+        if handoff:
+            st.markdown(f"Handoff ID：`{_ui_text(handoff.get('handoff_id'))}`")
+            st.markdown(f"已完成工作：{_ui_text(', '.join(handoff.get('completed_work', [])))}")
+        elif handoff_result.get("status") == READ_STATUS_UNKNOWN:
+            st.warning(f"Handoff UNKNOWN：{_ui_text(handoff_result.get('error'))}")
+        else:
+            st.caption("此 Task 沒有可驗證的 Handoff 紀錄。")
+
+
+def _render_overview(data):
+    now = datetime.now(timezone.utc)
+    tasks = data.get("all_tasks", [])
+    commands = data.get("all_commands", [])
+    executions = data.get("all_executions", [])
+    brief = data.get("daily_brief_vm")
+    active = _ui_active_executions(executions, now)
+    attention = [
+        execution for execution in executions
+        if execution.get("status") in {"failed", "interrupted", "cancelled"}
+        or is_execution_stale(execution, now)
+    ]
+    attention_tasks = [task for task in tasks if task.get("status") in {"blocked", "attention"}]
+    has_attention = bool(attention or attention_tasks)
+    queued = [command for command in commands if command.get("status") in {"queued", "claimed", "submitted"}]
+    current_task = _ui_task_for_execution(active[0], tasks) if active else {}
+    if not current_task and queued:
+        current_task = next((task for task in tasks if task.get("task_id") == queued[0].get("task_id")), {})
+
+    if active:
+        headline = "工作中"
+        headline_detail = f"{_ui_text(current_task.get('title') or active[0].get('task_id'))} 正由 {_ui_text(active[0].get('provider'))} 執行"
+        next_action = current_task.get("next_action") or active[0].get("last_provider_event") or "等待下一個 provider 事件"
+    elif has_attention:
+        headline = "需要處理"
+        headline_detail = "有執行紀錄需要人工確認，系統沒有把它算成正常工作中"
+        next_action = "先查看異常，再決定是否重試或調整下一步"
+    elif queued:
+        headline = "等待接單"
+        headline_detail = "已有任務或 request，但尚未證實 provider 正在執行"
+        next_action = current_task.get("next_action") or "查看任務佇列與可用配額"
+    else:
+        headline = "目前閒置"
+        headline_detail = "目前沒有已證實正在執行的 AI 任務"
+        next_action = "選擇一個待執行任務，或同步最新資料"
+
+    st.title("ADM")
+    st.caption("個人營運工作台。先看現在，再按需要下鑽。")
+    st.markdown(f"""
+    <section class="hero-card" aria-label="目前工作狀態">
+      <div class="hero-kicker">現在</div>
+      <div class="hero-title"><span class="state-{'running' if active else 'attention' if has_attention else 'waiting' if queued else 'idle'}">{headline}</span></div>
+      <div class="hero-copy"><strong>{headline_detail}</strong></div>
+      <div class="hero-next"><strong>下一步</strong><br>{_ui_text(next_action)}</div>
+    </section>
+    """, unsafe_allow_html=True)
+
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("正在做", min(len(active), 3))
+    metric_cols[1].metric("需要處理", len(attention) + len(attention_tasks))
+    reliable = sum(1 for card in (brief.accounts if brief else []) if card.has_reliable_quota)
+    total = len(brief.accounts) if brief else 0
+    metric_cols[2].metric("可用配額", f"{reliable} / {total}")
+
+    st.header("正在做")
+    if active:
+        for execution in active[:3]:
+            task = _ui_task_for_execution(execution, tasks)
+            provider = execution.get("provider") or task.get("assigned_provider") or "未知"
+            account = execution.get("account_id") or "未知"
+            progress = execution.get("last_provider_event") or task.get("current_progress") or "尚未回報"
+            st.markdown(f"""
+            <div class="glass-card">
+              <div class="metric-label">{_ui_text(provider)} / {_ui_text(account)}</div>
+              <div class="hero-title">{_ui_text(task.get('title') or execution.get('task_id'))}</div>
+              <div class="hero-copy">進度：{_ui_text(progress)}</div>
+              <div class="hero-next"><strong>下一步</strong><br>{_ui_text(task.get('next_action') or '等待最新事件')}</div>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("目前沒有已證實正在執行的任務。")
+
+    _render_execution_snapshot(data)
+    _render_dispatch_snapshot(data)
+
+    focus = []
+    seen = set()
+    for task in sorted(tasks, key=lambda item: (item.get("status") not in {"in_progress", "ready", "queued"},
+                                                item.get("priority") not in {"urgent", "high"},
+                                                _ui_record_time(item))):
+        task_id = task.get("task_id")
+        if task_id and task_id not in seen and task.get("status") not in {"completed", "cancelled"}:
+            focus.append(task)
+            seen.add(task_id)
+        if len(focus) == 4:
+            break
+    if len(focus) < 2:
+        for item in (data.get("overview") or {}).get("items", []):
+            item_id = item.get("item_id")
+            if item_id and item_id not in seen and item.get("status") not in {"completed", "cancelled", "merged"}:
+                focus.append({
+                    "task_id": item_id,
+                    "title": item.get("title"),
+                    "current_progress": item.get("current_progress"),
+                    "next_action": item.get("next_action"),
+                })
+                seen.add(item_id)
+            if len(focus) == 4:
+                break
+    st.header("今日重點")
+    if focus:
+        for task in focus:
+            st.markdown(f"- **{_ui_text(task.get('title') or task.get('task_id'))}**：{_ui_text(task.get('next_action') or task.get('current_progress'))}")
+    else:
+        st.info("目前沒有可驗證的今日任務。")
+
+    if has_attention:
+        st.header("需要處理")
+        for execution in attention[:3]:
+            task = _ui_task_for_execution(execution, tasks)
+            st.warning(f"{_ui_text(task.get('title') or execution.get('task_id'))}：執行狀態 {_ui_state(execution.get('status'))}，請查看 History。")
+        for task in attention_tasks[:max(0, 3 - len(attention))]:
+            st.warning(f"{_ui_text(task.get('title') or task.get('task_id'))}：任務 {_ui_state(task.get('status'))}，下一步 {_ui_text(task.get('next_action'))}。")
+
+    st.header("配額與重置")
+    accounts = brief.accounts if brief else []
+    if not accounts:
+        st.info("目前沒有可驗證的 provider account 配額資料。")
+    else:
+        quota_cols = st.columns(min(len(accounts), 3))
+        for index, card in enumerate(accounts):
+            with quota_cols[index % len(quota_cols)]:
+                _render_quota_card(card, compact=False)
+    _render_task_detail(data)
+    if data.get("warnings"):
+        with st.expander(f"資料警告（{len(data['warnings'])}）", expanded=False):
+            for warning in data["warnings"][:12]:
+                st.warning(warning)
+
+
+def _render_projects(data):
+    projects = data.get("projects", [])
+    tasks = data.get("all_tasks", [])
+    st.title("Projects")
+    st.caption("專案是下鑽入口，首頁只保留目前工作的摘要。")
+    if not projects:
+        st.info("目前沒有可驗證的專案資料。")
+        return
+    for project in projects:
+        project_tasks = [task for task in tasks if task.get("project_id") == project.get("project_id")]
+        active = sum(task.get("status") in {"in_progress", "running", "queued", "ready"} for task in project_tasks)
+        blocked = sum(task.get("status") in {"blocked", "attention"} for task in project_tasks)
+        st.markdown(f"""
+        <div class="glass-card"><div class="hero-title">{_ui_text(project.get('name') or project.get('project_id'))}</div>
+        <div class="hero-copy">進行中 {active}　需要處理 {blocked}　近期任務 {len(project_tasks)}</div></div>
+        """, unsafe_allow_html=True)
+
+
+def _render_tasks(data):
+    tasks = data.get("all_tasks", [])
+    st.title("Tasks")
+    st.caption("只看需要下鑽的任務明細；首頁不承擔歷史 backlog。")
+    if not tasks:
+        st.info("目前沒有可驗證的任務資料。")
+        return
+    for task in tasks[:12]:
+        st.markdown(f"""
+        <div class="glass-card"><div class="metric-label">{_ui_state(task.get('status'))} / {_ui_text(task.get('task_id'))}</div>
+        <div class="hero-title">{_ui_text(task.get('title') or task.get('task_id'))}</div>
+        <div class="hero-copy">目前進度：{_ui_text(task.get('current_progress'))}</div>
+        <div class="hero-next"><strong>下一步</strong><br>{_ui_text(task.get('next_action'))}</div></div>
+        """, unsafe_allow_html=True)
+
+
+def _render_sessions(data):
+    executions = data.get("all_executions", [])
+    sessions = data.get("all_sessions", [])
+    st.title("Sessions")
+    st.caption("Provider session 只有在 canonical Execution 或 Session record 證實時才顯示。")
+    rows = []
+    for execution in executions[:12]:
+        rows.append({
+            "狀態": _ui_state(execution.get("status")),
+            "Provider": execution.get("provider") or "未知",
+            "Account": execution.get("account_id") or "未知",
+            "Session": execution.get("provider_session_id") or execution.get("session_id") or "UNKNOWN",
+            "Task": execution.get("task_id") or "UNKNOWN",
+            "最後更新": _ui_time(_ui_record_time(execution)),
+        })
+    for session in sessions[:max(0, 12 - len(rows))]:
+        rows.append({
+            "狀態": _ui_state(session.get("status")), "Provider": session.get("provider") or "未知",
+            "Account": session.get("account_id") or "未知", "Session": session.get("provider_session_id") or session.get("session_id") or "UNKNOWN",
+            "Task": session.get("task_id") or "UNKNOWN", "最後更新": _ui_time(_ui_record_time(session)),
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("目前沒有可驗證的 Session。")
+
+
+def _render_history(data):
+    records = []
+    for kind in ("all_tasks", "all_commands", "all_executions", "all_handoffs"):
+        for record in data.get(kind, []):
+            records.append({
+                "時間": _ui_time(_ui_record_time(record)),
+                "類型": kind.removeprefix("all_").rstrip("s").upper(),
+                "狀態": _ui_state(record.get("status")),
+                "Task": record.get("task_id") or "UNKNOWN",
+                "事件": record.get("last_provider_event") or record.get("current_progress") or record.get("next_action") or record.get("reason") or "UNKNOWN",
+                "排序": _ui_record_time(record),
+            })
+    records.sort(key=lambda row: row["排序"], reverse=True)
+    st.title("History")
+    st.caption("最近的 lifecycle activity。完整 raw record 僅在需要時查看。")
+    if records:
+        st.dataframe(pd.DataFrame([{key: row[key] for key in ("時間", "類型", "狀態", "Task", "事件")} for row in records[:24]]), use_container_width=True, hide_index=True)
+    else:
+        st.info("目前沒有可驗證的歷史紀錄。")
+
+
+def _render_quota(data):
+    st.title("Quota")
+    st.caption("依 provider contract 顯示。5H 與 weekly 只在來源真的提供時出現；UNKNOWN、STALE、ERROR 不會偽裝成 0%。")
+    accounts = getattr(data.get("daily_brief_vm"), "accounts", [])
+    if not accounts:
+        st.info("目前沒有可驗證的 provider account 配額資料。")
+        return
+    for card in accounts:
+        with st.container():
+            _render_quota_card(card)
+            st.markdown("---")
+
+
+def _render_logs(data):
+    st.title("Logs")
+    st.caption("以最近事件為主，避免首頁被 debug payload 淹沒。")
+    warnings = data.get("warnings", [])
+    if warnings:
+        for warning in warnings[:12]:
+            st.warning(warning)
+    else:
+        st.info("目前沒有資料讀取警告。")
+    events = []
+    for kind in ("all_tasks", "all_commands", "all_executions", "all_handoffs"):
+        for record in data.get(kind, []):
+            events.append({
+                "時間": _ui_time(_ui_record_time(record)),
+                "類型": kind.removeprefix("all_").rstrip("s").upper(),
+                "Task": record.get("task_id") or "UNKNOWN",
+                "事件": record.get("last_provider_event") or record.get("current_progress") or record.get("next_action") or record.get("reason") or "UNKNOWN",
+                "排序": _ui_record_time(record),
+            })
+    events.sort(key=lambda row: row["排序"], reverse=True)
+    if events:
+        st.dataframe(pd.DataFrame([{key: row[key] for key in ("時間", "類型", "Task", "事件")} for row in events[:24]]), use_container_width=True, hide_index=True)
+
+
+def _render_ui_v3():
+    query = getattr(st, "query_params", {})
+    requested = query.get("view") if hasattr(query, "get") else None
+    requested_route = next((label for label, value in NAV_QUERY_VALUES.items() if value == requested), NAV_OVERVIEW)
+
+    with st.sidebar:
+        st.header("ADM")
+        if st.button("立即同步資料", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+        st.caption("資料來源：Google Drive runtime SSOT。這個 UI 只讀取，不修改 lifecycle 或 credential。")
+        selected = st.radio("工作區", NAV_OPTIONS, index=NAV_OPTIONS.index(requested_route), key="adm_ui_route")
+        if hasattr(st, "query_params") and st.query_params.get("view") != NAV_QUERY_VALUES[selected]:
+            st.query_params["view"] = NAV_QUERY_VALUES[selected]
+        st.caption(f"每 {AUTO_REFRESH_INTERVAL_SECONDS} 秒自動更新")
+
+    data = load_all_data(include_all_projects=selected != NAV_OVERVIEW)
+    if not data.get("success") and not data.get("daily_brief_vm"):
+        st.error(f"無法取得資料：{_ui_text(data.get('error'))}")
+        return
+
+    if selected == NAV_OVERVIEW:
+        _render_overview(data)
+    elif selected == NAV_PROJECTS:
+        _render_projects(data)
+    elif selected == NAV_TASKS:
+        _render_tasks(data)
+    elif selected == NAV_SESSIONS:
+        _render_sessions(data)
+    elif selected == NAV_HISTORY:
+        _render_history(data)
+    elif selected == NAV_QUOTA:
+        _render_quota(data)
+    else:
+        _render_logs(data)
+
 
 # Main App Loop
 st.session_state[_AUTO_REFRESH_ARMED_KEY] = False
@@ -538,7 +1044,9 @@ def _refresh_dashboard_automatically():
     app, which disarms and re-arms it, preventing an immediate rerun loop.
     """
     if st.session_state.get(_AUTO_REFRESH_ARMED_KEY):
-        load_all_data.clear()
+        clear_live_data = getattr(load_all_data, "clear", None)
+        if clear_live_data:
+            clear_live_data()
         load_infra_health.clear()
         load_pretask_dispatch_requests.clear()
         st.rerun()
@@ -546,6 +1054,9 @@ def _refresh_dashboard_automatically():
 
 
 _refresh_dashboard_automatically()
+
+_render_ui_v3()
+st.stop()
 
 st.title("AI 開發管理器")
 st.caption("營運控制台 · 即時任務、執行狀態與配額")
