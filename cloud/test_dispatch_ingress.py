@@ -1307,6 +1307,44 @@ class RepoWriteAdmissionIngressTests(unittest.TestCase):
             self.call(self.write_payload(repo_write={**self.write_payload()["repo_write"], "repo": "https://github.com/example/other-repo"}))
         self.assertEqual("repo_identity_mismatch", ctx.exception.code)
 
+    def test_repo_identity_accepted_when_project_repo_is_bare_owner_repo_form(self):
+        """P0 regression (fix/dispatch-repo-identity-normalization-20260829):
+        live-reproduced against gh-ingress-e2e-20260828-225142/project
+        outlook-mail. A Project's registered `repo` and a request's
+        `repo_write.repo` are both free-form strings (full HTTPS URL, SSH
+        remote, or bare "owner/repo") that can validly disagree in FORM
+        while naming the identical GitHub repository -- raw string equality
+        rejected every such request as a false repo_identity_mismatch, even
+        though an equivalent same-form request (see the sibling GitHub
+        ingress request gh-ingress-e2e-20260827-132808, which happened to
+        already use the Project's own URL form) was admitted successfully
+        the day before. Project.repo here uses the bare "owner/repo" form;
+        the request declares the full URL form -- must still match."""
+        self.store.put("projects", "p1", "p1", {**project(), "repo": "example/project"})
+        result = self.call(self.write_payload(repo_write={**self.write_payload()["repo_write"],
+                                                            "repo": "https://github.com/example/project"}))
+        self.assertEqual("dispatch-req-w1", result["task_id"])
+
+    def test_repo_identity_accepted_when_request_repo_is_bare_owner_repo_form(self):
+        """Mirror of the above with the form mismatch reversed: Project.repo
+        is the full URL (the actual outlook-mail production shape) and the
+        request declares the bare "owner/repo" form (the actual failing
+        request's shape) -- the exact live combination that was rejected."""
+        result = self.call(self.write_payload(repo_write={**self.write_payload()["repo_write"],
+                                                            "repo": "example/project"}))
+        self.assertEqual("dispatch-req-w1", result["task_id"])
+
+    def test_repo_identity_mismatch_still_rejected_across_different_forms(self):
+        """Normalization must never widen the check into accepting a
+        genuinely different repo just because the forms differ -- only
+        confirms test_repo_identity_mismatch_with_project_rejected's
+        coverage still holds when the two sides are in different forms."""
+        self.store.put("projects", "p1", "p1", {**project(), "repo": "example/project"})
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(self.write_payload(repo_write={**self.write_payload()["repo_write"],
+                                                       "repo": "https://github.com/example/other-repo"}))
+        self.assertEqual("repo_identity_mismatch", ctx.exception.code)
+
     def test_replay_with_widened_allowed_paths_fails_closed(self):
         self.call()
         widened = self.write_payload(repo_write={**self.write_payload()["repo_write"], "allowed_paths": ["manager/foo.py", "manager/bar.py"]})

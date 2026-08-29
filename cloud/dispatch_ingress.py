@@ -77,6 +77,7 @@ from manager.claude_account_selector import load_claude_accounts
 from manager.dispatch_requests import claim_dispatch_request, mark_dispatch_request_status
 from manager.dispatcher import dispatch as dispatcher_dispatch
 from manager.executions import MAX_RETRY_COUNT, linked_command_for_execution, list_executions, retry_eligible
+from manager.project_registry import normalize_repo_identity
 from manager.tasks import TaskError, create_task, now_iso, update_task, validate
 from manager.trusted_ingress import (
     ADMISSION_VERSION, ADMISSION_VERSION_V2_REPO_WRITE, REQUIRED_REPO_WRITE_TASK_POLICIES,
@@ -631,10 +632,22 @@ def handle_dispatch(store, service, lock_registry_factory, payload, request_crea
     except TaskError as exc:
         raise DispatchIngressError("unknown_project", f"unknown project: {project_id}") from exc
 
-    if clean["repo_write"] is not None and clean["repo_write"]["repo"] != project.get("repo"):
+    if clean["repo_write"] is not None and (
+            normalize_repo_identity(clean["repo_write"]["repo"]) != normalize_repo_identity(project.get("repo"))):
         # The caller's repo identity is only ever trusted once cross-checked
         # against the Project's own registered repo -- never taken on its
         # own say-so, even though its shape was already validated above.
+        # Compared via normalize_repo_identity() (already used for this
+        # exact purpose by manager.worktree_materializer's baseline lineage
+        # check) rather than raw string equality: a Project's registered
+        # `repo` and a request's `repo_write.repo` are both free-form
+        # strings (full HTTPS URL, SSH remote, or bare "owner/repo") that
+        # can validly disagree in form while naming the identical GitHub
+        # repository -- raw equality rejected every such request as a
+        # false "mismatch" (confirmed live: gh-ingress-e2e-20260828-225142
+        # against project outlook-mail, repo stored as
+        # "https://github.com/ne9221/excel-mail-generator" vs. the
+        # request's "ne9221/excel-mail-generator").
         raise DispatchIngressError(
             "repo_identity_mismatch",
             f"repo_write.repo does not match project {project_id}'s registered repo",
