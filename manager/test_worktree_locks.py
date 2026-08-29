@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from manager.gcs_lock_registry import RegistryConflict
 from manager.tasks import TaskError
-from manager.worktree_locks import acquire, canonical_branch, canonical_repository, canonical_scope, check, inspect, link_session, list_locks, release, renew, repository_lock_id, semantic_lock, validate_local_preflight
+from manager.worktree_locks import acquire, canonical_branch, canonical_repository, canonical_scope, check, inspect, link_session, list_locks, reconcile_unlinked_terminal_lease, release, renew, repository_lock_id, semantic_lock, validate_local_preflight
 
 
 NOW = datetime(2026, 8, 12, tzinfo=timezone.utc)
@@ -157,6 +157,22 @@ class WorktreeLockTests(unittest.TestCase):
         self.assertEqual("codex:session-a", renewed["session_id"])
         released = release(registry, result["lock_id"], **owner_from(result), lease_token=result["lease_token"])
         self.assertEqual("released", released["status"])
+
+    def test_terminal_reconciliation_releases_only_an_unlinked_exact_owner(self):
+        registry = MemoryRegistry(); arguments = acquire_args(); arguments.pop("session_id")
+        result = acquire(registry, **arguments)
+        reconciled = reconcile_unlinked_terminal_lease(
+            registry, result["lock_id"], "p1", "task-a", "exec-a", "codex", "cancelled",
+        )
+        self.assertEqual("released", reconciled["status"])
+        self.assertEqual("released", registry.document["locks"][result["lock_id"]]["status"])
+
+    def test_terminal_reconciliation_refuses_linked_or_nonterminal_owner(self):
+        registry = MemoryRegistry(); result = acquire(registry, **acquire_args())
+        with self.assertRaisesRegex(TaskError, "non-running terminal"):
+            reconcile_unlinked_terminal_lease(registry, result["lock_id"], **owner_from(result), terminal_status="running")
+        with self.assertRaisesRegex(TaskError, "linked provider session"):
+            reconcile_unlinked_terminal_lease(registry, result["lock_id"], **owner_from(result), terminal_status="cancelled")
 
     def test_session_link_is_idempotent_metadata_not_owner(self):
         registry = MemoryRegistry(); result = acquire(registry, **acquire_args(session_id=None))

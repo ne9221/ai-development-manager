@@ -296,6 +296,43 @@ def release(registry, lock_id, project_id, task_id, execution_id, provider, sess
     return _owned_update(registry, lock_id, owner_fields(project_id, task_id, execution_id, provider, session_id), lease_token, "release")
 
 
+def reconcile_unlinked_terminal_lease(registry, lock_id, project_id, task_id, execution_id, provider,
+                                     terminal_status, attempts=5):
+    """Release a writer lease left by a proven prelaunch terminal rollback.
+
+    This is deliberately narrower than ``release``: it accepts no token and
+    can only CAS an exact owner match whose lease has never been linked to a
+    provider Session and whose execution is already terminal before the
+    caller invokes this governance recovery path.  Running/completed leases,
+    linked leases, and owner mismatches remain refused.
+    """
+    if terminal_status not in {"cancelled", "failed", "interrupted"}:
+        raise TaskError("terminal lease reconciliation requires a non-running terminal status")
+    owner = owner_fields(project_id, task_id, execution_id, provider, None)
+    for _ in range(attempts):
+        document, etag, now = read_registry(registry)
+        lock = document["locks"].get(lock_id)
+        if not lock:
+            return {"status": "clean", "released": False, "reason": "lock_not_found"}
+        if not all(lock.get(key) == value for key, value in owner.items() if key != "session_id"):
+            raise TaskError("terminal lease reconciliation owner mismatch")
+        if lock.get("session_id") is not None:
+            raise TaskError("terminal lease reconciliation refuses a linked provider session")
+        if lock.get("status") == "released":
+            return public_lock(lock, now)
+        if lock.get("status") != "active":
+            raise TaskError("terminal lease reconciliation found an invalid lock status")
+        changed = {**lock, "status": "released", "updated_at": iso(now), "released_at": iso(now)}
+        semantic_lock(changed, lock_id)
+        updated = {**document, "locks": {**document["locks"], lock_id: changed}}
+        try:
+            registry.cas(etag, updated)
+            return public_lock(changed, now)
+        except RegistryConflict:
+            continue
+    raise TaskError("terminal lease reconciliation contention did not settle")
+
+
 def link_session(registry, lock_id, project_id, task_id, execution_id, provider, session_id, lease_token, attempts=5):
     owner = owner_fields(project_id, task_id, execution_id, provider, session_id)
     parsed = parse_manager_session_key(session_id)

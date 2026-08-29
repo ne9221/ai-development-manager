@@ -30,6 +30,7 @@ from manager.trusted_ingress import (
     ADMISSION_VERSION_V1, REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN, task_policy_satisfied,
     task_policy_satisfied_for_admission, verify_trusted_ingress_admission,
 )
+from manager.worktree_locks import canonical_repository, reconcile_unlinked_terminal_lease, repository_lock_id
 from manager.dispatch_requests import dispatch_request_registry
 from manager.production_guard import RuntimeGuardError, require_runtime_guard
 
@@ -385,6 +386,22 @@ def _claim_registry(command, claim_factory):
     return claim_factory(os.environ.get("ADM_LOCK_GCS_BUCKET"), command["project_id"], command["task_id"])
 
 
+def _reconcile_terminal_writer_lease(store, command, execution):
+    """Reconcile a prelaunch terminal rollback's unlinked writer lease."""
+    task = store.get("tasks", command["project_id"], command["task_id"])
+    validate("task", task)
+    if task.get("read_only") is True:
+        return {"status": "clean", "released": False, "reason": "read_only_no_writer_lease"}
+    project = store.get("projects", command["project_id"], command["project_id"])
+    validate("project", project)
+    lock_id = repository_lock_id(canonical_repository(project["repo"]))
+    return reconcile_unlinked_terminal_lease(
+        GCSLockRegistry.from_environment(), lock_id,
+        command["project_id"], command["task_id"], execution["execution_id"], execution["provider"],
+        execution["status"],
+    )
+
+
 def _reconcile_active(store, service, command, claim_factory):
     try:
         execution = store.get("executions", command["project_id"], command["execution_id"])
@@ -432,12 +449,20 @@ def _reconcile_active(store, service, command, claim_factory):
             )
         except TaskError:
             return _attention(store, command, execution, "reserved_execution_authority_inconsistent")
+        try:
+            _reconcile_terminal_writer_lease(store, command, cancelled)
+        except TaskError:
+            return _attention(store, command, execution, "terminal_writer_authority_reconciliation_unknown")
         _block_prelaunch_task(store, command, "prelaunch_contract_or_gate_failure")
         failed = _terminal(command, "failed", _result("error", cancelled["execution_id"], error_kind="prelaunch_failed"))
         failed["recovery_reason"] = "prelaunch_contract_or_gate_failure"
         _write(store, failed)
         return {"status": "failed", "reconciled": True}
     if execution["status"] == "cancelled":
+        try:
+            _reconcile_terminal_writer_lease(store, command, execution)
+        except TaskError:
+            return _attention(store, command, execution, "terminal_writer_authority_reconciliation_unknown")
         _block_prelaunch_task(store, command, "prelaunch_execution_cancelled")
         failed = _terminal(command, "failed", _result("error", command["execution_id"], error_kind="prelaunch_failed"))
         _write(store, failed)
