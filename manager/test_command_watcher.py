@@ -17,7 +17,7 @@ from manager.command_watcher import (
     POLL_TIME_BUDGET_SECONDS, PROVIDER_RUNTIMES,
     REQUIRED_TASK_POLICIES, _provider_state, _enumerate_waiting_quota_tasks, _promote_waiting_quota_task,
     _prioritized_commands, claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist,
-    poll_once, process_command, provider_quota_reliable, resolve_provider_runtime,
+    poll_once, process_command, provider_quota_reliable, resolve_provider_runtime, _spawn_claimed_worker,
 )
 from manager.execution_lifecycle import enter_running_gate
 from manager.executions import execution_health, heartbeat_execution, reserve_execution
@@ -1630,6 +1630,43 @@ class WatcherSessionCenterBootstrapIntegrationTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class AsyncClaimContinuationTests(unittest.TestCase):
+    ALLOWLIST = frozenset({("p1", "t1")})
+
+    def setUp(self):
+        self.store = CommandWatcherTests.allowlist_compliant_store()
+
+    def test_claimed_worker_receives_exact_lifecycle_identity(self):
+        claimed = command(project_id="p1", task_id="t1", execution_id="execution-1", status="claimed")
+        fake_process = Mock(pid=4242)
+        with patch("manager.command_watcher.subprocess.Popen", return_value=fake_process) as popen:
+            self.assertEqual(4242, _spawn_claimed_worker(claimed))
+
+        argv = popen.call_args.args[0]
+        self.assertEqual(["-m", "manager.command_watcher_worker", "p1", "t1", "execution-1"], argv[1:])
+        self.assertEqual(os.getcwd(), popen.call_args.kwargs["cwd"])
+        self.assertIs(popen.call_args.kwargs["stdin"], __import__("subprocess").DEVNULL)
+        self.assertIs(popen.call_args.kwargs["stdout"], __import__("subprocess").DEVNULL)
+        self.assertIs(popen.call_args.kwargs["stderr"], __import__("subprocess").DEVNULL)
+
+    def test_async_claim_returns_before_provider_launch(self):
+        provider_launch = Mock()
+        with patch("manager.command_watcher._spawn_claimed_worker", return_value=4242) as spawn, \
+             patch("manager.command_watcher.launch_task", provider_launch):
+            result = process_command(
+                self.store, object(), command(), claim_factory=CommandWatcherTests.claim_factory,
+                allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True,
+                async_launch=True,
+            )
+
+        self.assertEqual({"status": "claimed", "execution_id": "command-cmd-1", "worker_pid": 4242}, result)
+        spawn.assert_called_once()
+        provider_launch.assert_not_called()
+        persisted = self.store.get("commands", "p1", "cmd-1")
+        self.assertEqual("claimed", persisted["status"])
+        self.assertEqual("command-cmd-1", persisted["execution_id"])
 
 
 class PollOnceTimeBudgetTests(unittest.TestCase):

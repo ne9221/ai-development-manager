@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import urllib.request
@@ -518,9 +519,89 @@ def _existing_terminal(store, command):
                      _result(execution["status"], command["execution_id"], execution.get("session_id")))
 
 
+def _run_claimed_command(store, service, claimed, launcher_factory, writer_factory,
+                         claim_factory, explicit_account_id, claude_accounts, origin,
+                         retry_count=0, retry_of=None):
+    """Run the existing claimed -> Execution -> Session lifecycle."""
+    try:
+        task = store.get("tasks", claimed["project_id"], claimed["task_id"])
+        validate("task", task)
+        claim_registry = claim_factory(os.environ.get("ADM_LOCK_GCS_BUCKET"), claimed["project_id"], claimed["task_id"])
+        writer_registry = None if task.get("read_only") else writer_factory()
+        running = {**claimed, "status": "running"}
+        retry = ({"retry_count": retry_count, "retry_of_execution_id": retry_of} if retry_count else {})
+        outcome = launch_task(store, service, writer_registry, claim_registry, launcher_factory(),
+                              claimed["project_id"], claimed["task_id"], claimed["execution_id"], claimed["model"],
+                              on_running=lambda _execution: _on_execution_running(store, running),
+                              provider=claimed["provider"],
+                              claude_accounts=claude_accounts, account_id=explicit_account_id, provenance=origin, **retry)
+        terminal = outcome["terminal"]["execution"]
+        dispatch = outcome["dispatch"]
+        selected = {**running, "provider": dispatch["provider"], "account_id": dispatch.get("account_id"),
+                    "model": dispatch["model"] or claimed["model"],
+                    "fallback_model": dispatch["fallback_model"] or claimed["fallback_model"], "mode": dispatch["mode"],
+                    "effort": dispatch["effort"], "selection_reason": dispatch["selection_reason"],
+                    "quota_evidence": dispatch["quota_evidence"]}
+        final = _terminal(selected, "completed" if terminal["status"] == "completed" else "failed",
+                          _result(terminal["status"], claimed["execution_id"], outcome["session"].get("session_id")))
+    except Exception as exc:
+        terminal = _existing_terminal(store, claimed)
+        if terminal:
+            final = terminal
+        else:
+            no_execution_created = False
+            try:
+                existing = store.get("executions", claimed["project_id"], claimed["execution_id"])
+                if existing.get("status") in ("reserved", "running"):
+                    return _reconcile_active(store, service, {**claimed, "status": "running"}, claim_factory)
+            except TaskError:
+                no_execution_created = True
+            kind = getattr(exc, "classification", None) or type(exc).__name__
+            if no_execution_created:
+                _block_prelaunch_task(store, claimed, kind)
+            final = _terminal(claimed, "failed", _result("error", claimed["execution_id"], error_kind=str(kind)[:100]))
+    _write(store, final)
+    return {"status": final["status"], "execution_id": claimed["execution_id"]}
+
+
+def _spawn_claimed_worker(claimed):
+    """Continue provider work outside the one-minute watcher invocation."""
+    flags = (
+        getattr(subprocess, "DETACHED_PROCESS", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+    )
+    kwargs = {
+        "cwd": os.getcwd(),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = flags
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "manager.command_watcher_worker",
+             claimed["project_id"], claimed["task_id"], claimed["execution_id"]],
+            **kwargs,
+        )
+    except OSError:
+        if os.name != "nt" or not (flags & getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)):
+            raise
+        kwargs["creationflags"] = flags & ~getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        process = subprocess.Popen(
+            [sys.executable, "-m", "manager.command_watcher_worker",
+             claimed["project_id"], claimed["task_id"], claimed["execution_id"]],
+            **kwargs,
+        )
+    return process.pid
+
+
 def process_command(store, service, command, launcher_factory=None, writer_factory=GCSLockRegistry.from_environment,
                     claim_factory=task_claim_registry, allowlist=frozenset(), health_check=session_center_healthy,
-                    quota_check=None, ingress_registry_factory=dispatch_request_registry, origin_context=None):
+                    quota_check=None, ingress_registry_factory=dispatch_request_registry, origin_context=None,
+                    async_launch=False):
     """Claim/reconcile one command; a claimed command is never automatically relaunched.
 
     launcher_factory/quota_check are explicit-override escape hatches (tests
@@ -631,6 +712,17 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     origin = command_origin(origin_context)
     claimed = {**_claimed(command), "process_provenance": origin}
     _write(store, claimed)
+    if async_launch:
+        try:
+            worker_pid = _spawn_claimed_worker(claimed)
+            return {"status": "claimed", "execution_id": claimed["execution_id"], "worker_pid": worker_pid}
+        except Exception as exc:
+            kind = getattr(exc, "classification", None) or type(exc).__name__
+            _block_prelaunch_task(store, claimed, kind)
+            final = _terminal(claimed, "failed", _result("error", claimed["execution_id"], error_kind=str(kind)[:100]))
+            final["recovery_reason"] = "provider_worker_spawn_failed"
+            _write(store, final)
+            return {"status": final["status"], "execution_id": claimed["execution_id"]}
     try:
         task = store.get("tasks", claimed["project_id"], claimed["task_id"])
         validate("task", task)
@@ -1002,7 +1094,8 @@ def _prioritized_commands(commands):
     )
 
 
-def poll_once(store, service, allowlist=None, deadline=None, discovery_store=None, origin_context=None, **factories):
+def poll_once(store, service, allowlist=None, deadline=None, discovery_store=None, origin_context=None,
+              async_launch=False, **factories):
     """`deadline`, if given, is a `time.monotonic()` value after which this
     call stops STARTING new project/command work and returns whatever it has
     so far -- any project/command not yet reached this tick is picked up on
@@ -1171,7 +1264,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
                 return results
             try:
                 results.append(process_command(store, service, command, allowlist=allowlist,
-                                               origin_context=origin_context, **factories))
+                                               origin_context=origin_context, async_launch=async_launch, **factories))
             except Exception as exc:
                 # One command's processing must never take the rest of this
                 # project's queue -- or any later-rotated project's -- down
@@ -1228,7 +1321,8 @@ def main(argv=None):
             if embedded_ingress_enabled() and os.environ.get("ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID"):
                 from manager.drive_dispatch_ingress import poll_drive_dispatch_requests
                 ingress = poll_drive_dispatch_requests(store, service, os.environ.get("ADM_LOCK_GCS_BUCKET"))
-            result = poll_once(store, service, discovery_store=discovery_store, origin_context=invocation)
+            result = poll_once(store, service, discovery_store=discovery_store, origin_context=invocation,
+                               async_launch=True)
             print(json.dumps({"status": "ok", "host": socket.gethostname()[:100], "ingress": ingress,
                               "commands": result}, separators=(",", ":")))
         except Exception:
