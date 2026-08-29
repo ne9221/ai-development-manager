@@ -445,9 +445,10 @@ class ProjectIdEnumerationTests(unittest.TestCase):
 
         def fake_monotonic():
             call_count["n"] += 1
-            # 1st check: before page 1 of children(root) -- under budget.
-            # 2nd check: before page 2 -- budget now spent, stop.
-            return 0.0 if call_count["n"] <= 1 else 100.0
+            # 1st check: before resolving the PROJECTS root -- under budget.
+            # 2nd check: before page 1 of children(root) -- under budget.
+            # 3rd check: before page 2 -- budget now spent, stop.
+            return 0.0 if call_count["n"] <= 2 else 100.0
 
         with patch("manager.tasks.time.monotonic", side_effect=fake_monotonic):
             ids = store.list_project_ids(deadline=50.0)

@@ -267,6 +267,20 @@ def _terminal(command, status, result):
             "recovery_reason": command.get("recovery_reason"), "stale_at": command.get("stale_at")}
 
 
+def _terminal_cleanup_confirmed(execution):
+    """Terminal status is publishable only after durable cleanup evidence."""
+    evidence = execution.get("cleanup_evidence")
+    if (not isinstance(evidence, dict)
+            or evidence.get("provider_outcome") != execution.get("status")
+            or evidence.get("persistence") != "complete"
+            or evidence.get("persisted") != ["execution", "handoff", "task"]
+            or evidence.get("task_claim_release") != "released"):
+        return False
+    writer_release = evidence.get("writer_release")
+    return (writer_release in ("released", "not_required")
+            if execution.get("access") == "read_only" else writer_release == "released")
+
+
 def _attention(store, command, execution, reason):
     timestamp = command.get("stale_at") or now_iso()
     # Legacy uncertain executions have no heartbeat/process contract. Surface
@@ -371,10 +385,6 @@ def _claim_registry(command, claim_factory):
 
 
 def _reconcile_active(store, service, command, claim_factory):
-    terminal = _existing_terminal(store, command)
-    if terminal:
-        _write(store, terminal)
-        return {"status": terminal["status"], "reconciled": True}
     try:
         execution = store.get("executions", command["project_id"], command["execution_id"])
         validate("execution", execution)
@@ -382,12 +392,37 @@ def _reconcile_active(store, service, command, claim_factory):
         if command["status"] == "claimed" and not _claim_expired(command):
             return {"status": "claimed", "skipped": True}
         if command["status"] == "claimed" and _claim_expired(command):
+            try:
+                claim = check_task_execution_claim(
+                    _claim_registry(command, claim_factory), command["project_id"], command["task_id"])
+            except TaskError:
+                return _attention(store, command, None, "execution_record_missing_claim_state_unknown")
+            if claim is not None:
+                return _attention(store, command, None, "execution_record_missing_claim_retained")
             failed = _terminal(command, "failed", _result("error", command["execution_id"], error_kind="claim_timeout"))
             _write(store, failed)
             return {"status": "failed", "reconciled": True}
         return _attention(store, command, None, "execution_record_missing_or_invalid")
 
-    claim_registry = _claim_registry(command, claim_factory)
+    try:
+        claim_registry = _claim_registry(command, claim_factory)
+    except TaskError:
+        return _attention(store, command, execution, "task_claim_backend_unavailable")
+    if execution["status"] in ("completed", "failed", "interrupted"):
+        try:
+            claim = check_task_execution_claim(claim_registry, command["project_id"], command["task_id"])
+            if claim is not None:
+                from manager.execution_recovery import recover_task_claim
+                recovered = recover_task_claim(store, claim_registry, command["project_id"], command["task_id"])
+                if recovered.get("status") not in ("clean", "released"):
+                    return _attention(store, command, execution, "terminal_cleanup_not_confirmed")
+        except TaskError:
+            return _attention(store, command, execution, "terminal_cleanup_reconciliation_unknown")
+        terminal = _existing_terminal(store, command)
+        if terminal:
+            _write(store, terminal)
+            return {"status": terminal["status"], "reconciled": True}
+        return _attention(store, command, execution, "terminal_cleanup_not_confirmed")
     if execution["status"] == "reserved":
         try:
             cancelled = cancel_reserved_execution(
@@ -467,6 +502,17 @@ def _existing_terminal(store, command):
     except TaskError:
         return None
     if execution.get("status") not in ("completed", "failed", "interrupted"):
+        return None
+    if not _terminal_cleanup_confirmed(execution):
+        return None
+    try:
+        task = store.get("tasks", command["project_id"], command["task_id"])
+        validate("task", task)
+    except TaskError:
+        return None
+    expected_task_status = "completed" if execution["status"] == "completed" else "blocked"
+    if (task.get("status") != expected_task_status
+            or (task.get("source_context") or {}).get("active_execution_id") != command["execution_id"]):
         return None
     return _terminal(command, "completed" if execution["status"] == "completed" else "failed",
                      _result(execution["status"], command["execution_id"], execution.get("session_id")))

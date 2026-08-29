@@ -247,8 +247,24 @@ class CommandWatcherTests(unittest.TestCase):
         claimed = command(status="claimed", execution_id="command-cmd-1", claimed_at="2000-01-01T00:00:00Z")
         runner = Mock()
         result = process_command(self.store, object(), claimed, launcher_factory=runner)
-        self.assertEqual("failed", result["status"]); runner.assert_not_called()
-        self.assertEqual("claim_timeout", self.store.get("commands", "p1", "cmd-1")["result"]["error_kind"])
+        # With no observable GCS claim backend, an expired claim is UNKNOWN,
+        # not proof that the task is safe to terminalize.
+        self.assertEqual("attention", result["status"]); runner.assert_not_called()
+        self.assertEqual("execution_record_missing_claim_state_unknown", self.store.get("commands", "p1", "cmd-1")["recovery_reason"])
+
+    def test_terminal_execution_without_cleanup_is_not_published_as_command_terminal(self):
+        active, claim, execution = self.running_command(pid=os.getpid())
+        execution.update(status="completed", completed_at=now_iso(), finished_at=now_iso(),
+                         elapsed_minutes=1, quota_after={}, quota_delta={},
+                         terminal_reason="completed",
+                         cleanup_evidence={"provider_outcome": "completed", "persistence": "complete",
+                                           "persisted": ["execution", "handoff", "task"],
+                                           "task_claim_release": "retained", "writer_release": "not_required"})
+        self.store.put("executions", "p1", "command-cmd-1", execution)
+        result = process_command(self.store, object(), active, claim_factory=lambda *_: claim)
+        self.assertEqual("attention", result["status"])
+        self.assertEqual("attention", self.store.get("commands", "p1", "cmd-1")["status"])
+        self.assertIsNotNone(claim.document)
 
     def test_malformed_command_fails_closed_without_launch(self):
         runner = Mock()

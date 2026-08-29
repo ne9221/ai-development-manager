@@ -113,8 +113,8 @@ class DriveRecords:
             seen.add(next_token)
             token = next_token
 
-    def folder(self, parent, name, create=True):
-        matches = [item for item in self.children(parent, name) if item.get("mimeType") == MIME_FOLDER]
+    def folder(self, parent, name, create=True, deadline=None):
+        matches = [item for item in self.children(parent, name, deadline=deadline) if item.get("mimeType") == MIME_FOLDER]
         if len(matches) > 1:
             raise TaskError(f"duplicate Drive folder: {name}")
         if matches:
@@ -150,9 +150,9 @@ class DriveRecords:
         self.files.delete(fileId=created_id).execute()
         return winner["id"]
 
-    def project_folder(self, area, project_id, create=True):
-        root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS[area], create)
-        return self.folder(root, safe_id(project_id), create)
+    def project_folder(self, area, project_id, create=True, deadline=None):
+        root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS[area], create, deadline=deadline)
+        return self.folder(root, safe_id(project_id), create, deadline=deadline)
 
     @staticmethod
     def record_filename(name):
@@ -253,7 +253,12 @@ class DriveRecords:
         if single_request_worst_case is None:
             from collectors.publish_drive import DRIVE_REQUEST_TIMEOUT_SECONDS
             single_request_worst_case = DRIVE_REQUEST_TIMEOUT_SECONDS
-        parent = self.project_folder(area, project_id, create=False)
+        try:
+            parent = self.project_folder(area, project_id, create=False, deadline=deadline)
+        except TaskError:
+            if deadline is not None and time.monotonic() >= deadline:
+                return []
+            raise
         items = self.children(parent, deadline=deadline)
         records = []
         for item in items:
@@ -287,7 +292,12 @@ class DriveRecords:
         any project not yet seen is simply picked up on a later call. This
         does not change list_projects()'s own behavior or any other
         existing caller of children()/folder() at all."""
-        root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"], create=False)
+        try:
+            root = self.folder(ROOT_FOLDER_ID, ROOT_FOLDERS["projects"], create=False, deadline=deadline)
+        except TaskError:
+            if deadline is not None and time.monotonic() >= deadline:
+                return []
+            raise
         return [item["name"] for item in self.children(root, deadline=deadline)
                 if item.get("mimeType") == MIME_FOLDER]
 
