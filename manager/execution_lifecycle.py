@@ -221,7 +221,7 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
     return {"execution": running, "lease": lease, "task_claim": claim}
 
 
-def _verify_terminal_authority(store, writer_registry, claim_registry, project_id, task_id, execution_id, provider, claim_generation, lease_token):
+def _verify_terminal_authority(store, writer_registry, claim_registry, project_id, task_id, execution_id, provider, claim_generation, lease_token, writer_authority_released=False):
     execution = store.get("executions", project_id, execution_id)
     validate("execution", execution)
     identity = {"project_id": project_id, "task_id": task_id, "execution_id": execution_id, "provider": provider}
@@ -239,15 +239,23 @@ def _verify_terminal_authority(store, writer_registry, claim_registry, project_i
         if session_id is not None and session_id != execution.get("session_id"):
             raise TaskError("terminal callback session does not match the writer lease")
         owner = owner_fields(project_id, task_id, execution_id, provider, session_id)
-        if not current or current.get("generation") != lease.get("generation") or not active(current, server_time) or not same_owner(current, owner, lease_token):
-            raise TaskError("terminal callback does not own the active writer lease generation")
+        if writer_authority_released:
+            from manager.worktree_locks import verify_released_terminal_lease
+            verify_released_terminal_lease(
+                writer_registry, lease.get("lock_id"), project_id, task_id, execution_id,
+                provider, lease.get("generation"), execution.get("session_id"),
+            )
+        elif (not current or current.get("generation") != lease.get("generation")
+              or (current.get("status") != "released" and not active(current, server_time))
+              or not same_owner(current, owner, lease_token)):
+            raise TaskError("terminal callback does not own the writer lease generation")
     return execution
 
 
-def cleanup_execution(writer_registry, claim_registry, execution, claim_generation, lease_token=None):
+def cleanup_execution(writer_registry, claim_registry, execution, claim_generation, lease_token=None, writer_authority_released=False):
     """Release writer authority first; release only the supplied claim generation last."""
     previous = execution.get("cleanup_evidence") or {}
-    writer_release = "released" if previous.get("writer_release") == "released" else "not_required"
+    writer_release = "released" if (previous.get("writer_release") == "released" or writer_authority_released) else "not_required"
     evidence = {"writer_release": writer_release, "task_claim_release": "not_attempted", "errors": []}
     if execution.get("access") == "production_write" and writer_release != "released":
         try:
@@ -375,7 +383,7 @@ def _retain_terminal_authority(store, execution, status, persisted, error):
     return audit
 
 
-def terminalize_execution(store, service, writer_registry, claim_registry, project_id, task_id, execution_id, provider, status, claim_generation, provider_stopped, lease_token=None, completed_at=None, summary=None):
+def terminalize_execution(store, service, writer_registry, claim_registry, project_id, task_id, execution_id, provider, status, claim_generation, provider_stopped, lease_token=None, completed_at=None, summary=None, writer_authority_released=False):
     if status not in ("completed", "failed", "interrupted"):
         raise TaskError(f"invalid terminal execution status: {status}")
     if provider_stopped is not True:
@@ -401,7 +409,7 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
         cleanup_complete = audit.get("writer_release") in ("released", "not_required") and audit.get("task_claim_release") == "released"
         if state_complete and audit.get("persistence") == "complete" and cleanup_complete:
             return {"execution": existing, "cleanup": audit, "idempotent": True}
-    execution = _verify_terminal_authority(store, writer_registry, claim_registry, project_id, task_id, execution_id, provider, claim_generation, lease_token)
+    execution = _verify_terminal_authority(store, writer_registry, claim_registry, project_id, task_id, execution_id, provider, claim_generation, lease_token, writer_authority_released=writer_authority_released)
 
     timestamp = execution.get("completed_at") or completed_at or now_iso()
     summary = (execution["notes"][-1] if execution.get("status") == status and execution.get("notes")
@@ -434,7 +442,7 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
 
     pre_cleanup = {
         "provider_outcome": status, "persistence": "complete", "persisted": persisted,
-        "writer_release": "released" if (execution.get("cleanup_evidence") or {}).get("writer_release") == "released" else ("retained" if execution.get("access") == "production_write" else "not_required"),
+        "writer_release": "released" if (writer_authority_released or (execution.get("cleanup_evidence") or {}).get("writer_release") == "released") else ("retained" if execution.get("access") == "production_write" else "not_required"),
         "task_claim_release": "retained", "errors": [],
     }
     terminal = store.get("executions", project_id, execution_id)
@@ -448,7 +456,7 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
         pre_cleanup["errors"].append(f"complete persistence audit failed; authority retained: {exc}")
         return {"execution": terminal, "cleanup": pre_cleanup, "idempotent": False}
 
-    cleanup = cleanup_execution(writer_registry, claim_registry, terminal, claim_generation, lease_token)
+    cleanup = cleanup_execution(writer_registry, claim_registry, terminal, claim_generation, lease_token, writer_authority_released=writer_authority_released)
     audit = {**cleanup, "provider_outcome": status, "persistence": "complete", "persisted": persisted}
     try:
         terminal["cleanup_evidence"] = audit

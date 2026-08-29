@@ -501,6 +501,21 @@ def _reconcile_active(store, service, command, claim_factory):
         terminal = _existing_terminal(store, command)
         _write(store, terminal)
         return {"status": terminal["status"], "reconciled": True, "provider_state": provider}
+    if provider == "stopped" and exact_claim and execution.get("access") == "production_write":
+        try:
+            terminalize_execution(
+                store, service, GCSLockRegistry.from_environment(), claim_registry,
+                command["project_id"], command["task_id"], execution["execution_id"],
+                execution["provider"], "interrupted", claim["generation"], True,
+                summary=f"Recovery: {health['reason']}; provider stop and released writer generation proven",
+                writer_authority_released=True,
+            )
+            terminal = _existing_terminal(store, command)
+            if terminal:
+                _write(store, terminal)
+                return {"status": terminal["status"], "reconciled": True, "provider_state": provider}
+        except TaskError:
+            pass
     reason = health["reason"] or "provider_state_inconsistent"
     if provider == "stopped" and execution.get("access") == "production_write":
         reason = "provider_stopped_writer_authority_retained"

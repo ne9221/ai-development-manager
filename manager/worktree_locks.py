@@ -333,6 +333,32 @@ def reconcile_unlinked_terminal_lease(registry, lock_id, project_id, task_id, ex
     raise TaskError("terminal lease reconciliation contention did not settle")
 
 
+def verify_released_terminal_lease(registry, lock_id, project_id, task_id, execution_id, provider,
+                                   generation, session_id=None):
+    """Prove that an exact writer generation is already safely released.
+
+    This is used only after an owning provider process has been independently
+    proven stopped.  It never changes the registry and refuses a missing,
+    active, mismatched, or differently-linked generation.
+    """
+    if not isinstance(generation, int) or generation < 1:
+        raise TaskError("released lease verification requires a valid generation")
+    document, _, now = read_registry(registry)
+    lock = document["locks"].get(lock_id)
+    if not lock:
+        raise TaskError("released lease verification found no lock")
+    owner = owner_fields(project_id, task_id, execution_id, provider, lock.get("session_id"))
+    if any(lock.get(key) != value for key, value in owner.items()):
+        raise TaskError("released lease verification owner mismatch")
+    if lock.get("generation") != generation:
+        raise TaskError("released lease verification generation mismatch")
+    if lock.get("session_id") not in (None, session_id):
+        raise TaskError("released lease verification session mismatch")
+    if lock.get("status") != "released":
+        raise TaskError("released lease verification requires a released lock")
+    return public_lock(lock, now)
+
+
 def link_session(registry, lock_id, project_id, task_id, execution_id, provider, session_id, lease_token, attempts=5):
     owner = owner_fields(project_id, task_id, execution_id, provider, session_id)
     parsed = parse_manager_session_key(session_id)
