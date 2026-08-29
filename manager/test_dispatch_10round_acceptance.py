@@ -188,6 +188,29 @@ class TenRoundAcceptanceTests(unittest.TestCase):
         self.assertTrue(any(check.name == "HARNESS_CALL" and check.status == "FAIL"
                             for check in report.results[1].checks))
 
+    def test_collection_failure_preserves_dispatch_receipt_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = JsonlEvidenceRecorder(Path(directory) / "evidence.jsonl")
+
+            def collect(*_args):
+                raise RuntimeError("test-only collection failure")
+
+            run_unattended_ten_rounds(
+                project_id=PROJECT,
+                request_ids=[f"receipt-{n}" for n in range(1, ROUND_COUNT + 1)],
+                dispatch_round=lambda *_: {"task_id": "task-1", "command_id": "command-1", "status": "queued"},
+                collect_round=collect,
+                tick_seconds=TICK_SECONDS,
+                run_id="run-receipt",
+                recorder=recorder,
+                now=lambda: RUN_STARTED_AT,
+            )
+            snapshots = [json.loads(line) for line in (Path(directory) / "evidence.jsonl").read_text(encoding="utf-8").splitlines()
+                         if json.loads(line).get("event") == "round_snapshot"]
+            self.assertEqual("task-1", snapshots[0]["evidence"]["ids"]["task_id"])
+            self.assertEqual("command-1", snapshots[0]["evidence"]["ids"]["command_id"])
+            self.assertEqual("queued", snapshots[0]["evidence"].get("dispatch_status"))
+
 
 if __name__ == "__main__":
     unittest.main()
