@@ -55,6 +55,7 @@ def dispatch_round(round_number: int, request_id: str):
             "不得修改 production checkout、credential、token、governance 或 lifecycle core。"
         ),
         "priority": "normal",
+        "constraints": {"read_only": False},
         "provider": provider,
         "account_id": account_id,
         "repo_write": {
