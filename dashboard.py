@@ -443,8 +443,18 @@ def load_all_data():
         except Exception as p_exc:
             try:
                 projects = store.list_projects()
-            except Exception:
-                all_warnings.append(f"Drive project read warning: {p_exc}")
+            except Exception as list_exc:
+                # A malformed or unreadable historical Project record must
+                # not hide the live project's lifecycle records. Folder names
+                # are the canonical project IDs, so this fallback preserves
+                # Task/Command/Execution visibility with minimal metadata.
+                try:
+                    projects = [{"project_id": project_id} for project_id in store.list_project_ids()]
+                    all_warnings.append(
+                        f"Drive project metadata warning: {p_exc}; using project-folder IDs ({list_exc})"
+                    )
+                except Exception:
+                    all_warnings.append(f"Drive project read warning: {p_exc}; {list_exc}")
 
         all_tasks = []
         all_commands = []
