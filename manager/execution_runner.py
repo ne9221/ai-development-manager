@@ -540,7 +540,15 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
                 progress=event == "provider_event",
             ))
         outcome = launcher.wait(running)
-        heartbeat_execution(store, project_id, execution_id, "turn_terminal", at=outcome.completed_at)
+        # The provider outcome is authoritative once wait() returns. A
+        # terminal heartbeat is observability, not a second provider gate:
+        # transient Drive failure here must not turn a real completed turn
+        # into an invented interruption. terminalize_execution() below will
+        # persist the canonical terminal record and cleanup evidence.
+        try:
+            heartbeat_execution(store, project_id, execution_id, "turn_terminal", at=outcome.completed_at)
+        except TaskError:
+            pass
         status = outcome.status if outcome.status in ("completed", "failed", "interrupted") else "failed"
         summary = f"{provider} turn {status}"
         if outcome.failure_classification:

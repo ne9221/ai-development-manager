@@ -238,6 +238,20 @@ class RunnerTests(unittest.TestCase):
                 self.assertFalse(launcher.process.live)
                 self.assertEqual(outcome, result["terminal"]["execution"]["status"])
 
+    def test_terminal_heartbeat_failure_does_not_override_real_provider_outcome(self):
+        store = build_store(working_directory=self.request.working_directory)
+        with patch("manager.execution_runner.heartbeat_execution", side_effect=lambda *args, **kwargs: (
+                (_ for _ in ()).throw(TaskError("transient terminal heartbeat failure"))
+                if args[3] == "turn_terminal" else None
+        )):
+            _, writer, claim, launcher, result = self.execute(store=store, launcher=Launcher(outcome="completed"))
+        self.assertFalse(launcher.process.live)
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+        self.assertEqual("released", result["terminal"]["cleanup"]["writer_release"])
+        self.assertEqual("released", result["terminal"]["cleanup"]["task_claim_release"])
+        self.assertIsNone(claim.document)
+        self.assertEqual("released", next(iter(writer.document["locks"].values()))["status"])
+
     def test_terminalize_is_never_called_while_process_live(self):
         launcher = Launcher(close_stops=False)
         with patch("manager.execution_runner.terminalize_execution") as terminalize, self.assertRaisesRegex(TaskError, "stop could not be proven"):
