@@ -564,7 +564,7 @@ with st.sidebar:
 data = load_all_data()
 
 if not data["success"] and not data.get("all_tasks") and not data.get("daily_brief_vm"):
-    st.error(f"Failed to fetch data from Google Drive: {data['error']}")
+    st.error(f"無法從 Google Drive 取得資料：{data['error']}")
     st.stop()
 
 # Prepare Data Variables
@@ -781,14 +781,14 @@ if overall_gate["result"] == "PASS":
     st.success("派工真實狀態：通過")
 else:
     st.error("派工真實狀態：未通過")
-    with st.expander(f"Reasons ({len(overall_gate['reasons'])})", expanded=True):
+    with st.expander(f"判定原因（{len(overall_gate['reasons'])}）", expanded=True):
         for _reason in overall_gate["reasons"]:
             st.write(f"- {_reason}")
 
-with st.expander("🧬 Production Provenance (Dashboard vs. Watcher runtime identity)", expanded=(provenance_gate["result"] == "FAIL")):
+with st.expander("🧬 Production Provenance（Dashboard 與 Watcher runtime identity）", expanded=(provenance_gate["result"] == "FAIL")):
     _col1, _col2 = st.columns(2)
     with _col1:
-        st.markdown("**Dashboard (this page)**")
+        st.markdown("**Dashboard（目前頁面）**")
         st.write(f"repository_path=`{provenance_vm.dashboard_repository_path}`")
         st.write(f"branch=`{provenance_vm.dashboard_branch}`")
         st.write(f"reviewed_sha=`{provenance_vm.dashboard_reviewed_sha}`")
@@ -817,13 +817,13 @@ else:
         with st.container():
             st.markdown(f"""<div class="glass-card">
                 <b>{_badge} {_row['project_name']} → {_row['task_title']}</b><br>
-                <b>Dispatch State:</b> <code>{_state}</code> — {_row['dispatch_reason']}<br>
-                <b>AI / Account:</b> {_row['provider']} / {_row['account_id']} · <b>Model/Mode:</b> {_row['model']} / {_row['mode']}<br>
-                <b>5h remaining:</b> {_row['quota']['formatted_five_hour_remaining']} (resets {_row['quota']['formatted_five_hour_reset_at']})
-                · <b>Weekly remaining:</b> {_row['quota']['formatted_weekly_remaining']} (resets {_row['quota']['formatted_weekly_reset_at']})<br>
-                <b>Quota captured_at:</b> {_row['quota']['formatted_captured_at']} · <b>Freshness:</b> {_row['quota']['freshness']}
+                <b>派工狀態：</b> <code>{_state}</code> — {_row['dispatch_reason']}<br>
+                <b>AI / 帳戶：</b> {_row['provider']} / {_row['account_id']} · <b>模型 / 模式：</b> {_row['model']} / {_row['mode']}<br>
+                <b>五小時剩餘：</b> {_row['quota']['formatted_five_hour_remaining']}（重置 {_row['quota']['formatted_five_hour_reset_at']}）
+                · <b>每週剩餘：</b> {_row['quota']['formatted_weekly_remaining']}（重置 {_row['quota']['formatted_weekly_reset_at']}）<br>
+                <b>配額擷取時間：</b> {_row['quota']['formatted_captured_at']} · <b>新鮮度：</b> {_row['quota']['freshness']}
                 </div>""", unsafe_allow_html=True)
-            with st.expander("Technical IDs"):
+            with st.expander("技術識別碼"):
                 st.write(f"project_id=`{_row['project_id']}` · task_id=`{_row['task_id']}`")
                 st.write(f"execution_id=`{_row['execution_id']}` · session_id=`{_row['session_id']}`")
 
@@ -977,7 +977,7 @@ st.header("Provider 與帳戶配額")
 accounts_list = daily_brief_vm.accounts
 
 if not accounts_list:
-    st.info("No AI providers configured in quota status.")
+    st.info("配額資料中目前沒有已設定的 AI provider。")
 else:
     # Render in columns (max 3 or 4 per row)
     num_cols = min(len(accounts_list), 3)
@@ -992,10 +992,10 @@ else:
                 # Freshness badge
                 if card.stale:
                     fresh_class = "badge-stale"
-                    freshness_text = "STALE"
+                    freshness_text = "已過期"
                 else:
                     fresh_class = "badge-fresh"
-                    freshness_text = "FRESH"
+                    freshness_text = "新鮮"
 
                 # Status badge
                 status_class = "badge-ok" if card.status.lower() == "ok" else "badge-attention"
@@ -1009,11 +1009,17 @@ else:
                     "hold": "badge-action-hold"
                 }.get(card.action_recommendation.lower(), "badge-unknown")
 
-                action_text = card.action_recommendation.replace("_", " ").upper()
+                action_text = {
+                    "urgent_consume": "立即消耗",
+                    "suggest_consume": "建議消耗",
+                    "normal_use": "正常使用",
+                    "conserve": "節省使用",
+                    "hold": "暫緩派工",
+                }.get(card.action_recommendation.lower(), "未知")
 
                 st.markdown(f"""
                 <div>
-                    <span class="badge {status_class}">STATUS: {card.status.upper()}</span>
+                    <span class="badge {status_class}">狀態：{card.status.upper()}</span>
                     <span class="badge {fresh_class}">{freshness_text}</span>
                     <span class="badge {action_bg}">{action_text}</span>
                 </div>
@@ -1044,19 +1050,20 @@ else:
                 if card.has_weekly_window:
                     st.markdown("#### 每週配額窗")
                     w_used_text = f"{card.weekly_used_pct:.1f}%" if card.weekly_used_pct is not None else "—"
-                    st.write(f"• **Remaining**: **{card.formatted_weekly_remaining}** (Used: {w_used_text})")
-                    st.write(f"• **Reset**: `{card.formatted_weekly_countdown}`")
-                    st.caption(f"Weekly reset time: `{card.weekly_resets_at or 'UNKNOWN'}`")
+                    st.write(f"• **剩餘**：**{card.formatted_weekly_remaining}**（已使用：{w_used_text}）")
+                    st.write(f"• **重置**：`{card.formatted_weekly_countdown}`")
+                    st.caption(f"每週重置時間：`{card.weekly_resets_at or '未知'}`")
                     if card.weekly_action_recommendation in ("conserve", "hold"):
-                        st.caption(f"⚠️ Weekly status: {card.weekly_action_recommendation.upper()}")
+                        weekly_status = "節省使用" if card.weekly_action_recommendation == "conserve" else "暫緩派工"
+                        st.caption(f"⚠️ 每週狀態：{weekly_status}")
 
                 # Truthful availability: primary subscription quota, extra credits,
                 # and the effective (actually dispatchable) availability, kept distinct
                 # so "primary quota exhausted" is never displayed as "unavailable" when
                 # usable extra credits exist.
                 if card.extra_credits_available is not None:
-                    st.write(f"• **Extra Credits**: `{card.formatted_extra_credits}`")
-                st.write(f"• **Effective Availability**: `{card.formatted_effective_availability}`")
+                    st.write(f"• **額外額度**：`{card.formatted_extra_credits}`")
+                st.write(f"• **實際可用性**：`{card.formatted_effective_availability}`")
 
                 # Metadata / Telemetry
                 st.caption(f"來源：`{card.source}`（{card.source_type}）｜可信度：`{card.confidence}`")
@@ -1068,7 +1075,7 @@ else:
 
                 st.markdown("---")
             except Exception as e:
-                st.error(f"Error rendering account {card.card_title}: {e}")
+                st.error(f"帳戶 {card.card_title} 顯示失敗：{e}")
 
 st.markdown("---")
 
@@ -1101,26 +1108,26 @@ else:
         elapsed_str = "—"
         if start_time:
             elapsed_m = (now - start_time).total_seconds() / 60
-            elapsed_str = f"{elapsed_m:.1f} min"
+            elapsed_str = f"{elapsed_m:.1f} 分鐘"
 
-        expected_str = f"{task_snapshot.get('expected_minutes', '—')} min"
+        expected_str = f"{task_snapshot.get('expected_minutes', '—')} 分鐘"
 
         is_stale = is_execution_stale(exe, now)
-        attention = "⚠️ ATTENTION" if is_stale else "✅ OK"
+        attention = "⚠️ 需要處理" if is_stale else "✅ 正常"
 
         exec_rows.append({
-            "Project": p_id,
-            "Task": t_id,
-            "AI Provider": provider,
-            "Account": account,
-            "Model/Mode/Effort": f"{model} / {mode} / {effort}",
-            "Provider Session": session_id,
-            "State": ui_state.upper(),
+            "專案": p_id,
+            "任務": t_id,
+            "AI 提供者": provider,
+            "帳戶": account,
+            "模型 / 模式 / 努力程度": f"{model} / {mode} / {effort}",
+            "Provider 工作階段": session_id,
+            "狀態": ui_state.upper(),
             "目前進度": progress,
-            "Heartbeat": hb_at,
-            "Elapsed": elapsed_str,
-            "Expected": expected_str,
-            "Health": attention
+            "心跳": hb_at,
+            "已耗時": elapsed_str,
+            "預估耗時": expected_str,
+            "健康度": attention
         })
 
     st.table(pd.DataFrame(exec_rows))
@@ -1159,7 +1166,7 @@ def render_task_cards(tasks):
         task_id = t.get("task_id", "—")
         title = t.get("title", "—")
         priority = t.get("priority", "normal")
-        provider = t.get("assigned_provider") or t.get("recommended_provider") or "Unassigned"
+        provider = t.get("assigned_provider") or t.get("recommended_provider") or "尚未分派"
         progress = t.get("current_progress", "—")
         next_action = t.get("next_action", "—")
 
@@ -1243,52 +1250,52 @@ else:
             # belongs to this (project_id, task_id), never borrowed.
             if exe:
                 exec_state = determine_execution_state(exe, now)
-                st.info(f"Execution found (lifecycle state: {exec_state.upper()}).")
-                st.write(f"Execution ID: `{exe.get('execution_id') or 'UNKNOWN'}`")
-                st.write(f"Execution Status: `{exe.get('status') or 'UNKNOWN'}`")
-                st.write(f"Provider Session ID: `{exe.get('provider_session_id') or exe.get('session_id') or 'UNKNOWN'}`")
-                st.write(f"Heartbeat: `{exe.get('heartbeat_at') or exe.get('completed_at') or 'UNKNOWN'}`")
+                st.info(f"已找到 Execution（生命週期狀態：{exec_state.upper()}）。")
+                st.write(f"Execution ID：`{exe.get('execution_id') or '未知'}`")
+                st.write(f"Execution 狀態：`{exe.get('status') or '未知'}`")
+                st.write(f"Provider Session ID：`{exe.get('provider_session_id') or exe.get('session_id') or '未知'}`")
+                st.write(f"心跳：`{exe.get('heartbeat_at') or exe.get('completed_at') or '未知'}`")
             elif cmd:
-                st.write(f"No execution record found for this task's command (status: `{cmd.get('status') or 'UNKNOWN'}`).")
+                st.write(f"找不到此 Task 指令對應的 Execution（狀態：`{cmd.get('status') or '未知'}`）。")
             elif cmd_status == READ_STATUS_UNKNOWN or exe_status == READ_STATUS_UNKNOWN:
                 st.warning(
-                    f"UNKNOWN: command/execution truth for this project could not be confirmed "
-                    f"(read failure: `{cmd_read_error or exe_read_error}`). Not confirmed absent -- retry Sync."
+                    f"未知：無法確認此專案的 Command / Execution 真實狀態 "
+                    f"（讀取失敗：`{cmd_read_error or exe_read_error}`）。不是確認不存在；請重新同步。"
                 )
             else:
-                st.write("No command or execution record found for this task.")
+                st.write("此 Task 沒有 Command 或 Execution 紀錄。")
 
         with col2:
             st.subheader("最新交接")
             if ho:
-                st.write(f"Handoff ID: `{ho.get('handoff_id')}`")
-                st.write(f"Created At: `{ho.get('created_at')}`")
-                st.write(f"Reason: `{ho.get('reason')}`")
-                st.write(f"Next Action: {ho.get('next_action')}")
+                st.write(f"Handoff ID：`{ho.get('handoff_id')}`")
+                st.write(f"建立時間：`{ho.get('created_at')}`")
+                st.write(f"原因：`{ho.get('reason')}`")
+                st.write(f"下一步：{ho.get('next_action')}")
 
                 # Expand completed work & changes
-                with st.expander("Completed Work"):
+                with st.expander("已完成工作"):
                     st.write(ho.get("completed_work", []))
 
                 files_changed = ho.get("files_changed", [])
                 if files_changed:
-                    with st.expander("Files Changed"):
+                    with st.expander("已修改檔案"):
                         st.write(files_changed)
 
                 commits = ho.get("commits", [])
                 if commits:
-                    with st.expander("Commits"):
+                    with st.expander("提交紀錄"):
                         st.write(commits)
             elif handoff_result["status"] == READ_STATUS_UNKNOWN:
                 st.warning(
-                    f"UNKNOWN: handoff truth for this task could not be confirmed "
-                    f"(read failure: `{handoff_result['error']}`). Not confirmed absent -- retry Sync."
+                    f"未知：無法確認此 Task 的 Handoff 真實狀態 "
+                    f"（讀取失敗：`{handoff_result['error']}`）。不是確認不存在；請重新同步。"
                 )
             else:
-                st.write("No handoff records found for this task.")
+                st.write("此 Task 沒有 Handoff 紀錄。")
 
 if all_warnings:
     st.markdown("---")
-    with st.expander(f"⚠️ Partial Data Warnings ({len(all_warnings)})"):
+    with st.expander(f"⚠️ 部分資料警告（{len(all_warnings)}）"):
         for w in all_warnings:
             st.warning(w)
