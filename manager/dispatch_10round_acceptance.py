@@ -425,6 +425,23 @@ def run_unattended_ten_rounds(
         if dispatch_error:
             evidence["harness_error"] = dispatch_error
         evidences.append(evidence)
+        if recorder is not None:
+            # Persist each collected round before starting the next dispatch.
+            # The final evaluated record still follows after all ten rounds so
+            # cross-task checks remain authoritative; this snapshot is the
+            # durable, append-only audit trail for a round that has actually
+            # completed (including a dispatch/collection failure).
+            snapshot = _evidence_record(evidence, now())
+            snapshot["harness_error"] = dispatch_error
+            recorder.emit({
+                "event": "round_snapshot",
+                "harness_version": HARNESS_VERSION,
+                "run_id": run_id,
+                "round": round_number,
+                "request_id": request_id,
+                "RESULT": "PENDING_FINAL_EVALUATION",
+                "evidence": snapshot,
+            })
 
     report = evaluate_ten_rounds(
         evidences,
