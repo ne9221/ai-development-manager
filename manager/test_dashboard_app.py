@@ -7,6 +7,13 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 
+def run_full_data_view(at):
+    """Render the secondary inspector route used by legacy truth tests."""
+    at.run(timeout=30)
+    at.radio[0].set_value("完整資料")
+    return at.run(timeout=30)
+
+
 class TestDashboardAppRender(unittest.TestCase):
     def setUp(self):
         # Clear Streamlit cache to prevent test-to-test contamination
@@ -22,7 +29,7 @@ class TestDashboardAppRender(unittest.TestCase):
         mock_store.list_projects.return_value = []
 
         at = AppTest.from_file("../dashboard.py")
-        at.run(timeout=30)
+        run_full_data_view(at)
 
         self.assertFalse(at.exception, f"App crashed on empty drive: {at.exception}")
 
@@ -75,7 +82,7 @@ class TestDashboardAppRender(unittest.TestCase):
         mock_store.list_projects.return_value = []
 
         at = AppTest.from_file("../dashboard.py")
-        at.run(timeout=30)
+        run_full_data_view(at)
 
         self.assertFalse(at.exception, f"App crashed on remaining_percent=None: {at.exception}")
 
@@ -118,7 +125,7 @@ class TestDashboardAppRender(unittest.TestCase):
         mock_store.list_projects.return_value = []
 
         at = AppTest.from_file("../dashboard.py")
-        at.run(timeout=30)
+        run_full_data_view(at)
 
         self.assertFalse(at.exception, f"App crashed on remaining_percent=0: {at.exception}")
         # Progress bar should be drawn for 0% (value=0.0)
@@ -169,7 +176,7 @@ class TestDashboardAppRender(unittest.TestCase):
         mock_store.list_projects.return_value = []
 
         at = AppTest.from_file("../dashboard.py")
-        at.run(timeout=30)
+        run_full_data_view(at)
 
         self.assertFalse(at.exception, f"App crashed with Claude A/B accounts: {at.exception}")
 
@@ -193,7 +200,7 @@ class TestDashboardAppRender(unittest.TestCase):
         mock_store.list_projects.return_value = []
 
         at = AppTest.from_file("../dashboard.py")
-        at.run(timeout=30)
+        run_full_data_view(at)
 
         self.assertFalse(at.exception, f"App crashed on corrupt quota history: {at.exception}")
 
@@ -235,7 +242,7 @@ class TestDashboardAppRender(unittest.TestCase):
         mock_store.get.side_effect = mock_get
 
         at = AppTest.from_file("../dashboard.py")
-        at.run(timeout=30)
+        run_full_data_view(at)
 
         self.assertFalse(at.exception, f"App crashed on legacy execution: {at.exception}")
 
@@ -281,7 +288,7 @@ class TestDashboardAppRender(unittest.TestCase):
         mock_store.get.side_effect = mock_get
 
         at = AppTest.from_file("../dashboard.py")
-        at.run(timeout=30)
+        run_full_data_view(at)
 
         self.assertFalse(at.exception, f"App crashed with malformed record: {at.exception}")
 
@@ -323,7 +330,7 @@ class TestDashboardAppRender(unittest.TestCase):
         mock_store.get.side_effect = mock_get
 
         at = AppTest.from_file("../dashboard.py")
-        at.run(timeout=30)
+        run_full_data_view(at)
 
         self.assertFalse(at.exception, f"App crashed with healthy Claude execution: {at.exception}")
 
@@ -409,7 +416,7 @@ class TestDashboardAppRender(unittest.TestCase):
         mock_store.get.side_effect = mock_get
 
         at = AppTest.from_file("../dashboard.py")
-        at.run(timeout=30)
+        run_full_data_view(at)
 
         self.assertFalse(at.exception, f"App crashed during inspector render: {at.exception}")
 
@@ -453,7 +460,7 @@ class TestDashboardVisibleBeforeTaskRender(unittest.TestCase):
         mock_resolve.return_value = resolved
 
         at = AppTest.from_file("../dashboard.py")
-        at.run(timeout=30)
+        run_full_data_view(at)
         self.assertFalse(at.exception, f"App crashed rendering a pre-Task dispatch row: {at.exception}")
         return at
 
@@ -576,7 +583,7 @@ class TestDashboardVisibleBeforeTaskRender(unittest.TestCase):
         mock_resolve.return_value = {"task": None, "command": None}
 
         at = AppTest.from_file("../dashboard.py")
-        at.run(timeout=30)
+        run_full_data_view(at)
         self.assertFalse(at.exception, f"App crashed rendering a truncated pre-Task listing: {at.exception}")
         markdown_texts = [el.value for el in at.markdown]
         self.assertTrue(any("UNKNOWN" in m and "incomplete" in m for m in markdown_texts),
