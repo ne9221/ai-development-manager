@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import socket
+import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -221,6 +222,38 @@ def _result(status, execution_id_value, session_id=None, error_kind=None):
 def _write(store, command):
     validate("command", command)
     return store.put("commands", command["project_id"], command["command_id"], command)
+
+
+def _on_execution_running(store, running_command):
+    # AUTO_OPEN_ADM (P0 Dashboard Live Proof follow-up, 2026-08-29): every
+    # real dispatch that actually reaches "running" -- not just an explicit
+    # OPEN_EXISTING_ADM_UI command (see the dedicated branch above in
+    # process_command) -- should bring the user-visible Dashboard onto the
+    # interactive desktop, so the user never has to know a task was even
+    # dispatched to go look at it. Reuses the exact same
+    # focus_existing_adm_ui() idempotent focus-or-launch-or-noop logic, so
+    # this can never spawn a duplicate Streamlit instance or duplicate
+    # browser window regardless of how many Commands reach "running" in the
+    # same tick or across ticks. This Scheduled Task only ever runs
+    # interactively-logged-on (LogonType=Interactive), the same desktop
+    # session the user's own Dashboard shortcut launches into, so this call
+    # is always attempted -- it fails closed (a truthful error_kind,
+    # swallowed here) rather than raising only when no interactive desktop
+    # is actually available (e.g. a locked/disconnected session).
+    #
+    # Deliberately best-effort and never allowed to affect dispatch: this
+    # runs after the execution has already, genuinely reached "running"
+    # (on_running fires only once launch_task's own provider-start proof
+    # succeeds), and any failure here is only ever logged, never raised --
+    # a user who can't currently see their screen must never be the reason
+    # a real dispatch fails.
+    _write(store, running_command)
+    try:
+        result = focus_existing_adm_ui()
+        if result.get("status") != "completed":
+            print(f"AUTO_OPEN_ADM: {result.get('error_kind', 'unknown')}", file=sys.stderr)
+    except Exception as exc:
+        print(f"AUTO_OPEN_ADM: unexpected error: {exc}", file=sys.stderr)
 
 
 def _claimed(command):
@@ -561,7 +594,8 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         retry = ({"retry_count": retry_count, "retry_of_execution_id": retry_of} if retry_count else {})
         outcome = launch_task(store, service, writer_registry, claim_registry, launcher_factory(),
                               claimed["project_id"], claimed["task_id"], claimed["execution_id"], claimed["model"],
-                              on_running=lambda _execution: _write(store, running), provider=claimed["provider"],
+                              on_running=lambda _execution: _on_execution_running(store, running),
+                              provider=claimed["provider"],
                               claude_accounts=claude_accounts, account_id=explicit_account_id, provenance=origin, **retry)
         terminal = outcome["terminal"]["execution"]
         dispatch = outcome["dispatch"]

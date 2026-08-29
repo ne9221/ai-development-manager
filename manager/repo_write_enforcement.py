@@ -385,6 +385,45 @@ def _run_validation_command(working_directory, command: str, runner=subprocess.r
     }
 
 
+def capture_no_change_evidence(working_directory, branch: Optional[str], validation_command: str,
+                               validation_timeout_seconds: int = DEFAULT_VALIDATION_TIMEOUT_SECONDS,
+                               runner=subprocess.run) -> Dict[str, Any]:
+    """Real, independently-verified terminal evidence for a legitimate 'no
+    code change needed' outcome (Task.allow_no_change_success, P0 Dashboard
+    Live Proof follow-up 2026-08-29): a bounded repo-write Task whose
+    provider genuinely made zero file changes is only ever allowed to
+    terminalize completed if `validation_command` is independently re-run
+    HERE, against the unmodified worktree, and genuinely exits 0 -- never
+    on the provider's self-report alone, since an agent that did nothing at
+    all would otherwise be indistinguishable from one that verified the
+    existing code is already correct. The caller (manager.execution_runner)
+    is responsible for only reaching this function when both
+    allow_no_change_success is set AND validation_command is present --
+    this function itself has no fallback for a missing validation_command,
+    matching the fact that this path must never be taken without one.
+
+    Deliberately never commits or pushes -- there is nothing to commit --
+    and never fabricates final_commit_sha/remote_sha (both null here);
+    push_status is the distinct sentinel "not_applicable" rather than
+    "verified", so this evidence shape can never be confused with a real
+    commit-backed success (see the execution schema's own third
+    repo_write_evidence oneOf branch).
+    """
+    branch_short = None
+    if branch:
+        branch_short = branch[len("refs/heads/"):] if branch.startswith("refs/heads/") else branch
+    test_result = _run_validation_command(working_directory, validation_command, runner=runner,
+                                          timeout_seconds=validation_timeout_seconds)
+    tests_status = "failed" if test_result["timed_out"] or test_result["exit_code"] != 0 else "passed"
+    return {
+        "files_changed": [], "commits": [], "final_commit_sha": None,
+        "branch": branch_short, "worktree_path": str(working_directory),
+        "push_status": "not_applicable", "remote_sha": None,
+        "tests": [test_result],
+        "tests_status": tests_status,
+    }
+
+
 def capture_repo_write_evidence(working_directory, baseline_head: str, branch: str, files_changed: Sequence[str],
                                 validation_command: Optional[str] = None,
                                 validation_timeout_seconds: int = DEFAULT_VALIDATION_TIMEOUT_SECONDS,

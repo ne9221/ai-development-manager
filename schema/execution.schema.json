@@ -169,9 +169,40 @@
             },
             "tests_status": {"enum": ["passed", "failed", "not_required"]}
           }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["files_changed", "commits", "final_commit_sha", "branch", "worktree_path", "push_status", "remote_sha", "tests", "tests_status"],
+          "properties": {
+            "files_changed": {"const": []},
+            "commits": {"const": []},
+            "final_commit_sha": {"type": "null"},
+            "branch": {"type": ["string", "null"]},
+            "worktree_path": {"type": "string", "minLength": 1},
+            "push_status": {"const": "not_applicable"},
+            "remote_sha": {"type": "null"},
+            "tests": {
+              "type": "array", "minItems": 1,
+              "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["command", "exit_code", "output_summary", "started_at", "completed_at"],
+                "properties": {
+                  "command": {"type": "string", "minLength": 1},
+                  "executable": {"type": ["string", "null"], "minLength": 1},
+                  "exit_code": {"type": ["integer", "null"]},
+                  "output_summary": {"type": "string"},
+                  "started_at": {"type": "string", "format": "date-time"},
+                  "completed_at": {"type": "string", "format": "date-time"},
+                  "timed_out": {"type": "boolean"}
+                }
+              }
+            },
+            "tests_status": {"enum": ["passed", "failed"]}
+          },
+          "description": "A genuine 'no code change needed' outcome (Task.allow_no_change_success): no commit/push ever happened, so final_commit_sha/remote_sha are null rather than fabricated -- push_status is the distinct sentinel 'not_applicable', never 'verified'. tests is non-empty and required here (unlike the commit-backed branch above, where an undeclared validation_command legitimately means tests_status='not_required'/tests=[]) because a validation_command is mandatory for this path: without an independently-run, really-passing check, an agent that made zero changes because it verified correctness would be indistinguishable from one that did nothing at all."
         }
       ],
-      "description": "Real, independently git-verified repo-write terminal success evidence (Global Hands-off Execution Layer, Slice D2); only ever set on a completed bounded repo-write execution whose push was proven equal to the remote by direct query, never fabricated. `tests`/`tests_status` are likewise never a provider's self-report -- when the Task declares a validation_command, ADM runs it itself in the isolated worktree and records the real command, exit_code, bounded output, and timestamps; `tests_status` is \"not_required\" only when the Task declared no validation_command at all, \"passed\"/\"failed\" from the real exit code (a timeout counts as failed) otherwise -- never inferred from provider narration."
+      "description": "Real, independently git-verified repo-write terminal success evidence (Global Hands-off Execution Layer, Slice D2); only ever set on a completed bounded repo-write execution whose push was proven equal to the remote by direct query, never fabricated. `tests`/`tests_status` are likewise never a provider's self-report -- when the Task declares a validation_command, ADM runs it itself in the isolated worktree and records the real command, exit_code, bounded output, and timestamps; `tests_status` is \"not_required\" only when the Task declared no validation_command at all, \"passed\"/\"failed\" from the real exit code (a timeout counts as failed) otherwise -- never inferred from provider narration. A third shape (push_status: \"not_applicable\") records a genuine no-change-needed outcome instead of a commit -- see Task.allow_no_change_success."
     },
     "notes": {"type": "array", "items": {"type": "string"}},
     "task_snapshot": {"type": "object"}

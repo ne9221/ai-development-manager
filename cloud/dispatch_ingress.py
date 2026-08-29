@@ -110,13 +110,18 @@ MAX_GOAL_LENGTH = 4000
 # directly (ALLOWED_REPO_WRITE_FIELDS makes it impossible to smuggle any
 # other field in).
 REQUIRED_REPO_WRITE_FIELDS = {"allowed_paths", "baseline_head", "repo"}
-# validation_command is the one optional repo_write field: a caller-declared,
-# project-agnostic shell command (never hardcoded to pytest/npm/etc.) that
+# validation_command and allow_no_change_success are the two optional
+# repo_write fields. validation_command is a caller-declared, project-
+# agnostic shell command (never hardcoded to pytest/npm/etc.) that
 # manager.repo_write_enforcement.capture_repo_write_evidence() independently
 # runs itself in the isolated worktree once the commit lands -- see that
 # module's docstring for why nothing here ever trusts a provider's own
-# self-report of having run tests.
-ALLOWED_REPO_WRITE_FIELDS = REQUIRED_REPO_WRITE_FIELDS | {"validation_command"}
+# self-report of having run tests. allow_no_change_success (P0 Dashboard
+# Live Proof follow-up, 2026-08-29) opts an inspection/verification Task
+# into a legitimate "no code change needed" completion -- see
+# manager.execution_runner's own gate, which additionally requires
+# validation_command to be set before this can ever take effect.
+ALLOWED_REPO_WRITE_FIELDS = REQUIRED_REPO_WRITE_FIELDS | {"validation_command", "allow_no_change_success"}
 MAX_ALLOWED_PATH_ENTRIES = 100
 MAX_ALLOWED_PATH_LENGTH = 300
 MAX_VALIDATION_COMMAND_LENGTH = 500
@@ -236,6 +241,12 @@ def _validate_repo_write_request(value):
                 "invalid_validation_command",
                 f"repo_write.validation_command must be a non-empty string of at most {MAX_VALIDATION_COMMAND_LENGTH} characters")
         cleaned["validation_command"] = validation_command.strip()
+    if "allow_no_change_success" in value:
+        allow_no_change_success = value.get("allow_no_change_success")
+        if not isinstance(allow_no_change_success, bool):
+            raise DispatchIngressError(
+                "invalid_allow_no_change_success", "repo_write.allow_no_change_success must be a boolean")
+        cleaned["allow_no_change_success"] = allow_no_change_success
     return cleaned
 
 
@@ -447,7 +458,8 @@ def _repo_write_replay_matches(task, requested_repo_write):
     return (sorted(task.get("allowed_paths") or []) == sorted(requested_repo_write["allowed_paths"])
             and task.get("baseline_head") == requested_repo_write["baseline_head"]
             and (task.get("source_context") or {}).get("repo") == requested_repo_write["repo"]
-            and task.get("validation_command") == requested_repo_write.get("validation_command"))
+            and task.get("validation_command") == requested_repo_write.get("validation_command")
+            and bool(task.get("allow_no_change_success")) == bool(requested_repo_write.get("allow_no_change_success")))
 
 
 def _resolve_existing_claim(store, project_id, request_id, claim, clean=None):
@@ -796,7 +808,8 @@ def handle_dispatch(store, service, lock_registry_factory, payload, request_crea
             update_task(store, project_id, task_id, clear=("working_directory",), priority=clean["priority"],
                         read_only=False, execution_policies=sorted(REQUIRED_REPO_WRITE_TASK_POLICIES),
                         allowed_paths=clean["repo_write"]["allowed_paths"], baseline_head=clean["repo_write"]["baseline_head"],
-                        validation_command=clean["repo_write"].get("validation_command"))
+                        validation_command=clean["repo_write"].get("validation_command"),
+                        allow_no_change_success=clean["repo_write"].get("allow_no_change_success"))
         else:
             update_task(store, project_id, task_id, priority=clean["priority"],
                         read_only=True, execution_policies=sorted(REQUIRED_TASK_POLICIES))

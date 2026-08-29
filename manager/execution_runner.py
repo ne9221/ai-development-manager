@@ -24,7 +24,7 @@ from manager.gcs_lock_registry import GCSLockRegistry
 from manager.project_registry import get_global_registry, resolve_authoritative_working_directory_with_project
 from manager.quota_forecast import DEFAULT_MAX_AGE_MINUTES
 from manager.quota_reader import read_drive_status
-from manager.repo_write_enforcement import capture_repo_write_evidence, commit_and_push_repo_write_changes, enforce_allowed_paths, is_bounded_repo_write_snapshot
+from manager.repo_write_enforcement import capture_no_change_evidence, capture_repo_write_evidence, commit_and_push_repo_write_changes, enforce_allowed_paths, is_bounded_repo_write_snapshot
 from manager.session_identity import manager_session_key
 from manager.task_claims import task_claim_registry
 from manager.tasks import DriveRecords, TaskError, update_task, validate
@@ -598,30 +598,59 @@ def run_execution(store, service, writer_registry, claim_registry, launcher,
         try:
             files_changed = enforce_allowed_paths(snapshot["working_directory"], snapshot["baseline_head"], snapshot["allowed_paths"])
             if not files_changed:
-                raise TaskError(f"{provider} repo-write execution produced no file changes to commit")
-            commit_and_push_repo_write_changes(
-                snapshot["working_directory"], snapshot["branch"], files_changed,
-                f"{provider} repo_write: {task_id}/{execution_id}",
-            )
-            evidence = capture_repo_write_evidence(
-                snapshot["working_directory"], snapshot["baseline_head"], snapshot["branch"], files_changed,
-                validation_command=snapshot.get("validation_command"),
-            )
-            # Evidence (including a failed validation_command's real
-            # command/exit_code/output) is always persisted here, before any
-            # status downgrade below -- a required validation that failed is
-            # never silently discarded, and it is never conflated with the
-            # commit/push/scope failures above (those raise TaskError and
-            # skip evidence recording entirely, since there is no real
-            # evidence to record when the commit/push itself never
-            # succeeded).
-            record_repo_write_evidence(store, project_id, execution_id, evidence)
-            if evidence["tests_status"] == "failed":
-                status = "failed"
-                failed_test = evidence["tests"][-1] if evidence["tests"] else {}
-                summary = (f"{provider} required validation failed: "
-                          f"{failed_test.get('command')!r} exited {failed_test.get('exit_code')}"
-                          + (" (timed out)" if failed_test.get("timed_out") else ""))
+                # No-change success (P0 Dashboard Live Proof follow-up,
+                # 2026-08-29): an inspection/verification Task may
+                # legitimately conclude nothing needs to change. That is
+                # only ever trusted here -- never on the provider's mere
+                # "completed" self-report -- when the Task explicitly opted
+                # in (allow_no_change_success) AND declared a
+                # validation_command for capture_no_change_evidence to
+                # independently re-run against the unmodified worktree; a
+                # Task missing either one falls straight through to the
+                # ordinary zero-diff failure below, unchanged from before
+                # this fix. A real defect the validation_command still
+                # catches downgrades status to failed exactly like the
+                # commit-backed validation-failure path already does.
+                if snapshot.get("allow_no_change_success") and snapshot.get("validation_command"):
+                    evidence = capture_no_change_evidence(
+                        snapshot["working_directory"], snapshot.get("branch"),
+                        validation_command=snapshot["validation_command"],
+                    )
+                    record_repo_write_evidence(store, project_id, execution_id, evidence)
+                    if evidence["tests_status"] == "failed":
+                        status = "failed"
+                        failed_test = evidence["tests"][-1]
+                        summary = (f"{provider} verification found an unresolved issue: "
+                                  f"{failed_test.get('command')!r} exited {failed_test.get('exit_code')}"
+                                  + (" (timed out)" if failed_test.get("timed_out") else ""))
+                    else:
+                        summary = f"{provider} verified no code change was needed (validation passed)"
+                else:
+                    raise TaskError(f"{provider} repo-write execution produced no file changes to commit")
+            else:
+                commit_and_push_repo_write_changes(
+                    snapshot["working_directory"], snapshot["branch"], files_changed,
+                    f"{provider} repo_write: {task_id}/{execution_id}",
+                )
+                evidence = capture_repo_write_evidence(
+                    snapshot["working_directory"], snapshot["baseline_head"], snapshot["branch"], files_changed,
+                    validation_command=snapshot.get("validation_command"),
+                )
+                # Evidence (including a failed validation_command's real
+                # command/exit_code/output) is always persisted here, before
+                # any status downgrade below -- a required validation that
+                # failed is never silently discarded, and it is never
+                # conflated with the commit/push/scope failures above (those
+                # raise TaskError and skip evidence recording entirely,
+                # since there is no real evidence to record when the
+                # commit/push itself never succeeded).
+                record_repo_write_evidence(store, project_id, execution_id, evidence)
+                if evidence["tests_status"] == "failed":
+                    status = "failed"
+                    failed_test = evidence["tests"][-1] if evidence["tests"] else {}
+                    summary = (f"{provider} required validation failed: "
+                              f"{failed_test.get('command')!r} exited {failed_test.get('exit_code')}"
+                              + (" (timed out)" if failed_test.get("timed_out") else ""))
         except TaskError as exc:
             status = "failed"
             summary = f"{provider} turn rejected: {exc}"

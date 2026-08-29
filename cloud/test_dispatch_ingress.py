@@ -1277,6 +1277,25 @@ class RepoWriteAdmissionIngressTests(unittest.TestCase):
             self.call(bad)
         self.assertEqual("malformed_repo_write", ctx.exception.code)
 
+    def test_allow_no_change_success_is_stamped_onto_the_task(self):
+        result = self.call(self.write_payload(
+            repo_write={**self.write_payload()["repo_write"], "allow_no_change_success": True,
+                       "validation_command": "pytest -q"}))
+        task = self.store.get("tasks", "p1", result["task_id"])
+        validate("task", task)
+        self.assertIs(True, task["allow_no_change_success"])
+
+    def test_allow_no_change_success_defaults_absent_when_not_requested(self):
+        result = self.call()
+        task = self.store.get("tasks", "p1", result["task_id"])
+        self.assertNotIn("allow_no_change_success", task)
+
+    def test_allow_no_change_success_must_be_a_boolean(self):
+        with self.assertRaises(DispatchIngressError) as ctx:
+            self.call(self.write_payload(
+                repo_write={**self.write_payload()["repo_write"], "allow_no_change_success": "yes"}))
+        self.assertEqual("invalid_allow_no_change_success", ctx.exception.code)
+
     def test_invalid_baseline_head_rejected(self):
         for bad_head in ("abc123", "g" * 40, "A" * 40, "a" * 39, ""):
             with self.subTest(bad_head=bad_head):

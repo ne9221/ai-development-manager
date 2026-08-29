@@ -172,6 +172,7 @@ def task_snapshot(task):
         "needs_research", "needs_browser", "parallelizable", "read_only", "scope",
         "constraints", "acceptance_criteria", "working_directory", "branch",
         "baseline_head", "allowed_paths", "execution_policies", "validation_command",
+        "allow_no_change_success",
     )
     return {key: task.get(key) for key in keys if key in task}
 

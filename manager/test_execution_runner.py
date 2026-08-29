@@ -1547,9 +1547,9 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         self._lock_home_patch.start()
         self.addCleanup(self._lock_home_patch.stop)
 
-    def _repo_write_task(self, validation_command=None):
+    def _repo_write_task(self, validation_command=None, allow_no_change_success=None, task_type="implementation"):
         task = {
-            "task_id": "t1", "project_id": "p1", "title": "Bounded write task", "task_type": "implementation",
+            "task_id": "t1", "project_id": "p1", "title": "Bounded write task", "task_type": task_type,
             "complexity": "medium", "expected_minutes": 20, "needs_repo_edit": True,
             "needs_research": False, "needs_browser": False, "parallelizable": False,
             "read_only": False, "scope": ["manager/foo.py"], "constraints": [],
@@ -1560,16 +1560,21 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         }
         if validation_command is not None:
             task["validation_command"] = validation_command
+        if allow_no_change_success is not None:
+            task["allow_no_change_success"] = allow_no_change_success
         return task
 
-    def _store(self, validation_command=None):
+    def _store(self, validation_command=None, allow_no_change_success=None, task_type="implementation"):
         store = MemoryStore()
         create_project(store, {
             "project_id": "p1", "name": "Project", "repo": REPO, "default_branch": "main",
             "runtime_ssot": "Drive", "project_rules": [], "active_tasks": ["t1"],
             "current_phase": "Phase 3C", "important_constraints": [],
         })
-        create_task(store, self._repo_write_task(validation_command=validation_command), assign=False)
+        create_task(store, self._repo_write_task(
+            validation_command=validation_command, allow_no_change_success=allow_no_change_success,
+            task_type=task_type,
+        ), assign=False)
         return store
 
     def _launch(self, store, launcher):
@@ -1773,6 +1778,70 @@ class RealGitAllowedPathsEnforcementIntegrationTests(unittest.TestCase):
         self.assertEqual([], handoff["files_changed"])
         self.assertEqual([], handoff["commits"])
         self.assertIsNone(handoff["push_status"])
+
+    def test_no_change_success_completes_when_validation_genuinely_passes(self):
+        """(1/5) A verification/inspection Task that opts in via
+        allow_no_change_success=true, declares a validation_command, and
+        makes zero file changes: completion is allowed ONLY because the
+        real validation_command was independently re-run here and genuinely
+        exited 0 -- never on the provider's bare 'completed' self-report.
+        Also proves no fake commit SHA is ever fabricated (2/5) and that
+        Task/Execution/Handoff terminal state stays consistent (3/5)."""
+        command = f'{sys.executable} -c "print(\'still correct\'); import sys; sys.exit(0)"'
+        store = self._store(validation_command=command, allow_no_change_success=True, task_type="verification")
+        result = self._launch(store, Launcher())
+
+        self.assertEqual("completed", result["terminal"]["execution"]["status"])
+        self.assertEqual("completed", store.get("tasks", "p1", "t1")["status"])
+        evidence = result["terminal"]["execution"]["repo_write_evidence"]
+        self.assertEqual([], evidence["files_changed"])
+        self.assertEqual([], evidence["commits"])
+        self.assertIsNone(evidence["final_commit_sha"])
+        self.assertIsNone(evidence["remote_sha"])
+        self.assertEqual("not_applicable", evidence["push_status"])
+        self.assertEqual("passed", evidence["tests_status"])
+        self.assertEqual(command, evidence["tests"][0]["command"])
+        self.assertIn("still correct", evidence["tests"][0]["output_summary"])
+        # Real git state never moved and nothing was ever pushed.
+        self.assertEqual(self.baseline_head, _git(self.worktree, "rev-parse", "HEAD"))
+        ls_remote = subprocess.run(["git", "ls-remote", "origin", "refs/heads/main"],
+                                   cwd=str(self.worktree), capture_output=True, text=True)
+        self.assertEqual("", ls_remote.stdout.strip())
+        handoff = store.get("handoffs", "p1", "t1-completed-exec-a-0")
+        self.assertEqual("completed", handoff["current_state"])
+        self.assertEqual([], handoff["files_changed"])
+        self.assertEqual("passed", handoff["tests_status"])
+
+    def test_no_change_success_still_fails_when_validation_finds_a_real_defect(self):
+        """(4/5) A verification Task must never fake completion when its own
+        independently-run validation_command proves something is genuinely
+        still broken -- opting into allow_no_change_success is not a
+        blanket pass."""
+        command = f'{sys.executable} -c "import sys; print(\'still broken\'); sys.exit(1)"'
+        store = self._store(validation_command=command, allow_no_change_success=True, task_type="verification")
+        result = self._launch(store, Launcher())
+
+        self.assertEqual("failed", result["terminal"]["execution"]["status"])
+        self.assertNotEqual("completed", store.get("tasks", "p1", "t1")["status"])
+        evidence = result["terminal"]["execution"]["repo_write_evidence"]
+        self.assertEqual("failed", evidence["tests_status"])
+        self.assertIn("still broken", evidence["tests"][0]["output_summary"])
+        self.assertIsNone(evidence["final_commit_sha"])
+        self.assertIn("unresolved issue", result["terminal"]["execution"]["notes"][-1])
+
+    def test_no_change_success_requires_a_validation_command_not_agent_say_so(self):
+        """allow_no_change_success alone, with no validation_command
+        declared, must never be trusted on its own -- an agent that
+        genuinely verified correctness would otherwise be indistinguishable
+        from one that did nothing at all, so this falls straight through to
+        the ordinary zero-diff failure, unchanged from before this fix."""
+        store = self._store(allow_no_change_success=True, task_type="verification")
+        result = self._launch(store, Launcher())
+
+        self.assertEqual("failed", result["terminal"]["execution"]["status"])
+        self.assertNotEqual("completed", store.get("tasks", "p1", "t1")["status"])
+        self.assertIsNone(result["terminal"]["execution"].get("repo_write_evidence"))
+        self.assertIn("produced no file changes to commit", result["terminal"]["execution"]["notes"][-1])
 
     def test_host_push_failure_fails_closed_when_remote_is_unreachable(self):
         """Bootstrap architecture: ADM host owns the git push, so a push

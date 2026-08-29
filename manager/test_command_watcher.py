@@ -60,6 +60,27 @@ class Store:
         return max(items, key=lambda item: item["created_at"])
 
 
+# _on_execution_running() (AUTO_OPEN_ADM) now calls the REAL
+# manager.open_existing_adm_ui.focus_existing_adm_ui() -- real Win32
+# EnumWindows/SetForegroundWindow/subprocess calls -- every time a test's
+# fake launch_task() invokes its on_running callback, which is most tests
+# in this module. None of those tests are about AUTO_OPEN_ADM itself, so a
+# module-wide default patch keeps them from ever touching this machine's
+# real interactive desktop; the two tests that DO exercise AUTO_OPEN_ADM
+# apply their own local `patch(...)` on top, which safely shadows this one
+# for the duration of their `with` block only.
+_focus_existing_adm_ui_patch = patch("manager.command_watcher.focus_existing_adm_ui",
+                                     Mock(return_value={"status": "completed", "window_title": "ADM Unified Operations Dashboard"}))
+
+
+def setUpModule():
+    _focus_existing_adm_ui_patch.start()
+
+
+def tearDownModule():
+    _focus_existing_adm_ui_patch.stop()
+
+
 def command(**changes):
     value = {
         "command_id": "cmd-1", "project_id": "p1", "task_id": "t1", "provider": "codex",
@@ -467,6 +488,36 @@ class CommandWatcherTests(unittest.TestCase):
             result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
         runner.assert_called_once()
         self.assertEqual("completed", result["status"])
+
+    def test_normal_dispatch_reaching_running_auto_opens_the_dashboard(self):
+        """AUTO_OPEN_ADM: a completely ordinary dispatch (no
+        OPEN_EXISTING_ADM_UI action at all) that genuinely reaches
+        "running" must, as a side effect, call the same user-visible
+        focus-or-launch-or-noop path -- so the Dashboard shows up on the
+        user's desktop for ANY real dispatch, not only one that explicitly
+        asked to open it."""
+        focus = Mock(return_value={"status": "completed", "window_title": "ADM Unified Operations Dashboard"})
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])
+        with patch("manager.command_watcher.launch_task", runner), patch("manager.command_watcher.focus_existing_adm_ui", focus):
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
+        focus.assert_called_once_with()
+        self.assertEqual("completed", result["status"])
+
+    def test_auto_open_dashboard_failure_never_blocks_or_fails_dispatch(self):
+        """A real dispatch's success must never depend on whether the
+        interactive desktop happened to be visible/available -- a failed or
+        raising focus_existing_adm_ui() is only ever logged (see
+        _on_execution_running), never allowed to change the Command/Task's
+        own terminal outcome."""
+        for focus in (
+            Mock(return_value={"status": "failed", "error_kind": "no_interactive_desktop"}),
+            Mock(side_effect=RuntimeError("unexpected desktop error")),
+        ):
+            with self.subTest(focus=focus):
+                runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])
+                with patch("manager.command_watcher.launch_task", runner), patch("manager.command_watcher.focus_existing_adm_ui", focus):
+                    result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
+                self.assertEqual("completed", result["status"])
 
     def test_open_existing_adm_ui_is_governed_and_does_not_launch_codex(self):
         focus = Mock(return_value={"status": "completed", "window_title": "ADM Unified Operations Dashboard"})
