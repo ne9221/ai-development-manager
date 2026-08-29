@@ -177,6 +177,60 @@ def collect_round(round_number: int, request_id: str, receipt):
                 execution = store.get("executions", PROJECT_ID, command["execution_id"])
             except Exception as exc:  # transient read; do not invent state
                 last_error = type(exc).__name__
+        # A prelaunch failure can truthfully terminalize Command/Task while
+        # rolling a reserved Execution back to cancelled (or without ever
+        # reserving one).  The acceptance harness must record that terminal
+        # lifecycle outcome instead of waiting 30 minutes for an Execution
+        # that governance correctly never allowed to become running.
+        if execution is None and command.get("status") in {"completed", "failed", "cancelled"}:
+            evidence_service = build_service(timeout=EVIDENCE_REQUEST_TIMEOUT_SECONDS)
+            evidence_store = BoundedEvidenceStore(DriveRecords(evidence_service))
+            evidence_registry = dispatch_request_registry(BUCKET, PROJECT_ID, request_id)
+            evidence = collect_evidence(
+                evidence_store,
+                PROJECT_ID,
+                request_id,
+                dispatch_request_registry=evidence_registry,
+                acceptance_run_started_at=RUN_STARTED_AT,
+            )
+            evidence["provider_output"] = {
+                "observed": False,
+                "matched_expected": False,
+                "observed_at": command.get("completed_at"),
+                "verification_method": "provider_result_summary",
+            }
+            evidence["execution"] = {
+                "execution_id": command.get("execution_id"),
+                "status": None,
+                "reserved_at": None,
+                "running_at": None,
+                "terminal_at": None,
+                "provider_evidence": {"present": False, "pid": None, "host": None},
+            }
+            evidence["session"] = {
+                "session_id": None,
+                "provider_session_id": None,
+                "provider": command.get("provider"),
+                "task_id": task_id,
+                "execution_id": command.get("execution_id"),
+            }
+            state, reason = _terminal_state(task, command, None)
+            evidence["terminal"] = {
+                "state": state,
+                "command_status": command.get("status"),
+                "execution_status": None,
+                "task_claim_release": None,
+                "writer_release": None,
+            }
+            evidence["dashboard_truth"] = {
+                "observed": True,
+                "backend_status": str(state).upper(),
+                "dashboard_status": str(state).upper(),
+                "matches": False,
+                "observed_at": utc_now(),
+                "state_reason": reason,
+            }
+            return evidence
         if execution and execution.get("status") in {"completed", "failed", "cancelled"}:
             started = execution.get("started_at")
             terminal = execution.get("completed_at") or execution.get("finished_at")
