@@ -179,11 +179,11 @@ def read_provenance_evidence_file():
 
 
 @st.cache_data(ttl=15)
-def load_infra_health():
+def load_infra_health(active_executions=None):
     watcher_vm = parse_scheduled_task_health(WATCHER_TASK_NAME, query_scheduled_task_raw(WATCHER_TASK_NAME))
     supervisor_vm = parse_scheduled_task_health(SUPERVISOR_TASK_NAME, query_scheduled_task_raw(SUPERVISOR_TASK_NAME))
     listening, session = query_session_center_raw()
-    session_center_vm = build_session_center_health(listening, session)
+    session_center_vm = build_session_center_health(listening, session, active_executions)
     return watcher_vm, supervisor_vm, session_center_vm
 
 # Page Configuration
@@ -537,6 +537,9 @@ def _refresh_dashboard_automatically():
     app, which disarms and re-arms it, preventing an immediate rerun loop.
     """
     if st.session_state.get(_AUTO_REFRESH_ARMED_KEY):
+        load_all_data.clear()
+        load_infra_health.clear()
+        load_pretask_dispatch_requests.clear()
         st.rerun()
     st.session_state[_AUTO_REFRESH_ARMED_KEY] = True
 
@@ -796,8 +799,17 @@ else:
 
 st.markdown("---")
 
-# Active Executions mappings
-active_executions = [e for e in all_executions if e.get("status") not in {"completed", "failed", "interrupted", "cancelled"}]
+# Active means provider execution is proven running now. A reserved, stale, or
+# session-less Execution remains visible in lifecycle/attention views but must
+# not inflate Running Tasks or Active Sessions.
+execution_candidates = [
+    e for e in all_executions
+    if e.get("status") not in {"completed", "failed", "interrupted", "cancelled"}
+]
+active_executions = [
+    e for e in execution_candidates
+    if determine_execution_state(e, now) == "running" and not is_execution_stale(e, now)
+]
 active_executions_dict = {(e.get("project_id"), e.get("task_id")): e for e in active_executions}
 
 # Global Metrics
@@ -846,7 +858,11 @@ health_status_badge = {
     "Unknown": "badge-unknown",
 }
 try:
-    watcher_health, supervisor_health, session_center_health = load_infra_health()
+    execution_read_status = read_status.get(
+        ("executions", DASHBOARD_PROJECT_ID), (READ_STATUS_UNKNOWN, None)
+    )[0]
+    session_truth = active_executions if execution_read_status == READ_STATUS_OK else None
+    watcher_health, supervisor_health, session_center_health = load_infra_health(session_truth)
     h1, h2, h3 = st.columns(3)
     for col, vm in zip((h1, h2, h3), (watcher_health, supervisor_health, session_center_health)):
         with col:
@@ -1000,6 +1016,7 @@ else:
                     w_used_text = f"{card.weekly_used_pct:.1f}%" if card.weekly_used_pct is not None else "—"
                     st.write(f"• **Remaining**: **{card.formatted_weekly_remaining}** (Used: {w_used_text})")
                     st.write(f"• **Reset**: `{card.formatted_weekly_countdown}`")
+                    st.caption(f"Weekly reset time: `{card.weekly_resets_at or 'UNKNOWN'}`")
                     if card.weekly_action_recommendation in ("conserve", "hold"):
                         st.caption(f"⚠️ Weekly status: {card.weekly_action_recommendation.upper()}")
 
@@ -1014,6 +1031,7 @@ else:
                 # Metadata / Telemetry
                 st.caption(f"Source: `{card.source}` ({card.source_type}) | Confidence: `{card.confidence}`")
                 st.caption(f"Last updated: {card.last_updated or 'never'}")
+                st.caption(f"Reset time: `{card.five_hour_resets_at or 'UNKNOWN'}`")
 
                 if card.warning_reason:
                     st.caption(f"ℹ️ *{card.warning_reason}*")
@@ -1028,11 +1046,11 @@ st.markdown("---")
 # Section C: Running & Active Executions Table
 # =====================================================================
 st.header("🔄 Running & Active Executions")
-if not active_executions:
+if not execution_candidates:
     st.info("No active AI executions running currently.")
 else:
     exec_rows = []
-    for exe in active_executions:
+    for exe in execution_candidates:
         p_id = exe.get("project_id", "—")
         t_id = exe.get("task_id", "—")
         provider = exe.get("provider", "—")
@@ -1159,7 +1177,7 @@ else:
 
         # Find the task, and the exact task-scoped command/execution/handoff.
         # Deliberately NOT active_executions_dict / handoffs_dict here:
-        # active_executions_dict only covers non-terminal executions (a
+        # active_executions_dict only covers executions proven running (a
         # terminal-but-still-relevant execution silently reads as "no active
         # execution"), and handoffs_dict is always empty (load_all_data()
         # intentionally defers historical handoff hydration from first

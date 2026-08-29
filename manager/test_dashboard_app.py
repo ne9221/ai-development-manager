@@ -95,6 +95,7 @@ class TestDashboardAppRender(unittest.TestCase):
     def test_app_render_zero_percent_quota(self, mock_build_service, mock_read_drive_status, mock_drive_records):
         # Setup quota with remaining_percent=0.0
         now = datetime.now(timezone.utc)
+        reset_at = (now + timedelta(hours=2)).isoformat()
         mock_read_drive_status.return_value = {
             "providers": [
                 {
@@ -107,7 +108,7 @@ class TestDashboardAppRender(unittest.TestCase):
                     "confidence": "official",
                     "last_updated": now.isoformat().replace("+00:00", "Z"),
                     "windows": [
-                        {"name": "primary", "remaining_percent": 0.0, "used_percent": 100.0, "resets_at": (now + timedelta(hours=2)).isoformat()}
+                        {"name": "primary", "remaining_percent": 0.0, "used_percent": 100.0, "resets_at": reset_at}
                     ]
                 }
             ]
@@ -122,6 +123,7 @@ class TestDashboardAppRender(unittest.TestCase):
         # Progress bar should be drawn for 0% (value=0.0)
         self.assertEqual(len(at.get("progress")), 1)
         self.assertEqual(at.get("progress")[0].value, 0.0)
+        self.assertTrue(any(reset_at in str(el.value) for el in at.caption))
 
     @patch("manager.tasks.DriveRecords")
     @patch("manager.quota_reader.read_drive_status")
