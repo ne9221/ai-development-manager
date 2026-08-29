@@ -918,6 +918,20 @@ st.markdown("---")
 # =====================================================================
 st.header("今日派工建議")
 
+
+def _localize_quota_value(value):
+    """Translate display-only quota labels without changing raw truth values."""
+    text = str(value)
+    for source, label in (
+        ("Unknown / Stale", "未知／已過期"),
+        ("Available via credits", "可透過額外額度使用"),
+        ("Not available", "不可用"),
+        ("Unavailable", "不可用"),
+        ("Available", "可用"),
+    ):
+        text = text.replace(source, label)
+    return text.replace("balance:", "餘額：")
+
 action_badge_class = {
     "consume": "badge-action-consume",
     "normal": "badge-action-normal",
@@ -925,7 +939,12 @@ action_badge_class = {
     "hold": "badge-action-hold"
 }.get(daily_brief_vm.recommended_action, "badge-unknown")
 
-action_label = daily_brief_vm.recommended_action.upper()
+action_label = {
+    "consume": "立即消耗",
+    "normal": "正常使用",
+    "conserve": "節省使用",
+    "hold": "暫緩派工",
+}.get(daily_brief_vm.recommended_action, "未知")
 
 recommended_card = next(
     (
@@ -937,11 +956,12 @@ recommended_card = next(
 
 truth_line_html = ""
 if recommended_card is not None:
+    recommendation_availability = _localize_quota_value(recommended_card.formatted_effective_availability)
     truth_line_html = f"""
     <div style="font-size: 0.85rem; color: #8b949e; margin-bottom: 10px;">
         主要配額：<b>{recommended_card.formatted_five_hour_remaining}</b> &nbsp;|&nbsp;
         額外額度：<b>{recommended_card.formatted_extra_credits}</b> &nbsp;|&nbsp;
-        實際可用：<b>{recommended_card.formatted_effective_availability}</b>
+        實際可用：<b>{recommendation_availability}</b>
     </div>
     """
 
@@ -1066,8 +1086,8 @@ else:
                 # so "primary quota exhausted" is never displayed as "unavailable" when
                 # usable extra credits exist.
                 if card.extra_credits_available is not None:
-                    st.write(f"• **額外額度**：`{card.formatted_extra_credits}`")
-                st.write(f"• **實際可用性**：`{card.formatted_effective_availability}`")
+                    st.write(f"• **額外額度**：`{_localize_quota_value(card.formatted_extra_credits)}`")
+                st.write(f"• **實際可用性**：`{_localize_quota_value(card.formatted_effective_availability)}`")
 
                 # Metadata / Telemetry
                 st.caption(f"來源：`{card.source}`（{card.source_type}）｜可信度：`{card.confidence}`")
