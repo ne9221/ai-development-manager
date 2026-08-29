@@ -685,6 +685,44 @@ class WatcherSessionCenterHealthTests(unittest.TestCase):
         vm = build_session_center_health(listening=True, session=None)
         self.assertEqual("Online", vm.status_label)
 
+    def test_session_center_ignores_unmatched_stale_correlation_result(self):
+        vm = build_session_center_health(
+            listening=True,
+            session={
+                "provider": "claude",
+                "current_state": "correlation_failed",
+                "execution_id": "old-execution",
+            },
+            active_executions=[{
+                "execution_id": "current-execution",
+                "provider": "codex",
+                "status": "running",
+                "provider_session_id": "session-1",
+            }],
+        )
+        self.assertEqual("Online", vm.status_label)
+        self.assertNotIn("correlation_failed", vm.detail)
+        self.assertIn("stale/unmatched", vm.detail)
+
+    def test_session_center_reports_exact_matching_canonical_session(self):
+        vm = build_session_center_health(
+            listening=True,
+            session={
+                "provider": "codex",
+                "current_state": "running",
+                "execution_id": "execution-1",
+                "provider_session_id": "session-1",
+            },
+            active_executions=[{
+                "execution_id": "execution-1",
+                "provider": "codex",
+                "status": "running",
+                "provider_session_id": "session-1",
+            }],
+        )
+        self.assertIn("provider=codex", vm.detail)
+        self.assertIn("session=session-1", vm.detail)
+
 
 class VisibleDispatchTruthGateTests(unittest.TestCase):
     """Task/Provider/Account/Quota truth for the Dashboard's Visible

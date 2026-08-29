@@ -63,8 +63,17 @@ def parse_scheduled_task_health(task_name: str, raw_schtasks_output: str | None)
     return ServiceHealthViewModel(name=task_name, found=True, detail=detail, status_label=status_label)
 
 
-def build_session_center_health(listening: bool, session: dict | None) -> ServiceHealthViewModel:
-    """Build a health viewmodel from a Session Center /health + /api/session probe result."""
+def build_session_center_health(
+    listening: bool,
+    session: dict | None,
+    active_executions: Optional[Sequence[Dict[str, Any]]] = None,
+) -> ServiceHealthViewModel:
+    """Build Session Center health, gated by canonical active Executions.
+
+    ``/api/session`` can retain an old correlation result after its Execution
+    has ended.  When canonical Execution truth is available, only surface a
+    session payload that matches an active execution by execution/session ID.
+    """
     if not listening:
         return ServiceHealthViewModel(
             name="Session Center (HTTP :8765)",
@@ -72,7 +81,28 @@ def build_session_center_health(listening: bool, session: dict | None) -> Servic
             detail="not listening -- normal when no AI execution is currently active",
             status_label="Offline",
         )
-    if session:
+    if session and active_executions is not None:
+        execution_id = session.get("execution_id")
+        provider_session_id = session.get("provider_session_id")
+        matched = next((
+            execution for execution in active_executions
+            if (
+                execution_id
+                and execution.get("execution_id") == execution_id
+            ) or (
+                provider_session_id
+                and execution.get("provider_session_id") == provider_session_id
+            )
+        ), None)
+        if matched is None:
+            detail = "listening; stale/unmatched session payload ignored (no matching active canonical Execution)"
+        else:
+            detail = (
+                f"provider={matched.get('provider') or session.get('provider', '—')}, "
+                f"state={session.get('current_state') or matched.get('status', '—')}, "
+                f"session={matched.get('provider_session_id') or provider_session_id or '—'}"
+            )
+    elif session:
         detail = f"provider={session.get('provider', '—')}, state={session.get('current_state', '—')}"
     else:
         detail = "listening, but /api/session did not respond"
