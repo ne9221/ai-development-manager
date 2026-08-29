@@ -19,7 +19,7 @@ from manager.dispatch_10round_acceptance import JsonlEvidenceRecorder, run_unatt
 from manager.dispatch_3of3_acceptance import collect_evidence
 from manager.dispatch_requests import dispatch_request_registry
 from manager.gcs_lock_registry import GCSLockRegistry
-from manager.tasks import DriveRecords, build_service
+from manager.tasks import DriveRecords, MIME_FOLDER, MIME_JSON, ROOT_FOLDER_ID, ROOT_FOLDERS, TaskError, build_service
 
 
 PROJECT_ID = "ai-development-manager"
@@ -46,19 +46,79 @@ class BoundedEvidenceStore:
     def __init__(self, store):
         self._store = store
 
+    def _direct_drive_list_records(self, area, project_id, deadline):
+        """List real Drive records without DriveRecords' unbounded folder hop.
+
+        DriveRecords.list_records_bounded() bounds record hydration, but its
+        initial project_folder() lookup still uses the legacy unbounded
+        children() path.  The C gate must remain bounded even after a
+        terminal provider event, so use the same DriveRecords primitives with
+        the deadline forwarded through every listing page.  This adapter is
+        acceptance-only; production lifecycle code remains untouched.
+        """
+        root_matches = [item for item in self._store.children(
+            ROOT_FOLDER_ID, ROOT_FOLDERS[area], deadline=deadline
+        ) if item.get("mimeType") == MIME_FOLDER]
+        if len(root_matches) > 1:
+            raise TaskError(f"duplicate Drive folder: {ROOT_FOLDERS[area]}")
+        if not root_matches:
+            if time.monotonic() >= deadline:
+                raise TaskError("bounded evidence read deadline expired while locating area folder")
+            raise TaskError(f"Drive folder not found: {ROOT_FOLDERS[area]}")
+        project_matches = [item for item in self._store.children(
+            root_matches[0]["id"], project_id, deadline=deadline
+        ) if item.get("mimeType") == MIME_FOLDER]
+        if len(project_matches) > 1:
+            raise TaskError(f"duplicate Drive folder: {project_id}")
+        if not project_matches:
+            if time.monotonic() >= deadline:
+                raise TaskError("bounded evidence read deadline expired while locating project folder")
+            raise TaskError(f"Drive folder not found: {project_id}")
+
+        records = []
+        for item in self._store.children(project_matches[0]["id"], deadline=deadline):
+            if not item.get("name", "").endswith(".json"):
+                continue
+            if time.monotonic() + EVIDENCE_REQUEST_TIMEOUT_SECONDS >= deadline:
+                break
+            try:
+                raw = self._store.files.get_media(fileId=item["id"]).execute()
+                records.append(json.loads(raw.decode("utf-8")))
+            except Exception:
+                continue
+        return records
+
     def list_records(self, area, project_id):
+        deadline = time.monotonic() + EVIDENCE_AREA_BUDGET_SECONDS
+        if hasattr(self._store, "files") and hasattr(self._store, "children"):
+            return self._direct_drive_list_records(area, project_id, deadline)
         return self._store.list_records_bounded(
             area,
             project_id,
-            deadline=time.monotonic() + EVIDENCE_AREA_BUDGET_SECONDS,
+            deadline=deadline,
             single_request_worst_case=EVIDENCE_REQUEST_TIMEOUT_SECONDS,
         )
 
 
 def provider_for(round_number: int) -> tuple[str, str | None]:
     if round_number in {2, 4, 6, 8, 10}:
-        return "claude", "account-a" if round_number in {2, 6, 10} else "account-b"
+        # Leave account routing to the production Command Watcher.  The live
+        # harness does not own the machine's Claude registry, and hardcoding
+        # fixture ids here makes direct ingress fail with unknown_account
+        # before the natural watcher path can select a real account.
+        return "claude", None
     return "codex", None
+
+
+def provider_output_matches(execution):
+    """Accept either a normal completed turn or an independently validated
+    no-change success produced by the repo-write enforcement path."""
+    if execution.get("status") != "completed":
+        return False
+    if (execution.get("terminal_reason") or "").endswith("turn completed"):
+        return True
+    evidence = execution.get("repo_write_evidence") or {}
+    return evidence.get("push_status") == "not_applicable" and evidence.get("tests_status") == "passed"
 
 
 def dispatch_round(round_number: int, request_id: str):
@@ -121,7 +181,7 @@ def collect_round(round_number: int, request_id: str, receipt):
             started = execution.get("started_at")
             terminal = execution.get("completed_at") or execution.get("finished_at")
             outcome = execution.get("terminal_reason") or ""
-            provider_ok = execution.get("status") == "completed" and outcome.endswith("turn completed")
+            provider_ok = provider_output_matches(execution)
             evidence_service = build_service(timeout=EVIDENCE_REQUEST_TIMEOUT_SECONDS)
             evidence_store = BoundedEvidenceStore(DriveRecords(evidence_service))
             evidence_registry = dispatch_request_registry(BUCKET, PROJECT_ID, request_id)
