@@ -283,6 +283,13 @@ st.markdown("""
     .quota-ring.double .quota-ring-inner { background: conic-gradient(#79b99c calc(var(--inner) * 1%), #edf2ee 0); border: 6px solid #fff; }
     .quota-ring.double .quota-ring-inner span { background: #fff; border-radius: 50%; padding: 7px 4px; }
     .quota-number { font-size: 1.6rem; font-weight: 800; letter-spacing: -.04em; }
+    .quota-compact-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
+    .quota-compact-card { background: #fff; border: 1px solid var(--adm-line); border-radius: 16px; padding: 14px 16px; display: flex; gap: 13px; align-items: center; min-height: 112px; box-shadow: 0 8px 24px rgba(39,66,51,.045); }
+    .quota-compact-card .quota-ring { width: 68px; height: 68px; }
+    .quota-compact-card .quota-ring-inner { width: 48px; height: 48px; font-size: .66rem; }
+    .quota-compact-card .quota-ring.double .quota-ring-inner { border-width: 5px; }
+    .quota-compact-card .quota-number { font-size: 1.02rem; letter-spacing: -.02em; }
+    .quota-compact-card .quota-meta { font-size: .77rem; line-height: 1.5; }
     .quiet-note { color: var(--adm-muted); font-size: .82rem; }
     @media (max-width: 768px) { .block-container { padding: 1.25rem .9rem 3rem; } h1 { font-size: 1.8rem !important; } .hero-card { padding: 18px; } }
 </style>
@@ -644,6 +651,41 @@ def _ui_quota_status(card):
 
 
 def _render_quota_card(card, compact=False):
+    if compact:
+        status = _ui_quota_status(card)
+        if status == "STALE":
+            st.warning(f"{_ui_text(card.card_title)} 配額資料 STALE（已過期）；不可用於派工判定。")
+        elif status == "ERROR":
+            st.error(f"{_ui_text(card.card_title)} 配額來源回報 ERROR；不可用於派工判定。")
+        elif status == "UNKNOWN" or card.five_hour_remaining_pct is None:
+            st.info(f"{_ui_text(card.card_title)} 尚未回報百分比：UNKNOWN（不等於 0%）。")
+        usable = status == "OK" and card.five_hour_remaining_pct is not None
+        outer = max(0.0, min(100.0, float(card.five_hour_remaining_pct))) if usable else 0.0
+        weekly = (card.has_weekly_window and card.weekly_remaining_pct is not None
+                  and status == "OK")
+        inner = max(0.0, min(100.0, float(card.weekly_remaining_pct))) if weekly else 0.0
+        ring_class = "double" if weekly else "single"
+        ring_style = f"--outer:{outer};--inner:{inner}" if weekly else f"--pct:{outer}"
+        center = f"{inner:.0f}%<br>每週" if weekly else (f"{outer:.0f}%<br>5H" if usable else status)
+        weekly_line = (f"<br>每週 {card.formatted_weekly_remaining} · {card.weekly_resets_at or card.formatted_weekly_countdown or '未知'}"
+                       if weekly else "")
+        freshness = "過期" if card.stale else "最新"
+        freshness_class = "state-attention" if card.stale or status != "OK" else "state-running"
+        st.markdown(f"""
+        <div class="quota-compact-card">
+          <div class="quota-ring {ring_class}" style="{ring_style}">
+            <div class="quota-ring-inner"><span>{center}</span></div>
+          </div>
+          <div>
+            <div class="quota-number">{_ui_text(card.card_title)}</div>
+            <div class="quota-meta"><b>5H {card.formatted_five_hour_remaining if usable else status}</b> · {card.five_hour_resets_at or card.formatted_five_hour_countdown or '未知'}{weekly_line}<br>
+              <span class="{freshness_class}">{freshness}</span>
+            </div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
     st.markdown(f"### {_ui_text(card.card_title)}")
     status = _ui_quota_status(card)
     st.caption(f"狀態：{status}  |  Provider：{_ui_text(card.provider)}")
@@ -832,7 +874,6 @@ def _render_overview(data):
     else:
         st.info("目前沒有已證實正在執行的任務。")
 
-    _render_execution_snapshot(data)
     _render_dispatch_snapshot(data)
 
     focus = []
@@ -882,7 +923,7 @@ def _render_overview(data):
         quota_cols = st.columns(min(len(accounts), 3))
         for index, card in enumerate(accounts):
             with quota_cols[index % len(quota_cols)]:
-                _render_quota_card(card, compact=False)
+                _render_quota_card(card, compact=True)
     _render_task_detail(data)
     if data.get("warnings"):
         with st.expander(f"資料警告（{len(data['warnings'])}）", expanded=False):
