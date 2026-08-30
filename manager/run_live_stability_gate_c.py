@@ -29,6 +29,8 @@ BUCKET = "adm-lock-smoke-551449082603-20260813-0147"
 ALLOWED_PATHS = ["manager/test_dispatch_10round_acceptance.py"]
 EVIDENCE_REQUEST_TIMEOUT_SECONDS = 10
 EVIDENCE_AREA_BUDGET_SECONDS = 30
+ROUND_TIMEOUT_SECONDS = 1800
+WAITING_QUOTA_TIMEOUT_SECONDS = 8 * 60 * 60
 
 
 def utc_now() -> str:
@@ -165,12 +167,23 @@ def _terminal_state(task, command, execution):
 
 def collect_round(round_number: int, request_id: str, receipt):
     task_id = receipt["task_id"]
-    deadline = time.monotonic() + 1800
+    waiting_quota = receipt.get("status") == "waiting_quota" and not receipt.get("command_id")
+    command_id = receipt.get("command_id") or task_id
+    deadline = time.monotonic() + (WAITING_QUOTA_TIMEOUT_SECONDS if waiting_quota else ROUND_TIMEOUT_SECONDS)
     last_error = None
     while time.monotonic() < deadline:
         store, _ = live_store()
         task = store.get("tasks", PROJECT_ID, task_id)
-        command = store.get("commands", PROJECT_ID, receipt["command_id"])
+        try:
+            command = store.get("commands", PROJECT_ID, command_id)
+        except Exception as exc:
+            last_error = type(exc).__name__
+            # The watcher owns quota re-evaluation and Command creation. Keep
+            # observing this same admitted Task until natural promotion.
+            if waiting_quota and task.get("recommended_provider") is None and task.get("quota_evidence") is not None:
+                time.sleep(15)
+                continue
+            raise
         execution = None
         if command.get("execution_id"):
             try:
@@ -259,7 +272,7 @@ def collect_round(round_number: int, request_id: str, receipt):
             # as UNKNOWN/false by the acceptance adapter.
             try:
                 task = store.get("tasks", PROJECT_ID, task_id)
-                command = store.get("commands", PROJECT_ID, receipt["command_id"])
+                command = store.get("commands", PROJECT_ID, command_id)
                 if command.get("execution_id"):
                     execution = store.get("executions", PROJECT_ID, command["execution_id"])
             except Exception as exc:  # transient read; retain the observed terminal execution

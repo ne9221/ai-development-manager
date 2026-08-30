@@ -101,6 +101,48 @@ class BoundedEvidenceStoreTests(unittest.TestCase):
         self.assertEqual("execution-1", evidence["execution"]["execution_id"])
         self.assertFalse(evidence["provider_output"]["observed"])
 
+    def test_collect_round_waits_for_natural_waiting_quota_promotion(self):
+        waiting_task = {
+            "task_id": "task-1", "project_id": "project-1", "status": "ready",
+            "recommended_provider": None, "quota_evidence": {"decision": "waiting_quota"},
+        }
+        promoted_task = {**waiting_task, "recommended_provider": "claude", "status": "blocked"}
+        command = {
+            "command_id": "task-1", "task_id": "task-1", "project_id": "project-1",
+            "status": "failed", "provider": "claude", "execution_id": None,
+        }
+
+        class Store:
+            def __init__(self):
+                self.command_reads = 0
+
+            def get(self, area, project_id, name):
+                if area == "tasks":
+                    return waiting_task if self.command_reads == 0 else promoted_task
+                if area == "commands":
+                    self.command_reads += 1
+                    if self.command_reads == 1:
+                        raise RuntimeError("not promoted yet")
+                    return command
+                raise RuntimeError("no execution")
+
+            def list_records_bounded(self, area, project_id, **kwargs):
+                return {"tasks": [promoted_task], "commands": [command]}.get(area, [])
+
+        store = Store()
+        with patch("manager.run_live_stability_gate_c.live_store", return_value=(store, object())), \
+             patch("manager.run_live_stability_gate_c.time.sleep"), \
+             patch("manager.run_live_stability_gate_c.build_service", return_value=object()), \
+             patch("manager.run_live_stability_gate_c.DriveRecords", return_value=store), \
+             patch("manager.run_live_stability_gate_c.dispatch_request_registry", return_value=object()), \
+             patch("manager.run_live_stability_gate_c.RUN_STARTED_AT", "2026-08-29T18:00:00Z", create=True):
+            evidence = collect_round(2, "request-1", {
+                "task_id": "task-1", "command_id": None, "status": "waiting_quota",
+            })
+
+        self.assertEqual(2, store.command_reads)
+        self.assertEqual("failed", evidence["terminal"]["command_status"])
+
     def test_collect_round_refreshes_canonical_terminal_records(self):
         initial_task = {"task_id": "task-1", "project_id": "project-1", "status": "running"}
         final_task = {"task_id": "task-1", "project_id": "project-1", "status": "completed"}
