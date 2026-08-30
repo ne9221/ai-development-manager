@@ -16,6 +16,7 @@ from manager.command_watcher import (
     CLAIM_TIMEOUT_SECONDS, MAX_COMMANDS_PER_POLL, MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL, PHASE_1_TIME_BUDGET_SECONDS,
     POLL_TIME_BUDGET_SECONDS, PROVIDER_RUNTIMES,
     REQUIRED_TASK_POLICIES, _provider_state, _enumerate_waiting_quota_tasks, _promote_waiting_quota_task,
+    _reconcile_active,
     _prioritized_commands, claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist,
     poll_once, process_command, provider_quota_reliable, resolve_provider_runtime, _spawn_claimed_worker,
 )
@@ -422,6 +423,29 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertEqual("interrupted", self.store.get("executions", "p1", "command-cmd-1")["status"])
         self.assertEqual("failed", self.store.get("commands", "p1", "cmd-1")["status"])
         self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+
+    def test_proven_dead_writer_releases_exact_linked_lease_before_terminalizing(self):
+        active, claim, execution = self.running_command(heartbeat_minutes=16, pid=99_999_999)
+        execution.update(
+            access="production_write", session_id="codex:session-a", provider_session_id="session-a",
+            lease_evidence={
+                "authority": "acquired", "lock_id": "repo-" + "0" * 64, "generation": 7,
+                "repository": "github:ne9221/ai-development-manager", "branch": "refs/heads/main",
+                "scope": ["manager/executions.py"], "baseline_head": "0" * 40,
+            },
+        )
+        self.store.put("executions", "p1", "command-cmd-1", execution)
+        registry = object()
+        with patch("manager.command_watcher.GCSLockRegistry.from_environment", return_value=registry), \
+             patch("manager.command_watcher.reconcile_stopped_provider_terminal_lease") as release_linked, \
+             patch("manager.command_watcher.terminalize_execution") as terminalize:
+            result = _reconcile_active(self.store, object(), active, lambda *_: claim)
+        release_linked.assert_called_once_with(
+            registry, execution["lease_evidence"]["lock_id"], "p1", "t1", "command-cmd-1", "codex",
+            7, "codex:session-a", True,
+        )
+        terminalize.assert_called_once()
+        self.assertEqual("attention", result["status"])
 
     # Phase 4E parity gate item: process identity / PID reuse safety and the
     # full stale-provider auto-recovery path, reproduced exactly for

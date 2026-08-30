@@ -30,7 +30,8 @@ from manager.trusted_ingress import (
     ADMISSION_VERSION_V1, REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN, task_policy_satisfied,
     task_policy_satisfied_for_admission, verify_trusted_ingress_admission,
 )
-from manager.worktree_locks import canonical_repository, reconcile_unlinked_terminal_lease, repository_lock_id
+from manager.worktree_locks import (canonical_repository, reconcile_stopped_provider_terminal_lease,
+                                    reconcile_unlinked_terminal_lease, repository_lock_id)
 from manager.dispatch_requests import dispatch_request_registry
 from manager.production_guard import RuntimeGuardError, require_runtime_guard
 
@@ -504,6 +505,12 @@ def _reconcile_active(store, service, command, claim_factory):
         return {"status": terminal["status"], "reconciled": True, "provider_state": provider}
     if provider == "stopped" and exact_claim and execution.get("access") == "production_write":
         try:
+            lease = execution.get("lease_evidence") or {}
+            reconcile_stopped_provider_terminal_lease(
+                GCSLockRegistry.from_environment(), lease.get("lock_id"), command["project_id"],
+                command["task_id"], execution["execution_id"], execution["provider"],
+                lease.get("generation"), execution.get("session_id"), True,
+            )
             terminalize_execution(
                 store, service, GCSLockRegistry.from_environment(), claim_registry,
                 command["project_id"], command["task_id"], execution["execution_id"],

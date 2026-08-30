@@ -333,6 +333,37 @@ def reconcile_unlinked_terminal_lease(registry, lock_id, project_id, task_id, ex
     raise TaskError("terminal lease reconciliation contention did not settle")
 
 
+def reconcile_stopped_provider_terminal_lease(registry, lock_id, project_id, task_id, execution_id, provider,
+                                              generation, session_id, provider_stopped, attempts=5):
+    """CAS-release one exact linked lease after its provider is proven stopped."""
+    if provider_stopped is not True:
+        raise TaskError("linked terminal lease reconciliation requires proven provider stop")
+    if not isinstance(generation, int) or generation < 1:
+        raise TaskError("linked terminal lease reconciliation requires a valid generation")
+    owner = owner_fields(project_id, task_id, execution_id, provider, session_id)
+    for _ in range(attempts):
+        document, etag, now = read_registry(registry)
+        lock = document["locks"].get(lock_id)
+        if not lock:
+            raise TaskError("linked terminal lease reconciliation found no lock")
+        if any(lock.get(key) != value for key, value in owner.items()):
+            raise TaskError("linked terminal lease reconciliation owner mismatch")
+        if lock.get("generation") != generation:
+            raise TaskError("linked terminal lease reconciliation generation mismatch")
+        if lock.get("status") == "released":
+            return public_lock(lock, now)
+        if lock.get("status") != "active":
+            raise TaskError("linked terminal lease reconciliation found an invalid lock status")
+        changed = {**lock, "status": "released", "updated_at": iso(now), "released_at": iso(now)}
+        semantic_lock(changed, lock_id)
+        try:
+            registry.cas(etag, {**document, "locks": {**document["locks"], lock_id: changed}})
+            return public_lock(changed, now)
+        except RegistryConflict:
+            continue
+    raise TaskError("linked terminal lease reconciliation contention did not settle")
+
+
 def verify_released_terminal_lease(registry, lock_id, project_id, task_id, execution_id, provider,
                                    generation, session_id=None):
     """Prove that an exact writer generation is already safely released.

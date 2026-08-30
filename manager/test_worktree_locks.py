@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from manager.gcs_lock_registry import RegistryConflict
 from manager.tasks import TaskError
-from manager.worktree_locks import acquire, canonical_branch, canonical_repository, canonical_scope, check, inspect, link_session, list_locks, reconcile_unlinked_terminal_lease, release, renew, repository_lock_id, semantic_lock, validate_local_preflight
+from manager.worktree_locks import acquire, canonical_branch, canonical_repository, canonical_scope, check, inspect, link_session, list_locks, reconcile_stopped_provider_terminal_lease, reconcile_unlinked_terminal_lease, release, renew, repository_lock_id, semantic_lock, validate_local_preflight
 
 
 NOW = datetime(2026, 8, 12, tzinfo=timezone.utc)
@@ -173,6 +173,25 @@ class WorktreeLockTests(unittest.TestCase):
             reconcile_unlinked_terminal_lease(registry, result["lock_id"], **owner_from(result), terminal_status="running")
         with self.assertRaisesRegex(TaskError, "linked provider session"):
             reconcile_unlinked_terminal_lease(registry, result["lock_id"], **owner_from(result), terminal_status="cancelled")
+
+    def test_stopped_provider_reconciliation_releases_only_exact_linked_generation(self):
+        registry = MemoryRegistry()
+        result = acquire(registry, **acquire_args())
+        with self.assertRaisesRegex(TaskError, "proven provider stop"):
+            reconcile_stopped_provider_terminal_lease(
+                registry, result["lock_id"], **owner_from(result), generation=result["generation"],
+                session_id="codex:session-a", provider_stopped=False,
+            )
+        with self.assertRaisesRegex(TaskError, "generation mismatch"):
+            reconcile_stopped_provider_terminal_lease(
+                registry, result["lock_id"], **owner_from(result), generation=result["generation"] + 1,
+                session_id="codex:session-a", provider_stopped=True,
+            )
+        released = reconcile_stopped_provider_terminal_lease(
+            registry, result["lock_id"], **owner_from(result), generation=result["generation"],
+            session_id="codex:session-a", provider_stopped=True,
+        )
+        self.assertEqual("released", released["status"])
 
     def test_session_link_is_idempotent_metadata_not_owner(self):
         registry = MemoryRegistry(); result = acquire(registry, **acquire_args(session_id=None))
