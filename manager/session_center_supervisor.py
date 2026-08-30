@@ -39,9 +39,11 @@ from pathlib import Path
 from manager.codex_launcher import process_creation_identity, process_identity_state
 from manager.command_watcher import (
     POLL_TIME_BUDGET_SECONDS,
+    RECENT_COMMAND_SWEEP_BUDGET_SECONDS,
     WATCHER_DISCOVERY_TIMEOUT_SECONDS,
     _enumerate_commands,
     _enumerate_project_ids,
+    _enumerate_recent_commands,
     _rotated_project_ids,
     load_allowlist,
     queued_command_pending_only_health,
@@ -176,10 +178,36 @@ def find_active_command(store, allowlist, bucket=None, ingress_registry_factory=
     same two admission routes as above, replayed read-only) -- this can
     never turn an ordinary not-yet-admitted queued Command into an active
     one, and it never takes priority over a real claimed/running Command.
+
+    Bucket-route discovery order mirrors command_watcher.poll_once()'s own
+    two-phase sweep (see _enumerate_recent_commands's docstring): a cheap,
+    modifiedTime-ordered "recent" batch across every rotated project first,
+    then the full bounded historical sweep as the recovery path for
+    anything older. Without the recent-first pass, a project with a large
+    historical Command backlog can bury a Command created/claimed only
+    moments ago outside that project's bounded historical window for as
+    long as its rotation excludes it -- live-reproduced during Gate 3
+    cold-start activation (2026-08-30): a project's historical sweep
+    returned 36 Commands from days earlier and never reached one queued
+    minutes before. Classification (admission route, ACTIVE_STATUSES vs.
+    eligible-queued) is identical in both phases; a record seen in both is
+    harmless -- pool/sort/pick-latest already tolerates duplicates.
     """
     candidates = []
     queued_candidates = []
     deadline = time.monotonic() + POLL_TIME_BUDGET_SECONDS
+
+    def classify_bucket_record(project_id, record):
+        if (project_id, record.get("task_id")) in allowlist:
+            return  # already scanned via the static path above
+        status = record.get("status")
+        if status in ACTIVE_STATUSES:
+            if verify_trusted_ingress_admission(store, record, bucket, ingress_registry_factory) is not None:
+                candidates.append(record)
+        elif status == "queued" and queued_command_pending_only_health(
+                store, record, allowlist, bucket, ingress_registry_factory):
+            queued_candidates.append(record)
+
     for project_id, task_id in sorted(allowlist):
         try:
             commands = _enumerate_commands(store, project_id, deadline=deadline)
@@ -198,6 +226,16 @@ def find_active_command(store, allowlist, bucket=None, ingress_registry_factory=
             project_ids = _rotated_project_ids(_enumerate_project_ids(store, deadline=deadline))
         except TaskError:
             project_ids = []
+        recent_deadline = min(deadline, time.monotonic() + RECENT_COMMAND_SWEEP_BUDGET_SECONDS)
+        for project_id in project_ids:
+            if time.monotonic() >= recent_deadline:
+                break
+            try:
+                commands = _enumerate_recent_commands(store, project_id, deadline=recent_deadline)
+            except TaskError:
+                continue
+            for record in commands:
+                classify_bucket_record(project_id, record)
         for project_id in project_ids:
             if time.monotonic() >= deadline:
                 break
@@ -206,15 +244,7 @@ def find_active_command(store, allowlist, bucket=None, ingress_registry_factory=
             except TaskError:
                 continue
             for record in commands:
-                if (project_id, record.get("task_id")) in allowlist:
-                    continue  # already scanned via the static path above
-                status = record.get("status")
-                if status in ACTIVE_STATUSES:
-                    if verify_trusted_ingress_admission(store, record, bucket, ingress_registry_factory) is not None:
-                        candidates.append(record)
-                elif status == "queued" and queued_command_pending_only_health(
-                        store, record, allowlist, bucket, ingress_registry_factory):
-                    queued_candidates.append(record)
+                classify_bucket_record(project_id, record)
     pool = candidates or queued_candidates
     if not pool:
         return None

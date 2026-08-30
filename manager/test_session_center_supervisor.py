@@ -349,6 +349,72 @@ class ColdStartQueuedCommandTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class BucketRouteRecentSweepTests(unittest.TestCase):
+    """command_watcher.poll_once() already closed a starvation gap for
+    itself: a small, modifiedTime-desc "recent commands" sweep
+    (_enumerate_recent_commands) runs across every rotated project BEFORE
+    the full bounded historical sweep (_enumerate_commands), so a freshly
+    queued/claimed Command in a project with a large historical backlog is
+    never buried behind it for as long as that project's bounded
+    historical window happens to exclude it -- see
+    RECENT_COMMAND_SWEEP_BUDGET_SECONDS's docstring.
+
+    find_active_command()'s own bucket route never got the same
+    treatment, and this is a real live gap, not a hypothetical one: during
+    Gate 3 cold-start activation (2026-08-30), the 'ai-development-manager'
+    project's historical sweep returned 36 Commands from 2026-08-19..22
+    and never reached a Command queued minutes earlier via
+    direct_dispatch_ingress -- so the cold-start fallback proven by
+    ColdStartQueuedCommandTests above, though logically correct, could
+    never actually fire on a real tick for that project. These tests
+    mock discovery/admission separately so each stays focused: this class
+    only asserts WHICH records get discovered and reach the pool, not
+    whether they are admitted (that is ColdStartQueuedCommandTests'/
+    FindActiveCommandTrustedIngressTests' job).
+    """
+
+    def test_recent_sweep_finds_a_freshly_queued_command_the_historical_sweep_misses(self):
+        fresh = ingress_command(command_id="fresh-1", task_id="fresh-task", status="queued")
+        with patch("manager.session_center_supervisor._enumerate_project_ids", return_value=["p1"]), \
+             patch("manager.session_center_supervisor._rotated_project_ids", side_effect=lambda ids, now=None: ids), \
+             patch("manager.session_center_supervisor._enumerate_commands", return_value=[]), \
+             patch("manager.session_center_supervisor._enumerate_recent_commands", return_value=[fresh]), \
+             patch("manager.session_center_supervisor.queued_command_pending_only_health", return_value=True):
+            result = find_active_command(Store({}), frozenset(), bucket="test-bucket")
+        self.assertIsNotNone(result, "the recent-commands-first sweep must be consulted for the bucket route too")
+        self.assertEqual("fresh-1", result["command_id"])
+
+    def test_historical_sweep_still_runs_as_the_recovery_path_after_the_recent_sweep(self):
+        """The recent sweep must never REPLACE the historical sweep -- an
+        older active Command that has already fallen out of the small
+        recent window must still be found."""
+        stale_active = ingress_command(command_id="stale-1", task_id="stale-task", status="claimed")
+        with patch("manager.session_center_supervisor._enumerate_project_ids", return_value=["p1"]), \
+             patch("manager.session_center_supervisor._rotated_project_ids", side_effect=lambda ids, now=None: ids), \
+             patch("manager.session_center_supervisor._enumerate_recent_commands", return_value=[]), \
+             patch("manager.session_center_supervisor._enumerate_commands", return_value=[stale_active]), \
+             patch("manager.session_center_supervisor.verify_trusted_ingress_admission", return_value={"task": "ok"}):
+            result = find_active_command(Store({}), frozenset(), bucket="test-bucket")
+        self.assertIsNotNone(result)
+        self.assertEqual("stale-1", result["command_id"])
+
+    def test_recent_sweep_never_double_admits_when_historical_sweep_sees_the_same_record(self):
+        """A record the recent sweep already classified as active must not
+        cause any error or double-admission surprise when the historical
+        sweep (which does not know about the recent sweep's own bookkeeping)
+        also returns it -- find_active_command's final pool/sort/pick-latest
+        logic must tolerate the same command_id appearing twice."""
+        fresh = ingress_command(command_id="fresh-1", task_id="fresh-task", status="claimed")
+        with patch("manager.session_center_supervisor._enumerate_project_ids", return_value=["p1"]), \
+             patch("manager.session_center_supervisor._rotated_project_ids", side_effect=lambda ids, now=None: ids), \
+             patch("manager.session_center_supervisor._enumerate_recent_commands", return_value=[fresh]), \
+             patch("manager.session_center_supervisor._enumerate_commands", return_value=[fresh]), \
+             patch("manager.session_center_supervisor.verify_trusted_ingress_admission", return_value={"task": "ok"}):
+            result = find_active_command(Store({}), frozenset(), bucket="test-bucket")
+        self.assertIsNotNone(result)
+        self.assertEqual("fresh-1", result["command_id"])
+
+
 class StateTests(unittest.TestCase):
     def test_read_state_fails_closed_on_missing_or_malformed_file(self):
         self.assertEqual((None, None, None), read_state("/no/such/file.json"))
