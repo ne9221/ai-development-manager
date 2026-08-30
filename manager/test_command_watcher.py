@@ -2037,6 +2037,34 @@ class BoundedCommandEnumerationLifecycleSafetyTests(unittest.TestCase):
         self.assertEqual("completed", results[0]["status"])
         runner.assert_called_once()
 
+    def test_recent_sweep_reaches_late_project_before_full_history_hydration(self):
+        store, _ = self._real_store()
+        store.put("commands", "p1", "cmd-1", command())
+        projects = ["noise-1", "noise-2", "noise-3", "noise-4", "p1"]
+        seen = []
+
+        def recent(_store, project_id, deadline=None):
+            seen.append(project_id)
+            if project_id == "p1":
+                return [command()]
+            return [command(command_id=f"done-{project_id}", status="completed",
+                            completed_at="2026-08-14T00:05:00Z", result={"status": "completed"})]
+
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), CommandWatcherTests.complete(args[7]))[1])
+        with patch("manager.command_watcher._enumerate_project_ids", return_value=projects), \
+             patch("manager.command_watcher._rotated_project_ids", side_effect=lambda values: values), \
+             patch("manager.command_watcher._enumerate_waiting_quota_tasks", return_value=[]), \
+             patch("manager.command_watcher._enumerate_recent_commands", side_effect=recent), \
+             patch("manager.command_watcher._enumerate_commands", return_value=[]), \
+             patch("manager.command_watcher.launch_task", runner):
+            results = poll_once(store, object(), allowlist=self.ALLOWLIST,
+                                claim_factory=CommandWatcherTests.claim_factory,
+                                health_check=lambda: True, quota_check=lambda service: True)
+
+        self.assertEqual(projects, seen)
+        self.assertEqual("completed", results[0]["status"])
+        runner.assert_called_once()
+
     def test_deadline_expiring_during_command_hydration_never_interrupts_a_started_process_command(self):
         """The deadline can legitimately run out WHILE list_records_bounded
         is still hydrating a project's backlog -- process_command for a
@@ -2695,7 +2723,9 @@ class WaitingQuotaSweepStarvationTests(unittest.TestCase):
                      claim_factory=CommandWatcherTests.claim_factory,
                      health_check=lambda: True, quota_check=lambda service: True)
 
-        self.assertEqual(["waiting", "commands"], call_order)
+        self.assertEqual("waiting", call_order[0])
+        self.assertTrue(call_order[1:])
+        self.assertTrue(all(entry == "commands" for entry in call_order[1:]))
 
 
 class Phase1BudgetCapTests(unittest.TestCase):

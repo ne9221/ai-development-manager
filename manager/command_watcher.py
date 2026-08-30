@@ -916,6 +916,30 @@ def _enumerate_commands(store, project_id, deadline=None):
     return store.list_records("commands", project_id)
 
 
+RECENT_COMMANDS_PER_PROJECT = 2
+RECENT_COMMAND_SWEEP_BUDGET_SECONDS = 25  # Phase 2's guaranteed 40s - 15s floor.
+
+
+def _enumerate_recent_commands(store, project_id, deadline=None):
+    """Hydrate only the newest command records for the fast claim sweep.
+
+    The regular full bounded sweep still runs afterwards for stale recovery.
+    This first pass prevents terminal history in earlier projects from using
+    the whole poll budget before a newly queued command is even inspected.
+    """
+    if hasattr(store, "list_records_bounded"):
+        try:
+            return store.list_records_bounded(
+                "commands", project_id, deadline=deadline,
+                single_request_worst_case=WATCHER_DISCOVERY_TIMEOUT_SECONDS,
+                max_records=RECENT_COMMANDS_PER_PROJECT,
+                order_by="modifiedTime desc",
+            )
+        except TypeError:
+            pass
+    return _enumerate_commands(store, project_id, deadline=deadline)
+
+
 # DASHBOARD_TRUTH_CONNECTED gate 1/4: how many waiting_quota Tasks one
 # poll_once() tick will attempt to promote into a real Command. Bounded
 # exactly like MAX_COMMANDS_PER_POLL, for the same reason -- a project with
@@ -1268,8 +1292,34 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             except TaskError:
                 continue
 
-    # Phase 2: regular command processing, same rotated project order,
-    # using whatever budget remains after Phase 1 above.
+    # Phase 2a: inspect a tiny modified-time-ordered batch from every project
+    # before historical hydration. The later full sweep remains the recovery
+    # path for older claimed/running/attention records.
+    processed = set()
+    recent_deadline = min(deadline, time.monotonic() + RECENT_COMMAND_SWEEP_BUDGET_SECONDS)
+    for project_id in project_ids:
+        if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
+            break
+        try:
+            commands = _enumerate_recent_commands(discovery_store, project_id, deadline=recent_deadline)
+        except TaskError:
+            continue
+        for command in _prioritized_commands(commands):
+            if (project_id, command["command_id"]) in just_promoted:
+                continue
+            if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
+                break
+            try:
+                results.append(process_command(store, service, command, allowlist=allowlist,
+                                               origin_context=origin_context, async_launch=async_launch, **factories))
+                processed.add((project_id, command["command_id"]))
+            except Exception as exc:
+                results.append({"status": "error", "project_id": project_id,
+                                "command_id": command["command_id"], "error": repr(exc)})
+                processed.add((project_id, command["command_id"]))
+
+    # Phase 2b: regular full bounded command processing, same rotated project
+    # order, using whatever budget remains after the recent-command sweep.
     for project_id in project_ids:
         if time.monotonic() >= deadline:
             break
@@ -1288,6 +1338,8 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         for command in _prioritized_commands(commands):
             if (project_id, command["command_id"]) in just_promoted:
                 continue  # promoted this same tick -- launches on a later natural tick, not this one
+            if (project_id, command["command_id"]) in processed:
+                continue
             if len(results) == MAX_COMMANDS_PER_POLL:
                 # Global command-processing budget reached. `break` (not
                 # `return`) only stops processing MORE commands for THIS

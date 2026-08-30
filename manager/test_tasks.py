@@ -30,8 +30,9 @@ class FakeDriveFiles:
     the same stale "missing" snapshot, forcing a real TOCTOU interleaving
     (pausing before the snapshot would let CPython's GIL scheduling resolve
     the two callers sequentially by luck instead of racing them)."""
-    def __init__(self, on_list=None): self.items = {}; self.next_id = 1; self.lock = threading.Lock(); self.on_list = on_list
+    def __init__(self, on_list=None): self.items = {}; self.next_id = 1; self.lock = threading.Lock(); self.on_list = on_list; self.list_options = []
     def list(self, q, **_kwargs):
+        self.list_options.append(dict(_kwargs))
         parent = re.search(r"'([^']+)' in parents", q).group(1)
         name_match = re.search(r" and name='([^']*)'", q)
         name = name_match.group(1) if name_match else None
@@ -628,6 +629,27 @@ class ListRecordsBoundedTests(unittest.TestCase):
         bounded = {record["command_id"] for record in store.list_records_bounded("commands", "p1")}
         unbounded = {record["command_id"] for record in store.list_records("commands", "p1")}
         self.assertEqual(unbounded, bounded)
+
+    def test_recent_record_cap_is_ordered_and_stops_hydration(self):
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 6)
+        get_media_calls = {"n": 0}
+        original = service.transport.get_media
+
+        def counting_get_media(fileId):
+            get_media_calls["n"] += 1
+            return original(fileId)
+
+        service.transport.get_media = counting_get_media
+        records = store.list_records_bounded(
+            "commands", "p1", max_records=2, order_by="modifiedTime desc"
+        )
+
+        self.assertEqual(2, len(records))
+        self.assertEqual(2, get_media_calls["n"])
+        self.assertTrue(any(options.get("orderBy") == "modifiedTime desc"
+                            for options in service.transport.list_options))
 
 
 if __name__ == "__main__": unittest.main()

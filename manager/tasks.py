@@ -80,7 +80,7 @@ class DriveRecords:
     def __init__(self, service):
         self.files = service.files()
 
-    def children(self, parent, name=None, deadline=None):
+    def children(self, parent, name=None, deadline=None, order_by=None, page_size=100):
         """`deadline`, if given, is a `time.monotonic()` value checked only
         BETWEEN pages (never mid-single-request -- each individual
         `files.list().execute()` call remains bound only by the transport's
@@ -98,7 +98,9 @@ class DriveRecords:
         while True:
             if deadline is not None and time.monotonic() >= deadline:
                 return items
-            options = {"q": query, "spaces": "drive", "fields": "nextPageToken,files(id,name,mimeType,parents,modifiedTime,createdTime)", "pageSize": 100}
+            options = {"q": query, "spaces": "drive", "fields": "nextPageToken,files(id,name,mimeType,parents,modifiedTime,createdTime)", "pageSize": page_size}
+            if order_by:
+                options["orderBy"] = order_by
             if token:
                 options["pageToken"] = token
             response = self.files.list(**options).execute()
@@ -217,7 +219,8 @@ class DriveRecords:
         names = [logical_record_id(item["name"][:-5]) for item in self.children(parent) if item.get("name", "").endswith(".json")]
         return [self.get(area, project_id, name) for name in names]
 
-    def list_records_bounded(self, area, project_id, deadline=None, single_request_worst_case=None):
+    def list_records_bounded(self, area, project_id, deadline=None, single_request_worst_case=None,
+                             max_records=None, order_by=None):
         """Deadline-aware, bounded-hydration alternative to list_records()
         for callers (manager.command_watcher.poll_once) that cannot afford
         to hydrate an unbounded number of historical JSON records in one
@@ -259,7 +262,7 @@ class DriveRecords:
             if deadline is not None and time.monotonic() >= deadline:
                 return []
             raise
-        items = self.children(parent, deadline=deadline)
+        items = self.children(parent, deadline=deadline, order_by=order_by)
         records = []
         for item in items:
             if not item.get("name", "").endswith(".json"):
@@ -269,6 +272,8 @@ class DriveRecords:
             try:
                 raw = self.files.get_media(fileId=item["id"]).execute()
                 records.append(json.loads(raw.decode("utf-8")))
+                if max_records is not None and len(records) >= max_records:
+                    break
             except Exception:
                 continue
         return records
