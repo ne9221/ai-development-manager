@@ -245,6 +245,7 @@ def _evidence_record(evidence: Dict[str, Any], captured_at: str) -> Dict[str, An
         "captured_at": captured_at,
         "project_id": evidence.get("project_id"),
         "request_id": evidence.get("request_id"),
+        "dispatch_status": evidence.get("dispatch_status"),
         "ids": {name: ids.get(name) for name in ("task_id", "command_id", "execution_id", "session_id", "handoff_id")},
         "claim": {
             "ingress_first_observed_at": timestamps.get("ingress_first_observed_at"),
@@ -408,6 +409,7 @@ def run_unattended_ten_rounds(
     evidences: List[Dict[str, Any]] = []
     for round_number, request_id in enumerate(request_ids, start=1):
         dispatch_error = None
+        error_code = None
         receipt = None
         try:
             receipt = dispatch_round(round_number, request_id)
@@ -416,7 +418,21 @@ def run_unattended_ten_rounds(
                 raise TypeError("collect_round must return a dict")
         except Exception as exc:  # one failed round must be recorded, not retried or dropped
             dispatch_error = type(exc).__name__
+            error_code = getattr(exc, "code", None)
             evidence = _failed_evidence(project_id, request_id)
+            if isinstance(receipt, dict):
+                # Keep the adapter's already-returned identity evidence when
+                # collection fails.  This is metadata only: it does not
+                # re-read or mutate lifecycle authority, and it lets an audit
+                # distinguish dispatch failure from a later visibility read.
+                evidence["ids"] = {
+                    "task_id": receipt.get("task_id"),
+                    "command_id": receipt.get("command_id"),
+                    "execution_id": receipt.get("execution_id"),
+                    "session_id": receipt.get("session_id"),
+                    "handoff_id": None,
+                }
+                evidence["dispatch_status"] = receipt.get("status")
         evidence = dict(evidence)
         evidence.setdefault("project_id", project_id)
         evidence.setdefault("request_id", request_id)
@@ -425,6 +441,24 @@ def run_unattended_ten_rounds(
         if dispatch_error:
             evidence["harness_error"] = dispatch_error
         evidences.append(evidence)
+        if recorder is not None:
+            # Persist each collected round before starting the next dispatch.
+            # The final evaluated record still follows after all ten rounds so
+            # cross-task checks remain authoritative; this snapshot is the
+            # durable, append-only audit trail for a round that has actually
+            # completed (including a dispatch/collection failure).
+            snapshot = _evidence_record(evidence, now())
+            snapshot["harness_error"] = dispatch_error
+            snapshot["harness_error_code"] = error_code
+            recorder.emit({
+                "event": "round_snapshot",
+                "harness_version": HARNESS_VERSION,
+                "run_id": run_id,
+                "round": round_number,
+                "request_id": request_id,
+                "RESULT": "PENDING_FINAL_EVALUATION",
+                "evidence": snapshot,
+            })
 
     report = evaluate_ten_rounds(
         evidences,
