@@ -1,8 +1,61 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-from manager.run_live_stability_gate_c import BoundedEvidenceStore, collect_round, provider_output_matches
+from manager.provenance import ProvenanceError
+from manager.run_live_stability_gate_c import BoundedEvidenceStore, collect_round, current_baseline, provider_output_matches
 from manager.tasks import MIME_FOLDER, MIME_JSON, ROOT_FOLDER_ID, ROOT_FOLDERS
+
+
+class CurrentBaselineTests(unittest.TestCase):
+    """The repo-write worktree each round dispatches from must be
+    materialized at whatever production actually has activated *right
+    now* -- a hardcoded baseline is stale the instant the very commit
+    embedding it is merged (production HEAD immediately advances past
+    it), which live-reproduced as a RuntimeGuardError/PROVENANCE_MISMATCH
+    rejecting every round before a provider ever launched. This must
+    always re-read the same activated_sha.json manager.provenance.activate()
+    writes, never a value captured once at import/module-load time."""
+
+    def test_reads_the_currently_activated_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager_home = Path(directory)
+            (manager_home / "provenance").mkdir()
+            (manager_home / "provenance" / "activated_sha.json").write_text(
+                json.dumps({"activated_sha": "a" * 40}), encoding="utf-8")
+            with patch.dict("os.environ", {"AI_MANAGER_HOME": str(manager_home)}):
+                self.assertEqual("a" * 40, current_baseline())
+
+    def test_reflects_a_later_activation_without_needing_a_restart(self):
+        """Simulates production advancing mid-run (e.g. this harness's own
+        recovery commit being merged and activated) -- the next round must
+        see the new baseline, not one captured at process start."""
+        with tempfile.TemporaryDirectory() as directory:
+            manager_home = Path(directory)
+            (manager_home / "provenance").mkdir()
+            evidence_path = manager_home / "provenance" / "activated_sha.json"
+            evidence_path.write_text(json.dumps({"activated_sha": "a" * 40}), encoding="utf-8")
+            with patch.dict("os.environ", {"AI_MANAGER_HOME": str(manager_home)}):
+                self.assertEqual("a" * 40, current_baseline())
+                evidence_path.write_text(json.dumps({"activated_sha": "b" * 40}), encoding="utf-8")
+                self.assertEqual("b" * 40, current_baseline())
+
+    def test_missing_evidence_fails_closed_never_fabricates_a_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict("os.environ", {"AI_MANAGER_HOME": directory}):
+                with self.assertRaises(ProvenanceError):
+                    current_baseline()
+
+    def test_malformed_evidence_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager_home = Path(directory)
+            (manager_home / "provenance").mkdir()
+            (manager_home / "provenance" / "activated_sha.json").write_text("not json", encoding="utf-8")
+            with patch.dict("os.environ", {"AI_MANAGER_HOME": str(manager_home)}):
+                with self.assertRaises(ProvenanceError):
+                    current_baseline()
 
 
 class BoundedEvidenceStoreTests(unittest.TestCase):

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,12 +20,12 @@ from manager.dispatch_10round_acceptance import JsonlEvidenceRecorder, run_unatt
 from manager.dispatch_3of3_acceptance import collect_evidence
 from manager.dispatch_requests import dispatch_request_registry
 from manager.gcs_lock_registry import GCSLockRegistry
+from manager.provenance import ProvenanceError, _activated_evidence_path
 from manager.tasks import DriveRecords, MIME_FOLDER, MIME_JSON, ROOT_FOLDER_ID, ROOT_FOLDERS, TaskError, build_service
 
 
 PROJECT_ID = "ai-development-manager"
 REPO = "https://github.com/ne9221/ai-development-manager"
-BASELINE = "67fe409020fe95c06b54f9aee8dc70f4e3180567"
 BUCKET = "adm-lock-smoke-551449082603-20260813-0147"
 ALLOWED_PATHS = ["manager/test_dispatch_10round_acceptance.py"]
 EVIDENCE_REQUEST_TIMEOUT_SECONDS = 10
@@ -40,6 +41,33 @@ def utc_now() -> str:
 def live_store():
     service = build_service()
     return DriveRecords(service), service
+
+
+def current_baseline() -> str:
+    """The repo-write worktree each round dispatches against must be
+    materialized at whatever SHA production actually has activated right
+    now -- never a value frozen at some earlier point. A hardcoded
+    constant here is wrong on principle, not just inconvenient: the very
+    commit that would embed a fixed SHA is itself merged onto production
+    main, which immediately advances HEAD past that SHA, so the worktree
+    materializer would request a baseline the running production
+    checkout no longer matches and require_runtime_guard() would reject
+    the round with a PROVENANCE_MISMATCH RuntimeGuardError before a
+    provider is ever launched (live-reproduced during this harness's own
+    recovery/activation, 2026-08-30). Reads the same activated_sha.json
+    manager.provenance.activate() writes and manager.production_guard's
+    require_runtime_guard() itself trusts, so this can never drift from
+    what the rest of the system considers "currently activated".
+    """
+    manager_home = Path(os.environ.get("AI_MANAGER_HOME") or Path(__file__).resolve().parents[1] / ".ai-development-manager")
+    path = _activated_evidence_path(manager_home)
+    try:
+        activated_sha = json.loads(path.read_text(encoding="utf-8")).get("activated_sha")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ProvenanceError(f"PROVENANCE_MISMATCH: cannot read activated baseline at {path}") from exc
+    if not isinstance(activated_sha, str) or not activated_sha:
+        raise ProvenanceError(f"PROVENANCE_MISMATCH: activated evidence at {path} has no activated_sha")
+    return activated_sha
 
 
 class BoundedEvidenceStore:
@@ -139,7 +167,7 @@ def dispatch_round(round_number: int, request_id: str):
         "account_id": account_id,
         "repo_write": {
             "allowed_paths": ALLOWED_PATHS,
-            "baseline_head": BASELINE,
+            "baseline_head": current_baseline(),
             "repo": REPO,
             "validation_command": "git diff --check",
             "allow_no_change_success": True,
