@@ -48,6 +48,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from manager.remote_readback import verify_remote_branch_matches
@@ -99,6 +100,14 @@ def _run(cwd, *args, runner=subprocess.run):
     return runner(["git", "-C", str(cwd), *args], text=True, encoding="utf-8", errors="replace", capture_output=True)
 
 
+def _run_read(cwd, *args, runner=subprocess.run):
+    result = _run(cwd, *args, runner=runner)
+    if result.returncode != 0:
+        time.sleep(0.25)
+        result = _run(cwd, *args, runner=runner)
+    return result
+
+
 def collect_changed_paths(working_directory, baseline_head: str, runner=subprocess.run) -> List[str]:
     """Every repo-relative path the worktree's actual git state shows as
     touched relative to `baseline_head` -- modified, added, or deleted
@@ -122,7 +131,7 @@ def collect_changed_paths(working_directory, baseline_head: str, runner=subproce
     appearing anywhere other than the worktree root -- is still collected
     and enforced normally; only this one literal ADM-owned path is exempt.
     """
-    diff = _run(working_directory, "diff", "--name-status", "-M", "--no-color", baseline_head, "--", ".", runner=runner)
+    diff = _run_read(working_directory, "diff", "--name-status", "-M", "--no-color", baseline_head, "--", ".", runner=runner)
     if diff.returncode != 0:
         raise TaskError(f"git diff against baseline_head failed: {(diff.stderr or '').strip()}")
     changed = set()
@@ -140,7 +149,7 @@ def collect_changed_paths(working_directory, baseline_head: str, runner=subproce
         elif len(parts) >= 2:
             changed.add(parts[1])
 
-    untracked = _run(working_directory, "ls-files", "--others", "--exclude-standard", runner=runner)
+    untracked = _run_read(working_directory, "ls-files", "--others", "--exclude-standard", runner=runner)
     if untracked.returncode != 0:
         raise TaskError(f"git ls-files failed: {(untracked.stderr or '').strip()}")
     for line in untracked.stdout.splitlines():

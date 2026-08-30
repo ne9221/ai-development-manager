@@ -3,6 +3,7 @@
 
 import subprocess
 import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -177,6 +178,33 @@ def test_collect_changed_paths_includes_rename_both_sides():
 
     changed = collect_changed_paths("/fake/dir", "a" * 40, runner=fake_runner)
     assert changed == ["manager/x.py", "new/path.py", "old/path.py", "untracked/new.py"]
+
+
+def test_collect_changed_paths_retries_one_transient_git_read_failure():
+    calls = []
+
+    def fake_runner(command, **kwargs):
+        calls.append(command)
+        if "diff" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if len([call for call in calls if "ls-files" in call]) == 1:
+            return subprocess.CompletedProcess(command, 1, "", "transient")
+        return subprocess.CompletedProcess(command, 0, "manager/recovered.py\n", "")
+
+    with patch("manager.repo_write_enforcement.time.sleep") as sleep:
+        changed = collect_changed_paths("/fake/dir", "a" * 40, runner=fake_runner)
+    assert changed == ["manager/recovered.py"]
+    sleep.assert_called_once_with(0.25)
+
+
+def test_collect_changed_paths_still_fails_closed_after_retry():
+    def fake_runner(command, **kwargs):
+        if "diff" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(command, 1, "", "persistent")
+
+    with patch("manager.repo_write_enforcement.time.sleep"), pytest.raises(TaskError, match="git ls-files failed: persistent"):
+        collect_changed_paths("/fake/dir", "a" * 40, runner=fake_runner)
 
 
 # --- OWNER_MARKER_FILENAME exclusion (fix/repo-write-owner-marker-exclusion-20260826) --
