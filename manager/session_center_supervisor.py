@@ -37,15 +37,23 @@ import time
 from pathlib import Path
 
 from manager.codex_launcher import process_creation_identity, process_identity_state
-from manager.command_watcher import load_allowlist
+from manager.command_watcher import (
+    POLL_TIME_BUDGET_SECONDS,
+    WATCHER_DISCOVERY_TIMEOUT_SECONDS,
+    _enumerate_commands,
+    _enumerate_project_ids,
+    _rotated_project_ids,
+    load_allowlist,
+)
 from manager.dispatch_requests import dispatch_request_registry
 from manager.refresh_status import RefreshError, runtime_lock, write_atomic
-from manager.runtime_bridge import all_projects
 from manager.tasks import DriveRecords, TaskError
 from manager.trusted_ingress import verify_trusted_ingress_admission
 from manager.production_guard import RuntimeGuardError, require_runtime_guard
 
-ACTIVE_STATUSES = ("queued", "claimed", "running")
+# A queued Command has no provider process or Execution to correlate. Following
+# one lets an abandoned historical queue item occupy :8765 indefinitely.
+ACTIVE_STATUSES = ("claimed", "running")
 PORT_RECHECK_ATTEMPTS = 10
 PORT_RECHECK_INTERVAL_SECONDS = 0.2
 WATCHER_TASK_NAME = "AI Development Manager - Command Watcher"
@@ -156,19 +164,25 @@ def find_active_command(store, allowlist, bucket=None, ingress_registry_factory=
        queued/claimed/running.
     """
     candidates = []
+    deadline = time.monotonic() + POLL_TIME_BUDGET_SECONDS
     for project_id, task_id in sorted(allowlist):
         try:
-            commands = store.list_records("commands", project_id)
+            commands = _enumerate_commands(store, project_id, deadline=deadline)
         except TaskError:
             continue
         for record in commands:
             if record.get("task_id") == task_id and record.get("status") in ACTIVE_STATUSES:
                 candidates.append(record)
     if bucket:
-        for project in all_projects(store):
-            project_id = project["project_id"]
+        try:
+            project_ids = _rotated_project_ids(_enumerate_project_ids(store, deadline=deadline))
+        except TaskError:
+            project_ids = []
+        for project_id in project_ids:
+            if time.monotonic() >= deadline:
+                break
             try:
-                commands = store.list_records("commands", project_id)
+                commands = _enumerate_commands(store, project_id, deadline=deadline)
             except TaskError:
                 continue
             for record in commands:
@@ -352,7 +366,7 @@ def main(argv=None):
             )
             try:
                 from collectors.publish_drive import build_service
-                store = DriveRecords(build_service())
+                store = DriveRecords(build_service(timeout=WATCHER_DISCOVERY_TIMEOUT_SECONDS))
             except Exception:
                 result = {"status": "unavailable"}
             else:

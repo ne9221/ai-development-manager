@@ -1,7 +1,10 @@
+import json
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 
-from manager.quota_reader import summarize
+from manager.quota_reader import QuotaReaderError, read_local_status, summarize
 
 
 NOW = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)
@@ -29,6 +32,24 @@ def codex_item(remaining=90, updated=NOW):
         "windows": [{"name": "seven_day", "remaining_percent": remaining,
                      "used_percent": 100 - remaining, "resets_at": None}],
     }
+
+
+class LocalRuntimeStatusTests(unittest.TestCase):
+    def test_reads_only_schema_valid_local_runtime_truth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "status.json"
+            path.write_text(json.dumps({
+                "schema_version": "0.1.0", "generated_at": NOW.isoformat(),
+                "providers": [codex_item()],
+            }), encoding="utf-8")
+            self.assertEqual("codex", read_local_status(path)["providers"][0]["provider"])
+
+    def test_rejects_invalid_local_runtime_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "status.json"
+            path.write_text('{"providers": "not-a-list"}', encoding="utf-8")
+            with self.assertRaises(QuotaReaderError):
+                read_local_status(path)
 
 
 def doc(*providers):

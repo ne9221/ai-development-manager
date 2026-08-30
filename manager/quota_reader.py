@@ -76,6 +76,20 @@ def read_drive_status(service=None, folder_id=FOLDER_ID, schema_path=None, valid
         raise QuotaReaderError(f"Drive status read failed: {exc}") from exc
 
 
+def read_local_status(path=None, schema_path=None, validate_document=True):
+    """Read the refresh worker's local runtime status without inventing data."""
+    home = Path(os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
+    path = Path(path) if path is not None else home / "runtime" / "status.json"
+    schema_path = schema_path or Path(__file__).parents[1] / "schema" / "status.schema.json"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if validate_document:
+            validate_status(document, schema_path)
+        return apply_controlled_unavailability(document, os.environ.get("AI_MANAGER_HOME"))
+    except Exception as exc:
+        raise QuotaReaderError(f"local runtime status read failed: {exc}") from exc
+
+
 def _summarize_item(provider_id, display_name, item, now, max_age_minutes):
     updated = parse_time(item.get("last_updated"))
     age_minutes = None if updated is None else (now - updated).total_seconds() / 60

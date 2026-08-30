@@ -184,6 +184,23 @@ Describe "Dashboard single-instance lifecycle & focus" {
     }
 }
 
+Describe "Dashboard production checkout identity" {
+    BeforeEach {
+        Mock Get-NetTCPConnection { [pscustomobject]@{ OwningProcess = 1234 } }
+    }
+
+    It "accepts a listener launched with this checkout's absolute dashboard path" {
+        $expected = Join-Path $repository "dashboard.py"
+        Mock Get-CimInstance { [pscustomobject]@{ CommandLine = "python -m streamlit run `"$expected`" --server.port 8501" } }
+        Test-AdmDashboardRunning -RepositoryPath $repository | Should Be $true
+    }
+
+    It "rejects a live listener launched from a different checkout" {
+        Mock Get-CimInstance { [pscustomobject]@{ CommandLine = 'python -m streamlit run "C:\old-checkout\dashboard.py" --server.port 8501' } }
+        Test-AdmDashboardRunning -RepositoryPath $repository | Should Be $false
+    }
+}
+
 Describe "Shortcut installation (AI 開發管理器)" {
     BeforeEach {
         $script:testShortcutsRoot = Join-Path $TestDrive "shortcuts"

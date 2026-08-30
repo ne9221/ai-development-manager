@@ -89,17 +89,19 @@ function Start-AdmAllTasks {
 }
 
 function Test-AdmDashboardRunning {
-    param([int]$Port = $AdmDashboardPort)
+    param(
+        [int]$Port = $AdmDashboardPort,
+        [string]$RepositoryPath
+    )
     try {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $iar = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
-        $success = $iar.AsyncWaitHandle.WaitOne(400, $false)
-        if ($success -and $client.Connected) {
-            $client.EndConnect($iar)
-            $client.Close()
-            return $true
-        }
-        $client.Close()
+        $listener = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop | Select-Object -First 1
+        if (-not $listener) { return $false }
+        if (-not $RepositoryPath) { return $true }
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction Stop
+        $expectedScript = [IO.Path]::GetFullPath((Join-Path $RepositoryPath "dashboard.py"))
+        $commandLine = ([string]$process.CommandLine).Replace('/', '\')
+        return $commandLine.IndexOf($expectedScript, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+            $commandLine -match '(?i)-m\s+streamlit\s+run'
     } catch {}
     return $false
 }
@@ -110,8 +112,11 @@ function Start-AdmDashboardProcess {
         [string]$PythonPath = "C:\Users\EE\AppData\Local\Python\pythoncore-3.14-64\python.exe",
         [int]$Port = $AdmDashboardPort
     )
-    if (Test-AdmDashboardRunning -Port $Port) {
+    if (Test-AdmDashboardRunning -Port $Port -RepositoryPath $RepositoryPath) {
         return
+    }
+    if (Test-AdmDashboardRunning -Port $Port) {
+        throw "Dashboard port $Port is occupied by a process that is not this production checkout: $RepositoryPath"
     }
     if (-not (Test-Path -LiteralPath $PythonPath)) {
         $PythonPath = "python"
@@ -122,7 +127,7 @@ function Start-AdmDashboardProcess {
     }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $PythonPath
-    $psi.Arguments = "-m streamlit run dashboard.py --server.port $Port --server.headless true"
+    $psi.Arguments = "-m streamlit run `"$dashboardScript`" --server.port $Port --server.headless true"
     $psi.WorkingDirectory = $RepositoryPath
     $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
     $psi.CreateNoWindow = $true
@@ -131,7 +136,7 @@ function Start-AdmDashboardProcess {
 
     for ($i = 0; $i -lt 15; $i++) {
         Start-Sleep -Milliseconds 200
-        if (Test-AdmDashboardRunning -Port $Port) { break }
+        if (Test-AdmDashboardRunning -Port $Port -RepositoryPath $RepositoryPath) { break }
     }
 }
 

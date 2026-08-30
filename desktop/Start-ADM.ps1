@@ -22,7 +22,7 @@ try {
 Start-AdmAllTasks
 
 if (-not $env:ADM_SKIP_DASHBOARD_LAUNCH) {
-    if (Test-AdmDashboardRunning) {
+    if (Test-AdmDashboardRunning -RepositoryPath $repository) {
         Focus-AdmDashboard
     } else {
         Start-AdmDashboardProcess -RepositoryPath $repository

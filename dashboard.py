@@ -13,7 +13,7 @@ import pandas as pd
 from collectors.publish_drive import build_service
 from manager.tasks import DriveRecords
 from manager.overview import read_overview
-from manager.quota_reader import read_drive_status, summarize
+from manager.quota_reader import read_drive_status, read_local_status, summarize
 from manager.quota_history import get_default_quota_history_store
 from manager.gcs_lock_registry import BUCKET_ENV
 from manager.dispatch_requests import (
@@ -61,6 +61,7 @@ SUPERVISOR_TASK_NAME = "AI Development Manager - Session Center Supervisor"
 SESSION_CENTER_URL = "http://127.0.0.1:8765"
 DASHBOARD_PROJECT_ID = os.environ.get("ADM_DASHBOARD_PROJECT_ID", "ai-development-manager")
 RECENT_RECORD_LIMIT = 6
+DASHBOARD_DRIVE_REQUEST_TIMEOUT_SECONDS = 8
 # Bounded cap on how many recent dispatch-requests object names are listed
 # per project for the pre-Task ("VISIBLE_BEFORE_TASK") Dashboard rows below
 # -- a single bounded GCS prefix listing, never a full-history scan. See
@@ -323,7 +324,7 @@ def load_task_handoff_from_store(project_id: str, task_id: str):
     if not project_id or not task_id:
         return {"status": READ_STATUS_OK, "records": [], "error": None}
     try:
-        service = build_service()
+        service = build_service(timeout=DASHBOARD_DRIVE_REQUEST_TIMEOUT_SECONDS)
         store = DriveRecords(service)
     except Exception as exc:
         return {"status": READ_STATUS_UNKNOWN, "records": [], "error": summarize_drive_read_error(exc)}
@@ -430,7 +431,9 @@ def load_all_data(include_all_projects=False):
     now = datetime.now(timezone.utc)
     all_warnings = []
     try:
-        service = build_service()
+        # Dashboard reads are independently degradable and must never inherit
+        # the 45s write transport timeout used by lifecycle writers.
+        service = build_service(timeout=DASHBOARD_DRIVE_REQUEST_TIMEOUT_SECONDS)
         store = DriveRecords(service)
 
         # Load Quota Document
@@ -441,7 +444,13 @@ def load_all_data(include_all_projects=False):
             quota_summary = summarize(quota_doc, max_age_minutes=60, now=now)
         except Exception as q_exc:
             all_warnings.append(f"Drive quota status read warning: {q_exc}")
-            quota_summary = summarize({}, max_age_minutes=60, now=now)
+            try:
+                quota_doc = read_local_status()
+                quota_summary = summarize(quota_doc, max_age_minutes=60, now=now)
+                all_warnings.append("Drive quota status unavailable; using validated local runtime status.")
+            except Exception as local_exc:
+                all_warnings.append(f"Local runtime quota status read warning: {local_exc}")
+                quota_summary = summarize({}, max_age_minutes=60, now=now)
 
         # Load Quota Telemetry History (Fail-safe)
         history_snapshots = []

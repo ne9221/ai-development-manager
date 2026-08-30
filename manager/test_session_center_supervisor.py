@@ -111,7 +111,7 @@ class WatcherMaintenanceTests(unittest.TestCase):
         self.assertNotIn("enable_task", source)
 
 
-def cmd(command_id="c1", project_id="p1", task_id="t1", status="queued", execution_id=None, created_at="2026-08-14T00:00:00Z"):
+def cmd(command_id="c1", project_id="p1", task_id="t1", status="claimed", execution_id=None, created_at="2026-08-14T00:00:00Z"):
     return {"command_id": command_id, "project_id": project_id, "task_id": task_id,
             "status": status, "execution_id": execution_id, "created_at": created_at}
 
@@ -128,6 +128,10 @@ class FindActiveCommandTests(unittest.TestCase):
 
     def test_terminal_commands_are_never_candidates(self):
         store = Store({"p1": [cmd(status="completed"), cmd(command_id="c2", status="failed")]})
+        self.assertIsNone(find_active_command(store, frozenset({("p1", "t1")})))
+
+    def test_queued_command_without_provider_execution_is_not_a_session_target(self):
+        store = Store({"p1": [cmd(status="queued")]})
         self.assertIsNone(find_active_command(store, frozenset({("p1", "t1")})))
 
     def test_most_recently_created_active_command_wins(self):
@@ -178,6 +182,7 @@ class FindActiveCommandTrustedIngressTests(unittest.TestCase):
     @staticmethod
     def admitted_command(**overrides):
         value = ingress_command(created_via="direct_dispatch_ingress", admission_version="v1", request_id="req-1")
+        value["status"] = "claimed"
         value.update(overrides)
         return value
 
@@ -185,7 +190,7 @@ class FindActiveCommandTrustedIngressTests(unittest.TestCase):
         """Requirement A: an ordinary allowlisted command (no trusted-ingress
         evidence at all) must still be discovered exactly as before, whether
         or not a GCS bucket is now also configured."""
-        self.store.put("commands", "p1", "cmd-1", ingress_command())
+        self.store.put("commands", "p1", "cmd-1", ingress_command(status="claimed"))
         result = find_active_command(self.store, frozenset({("p1", "t1")}), bucket="test-bucket",
                                      ingress_registry_factory=self.registry_factory)
         self.assertEqual("cmd-1", result["command_id"])
