@@ -1076,10 +1076,20 @@ def _enumerate_waiting_quota_tasks(store, project_id, deadline=None):
     signature (see _promote_waiting_quota_task()'s docstring for why
     recommended_provider is None AND quota_evidence is not None is the only
     non-guessed way to identify it) happens here, once, so callers never
-    duplicate that evidence check."""
+    duplicate that evidence check.
+
+    Forwards the same wall-clock-derived `rotate_offset` _enumerate_commands
+    already does (see `_within_project_record_rotation_offset`'s own
+    docstring): without it, a project whose Tasks backlog exceeds one
+    tick's bounded hydration budget can permanently strand its own
+    waiting_quota Task past every tick's cutoff -- live-reproduced (a real
+    v2-repo-write waiting_quota Task in ai-development-manager sat
+    unpromoted for 40+ minutes across many natural ticks with confirmed-
+    fresh codex quota available the whole time)."""
     if hasattr(store, "list_records_bounded"):
         tasks = store.list_records_bounded("tasks", project_id, deadline=deadline,
-                                            single_request_worst_case=WATCHER_DISCOVERY_TIMEOUT_SECONDS)
+                                            single_request_worst_case=WATCHER_DISCOVERY_TIMEOUT_SECONDS,
+                                            rotate_offset=_within_project_record_rotation_offset())
     else:
         tasks = store.list_records("tasks", project_id)
     return [task for task in tasks

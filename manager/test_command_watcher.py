@@ -2070,6 +2070,36 @@ class WithinProjectRecordRotationTests(unittest.TestCase):
 
         self.assertEqual([{"command_id": "c1", "project_id": "p1"}], _enumerate_commands(PlainStore(), "p1"))
 
+    def test_enumerate_waiting_quota_tasks_forwards_a_time_derived_rotate_offset(self):
+        """_enumerate_waiting_quota_tasks is documented as "the exact mirror
+        of _enumerate_commands() above" but, unlike it, never forwarded a
+        rotate_offset -- so a project whose Tasks backlog exceeds one tick's
+        bounded hydration budget can permanently strand its own waiting_quota
+        Task past every tick's cutoff, exactly the same starvation class
+        _enumerate_commands was already fixed for. Live-reproduced: a real
+        v2-repo-write waiting_quota Task in the ai-development-manager
+        project sat unpromoted for 40+ minutes across many natural ticks,
+        with confirmed-fresh codex quota available the whole time."""
+        from manager.command_watcher import _enumerate_waiting_quota_tasks
+
+        class FakeBoundedStore:
+            def __init__(self):
+                self.calls = []
+
+            def list_records_bounded(self, area, project_id, **kwargs):
+                self.calls.append((area, project_id, kwargs))
+                return []
+
+        store = FakeBoundedStore()
+        with patch("manager.command_watcher._within_project_record_rotation_offset", return_value=42):
+            _enumerate_waiting_quota_tasks(store, "p1", deadline=100.0)
+
+        self.assertEqual(1, len(store.calls))
+        area, project_id, kwargs = store.calls[0]
+        self.assertEqual("tasks", area)
+        self.assertEqual("p1", project_id)
+        self.assertEqual(42, kwargs["rotate_offset"])
+
 
 class BoundedCommandEnumerationLifecycleSafetyTests(unittest.TestCase):
     """Covers the P0 fix using a real DriveRecords + fake Drive backend
