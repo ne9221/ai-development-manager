@@ -14,7 +14,7 @@ from collectors.publish_drive import build_service
 from manager.claude_account_selector import load_claude_accounts
 from manager.ag_runner import AgRunner
 from manager.claude_launcher import ClaudeLauncher
-from manager.codex_launcher import CodexLauncher, process_identity_state
+from manager.codex_launcher import CodexLauncher, process_creation_identity, process_identity_state
 from manager.execution_lifecycle import terminalize_execution
 from manager.execution_runner import launch_task
 from manager.open_existing_adm_ui import focus_existing_adm_ui
@@ -24,7 +24,8 @@ from manager.governance import validate_task_enforcement
 from manager.quota_reader import read_drive_status, summarize
 from manager.runtime_bridge import all_projects
 from manager.runtime_supervisor import try_check_and_recover
-from manager.task_claims import check_task_execution_claim, task_claim_registry
+from manager.task_claims import (check_task_execution_claim, release_task_execution_claim,
+                                  task_claim_registry, TaskClaimConflict)
 from manager.tasks import DriveRecords, TaskError, now_iso, validate
 from manager.trusted_ingress import (
     ADMISSION_VERSION_V1, REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN, task_policy_satisfied,
@@ -402,6 +403,113 @@ def _reconcile_terminal_writer_lease(store, command, execution):
     )
 
 
+def _release_orphan_pre_execution_claim(store, command, claim_registry):
+    """Autonomous recovery for a GCS task claim whose owning worker crashed
+    before it could write its Execution record.
+
+    Safety fences (all must be satisfied before any CAS delete is attempted):
+      1. CLAIM_TIMEOUT_SECONDS already elapsed (caller's responsibility --
+         checked by _claim_expired before this is ever called).
+      2. No Execution record exists for the claimed execution_id (caller's
+         responsibility -- checked by _reconcile_active's TaskError path).
+      3. The current GCS claim still names exactly the same execution_id
+         this Command carries -- a newer owner having replaced the claim
+         (claim["execution_id"] != command["execution_id"]) is NOT an orphan
+         from this command's point of view; leave it alone.
+      4. No Session record exists for the task -- any Session is evidence
+         the worker advanced past reserve_execution() (possibly just before
+         crashing with the Execution write pending), so the state is
+         ambiguous and unsafe to auto-release.
+      5. CAS delete (delete_if_generation_matches) -- generation-locked,
+         ABA-safe, idempotent across concurrent reconcilers: if two watcher
+         ticks race here, exactly one will win the GCS precondition; the
+         loser sees TaskClaimConflict and falls back to attention (correct
+         -- the winner already requeued the Command).
+
+    On success: CAS-releases the GCS claim, resets the Command back to
+    `queued` (execution_id=None, claimed_at=None) with recovery provenance
+    so the next natural watcher tick can re-admit and launch it.
+    Returns a process_command-compatible outcome dict.
+    """
+    try:
+        existing = check_task_execution_claim(claim_registry, command["project_id"], command["task_id"])
+    except TaskError:
+        return _attention(store, command, None, "execution_record_missing_claim_state_unknown")
+    if existing is None:
+        # Claim is already gone (earlier tick released it, or worker
+        # released normally after all). Treat the same as the no-claim path:
+        # terminalize as claim_timeout so the Command isn't left claimed.
+        failed = _terminal(command, "failed", _result("error", command["execution_id"], error_kind="claim_timeout"))
+        _write(store, failed)
+        return {"status": "failed", "reconciled": True}
+    # Fence 3: execution_id must match exactly.
+    if existing.get("execution_id") != command.get("execution_id"):
+        # A newer execution already claimed the slot; our command is stale.
+        return _attention(store, command, None, "execution_record_missing_claim_replaced_by_newer")
+    # Fence 4: absence of any Session for this task/project is required.
+    # A Session record is evidence the worker progressed past reserve_execution();
+    # do not release a potentially-active claim in that case.
+    try:
+        sessions = store.list_records("sessions", command["project_id"])
+        task_sessions = [s for s in sessions if s.get("task_id") == command["task_id"]]
+    except (TaskError, Exception):  # noqa: BLE001 -- session check is best-effort; ambiguity → refuse
+        task_sessions = [object()]  # non-empty → refuse
+    if task_sessions:
+        return _attention(store, command, None, "execution_record_missing_session_evidence_present")
+    # Fence 5: Worker liveness check.
+    # Worker identity (PID + creation identity) must be known. If unknown (e.g. legacy
+    # record), fail closed to avoid releasing a claim for a running unmonitored worker.
+    worker_pid = command.get("worker_pid")
+    worker_creation = command.get("worker_creation_identity")
+    if worker_pid is None:
+        return _attention(store, command, None, "execution_record_missing_claim_retained_worker_liveness_unknown")
+    worker_state = process_identity_state(worker_pid, worker_creation)
+    if worker_state == "live":
+        return _attention(store, command, None, "execution_record_missing_worker_process_live")
+    if worker_state == "unknown":
+        return _attention(store, command, None, "execution_record_missing_worker_state_unknown")
+    if worker_state not in ("stopped", "replaced"):
+        return _attention(store, command, None, f"execution_record_missing_worker_{worker_state}")
+    # Fence 6: CAS delete — generation-locked, safe for concurrent reconcilers.
+    try:
+        released = release_task_execution_claim(
+            claim_registry, command["project_id"], command["task_id"],
+            existing["execution_id"], existing["generation"],
+        )
+    except TaskClaimConflict:
+        # Another reconciler won the race; our command will be re-read on the
+        # next tick with a fresh (correct) state. Surface attention so this
+        # tick doesn't pretend to have done anything it didn't.
+        return _attention(store, command, None, "orphan_claim_recovery_concurrent_release")
+    except TaskError:
+        return _attention(store, command, None, "execution_record_missing_claim_state_unknown")
+    if not released.get("released"):
+        # release_task_execution_claim returned False (e.g. claim was already
+        # gone by the time it checked) -- safe no-op; fail the command out
+        # to avoid it looping as claimed with no execution forever.
+        failed = _terminal(command, "failed", _result("error", command["execution_id"], error_kind="claim_timeout"))
+        _write(store, failed)
+        return {"status": "failed", "reconciled": True}
+    # Claim CAS-released. Reset Command to queued with recovery provenance
+    # so the next natural watcher tick can re-admit and launch it.
+    requeued = {
+        **command,
+        "status": "queued",
+        "execution_id": None,
+        "claimed_at": None,
+        "completed_at": None,
+        "result": None,
+        "worker_pid": None,
+        "worker_creation_identity": None,
+        "worker_spawned_at": None,
+        "stale_at": command.get("stale_at") or now_iso(),
+        "recovery_reason": "orphaned_pre_execution_claim_released",
+    }
+    validate("command", requeued)
+    _write(store, requeued)
+    return {"status": "queued", "reconciled": True, "orphan_claim_released": True}
+
+
 def _reconcile_active(store, service, command, claim_factory):
     try:
         execution = store.get("executions", command["project_id"], command["execution_id"])
@@ -411,15 +519,10 @@ def _reconcile_active(store, service, command, claim_factory):
             return {"status": "claimed", "skipped": True}
         if command["status"] == "claimed" and _claim_expired(command):
             try:
-                claim = check_task_execution_claim(
-                    _claim_registry(command, claim_factory), command["project_id"], command["task_id"])
+                claim_registry = _claim_registry(command, claim_factory)
             except TaskError:
                 return _attention(store, command, None, "execution_record_missing_claim_state_unknown")
-            if claim is not None:
-                return _attention(store, command, None, "execution_record_missing_claim_retained")
-            failed = _terminal(command, "failed", _result("error", command["execution_id"], error_kind="claim_timeout"))
-            _write(store, failed)
-            return {"status": "failed", "reconciled": True}
+            return _release_orphan_pre_execution_claim(store, command, claim_registry)
         return _attention(store, command, None, "execution_record_missing_or_invalid")
 
     try:
@@ -531,7 +634,17 @@ def _reconcile_active(store, service, command, claim_factory):
 def _claim_expired(command, now=None):
     try:
         claimed = datetime.fromisoformat(command["claimed_at"].replace("Z", "+00:00"))
-        return (now or datetime.now(timezone.utc) - claimed).total_seconds() > CLAIM_TIMEOUT_SECONDS
+        # Parenthesise the `or` operands explicitly: without parens Python
+        # binds `-` tighter than `or`, so the original
+        # `now or datetime.now(timezone.utc) - claimed` would be parsed as
+        # `now or (datetime.now(timezone.utc) - claimed)` -- fine when
+        # now=None (evaluates the timedelta sub-expression), but when now IS
+        # a datetime the expression short-circuits to the datetime itself and
+        # `.total_seconds()` raises AttributeError (datetime has no such
+        # method), caught below and returning True (wrong: every injected-now
+        # claim appears expired). Fix: force the operands of `or` to be the
+        # two datetime values, so the subtraction always produces a timedelta.
+        return ((now or datetime.now(timezone.utc)) - claimed).total_seconds() > CLAIM_TIMEOUT_SECONDS
     except (AttributeError, TypeError, ValueError):
         return True
 
@@ -800,6 +913,16 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     if async_launch:
         try:
             worker_pid = _spawn_claimed_worker(claimed)
+            worker_creation = process_creation_identity(worker_pid) if worker_pid else None
+            worker_spawned_at = now_iso()
+            claimed_with_worker = {
+                **claimed,
+                "worker_pid": worker_pid,
+                "worker_creation_identity": worker_creation,
+                "worker_spawned_at": worker_spawned_at,
+            }
+            validate("command", claimed_with_worker)
+            _write(store, claimed_with_worker)
             return {"status": "claimed", "execution_id": claimed["execution_id"], "worker_pid": worker_pid}
         except Exception as exc:
             kind = getattr(exc, "classification", None) or type(exc).__name__

@@ -31,6 +31,9 @@
     "created_via": {"type": "string", "maxLength": 80, "description": "Server-stamped provenance, e.g. 'direct_dispatch_ingress'; never taken verbatim from an external caller's request payload."},
     "admission_version": {"type": "string", "maxLength": 20, "description": "Safe Auto-Admission contract version this record was stamped under, for the Command Watcher's trusted-ingress verification."},
     "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$", "description": "External request identity, used to cross-check against the ingress idempotency record; not launch/account authority."},
+    "worker_pid": {"type": ["integer", "null"], "minimum": 1, "description": "PID of the detached command_watcher_worker process spawned for async execution."},
+    "worker_creation_identity": {"type": ["string", "null"], "minLength": 1, "maxLength": 200, "description": "Platform creation identity of the spawned worker process for ABA-safe liveness checks."},
+    "worker_spawned_at": {"type": ["string", "null"], "format": "date-time", "description": "Timestamp when the detached worker was spawned."},
     "process_provenance": {
       "type": "object",
       "additionalProperties": false,
