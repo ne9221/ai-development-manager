@@ -398,6 +398,42 @@ class BucketRouteRecentSweepTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual("stale-1", result["command_id"])
 
+    def test_recent_sweep_runs_before_the_allowlist_loops_own_historical_scan(self):
+        """The static allowlist loop's per-entry historical fetch
+        (_enumerate_commands) can itself be expensive for a project with a
+        large backlog -- if it always ran BEFORE the bucket route's cheap
+        recent-sweep, it could consume the whole shared `deadline` before
+        the recent-sweep (what the cold-start fallback actually depends
+        on) ever got a chance to run at all. Live HOME reproduction (Gate
+        3 activation, 2026-08-30): the allowlist's own
+        'ai-development-manager' entry's historical fetch alone took
+        30.05s of the 40s shared budget, leaving the bucket route's
+        recent-sweep so little time that it returned empty for that exact
+        project when it finally got there -- find_active_command()
+        returned None on multiple consecutive real ticks as a direct
+        result. This asserts the fix as a call-order invariant, not a
+        timing simulation: the recent sweep must be attempted before the
+        allowlist loop's own historical scan, regardless of how long
+        either one actually takes on a given tick."""
+        order = []
+
+        def historical(store, project_id, deadline=None):
+            order.append(("historical", project_id))
+            return []
+
+        def recent(store, project_id, deadline=None):
+            order.append(("recent", project_id))
+            return []
+
+        with patch("manager.session_center_supervisor._enumerate_commands", side_effect=historical), \
+             patch("manager.session_center_supervisor._enumerate_recent_commands", side_effect=recent), \
+             patch("manager.session_center_supervisor._enumerate_project_ids", return_value=["p1"]), \
+             patch("manager.session_center_supervisor._rotated_project_ids", side_effect=lambda ids, now=None: ids):
+            find_active_command(Store({}), frozenset({("p1", "some-task")}), bucket="test-bucket")
+        self.assertTrue(order, "expected at least one discovery call")
+        self.assertEqual("recent", order[0][0],
+                         f"the recent sweep must run before the allowlist loop's historical scan, got order={order}")
+
     def test_recent_sweep_never_double_admits_when_historical_sweep_sees_the_same_record(self):
         """A record the recent sweep already classified as active must not
         cause any error or double-admission surprise when the historical

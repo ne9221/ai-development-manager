@@ -208,6 +208,36 @@ def find_active_command(store, allowlist, bucket=None, ingress_registry_factory=
                 store, record, allowlist, bucket, ingress_registry_factory):
             queued_candidates.append(record)
 
+    # Bucket-route recent-sweep runs FIRST, before either historical scan
+    # below -- deliberately, not incidentally. The static allowlist loop's
+    # own per-entry historical fetch can itself be expensive for a project
+    # with a large backlog (it hydrates as much as the shared `deadline`
+    # allows, looking for just one task_id); if it ran first, it could
+    # consume nearly the whole budget before the recent-sweep -- what the
+    # cold-start fallback actually depends on -- ever got a chance to run
+    # at all. Live HOME reproduction (Gate 3 activation, 2026-08-30): the
+    # allowlist's own 'ai-development-manager' entry's historical fetch
+    # alone took 30 of the 40s shared budget, so the recent-sweep that ran
+    # afterward had almost nothing left and returned empty for that exact
+    # project -- find_active_command() returned None on multiple
+    # consecutive real ticks as a direct result.
+    bucket_project_ids = []
+    if bucket:
+        try:
+            bucket_project_ids = _rotated_project_ids(_enumerate_project_ids(store, deadline=deadline))
+        except TaskError:
+            bucket_project_ids = []
+        recent_deadline = min(deadline, time.monotonic() + RECENT_COMMAND_SWEEP_BUDGET_SECONDS)
+        for project_id in bucket_project_ids:
+            if time.monotonic() >= recent_deadline:
+                break
+            try:
+                commands = _enumerate_recent_commands(store, project_id, deadline=recent_deadline)
+            except TaskError:
+                continue
+            for record in commands:
+                classify_bucket_record(project_id, record)
+
     for project_id, task_id in sorted(allowlist):
         try:
             commands = _enumerate_commands(store, project_id, deadline=deadline)
@@ -221,22 +251,9 @@ def find_active_command(store, allowlist, bucket=None, ingress_registry_factory=
             elif record.get("status") == "queued" and queued_command_pending_only_health(
                     store, record, allowlist, bucket, ingress_registry_factory):
                 queued_candidates.append(record)
+
     if bucket:
-        try:
-            project_ids = _rotated_project_ids(_enumerate_project_ids(store, deadline=deadline))
-        except TaskError:
-            project_ids = []
-        recent_deadline = min(deadline, time.monotonic() + RECENT_COMMAND_SWEEP_BUDGET_SECONDS)
-        for project_id in project_ids:
-            if time.monotonic() >= recent_deadline:
-                break
-            try:
-                commands = _enumerate_recent_commands(store, project_id, deadline=recent_deadline)
-            except TaskError:
-                continue
-            for record in commands:
-                classify_bucket_record(project_id, record)
-        for project_id in project_ids:
+        for project_id in bucket_project_ids:
             if time.monotonic() >= deadline:
                 break
             try:
