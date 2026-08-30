@@ -1691,6 +1691,9 @@ class AsyncClaimContinuationTests(unittest.TestCase):
         persisted = self.store.get("commands", "p1", "cmd-1")
         self.assertEqual("claimed", persisted["status"])
         self.assertEqual("command-cmd-1", persisted["execution_id"])
+        self.assertEqual(4242, persisted.get("worker_pid"))
+        self.assertIsNotNone(persisted.get("worker_spawned_at"))
+        validate("command", persisted)
 
 
 class PollOnceTimeBudgetTests(unittest.TestCase):
@@ -2926,6 +2929,344 @@ class Phase1BudgetCapTests(unittest.TestCase):
 
         self.assertEqual([], results)
         self.assertEqual("queued", store.get("commands", "p1", "cmd-1")["status"])
+
+
+class OrphanClaimRecoveryTests(unittest.TestCase):
+    """P0-2: autonomous recovery for orphaned pre-execution GCS claims.
+
+    Complete test matrix (A through J) as specified in requirements:
+      A. expired + exact claim + no Execution + worker dead -> release + requeue
+      B. worker still alive -> do not release (fail closed)
+      C. PID reused / creation identity mismatch -> worker proven dead -> release + requeue
+      D. worker identity unknown (e.g. legacy command) -> fail closed (do not release)
+      E. matching Session/provider evidence exists -> do not release
+      F. newer claim generation / different execution owner -> stale recovery does not release
+      G. two concurrent reconcilers -> exactly one CAS wins, other does not double-requeue
+      H. CAS backend transient error -> fail closed, do not requeue
+      I. release succeeded -> next watcher tick can cleanly re-claim and execute
+      J. _claim_expired(now=datetime) deterministic time-injection correctness
+    """
+
+    ALLOWLIST = frozenset({("p1", "t1")})
+
+    @staticmethod
+    def allowlist_compliant_store():
+        store = Store()
+        from manager.test_execution_lifecycle import project, task
+        from manager.tasks import create_project, create_task
+        create_project(store, project())
+        create_task(store, task(read_only=True), assign=False)
+        compliant = store.get("tasks", "p1", "t1")
+        compliant["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)
+        store.put("tasks", "p1", "t1", compliant)
+        return store
+
+    def _orphan_claimed_command(self, worker_pid=99999999, worker_creation_identity="dead-worker-creation-id"):
+        """A claimed Command whose claim_timeout has already elapsed, with
+        worker identity recorded. Default PID 99999999 is dead on any normal system."""
+        cmd = command(
+            status="claimed",
+            execution_id="command-cmd-1",
+            claimed_at="2000-01-01T00:00:00Z",  # well past CLAIM_TIMEOUT_SECONDS
+            worker_pid=worker_pid,
+            worker_creation_identity=worker_creation_identity,
+            worker_spawned_at="2000-01-01T00:00:00Z",
+        )
+        return cmd
+
+    def _pre_seeded_claim_registry(self, execution_id="command-cmd-1"):
+        """A MemoryClaimRegistry with the orphan claim already written."""
+        registry = MemoryClaimRegistry()
+        from manager.task_claims import claim_task_execution
+        claim_task_execution(registry, "p1", "t1", execution_id, "codex", "2000-01-01T00:00:00Z")
+        return registry
+
+    # -------------------------------------------------------------------
+    # Test A: expired + exact claim + no Execution + worker dead -> release + requeue
+    # -------------------------------------------------------------------
+
+    def test_A_expired_orphan_claim_worker_dead_releases_and_requeues(self):
+        store = self.allowlist_compliant_store()
+        cmd = self._orphan_claimed_command(worker_pid=99999999, worker_creation_identity="dead-worker")
+        store.put("commands", "p1", "cmd-1", cmd)
+
+        registry = self._pre_seeded_claim_registry()
+        result = process_command(store, object(), cmd, claim_factory=lambda *_: registry)
+
+        self.assertEqual("queued", result["status"])
+        self.assertTrue(result.get("orphan_claim_released"))
+        stored = store.get("commands", "p1", "cmd-1")
+        self.assertEqual("queued", stored["status"])
+        self.assertIsNone(registry.document, "GCS claim must be CAS-released")
+        self.assertEqual("orphaned_pre_execution_claim_released", stored.get("recovery_reason"))
+        self.assertIsNone(stored.get("execution_id"))
+        self.assertIsNone(stored.get("claimed_at"))
+        self.assertIsNone(stored.get("worker_pid"))
+        self.assertIsNone(stored.get("worker_creation_identity"))
+        self.assertIsNone(stored.get("worker_spawned_at"))
+
+    # -------------------------------------------------------------------
+    # Test B: worker still alive -> do not release
+    # -------------------------------------------------------------------
+
+    def test_B_worker_still_alive_refuses_release(self):
+        store = self.allowlist_compliant_store()
+        live_pid = os.getpid()
+        live_identity = process_creation_identity(live_pid)
+        cmd = self._orphan_claimed_command(worker_pid=live_pid, worker_creation_identity=live_identity)
+        store.put("commands", "p1", "cmd-1", cmd)
+
+        registry = self._pre_seeded_claim_registry()
+        result = process_command(store, object(), cmd, claim_factory=lambda *_: registry)
+
+        self.assertEqual("attention", result["status"])
+        self.assertEqual("execution_record_missing_worker_process_live", result["recovery_reason"])
+        self.assertIsNotNone(registry.document, "Claim must not be released while worker is live")
+        stored = store.get("commands", "p1", "cmd-1")
+        self.assertEqual("attention", stored["status"])
+
+    # -------------------------------------------------------------------
+    # Test C: PID reused / creation identity mismatch -> worker dead -> release + requeue
+    # -------------------------------------------------------------------
+
+    def test_C_pid_reused_creation_identity_mismatch_proves_worker_dead(self):
+        store = self.allowlist_compliant_store()
+        # Use our own live PID, but with an old/different creation identity (simulating PID reuse)
+        cmd = self._orphan_claimed_command(worker_pid=os.getpid(), worker_creation_identity="old-defunct-identity:12345")
+        store.put("commands", "p1", "cmd-1", cmd)
+
+        registry = self._pre_seeded_claim_registry()
+        result = process_command(store, object(), cmd, claim_factory=lambda *_: registry)
+
+        self.assertEqual("queued", result["status"])
+        self.assertTrue(result.get("orphan_claim_released"))
+        self.assertIsNone(registry.document, "Claim must be released when creation identity mismatch proves dead")
+        stored = store.get("commands", "p1", "cmd-1")
+        self.assertEqual("queued", stored["status"])
+
+    # -------------------------------------------------------------------
+    # Test D: worker identity unknown -> fail closed (do not release)
+    # -------------------------------------------------------------------
+
+    def test_D_worker_identity_unknown_fails_closed(self):
+        store = self.allowlist_compliant_store()
+        # Legacy record without worker_pid / worker_creation_identity
+        cmd = command(
+            status="claimed",
+            execution_id="command-cmd-1",
+            claimed_at="2000-01-01T00:00:00Z",
+        )
+        store.put("commands", "p1", "cmd-1", cmd)
+
+        registry = self._pre_seeded_claim_registry()
+        result = process_command(store, object(), cmd, claim_factory=lambda *_: registry)
+
+        self.assertEqual("attention", result["status"])
+        self.assertEqual("execution_record_missing_claim_retained_worker_liveness_unknown", result["recovery_reason"])
+        self.assertIsNotNone(registry.document, "Claim must not be released when worker liveness is unknown")
+        stored = store.get("commands", "p1", "cmd-1")
+        self.assertEqual("attention", stored["status"])
+
+    # -------------------------------------------------------------------
+    # Test E: matching Session/provider evidence exists -> do not release
+    # -------------------------------------------------------------------
+
+    def test_E_session_evidence_present_refuses_recovery(self):
+        store = self.allowlist_compliant_store()
+        cmd = self._orphan_claimed_command(worker_pid=99999999, worker_creation_identity="dead-worker")
+        store.put("commands", "p1", "cmd-1", cmd)
+
+        from manager.session_identity import manager_session_key
+        session_id = manager_session_key("codex", "test-provider-session-001")
+        store.put("sessions", "p1", session_id, {
+            "session_id": session_id, "provider": "codex",
+            "provider_session_id": "test-provider-session-001",
+            "account_id": None,
+            "project_id": "p1", "task_id": "t1",
+            "conversation_label": None, "title": None, "summary": None,
+            "started_at": "2000-01-01T00:00:00Z", "updated_at": "2000-01-01T00:00:00Z",
+            "working_directory": None, "repository": None,
+            "source_identifier": "test-provider-session-001",
+            "source_path": None,
+            "classification_method": "working_directory",
+            "classification_confidence": "high",
+            "classification_status": "classified",
+            "status": "active", "message_count": 0,
+            "model": None, "first_user_prompt": None,
+        })
+
+        registry = self._pre_seeded_claim_registry()
+        result = process_command(store, object(), cmd, claim_factory=lambda *_: registry)
+
+        self.assertEqual("attention", result["status"])
+        self.assertEqual("execution_record_missing_session_evidence_present", result["recovery_reason"])
+        self.assertIsNotNone(registry.document, "Claim must not be released when session evidence exists")
+        stored = store.get("commands", "p1", "cmd-1")
+        self.assertEqual("attention", stored["status"])
+
+    # -------------------------------------------------------------------
+    # Test F: newer claim generation / different execution owner -> refuse release
+    # -------------------------------------------------------------------
+
+    def test_F_newer_claim_owner_or_generation_refuses_stale_release(self):
+        store = self.allowlist_compliant_store()
+        cmd = self._orphan_claimed_command(worker_pid=99999999, worker_creation_identity="dead-worker")
+        store.put("commands", "p1", "cmd-1", cmd)
+
+        # Registry has a different execution_id (newer owner)
+        registry = self._pre_seeded_claim_registry(execution_id="command-cmd-NEWER")
+        result = process_command(store, object(), cmd, claim_factory=lambda *_: registry)
+
+        self.assertEqual("attention", result["status"])
+        self.assertEqual("execution_record_missing_claim_replaced_by_newer", result["recovery_reason"])
+        self.assertIsNotNone(registry.document, "Claim owned by different execution must not be deleted")
+
+    # -------------------------------------------------------------------
+    # Test G: two concurrent reconcilers -> only one CAS wins
+    # -------------------------------------------------------------------
+
+    def test_G_concurrent_reconciliation_only_one_cas_wins(self):
+        import threading
+        store = self.allowlist_compliant_store()
+        cmd = self._orphan_claimed_command(worker_pid=99999999, worker_creation_identity="dead-worker")
+        store.put("commands", "p1", "cmd-1", cmd)
+
+        registry = self._pre_seeded_claim_registry()
+        results = []
+        errors = []
+
+        def reconcile():
+            try:
+                r = process_command(store, object(), cmd, claim_factory=lambda *_: registry)
+                results.append(r["status"])
+            except Exception as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=reconcile)
+        t2 = threading.Thread(target=reconcile)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        self.assertEqual([], errors, f"concurrent recovery raised: {errors}")
+        self.assertIsNone(registry.document, "GCS claim must be deleted exactly once")
+        self.assertIn("queued", results, "At least one reconciler must have successfully requeued")
+        stored = store.get("commands", "p1", "cmd-1")
+        self.assertEqual("queued", stored["status"])
+
+    # -------------------------------------------------------------------
+    # Test H: CAS backend transient error -> fail closed, do not requeue
+    # -------------------------------------------------------------------
+
+    def test_H_backend_unavailable_fails_closed_without_requeue(self):
+        store = self.allowlist_compliant_store()
+        cmd = self._orphan_claimed_command(worker_pid=99999999, worker_creation_identity="dead-worker")
+        store.put("commands", "p1", "cmd-1", cmd)
+
+        registry = self._pre_seeded_claim_registry()
+        registry.unavailable = True  # simulate GCS 5xx / connection failure
+
+        result = process_command(store, object(), cmd, claim_factory=lambda *_: registry)
+
+        self.assertEqual("attention", result["status"])
+        self.assertIn("claim", result["recovery_reason"])
+        stored = store.get("commands", "p1", "cmd-1")
+        self.assertNotEqual("queued", stored["status"], "Command must not be requeued on backend error")
+
+    # -------------------------------------------------------------------
+    # Test I: release succeeded -> next watcher tick can cleanly re-claim and execute
+    # -------------------------------------------------------------------
+
+    def test_I_requeued_command_executes_cleanly_on_next_tick(self):
+        store = self.allowlist_compliant_store()
+        cmd = self._orphan_claimed_command(worker_pid=99999999, worker_creation_identity="dead-worker")
+        store.put("commands", "p1", "cmd-1", cmd)
+
+        registry = self._pre_seeded_claim_registry()
+
+        # Tick 1: Reconcile orphaned claim
+        res1 = process_command(store, object(), cmd, claim_factory=lambda *_: registry)
+        self.assertEqual("queued", res1["status"])
+        self.assertIsNone(registry.document)
+
+        # Tick 2: Next watcher poll cycle executes requeued command
+        new_registry = MemoryClaimRegistry()
+        runner = Mock(side_effect=lambda *args, **kwargs: (
+            kwargs["on_running"](None),
+            {"terminal": {"execution": {"status": "completed"}},
+             "session": {"session_id": "codex:test-session-2"},
+             "execution_id": args[7],
+             "dispatch": {"provider": "codex", "model": None, "fallback_model": None,
+                          "mode": "code", "effort": "medium",
+                          "selection_reason": ["fresh quota"],
+                          "quota_evidence": {"codex": {"freshness": "fresh"}},
+                          "account_id": None}},
+        )[1])
+
+        with patch("manager.command_watcher.launch_task", runner):
+            requeued = store.get("commands", "p1", "cmd-1")
+            res2 = process_command(
+                store, object(), requeued,
+                claim_factory=lambda *_: new_registry,
+                allowlist=self.ALLOWLIST,
+                health_check=lambda: True,
+                quota_check=lambda service: True,
+            )
+
+        self.assertEqual("completed", res2["status"])
+        runner.assert_called_once()
+
+
+class ClaimExpiredTimeBugTests(unittest.TestCase):
+    """Latent operator-precedence bug in _claim_expired(command, now=...).
+
+    `(now or datetime.now(timezone.utc) - claimed).total_seconds()` —
+    when now is a datetime, Python parses this as
+    `now or (datetime.now(timezone.utc) - claimed)`, so now.total_seconds()
+    is called, which raises AttributeError (datetime has no .total_seconds).
+    The except catches it and returns True (expired), making every claim look
+    expired when now= is injected. This is a latent test-injection API bug.
+    """
+
+    def _make_command(self, claimed_at_iso):
+        return command(
+            status="claimed",
+            execution_id="command-cmd-1",
+            claimed_at=claimed_at_iso,
+        )
+
+    def test_not_expired_when_now_is_recent(self):
+        """Passing a recent datetime as now= must return False (not expired)."""
+        from manager.command_watcher import _claim_expired, CLAIM_TIMEOUT_SECONDS
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        claimed_at = now - timedelta(seconds=1)
+        claimed_at_iso = claimed_at.isoformat().replace("+00:00", "Z")
+        cmd = self._make_command(claimed_at_iso)
+        result = _claim_expired(cmd, now=now)
+        self.assertFalse(result, "_claim_expired(now=recent_datetime) must return False for a non-expired claim")
+
+    def test_expired_when_now_is_far_future(self):
+        """Passing an expired datetime as now= must return True."""
+        from manager.command_watcher import _claim_expired, CLAIM_TIMEOUT_SECONDS
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        claimed_at = now - timedelta(seconds=CLAIM_TIMEOUT_SECONDS + 1)
+        claimed_at_iso = claimed_at.isoformat().replace("+00:00", "Z")
+        cmd = self._make_command(claimed_at_iso)
+        result = _claim_expired(cmd, now=now)
+        self.assertTrue(result, "_claim_expired(now=...) must return True for a claim older than CLAIM_TIMEOUT_SECONDS")
+
+    def test_none_now_uses_real_clock_not_expired(self):
+        """The default now=None path must work correctly for recent claims."""
+        from manager.command_watcher import _claim_expired
+        cmd = self._make_command(now_iso())
+        self.assertFalse(_claim_expired(cmd), "_claim_expired(now=None) must return False for a just-claimed command")
+
+    def test_none_now_uses_real_clock_expired(self):
+        """Default path for an old claim must still return True."""
+        from manager.command_watcher import _claim_expired
+        cmd = self._make_command("2000-01-01T00:00:00Z")
+        self.assertTrue(_claim_expired(cmd), "_claim_expired(now=None) must return True for an ancient claim")
 
 
 if __name__ == "__main__": unittest.main()
