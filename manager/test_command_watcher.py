@@ -2035,10 +2035,18 @@ class WithinProjectRecordRotationTests(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_offset_advances_by_one_per_poll_tick(self):
+        # Default stride=1 preserves the original one-position-per-tick
+        # behavior for every existing caller (e.g. _enumerate_commands).
         from manager.command_watcher import POLL_SECONDS, _within_project_record_rotation_offset
         base = _within_project_record_rotation_offset(now=0.0)
         one_tick_later = _within_project_record_rotation_offset(now=POLL_SECONDS)
         self.assertEqual(base + 1, one_tick_later)
+
+    def test_offset_advances_by_stride_per_poll_tick(self):
+        from manager.command_watcher import POLL_SECONDS, _within_project_record_rotation_offset
+        base = _within_project_record_rotation_offset(now=0.0, stride=4)
+        one_tick_later = _within_project_record_rotation_offset(now=POLL_SECONDS, stride=4)
+        self.assertEqual(base + 4, one_tick_later)
 
     def test_enumerate_commands_forwards_a_time_derived_rotate_offset(self):
         from manager.command_watcher import _enumerate_commands, _within_project_record_rotation_offset
@@ -2102,6 +2110,39 @@ class WithinProjectRecordRotationTests(unittest.TestCase):
         self.assertEqual("tasks", area)
         self.assertEqual("p1", project_id)
         self.assertEqual(42, kwargs["rotate_offset"])
+
+    def test_enumerate_waiting_quota_tasks_forwards_stride_rotate_offset_and_max_records(self):
+        """Bounded Convergence Acceleration (2026-08-31): the plain stride=1
+        rotate_offset fix above only guarantees EVENTUAL reachability -- for
+        a project whose Tasks backlog is very large (confirmed live: a real
+        181-record backlog in ai-development-manager), full-cycle coverage
+        could take on the order of hours. Passing WAITING_QUOTA_DISCOVERY_
+        WINDOW as both max_records and rotation stride bounds this to
+        ceil(N / K) ticks for any N, while keeping the single-tick Drive
+        read count capped at K."""
+        from manager.command_watcher import (
+            WAITING_QUOTA_DISCOVERY_WINDOW,
+            _enumerate_waiting_quota_tasks,
+        )
+
+        class FakeBoundedStore:
+            def __init__(self):
+                self.calls = []
+
+            def list_records_bounded(self, area, project_id, **kwargs):
+                self.calls.append((area, project_id, kwargs))
+                return []
+
+        store = FakeBoundedStore()
+        with patch("manager.command_watcher._within_project_record_rotation_offset", return_value=16):
+            _enumerate_waiting_quota_tasks(store, "p1", deadline=100.0)
+
+        self.assertEqual(1, len(store.calls))
+        area, project_id, kwargs = store.calls[0]
+        self.assertEqual("tasks", area)
+        self.assertEqual("p1", project_id)
+        self.assertEqual(16, kwargs["rotate_offset"])
+        self.assertEqual(WAITING_QUOTA_DISCOVERY_WINDOW, kwargs["max_records"])
 
 
 class BoundedCommandEnumerationLifecycleSafetyTests(unittest.TestCase):

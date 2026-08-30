@@ -1068,37 +1068,42 @@ def _rotated_project_ids(project_ids, now=None):
     return project_ids[offset:] + project_ids[:offset]
 
 
-def _within_project_record_rotation_offset(now=None):
+def _within_project_record_rotation_offset(now=None, stride=1):
     """Deterministic, cross-process, wall-clock-only rotation offset for
-    ONE project's own historical Command listing (see
+    ONE project's own historical Command or Task listing (see
     DriveRecords.list_records_bounded's `rotate_offset` parameter).
 
     Why this exists: `_rotated_project_ids` above already prevents one
-    project with a huge Command backlog from starving every OTHER
-    project's discovery forever, by rotating which project goes first each
-    tick. It does nothing for a Command stuck *inside* that one large
-    project's own backlog: `_enumerate_commands`'s bounded hydration walks
-    Drive's own listing order (otherwise unspecified but stable call to
-    call, since nothing about the stored records or the query changes
-    between ticks) and simply stops once its per-tick budget runs out --
-    so whichever records happen to land after that cutoff point are
-    unreachable on every single tick, forever, exactly the same way an
-    unrotated project order would starve a whole project. A live HOME
-    canary (a queued repo-write Command for a project with a large,
-    self-inflicted historical Command backlog from repeated acceptance
-    runs) reproduced this: still unclaimed after 50+ minutes of continuous
-    natural ticks, confirmed via a direct Drive read showing
-    status="queued", claimed_at=null the entire time.
+    project with a huge backlog from starving every OTHER project's
+    discovery forever, by rotating which project goes first each tick. It
+    does nothing for a record stuck *inside* that one large project's own
+    backlog: bounded hydration walks Drive's own listing order and simply
+    stops once its per-tick budget runs out -- so whichever records happen
+    to land after that cutoff point would be unreachable forever without
+    rotation. A live HOME canary (a queued repo-write Command for a
+    project with a large, self-inflicted historical Command backlog from
+    repeated acceptance runs) reproduced this: still unclaimed after 50+
+    minutes of continuous natural ticks, confirmed via a direct Drive read
+    showing status="queued", claimed_at=null the entire time.
 
-    This returns a plain, ever-increasing integer (never reduced modulo a
-    record count the caller doesn't know yet -- `list_records_bounded`
-    itself takes `% len(items)`), advancing by 1 approximately every
-    POLL_SECONDS, exactly mirroring `_rotated_project_ids`'s own technique
-    and rationale one level deeper. Purely a function of wall-clock time,
-    never a process-local counter, since every `--once` invocation is a
-    fresh process with no memory of prior ticks."""
+    `stride`, when > 1 (e.g. matching the bounded scan window K for
+    waiting_quota tasks -- see WAITING_QUOTA_DISCOVERY_WINDOW), advances
+    the starting offset by K positions per tick. Because intervals of size
+    K placed at offsets t*K are contiguous on the unwrapped circle, every
+    index in [0, N-1] is guaranteed to be visited in at most ceil(N / K)
+    ticks for any arbitrary integer N >= 1, with zero starvation even when
+    gcd(N, K) > 1, while strictly preserving the single-tick Drive API
+    bound. Default stride=1 preserves the original one-position-per-tick
+    behavior for every existing caller (e.g. _enumerate_commands).
+
+    This returns an ever-increasing integer (never reduced modulo a record
+    count the caller doesn't know yet -- `list_records_bounded` itself takes
+    `% len(items)`), advancing by `stride` approximately every POLL_SECONDS.
+    Purely a function of wall-clock time, never a process-local counter,
+    since every `--once` invocation is a fresh process with no memory of
+    prior ticks."""
     now = now if now is not None else time.time()
-    return int(now // POLL_SECONDS)
+    return int(now // POLL_SECONDS) * stride
 
 
 def _enumerate_commands(store, project_id, deadline=None):
@@ -1167,6 +1172,18 @@ def _enumerate_recent_commands(store, project_id, deadline=None):
 # already are.
 MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL = 4
 
+# Bounded task hydration window per project for the waiting_quota Phase 1
+# sweep. Matches MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL so single-tick Drive
+# get_media() calls are strictly capped (at most K calls), and rotation
+# advances by K positions per natural tick, yielding provable ceil(N / K)
+# full-cycle reachability for any arbitrary N >= 1 backlog -- closing the
+# residual gap where the plain (stride=1) rotate_offset fix guaranteed only
+# eventual, not bounded-fast, reachability for a project with a very large
+# pre-existing Tasks backlog (confirmed live: a real waiting_quota Task in
+# ai-development-manager's own 181-record backlog still hadn't been reached
+# after 3+ hours of continuous natural ticks under stride=1).
+WAITING_QUOTA_DISCOVERY_WINDOW = MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL
+
 # Real P0 (2026-08-29): Phase 1 (the waiting_quota sweep, see poll_once())
 # used to share the tick's full POLL_TIME_BUDGET_SECONDS deadline with
 # Phase 2 (regular command processing) -- fine when each project's sweep is
@@ -1200,18 +1217,23 @@ def _enumerate_waiting_quota_tasks(store, project_id, deadline=None):
     non-guessed way to identify it) happens here, once, so callers never
     duplicate that evidence check.
 
-    Forwards the same wall-clock-derived `rotate_offset` _enumerate_commands
-    already does (see `_within_project_record_rotation_offset`'s own
-    docstring): without it, a project whose Tasks backlog exceeds one
-    tick's bounded hydration budget can permanently strand its own
-    waiting_quota Task past every tick's cutoff -- live-reproduced (a real
-    v2-repo-write waiting_quota Task in ai-development-manager sat
-    unpromoted for 40+ minutes across many natural ticks with confirmed-
-    fresh codex quota available the whole time)."""
+    Passes WAITING_QUOTA_DISCOVERY_WINDOW as max_records and rotation stride
+    so the scan window advances by K positions per natural tick, guaranteeing
+    full-cycle coverage across all N historical records in ceil(N / K) ticks
+    -- see `_within_project_record_rotation_offset`'s own docstring. Without
+    bounded stride>1 rotation, a project whose Tasks backlog exceeds one
+    tick's bounded hydration budget can take arbitrarily many ticks to
+    strand-recover a specific waiting_quota Task -- live-reproduced (a real
+    v2-repo-write waiting_quota Task in ai-development-manager's own
+    181-record backlog still hadn't been reached after 3+ hours of
+    continuous natural ticks under the plain stride=1 rotation)."""
     if hasattr(store, "list_records_bounded"):
-        tasks = store.list_records_bounded("tasks", project_id, deadline=deadline,
-                                            single_request_worst_case=WATCHER_DISCOVERY_TIMEOUT_SECONDS,
-                                            rotate_offset=_within_project_record_rotation_offset())
+        tasks = store.list_records_bounded(
+            "tasks", project_id, deadline=deadline,
+            single_request_worst_case=WATCHER_DISCOVERY_TIMEOUT_SECONDS,
+            max_records=WAITING_QUOTA_DISCOVERY_WINDOW,
+            rotate_offset=_within_project_record_rotation_offset(stride=WAITING_QUOTA_DISCOVERY_WINDOW),
+        )
     else:
         tasks = store.list_records("tasks", project_id)
     return [task for task in tasks
