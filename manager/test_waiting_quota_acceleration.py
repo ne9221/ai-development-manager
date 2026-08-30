@@ -47,7 +47,7 @@ class WaitingQuotaAccelerationTests(unittest.TestCase):
         """Case A: N=181, tail waiting_quota task at index 180 must be reached
         within ceil(181/K) ticks (46 ticks for K=4), not 181 ticks."""
         _seed_tasks(self.store, "p1", 181, waiting_indices={180})
-        
+
         from manager.command_watcher import WAITING_QUOTA_DISCOVERY_WINDOW
         k = WAITING_QUOTA_DISCOVERY_WINDOW
         expected_max_ticks = (181 + k - 1) // k
@@ -226,7 +226,7 @@ class WaitingQuotaAccelerationTests(unittest.TestCase):
     def test_case_h_deadline_exhausted_early_bails_gracefully(self):
         """Case H: When deadline is exhausted early, enumeration bails gracefully."""
         _seed_tasks(self.store, "p1", 50)
-        
+
         # deadline already in the past
         tasks = _enumerate_waiting_quota_tasks(self.store, "p1", deadline=time.monotonic() - 10)
         self.assertEqual([], tasks)
