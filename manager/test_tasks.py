@@ -651,5 +651,68 @@ class ListRecordsBoundedTests(unittest.TestCase):
         self.assertTrue(any(options.get("orderBy") == "modifiedTime desc"
                             for options in service.transport.list_options))
 
+    # rotate_offset: closes the within-project counterpart to
+    # _rotated_project_ids's cross-project starvation fix. See
+    # manager.command_watcher._within_project_record_rotation_offset's
+    # docstring for the real live canary this reproduces: a queued Command
+    # past a large project's per-tick bounded-hydration cutoff is
+    # otherwise unreachable on every single tick, forever.
+    def test_rotate_offset_zero_matches_prior_unrotated_order(self):
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 10)
+        records = store.list_records_bounded("commands", "p1", max_records=3, rotate_offset=0)
+        self.assertEqual(["cmd-000", "cmd-001", "cmd-002"], [r["command_id"] for r in records])
+
+    def test_rotate_offset_shifts_the_hydration_window(self):
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 10)
+        records = store.list_records_bounded("commands", "p1", max_records=3, rotate_offset=5)
+        self.assertEqual(["cmd-005", "cmd-006", "cmd-007"], [r["command_id"] for r in records])
+
+    def test_rotate_offset_wraps_around_the_end_of_the_listing(self):
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 10)
+        records = store.list_records_bounded("commands", "p1", max_records=3, rotate_offset=9)
+        self.assertEqual(["cmd-009", "cmd-000", "cmd-001"], [r["command_id"] for r in records])
+
+    def test_every_record_becomes_reachable_within_one_full_rotation(self):
+        """The direct fix proof: a record past a fixed bounded-hydration
+        cutoff (here, anything beyond the first 3 of 10) is unreachable
+        with rotate_offset=0 forever, but sweeping rotate_offset across one
+        full cycle (as _within_project_record_rotation_offset does, once
+        per POLL_SECONDS) reaches every record at least once."""
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 10)
+        seen = set()
+        for offset in range(10):
+            batch = store.list_records_bounded("commands", "p1", max_records=3, rotate_offset=offset)
+            seen.update(r["command_id"] for r in batch)
+        self.assertEqual({f"cmd-{i:03d}" for i in range(10)}, seen)
+
+    def test_rotate_offset_is_ignored_when_order_by_is_explicit(self):
+        """An explicit caller-requested order (the recent-command sweep's
+        "modifiedTime desc") must never be perturbed by rotation -- only
+        the historical sweep (no order_by of its own) needs rotation."""
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 10)
+        unrotated = [r["command_id"] for r in store.list_records_bounded(
+            "commands", "p1", max_records=3, order_by="modifiedTime desc", rotate_offset=0)]
+        rotated = [r["command_id"] for r in store.list_records_bounded(
+            "commands", "p1", max_records=3, order_by="modifiedTime desc", rotate_offset=5)]
+        self.assertEqual(unrotated, rotated)
+
+    def test_rotate_offset_default_reproduces_prior_behavior_exactly(self):
+        service = FakeDriveService()
+        store = DriveRecords(service)
+        self._seed_commands(store, "p1", 6)
+        with_default = {r["command_id"] for r in store.list_records_bounded("commands", "p1")}
+        explicit_zero = {r["command_id"] for r in store.list_records_bounded("commands", "p1", rotate_offset=0)}
+        self.assertEqual(explicit_zero, with_default)
+
 
 if __name__ == "__main__": unittest.main()

@@ -220,7 +220,7 @@ class DriveRecords:
         return [self.get(area, project_id, name) for name in names]
 
     def list_records_bounded(self, area, project_id, deadline=None, single_request_worst_case=None,
-                             max_records=None, order_by=None):
+                             max_records=None, order_by=None, rotate_offset=0):
         """Deadline-aware, bounded-hydration alternative to list_records()
         for callers (manager.command_watcher.poll_once) that cannot afford
         to hydrate an unbounded number of historical JSON records in one
@@ -252,6 +252,24 @@ class DriveRecords:
           actually fetched is skipped, not raised -- one malformed record
           must not block every other record in the same project the way
           list_records() raising TaskError for the whole call would.
+        - `rotate_offset`, if nonzero, cyclically shifts the metadata
+          listing's starting point by that many positions before hydration
+          begins -- see manager.command_watcher._enumerate_commands's own
+          docstring for the real production trace this closes: with no
+          `order_by` (Drive's own listing order is otherwise unspecified
+          but stable call-to-call), a project whose total record count
+          exceeds what fits in one call's bounded hydration budget would
+          otherwise have its records past that budget's cutoff point
+          permanently unreachable -- every call, forever -- since nothing
+          about a fixed listing order or a fixed budget ever changes
+          between calls. A caller that varies `rotate_offset` by wall-clock
+          time (as `_rotated_project_ids` already does one level up, for
+          project order) guarantees every record eventually rotates inside
+          the reachable window within a bounded number of calls. Default 0
+          reproduces the exact prior (unrotated) order for every existing
+          caller unchanged. Ignored when `order_by` is given, since an
+          explicit caller-requested order (e.g. the recent-command sweep's
+          "modifiedTime desc") must never be perturbed by rotation.
         """
         if single_request_worst_case is None:
             from collectors.publish_drive import DRIVE_REQUEST_TIMEOUT_SECONDS
@@ -263,6 +281,9 @@ class DriveRecords:
                 return []
             raise
         items = self.children(parent, deadline=deadline, order_by=order_by)
+        if not order_by and rotate_offset and items:
+            offset = rotate_offset % len(items)
+            items = items[offset:] + items[:offset]
         records = []
         for item in items:
             if not item.get("name", "").endswith(".json"):

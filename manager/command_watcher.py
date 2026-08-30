@@ -893,6 +893,39 @@ def _rotated_project_ids(project_ids, now=None):
     return project_ids[offset:] + project_ids[:offset]
 
 
+def _within_project_record_rotation_offset(now=None):
+    """Deterministic, cross-process, wall-clock-only rotation offset for
+    ONE project's own historical Command listing (see
+    DriveRecords.list_records_bounded's `rotate_offset` parameter).
+
+    Why this exists: `_rotated_project_ids` above already prevents one
+    project with a huge Command backlog from starving every OTHER
+    project's discovery forever, by rotating which project goes first each
+    tick. It does nothing for a Command stuck *inside* that one large
+    project's own backlog: `_enumerate_commands`'s bounded hydration walks
+    Drive's own listing order (otherwise unspecified but stable call to
+    call, since nothing about the stored records or the query changes
+    between ticks) and simply stops once its per-tick budget runs out --
+    so whichever records happen to land after that cutoff point are
+    unreachable on every single tick, forever, exactly the same way an
+    unrotated project order would starve a whole project. A live HOME
+    canary (a queued repo-write Command for a project with a large,
+    self-inflicted historical Command backlog from repeated acceptance
+    runs) reproduced this: still unclaimed after 50+ minutes of continuous
+    natural ticks, confirmed via a direct Drive read showing
+    status="queued", claimed_at=null the entire time.
+
+    This returns a plain, ever-increasing integer (never reduced modulo a
+    record count the caller doesn't know yet -- `list_records_bounded`
+    itself takes `% len(items)`), advancing by 1 approximately every
+    POLL_SECONDS, exactly mirroring `_rotated_project_ids`'s own technique
+    and rationale one level deeper. Purely a function of wall-clock time,
+    never a process-local counter, since every `--once` invocation is a
+    fresh process with no memory of prior ticks."""
+    now = now if now is not None else time.time()
+    return int(now // POLL_SECONDS)
+
+
 def _enumerate_commands(store, project_id, deadline=None):
     """Deadline-aware, bounded-hydration command enumeration for one
     project. Prefers DriveRecords.list_records_bounded() when the store
@@ -909,10 +942,19 @@ def _enumerate_commands(store, project_id, deadline=None):
     per-request transport timeout, not this function's business, is what
     actually determines the real worst case for each get_media() call.
     single_request_worst_case is passed through unchanged so callers can
-    match it to that store's actual configured timeout."""
+    match it to that store's actual configured timeout.
+
+    Passes a wall-clock-derived `rotate_offset` (see
+    `_within_project_record_rotation_offset`'s own docstring for the real
+    production trace this closes) so a project whose Command backlog
+    exceeds one tick's bounded hydration budget cannot permanently strand
+    a specific record past every tick's cutoff point -- unlike the
+    recent-command sweep below, this is the ONLY enumeration path with no
+    `order_by` of its own, so it is the one that needed this."""
     if hasattr(store, "list_records_bounded"):
         return store.list_records_bounded("commands", project_id, deadline=deadline,
-                                           single_request_worst_case=WATCHER_DISCOVERY_TIMEOUT_SECONDS)
+                                           single_request_worst_case=WATCHER_DISCOVERY_TIMEOUT_SECONDS,
+                                           rotate_offset=_within_project_record_rotation_offset())
     return store.list_records("commands", project_id)
 
 

@@ -1992,6 +1992,61 @@ class RotatedProjectIdsTests(unittest.TestCase):
         self.assertEqual(3, len(rotated))
 
 
+class WithinProjectRecordRotationTests(unittest.TestCase):
+    """Covers the within-project counterpart to RotatedProjectIdsTests
+    above: _rotated_project_ids alone cannot save a Command stuck *inside*
+    one large project's own historical backlog, past _enumerate_commands's
+    bounded-hydration cutoff -- see
+    _within_project_record_rotation_offset's docstring for the real live
+    HOME canary (a queued repo-write Command, unclaimed 50+ minutes across
+    continuous natural ticks) this closes."""
+
+    def test_rotation_is_a_pure_function_of_time_not_process_state(self):
+        from manager.command_watcher import _within_project_record_rotation_offset
+        first = _within_project_record_rotation_offset(now=0.0)
+        second = _within_project_record_rotation_offset(now=0.0)
+        self.assertEqual(first, second)
+
+    def test_offset_advances_by_one_per_poll_tick(self):
+        from manager.command_watcher import POLL_SECONDS, _within_project_record_rotation_offset
+        base = _within_project_record_rotation_offset(now=0.0)
+        one_tick_later = _within_project_record_rotation_offset(now=POLL_SECONDS)
+        self.assertEqual(base + 1, one_tick_later)
+
+    def test_enumerate_commands_forwards_a_time_derived_rotate_offset(self):
+        from manager.command_watcher import _enumerate_commands, _within_project_record_rotation_offset
+
+        class FakeBoundedStore:
+            def __init__(self):
+                self.calls = []
+
+            def list_records_bounded(self, area, project_id, **kwargs):
+                self.calls.append((area, project_id, kwargs))
+                return []
+
+        store = FakeBoundedStore()
+        with patch("manager.command_watcher._within_project_record_rotation_offset", return_value=42):
+            _enumerate_commands(store, "p1", deadline=100.0)
+
+        self.assertEqual(1, len(store.calls))
+        area, project_id, kwargs = store.calls[0]
+        self.assertEqual("commands", area)
+        self.assertEqual("p1", project_id)
+        self.assertEqual(42, kwargs["rotate_offset"])
+
+    def test_enumerate_commands_falls_back_to_list_records_without_bounded_support(self):
+        """A store without list_records_bounded (e.g. a test double) must
+        keep working exactly as before -- rotate_offset is never referenced
+        on that path at all."""
+        from manager.command_watcher import _enumerate_commands
+
+        class PlainStore:
+            def list_records(self, area, project_id):
+                return [{"command_id": "c1", "project_id": project_id}]
+
+        self.assertEqual([{"command_id": "c1", "project_id": "p1"}], _enumerate_commands(PlainStore(), "p1"))
+
+
 class BoundedCommandEnumerationLifecycleSafetyTests(unittest.TestCase):
     """Covers the P0 fix using a real DriveRecords + fake Drive backend
     (not the simplified in-memory Store), so this exercises the real
