@@ -2042,8 +2042,10 @@ class BoundedCommandEnumerationLifecycleSafetyTests(unittest.TestCase):
         store.put("commands", "p1", "cmd-1", command())
         projects = ["noise-1", "noise-2", "noise-3", "noise-4", "p1"]
         seen = []
+        recent_source = object()
 
         def recent(_store, project_id, deadline=None):
+            self.assertIs(recent_source, _store)
             seen.append(project_id)
             if project_id == "p1":
                 return [command()]
@@ -2058,6 +2060,7 @@ class BoundedCommandEnumerationLifecycleSafetyTests(unittest.TestCase):
              patch("manager.command_watcher._enumerate_commands", return_value=[]), \
              patch("manager.command_watcher.launch_task", runner):
             results = poll_once(store, object(), allowlist=self.ALLOWLIST,
+                                recent_store=recent_source,
                                 claim_factory=CommandWatcherTests.claim_factory,
                                 health_check=lambda: True, quota_check=lambda service: True)
 
@@ -2199,7 +2202,9 @@ class MainOnceFastFailTests(unittest.TestCase):
         would not really bound anything."""
         import io
         from contextlib import redirect_stdout
-        from manager.command_watcher import WATCHER_DISCOVERY_TIMEOUT_SECONDS, main
+        from manager.command_watcher import (
+            RECENT_COMMAND_DISCOVERY_TIMEOUT_SECONDS, WATCHER_DISCOVERY_TIMEOUT_SECONDS, main,
+        )
 
         build_calls = []
 
@@ -2216,7 +2221,10 @@ class MainOnceFastFailTests(unittest.TestCase):
         # means "use DRIVE_REQUEST_TIMEOUT_SECONDS", untouched by this fix).
         # Second call: the discovery-only service, with an explicit,
         # strictly shorter timeout than POLL_TIME_BUDGET_SECONDS.
-        self.assertEqual([None, WATCHER_DISCOVERY_TIMEOUT_SECONDS], build_calls)
+        self.assertEqual(
+            [None, WATCHER_DISCOVERY_TIMEOUT_SECONDS, RECENT_COMMAND_DISCOVERY_TIMEOUT_SECONDS],
+            build_calls,
+        )
 
     def test_discovery_timeout_leaves_real_margin_under_the_poll_budget(self):
         """Documents the actual math this fix depends on: with the real

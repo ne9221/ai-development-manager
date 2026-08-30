@@ -918,6 +918,7 @@ def _enumerate_commands(store, project_id, deadline=None):
 
 RECENT_COMMANDS_PER_PROJECT = 2
 RECENT_COMMAND_SWEEP_BUDGET_SECONDS = 25  # Phase 2's guaranteed 40s - 15s floor.
+RECENT_COMMAND_DISCOVERY_TIMEOUT_SECONDS = 3
 
 
 def _enumerate_recent_commands(store, project_id, deadline=None):
@@ -931,7 +932,7 @@ def _enumerate_recent_commands(store, project_id, deadline=None):
         try:
             return store.list_records_bounded(
                 "commands", project_id, deadline=deadline,
-                single_request_worst_case=WATCHER_DISCOVERY_TIMEOUT_SECONDS,
+                single_request_worst_case=RECENT_COMMAND_DISCOVERY_TIMEOUT_SECONDS,
                 max_records=RECENT_COMMANDS_PER_PROJECT,
                 order_by="modifiedTime desc",
             )
@@ -1158,7 +1159,7 @@ def _prioritized_commands(commands):
     )
 
 
-def poll_once(store, service, allowlist=None, deadline=None, discovery_store=None, origin_context=None,
+def poll_once(store, service, allowlist=None, deadline=None, discovery_store=None, recent_store=None, origin_context=None,
               async_launch=False, **factories):
     """`deadline`, if given, is a `time.monotonic()` value after which this
     call stops STARTING new project/command work and returns whatever it has
@@ -1215,6 +1216,8 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         deadline = time.monotonic() + POLL_TIME_BUDGET_SECONDS
     if discovery_store is None:
         discovery_store = store
+    if recent_store is None:
+        recent_store = discovery_store
     results = []
     # DASHBOARD_TRUTH_CONNECTED gate 1/4: waiting_quota Task promotion is
     # this tick's OWN natural retry -- lazily fetched at most once per
@@ -1301,7 +1304,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
             break
         try:
-            commands = _enumerate_recent_commands(discovery_store, project_id, deadline=recent_deadline)
+            commands = _enumerate_recent_commands(recent_store, project_id, deadline=recent_deadline)
         except TaskError:
             continue
         for command in _prioritized_commands(commands):
@@ -1406,6 +1409,8 @@ def main(argv=None):
             # active provider lifecycle below.
             discovery_service = build_service(timeout=WATCHER_DISCOVERY_TIMEOUT_SECONDS)
             discovery_store = DriveRecords(discovery_service)
+            recent_service = build_service(timeout=RECENT_COMMAND_DISCOVERY_TIMEOUT_SECONDS)
+            recent_store = DriveRecords(recent_service)
             ingress = []
             # embedded_ingress_enabled() gates this independent of the
             # folder-id env var below -- see its docstring for the
@@ -1413,7 +1418,8 @@ def main(argv=None):
             if embedded_ingress_enabled() and os.environ.get("ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID"):
                 from manager.drive_dispatch_ingress import poll_drive_dispatch_requests
                 ingress = poll_drive_dispatch_requests(store, service, os.environ.get("ADM_LOCK_GCS_BUCKET"))
-            result = poll_once(store, service, discovery_store=discovery_store, origin_context=invocation,
+            result = poll_once(store, service, discovery_store=discovery_store, recent_store=recent_store,
+                               origin_context=invocation,
                                async_launch=True)
             print(json.dumps({"status": "ok", "host": socket.gethostname()[:100], "ingress": ingress,
                               "commands": result}, separators=(",", ":")))
