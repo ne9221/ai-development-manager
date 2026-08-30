@@ -115,10 +115,21 @@ def select_claude_account(accounts, *, explicit_account_id=None, max_age_seconds
             "every Claude account has unknown/missing/stale quota confidence, or failed live "
             "authentication readiness; refusing to guess -- pass an explicit account_id instead"
         )
-    if len(reliable) == 1:
+    if len(reliable) == 1 and not reliable[0].get("windows"):
+        # No quota window data at all for the sole candidate (legacy/manual
+        # collection that has never captured any) -- there is nothing to
+        # forecast or exhaustion-check against, so this preserves the
+        # pre-existing behavior of trusting confidence alone.
         return reliable[0]["account_id"]
 
-    # Multiple reliable accounts: rank via forecast evidence and score
+    # One or more reliable accounts with real quota window data: every one
+    # must still be proven non-exhausted via forecast evidence before being
+    # returned -- a single remaining candidate is not exempt from this (see
+    # the exhausted-account single-candidate bug this closes: an account
+    # whose OWN quota was already exhausted on one window was previously
+    # returned unconditionally whenever it was the only "reliable" one,
+    # e.g. because a live auth_ready check had just excluded the other
+    # candidate).
     from manager.quota_forecast import forecast_account, score_account_forecast
 
     max_age_min = (max_age_seconds / 60.0) if max_age_seconds is not None else 60.0
@@ -133,7 +144,7 @@ def select_claude_account(accounts, *, explicit_account_id=None, max_age_seconds
     if not eligible:
         candidates = ", ".join(sorted(a["account_id"] for a in reliable))
         raise AccountSelectionError(
-            f"multiple Claude accounts have reliable quota data ({candidates}); "
+            f"every Claude account with reliable quota confidence is exhausted or ineligible ({candidates}); "
             "pass an explicit account_id instead of relying on automatic selection"
         )
 

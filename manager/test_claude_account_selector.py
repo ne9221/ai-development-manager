@@ -10,8 +10,26 @@ from manager.claude_account_selector import (
 )
 
 
-def account(account_id, confidence="official", last_updated="2026-08-15T02:00:00Z", enabled=True):
-    return {"account_id": account_id, "confidence": confidence, "last_updated": last_updated, "enabled": enabled}
+def account(account_id, confidence="official", last_updated="2026-08-15T02:00:00Z", enabled=True, windows=None):
+    entry = {"account_id": account_id, "confidence": confidence, "last_updated": last_updated, "enabled": enabled}
+    if windows is not None:
+        # forecast_account() only treats a record as source_reliable (a
+        # prerequisite for has_reliable_quota/dispatchable) when source_type
+        # is explicitly "official" -- real production entries always carry
+        # this (see quota_reader._summarize_item), so windowed test fixtures
+        # must too, or every forecast comes back unreliable regardless of
+        # the windows' actual remaining_percent values.
+        entry["source_type"] = "official"
+        entry["windows"] = windows
+        entry["provider"] = "claude"
+    return entry
+
+
+def windows(five_hour, seven_day):
+    return [
+        {"name": "five_hour", "remaining_percent": five_hour},
+        {"name": "seven_day", "remaining_percent": seven_day},
+    ]
 
 
 NOW = datetime(2026, 8, 15, 2, 10, 0, tzinfo=timezone.utc)
@@ -122,6 +140,85 @@ class SelectClaudeAccountTests(unittest.TestCase):
             "account-a",
             select_claude_account([account("account-a")], now=NOW),
         )
+
+    # -- exhausted-account single-candidate fast-path bug (2026-08-30) --
+    #
+    # select_claude_account()'s `len(reliable) == 1: return reliable[0]`
+    # shortcut historically returned the sole "reliable" (fresh, known-
+    # confidence) candidate WITHOUT ever running it through
+    # quota_forecast.forecast_account()'s exhaustion check -- that check
+    # only ran in the >=2-candidate ranking branch. Live-reproduced in
+    # production: whenever a live auth_ready check (or momentary staleness)
+    # excluded one account, leaving exactly one "reliable" candidate whose
+    # own quota was ALREADY exhausted on one window, that exhausted account
+    # was still returned and then genuinely failed at real launch
+    # (authentication_check_failed / provider_error), three times in a row
+    # (Commands dispatch-cgate2-r4/r6/r7-20260830...).
+
+    def test_two_candidates_one_exhausted_selects_the_healthy_one(self):
+        healthy = account("account-a", windows=windows(74.0, 32.0))
+        exhausted_secondary = account("account-b", windows=windows(98.0, 0.0))
+        self.assertEqual(
+            "account-a",
+            select_claude_account([healthy, exhausted_secondary], now=NOW),
+        )
+
+    def test_two_candidates_primary_exhausted_selects_the_healthy_one(self):
+        exhausted_primary = account("account-a", windows=windows(0.0, 50.0))
+        healthy = account("account-b", windows=windows(60.0, 40.0))
+        self.assertEqual(
+            "account-b",
+            select_claude_account([exhausted_primary, healthy], now=NOW),
+        )
+
+    def test_single_reliable_candidate_with_secondary_window_exhausted_fails_closed(self):
+        # THE BUG: with only one "reliable" candidate, the old fast path
+        # returned it unconditionally even though its seven_day window is
+        # genuinely exhausted (0% remaining) -- this must now fail closed
+        # instead, exactly like the >=2-candidate branch already does.
+        exhausted = account("account-a", windows=windows(98.0, 0.0))
+        with self.assertRaises(AccountSelectionError):
+            select_claude_account([exhausted], now=NOW)
+
+    def test_single_reliable_candidate_with_primary_window_exhausted_fails_closed(self):
+        exhausted = account("account-a", windows=windows(0.0, 40.0))
+        with self.assertRaises(AccountSelectionError):
+            select_claude_account([exhausted], now=NOW)
+
+    def test_single_reliable_candidate_healthy_still_selected(self):
+        # Must not regress the common single-account case: no exhausted
+        # window at all is still selected via the fast path.
+        healthy = account("account-a", windows=windows(74.0, 32.0))
+        self.assertEqual("account-a", select_claude_account([healthy], now=NOW))
+
+    def test_single_reliable_candidate_no_windows_preserves_legacy_behavior(self):
+        # An account entry with no windows at all (legacy/manual collection,
+        # never captured any quota data) must keep behaving exactly as
+        # before this fix -- forecast_account() cannot meaningfully assess
+        # "exhausted" with zero windows, so this must not newly start
+        # failing closed on accounts that simply have no quota data yet.
+        self.assertEqual(
+            "account-a",
+            select_claude_account([account("account-a")], now=NOW),
+        )
+
+    def test_both_candidates_exhausted_fails_closed(self):
+        exhausted_a = account("account-a", windows=windows(98.0, 0.0))
+        exhausted_b = account("account-b", windows=windows(0.0, 40.0))
+        with self.assertRaises(AccountSelectionError):
+            select_claude_account([exhausted_a, exhausted_b], now=NOW)
+
+    def test_auth_ready_narrowing_to_one_exhausted_candidate_still_fails_closed(self):
+        # The exact production sequence: two accounts start reliable, a live
+        # auth_ready check excludes one, leaving exactly one candidate --
+        # which must still be exhaustion-checked, not fast-pathed through.
+        healthy_but_unauthed = account("account-a", windows=windows(74.0, 32.0))
+        exhausted_but_authed = account("account-b", windows=windows(98.0, 0.0))
+        with self.assertRaises(AccountSelectionError):
+            select_claude_account(
+                [healthy_but_unauthed, exhausted_but_authed],
+                auth_ready={"account-a": False, "account-b": True}, now=NOW,
+            )
 
 
 def quota_doc(*claude_entries):
