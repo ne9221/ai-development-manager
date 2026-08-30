@@ -44,6 +44,7 @@ from manager.command_watcher import (
     _enumerate_project_ids,
     _rotated_project_ids,
     load_allowlist,
+    queued_command_pending_only_health,
 )
 from manager.dispatch_requests import dispatch_request_registry
 from manager.refresh_status import RefreshError, runtime_lock, write_atomic
@@ -162,8 +163,22 @@ def find_active_command(store, allowlist, bucket=None, ingress_registry_factory=
        duplicated or re-implemented here). Only evaluated when `bucket` is
        given; a command is never assumed in-scope just for being
        queued/claimed/running.
+
+    Cold-start fallback: Command Watcher itself refuses to claim a `queued`
+    Command while Session Center is unhealthy (see
+    command_watcher.session_center_healthy) -- so if this function only ever
+    reacted to claimed/running Commands, a cold Session Center and a
+    legitimately admissible queued Command would deadlock forever (neither
+    side ever moves first). When the scan above finds no claimed/running
+    candidate at all, a `queued` Command is used instead, but only one that
+    already independently clears process_command's own governance/
+    trusted-ingress/policy gate (queued_command_pending_only_health, the
+    same two admission routes as above, replayed read-only) -- this can
+    never turn an ordinary not-yet-admitted queued Command into an active
+    one, and it never takes priority over a real claimed/running Command.
     """
     candidates = []
+    queued_candidates = []
     deadline = time.monotonic() + POLL_TIME_BUDGET_SECONDS
     for project_id, task_id in sorted(allowlist):
         try:
@@ -171,8 +186,13 @@ def find_active_command(store, allowlist, bucket=None, ingress_registry_factory=
         except TaskError:
             continue
         for record in commands:
-            if record.get("task_id") == task_id and record.get("status") in ACTIVE_STATUSES:
+            if record.get("task_id") != task_id:
+                continue
+            if record.get("status") in ACTIVE_STATUSES:
                 candidates.append(record)
+            elif record.get("status") == "queued" and queued_command_pending_only_health(
+                    store, record, allowlist, bucket, ingress_registry_factory):
+                queued_candidates.append(record)
     if bucket:
         try:
             project_ids = _rotated_project_ids(_enumerate_project_ids(store, deadline=deadline))
@@ -186,16 +206,20 @@ def find_active_command(store, allowlist, bucket=None, ingress_registry_factory=
             except TaskError:
                 continue
             for record in commands:
-                if record.get("status") not in ACTIVE_STATUSES:
-                    continue
                 if (project_id, record.get("task_id")) in allowlist:
-                    continue  # already a candidate via the static path above
-                if verify_trusted_ingress_admission(store, record, bucket, ingress_registry_factory) is not None:
-                    candidates.append(record)
-    if not candidates:
+                    continue  # already scanned via the static path above
+                status = record.get("status")
+                if status in ACTIVE_STATUSES:
+                    if verify_trusted_ingress_admission(store, record, bucket, ingress_registry_factory) is not None:
+                        candidates.append(record)
+                elif status == "queued" and queued_command_pending_only_health(
+                        store, record, allowlist, bucket, ingress_registry_factory):
+                    queued_candidates.append(record)
+    pool = candidates or queued_candidates
+    if not pool:
         return None
-    candidates.sort(key=lambda c: c.get("created_at") or "")
-    return candidates[-1]
+    pool.sort(key=lambda c: c.get("created_at") or "")
+    return pool[-1]
 
 
 def target_execution_id(command):

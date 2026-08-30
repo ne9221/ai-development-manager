@@ -242,6 +242,113 @@ class FindActiveCommandTrustedIngressTests(unittest.TestCase):
         self.assertEqual("cmd-1", result["command_id"])
 
 
+class ColdStartQueuedCommandTests(unittest.TestCase):
+    """Gate 3 cold-start fix: Command Watcher refuses to claim a `queued`
+    Command while Session Center is unhealthy (see
+    command_watcher.session_center_healthy), but before this fix this
+    supervisor only ever reacted to `claimed`/`running` Commands -- so on a
+    cold start (Session Center down, nothing yet claimed) a legitimately
+    admissible queued Command could never get a Session Center started for
+    it, and the two components waited on each other forever.
+
+    Fixture setup mirrors FindActiveCommandTrustedIngressTests (same
+    self.admitted_task()/self.registry_factory shape) since the fix must
+    apply the exact same trusted-ingress/governance gate, just to a `queued`
+    Command instead of an already-`claimed` one.
+    """
+
+    def setUp(self):
+        self.store = DriveStore()
+        create_project(self.store, project())
+        self.registry = MemoryClaimRegistry()
+        self.registry.document = {
+            "schema_version": "0.1.0", "project_id": "p1", "request_id": "req-1",
+            "task_id": "t1", "command_id": "cmd-1", "created_at": "2026-08-14T00:00:00Z",
+        }
+        self.registry.generation = 1
+
+    def registry_factory(self, bucket, project_id, request_id):
+        return self.registry
+
+    def admitted_task(self, **overrides):
+        built = task(read_only=True)
+        built["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)
+        built["source_context"] = {
+            "origin": "direct_dispatch_ingress", "external_request_id": "req-1", "admission_version": "v1",
+        }
+        built.update(overrides)
+        create_task(self.store, built, assign=False)
+        return built
+
+    @staticmethod
+    def admitted_command(**overrides):
+        value = ingress_command(created_via="direct_dispatch_ingress", admission_version="v1", request_id="req-1")
+        value["status"] = "claimed"
+        value.update(overrides)
+        return value
+
+    def test_queued_trusted_ingress_command_starts_cold_when_nothing_active(self):
+        self.admitted_task()
+        self.store.put("commands", "p1", "cmd-1", self.admitted_command(status="queued"))
+        result = find_active_command(self.store, frozenset(), bucket="test-bucket",
+                                     ingress_registry_factory=self.registry_factory)
+        self.assertIsNotNone(result, "a governed queued Command must break the cold-start deadlock")
+        self.assertEqual("cmd-1", result["command_id"])
+
+    def test_queued_allowlisted_command_also_starts_cold_when_nothing_active(self):
+        """Same cold-start relief for the static-allowlist admission route,
+        not just the trusted-ingress route."""
+        self.admitted_task()
+        self.store.put("commands", "p1", "cmd-1", ingress_command(status="queued"))
+        result = find_active_command(self.store, frozenset({("p1", "t1")}), bucket="test-bucket",
+                                     ingress_registry_factory=self.registry_factory)
+        self.assertIsNotNone(result)
+        self.assertEqual("cmd-1", result["command_id"])
+
+    def test_claimed_command_always_wins_over_queued_cold_start_candidate(self):
+        """The cold-start fallback must never steal Session Center away from
+        a genuinely active claimed/running Command -- it only fires when the
+        active-status scan finds nothing at all, regardless of created_at."""
+        self.admitted_task()
+        self.store.put("commands", "p1", "cmd-1", self.admitted_command(
+            status="queued", created_at="2026-08-30T09:00:00Z"))
+        self.store.put("commands", "p1", "cmd-2", ingress_command(
+            command_id="cmd-2", status="claimed", created_at="2026-08-30T01:00:00Z"))
+        result = find_active_command(self.store, frozenset({("p1", "t1")}), bucket="test-bucket",
+                                     ingress_registry_factory=self.registry_factory)
+        self.assertEqual("cmd-2", result["command_id"])
+
+    def test_ungoverned_queued_command_never_becomes_cold_start_candidate(self):
+        """Identical scenario to test_d (no ingress evidence, off the static
+        allowlist) restated here to make the cold-start boundary explicit:
+        a queued Command that would not be admitted by process_command
+        itself must never be treated as active just because nothing else is."""
+        self.store.put("commands", "p1", "cmd-1", ingress_command(status="queued"))
+        result = find_active_command(self.store, frozenset(), bucket="test-bucket",
+                                     ingress_registry_factory=self.registry_factory)
+        self.assertIsNone(result)
+
+    def test_policy_unsatisfied_queued_task_never_becomes_cold_start_candidate(self):
+        """A queued Command whose Task fails the mandatory governance/policy
+        gate must stay invisible even under the cold-start fallback -- this
+        fix must never weaken _policy_satisfied()."""
+        self.admitted_task(execution_policies=[])
+        self.store.put("commands", "p1", "cmd-1", self.admitted_command(status="queued"))
+        result = find_active_command(self.store, frozenset(), bucket="test-bucket",
+                                     ingress_registry_factory=self.registry_factory)
+        self.assertIsNone(result)
+
+    def test_no_bucket_configured_never_admits_queued_cold_start_candidate(self):
+        """Fail closed the same direction as the existing claimed/running
+        case: without ADM_LOCK_GCS_BUCKET, the trusted-ingress route is
+        never evaluated, so a queued trusted-ingress Command stays invisible."""
+        self.admitted_task()
+        self.store.put("commands", "p1", "cmd-1", self.admitted_command(status="queued"))
+        result = find_active_command(self.store, frozenset(), bucket=None,
+                                     ingress_registry_factory=self.registry_factory)
+        self.assertIsNone(result)
+
+
 class StateTests(unittest.TestCase):
     def test_read_state_fails_closed_on_missing_or_malformed_file(self):
         self.assertEqual((None, None, None), read_state("/no/such/file.json"))

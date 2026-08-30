@@ -638,6 +638,51 @@ def _spawn_claimed_worker(claimed):
     return process.pid
 
 
+def queued_command_pending_only_health(store, command, allowlist=frozenset(), bucket=None,
+                                       ingress_registry_factory=dispatch_request_registry):
+    """Read-only replay of process_command's own admission gate for a still-
+    `queued` Command, covering everything process_command checks up to (but
+    never including) its Session Center health_check() gate.
+
+    This exists only so manager.session_center_supervisor can tell whether a
+    queued Command is real enough -- same governance, same trusted-ingress
+    admission, same task-policy gate process_command itself enforces -- to
+    justify starting Session Center for it before it has ever been claimed.
+    process_command remains the sole authority that actually claims a
+    Command: this never writes, never claims, and grants no authority
+    process_command doesn't independently re-derive on its own next tick --
+    it can only ever be more conservative than process_command, never less,
+    since any error here fails closed to False (not eligible).
+    """
+    if command.get("status") != "queued":
+        return False
+    try:
+        validate("command", command)
+    except TaskError:
+        return False
+    if command.get("action") == "OPEN_EXISTING_ADM_UI":
+        return False
+    if resolve_provider_runtime(command.get("provider")) is None:
+        return False
+    admitted_task = None
+    admission_version = ADMISSION_VERSION_V1
+    if (command.get("project_id"), command.get("task_id")) not in allowlist:
+        admitted_task = verify_trusted_ingress_admission(store, command, bucket, ingress_registry_factory)
+        if admitted_task is None:
+            return False
+        admission_version = command.get("admission_version")
+    try:
+        candidate_task = admitted_task or store.get("tasks", command["project_id"], command["task_id"])
+        validate("task", candidate_task)
+    except (TaskError, AttributeError, KeyError):
+        return False
+    try:
+        validate_task_enforcement(candidate_task)
+    except TaskError:
+        return False
+    return _policy_satisfied(candidate_task, admission_version)
+
+
 def process_command(store, service, command, launcher_factory=None, writer_factory=GCSLockRegistry.from_environment,
                     claim_factory=task_claim_registry, allowlist=frozenset(), health_check=session_center_healthy,
                     quota_check=None, ingress_registry_factory=dispatch_request_registry, origin_context=None,
