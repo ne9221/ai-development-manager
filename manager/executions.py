@@ -260,7 +260,7 @@ def reserve_execution(store, project_id, task_id, execution_id, provider, quota_
         existing = None
     if existing is not None:
         validate("execution", existing)
-        if existing.get("status") == "reserved" and all(existing.get(key) == value for key, value in expected.items()):
+        if existing.get("status") in ("reserved", "running") and all(existing.get(key) == value for key, value in expected.items()):
             return existing
         # Retries reuse the same execution_id as the attempt they retry (the
         # watcher derives it deterministically from the command, not the

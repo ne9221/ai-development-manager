@@ -150,7 +150,7 @@ CREDENTIAL_PATH_DENYLIST = re.compile(
 # tolerate a still-in-flight concurrent winner (its writes are ordinary,
 # non-CAS Drive puts, so a retrying caller must never attempt them itself)
 # without waiting so long the ingress call blocks indefinitely.
-CLAIM_VERIFICATION_ATTEMPTS = 5
+CLAIM_VERIFICATION_ATTEMPTS = 15
 CLAIM_VERIFICATION_DELAY_SECONDS = 0.02
 
 # Bounds manager.dispatcher.dispatch()'s historical-estimate lookup

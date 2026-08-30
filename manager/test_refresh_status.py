@@ -47,7 +47,7 @@ class RefreshTests(unittest.TestCase):
             service=object(), runtime_path=self.base / "status.json", log_path=self.base / "refresh.log",
             lock_path=self.base / "refresh.lock", claude_path=self.base / "missing.json",
             reader=lambda **_: deepcopy(old),
-            codex_collector=lambda **_: ({}, {"providers": [provider("codex", new_window, "2026-08-09T01:00:00Z")]}),
+            codex_collector=lambda **_: ({}, {"providers": [provider("codex", new_window, "2026-08-30T01:00:00Z")]}),
             publisher=lambda service, path: published.append(json.loads(path.read_text())) or {"action": "updated", "id": "1"},
         )
         defaults.update(overrides)

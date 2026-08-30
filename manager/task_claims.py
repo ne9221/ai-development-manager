@@ -34,16 +34,19 @@ def task_claim_registry(bucket, project_id, task_id, session=None):
     return GCSLockRegistry(bucket, task_claim_object_name(project_id, task_id), session=session)
 
 
-def _new_claim_record(project_id, task_id, execution_id, provider, claimed_at):
+def _new_claim_record(project_id, task_id, execution_id, provider, claimed_at, claim_token=None):
     for name, value in (("project_id", project_id), ("task_id", task_id), ("execution_id", execution_id), ("provider", provider), ("claimed_at", claimed_at)):
         if not isinstance(value, str) or not value.strip():
             raise TaskError(f"task claim requires a non-empty {name}")
-    return {
+    record = {
         "schema_version": CLAIM_SCHEMA_VERSION,
         "project_id": project_id, "task_id": task_id,
         "execution_id": execution_id, "provider": provider,
         "claimed_at": claimed_at,
     }
+    if claim_token is not None:
+        record["claim_token"] = claim_token
+    return record
 
 
 def _validate_claim_record(document, project_id, task_id):
@@ -58,7 +61,13 @@ def _validate_claim_record(document, project_id, task_id):
 
 
 def _same_owner(document, record):
-    return document.get("project_id") == record["project_id"] and document.get("task_id") == record["task_id"] and document.get("execution_id") == record["execution_id"]
+    if not (document.get("project_id") == record["project_id"] and document.get("task_id") == record["task_id"] and document.get("execution_id") == record["execution_id"]):
+        return False
+    doc_token = document.get("claim_token")
+    rec_token = record.get("claim_token")
+    if doc_token is not None or rec_token is not None:
+        return doc_token == rec_token
+    return True
 
 
 def _resolve_conflict(registry, record):
@@ -99,7 +108,7 @@ def _resolve_ambiguous(registry, record, attempts):
     raise TaskError("task claim ambiguous create outcome did not resolve after retries; failing closed")
 
 
-def claim_task_execution(registry, project_id, task_id, execution_id, provider, claimed_at, attempts=DEFAULT_AMBIGUOUS_ATTEMPTS):
+def claim_task_execution(registry, project_id, task_id, execution_id, provider, claimed_at, attempts=DEFAULT_AMBIGUOUS_ATTEMPTS, claim_token=None):
     """Atomically claim exclusive active-execution authority for one task.
 
     - First claim: create-if-absent (ifGenerationMatch=0) is the sole winner.
@@ -109,7 +118,7 @@ def claim_task_execution(registry, project_id, task_id, execution_id, provider, 
       the loser never writes the object.
     - Backend unavailable / malformed record: fails closed (TaskError).
     """
-    record = _new_claim_record(project_id, task_id, execution_id, provider, claimed_at)
+    record = _new_claim_record(project_id, task_id, execution_id, provider, claimed_at, claim_token=claim_token)
     try:
         generation = registry.create_if_absent(record)
         return {**record, "generation": generation}
@@ -131,7 +140,7 @@ def check_task_execution_claim(registry, project_id, task_id):
     return {**_validate_claim_record(document, project_id, task_id), "generation": generation}
 
 
-def release_task_execution_claim(registry, project_id, task_id, execution_id, generation):
+def release_task_execution_claim(registry, project_id, task_id, execution_id, generation, claim_token=None):
     """Generation-matched release. Never a blind delete: verifies the caller's
     execution_id still owns the claim and that the generation the caller holds
     is still current before deleting, so a stale rollback can never remove a
@@ -146,6 +155,8 @@ def release_task_execution_claim(registry, project_id, task_id, execution_id, ge
     _validate_claim_record(document, project_id, task_id)
     if document["execution_id"] != execution_id:
         return {"released": False, "reason": "claim is owned by a different execution"}
+    if claim_token is not None and document.get("claim_token") is not None and document.get("claim_token") != claim_token:
+        return {"released": False, "reason": "claim token mismatch"}
     if current_generation != generation:
         raise TaskClaimConflict("task claim generation changed; refusing to release under a stale generation")
     try:

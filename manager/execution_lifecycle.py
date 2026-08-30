@@ -1,3 +1,4 @@
+import secrets
 """Authoritative reservation-to-running lifecycle gate."""
 
 from datetime import timedelta
@@ -43,7 +44,7 @@ def _rollback_execution(store, project_id, execution_id, original):
 
 
 def enter_running_gate(store, service, registry, project_id, task_id, execution_id, provider, access, baseline_head=None,
-                       started_at=None, task_claim_registry=None, hard_timeout=None):
+                       started_at=None, task_claim_registry=None, hard_timeout=None, claim_token=None):
     """Validate and authorize one reservation; never launches a provider."""
     if hard_timeout is not None and (isinstance(hard_timeout, bool) or not isinstance(hard_timeout, (int, float))
                                      or not 0 < hard_timeout <= MAX_HARD_TIMEOUT_SECONDS):
@@ -124,8 +125,9 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
 
     claim = None
     claim_time = started_at or now_iso()
+    claim_token = claim_token or secrets.token_urlsafe(32)
     try:
-        claim = claim_task_execution(task_claim_registry, project_id, task_id, execution_id, provider, claim_time)
+        claim = claim_task_execution(task_claim_registry, project_id, task_id, execution_id, provider, claim_time, claim_token=claim_token)
         expected_claim = {
             "schema_version": CLAIM_SCHEMA_VERSION, "project_id": project_id, "task_id": task_id,
             "execution_id": execution_id, "provider": provider,
@@ -144,7 +146,7 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
         generation = claim.get("generation") if isinstance(claim, dict) else None
         if isinstance(generation, int) and generation >= 1:
             try:
-                release_task_execution_claim(task_claim_registry, project_id, task_id, execution_id, generation)
+                release_task_execution_claim(task_claim_registry, project_id, task_id, execution_id, generation, claim_token=claim_token)
             except Exception as cleanup_exc:
                 raise TaskError(f"task claim validation failed and claim cleanup failed; writer lease retained when present: {cleanup_exc}") from exc
             if lease:

@@ -417,6 +417,7 @@ def _reconcile_active(store, service, command, claim_factory):
                 return _attention(store, command, None, "execution_record_missing_claim_state_unknown")
             if claim is not None:
                 return _attention(store, command, None, "execution_record_missing_claim_retained")
+            _block_prelaunch_task(store, command, "claim_timeout")
             failed = _terminal(command, "failed", _result("error", command["execution_id"], error_kind="claim_timeout"))
             _write(store, failed)
             return {"status": "failed", "reconciled": True}

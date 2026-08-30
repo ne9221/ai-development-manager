@@ -115,9 +115,13 @@ def _persist_session_link(store, writer_registry, execution, prepared, request, 
         existing = None
     if existing is None:
         store.put("sessions", execution["project_id"], session["session_id"], session)
-    elif existing != session:
-        raise TaskError("canonical provider session conflicts with persisted content")
-    if store.get("sessions", execution["project_id"], session["session_id"]) != session:
+    else:
+        identity_keys = ("session_id", "project_id", "task_id", "provider", "provider_session_id")
+        if any(existing.get(k) != session.get(k) for k in identity_keys):
+            raise TaskError("canonical provider session conflicts with persisted content")
+    persisted = store.get("sessions", execution["project_id"], session["session_id"])
+    identity_keys = ("session_id", "project_id", "task_id", "provider", "provider_session_id")
+    if any(persisted.get(k) != session.get(k) for k in identity_keys):
         raise TaskError("canonical provider session persistence verification failed")
 
     link_execution_session(store, execution["project_id"], execution["execution_id"], session)
