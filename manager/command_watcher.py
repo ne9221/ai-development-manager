@@ -15,7 +15,7 @@ from manager.claude_account_selector import load_claude_accounts
 from manager.ag_runner import AgRunner
 from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_creation_identity, process_identity_state
-from manager.execution_lifecycle import retry_incomplete_terminal_persistence, terminalize_execution
+from manager.execution_lifecycle import merge_cleanup_evidence, retry_incomplete_terminal_persistence, terminalize_execution
 from manager.execution_runner import launch_task
 from manager.open_existing_adm_ui import focus_existing_adm_ui
 from manager.executions import cancel_reserved_execution, execution_health, prepare_task_retry
@@ -617,7 +617,7 @@ def _reconcile_active(store, service, command, claim_factory):
                     # seeing 'retained' forever even though the real claim
                     # is now genuinely gone.
                     refreshed = store.get("executions", command["project_id"], command["execution_id"])
-                    refreshed["cleanup_evidence"] = {**(refreshed.get("cleanup_evidence") or {}), "task_claim_release": "released"}
+                    refreshed["cleanup_evidence"] = merge_cleanup_evidence(refreshed.get("cleanup_evidence"), {"task_claim_release": "released"})
                     validate("execution", refreshed)
                     store.put("executions", command["project_id"], command["execution_id"], refreshed)
                     execution = refreshed
@@ -644,7 +644,7 @@ def _reconcile_active(store, service, command, claim_factory):
                             pass
                         if evidence.get("task_claim_release") != "released":
                             refreshed = store.get("executions", command["project_id"], command["execution_id"])
-                            refreshed["cleanup_evidence"] = {**(refreshed.get("cleanup_evidence") or {}), "task_claim_release": "released"}
+                            refreshed["cleanup_evidence"] = merge_cleanup_evidence(refreshed.get("cleanup_evidence"), {"task_claim_release": "released"})
                             validate("execution", refreshed)
                             store.put("executions", command["project_id"], command["execution_id"], refreshed)
                             execution = refreshed
