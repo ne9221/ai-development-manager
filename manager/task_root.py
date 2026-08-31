@@ -76,6 +76,7 @@ _BIND_IMMUTABLE_FIELDS = (
     "terminal_committed_at", "provider_identity", "session_id", "account_identity",
     "schema_version", "canonicalization_version", "canonical_proposal", "proposal_hash",
     "terminal_fence_epoch", "task_projection_drive_id", "handoff_drive_file_id",
+    "expected_task_projection_digest", "expected_handoff_projection_digest",
 )
 
 
@@ -127,8 +128,89 @@ def proposal_hash(proposal):
     return hashlib.sha256(_canonical_json(canonical).encode("utf-8")).hexdigest()
 
 
+def projection_digest(payload):
+    """Deterministic digest of a Drive projection payload (a Task or
+    Handoff document, or the authoritative-fields subset of one). Callers
+    own what exactly goes into `payload` -- this function only owns making
+    the same payload always hash the same way."""
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def projection_of(bind):
+    """The authority tuple one Drive Task/Handoff projection must carry to
+    be verifiable later against verify_projection_matches_commit."""
+    if not isinstance(bind, dict):
+        return None
+    return {"execution_id": bind.get("execution_id"), "epoch": bind.get("epoch"),
+            "proposal_hash": bind.get("proposal_hash")}
+
+
+def verify_projection_matches_commit(bind, projection):
+    """Fail-closed authority check: a Drive-materialized projection is
+    authoritative only when execution_id, epoch, and proposal_hash all
+    agree with the current GCS Task Root bind. A stale writer can still
+    physically produce a projection after a newer commit exists -- this
+    predicate is what lets a reader ignore/reject it and trigger repair
+    instead of trusting Drive on its own.
+    STALE_WRITE_CAN_PHYSICALLY_EXIST=YES, STALE_WRITE_CAN_BECOME_AUTHORITATIVE=NO."""
+    if not isinstance(bind, dict) or not isinstance(projection, dict):
+        return False
+    return (bind.get("execution_id") == projection.get("execution_id")
+            and bind.get("epoch") == projection.get("epoch")
+            and bind.get("proposal_hash") == projection.get("proposal_hash"))
+
+
+def verify_projection_digest(bind, view, actual_payload):
+    """Fail-closed content check, ORTHOGONAL to verify_projection_matches_commit:
+    even when the authority tuple (execution_id/epoch/proposal_hash) matches
+    the current winner, a stale writer overwriting the SAME winner's Drive
+    projection with different content must still be rejected. Recomputes
+    the digest from the actual payload read off Drive -- never trusts a
+    self-reported hash embedded in the Drive document itself. `view` is
+    "task" or "handoff". Returns True (nothing to validate against yet) if
+    the bind has no expected digest recorded for that view."""
+    if view not in ("task", "handoff"):
+        raise TaskError(f"unknown projection view: {view}")
+    expected = bind.get(f"expected_{view}_projection_digest") if isinstance(bind, dict) else None
+    if expected is None:
+        return True
+    return projection_digest(actual_payload) == expected
+
+
 def _is_strengthened(document):
     return isinstance(document, dict) and "epoch" in document
+
+
+# Orthogonal truth domains (Checkpoint C). Terminal authority (bound/unbound)
+# already lives in `terminal`. These two are independent of it and of each
+# other: a task can legally be terminal=bound + materialization=attention +
+# cleanup=released all at once -- exactly the permanent-Drive-failure shape
+# that must not hold a runtime claim hostage forever. Neither domain is
+# collapsed into a single linear phase.
+
+# Materialization is a recoverable KNOWLEDGE state about one Drive view
+# (task projection or handoff), NOT a rank -- "attention" is not a ceiling
+# above "verified"; it can transition back to "verified" once whatever
+# failed is retried and confirmed. Views are tracked independently because a
+# permanently-broken Handoff write must never block a healthy Task
+# projection (or vice versa) from reaching "verified".
+MATERIALIZATION_STATUSES = ("absent", "pending", "verified", "attention")
+_MATERIALIZATION_TRANSITIONS = {
+    "absent": {"pending"},
+    "pending": {"pending", "verified", "attention"},
+    "verified": {"verified", "pending"},   # re-materializing an already-good view (e.g. repair) is legal
+    "attention": {"pending", "verified", "attention"},  # recoverable, never a dead end
+}
+
+# Cleanup (the RUNTIME claim/writer/provider resource lattice, distinct from
+# Execution.cleanup_evidence's own lattice) IS a monotonic rank: once
+# resources are released they are never un-released. "released" is sticky.
+CLEANUP_STATUSES = ("retained", "release_pending", "released")
+_CLEANUP_RANK = {"retained": 0, "release_pending": 1, "released": 2}
+
+
+def _fresh_materialization():
+    return {"task": {"status": "absent"}, "handoff": {"status": "absent"}}
 
 
 def _fresh_epoch_document(project_id, task_id, execution_id, provider, claimed_at, epoch, claim_token=None):
@@ -136,7 +218,7 @@ def _fresh_epoch_document(project_id, task_id, execution_id, provider, claimed_a
         "schema_version": SCHEMA_VERSION, "project_id": project_id, "task_id": task_id,
         "epoch": epoch, "execution_id": execution_id, "provider": provider, "claimed_at": claimed_at,
         "authority_active": True, "terminal": None,
-        "materialization": {"status": "absent"}, "cleanup": {"status": "retained"},
+        "materialization": _fresh_materialization(), "cleanup": {"status": "retained"},
         "epoch_history": [],
     }
     if claim_token is not None:
@@ -178,7 +260,7 @@ def _migrate_legacy_document(document, project_id, task_id, linked_execution):
         "schema_version": SCHEMA_VERSION, "project_id": project_id, "task_id": task_id,
         "epoch": 1, "execution_id": document["execution_id"], "provider": document.get("provider"),
         "claimed_at": document.get("claimed_at"), "authority_active": linked_execution is None,
-        "terminal": None, "materialization": {"status": "absent"}, "cleanup": {"status": "retained"},
+        "terminal": None, "materialization": _fresh_materialization(), "cleanup": {"status": "retained"},
         "epoch_history": [],
     }
     if document.get("claim_token") is not None:
@@ -261,7 +343,7 @@ def acquire_task_root(registry, project_id, task_id, execution_id, provider, cla
             new_document = {
                 **document, "epoch": document["epoch"] + 1, "execution_id": execution_id, "provider": provider,
                 "claimed_at": claimed_at, "authority_active": True, "terminal": None,
-                "materialization": {"status": "absent"}, "cleanup": {"status": "retained"},
+                "materialization": _fresh_materialization(), "cleanup": {"status": "retained"},
                 "epoch_history": _archive_current_epoch(document),
             }
         else:
@@ -378,7 +460,8 @@ def validate_task_root_running_authority(claim, project_id, task_id, execution_i
 
 
 def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id_factory=None,
-                         handoff_drive_id_factory=None, attempts=DEFAULT_ATTEMPTS):
+                         handoff_drive_id_factory=None, expected_task_projection=None,
+                         expected_handoff_projection=None, attempts=DEFAULT_ATTEMPTS):
     """CAS-bind this execution's terminal proposal as its epoch's winner.
 
     Same epoch + identical canonical proposal -> idempotent (returns the
@@ -454,6 +537,8 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
                 "canonical_proposal": proposal, "proposal_hash": proposal_h,
                 "terminal_fence_epoch": epoch,
                 "task_projection_drive_id": fresh_task_drive_id, "handoff_drive_file_id": fresh_handoff_drive_id,
+                "expected_task_projection_digest": projection_digest(expected_task_projection) if expected_task_projection is not None else None,
+                "expected_handoff_projection_digest": projection_digest(expected_handoff_projection) if expected_handoff_projection is not None else None,
             }
             new_document = {**document, "terminal": bind}
             try:
@@ -482,6 +567,10 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
             updates["task_projection_drive_id"] = fresh_task_drive_id
         if fresh_handoff_drive_id is not None and existing_bind.get("handoff_drive_file_id") is None:
             updates["handoff_drive_file_id"] = fresh_handoff_drive_id
+        if expected_task_projection is not None and existing_bind.get("expected_task_projection_digest") is None:
+            updates["expected_task_projection_digest"] = projection_digest(expected_task_projection)
+        if expected_handoff_projection is not None and existing_bind.get("expected_handoff_projection_digest") is None:
+            updates["expected_handoff_projection_digest"] = projection_digest(expected_handoff_projection)
         if not updates:
             return document, generation
 
@@ -494,6 +583,86 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
             raise TaskError("task root backend unavailable while committing terminal bind") from exc
         return new_document, new_generation
     raise TaskError("terminal bind ambiguous after retries; failing closed")
+
+
+def _current_epoch_owner_document(registry, project_id, task_id, execution_id):
+    try:
+        existing = registry.read_if_exists()
+    except Exception as exc:
+        raise TaskError("task root backend unavailable") from exc
+    if existing is None:
+        raise TaskError("task root object does not exist")
+    document, generation, _server_time = existing
+    if document.get("project_id") != project_id or document.get("task_id") != task_id:
+        raise TaskError("malformed task root record: identity does not match the claim key")
+    if not _is_strengthened(document):
+        raise TaskError("facet advance requires a strengthened task root")
+    if document.get("execution_id") != execution_id:
+        raise TaskError("only the current epoch's owning execution may advance its facets")
+    return document, generation
+
+
+def advance_materialization_view(registry, project_id, task_id, execution_id, view, new_status, note=None, attempts=DEFAULT_ATTEMPTS):
+    """CAS-advance ONE materialization view ("task" or "handoff")
+    independently of the other and independently of the cleanup facet.
+    Validated against _MATERIALIZATION_TRANSITIONS -- a knowledge state,
+    not a rank: "attention" can legally advance back to "verified" once
+    whatever failed is retried and confirmed, so a permanently-broken
+    Handoff can never trap a healthy Task view (or vice versa) below
+    "verified". Never touches the terminal bind (guarded by
+    _reject_bind_mutation defensively)."""
+    if view not in ("task", "handoff"):
+        raise TaskError(f"unknown materialization view: {view}")
+    if new_status not in MATERIALIZATION_STATUSES:
+        raise TaskError(f"unknown materialization status: {new_status}")
+    for _ in range(attempts):
+        document, generation = _current_epoch_owner_document(registry, project_id, task_id, execution_id)
+        materialization = dict(document.get("materialization") or _fresh_materialization())
+        current = (materialization.get(view) or {}).get("status", "absent")
+        if new_status not in _MATERIALIZATION_TRANSITIONS.get(current, set()) and new_status != current:
+            raise TaskError(f"illegal materialization transition for '{view}': {current} -> {new_status}")
+        view_state = {"status": new_status}
+        if note is not None:
+            view_state["note"] = str(note)[:500]
+        materialization[view] = view_state
+        new_document = {**document, "materialization": materialization}
+        _reject_bind_mutation(document, new_document)
+        try:
+            new_generation = registry.compare_and_swap(generation, new_document)
+        except RegistryConflict:
+            continue
+        except Exception as exc:
+            raise TaskError("task root backend unavailable while advancing materialization") from exc
+        return new_document, new_generation
+    raise TaskError("materialization advance ambiguous after retries; failing closed")
+
+
+def advance_cleanup_facet(registry, project_id, task_id, execution_id, new_status, attempts=DEFAULT_ATTEMPTS):
+    """CAS-advance the RUNTIME cleanup facet (retained -> release_pending ->
+    released), monotonically -- "released" is sticky and this never
+    regresses it, independent of what materialization currently shows.
+    This is the facet acquire_task_root() checks before opening a new
+    epoch; it is deliberately independent of `terminal`/`materialization`
+    so a permanently-attention materialization can still let cleanup
+    reach "released" and free up the task for a legitimate retry -- see
+    module docstring's permanent-Drive-failure shape."""
+    if new_status not in CLEANUP_STATUSES:
+        raise TaskError(f"unknown cleanup status: {new_status}")
+    for _ in range(attempts):
+        document, generation = _current_epoch_owner_document(registry, project_id, task_id, execution_id)
+        current = (document.get("cleanup") or {}).get("status", "retained")
+        if _CLEANUP_RANK[new_status] <= _CLEANUP_RANK.get(current, 0):
+            return document, generation  # monotonic no-op: never regress, no-op if already there or ahead
+        new_document = {**document, "cleanup": {"status": new_status}}
+        _reject_bind_mutation(document, new_document)
+        try:
+            new_generation = registry.compare_and_swap(generation, new_document)
+        except RegistryConflict:
+            continue
+        except Exception as exc:
+            raise TaskError("task root backend unavailable while advancing cleanup facet") from exc
+        return new_document, new_generation
+    raise TaskError("cleanup facet advance ambiguous after retries; failing closed")
 
 
 def release_runtime_claim(registry, project_id, task_id, execution_id, generation, claim_token=None, attempts=DEFAULT_ATTEMPTS):

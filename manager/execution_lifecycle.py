@@ -11,6 +11,111 @@ from manager.tasks import TaskError, create_handoff, now_iso, validate
 from manager.worktree_locks import active, acquire, canonical_baseline, canonical_branch, canonical_repository, canonical_scope, owner_fields, read_registry, release, repository_lock_id, same_owner, validate_local_preflight
 
 
+_PERSISTENCE_RANK = {"incomplete": 0, "partial": 1, "complete": 2}
+_PERSISTED_ORDER = ["execution", "handoff", "task"]
+_WRITER_RELEASE_STICKY = ("released", "not_required")
+
+
+def _sticky(existing_value, new_value, sticky_values):
+    """Once either side already shows a value in `sticky_values`, that value
+    wins and can never be pulled back to a non-sticky one -- order of the two
+    calls this merge is folded across must not matter (commutative)."""
+    if existing_value in sticky_values:
+        return existing_value
+    if new_value in sticky_values:
+        return new_value
+    return new_value if new_value is not None else existing_value
+
+
+def _write_once(existing_value, new_value, field_name):
+    """`field_name` may be recorded once; a second write is only ever
+    valid if it repeats the same value. Two different non-empty values is a
+    genuine conflict between two observations of what should be the single
+    same fact -- fail closed rather than silently pick one (the caller is
+    responsible for surfacing this as a hard error, not for guessing)."""
+    if existing_value is None:
+        return new_value
+    if new_value is None or new_value == existing_value:
+        return existing_value
+    raise TaskError(f"cleanup evidence conflict on write-once field '{field_name}': "
+                    f"{existing_value!r} != {new_value!r}")
+
+
+def merge_cleanup_evidence(existing, updates):
+    """The single shared lattice merge for every terminal-lifecycle write to
+    Execution.cleanup_evidence -- distinct from (and orthogonal to) the
+    Task Root's own materialization/cleanup facets in manager.task_root,
+    which track runtime claim/writer authority rather than this record's
+    own persistence/provider-outcome audit trail.
+
+    Never a wholesale overwrite: always fold `updates` onto `existing`
+    field-by-field under a fixed per-field law, so the result is idempotent
+    (merge(x, x) == x), commutative (merge(a, b) == merge(b, a)), associative
+    (merge(merge(a, b), c) == merge(a, merge(b, c))), and monotonic (no field
+    ever regresses to a "less converged" value once it has advanced):
+
+      persistence          -- incomplete < partial < complete; keeps the max
+      persisted             -- set union, rendered in canonical order
+      task_claim_release    -- "released" is sticky
+      writer_release        -- "released"/"not_required" are sticky
+      provider_outcome      -- write-once; conflicting non-empty values FAIL CLOSED
+      errors                -- append-only + dedup (historical audit trail)
+      terminal_at           -- write-once; an existing value is never re-stamped
+      session_id            -- enrichment-only; conflicting non-empty values FAIL CLOSED
+      error_kind            -- enrichment-only; conflicting non-empty values FAIL CLOSED
+
+    Any other key present on either side passes through (`updates` wins when
+    both sides set it). Both inputs are read-only; a fresh dict is always
+    returned. `existing` should be the just-re-read current value from the
+    store (or None), not a snapshot captured before other work happened, so
+    a concurrent writer's progress is never clobbered.
+    """
+    existing = dict(existing or {})
+    updates = dict(updates or {})
+    merged = {}
+
+    if "persistence" in existing or "persistence" in updates:
+        existing_rank = _PERSISTENCE_RANK.get(existing.get("persistence"), -1)
+        updates_rank = _PERSISTENCE_RANK.get(updates.get("persistence"), -1)
+        merged["persistence"] = existing.get("persistence") if existing_rank >= updates_rank else updates.get("persistence")
+
+    if "persisted" in existing or "persisted" in updates:
+        union = set(existing.get("persisted") or []) | set(updates.get("persisted") or [])
+        merged["persisted"] = [item for item in _PERSISTED_ORDER if item in union] + sorted(union - set(_PERSISTED_ORDER))
+
+    if "task_claim_release" in existing or "task_claim_release" in updates:
+        merged["task_claim_release"] = _sticky(existing.get("task_claim_release"), updates.get("task_claim_release"), {"released"})
+
+    if "writer_release" in existing or "writer_release" in updates:
+        merged["writer_release"] = _sticky(existing.get("writer_release"), updates.get("writer_release"), _WRITER_RELEASE_STICKY)
+
+    if "provider_outcome" in existing or "provider_outcome" in updates:
+        merged["provider_outcome"] = _write_once(existing.get("provider_outcome"), updates.get("provider_outcome"), "provider_outcome")
+
+    if "errors" in existing or "errors" in updates:
+        merged_errors = list(existing.get("errors") or [])
+        for error in updates.get("errors") or []:
+            if error not in merged_errors:
+                merged_errors.append(error)
+        merged["errors"] = merged_errors
+
+    if "terminal_at" in existing or "terminal_at" in updates:
+        merged["terminal_at"] = existing.get("terminal_at") or updates.get("terminal_at")
+
+    if "session_id" in existing or "session_id" in updates:
+        merged["session_id"] = _write_once(existing.get("session_id"), updates.get("session_id"), "session_id")
+
+    if "error_kind" in existing or "error_kind" in updates:
+        merged["error_kind"] = _write_once(existing.get("error_kind"), updates.get("error_kind"), "error_kind")
+
+    handled = {"persistence", "persisted", "task_claim_release", "writer_release",
+               "provider_outcome", "errors", "terminal_at", "session_id", "error_kind"}
+    for key in (set(existing) | set(updates)) - handled:
+        merged[key] = updates[key] if key in updates else existing[key]
+
+    return merged
+
+
 def _claimed_task(task, execution_id):
     context = dict(task.get("source_context") or {})
     active = context.get("active_execution_id")
@@ -365,15 +470,23 @@ def _terminal_state(execution, task, handoff, status, summary, timestamp):
 
 
 def _retain_terminal_authority(store, execution, status, persisted, error):
-    writer_release = "released" if (execution.get("cleanup_evidence") or {}).get("writer_release") == "released" else ("retained" if execution.get("access") == "production_write" else "not_required")
-    audit = {
+    try:
+        current = store.get("executions", execution["project_id"], execution["execution_id"])
+        existing_evidence = current.get("cleanup_evidence")
+    except Exception:
+        current = None
+        existing_evidence = execution.get("cleanup_evidence")
+    writer_release = "released" if (existing_evidence or {}).get("writer_release") == "released" else ("retained" if execution.get("access") == "production_write" else "not_required")
+    updates = {
         "provider_outcome": status, "persistence": "incomplete" if not persisted else "partial",
         "persisted": persisted,
         "writer_release": writer_release,
         "task_claim_release": "retained", "errors": [f"persistence failed: {error}"],
     }
+    audit = merge_cleanup_evidence(existing_evidence, updates)
     try:
-        current = store.get("executions", execution["project_id"], execution["execution_id"])
+        if current is None:
+            current = store.get("executions", execution["project_id"], execution["execution_id"])
         current["cleanup_evidence"] = audit
         validate("execution", current)
         store.put("executions", execution["project_id"], execution["execution_id"], current)

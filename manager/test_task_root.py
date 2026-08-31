@@ -490,5 +490,119 @@ class RealAcquisitionPathIntegrationTests(unittest.TestCase):
         self.assertEqual("exec-r17-old", gate["task_claim"]["epoch_history"][0]["execution_id"])
 
 
+class OrthogonalFacetsTests(unittest.TestCase):
+    """Checkpoint C: terminal authority, materialization (per-view), and
+    runtime cleanup are three independent truth domains -- none of them
+    collapsed into a single linear phase."""
+
+    def setUp(self):
+        self.registry = MemoryClaimRegistry()
+        task_root.acquire_task_root(self.registry, "p1", "t1", "exec-a", "codex", _now())
+        task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
+
+    def test_materialization_views_are_independent(self):
+        task_root.advance_materialization_view(self.registry, "p1", "t1", "exec-a", "task", "pending")
+        task_root.advance_materialization_view(self.registry, "p1", "t1", "exec-a", "task", "verified")
+        doc = self.registry.document
+        self.assertEqual("verified", doc["materialization"]["task"]["status"])
+        self.assertEqual("absent", doc["materialization"]["handoff"]["status"])
+
+    def test_attention_is_recoverable_not_a_permanent_top(self):
+        task_root.advance_materialization_view(self.registry, "p1", "t1", "exec-a", "handoff", "pending")
+        task_root.advance_materialization_view(self.registry, "p1", "t1", "exec-a", "handoff", "attention", note="Drive 403")
+        self.assertEqual("attention", self.registry.document["materialization"]["handoff"]["status"])
+        # Recovery: attention -> verified is a legal transition, not blocked
+        # by any linear rank treating attention as beyond verified.
+        task_root.advance_materialization_view(self.registry, "p1", "t1", "exec-a", "handoff", "verified")
+        self.assertEqual("verified", self.registry.document["materialization"]["handoff"]["status"])
+
+    def test_illegal_materialization_transition_rejected(self):
+        with self.assertRaises(TaskError):
+            task_root.advance_materialization_view(self.registry, "p1", "t1", "exec-a", "task", "verified")  # absent -> verified skips pending
+
+    def test_cleanup_facet_monotonic_released_sticky(self):
+        task_root.advance_cleanup_facet(self.registry, "p1", "t1", "exec-a", "release_pending")
+        task_root.advance_cleanup_facet(self.registry, "p1", "t1", "exec-a", "released")
+        # Regression attempt is a silent no-op, never an error and never a
+        # downgrade -- released is sticky.
+        task_root.advance_cleanup_facet(self.registry, "p1", "t1", "exec-a", "retained")
+        self.assertEqual("released", self.registry.document["cleanup"]["status"])
+
+    def test_permanent_drive_failure_valid_state_terminal_bound_attention_cleanup_released(self):
+        """The core state Checkpoint C exists to make legal: a permanently
+        broken Handoff materialization must never hold runtime resources
+        hostage. terminal=bound + materialization=attention +
+        cleanup=released is a valid, reachable, simultaneous state."""
+        task_root.advance_materialization_view(self.registry, "p1", "t1", "exec-a", "handoff", "pending")
+        task_root.advance_materialization_view(self.registry, "p1", "t1", "exec-a", "handoff", "attention", note="permanent 403")
+        task_root.advance_cleanup_facet(self.registry, "p1", "t1", "exec-a", "release_pending")
+        task_root.advance_cleanup_facet(self.registry, "p1", "t1", "exec-a", "released")
+        task_root.release_runtime_claim(self.registry, "p1", "t1", "exec-a", self.registry.generation)
+        doc = self.registry.document
+        self.assertIsNotNone(doc["terminal"])  # terminal authority remains bound
+        self.assertEqual("attention", doc["materialization"]["handoff"]["status"])
+        self.assertEqual("released", doc["cleanup"]["status"])
+        # And a genuinely new retry can now legally open epoch 2, proving
+        # runtime authority was NOT held hostage by the broken view.
+        second = task_root.acquire_task_root(self.registry, "p1", "t1", "exec-b", "codex", _now())
+        self.assertEqual(2, second["epoch"])
+
+    def test_facet_advance_refuses_a_non_owning_execution(self):
+        with self.assertRaises(TaskError):
+            task_root.advance_materialization_view(self.registry, "p1", "t1", "exec-OTHER", "task", "pending")
+        with self.assertRaises(TaskError):
+            task_root.advance_cleanup_facet(self.registry, "p1", "t1", "exec-OTHER", "released")
+
+
+class ProjectionDigestTests(unittest.TestCase):
+    """Checkpoint D: expected projection digests are stamped into the bind
+    once, and a reader must recompute from the ACTUAL Drive content rather
+    than trust anything self-reported inside the document."""
+
+    def setUp(self):
+        self.registry = MemoryClaimRegistry()
+        task_root.acquire_task_root(self.registry, "p1", "t1", "exec-a", "codex", _now())
+
+    def test_expected_digest_stamped_and_reader_recomputes(self):
+        task_payload = {"status": "completed", "blocked_reason": None}
+        handoff_payload = {"handoff_id": "t1-completed-exec-a-0", "reason": "completed"}
+        bound, _ = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"),
+                                                  expected_task_projection=task_payload,
+                                                  expected_handoff_projection=handoff_payload)
+        bind = bound["terminal"]
+        self.assertIsNotNone(bind["expected_task_projection_digest"])
+        self.assertTrue(task_root.verify_projection_digest(bind, "task", task_payload))
+        self.assertTrue(task_root.verify_projection_digest(bind, "handoff", handoff_payload))
+
+    def test_K_same_epoch_hash_but_corrupted_payload_digest_mismatch_rejected(self):
+        """K: same winner/same fence/same proposal_hash, but the ACTUAL
+        Drive content was overwritten with something else (e.g. a stale
+        writer's own idea of the projection) -- digest recompute catches
+        it even though the authority tuple alone would not."""
+        task_payload = {"status": "completed", "blocked_reason": None}
+        bound, _ = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"),
+                                                  expected_task_projection=task_payload)
+        bind = bound["terminal"]
+        corrupted = {"status": "blocked", "blocked_reason": "stale writer overwrite"}
+        self.assertFalse(task_root.verify_projection_digest(bind, "task", corrupted))
+        # But the authority tuple itself still matches -- proving these are
+        # genuinely orthogonal checks, not the same information twice.
+        self.assertTrue(task_root.verify_projection_matches_commit(bind, task_root.projection_of(bind)))
+
+    def test_J_old_epoch_projection_rejected(self):
+        """J: a projection minted under an OLDER epoch is rejected by the
+        authority-tuple check regardless of digest."""
+        bound, bind_generation = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
+        stale_projection = {"execution_id": "exec-a", "epoch": 0, "proposal_hash": bound["terminal"]["proposal_hash"]}
+        self.assertFalse(task_root.verify_projection_matches_commit(bound["terminal"], stale_projection))
+
+    def test_digest_immutable_once_bound_even_if_new_payload_supplied(self):
+        first_payload = {"status": "completed"}
+        second_payload = {"status": "completed", "extra": "field"}
+        bound1, _ = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"), expected_task_projection=first_payload)
+        bound2, _ = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"), expected_task_projection=second_payload)
+        self.assertEqual(bound1["terminal"]["expected_task_projection_digest"], bound2["terminal"]["expected_task_projection_digest"])
+
+
 if __name__ == "__main__":
     unittest.main()
