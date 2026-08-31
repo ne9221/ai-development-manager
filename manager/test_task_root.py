@@ -795,6 +795,45 @@ class R17RoundRoundAndFreshProcessRecoveryTests(unittest.TestCase):
         for key in ("proposal_hash", "execution_id", "epoch", "terminal_fence_epoch", "terminal_committed_at", "canonical_proposal"):
             self.assertEqual(original_bind.get(key), fresh_registry.document["terminal"].get(key), f"field {key} changed across crash recovery")
 
+    def test_L_winner_repair_deterministically_overwrites_stale_task_projection(self):
+        """L: a stale/corrupted Task record (e.g. a straggling old writer's
+        overwrite) is not lattice-merged with the winner's truth -- the
+        next reconciliation pass deterministically regenerates the FULL
+        authoritative projection from the immutable proposal and
+        overwrites it wholesale."""
+        from manager.execution_lifecycle import retry_incomplete_terminal_persistence
+
+        self._seed_terminal_execution()
+        cmd = self._corrupt_to_r17_shape()
+        self._seed_legacy_claim_document()
+
+        # First convergence pass establishes the real winner.
+        with patch("manager.command_watcher.process_identity_state", return_value="stopped"):
+            process_command(self.store, None, cmd, claim_factory=lambda *_: self.registry)
+        authoritative_task = self.store.get("tasks", "p1", "t1")
+        self.assertEqual("completed", authoritative_task["status"])
+
+        # A stale writer corrupts the Task view after the fact.
+        corrupted = dict(authoritative_task)
+        corrupted["status"] = "blocked"
+        corrupted["blocked_reason"] = "stale writer overwrite"
+        corrupted["current_progress"] = "corrupted by a straggling old writer"
+        self.store.put("tasks", "p1", "t1", corrupted)
+
+        # Re-running the recovery path (idempotent -- persistence is
+        # already complete, but the underlying repair mechanism is the
+        # same deterministic-overwrite logic) restores authoritative truth.
+        execution = self.store.get("executions", "p1", self.execution_id)
+        execution["cleanup_evidence"]["persistence"] = "partial"
+        self.store.put("executions", "p1", self.execution_id, execution)
+        retry_incomplete_terminal_persistence(self.store, "p1", "t1", self.execution_id,
+                                              claim_registry=self.registry)
+
+        repaired = self.store.get("tasks", "p1", "t1")
+        self.assertEqual("completed", repaired["status"])
+        self.assertIsNone(repaired["blocked_reason"])
+        self.assertNotEqual("corrupted by a straggling old writer", repaired["current_progress"])
+
 
 if __name__ == "__main__":
     unittest.main()
