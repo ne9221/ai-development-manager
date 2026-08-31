@@ -5,7 +5,8 @@ import json
 import os
 
 from collectors.publish_drive import build_service
-from manager.task_claims import check_task_execution_claim, release_task_execution_claim, task_claim_registry
+from manager.task_claims import task_claim_registry
+from manager.task_root import read_task_root_or_legacy_claim, release_runtime_claim
 from manager.tasks import DriveRecords, TaskError, validate
 
 
@@ -26,7 +27,7 @@ def recover_task_claim(store, claim_registry, project_id, task_id):
     execution must be terminalized by its original recovery flow after external
     provider-stop evidence is available.
     """
-    claim = check_task_execution_claim(claim_registry, project_id, task_id)
+    claim = read_task_root_or_legacy_claim(claim_registry, project_id, task_id)
     if claim is None:
         return {"status": "clean", "released": False, "reason": "no_active_claim"}
     try:
@@ -55,8 +56,8 @@ def recover_task_claim(store, claim_registry, project_id, task_id):
         return _refused("authoritative_terminal_cleanup_not_confirmed", claim)
     if execution.get("access") == "production_write" and cleanup.get("writer_release") != "released":
         return _refused("writer_authority_not_confirmed_released", claim)
-    released = release_task_execution_claim(claim_registry, project_id, task_id,
-                                            claim["execution_id"], claim["generation"])
+    released = release_runtime_claim(claim_registry, project_id, task_id,
+                                     claim["execution_id"], claim["generation"])
     if not released.get("released"):
         return _refused("claim_changed_or_not_owned", claim)
     return {"status": "released", "released": True, "execution_id": claim["execution_id"],

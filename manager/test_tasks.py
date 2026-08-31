@@ -8,10 +8,33 @@ from manager.tasks import MIME_FOLDER, ROOT_FOLDER_ID, ROOT_FOLDERS, DriveRecord
 
 
 class MemoryStore:
-    def __init__(self): self.records = {}
+    def __init__(self):
+        self.records = {}
+        self.files_by_id = {}
+        self.next_file_seq = 1
+    def generate_record_file_id(self):
+        file_id = f"mem-file-{self.next_file_seq:06d}"
+        self.next_file_seq += 1
+        return file_id
     def put(self, area, project, name, document):
         self.records[(area, project, name)] = deepcopy(document); return document
+    def put_with_fixed_file_id(self, area, project, name, document, drive_file_id):
+        existing = self.files_by_id.get(drive_file_id)
+        if existing is not None:
+            if existing["document"] == document:
+                return deepcopy(document)
+            raise TaskError(f"Drive fixed-ID conflict: record {name} with id {drive_file_id} already exists with conflicting payload")
+        self.files_by_id[drive_file_id] = {
+            "area": area, "project": project, "name": name, "document": deepcopy(document)
+        }
+        self.records[(area, project, name)] = deepcopy(document)
+        return deepcopy(document)
     def get(self, area, project, name): return deepcopy(self.records[(area, project, name)])
+    def get_by_file_id(self, drive_file_id):
+        item = self.files_by_id.get(drive_file_id)
+        if item is None:
+            raise TaskError(f"file not found: {drive_file_id}")
+        return deepcopy(item["document"])
     def latest(self, area, project, task):
         items = [value for (a, p, _), value in self.records.items() if a == area and p == project and value.get("task_id") == task]
         return max(items, key=lambda item: item["created_at"])
@@ -31,6 +54,15 @@ class FakeDriveFiles:
     (pausing before the snapshot would let CPython's GIL scheduling resolve
     the two callers sequentially by luck instead of racing them)."""
     def __init__(self, on_list=None): self.items = {}; self.next_id = 1; self.lock = threading.Lock(); self.on_list = on_list; self.list_options = []
+    def generateIds(self, count=1, space="drive", **_kwargs):
+        def result():
+            with self.lock:
+                ids = []
+                for _ in range(count):
+                    seq = self.next_id; self.next_id += 1
+                    ids.append(f"gen-{seq:08d}")
+                return {"kind": "drive#generatedIds", "space": space, "ids": ids}
+        return Request(result)
     def list(self, q, **_kwargs):
         self.list_options.append(dict(_kwargs))
         parent = re.search(r"'([^']+)' in parents", q).group(1)
@@ -46,8 +78,19 @@ class FakeDriveFiles:
     def create(self, body, media_body=None, **_kwargs):
         def result():
             with self.lock:
-                created_seq = self.next_id; self.next_id += 1
-                file_id = f"file-{created_seq:06d}"
+                caller_id = body.get("id")
+                if caller_id:
+                    if caller_id in self.items:
+                        from googleapiclient.errors import HttpError
+                        from unittest.mock import MagicMock
+                        resp = MagicMock(status=409, reason="Conflict")
+                        content = b'{"error": {"code": 409, "message": "A file already exists with the provided ID.", "errors": [{"domain": "global", "reason": "fileIdInUse"}]}}'
+                        raise HttpError(resp, content)
+                    file_id = caller_id
+                    created_seq = self.next_id; self.next_id += 1
+                else:
+                    created_seq = self.next_id; self.next_id += 1
+                    file_id = f"file-{created_seq:06d}"
                 meta = dict(body, id=file_id, createdTime=f"{created_seq:012d}")
                 raw = media_body.getbytes(0, media_body.size()) if media_body else b""
                 self.items[file_id] = {"meta": meta, "raw": raw}
@@ -60,11 +103,21 @@ class FakeDriveFiles:
                 self.items[fileId]["raw"] = media_body.getbytes(0, media_body.size())
             return {"id": fileId}
         return Request(result)
-    def get_media(self, fileId): return Request(lambda: self.items[fileId]["raw"])
+    def get_media(self, fileId):
+        def result():
+            with self.lock:
+                if fileId not in self.items:
+                    from googleapiclient.errors import HttpError
+                    from unittest.mock import MagicMock
+                    resp = MagicMock(status=404, reason="Not Found")
+                    content = b'{"error": {"code": 404, "message": "File not found."}}'
+                    raise HttpError(resp, content)
+                return self.items[fileId]["raw"]
+        return Request(result)
     def delete(self, fileId):
         def result():
             with self.lock:
-                self.items.pop(fileId)
+                self.items.pop(fileId, None)
             return {}
         return Request(result)
 
@@ -967,3 +1020,4 @@ class DriveFixedIdRealDriveIntegrationTests(unittest.TestCase):
 
 
 if __name__ == "__main__": unittest.main()
+

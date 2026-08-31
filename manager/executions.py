@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from collectors.publish_drive import build_service
 from manager.quota_reader import read_drive_status
 from manager.session_identity import manager_session_key, parse_manager_session_key, session_provider_identity
-from manager.task_claims import check_task_execution_claim
+from manager.task_root import read_task_root_or_legacy_claim
 from manager.tasks import DriveRecords, TaskError, complete_task, now_iso, update_task, validate
 
 
@@ -313,7 +313,7 @@ def cancel_reserved_execution(store, claim_registry, project_id, execution_id, r
     for field in ("started_at", "session_id", "provider_session_id", "access", "lease_evidence"):
         if execution.get(field) is not None:
             raise TaskError(f"reservation has running authority evidence: {field}")
-    if check_task_execution_claim(claim_registry, project_id, execution["task_id"]) is not None:
+    if read_task_root_or_legacy_claim(claim_registry, project_id, execution["task_id"]) is not None:
         raise TaskError("reservation cannot be cancelled while a task claim exists")
     cancelled = {**execution, "status": "cancelled", "finished_at": cancelled_at or now_iso(),
                  "elapsed_minutes": 0, "access": None, "lease_evidence": None,
@@ -398,7 +398,7 @@ def prepare_task_retry(store, claim_registry, project_id, task_id, prior_executi
             raise TaskError("retry requires complete persistence and released task claim")
         if prior.get("access") == "production_write" and cleanup.get("writer_release") != "released":
             raise TaskError("retry requires released writer authority")
-    if check_task_execution_claim(claim_registry, project_id, task_id) is not None:
+    if read_task_root_or_legacy_claim(claim_registry, project_id, task_id) is not None:
         raise TaskError("retry requires no active task claim")
     executions = store.list_records("executions", project_id)
     if any(item.get("task_id") == task_id and item.get("status") in ("running", "reserved") for item in executions):

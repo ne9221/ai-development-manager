@@ -239,7 +239,7 @@ class TerminalMonotonicityAndCleanupTruthTests(unittest.TestCase):
         """H. Claim read error / timeout fails closed and does NOT declare released."""
         cmd = self._setup_terminal_state(terminal_status="completed", task_claim_release="retained")
 
-        with patch("manager.command_watcher.check_task_execution_claim", side_effect=TaskError("503 timeout")):
+        with patch("manager.command_watcher.read_task_root_or_legacy_claim", side_effect=TaskError("503 timeout")):
             outcome = _reconcile_active(self.store, None, cmd, lambda *_: self.registry)
 
         self.assertEqual("attention", outcome.get("status"))

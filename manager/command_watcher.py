@@ -24,8 +24,8 @@ from manager.governance import validate_task_enforcement
 from manager.quota_reader import read_drive_status, summarize
 from manager.runtime_bridge import all_projects
 from manager.runtime_supervisor import try_check_and_recover
-from manager.task_claims import (check_task_execution_claim, release_task_execution_claim,
-                                  task_claim_registry, TaskClaimConflict)
+from manager.task_claims import task_claim_registry, TaskClaimConflict
+from manager.task_root import read_task_root_or_legacy_claim, release_runtime_claim
 from manager.tasks import DriveRecords, TaskError, now_iso, validate
 from manager.trusted_ingress import (
     ADMISSION_VERSION_V1, REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN, task_policy_satisfied,
@@ -481,7 +481,7 @@ def _release_orphan_pre_execution_claim(store, command, claim_registry):
     Returns a process_command-compatible outcome dict.
     """
     try:
-        existing = check_task_execution_claim(claim_registry, command["project_id"], command["task_id"])
+        existing = read_task_root_or_legacy_claim(claim_registry, command["project_id"], command["task_id"])
     except TaskError:
         return _attention(store, command, None, "execution_record_missing_claim_state_unknown")
     if existing is None:
@@ -540,7 +540,7 @@ def _release_orphan_pre_execution_claim(store, command, claim_registry):
     validate("command", requeued)
     _write(store, requeued)
     try:
-        released = release_task_execution_claim(
+        released = release_runtime_claim(
             claim_registry, command["project_id"], command["task_id"],
             existing["execution_id"], existing["generation"],
         )
@@ -577,7 +577,7 @@ def _reconcile_active(store, service, command, claim_factory):
                 execution = store.get("executions", command["project_id"], command["execution_id"])
                 evidence = execution.get("cleanup_evidence") or {}
         try:
-            claim = check_task_execution_claim(claim_registry, command["project_id"], command["task_id"])
+            claim = read_task_root_or_legacy_claim(claim_registry, command["project_id"], command["task_id"])
             if claim is not None:
                 from manager.execution_recovery import recover_task_claim
                 recovered = recover_task_claim(store, claim_registry, command["project_id"], command["task_id"])
@@ -676,7 +676,7 @@ def _reconcile_active(store, service, command, claim_factory):
     if provider == "stopped" and health["state"] == "healthy":
         health = {**health, "state": "attention", "reason": "provider_process_stopped"}
     try:
-        claim = check_task_execution_claim(claim_registry, command["project_id"], command["task_id"])
+        claim = read_task_root_or_legacy_claim(claim_registry, command["project_id"], command["task_id"])
     except TaskError:
         claim = None
     exact_claim = claim and claim.get("execution_id") == execution["execution_id"]

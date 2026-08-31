@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
+from manager import task_root
 from manager.execution_lifecycle import enter_running_gate, terminalize_execution
 from manager.executions import reserve_execution
 from manager.task_claims import TaskClaimConflict, claim_task_execution
@@ -46,10 +47,10 @@ class TerminalLifecycleTests(unittest.TestCase):
 
     def test_writer_release_precedes_claim_release(self):
         store, writer, claim, gate = self.running(); events = []
-        real_writer, real_claim = release, __import__("manager.task_claims", fromlist=["release_task_execution_claim"]).release_task_execution_claim
+        real_writer, real_claim = release, __import__("manager.task_root", fromlist=["release_runtime_claim"]).release_runtime_claim
         with patch("manager.executions.read_drive_status", return_value=quota_document()), \
              patch("manager.execution_lifecycle.release", side_effect=lambda *a, **k: (events.append("writer"), real_writer(*a, **k))[1]), \
-             patch("manager.execution_lifecycle.release_task_execution_claim", side_effect=lambda *a, **k: (events.append("claim"), real_claim(*a, **k))[1]):
+             patch("manager.task_root.release_runtime_claim", side_effect=lambda *a, **k: (events.append("claim"), real_claim(*a, **k))[1]):
             terminalize_execution(store, object(), writer, claim, "p1", "t1", "exec-a", "codex", "completed", gate["task_claim"]["generation"], True, gate["lease"]["lease_token"])
         self.assertEqual(["writer", "claim"], events)
 
@@ -70,7 +71,7 @@ class TerminalLifecycleTests(unittest.TestCase):
 
     def test_claim_release_failure_is_retried_before_idempotent_return(self):
         store, writer, claim, gate = self.running()
-        with patch("manager.executions.read_drive_status", return_value=quota_document()), patch("manager.execution_lifecycle.release_task_execution_claim", side_effect=TaskError("claim down")):
+        with patch("manager.executions.read_drive_status", return_value=quota_document()), patch("manager.task_root.release_runtime_claim", side_effect=TaskError("claim down")):
             first = terminalize_execution(store, object(), writer, claim, "p1", "t1", "exec-a", "codex", "completed", gate["task_claim"]["generation"], True, gate["lease"]["lease_token"])
         self.assertEqual("completed", first["execution"]["status"])
         self.assertEqual("failed", first["cleanup"]["task_claim_release"])
@@ -170,7 +171,7 @@ class TerminalLifecycleTests(unittest.TestCase):
         with patch("manager.executions.read_drive_status", return_value=quota_document()), patch("manager.execution_lifecycle.create_handoff", side_effect=TaskError("handoff failed")), self.assertRaises(TaskError):
             terminalize_execution(store, object(), writer, claim, "p1", "t1", "exec-a", "codex", "completed", gate["task_claim"]["generation"], True, gate["lease"]["lease_token"])
         with self.assertRaises(TaskClaimConflict):
-            claim_task_execution(claim, "p1", "t1", "exec-b", "claude", "2026-08-13T00:03:00Z")
+            task_root.acquire_task_root(claim, "p1", "t1", "exec-b", "claude", "2026-08-13T00:03:00Z")
 
     def test_complete_state_same_outcome_is_idempotent_without_rewrites(self):
         store, _, claim, gate, result = self.terminal("completed")

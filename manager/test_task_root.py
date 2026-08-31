@@ -13,8 +13,13 @@ import threading
 import unittest
 from datetime import datetime, timezone
 
+from unittest.mock import patch
+
+from manager.execution_lifecycle import enter_running_gate
+from manager.executions import reserve_execution
 from manager.task_claims import TaskClaimConflict, _new_claim_record
 from manager.tasks import TaskError
+from manager.test_execution_lifecycle import MemoryStore, build_store, quota_document
 from manager.test_task_claims import MemoryClaimRegistry
 from manager import task_root
 
@@ -56,6 +61,54 @@ class FreshClaimTests(unittest.TestCase):
         with self.assertRaises(TaskClaimConflict):
             task_root.acquire_task_root(self.registry, "p1", "t1", "exec-b", "codex", _now())
 
+    def test_two_racing_callers_with_the_same_execution_id_exactly_one_winner(self):
+        """Regression: two DIFFERENT callers (distinct claim_token, e.g. two
+        command-watcher processes racing to run the literal same Command --
+        exactly what enter_running_gate's own secrets.token_urlsafe(32)
+        default produces for each independent call) sharing the same
+        execution_id/provider must not both be treated as one idempotent
+        owner -- only claim_token identity proves it is genuinely the same
+        caller retrying. Caught live via test_concurrency_reliability_gate4's
+        real enter_running_gate race, which regressed to 2 winners when this
+        check only compared execution_id/provider."""
+        results, errors = [], []
+        barrier = threading.Barrier(2)
+
+        def attempt(token):
+            barrier.wait(timeout=2)
+            try:
+                results.append(task_root.acquire_task_root(self.registry, "p1", "t1", "exec-1", "codex", _now(), claim_token=token))
+            except TaskClaimConflict as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=attempt, args=("token-a",))
+        t2 = threading.Thread(target=attempt, args=("token-b",))
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+        self.assertEqual(1, len(results))
+        self.assertEqual(1, len(errors))
+
+    def test_same_caller_same_token_retry_is_idempotent_even_racing(self):
+        """The genuine same-caller-retrying case (identical claim_token)
+        stays idempotent even under a race -- only a DIFFERENT token is
+        treated as a rival."""
+        results, errors = [], []
+        barrier = threading.Barrier(2)
+
+        def attempt():
+            barrier.wait(timeout=2)
+            try:
+                results.append(task_root.acquire_task_root(self.registry, "p1", "t1", "exec-1", "codex", _now(), claim_token="same-token"))
+            except TaskClaimConflict as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=attempt)
+        t2 = threading.Thread(target=attempt)
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+        self.assertEqual(2, len(results))
+        self.assertEqual(0, len(errors))
+
     def test_two_concurrent_fresh_claims_exactly_one_winner(self):
         """One Root CAS winner: two threads racing create_if_absent on a
         genuinely fresh task must not both succeed as different owners."""
@@ -82,16 +135,30 @@ class RootNeverDeletedTests(unittest.TestCase):
     def setUp(self):
         self.registry = MemoryClaimRegistry()
 
-    def test_release_preserves_object(self):
+    def test_release_without_any_bind_physically_deletes(self):
+        """No terminal bind ever existed -- nothing durable to preserve, so
+        release behaves exactly like the pre-Design-A delete-based
+        release. This is the CURRENT live behavior for every execution
+        today (commit_terminal_bind is not yet wired into the completion
+        path), and must stay unchanged."""
         claimed = task_root.acquire_task_root(self.registry, "p1", "t1", "exec-a", "codex", _now())
         result = task_root.release_runtime_claim(self.registry, "p1", "t1", "exec-a", claimed["generation"])
         self.assertTrue(result["released"])
+        self.assertIsNone(self.registry.document)
+
+    def test_release_after_bind_preserves_object(self):
+        claimed = task_root.acquire_task_root(self.registry, "p1", "t1", "exec-a", "codex", _now())
+        bound, bind_generation = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
+        result = task_root.release_runtime_claim(self.registry, "p1", "t1", "exec-a", bind_generation)
+        self.assertTrue(result["released"])
         self.assertIsNotNone(self.registry.document)
         self.assertFalse(self.registry.document["authority_active"])
+        self.assertEqual(bound["terminal"], self.registry.document["terminal"])
 
     def test_release_wrong_owner_refused(self):
         claimed = task_root.acquire_task_root(self.registry, "p1", "t1", "exec-a", "codex", _now())
-        result = task_root.release_runtime_claim(self.registry, "p1", "t1", "exec-OTHER", claimed["generation"])
+        task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
+        result = task_root.release_runtime_claim(self.registry, "p1", "t1", "exec-OTHER", self.registry.generation)
         self.assertFalse(result["released"])
         self.assertIsNotNone(self.registry.document)
 
@@ -108,13 +175,13 @@ class RetryAfterPreservedRootTests(unittest.TestCase):
 
     def _terminalize_epoch_1(self, cleanup_released=True):
         claimed = task_root.acquire_task_root(self.registry, "p1", "t1", "exec-a", "codex", _now())
-        released = task_root.release_runtime_claim(self.registry, "p1", "t1", "exec-a", claimed["generation"])
-        # Checkpoint A does not yet write real terminal binds (Checkpoint B)
-        # -- stamp a minimal bind directly to simulate "epoch 1 reached
-        # terminal", exactly what Checkpoint B's commit will produce.
+        _bound, bind_generation = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
+        task_root.release_runtime_claim(self.registry, "p1", "t1", "exec-a", bind_generation)
+        # Checkpoint C owns real cleanup-facet CAS transitions; stamp the
+        # facet directly here to isolate this test to acquisition gating
+        # logic rather than depending on that later checkpoint.
         document = dict(self.registry.document)
-        document["terminal"] = {"execution_id": "exec-a", "outcome": "completed"}
-        document["cleanup"] = {"status": "released" if cleanup_released else "retained"}
+        document["cleanup"] = {"status": "released"} if cleanup_released else {"status": "retained"}
         self.registry.compare_and_swap(self.registry.generation, document)
         return claimed
 
@@ -128,7 +195,9 @@ class RetryAfterPreservedRootTests(unittest.TestCase):
         # Epoch 1's terminal facts are archived, untouched.
         self.assertEqual(1, len(second["epoch_history"]))
         self.assertEqual("exec-a", second["epoch_history"][0]["execution_id"])
-        self.assertEqual({"execution_id": "exec-a", "outcome": "completed"}, second["epoch_history"][0]["terminal"])
+        self.assertEqual("exec-a", second["epoch_history"][0]["terminal"]["execution_id"])
+        self.assertEqual("completed", second["epoch_history"][0]["terminal"]["terminal_status"])
+        self.assertIsNotNone(second["epoch_history"][0]["terminal"]["terminal_fence_generation"])
 
     def test_retry_refused_while_cleanup_not_yet_released(self):
         self._terminalize_epoch_1(cleanup_released=False)
@@ -229,6 +298,117 @@ class LegacyMigrationGateTests(unittest.TestCase):
         self.assertEqual(1, self.registry.document["epoch"])
 
 
+def _execution(execution_id, task_id="t1", status="completed", retry_count=0,
+              session_id="codex:session-a", provider="codex", account_id=None,
+              terminal_reason=None, completed_at="2026-09-01T00:00:00Z"):
+    return {
+        "execution_id": execution_id, "task_id": task_id, "project_id": "p1",
+        "status": status, "retry_count": retry_count, "session_id": session_id,
+        "provider": provider, "account_id": account_id, "terminal_reason": terminal_reason,
+        "completed_at": completed_at, "cleanup_evidence": {"provider_outcome": status},
+    }
+
+
+class TerminalBindTests(unittest.TestCase):
+    """Checkpoint B: two incompatible proposals -> one bind winner, same
+    proposal replay is idempotent, loser cannot bind or consume its own
+    pre-generated fixed Drive IDs."""
+
+    def setUp(self):
+        self.registry = MemoryClaimRegistry()
+        task_root.acquire_task_root(self.registry, "p1", "t1", "exec-a", "codex", _now())
+
+    def test_H_two_incompatible_proposals_exactly_one_bind_winner(self):
+        task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
+        with self.assertRaises(task_root.TerminalProposalLost) as ctx:
+            task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-b"))
+        self.assertEqual("exec-a", ctx.exception.winner["execution_id"])
+
+    def test_I_same_proposal_replay_is_idempotent(self):
+        bound1, gen1 = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
+        bound2, gen2 = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
+        self.assertEqual(gen1, gen2)
+        self.assertEqual(bound1["terminal"], bound2["terminal"])
+
+    def test_conflicting_non_null_proposal_fails_closed(self):
+        task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a", session_id="codex:a"))
+        with self.assertRaises(task_root.TerminalProposalConflict):
+            task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a", session_id="codex:DIFFERENT"))
+
+    def test_L_loser_never_consumes_its_own_pregenerated_fixed_ids(self):
+        task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
+        loser_calls = []
+        loser_factory = lambda: loser_calls.append(1) or "loser-id"
+        with self.assertRaises(task_root.TerminalProposalLost):
+            task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-b"),
+                                           task_drive_id_factory=loser_factory, handoff_drive_id_factory=loser_factory)
+        self.assertEqual(0, len(loser_calls))
+
+    def test_fixed_ids_frozen_once_bound(self):
+        calls = []
+        factory = lambda: calls.append(1) or f"id-{len(calls)}"
+        bound1, _ = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"),
+                                                    task_drive_id_factory=factory, handoff_drive_id_factory=factory)
+        first_task_id = bound1["terminal"]["task_projection_drive_id"]
+        first_handoff_id = bound1["terminal"]["handoff_drive_file_id"]
+        bound2, _ = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"),
+                                                    task_drive_id_factory=factory, handoff_drive_id_factory=factory)
+        self.assertEqual(first_task_id, bound2["terminal"]["task_projection_drive_id"])
+        self.assertEqual(first_handoff_id, bound2["terminal"]["handoff_drive_file_id"])
+        self.assertEqual(2, len(calls))  # exactly one task id + one handoff id, never regenerated
+
+
+class TerminalFenceGenerationTests(unittest.TestCase):
+    """J/K: terminal_fence_generation is written atomically in the SAME CAS
+    as the rest of the bind (it is just `epoch`, known before that write
+    even happens -- see commit_terminal_bind's docstring for why the
+    earlier two-step raw-GCS-generation design was abandoned as an
+    unrecoverable-after-crash dead end) and never changes again, even as
+    the Root's own current generation keeps advancing under later cursor
+    updates."""
+
+    def setUp(self):
+        self.registry = MemoryClaimRegistry()
+        task_root.acquire_task_root(self.registry, "p1", "t1", "exec-a", "codex", _now())
+
+    def test_fence_equals_epoch_written_atomically_with_the_bind(self):
+        bound, bind_generation = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
+        fence = bound["terminal"]["terminal_fence_generation"]
+        self.assertEqual(bound["epoch"], fence)
+        # Exactly one CAS write for the whole bind (generation 1 was the
+        # setUp claim; this bind is the very next write) -- no separate
+        # freeze step, so no crash window exists between "bound" and
+        # "fenced".
+        self.assertEqual(2, bind_generation)
+
+        # Simulate later cursor-only updates (materialization/cleanup
+        # facet CAS writes a real checkpoint would perform) advancing the
+        # Root's own current generation further.
+        doc = dict(self.registry.document)
+        doc["materialization"] = {"status": "pending"}
+        gen_after_1 = self.registry.compare_and_swap(self.registry.generation, doc)
+        doc = dict(self.registry.document)
+        doc["cleanup"] = {"status": "release_pending"}
+        gen_after_2 = self.registry.compare_and_swap(self.registry.generation, doc)
+
+        self.assertGreater(gen_after_1, bind_generation)
+        self.assertGreater(gen_after_2, gen_after_1)
+        self.assertEqual(fence, self.registry.document["terminal"]["terminal_fence_generation"])
+
+    def test_fence_survives_a_crash_immediately_after_the_single_bind_write(self):
+        """A crash the instant after the bind's one-and-only write lands
+        leaves the fence already durably correct -- there is no follow-up
+        write to lose, so a fresh process reading the object sees the
+        exact same fence a live process would have."""
+        bound, _ = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
+        fresh_registry_view = MemoryClaimRegistry()
+        fresh_registry_view.document = self.registry.document
+        fresh_registry_view.generation = self.registry.generation
+        recovered, _ = task_root.commit_terminal_bind(fresh_registry_view, "p1", "t1", _execution("exec-a"))
+        self.assertEqual(bound["terminal"], recovered["terminal"])
+        self.assertEqual(bound["epoch"], recovered["terminal"]["terminal_fence_generation"])
+
+
 class ReleaseFallbackTests(unittest.TestCase):
     def test_release_on_legacy_document_falls_back_to_plain_delete(self):
         """A task never migrated has no bind/epoch-history to preserve --
@@ -241,6 +421,73 @@ class ReleaseFallbackTests(unittest.TestCase):
         result = task_root.release_runtime_claim(registry, "p1", "t1", "exec-a", 1)
         self.assertTrue(result["released"])
         self.assertIsNone(registry.document)
+
+
+class RealAcquisitionPathIntegrationTests(unittest.TestCase):
+    """Checkpoint B integration proofs: the REAL execution_lifecycle.
+    enter_running_gate(), not a direct unit call to acquire_task_root(),
+    is what now performs claim acquisition -- these prove the live-path
+    cutover actually took, not just the module in isolation."""
+
+    def test_F_retry_after_preserved_root_via_real_enter_running_gate(self):
+        store = build_store(read_only=True)
+        claim_registry = MemoryClaimRegistry()
+        with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+            gate = enter_running_gate(store, object(), None, "p1", "t1", "exec-a", "codex", "read_only",
+                                      task_claim_registry=claim_registry)
+        self.assertEqual(1, gate["task_claim"]["epoch"])
+
+        bound, bind_generation = task_root.commit_terminal_bind(claim_registry, "p1", "t1", _execution("exec-a"))
+        task_root.release_runtime_claim(claim_registry, "p1", "t1", "exec-a", bind_generation)
+        self.assertIsNotNone(claim_registry.document)  # Root preserved, not deleted
+        # Checkpoint C owns real cleanup-facet CAS transitions; stamp the
+        # facet directly here to isolate this test to the acquisition
+        # layer rather than depending on that later checkpoint.
+        preserved = dict(claim_registry.document)
+        preserved["cleanup"] = {"status": "released"}
+        claim_registry.compare_and_swap(claim_registry.generation, preserved)
+
+        # Task returns to ready for a fresh retry attempt -- this test
+        # isolates the acquisition layer, not the full retry pipeline
+        # (prepare_task_retry), so the Task Drive record is reset directly.
+        task_doc = store.get("tasks", "p1", "t1")
+        task_doc["status"] = "ready"
+        task_doc["source_context"] = {}
+        store.put("tasks", "p1", "t1", task_doc)
+        reserve_execution(store, "p1", "t1", "exec-b", "codex", {"decision": "retry"}, "code", "high", "2026-08-13T00:03:00Z")
+
+        with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+            retry_gate = enter_running_gate(store, object(), None, "p1", "t1", "exec-b", "codex", "read_only",
+                                            task_claim_registry=claim_registry)
+        self.assertEqual(2, retry_gate["task_claim"]["epoch"])
+        self.assertEqual("exec-b", retry_gate["task_claim"]["execution_id"])
+
+    def test_G_legacy_r17_vs_new_claim_through_real_enter_running_gate(self):
+        store = build_store(read_only=True)  # reserves "exec-a", ready to run
+        claim_registry = MemoryClaimRegistry()
+
+        # Seed a stuck legacy R17-shaped claim for a DIFFERENT, already-
+        # terminal, already-cleaned-up execution on the same task --
+        # exactly the shape a pre-Design-A watcher would have left behind
+        # if release_task_execution_claim's delete had, for any reason,
+        # never landed.
+        legacy_record = _new_claim_record("p1", "t1", "exec-r17-old", "codex", "2026-08-13T00:00:00Z")
+        claim_registry.create_if_absent(legacy_record)
+        old_execution = _execution("exec-r17-old", task_id="t1")
+        old_execution["cleanup_evidence"]["task_claim_release"] = "released"
+        store.put("executions", "p1", "exec-r17-old", old_execution)
+
+        with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+            gate = enter_running_gate(store, object(), None, "p1", "t1", "exec-a", "codex", "read_only",
+                                      task_claim_registry=claim_registry)
+
+        # The new execution did not bypass strengthened acquisition -- the
+        # legacy document was migrated (recording the old terminal winner)
+        # before a fresh epoch was legally opened for exec-a.
+        self.assertEqual(2, gate["task_claim"]["epoch"])
+        self.assertEqual("exec-a", gate["task_claim"]["execution_id"])
+        self.assertEqual(1, len(gate["task_claim"]["epoch_history"]))
+        self.assertEqual("exec-r17-old", gate["task_claim"]["epoch_history"][0]["execution_id"])
 
 
 if __name__ == "__main__":

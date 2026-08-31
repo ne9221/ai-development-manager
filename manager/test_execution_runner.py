@@ -17,7 +17,7 @@ from manager.execution_runner import (
 )
 from manager.production_guard import RuntimeGuardError, mark_production_path
 from manager import provenance
-from manager.task_claims import check_task_execution_claim
+from manager.task_root import read_task_root_or_legacy_claim
 from manager.tasks import TaskError, create_project, create_task, now_iso, update_task
 from manager.test_execution_lifecycle import MemoryStore, build_store, quota_document
 from manager.test_task_claims import MemoryClaimRegistry
@@ -277,7 +277,7 @@ class RunnerTests(unittest.TestCase):
             run_execution(store, object(), writer, claim, launcher, "p1", "t1", "exec-a", "secret prompt", self.request, baseline_head="a" * 40)
         self.assertFalse(launcher.process.live)
         self.assertEqual("running", store.get("executions", "p1", "exec-a")["status"])
-        self.assertEqual("exec-a", check_task_execution_claim(claim, "p1", "t1")["execution_id"])
+        self.assertEqual("exec-a", read_task_root_or_legacy_claim(claim, "p1", "t1")["execution_id"])
         self.assertEqual("active", next(iter(writer.document["locks"].values()))["status"])
 
     def test_read_only_and_production_authority_use_existing_cleanup(self):

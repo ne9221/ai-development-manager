@@ -375,8 +375,15 @@ class ExecutionLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(TaskClaimConflict, "already claimed by execution exec-a"):
             self.gate(store, registry, execution_id="exec-b", task_claim_registry=claim_registry)
         self.assert_reserved_ready(store, "exec-b")
-        self.assertEqual(winner["generation"], claim_registry.generation)
+        # The legacy winner's own claim is synchronously migrated to the
+        # strengthened shape as part of the loser's acquisition attempt
+        # (see task_root.acquire_task_root's migration gate) -- the
+        # object's generation legitimately advances for that one-time
+        # shape upgrade, but the winning execution's identity/authority
+        # is preserved exactly, never displaced by the loser.
+        self.assertGreaterEqual(claim_registry.generation, winner["generation"])
         self.assertEqual("exec-a", claim_registry.document["execution_id"])
+        self.assertTrue(claim_registry.document.get("authority_active"))
         self.assertEqual("released", next(iter(registry.document["locks"].values()))["status"])
 
     def test_ambiguous_claim_self_recognition_enters_running(self):
@@ -451,11 +458,14 @@ class ExecutionLifecycleTests(unittest.TestCase):
     def test_forged_claim_evidence_never_authorizes_running(self):
         store = build_store(); registry = MemoryRegistry(); claim_registry = MemoryClaimRegistry()
         forged = {
-            "schema_version": "0.1.0", "project_id": "p1", "task_id": "t1",
-            "execution_id": "forged", "provider": "codex", "claimed_at": "2026-08-13T00:01:00Z", "generation": 1,
+            "schema_version": "1.0.0", "project_id": "p1", "task_id": "t1", "epoch": 1,
+            "execution_id": "forged", "provider": "codex", "claimed_at": "2026-08-13T00:01:00Z",
+            "authority_active": True, "terminal": None,
+            "materialization": {"status": "absent"}, "cleanup": {"status": "retained"},
+            "epoch_history": [], "generation": 1,
         }
-        with patch("manager.execution_lifecycle.claim_task_execution", return_value=forged):
-            with self.assertRaisesRegex(TaskError, "owned generation evidence"):
+        with patch("manager.task_root.acquire_task_root", return_value=forged):
+            with self.assertRaisesRegex(TaskError, "does not match the requested running authority"):
                 self.gate(store, registry, task_claim_registry=claim_registry)
         self.assert_reserved_ready(store)
         self.assertEqual("released", next(iter(registry.document["locks"].values()))["status"])

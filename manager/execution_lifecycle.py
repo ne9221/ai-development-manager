@@ -3,9 +3,10 @@ import secrets
 
 from datetime import timedelta
 
+from manager import task_root
 from manager.executions import MAX_HARD_TIMEOUT_SECONDS, hard_timeout_seconds, parse_time, persist_terminal, quota_snapshot, task_snapshot
 from manager.quota_reader import read_drive_status
-from manager.task_claims import CLAIM_SCHEMA_VERSION, TaskClaimConflict, check_task_execution_claim, claim_task_execution, release_task_execution_claim
+from manager.task_claims import TaskClaimConflict
 from manager.tasks import TaskError, create_handoff, now_iso, validate
 from manager.worktree_locks import active, acquire, canonical_baseline, canonical_branch, canonical_repository, canonical_scope, owner_fields, read_registry, release, repository_lock_id, same_owner, validate_local_preflight
 
@@ -127,14 +128,10 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
     claim_time = started_at or now_iso()
     claim_token = claim_token or secrets.token_urlsafe(32)
     try:
-        claim = claim_task_execution(task_claim_registry, project_id, task_id, execution_id, provider, claim_time, claim_token=claim_token)
-        expected_claim = {
-            "schema_version": CLAIM_SCHEMA_VERSION, "project_id": project_id, "task_id": task_id,
-            "execution_id": execution_id, "provider": provider,
-        }
-        if (not isinstance(claim, dict) or not isinstance(claim.get("generation"), int)
-                or claim["generation"] < 1 or any(claim.get(key) != value for key, value in expected_claim.items())):
-            raise TaskError("authoritative task claim did not return owned generation evidence")
+        claim = task_root.acquire_task_root(
+            task_claim_registry, project_id, task_id, execution_id, provider, claim_time, claim_token=claim_token,
+            legacy_migration_lookup=task_root.legacy_terminal_execution_lookup(store))
+        task_root.validate_task_root_running_authority(claim, project_id, task_id, execution_id, provider)
     except TaskClaimConflict as exc:
         if lease:
             try:
@@ -146,7 +143,7 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
         generation = claim.get("generation") if isinstance(claim, dict) else None
         if isinstance(generation, int) and generation >= 1:
             try:
-                release_task_execution_claim(task_claim_registry, project_id, task_id, execution_id, generation, claim_token=claim_token)
+                task_root.release_runtime_claim(task_claim_registry, project_id, task_id, execution_id, generation, claim_token=claim_token)
             except Exception as cleanup_exc:
                 raise TaskError(f"task claim validation failed and claim cleanup failed; writer lease retained when present: {cleanup_exc}") from exc
             if lease:
@@ -211,7 +208,7 @@ def enter_running_gate(store, service, registry, project_id, task_id, execution_
             details = "; ".join(recovery_errors) or "persistent state could not be confirmed"
             raise TaskError(f"running gate recovery required; claims and lease retained when present: {details}") from exc
         try:
-            release_task_execution_claim(task_claim_registry, project_id, task_id, execution_id, claim["generation"])
+            task_root.release_runtime_claim(task_claim_registry, project_id, task_id, execution_id, claim["generation"])
         except Exception as cleanup_exc:
             raise TaskError(f"running gate failed and task claim release failed; writer lease retained when present: {cleanup_exc}") from exc
         if lease:
@@ -229,7 +226,7 @@ def _verify_terminal_authority(store, writer_registry, claim_registry, project_i
     identity = {"project_id": project_id, "task_id": task_id, "execution_id": execution_id, "provider": provider}
     if any(execution.get(key) != value for key, value in identity.items()):
         raise TaskError("terminal callback identity does not match execution")
-    claim = check_task_execution_claim(claim_registry, project_id, task_id)
+    claim = task_root.read_task_root_or_legacy_claim(claim_registry, project_id, task_id)
     if not claim or claim.get("execution_id") != execution_id or claim.get("provider") != provider or claim.get("generation") != claim_generation:
         raise TaskError("terminal callback does not hold the exact task claim generation")
     cleanup = execution.get("cleanup_evidence") or {}
@@ -268,7 +265,7 @@ def cleanup_execution(writer_registry, claim_registry, execution, claim_generati
             evidence["errors"].append(f"writer release failed: {exc}")
             return evidence
     try:
-        result = release_task_execution_claim(claim_registry, execution["project_id"], execution["task_id"], execution["execution_id"], claim_generation)
+        result = task_root.release_runtime_claim(claim_registry, execution["project_id"], execution["task_id"], execution["execution_id"], claim_generation)
         evidence["task_claim_release"] = "released" if result.get("released") else result.get("reason", "not_released")
     except Exception as exc:
         evidence["task_claim_release"] = "failed"
