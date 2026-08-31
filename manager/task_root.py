@@ -1,7 +1,7 @@
 """Strengthened Design A -- Checkpoint A + B: the single GCS Task Root
 Object acquisition path with a synchronous legacy-migration gate
 (Checkpoint A), plus the immutable terminal bind and its immutable
-terminal_fence_generation (Checkpoint B).
+terminal_fence_epoch (Checkpoint B).
 
 One task has exactly one durable GCS authority object -- the same physical
 object task_claims.py has always used at task-claims/<project_id>/<task_id>.json.
@@ -67,7 +67,7 @@ _PROPOSAL_FIELDS = (
 )
 
 # BIND fields, frozen the instant a terminal proposal wins its epoch's CAS.
-# terminal_fence_generation is the one field allowed to start null and be
+# terminal_fence_epoch is the one field allowed to start null and be
 # filled in exactly once by a follow-up CAS (see commit_terminal_bind) --
 # every other field is written atomically with the bind itself.
 _BIND_IMMUTABLE_FIELDS = (
@@ -75,7 +75,7 @@ _BIND_IMMUTABLE_FIELDS = (
     "terminal_status", "provider_outcome", "terminal_reason", "completed_at",
     "terminal_committed_at", "provider_identity", "session_id", "account_identity",
     "schema_version", "canonicalization_version", "canonical_proposal", "proposal_hash",
-    "terminal_fence_generation", "task_projection_drive_id", "handoff_drive_file_id",
+    "terminal_fence_epoch", "task_projection_drive_id", "handoff_drive_file_id",
 )
 
 
@@ -389,7 +389,7 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
     materialize anything or consume its own pre-generated Drive IDs (see
     module docstring / test_task_root.py's H test).
 
-    terminal_fence_generation is NOT the raw GCS object generation. An
+    terminal_fence_epoch is NOT the raw GCS object generation. An
     earlier draft tried to use the GCS-assigned generation returned by the
     bind's own CAS write, filled in via a required follow-up CAS (GCS only
     learns that number AFTER a write lands -- real GCS generations are
@@ -403,7 +403,7 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
     object's current (now-later) generation -- nothing durable records
     the former once the latter exists. Proven unrecoverable; not used.
 
-    Instead, terminal_fence_generation is simply the epoch this bind
+    Instead, terminal_fence_epoch is simply the epoch this bind
     belongs to. `epoch` is read off the document BEFORE the bind write --
     never returned by it -- so it is known deterministically up front,
     needs no follow-up write, and has no crash window at all: the ENTIRE
@@ -452,7 +452,7 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
                 "session_id": proposal["session_id"], "account_identity": proposal["account_identity"],
                 "schema_version": SCHEMA_VERSION, "canonicalization_version": CANONICALIZATION_VERSION,
                 "canonical_proposal": proposal, "proposal_hash": proposal_h,
-                "terminal_fence_generation": epoch,
+                "terminal_fence_epoch": epoch,
                 "task_projection_drive_id": fresh_task_drive_id, "handoff_drive_file_id": fresh_handoff_drive_id,
             }
             new_document = {**document, "terminal": bind}

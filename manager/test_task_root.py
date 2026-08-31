@@ -197,7 +197,7 @@ class RetryAfterPreservedRootTests(unittest.TestCase):
         self.assertEqual("exec-a", second["epoch_history"][0]["execution_id"])
         self.assertEqual("exec-a", second["epoch_history"][0]["terminal"]["execution_id"])
         self.assertEqual("completed", second["epoch_history"][0]["terminal"]["terminal_status"])
-        self.assertIsNotNone(second["epoch_history"][0]["terminal"]["terminal_fence_generation"])
+        self.assertIsNotNone(second["epoch_history"][0]["terminal"]["terminal_fence_epoch"])
 
     def test_retry_refused_while_cleanup_not_yet_released(self):
         self._terminalize_epoch_1(cleanup_released=False)
@@ -359,7 +359,7 @@ class TerminalBindTests(unittest.TestCase):
 
 
 class TerminalFenceGenerationTests(unittest.TestCase):
-    """J/K: terminal_fence_generation is written atomically in the SAME CAS
+    """J/K: terminal_fence_epoch is written atomically in the SAME CAS
     as the rest of the bind (it is just `epoch`, known before that write
     even happens -- see commit_terminal_bind's docstring for why the
     earlier two-step raw-GCS-generation design was abandoned as an
@@ -373,7 +373,7 @@ class TerminalFenceGenerationTests(unittest.TestCase):
 
     def test_fence_equals_epoch_written_atomically_with_the_bind(self):
         bound, bind_generation = task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
-        fence = bound["terminal"]["terminal_fence_generation"]
+        fence = bound["terminal"]["terminal_fence_epoch"]
         self.assertEqual(bound["epoch"], fence)
         # Exactly one CAS write for the whole bind (generation 1 was the
         # setUp claim; this bind is the very next write) -- no separate
@@ -393,7 +393,7 @@ class TerminalFenceGenerationTests(unittest.TestCase):
 
         self.assertGreater(gen_after_1, bind_generation)
         self.assertGreater(gen_after_2, gen_after_1)
-        self.assertEqual(fence, self.registry.document["terminal"]["terminal_fence_generation"])
+        self.assertEqual(fence, self.registry.document["terminal"]["terminal_fence_epoch"])
 
     def test_fence_survives_a_crash_immediately_after_the_single_bind_write(self):
         """A crash the instant after the bind's one-and-only write lands
@@ -406,7 +406,7 @@ class TerminalFenceGenerationTests(unittest.TestCase):
         fresh_registry_view.generation = self.registry.generation
         recovered, _ = task_root.commit_terminal_bind(fresh_registry_view, "p1", "t1", _execution("exec-a"))
         self.assertEqual(bound["terminal"], recovered["terminal"])
-        self.assertEqual(bound["epoch"], recovered["terminal"]["terminal_fence_generation"])
+        self.assertEqual(bound["epoch"], recovered["terminal"]["terminal_fence_epoch"])
 
 
 class ReleaseFallbackTests(unittest.TestCase):
