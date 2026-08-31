@@ -553,6 +553,7 @@ def _reconcile_active(store, service, command, claim_factory):
         if evidence.get("persistence") != "complete":
             if retry_incomplete_terminal_persistence(store, command["project_id"], command["task_id"], command["execution_id"]):
                 execution = store.get("executions", command["project_id"], command["execution_id"])
+                evidence = execution.get("cleanup_evidence") or {}
         try:
             claim = check_task_execution_claim(claim_registry, command["project_id"], command["task_id"])
             if claim is not None:
@@ -572,6 +573,33 @@ def _reconcile_active(store, service, command, claim_factory):
                     validate("execution", refreshed)
                     store.put("executions", command["project_id"], command["execution_id"], refreshed)
                     execution = refreshed
+            else:
+                # Claim is explicitly ABSENT from authoritative registry read.
+                # If execution is terminal, cleanup persistence is complete,
+                # writer lease (if write access) is released, provider process is dead,
+                # and no newer execution owns the task, converge cleanup_evidence.task_claim_release to "released".
+                if (evidence.get("persistence") == "complete"
+                        and evidence.get("persisted") == ["execution", "handoff", "task"]
+                        and evidence.get("provider_outcome") == execution.get("status")):
+                    if execution.get("access") != "production_write" or evidence.get("writer_release") == "released":
+                        provider_ev = execution.get("provider_evidence") or {}
+                        pid = provider_ev.get("pid")
+                        creation = provider_ev.get("creation_identity")
+                        if pid is not None and process_identity_state(pid, creation) == "live":
+                            return _attention(store, command, execution, "terminal_cleanup_provider_still_live")
+                        try:
+                            task = store.get("tasks", command["project_id"], command["task_id"])
+                            active_exec = (task.get("source_context") or {}).get("active_execution_id")
+                            if active_exec and active_exec != execution["execution_id"]:
+                                return _attention(store, command, execution, "terminal_cleanup_task_reclaimed_by_newer_execution")
+                        except TaskError:
+                            pass
+                        if evidence.get("task_claim_release") != "released":
+                            refreshed = store.get("executions", command["project_id"], command["execution_id"])
+                            refreshed["cleanup_evidence"] = {**(refreshed.get("cleanup_evidence") or {}), "task_claim_release": "released"}
+                            validate("execution", refreshed)
+                            store.put("executions", command["project_id"], command["execution_id"], refreshed)
+                            execution = refreshed
         except TaskError:
             return _attention(store, command, execution, "terminal_cleanup_reconciliation_unknown")
         terminal = _existing_terminal(store, command)
@@ -861,7 +889,7 @@ def queued_command_pending_only_health(store, command, allowlist=frozenset(), bu
 
 
 def process_command(store, service, command, launcher_factory=None, writer_factory=GCSLockRegistry.from_environment,
-                    claim_factory=task_claim_registry, allowlist=frozenset(), health_check=session_center_healthy,
+                    claim_factory=task_claim_registry, allowlist=frozenset(), health_check=None,
                     quota_check=None, ingress_registry_factory=dispatch_request_registry, origin_context=None,
                     async_launch=False):
     """Claim/reconcile one command; a claimed command is never automatically relaunched.
@@ -889,6 +917,7 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         return {"status": "rejected", "reason": "unsupported_provider"}
     launcher_factory = launcher_factory or runtime["launcher_factory"]
     quota_check = quota_check or runtime["quota_check"]
+    health_check = health_check or session_center_healthy
     admitted_task = None
     # Static-allowlist admission is always evaluated under v1 read-only
     # semantics, never whatever admission_version the Command itself claims
