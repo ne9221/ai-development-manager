@@ -168,6 +168,56 @@ class DriveRecords:
             raise TaskError(f"expected one Drive record {filename}; found {len(matches)}")
         return parent, filename, matches[0]
 
+    def generate_record_file_id(self):
+        try:
+            response = self.files.generateIds(count=1, space="drive").execute()
+            ids = response.get("ids", []) if isinstance(response, dict) else []
+            if not ids or not isinstance(ids[0], str) or not ids[0]:
+                raise TaskError("malformed Drive generateIds response")
+            return safe_id(ids[0])
+        except TaskError:
+            raise
+        except Exception as exc:
+            raise TaskError(f"could not generate Drive file id: {exc}") from exc
+
+    def put_with_fixed_file_id(self, area, project_id, name, document, drive_file_id):
+        from googleapiclient.http import MediaIoBaseUpload
+        drive_file_id = safe_id(drive_file_id)
+        parent = self.project_folder(area, project_id)
+        filename = self.record_filename(name)
+        raw = (json.dumps(document, indent=2) + "\n").encode("utf-8")
+        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=MIME_JSON, resumable=False)
+        try:
+            self.files.create(
+                body={"id": drive_file_id, "name": filename, "parents": [parent], "mimeType": MIME_JSON},
+                media_body=media,
+                fields="id"
+            ).execute()
+        except Exception as exc:
+            try:
+                remote = self.files.get_media(fileId=drive_file_id).execute()
+            except Exception:
+                raise TaskError(f"Drive fixed-ID create failed: {filename} ({exc})") from exc
+            if remote == raw:
+                return document
+            raise TaskError(
+                f"Drive fixed-ID conflict: record {filename} with id {drive_file_id} already exists with conflicting payload"
+            )
+        remote = self.files.get_media(fileId=drive_file_id).execute()
+        if remote != raw:
+            raise TaskError(f"Drive fixed-ID verification failed: {filename}")
+        return document
+
+    def get_by_file_id(self, drive_file_id):
+        try:
+            raw = self.files.get_media(fileId=safe_id(drive_file_id)).execute()
+            return json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise TaskError(f"could not read Drive record by file id: {drive_file_id}") from exc
+
+    def get_record_by_file_id(self, drive_file_id):
+        return self.get_by_file_id(drive_file_id)
+
     def put(self, area, project_id, name, document):
         from googleapiclient.http import MediaIoBaseUpload
         parent = self.project_folder(area, project_id)
@@ -392,7 +442,7 @@ def update_task(store, project_id, task_id, clear=(), **changes):
     return store.put("tasks", project_id, task_id, task)
 
 
-def create_handoff(store, document):
+def create_handoff(store, document, drive_file_id=None):
     from manager.governance import validate_completion_report
 
     document = dict(document)
@@ -405,6 +455,9 @@ def create_handoff(store, document):
         task = store.get("tasks", document["project_id"], document["task_id"])
         validate_completion_report(document.get("completion_report"), task, store, document.get("from_provider"), document.get("from_session"))
     validate("handoff", document)
+    if drive_file_id is not None:
+        if hasattr(store, "put_with_fixed_file_id"):
+            return store.put_with_fixed_file_id("handoffs", document["project_id"], document["handoff_id"], document, drive_file_id)
     return store.put("handoffs", document["project_id"], document["handoff_id"], document)
 
 

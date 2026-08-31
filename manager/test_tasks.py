@@ -715,4 +715,255 @@ class ListRecordsBoundedTests(unittest.TestCase):
         self.assertEqual(explicit_zero, with_default)
 
 
+class DriveFixedIdStorageUnitTests(unittest.TestCase):
+    """Unit test suite for fixed-ID create-only record contract:
+    A. generate ID
+    B. fixed-ID first create
+    C. same ID same payload retry
+    D. same ID conflicting payload
+    E. two concurrent create
+    F. crash-after-create replay
+    G. exact file-id readback
+    H. delayed list visibility irrelevant
+    I. legacy DriveRecords.put unchanged
+    """
+
+    def setUp(self):
+        self.service = FakeDriveService()
+        self.store = DriveRecords(self.service)
+
+    def test_A_generate_id(self):
+        """A. generate_record_file_id returns valid safe unique IDs."""
+        id1 = self.store.generate_record_file_id()
+        id2 = self.store.generate_record_file_id()
+        self.assertTrue(isinstance(id1, str) and len(id1) > 0)
+        self.assertTrue(isinstance(id2, str) and len(id2) > 0)
+        self.assertNotEqual(id1, id2)
+
+    def test_B_fixed_id_first_create(self):
+        """B. First exact-ID create succeeds."""
+        file_id = self.store.generate_record_file_id()
+        doc = {"task_id": "t1", "status": "completed", "version": 1}
+        first = self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
+        self.assertEqual(doc, first)
+        self.assertEqual(doc, self.store.get_by_file_id(file_id))
+
+    def test_C_same_id_same_payload_retry(self):
+        """C. Sequential same-ID retry with identical payload is idempotent."""
+        file_id = self.store.generate_record_file_id()
+        doc = {"task_id": "t1", "status": "completed", "version": 1}
+        self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
+
+        # Retry with identical payload
+        retry = self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
+        self.assertEqual(doc, retry)
+
+        # Exact physical file count is 1
+        self.assertEqual(1, sum(1 for item in self.service.transport.items.values()
+                                if item["meta"].get("id") == file_id))
+
+    def test_D_same_id_conflicting_payload(self):
+        """D. Same ID with conflicting payload fails closed with TaskError."""
+        file_id = self.store.generate_record_file_id()
+        doc1 = {"task_id": "t1", "payload": "original"}
+        doc2 = {"task_id": "t1", "payload": "conflicting_attempt"}
+
+        self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc1, file_id)
+
+        with self.assertRaises(TaskError) as ctx:
+            self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc2, file_id)
+
+        self.assertIn("conflict", str(ctx.exception).lower())
+        # Original content in file_id remains intact
+        readback = self.store.get_by_file_id(file_id)
+        self.assertEqual(doc1, readback)
+
+    def test_E_two_concurrent_create(self):
+        """E. Concurrent same-ID creates resolve to exactly one physical Drive file."""
+        file_id = self.store.generate_record_file_id()
+        doc = {"task_id": "t1", "status": "completed", "threads": 2}
+        results = []
+        errors = []
+        barrier = threading.Barrier(2)
+
+        def worker():
+            try:
+                barrier.wait()
+                res = self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
+                results.append(res)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual([], errors)
+        self.assertEqual(2, len(results))
+        for res in results:
+            self.assertEqual(doc, res)
+
+        # Exactly one physical file in fake drive storage
+        self.assertIn(file_id, self.service.transport.items)
+        self.assertEqual(1, sum(1 for item in self.service.transport.items.values()
+                                if item["meta"].get("id") == file_id))
+
+    def test_F_crash_after_create_replay(self):
+        """F. Caller crashes after Drive create; fresh process retries same ID safely."""
+        file_id = self.store.generate_record_file_id()
+        doc = {"task_id": "t1", "state": "crash_simulated"}
+
+        # First instance creates the file on Drive
+        store1 = DriveRecords(self.service)
+        store1.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
+
+        # Simulated crash: fresh process/store instance without in-memory state retries
+        store2 = DriveRecords(self.service)
+        result = store2.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
+        self.assertEqual(doc, result)
+
+        # No duplicate created
+        matching = [item for item in self.service.transport.items.values()
+                    if item["meta"].get("id") == file_id]
+        self.assertEqual(1, len(matching))
+
+    def test_G_exact_file_id_readback(self):
+        """G. Readback by exact file ID returns document or raises TaskError if absent."""
+        file_id = self.store.generate_record_file_id()
+        doc = {"key": "value"}
+        self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
+        self.assertEqual(doc, self.store.get_by_file_id(file_id))
+        self.assertEqual(doc, self.store.get_record_by_file_id(file_id))
+
+        with self.assertRaises(TaskError):
+            self.store.get_by_file_id("non-existent-id")
+
+    def test_H_delayed_list_visibility_irrelevant(self):
+        """H. Delayed folder list visibility does not affect correctness."""
+        # Custom transport where list() always hides newly created JSON files
+        class LaggingListFakeDriveFiles(FakeDriveFiles):
+            def list(self, q, **_kwargs):
+                self.list_options.append(dict(_kwargs))
+                parent = re.search(r"'([^']+)' in parents", q).group(1)
+                name_match = re.search(r" and name='([^']*)'", q)
+                name = name_match.group(1) if name_match else None
+                def result():
+                    with self.lock:
+                        # Only return folders, hide JSON files (simulating indexing lag)
+                        values = [deepcopy(item["meta"]) for item in self.items.values()
+                                  if parent in item["meta"].get("parents", [])
+                                  and (name is None or item["meta"]["name"] == name)
+                                  and item["meta"].get("mimeType") == MIME_FOLDER]
+                    return {"files": values}
+                return Request(result)
+
+        class LaggingDriveService:
+            def __init__(self): self.transport = LaggingListFakeDriveFiles()
+            def files(self): return self.transport
+
+        service = LaggingDriveService()
+        store = DriveRecords(service)
+        file_id = store.generate_record_file_id()
+        doc = {"task_id": "t1", "indexing_lag": True}
+
+        # Put succeeds despite list() not showing the file
+        created = store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
+        self.assertEqual(doc, created)
+
+        # Retry also succeeds
+        retry = store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
+        self.assertEqual(doc, retry)
+
+        # Exact ID readback works
+        readback = store.get_by_file_id(file_id)
+        self.assertEqual(doc, readback)
+
+    def test_I_legacy_put_unchanged(self):
+        """I. Legacy DriveRecords.put() behavior remains unchanged."""
+        doc1 = {"version": 1}
+        doc2 = {"version": 2}
+        self.store.put("tasks", "proj-a", "task-1", doc1)
+        self.assertEqual(doc1, self.store.get("tasks", "proj-a", "task-1"))
+
+        # Update existing record
+        self.store.put("tasks", "proj-a", "task-1", doc2)
+        self.assertEqual(doc2, self.store.get("tasks", "proj-a", "task-1"))
+
+    def test_create_handoff_with_fixed_file_id_opt_in(self):
+        """create_handoff accepts optional drive_file_id and uses fixed-ID idempotency."""
+        file_id = self.store.generate_record_file_id()
+        data = handoff_input()
+        data["created_at"] = "2026-09-01T00:00:00Z"
+        first = create_handoff(self.store, data, drive_file_id=file_id)
+        self.assertEqual(data["handoff_id"], first["handoff_id"])
+
+        # Retry create_handoff with same file_id and same data
+        second = create_handoff(self.store, data, drive_file_id=file_id)
+        self.assertEqual(first, second)
+
+        # Exact readback matches
+        readback = self.store.get_by_file_id(file_id)
+        self.assertEqual(first["handoff_id"], readback["handoff_id"])
+
+
+class DriveFixedIdRealDriveIntegrationTests(unittest.TestCase):
+    """Integration proof against real Google Drive API v3 (executed when token is available)."""
+
+    def setUp(self):
+        try:
+            from collectors.publish_drive import build_service, token_path
+            if not token_path().exists():
+                self.skipTest("Real Google Drive credentials not available")
+            self.service = build_service()
+            self.store = DriveRecords(self.service)
+        except Exception as exc:
+            self.skipTest(f"Real Google Drive service initialization skipped: {exc}")
+
+    def test_real_drive_fixed_id_lifecycle(self):
+        """Verify generateIds -> caller-supplied create -> same-ID retry -> conflict fail closed on real Drive."""
+        file_id = self.store.generate_record_file_id()
+        self.assertTrue(isinstance(file_id, str) and len(file_id) > 10)
+
+        area = "handoffs"
+        project_id = "ai-dev-mgr-fixed-id-test"
+        name = f"integration-{file_id}"
+        doc = {
+            "test_type": "real_drive_fixed_id_integration",
+            "file_id": file_id,
+            "created_at": "2026-09-01T00:00:00Z",
+            "status": "verified"
+        }
+
+        try:
+            # 1. First exact-ID create succeeds
+            created = self.store.put_with_fixed_file_id(area, project_id, name, doc, file_id)
+            self.assertEqual(doc, created)
+
+            # 2. Same ID + identical payload retry is idempotent
+            retry = self.store.put_with_fixed_file_id(area, project_id, name, doc, file_id)
+            self.assertEqual(doc, retry)
+
+            # 3. Exact file-ID readback succeeds
+            readback = self.store.get_by_file_id(file_id)
+            self.assertEqual(doc, readback)
+
+            # 4. Same ID + conflicting payload fails closed
+            conflict_doc = dict(doc, status="conflicting_status")
+            with self.assertRaises(TaskError) as ctx:
+                self.store.put_with_fixed_file_id(area, project_id, name, conflict_doc, file_id)
+            self.assertIn("conflict", str(ctx.exception).lower())
+
+            # 5. Content on Drive remains the original doc
+            readback_after_conflict = self.store.get_by_file_id(file_id)
+            self.assertEqual(doc, readback_after_conflict)
+        finally:
+            # Clean up test file from real Drive
+            try:
+                self.store.files.delete(fileId=file_id).execute()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__": unittest.main()
