@@ -323,19 +323,32 @@ def _attention(store, command, execution, reason):
 
     timestamp = command.get("stale_at") or now_iso()
     # Legacy uncertain executions have no heartbeat/process contract. Surface
-    # their Command, but do not rewrite the execution authority record.
+    # their Command, but do not rewrite the execution authority record if execution is already terminal.
     if execution and (execution.get("heartbeat_at") or execution.get("provider_evidence")):
-        execution.update(stale_at=execution.get("stale_at") or timestamp, recovery_reason=reason)
-        validate("execution", execution)
-        store.put("executions", command["project_id"], command["execution_id"], execution)
-        task = store.get("tasks", command["project_id"], command["task_id"])
-        if (task.get("source_context") or {}).get("active_execution_id") == command["execution_id"]:
-            task.update(status="blocked", updated_at=timestamp,
-                        blocked_reason=f"Execution recovery required: {reason}",
-                        current_progress="Execution requires attention",
-                        next_action="Verify provider/process and authority evidence; do not start a duplicate")
-            validate("task", task)
-            store.put("tasks", command["project_id"], command["task_id"], task)
+        try:
+            curr_exec = store.get("executions", command["project_id"], command["execution_id"])
+        except TaskError:
+            curr_exec = execution
+        should_block_task = (
+            curr_exec.get("status") not in ("completed", "failed", "interrupted")
+            or (curr_exec.get("cleanup_evidence") or {}).get("persistence") != "complete"
+        )
+        if curr_exec.get("status") not in ("completed", "failed", "interrupted"):
+            curr_exec.update(stale_at=curr_exec.get("stale_at") or timestamp, recovery_reason=reason)
+            validate("execution", curr_exec)
+            store.put("executions", command["project_id"], command["execution_id"], curr_exec)
+        if should_block_task:
+            try:
+                task = store.get("tasks", command["project_id"], command["task_id"])
+                if (task.get("source_context") or {}).get("active_execution_id") == command["execution_id"]:
+                    task.update(status="blocked", updated_at=timestamp,
+                                blocked_reason=f"Execution recovery required: {reason}",
+                                current_progress="Execution requires attention",
+                                next_action="Verify provider/process and authority evidence; do not start a duplicate")
+                    validate("task", task)
+                    store.put("tasks", command["project_id"], command["task_id"], task)
+            except TaskError:
+                pass
     marked = {**command, "status": "attention", "stale_at": timestamp,
               "recovery_reason": reason, "completed_at": None, "result": None}
     _write(store, marked)
@@ -898,7 +911,7 @@ def queued_command_pending_only_health(store, command, allowlist=frozenset(), bu
 
 
 def process_command(store, service, command, launcher_factory=None, writer_factory=GCSLockRegistry.from_environment,
-                    claim_factory=task_claim_registry, allowlist=frozenset(), health_check=None,
+                    claim_factory=task_claim_registry, allowlist=frozenset(), health_check=session_center_healthy,
                     quota_check=None, ingress_registry_factory=dispatch_request_registry, origin_context=None,
                     async_launch=False):
     """Claim/reconcile one command; a claimed command is never automatically relaunched.
@@ -926,7 +939,6 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         return {"status": "rejected", "reason": "unsupported_provider"}
     launcher_factory = launcher_factory or runtime["launcher_factory"]
     quota_check = quota_check or runtime["quota_check"]
-    health_check = health_check or session_center_healthy
     admitted_task = None
     # Static-allowlist admission is always evaluated under v1 read-only
     # semantics, never whatever admission_version the Command itself claims

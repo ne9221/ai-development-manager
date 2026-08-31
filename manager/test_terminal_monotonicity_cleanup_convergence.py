@@ -335,6 +335,67 @@ class TerminalMonotonicityAndCleanupTruthTests(unittest.TestCase):
         self.assertEqual("completed", stored["result"]["status"])
         self.assertEqual("codex:01a05537-real-session", stored["result"]["session_id"])
 
+    # -------------------------------------------------------------------------
+    # N. Multithreaded Race: Thread A (stale attention) vs Thread B (write completed)
+    # -------------------------------------------------------------------------
+    def test_N_multithreaded_stale_attention_vs_completed_write(self):
+        """Thread A holds stale running snapshot and attempts _attention;
+        Thread B writes completed with real session_id. Completed always wins."""
+        import threading
+        self._setup_terminal_state(terminal_status="completed", task_claim_release="released",
+                                  command_status="running", claim_in_gcs=False)
+        stale_cmd = command(status="running", execution_id=self.execution_id, claimed_at=_now())
+        exec_doc = self.store.get("executions", self.project_id, self.execution_id)
+        completed_cmd = command(status="completed", execution_id=self.execution_id, claimed_at=_now(),
+                                completed_at=_now(), result={"status": "completed", "session_id": "codex:01a05537-threadb", "error_kind": None})
+
+        def run_thread_a():
+            _attention(self.store, stale_cmd, exec_doc, "terminal_cleanup_not_confirmed")
+
+        def run_thread_b():
+            _write(self.store, completed_cmd)
+
+        t_b = threading.Thread(target=run_thread_b)
+        t_a = threading.Thread(target=run_thread_a)
+        t_b.start()
+        t_a.start()
+        t_b.join()
+        t_a.join()
+
+        stored = self.store.get("commands", self.project_id, "cmd-1")
+        self.assertEqual("completed", stored["status"])
+        self.assertEqual("codex:01a05537-threadb", stored["result"]["session_id"])
+
+    # -------------------------------------------------------------------------
+    # O. Multithreaded Dual Reconciler: Cleanup Enrichment vs Stale Attention
+    # -------------------------------------------------------------------------
+    def test_O_multithreaded_cleanup_enrichment_vs_stale_attention(self):
+        """Reconciler 1 performs cleanup absent convergence (retained -> released),
+        Reconciler 2 attempts attention with stale snapshot. Final state is terminal + released."""
+        import threading
+        cmd = self._setup_terminal_state(terminal_status="completed", task_claim_release="retained", claim_in_gcs=False)
+        exec_doc = self.store.get("executions", self.project_id, self.execution_id)
+
+        def reconciler_1():
+            with patch("manager.command_watcher.process_identity_state", return_value="stopped"):
+                _reconcile_active(self.store, None, cmd, lambda *_: self.registry)
+
+        def reconciler_2():
+            _attention(self.store, cmd, exec_doc, "terminal_cleanup_not_confirmed")
+
+        t1 = threading.Thread(target=reconciler_1)
+        t2 = threading.Thread(target=reconciler_2)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        stored_cmd = self.store.get("commands", self.project_id, "cmd-1")
+        self.assertEqual("completed", stored_cmd["status"])
+        self.assertEqual("codex:01a05537-real-session", stored_cmd["result"]["session_id"])
+        refreshed_exec = self.store.get("executions", self.project_id, self.execution_id)
+        self.assertEqual("released", refreshed_exec["cleanup_evidence"]["task_claim_release"])
+
 
 if __name__ == "__main__":
     unittest.main()
