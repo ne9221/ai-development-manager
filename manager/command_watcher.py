@@ -1328,7 +1328,7 @@ WAITING_QUOTA_DISCOVERY_WINDOW = MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL
 PHASE_1_TIME_BUDGET_SECONDS = 15
 
 
-def _enumerate_waiting_quota_tasks(store, project_id, deadline=None):
+def _enumerate_waiting_quota_tasks(store, project_id, deadline=None, rotate_offset=None):
     """Deadline-aware, bounded-hydration enumeration of one project's
     waiting_quota Tasks -- the exact mirror of _enumerate_commands() above,
     generic DriveRecords.list_records_bounded()/list_records() over the
@@ -1338,22 +1338,17 @@ def _enumerate_waiting_quota_tasks(store, project_id, deadline=None):
     non-guessed way to identify it) happens here, once, so callers never
     duplicate that evidence check.
 
-    Passes WAITING_QUOTA_DISCOVERY_WINDOW as max_records and rotation stride
-    so the scan window advances by K positions per natural tick, guaranteeing
-    full-cycle coverage across all N historical records in ceil(N / K) ticks
-    -- see `_within_project_record_rotation_offset`'s own docstring. Without
-    bounded stride>1 rotation, a project whose Tasks backlog exceeds one
-    tick's bounded hydration budget can take arbitrarily many ticks to
-    strand-recover a specific waiting_quota Task -- live-reproduced (a real
-    v2-repo-write waiting_quota Task in ai-development-manager's own
-    181-record backlog still hadn't been reached after 3+ hours of
-    continuous natural ticks under the plain stride=1 rotation)."""
+    When `rotate_offset` is provided (e.g. from Phase-1 actual-invocation cursor),
+    it uses that exact per-visit offset. Otherwise falls back to
+    _within_project_record_rotation_offset."""
+    if rotate_offset is None:
+        rotate_offset = _within_project_record_rotation_offset(stride=WAITING_QUOTA_DISCOVERY_WINDOW)
     if hasattr(store, "list_records_bounded"):
         tasks = store.list_records_bounded(
             "tasks", project_id, deadline=deadline,
             single_request_worst_case=WATCHER_DISCOVERY_TIMEOUT_SECONDS,
             max_records=WAITING_QUOTA_DISCOVERY_WINDOW,
-            rotate_offset=_within_project_record_rotation_offset(stride=WAITING_QUOTA_DISCOVERY_WINDOW),
+            rotate_offset=rotate_offset,
         )
     else:
         tasks = store.list_records("tasks", project_id)
@@ -1530,7 +1525,7 @@ def _prioritized_commands(commands):
 
 
 def poll_once(store, service, allowlist=None, deadline=None, discovery_store=None, recent_store=None, origin_context=None,
-              async_launch=False, **factories):
+              async_launch=False, cursor_path=None, **factories):
     """`deadline`, if given, is a `time.monotonic()` value after which this
     call stops STARTING new project/command work and returns whatever it has
     so far -- any project/command not yet reached this tick is picked up on
@@ -1559,18 +1554,12 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     (every existing caller/test), reproducing prior behavior exactly.
 
     Project enumeration itself (_enumerate_project_ids above) is also
-    deadline-aware and does not hydrate full project documents -- see its
-    docstring for why the earlier all_projects()-based version of this loop
-    could not be bounded by this same deadline check at all: the full
-    listing+hydration ran to completion before the loop's first iteration
-    was ever reached. Command enumeration within each project
-    (_enumerate_commands) is likewise deadline-aware and never starts a new
-    per-record Drive hydration that could itself finish after the deadline
-    -- see its docstring and list_records_bounded()'s for the full
-    reasoning. Project order is rotated deterministically by wall-clock
-    time (_rotated_project_ids) so a project with a very large historical
-    Command backlog cannot permanently starve every other project's
-    commands from ever being reached.
+    deadline-aware and does not hydrate full project documents.
+    Phase 1 waiting_quota sweep and Phase 2 command processing use a durable
+    actual-invocation cursor (manager.phase1_cursor), advancing one project
+    per actual invocation (M=1) and advancing within-project record offsets
+    contiguously on each visit. This eliminates cross-project time starvation
+    and orbital GCD record starvation caused by wall-clock aliasing.
 
     Within one project's already-returned bounded batch, commands are
     processed in _prioritized_commands() order (claimed/running, then
@@ -1606,64 +1595,62 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
                 sweep_quota_document.append(False)
         return sweep_quota_document[0] or None
 
-    project_ids = _rotated_project_ids(_enumerate_project_ids(discovery_store, deadline=deadline))
+    raw_project_ids = _enumerate_project_ids(discovery_store, deadline=deadline)
+    if not raw_project_ids:
+        return results
 
-    # Phase 1 (2026-08-28 P0 fix): the waiting_quota sweep runs for EVERY
-    # rotated project FIRST, entirely before the (potentially much more
-    # expensive) regular command-processing loop below touches any project.
-    # Live-reproduced root cause this closes: with enough real registered
-    # projects (a live HOME machine had 10, most of them old smoke/E2E test
-    # projects from prior sessions), cumulative per-project discovery
-    # overhead alone -- 1-8 real seconds each, just to enumerate commands or
-    # tasks -- can consume the ENTIRE POLL_TIME_BUDGET_SECONDS budget before
-    # a project unlucky enough to land in a late rotation position is ever
-    # reached at all, in either loop. A genuinely new waiting_quota Task
-    # then never gets promoted on ANY natural tick, indefinitely, purely
-    # because of how many OTHER projects exist and where this one happened
-    # to rotate to -- confirmed live (a real waiting_quota Task sat
-    # unpromoted for 70+ minutes across real ticks even after the separate
-    # MAX_COMMANDS_PER_POLL starvation fix above). Promotion itself is
-    # comparatively cheap (a bounded dispatch() re-attempt, never a real
-    # provider launch), so giving it first claim on the shared budget --
-    # still bounded by its own MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL cap,
-    # never unbounded -- lets it reliably complete for every rotated
-    # project before the backlog-heavy command loop gets a chance to
-    # exhaust the deadline on its own account.
-    # (project_id, command_id) pairs this SAME tick's Phase 1 just created.
-    # Phase 2 below must never process one of these -- command_id == task_id
-    # for every promotion (see _promote_waiting_quota_task's own docstring),
-    # so a fresh Phase 2 enumeration would otherwise see it immediately and
-    # attempt to launch it in the same tick it was promoted, breaking the
-    # existing "promoted this tick, launched on a later natural tick"
-    # contract several other tests and callers already depend on -- this
-    # fix's scope is closing the starvation gap, not changing that timing.
+    from manager.phase1_cursor import load_phase1_cursor, save_phase1_cursor
+
+    cursor = load_phase1_cursor(cursor_path=cursor_path)
+    current_gen = cursor.get("generation", 0)
+    num_projects = len(raw_project_ids)
+    proj_idx = cursor.get("project_cursor", 0) % num_projects
+
+    # Project rotation is ordered by actual service progress, starting at target_project_id
+    project_ids = raw_project_ids[proj_idx:] + raw_project_ids[:proj_idx]
+    target_project_id = project_ids[0]
+
     just_promoted = set()
-    # Own, shorter sub-deadline (never later than the tick's real deadline,
-    # e.g. an already-tight caller-supplied deadline in a test) -- see
-    # PHASE_1_TIME_BUDGET_SECONDS's docstring for why Phase 1 must never
-    # again be allowed to consume the whole tick budget on its own account.
     phase1_deadline = min(deadline, time.monotonic() + PHASE_1_TIME_BUDGET_SECONDS)
 
-    for project_id in project_ids:
+    # Phase 1: Dedicated bounded slice for M=1 project (target_project_id).
+    # Advances actual-invocation cursor deterministically.
+    record_cursors = cursor.get("per_project_record_cursor", {})
+    record_offset = record_cursors.get(target_project_id, 0)
+
+    try:
+        try:
+            waiting_tasks = _enumerate_waiting_quota_tasks(
+                discovery_store, target_project_id, deadline=phase1_deadline, rotate_offset=record_offset
+            )
+        except TypeError:
+            waiting_tasks = _enumerate_waiting_quota_tasks(
+                discovery_store, target_project_id, deadline=phase1_deadline
+            )
+    except TaskError:
+        waiting_tasks = []
+
+    for task in waiting_tasks:
         if promotions_this_poll >= MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL or time.monotonic() >= phase1_deadline:
             break
+        quota_document = sweep_quota()
+        if quota_document is None:
+            break  # quota unavailable this tick -- do not attempt more promotions
         try:
-            waiting_tasks = _enumerate_waiting_quota_tasks(discovery_store, project_id, deadline=phase1_deadline)
+            promoted = _promote_waiting_quota_task(store, service, task, quota_document)
+            if promoted is not None:
+                promotions_this_poll += 1
+                just_promoted.add((target_project_id, promoted["command_id"]))
         except TaskError:
             continue
-        for task in waiting_tasks:
-            if promotions_this_poll >= MAX_WAITING_QUOTA_PROMOTIONS_PER_POLL or time.monotonic() >= phase1_deadline:
-                break
-            quota_document = sweep_quota()
-            if quota_document is None:
-                break  # quota unavailable this tick -- do not attempt more promotions
-            try:
-                promoted = _promote_waiting_quota_task(store, service, task, quota_document)
-                if promoted is not None:
-                    promotions_this_poll += 1
-                    just_promoted.add((project_id, promoted["command_id"]))
-            except TaskError:
-                continue
+
+    # Advance project cursor to next project (0 -> 1 -> ... -> P-1 -> 0) and advance target project's record offset
+    cursor["project_cursor"] = (proj_idx + 1) % num_projects
+    cursor["per_project_record_cursor"][target_project_id] = record_offset + WAITING_QUOTA_DISCOVERY_WINDOW
+    try:
+        save_phase1_cursor(cursor, cursor_path=cursor_path, expected_generation=current_gen)
+    except Exception:
+        pass
 
     # Phase 2a: inspect a tiny modified-time-ordered batch from every project
     # before historical hydration. The later full sweep remains the recovery
