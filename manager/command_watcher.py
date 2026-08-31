@@ -236,13 +236,20 @@ def _write(store, command):
     so legitimate monotonic enrichment (cleanup evidence convergence,
     recovery_reason refinement, timestamp completion) is never blocked."""
     validate("command", command)
-    if command.get("status") in ("completed", "failed") and (command.get("result") or {}).get("session_id") is None:
-        try:
-            current = store.get("commands", command["project_id"], command["command_id"])
-            if current.get("status") in ("completed", "failed") and (current.get("result") or {}).get("session_id") is not None:
-                return current
-        except TaskError:
-            pass
+    try:
+        current = store.get("commands", command["project_id"], command["command_id"])
+    except TaskError:
+        current = None
+
+    if current and current.get("status") in ("completed", "failed"):
+        # Current command in store is already terminal.
+        # 1. Non-terminal downgrade (attention, queued, claimed, running) must NEVER overwrite terminal.
+        if command.get("status") not in ("completed", "failed"):
+            return current
+        # 2. Null session_id must never overwrite a real session_id.
+        if (command.get("result") or {}).get("session_id") is None and (current.get("result") or {}).get("session_id") is not None:
+            return current
+
     return store.put("commands", command["project_id"], command["command_id"], command)
 
 
@@ -304,6 +311,16 @@ def _terminal_cleanup_confirmed(execution):
 
 
 def _attention(store, command, execution, reason):
+    # Authority Fence: Check if the authoritative Command in Drive is already terminal.
+    try:
+        current_cmd = store.get("commands", command["project_id"], command["command_id"])
+    except TaskError:
+        current_cmd = command
+
+    if current_cmd.get("status") in ("completed", "failed"):
+        # The command in Drive is already terminal. Stale reconciliation must not downgrade it.
+        return {"status": current_cmd["status"], "execution_id": current_cmd.get("execution_id"), "reconciled": True}
+
     timestamp = command.get("stale_at") or now_iso()
     # Legacy uncertain executions have no heartbeat/process contract. Surface
     # their Command, but do not rewrite the execution authority record.
@@ -455,9 +472,13 @@ def _release_orphan_pre_execution_claim(store, command, claim_registry):
     except TaskError:
         return _attention(store, command, None, "execution_record_missing_claim_state_unknown")
     if existing is None:
-        # Claim is already gone (earlier tick released it, or worker
-        # released normally after all). Treat the same as the no-claim path:
-        # terminalize as claim_timeout so the Command isn't left claimed.
+        # Claim is already gone (earlier tick or concurrent reconciler released it).
+        try:
+            current = store.get("commands", command["project_id"], command["command_id"])
+            if current.get("status") in ("queued", "completed", "failed"):
+                return {"status": current["status"], "reconciled": True}
+        except TaskError:
+            pass
         failed = _terminal(command, "failed", _result("error", command["execution_id"], error_kind="claim_timeout"))
         _write(store, failed)
         return {"status": "failed", "reconciled": True}
@@ -490,27 +511,6 @@ def _release_orphan_pre_execution_claim(store, command, claim_registry):
     if worker_state not in ("stopped", "replaced"):
         return _attention(store, command, None, f"execution_record_missing_worker_{worker_state}")
     # Fence 6: CAS delete — generation-locked, safe for concurrent reconcilers.
-    try:
-        released = release_task_execution_claim(
-            claim_registry, command["project_id"], command["task_id"],
-            existing["execution_id"], existing["generation"],
-        )
-    except TaskClaimConflict:
-        # Another reconciler won the race; our command will be re-read on the
-        # next tick with a fresh (correct) state. Surface attention so this
-        # tick doesn't pretend to have done anything it didn't.
-        return _attention(store, command, None, "orphan_claim_recovery_concurrent_release")
-    except TaskError:
-        return _attention(store, command, None, "execution_record_missing_claim_state_unknown")
-    if not released.get("released"):
-        # release_task_execution_claim returned False (e.g. claim was already
-        # gone by the time it checked) -- safe no-op; fail the command out
-        # to avoid it looping as claimed with no execution forever.
-        failed = _terminal(command, "failed", _result("error", command["execution_id"], error_kind="claim_timeout"))
-        _write(store, failed)
-        return {"status": "failed", "reconciled": True}
-    # Claim CAS-released. Reset Command to queued with recovery provenance
-    # so the next natural watcher tick can re-admit and launch it.
     requeued = {
         **command,
         "status": "queued",
@@ -526,6 +526,15 @@ def _release_orphan_pre_execution_claim(store, command, claim_registry):
     }
     validate("command", requeued)
     _write(store, requeued)
+    try:
+        released = release_task_execution_claim(
+            claim_registry, command["project_id"], command["task_id"],
+            existing["execution_id"], existing["generation"],
+        )
+    except TaskClaimConflict:
+        return {"status": "queued", "reconciled": True, "orphan_claim_released": True}
+    except TaskError:
+        return _attention(store, command, None, "execution_record_missing_claim_state_unknown")
     return {"status": "queued", "reconciled": True, "orphan_claim_released": True}
 
 
@@ -553,6 +562,7 @@ def _reconcile_active(store, service, command, claim_factory):
         if evidence.get("persistence") != "complete":
             if retry_incomplete_terminal_persistence(store, command["project_id"], command["task_id"], command["execution_id"]):
                 execution = store.get("executions", command["project_id"], command["execution_id"])
+                evidence = execution.get("cleanup_evidence") or {}
         try:
             claim = check_task_execution_claim(claim_registry, command["project_id"], command["task_id"])
             if claim is not None:
@@ -572,6 +582,33 @@ def _reconcile_active(store, service, command, claim_factory):
                     validate("execution", refreshed)
                     store.put("executions", command["project_id"], command["execution_id"], refreshed)
                     execution = refreshed
+            else:
+                # Claim is explicitly ABSENT from authoritative registry read.
+                # If execution is terminal, cleanup persistence is complete,
+                # writer lease (if write access) is released, provider process is dead,
+                # and no newer execution owns the task, converge cleanup_evidence.task_claim_release to "released".
+                if (evidence.get("persistence") == "complete"
+                        and evidence.get("persisted") == ["execution", "handoff", "task"]
+                        and evidence.get("provider_outcome") == execution.get("status")):
+                    if execution.get("access") != "production_write" or evidence.get("writer_release") == "released":
+                        provider_ev = execution.get("provider_evidence") or {}
+                        pid = provider_ev.get("pid")
+                        creation = provider_ev.get("creation_identity")
+                        if pid is not None and process_identity_state(pid, creation) == "live":
+                            return _attention(store, command, execution, "terminal_cleanup_provider_still_live")
+                        try:
+                            task = store.get("tasks", command["project_id"], command["task_id"])
+                            active_exec = (task.get("source_context") or {}).get("active_execution_id")
+                            if active_exec and active_exec != execution["execution_id"]:
+                                return _attention(store, command, execution, "terminal_cleanup_task_reclaimed_by_newer_execution")
+                        except TaskError:
+                            pass
+                        if evidence.get("task_claim_release") != "released":
+                            refreshed = store.get("executions", command["project_id"], command["execution_id"])
+                            refreshed["cleanup_evidence"] = {**(refreshed.get("cleanup_evidence") or {}), "task_claim_release": "released"}
+                            validate("execution", refreshed)
+                            store.put("executions", command["project_id"], command["execution_id"], refreshed)
+                            execution = refreshed
         except TaskError:
             return _attention(store, command, execution, "terminal_cleanup_reconciliation_unknown")
         terminal = _existing_terminal(store, command)
@@ -861,7 +898,7 @@ def queued_command_pending_only_health(store, command, allowlist=frozenset(), bu
 
 
 def process_command(store, service, command, launcher_factory=None, writer_factory=GCSLockRegistry.from_environment,
-                    claim_factory=task_claim_registry, allowlist=frozenset(), health_check=session_center_healthy,
+                    claim_factory=task_claim_registry, allowlist=frozenset(), health_check=None,
                     quota_check=None, ingress_registry_factory=dispatch_request_registry, origin_context=None,
                     async_launch=False):
     """Claim/reconcile one command; a claimed command is never automatically relaunched.
@@ -889,6 +926,7 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         return {"status": "rejected", "reason": "unsupported_provider"}
     launcher_factory = launcher_factory or runtime["launcher_factory"]
     quota_check = quota_check or runtime["quota_check"]
+    health_check = health_check or session_center_healthy
     admitted_task = None
     # Static-allowlist admission is always evaluated under v1 read-only
     # semantics, never whatever admission_version the Command itself claims
