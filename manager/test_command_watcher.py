@@ -3310,4 +3310,195 @@ class ClaimExpiredTimeBugTests(unittest.TestCase):
         self.assertTrue(_claim_expired(cmd), "_claim_expired(now=None) must return True for an ancient claim")
 
 
+class TerminalPersistenceRetryTests(CommandWatcherTests):
+    """Reproduces a real production defect observed twice live in the C
+    Stability Gate campaign (round13 and round42): terminalize_execution()
+    persists 'execution' and 'handoff' successfully, but the immediate
+    write-then-readback verification of the Task write transiently
+    mismatches (a real Drive/GCS eventual-consistency hiccup -- the
+    underlying write is not corrupt, just not yet visible to the very next
+    read), raising TaskError('terminal task persistence verification
+    failed') from inside terminalize_execution's own try/except.
+    _retain_terminal_authority() then durably records
+    cleanup_evidence={persistence:'partial', persisted:['execution',
+    'handoff'], task_claim_release:'retained'} -- correctly reflecting that
+    the GCS claim genuinely was never released (cleanup_execution() is only
+    ever reached after task persistence succeeds). recover_task_claim()
+    correctly REFUSES to release the claim while persistence is incomplete
+    (a real, intentional safety fence -- see execution_recovery.py). But
+    nothing anywhere ever retries the one specific missing Task write, so
+    _reconcile_active() falls to attention/'terminal_cleanup_not_confirmed'
+    on every single tick forever: a real Task/Command stuck permanently,
+    not a transient that clears on its own."""
+
+    def _stuck_completed_execution(self):
+        active, claim, execution = self.running_command()
+        from manager.execution_lifecycle import terminalize_execution
+        original_get = self.store.get
+        stale_snapshot = self.store.get("tasks", "p1", "t1")
+        state = {"n": 0}
+
+        def flaky_get(area, project_id, name):
+            if area == "tasks" and project_id == "p1" and name == "t1":
+                n = state["n"]
+                state["n"] += 1
+                # 3 "tasks" reads happen inside terminalize_execution: #0 is
+                # its own initial fetch (execution_lifecycle.py); #1 is a
+                # hidden nested read inside create_handoff()'s
+                # completion-report validation (manager/tasks.py); #2 is the
+                # actual write-then-readback verification right after
+                # store.put() (execution_lifecycle.py) -- that is the one a
+                # real transient eventual-consistency glitch would hit.
+                if n == 2:
+                    return deepcopy(stale_snapshot)
+            return original_get(area, project_id, name)
+
+        self.store.get = flaky_get
+        try:
+            with self.assertRaises(TaskError), \
+                 patch("manager.executions.read_drive_status", return_value=quota_document()):
+                terminalize_execution(
+                    self.store, object(), None, claim, "p1", "t1", "command-cmd-1",
+                    "codex", "completed", claim.generation, True,
+                )
+        finally:
+            self.store.get = original_get
+        execution = self.store.get("executions", "p1", "command-cmd-1")
+        evidence = execution["cleanup_evidence"]
+        self.assertEqual("partial", evidence["persistence"])
+        self.assertEqual(["execution", "handoff"], evidence["persisted"])
+        self.assertEqual("retained", evidence["task_claim_release"])
+        self.assertIsNotNone(claim.document, "claim must genuinely still be held -- persistence never completed")
+        return active, claim, execution
+
+    def test_stuck_completed_execution_reproduces_real_cleanup_evidence_shape(self):
+        """Sanity check on the reproduction fixture itself, independent of
+        _reconcile_active -- confirms the setup matches round42's live
+        evidence exactly (see project memory: round42 execution had
+        persistence='partial', persisted=['execution','handoff'],
+        task_claim_release='retained')."""
+        self._stuck_completed_execution()
+
+    def test_reconcile_active_recovers_a_stuck_partial_persistence(self):
+        """The behavior this hotfix adds: _reconcile_active() must retry the
+        specific missing Task write (not just refuse to release the claim
+        forever) so a transient readback glitch self-heals on a later tick,
+        exactly like every other transient recovery_reason in this file.
+        Before the fix, this assertion fails: it stays 'attention' forever
+        (see test_current_behavior_never_recovers_without_the_fix below,
+        preserved as a permanent regression guard)."""
+        active, claim, _ = self._stuck_completed_execution()
+        result = _reconcile_active(self.store, object(), active, lambda *_: claim)
+        self.assertEqual("completed", result["status"])
+        self.assertTrue(result.get("reconciled"))
+        self.assertIsNone(claim.document, "claim must be released once persistence genuinely completes")
+        task = self.store.get("tasks", "p1", "t1")
+        self.assertEqual("completed", task["status"])
+        execution = self.store.get("executions", "p1", "command-cmd-1")
+        self.assertEqual("complete", execution["cleanup_evidence"]["persistence"])
+        self.assertEqual(["execution", "handoff", "task"], execution["cleanup_evidence"]["persisted"])
+        self.assertEqual("released", execution["cleanup_evidence"]["task_claim_release"])
+        command = self.store.get("commands", "p1", "cmd-1")
+        self.assertEqual("completed", command["status"])
+
+    def test_two_ticks_without_a_retry_helper_would_stay_stuck_forever(self):
+        """Documents the exact pre-fix symptom for posterity: calling
+        _reconcile_active() repeatedly with the retry helper DISABLED makes
+        zero progress across ticks -- the real production shape (round13,
+        round42), not a one-tick transient. Guards against a future
+        regression that reintroduces a silent no-retry path."""
+        active, claim, _ = self._stuck_completed_execution()
+        with patch("manager.command_watcher.retry_incomplete_terminal_persistence", return_value=False):
+            first = _reconcile_active(self.store, object(), active, lambda *_: claim)
+            self.assertEqual("attention", first["status"])
+            self.assertEqual("terminal_cleanup_not_confirmed", first["recovery_reason"])
+            second = _reconcile_active(self.store, object(), self.store.get("commands", "p1", "cmd-1"), lambda *_: claim)
+            self.assertEqual("attention", second["status"])
+            self.assertEqual("terminal_cleanup_not_confirmed", second["recovery_reason"])
+        self.assertIsNotNone(claim.document, "claim must never be released while persistence stays incomplete")
+        self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+
+
+class RetryIncompleteTerminalPersistenceTests(CommandWatcherTests):
+    """Unit coverage for the new helper directly, independent of
+    _reconcile_active's own control flow."""
+
+    def test_completes_a_missing_task_write_and_marks_persistence_complete(self):
+        from manager.execution_lifecycle import retry_incomplete_terminal_persistence
+        active, claim, execution = self.running_command()
+        execution["status"] = "completed"
+        execution["completed_at"] = now_iso()
+        execution["notes"] = ["codex turn completed"]
+        execution["cleanup_evidence"] = {
+            "provider_outcome": "completed", "persistence": "partial",
+            "persisted": ["execution", "handoff"], "writer_release": "not_required",
+            "task_claim_release": "retained", "errors": ["persistence failed: terminal task persistence verification failed"],
+        }
+        self.store.put("executions", "p1", "command-cmd-1", execution)
+        result = retry_incomplete_terminal_persistence(self.store, "p1", "t1", "command-cmd-1")
+        self.assertTrue(result)
+        refreshed = self.store.get("executions", "p1", "command-cmd-1")
+        self.assertEqual("complete", refreshed["cleanup_evidence"]["persistence"])
+        self.assertEqual(["execution", "handoff", "task"], refreshed["cleanup_evidence"]["persisted"])
+        # task_claim_release is untouched here -- releasing the actual GCS
+        # claim is _reconcile_active's/recover_task_claim's job, not this
+        # helper's; it only fixes the specific incomplete persistence step.
+        self.assertEqual("retained", refreshed["cleanup_evidence"]["task_claim_release"])
+        task = self.store.get("tasks", "p1", "t1")
+        self.assertEqual("completed", task["status"])
+
+    def test_is_a_noop_when_already_fully_persisted(self):
+        from manager.execution_lifecycle import retry_incomplete_terminal_persistence
+        active, claim, execution = self.running_command()
+        execution["status"] = "completed"
+        execution["completed_at"] = now_iso()
+        execution["cleanup_evidence"] = {
+            "provider_outcome": "completed", "persistence": "complete",
+            "persisted": ["execution", "handoff", "task"], "writer_release": "not_required",
+            "task_claim_release": "released", "errors": [],
+        }
+        self.store.put("executions", "p1", "command-cmd-1", execution)
+        before = self.store.get("executions", "p1", "command-cmd-1")
+        result = retry_incomplete_terminal_persistence(self.store, "p1", "t1", "command-cmd-1")
+        self.assertTrue(result)
+        after = self.store.get("executions", "p1", "command-cmd-1")
+        self.assertEqual(before, after, "must not touch an already-complete execution")
+
+    def test_returns_false_and_leaves_state_untouched_when_task_write_keeps_failing(self):
+        from manager.execution_lifecycle import retry_incomplete_terminal_persistence
+        active, claim, execution = self.running_command()
+        execution["status"] = "completed"
+        execution["completed_at"] = now_iso()
+        execution["notes"] = ["codex turn completed"]
+        execution["cleanup_evidence"] = {
+            "provider_outcome": "completed", "persistence": "partial",
+            "persisted": ["execution", "handoff"], "writer_release": "not_required",
+            "task_claim_release": "retained", "errors": ["persistence failed: terminal task persistence verification failed"],
+        }
+        self.store.put("executions", "p1", "command-cmd-1", execution)
+        before = self.store.get("executions", "p1", "command-cmd-1")
+        original_put = self.store.put
+
+        def failing_put(area, project_id, name, document):
+            if area == "tasks":
+                raise TaskError("simulated persistent Drive outage")
+            return original_put(area, project_id, name, document)
+
+        self.store.put = failing_put
+        try:
+            result = retry_incomplete_terminal_persistence(self.store, "p1", "t1", "command-cmd-1")
+        finally:
+            self.store.put = original_put
+        self.assertFalse(result)
+        after = self.store.get("executions", "p1", "command-cmd-1")
+        self.assertEqual(before, after, "a failed retry must not leave partially-updated cleanup_evidence behind")
+
+    def test_returns_false_for_a_running_execution(self):
+        from manager.execution_lifecycle import retry_incomplete_terminal_persistence
+        active, claim, execution = self.running_command()
+        self.assertEqual("running", execution["status"])
+        result = retry_incomplete_terminal_persistence(self.store, "p1", "t1", "command-cmd-1")
+        self.assertFalse(result)
+
+
 if __name__ == "__main__": unittest.main()

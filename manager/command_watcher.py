@@ -15,7 +15,7 @@ from manager.claude_account_selector import load_claude_accounts
 from manager.ag_runner import AgRunner
 from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_creation_identity, process_identity_state
-from manager.execution_lifecycle import terminalize_execution
+from manager.execution_lifecycle import retry_incomplete_terminal_persistence, terminalize_execution
 from manager.execution_runner import launch_task
 from manager.open_existing_adm_ui import focus_existing_adm_ui
 from manager.executions import cancel_reserved_execution, execution_health, prepare_task_retry
@@ -224,7 +224,25 @@ def _result(status, execution_id_value, session_id=None, error_kind=None):
 
 
 def _write(store, command):
+    """Never let a terminal write downgrade an already-terminal Command's
+    canonical result: a stale worker/exception fallback that resolves to a
+    generic {status:'error', session_id:None} must not clobber a Command
+    that already carries real Execution truth (a specific terminal status
+    and a real session_id). Only the specific null-session-over-real-session
+    downgrade is guarded -- a first-time terminal write (existing status not
+    yet terminal), a write whose existing terminal result ALSO has no real
+    session_id to lose, or any write that itself carries a real session_id
+    (a genuinely newer/better canonical truth) all proceed unconditionally,
+    so legitimate monotonic enrichment (cleanup evidence convergence,
+    recovery_reason refinement, timestamp completion) is never blocked."""
     validate("command", command)
+    if command.get("status") in ("completed", "failed") and (command.get("result") or {}).get("session_id") is None:
+        try:
+            current = store.get("commands", command["project_id"], command["command_id"])
+            if current.get("status") in ("completed", "failed") and (current.get("result") or {}).get("session_id") is not None:
+                return current
+        except TaskError:
+            pass
     return store.put("commands", command["project_id"], command["command_id"], command)
 
 
@@ -531,6 +549,10 @@ def _reconcile_active(store, service, command, claim_factory):
     except TaskError:
         return _attention(store, command, execution, "task_claim_backend_unavailable")
     if execution["status"] in ("completed", "failed", "interrupted"):
+        evidence = execution.get("cleanup_evidence") or {}
+        if evidence.get("persistence") != "complete":
+            if retry_incomplete_terminal_persistence(store, command["project_id"], command["task_id"], command["execution_id"]):
+                execution = store.get("executions", command["project_id"], command["execution_id"])
         try:
             claim = check_task_execution_claim(claim_registry, command["project_id"], command["task_id"])
             if claim is not None:
@@ -538,6 +560,18 @@ def _reconcile_active(store, service, command, claim_factory):
                 recovered = recover_task_claim(store, claim_registry, command["project_id"], command["task_id"])
                 if recovered.get("status") not in ("clean", "released"):
                     return _attention(store, command, execution, "terminal_cleanup_not_confirmed")
+                if recovered.get("status") == "released":
+                    # recover_task_claim() only ever touches the raw GCS
+                    # claim -- it never syncs the Execution record's own
+                    # cleanup_evidence.task_claim_release field, so without
+                    # this, _terminal_cleanup_confirmed() below would keep
+                    # seeing 'retained' forever even though the real claim
+                    # is now genuinely gone.
+                    refreshed = store.get("executions", command["project_id"], command["execution_id"])
+                    refreshed["cleanup_evidence"] = {**(refreshed.get("cleanup_evidence") or {}), "task_claim_release": "released"}
+                    validate("execution", refreshed)
+                    store.put("executions", command["project_id"], command["execution_id"], refreshed)
+                    execution = refreshed
         except TaskError:
             return _attention(store, command, execution, "terminal_cleanup_reconciliation_unknown")
         terminal = _existing_terminal(store, command)
@@ -714,6 +748,29 @@ def _run_claimed_command(store, service, claimed, launcher_factory, writer_facto
                 existing = store.get("executions", claimed["project_id"], claimed["execution_id"])
                 if existing.get("status") in ("reserved", "running"):
                     return _reconcile_active(store, service, {**claimed, "status": "running"}, claim_factory)
+                if existing.get("status") in ("completed", "failed", "interrupted"):
+                    # Execution genuinely reached terminal status (real
+                    # session, real provider outcome) but _existing_terminal
+                    # refused it above -- cleanup_evidence isn't fully
+                    # confirmed yet (e.g. a transient task-persistence
+                    # readback glitch, see retry_incomplete_terminal_persistence).
+                    # The caller's own exception (a worker teardown error, a
+                    # provider-stopped TaskError) is strictly LESS
+                    # authoritative than this already-terminal Execution
+                    # record -- deriving the Command's result from it
+                    # instead of the generic error/TaskError fallback below
+                    # is what keeps real session_id/status from degrading to
+                    # a generic null-session snapshot.
+                    terminal_status = "completed" if existing["status"] == "completed" else "failed"
+                    selected = {**claimed}
+                    if existing.get("account_id"):
+                        selected["account_id"] = existing["account_id"]
+                    if existing.get("provider"):
+                        selected["provider"] = existing["provider"]
+                    final = _terminal(selected, terminal_status,
+                                      _result(existing["status"], claimed["execution_id"], existing.get("session_id")))
+                    _write(store, final)
+                    return {"status": final["status"], "execution_id": claimed["execution_id"]}
             except TaskError:
                 no_execution_created = True
             kind = getattr(exc, "classification", None) or type(exc).__name__
@@ -988,6 +1045,20 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
                 existing = store.get("executions", claimed["project_id"], claimed["execution_id"])
                 if existing.get("status") in ("reserved", "running"):
                     return _reconcile_active(store, service, running, claim_factory)
+                if existing.get("status") in ("completed", "failed", "interrupted"):
+                    # Same terminal-truth-over-generic-fallback derivation as
+                    # _run_claimed_command's async path above -- see its
+                    # comment for the full rationale.
+                    terminal_status = "completed" if existing["status"] == "completed" else "failed"
+                    selected = {**claimed}
+                    if existing.get("account_id"):
+                        selected["account_id"] = existing["account_id"]
+                    if existing.get("provider"):
+                        selected["provider"] = existing["provider"]
+                    final = _terminal(selected, terminal_status,
+                                      _result(existing["status"], claimed["execution_id"], existing.get("session_id")))
+                    _write(store, final)
+                    return {"status": final["status"], "execution_id": claimed["execution_id"]}
             except TaskError:
                 no_execution_created = True
             # error_kind classification is unchanged from before this fix

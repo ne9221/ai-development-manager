@@ -385,6 +385,72 @@ def _retain_terminal_authority(store, execution, status, persisted, error):
     return audit
 
 
+def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_id):
+    """Retry a terminal execution's incompletely-persisted handoff/task write.
+
+    terminalize_execution() can raise after persisting 'execution' but before
+    'handoff' and/or 'task' complete their own write-then-readback
+    verification -- observed live twice in production (C Stability Gate
+    rounds 13 and 42) as a transient Drive/GCS eventual-consistency glitch:
+    the write itself lands durably, but the immediate readback used to
+    confirm it doesn't yet see it. _retain_terminal_authority() durably
+    records this as cleanup_evidence={persistence:'partial',
+    task_claim_release:'retained', ...} -- correct, since
+    cleanup_execution() (which would actually release the claim) is never
+    reached when persistence fails. recover_task_claim() then correctly
+    REFUSES to release that claim while persistence stays incomplete (a
+    real safety fence, not a bug) -- but nothing else ever retries the
+    specific missing write, so without this helper the Task/Command stay
+    stuck in attention forever, not just for one transient tick.
+
+    Re-deriving and re-writing the exact same idempotent handoff/task
+    records from the still-terminal, still-claim-holding execution is safe
+    to retry on every watcher tick: nothing else can be racing to write
+    them (the GCS claim is still held), and the target records are pure
+    functions of the unchanged execution/task state, so a retry either
+    completes the missing piece or safely no-ops.
+
+    Returns True once persistence is (now) complete, False otherwise --
+    on any failure, leaves the execution's cleanup_evidence exactly as it
+    was, so the caller's existing attention/refusal path still applies
+    unchanged."""
+    execution = store.get("executions", project_id, execution_id)
+    if execution.get("status") not in ("completed", "failed", "interrupted"):
+        return False
+    evidence = execution.get("cleanup_evidence") or {}
+    if evidence.get("persistence") == "complete" and evidence.get("persisted") == ["execution", "handoff", "task"]:
+        return True
+    status = execution["status"]
+    timestamp = execution.get("completed_at") or now_iso()
+    summary = execution["notes"][-1] if execution.get("notes") else f"Execution {execution_id} {status}"
+    try:
+        task = store.get("tasks", project_id, task_id)
+        expected_handoff = _terminal_handoff(execution, task, status, summary, timestamp)
+        handoff = _optional_record(store, "handoffs", project_id, expected_handoff["handoff_id"])
+        if handoff is None:
+            create_handoff(store, expected_handoff)
+            if store.get("handoffs", project_id, expected_handoff["handoff_id"]) != expected_handoff:
+                return False
+        elif handoff != expected_handoff:
+            return False
+        expected_task = _expected_terminal_task(task, execution_id, status, summary, timestamp)
+        if task != expected_task:
+            store.put("tasks", project_id, task_id, expected_task)
+            if store.get("tasks", project_id, task_id) != expected_task:
+                return False
+    except Exception:
+        return False
+    updated_evidence = {**evidence, "persistence": "complete", "persisted": ["execution", "handoff", "task"], "errors": []}
+    terminal = store.get("executions", project_id, execution_id)
+    terminal["cleanup_evidence"] = updated_evidence
+    try:
+        validate("execution", terminal)
+        store.put("executions", project_id, execution_id, terminal)
+        return store.get("executions", project_id, execution_id) == terminal
+    except Exception:
+        return False
+
+
 def terminalize_execution(store, service, writer_registry, claim_registry, project_id, task_id, execution_id, provider, status, claim_generation, provider_stopped, lease_token=None, completed_at=None, summary=None, writer_authority_released=False):
     if status not in ("completed", "failed", "interrupted"):
         raise TaskError(f"invalid terminal execution status: {status}")
