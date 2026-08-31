@@ -310,6 +310,26 @@ def _terminal_cleanup_confirmed(execution):
             if execution.get("access") == "read_only" else writer_release == "released")
 
 
+def _terminal_reconciliation_needed(execution):
+    """Narrow predicate for process_command()'s completed/failed short-circuit:
+    fall through to reconciliation only when there is durable work left that
+    retry_incomplete_terminal_persistence()/recover_task_claim() can actually
+    fix -- persistence still incomplete, or the task claim not yet in a
+    released/terminal-settled state. Deliberately narrower than
+    _terminal_cleanup_confirmed() (used elsewhere to gate publishing a fully
+    converged terminal status): a harmless cleanup_evidence variation such as
+    a provider_outcome/writer_release mismatch has its own dedicated recovery
+    path and must not pull an otherwise-settled command into reconciliation."""
+    evidence = execution.get("cleanup_evidence")
+    if not isinstance(evidence, dict):
+        return True
+    if evidence.get("persistence") != "complete":
+        return True
+    if evidence.get("task_claim_release") != "released":
+        return True
+    return False
+
+
 def _attention(store, command, execution, reason):
     # Authority Fence: Check if the authoritative Command in Drive is already terminal.
     try:
@@ -759,8 +779,14 @@ def _existing_terminal(store, command):
     if (task.get("status") != expected_task_status
             or (task.get("source_context") or {}).get("active_execution_id") != command["execution_id"]):
         return None
+    # Monotonic enrichment, not a fresh derivation: preserve whatever
+    # error_kind the Command already carried from its original terminal
+    # write rather than resetting it to None -- this reconciliation only
+    # confirms durable cleanup, it never re-classifies a real outcome.
+    existing_error_kind = (command.get("result") or {}).get("error_kind")
     return _terminal(command, "completed" if execution["status"] == "completed" else "failed",
-                     _result(execution["status"], command["execution_id"], execution.get("session_id")))
+                     _result(execution["status"], command["execution_id"], execution.get("session_id"),
+                             error_kind=existing_error_kind))
 
 
 def _run_claimed_command(store, service, claimed, launcher_factory, writer_factory,
@@ -910,7 +936,7 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
             try:
                 execution = store.get("executions", command["project_id"], command["execution_id"])
                 if (execution.get("status") in ("completed", "failed", "interrupted")
-                        and not _terminal_cleanup_confirmed(execution)):
+                        and _terminal_reconciliation_needed(execution)):
                     return _reconcile_active(store, service, command, claim_factory)
             except TaskError:
                 pass

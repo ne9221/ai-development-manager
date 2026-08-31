@@ -425,6 +425,12 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
     summary = execution["notes"][-1] if execution.get("notes") else f"Execution {execution_id} {status}"
     try:
         task = store.get("tasks", project_id, task_id)
+        if (task.get("source_context") or {}).get("active_execution_id") != execution_id:
+            # A newer execution already holds authority over this task --
+            # this stale terminal retry must not derive or write anything
+            # (Handoff or Task) on its behalf. The newer execution owns
+            # reconciliation now; fail closed and let it converge instead.
+            return False
         expected_handoff = _terminal_handoff(execution, task, status, summary, timestamp)
         handoff = _optional_record(store, "handoffs", project_id, expected_handoff["handoff_id"])
         if handoff is None:
@@ -435,11 +441,31 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
             return False
         expected_task = _expected_terminal_task(task, execution_id, status, summary, timestamp)
         if task != expected_task:
+            # Drive has no atomic CAS primitive (see PHASE-3C-EXECUTION-
+            # LIFECYCLE.md Slice 3), so re-read immediately before writing
+            # and compare against the exact snapshot used to derive
+            # expected_task -- any concurrent change (task claimed by a
+            # newer execution, or any other write) means this retry's view
+            # is stale; abandon rather than clobber it. Same idiom as
+            # _rollback_task_record's own authority re-check.
+            current_task = store.get("tasks", project_id, task_id)
+            if current_task != task:
+                return False
             store.put("tasks", project_id, task_id, expected_task)
             if store.get("tasks", project_id, task_id) != expected_task:
                 return False
     except Exception:
         return False
+    # Preserve any pre-existing failure as durable historical audit evidence
+    # (PHASE-3C-EXECUTION-LIFECYCLE.md #15) -- current `errors` reflects the
+    # NOW-authoritative complete state, but the real Drive-verification
+    # failure that caused the original partial persistence must never be
+    # silently erased from the record.
+    prior_errors = evidence.get("errors") or []
+    historical_errors = list(evidence.get("historical_errors") or [])
+    for error in prior_errors:
+        if error not in historical_errors:
+            historical_errors.append(error)
     writer_release = "released" if (execution.get("cleanup_evidence") or {}).get("writer_release") == "released" else ("retained" if execution.get("access") == "production_write" else "not_required")
     updated_evidence = {
         **evidence,
@@ -448,6 +474,7 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
         "persisted": ["execution", "handoff", "task"],
         "writer_release": writer_release,
         "task_claim_release": evidence.get("task_claim_release") or "retained",
+        "historical_errors": historical_errors,
         "errors": [],
     }
     terminal = store.get("executions", project_id, execution_id)
