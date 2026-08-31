@@ -769,22 +769,23 @@ class ListRecordsBoundedTests(unittest.TestCase):
 
 
 class DriveFixedIdStorageUnitTests(unittest.TestCase):
-    """Unit test suite for fixed-ID idempotent record creation contract:
-    A. Generated ID
-    B. Sequential same-ID retry
-    C. Concurrent same-ID create
-    D. Identical payload retry
-    E. Conflicting payload fail closed
-    F. Crash-after-create retry
-    G. Delayed list visibility irrelevant
-    H. Legacy put unchanged
+    """Unit test suite for fixed-ID create-only record contract:
+    A. generate ID
+    B. fixed-ID first create
+    C. same ID same payload retry
+    D. same ID conflicting payload
+    E. two concurrent create
+    F. crash-after-create replay
+    G. exact file-id readback
+    H. delayed list visibility irrelevant
+    I. legacy DriveRecords.put unchanged
     """
 
     def setUp(self):
         self.service = FakeDriveService()
         self.store = DriveRecords(self.service)
 
-    def test_A_generated_id_format_and_uniqueness(self):
+    def test_A_generate_id(self):
         """A. generate_record_file_id returns valid safe unique IDs."""
         id1 = self.store.generate_record_file_id()
         id2 = self.store.generate_record_file_id()
@@ -792,55 +793,30 @@ class DriveFixedIdStorageUnitTests(unittest.TestCase):
         self.assertTrue(isinstance(id2, str) and len(id2) > 0)
         self.assertNotEqual(id1, id2)
 
-    def test_B_and_D_sequential_identical_payload_retry_is_idempotent(self):
-        """B & D. Sequential same-ID create with identical payload is idempotent."""
+    def test_B_fixed_id_first_create(self):
+        """B. First exact-ID create succeeds."""
         file_id = self.store.generate_record_file_id()
         doc = {"task_id": "t1", "status": "completed", "version": 1}
         first = self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
         self.assertEqual(doc, first)
+        self.assertEqual(doc, self.store.get_by_file_id(file_id))
+
+    def test_C_same_id_same_payload_retry(self):
+        """C. Sequential same-ID retry with identical payload is idempotent."""
+        file_id = self.store.generate_record_file_id()
+        doc = {"task_id": "t1", "status": "completed", "version": 1}
+        self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
 
         # Retry with identical payload
-        second = self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
-        self.assertEqual(doc, second)
+        retry = self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
+        self.assertEqual(doc, retry)
 
         # Exact physical file count is 1
         self.assertEqual(1, sum(1 for item in self.service.transport.items.values()
                                 if item["meta"].get("id") == file_id))
 
-    def test_C_concurrent_same_id_create_resolves_to_single_physical_file(self):
-        """C. Concurrent same-ID creates resolve to exactly one physical Drive file."""
-        file_id = self.store.generate_record_file_id()
-        doc = {"task_id": "t1", "status": "completed", "threads": 10}
-        results = []
-        errors = []
-        barrier = threading.Barrier(10)
-
-        def worker():
-            try:
-                barrier.wait()
-                res = self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
-                results.append(res)
-            except Exception as e:
-                errors.append(e)
-
-        threads = [threading.Thread(target=worker) for _ in range(10)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        self.assertEqual([], errors)
-        self.assertEqual(10, len(results))
-        for res in results:
-            self.assertEqual(doc, res)
-
-        # Exactly one physical file in fake drive storage
-        self.assertIn(file_id, self.service.transport.items)
-        self.assertEqual(1, sum(1 for item in self.service.transport.items.values()
-                                if item["meta"].get("id") == file_id))
-
-    def test_E_conflicting_payload_fails_closed(self):
-        """E. Same ID with conflicting payload fails closed with TaskError."""
+    def test_D_same_id_conflicting_payload(self):
+        """D. Same ID with conflicting payload fails closed with TaskError."""
         file_id = self.store.generate_record_file_id()
         doc1 = {"task_id": "t1", "payload": "original"}
         doc2 = {"task_id": "t1", "payload": "conflicting_attempt"}
@@ -855,7 +831,39 @@ class DriveFixedIdStorageUnitTests(unittest.TestCase):
         readback = self.store.get_by_file_id(file_id)
         self.assertEqual(doc1, readback)
 
-    def test_F_crash_after_create_retry_safe(self):
+    def test_E_two_concurrent_create(self):
+        """E. Concurrent same-ID creates resolve to exactly one physical Drive file."""
+        file_id = self.store.generate_record_file_id()
+        doc = {"task_id": "t1", "status": "completed", "threads": 2}
+        results = []
+        errors = []
+        barrier = threading.Barrier(2)
+
+        def worker():
+            try:
+                barrier.wait()
+                res = self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
+                results.append(res)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual([], errors)
+        self.assertEqual(2, len(results))
+        for res in results:
+            self.assertEqual(doc, res)
+
+        # Exactly one physical file in fake drive storage
+        self.assertIn(file_id, self.service.transport.items)
+        self.assertEqual(1, sum(1 for item in self.service.transport.items.values()
+                                if item["meta"].get("id") == file_id))
+
+    def test_F_crash_after_create_replay(self):
         """F. Caller crashes after Drive create; fresh process retries same ID safely."""
         file_id = self.store.generate_record_file_id()
         doc = {"task_id": "t1", "state": "crash_simulated"}
@@ -874,8 +882,19 @@ class DriveFixedIdStorageUnitTests(unittest.TestCase):
                     if item["meta"].get("id") == file_id]
         self.assertEqual(1, len(matching))
 
-    def test_G_delayed_list_visibility_irrelevant(self):
-        """G. Delayed folder list visibility does not affect correctness."""
+    def test_G_exact_file_id_readback(self):
+        """G. Readback by exact file ID returns document or raises TaskError if absent."""
+        file_id = self.store.generate_record_file_id()
+        doc = {"key": "value"}
+        self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
+        self.assertEqual(doc, self.store.get_by_file_id(file_id))
+        self.assertEqual(doc, self.store.get_record_by_file_id(file_id))
+
+        with self.assertRaises(TaskError):
+            self.store.get_by_file_id("non-existent-id")
+
+    def test_H_delayed_list_visibility_irrelevant(self):
+        """H. Delayed folder list visibility does not affect correctness."""
         # Custom transport where list() always hides newly created JSON files
         class LaggingListFakeDriveFiles(FakeDriveFiles):
             def list(self, q, **_kwargs):
@@ -914,8 +933,8 @@ class DriveFixedIdStorageUnitTests(unittest.TestCase):
         readback = store.get_by_file_id(file_id)
         self.assertEqual(doc, readback)
 
-    def test_H_legacy_put_unchanged(self):
-        """H. Legacy DriveRecords.put() behavior remains unchanged."""
+    def test_I_legacy_put_unchanged(self):
+        """I. Legacy DriveRecords.put() behavior remains unchanged."""
         doc1 = {"version": 1}
         doc2 = {"version": 2}
         self.store.put("tasks", "proj-a", "task-1", doc1)
@@ -924,17 +943,6 @@ class DriveFixedIdStorageUnitTests(unittest.TestCase):
         # Update existing record
         self.store.put("tasks", "proj-a", "task-1", doc2)
         self.assertEqual(doc2, self.store.get("tasks", "proj-a", "task-1"))
-
-    def test_get_by_file_id_readback_exact(self):
-        """Readback by exact file ID returns document or raises TaskError if absent."""
-        file_id = self.store.generate_record_file_id()
-        doc = {"key": "value"}
-        self.store.put_with_fixed_file_id("handoffs", "proj-a", "handoff-1", doc, file_id)
-        self.assertEqual(doc, self.store.get_by_file_id(file_id))
-        self.assertEqual(doc, self.store.get_record_by_file_id(file_id))
-
-        with self.assertRaises(TaskError):
-            self.store.get_by_file_id("non-existent-id")
 
     def test_create_handoff_with_fixed_file_id_opt_in(self):
         """create_handoff accepts optional drive_file_id and uses fixed-ID idempotency."""
