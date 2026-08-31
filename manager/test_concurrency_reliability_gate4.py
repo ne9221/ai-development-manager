@@ -209,7 +209,7 @@ class TestConcurrencyReliabilityGate4(unittest.TestCase):
         self.assertEqual('claim_timeout', final_cmd['result']['error_kind'])
 
         final_task = store.get('tasks', 'p1', 't1')
-        self.assertEqual('blocked', final_task['status'])
+        self.assertEqual('queued', final_task['status'])
 
     def test_3_two_processes_simultaneously_create_execution(self):
         # Scenario 3: Two processes simultaneously call reserve_execution with identical parameters.
