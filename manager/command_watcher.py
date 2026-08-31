@@ -225,6 +225,13 @@ def _result(status, execution_id_value, session_id=None, error_kind=None):
 
 def _write(store, command):
     validate("command", command)
+    if command.get("status") in ("completed", "failed") and (command.get("result") or {}).get("session_id") is None:
+        try:
+            current = store.get("commands", command["project_id"], command["command_id"])
+            if current.get("status") in ("completed", "failed") and (current.get("result") or {}).get("session_id") is not None:
+                return current
+        except TaskError:
+            pass
     return store.put("commands", command["project_id"], command["command_id"], command)
 
 
@@ -726,6 +733,17 @@ def _run_claimed_command(store, service, claimed, launcher_factory, writer_facto
                 existing = store.get("executions", claimed["project_id"], claimed["execution_id"])
                 if existing.get("status") in ("reserved", "running"):
                     return _reconcile_active(store, service, {**claimed, "status": "running"}, claim_factory)
+                if existing.get("status") in ("completed", "failed", "interrupted"):
+                    terminal_status = "completed" if existing["status"] == "completed" else "failed"
+                    selected = {**claimed}
+                    if existing.get("account_id"):
+                        selected["account_id"] = existing["account_id"]
+                    if existing.get("provider"):
+                        selected["provider"] = existing["provider"]
+                    final = _terminal(selected, terminal_status,
+                                      _result(existing["status"], claimed["execution_id"], existing.get("session_id")))
+                    _write(store, final)
+                    return {"status": final["status"], "execution_id": claimed["execution_id"]}
             except TaskError:
                 no_execution_created = True
             kind = getattr(exc, "classification", None) or type(exc).__name__
@@ -987,28 +1005,24 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
         if terminal:
             final = terminal
         else:
-            # No Execution record exists at all (as opposed to one that was
-            # reserved/running/already-terminal) means launch_task() raised
-            # before provider authority was ever established -- the Task
-            # must truthfully report that execution never started, same as
-            # _block_prelaunch_task's existing reserved-execution contract
-            # (see test_prelaunch_reservation_is_cancelled_and_not_left_running),
-            # rather than being silently left "ready"/"Not started" while the
-            # Command is terminal "failed".
             no_execution_created = False
             try:
                 existing = store.get("executions", claimed["project_id"], claimed["execution_id"])
                 if existing.get("status") in ("reserved", "running"):
                     return _reconcile_active(store, service, running, claim_factory)
+                if existing.get("status") in ("completed", "failed", "interrupted"):
+                    terminal_status = "completed" if existing["status"] == "completed" else "failed"
+                    selected = {**claimed}
+                    if existing.get("account_id"):
+                        selected["account_id"] = existing["account_id"]
+                    if existing.get("provider"):
+                        selected["provider"] = existing["provider"]
+                    final = _terminal(selected, terminal_status,
+                                      _result(existing["status"], claimed["execution_id"], existing.get("session_id")))
+                    _write(store, final)
+                    return {"status": final["status"], "execution_id": claimed["execution_id"]}
             except TaskError:
                 no_execution_created = True
-            # error_kind classification is unchanged from before this fix
-            # (bare exception class name, or an explicit .classification
-            # attribute when the exception sets one) -- never the exception's
-            # own message text, which could carry an absolute filesystem
-            # path or other non-sensitive-but-unbounded content. The only
-            # new behavior is truthfully blocking the Task when no Execution
-            # was ever created for this launch attempt.
             kind = getattr(exc, "classification", None) or type(exc).__name__
             if no_execution_created:
                 _block_prelaunch_task(store, claimed, kind)
