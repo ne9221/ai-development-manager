@@ -799,28 +799,7 @@ def _run_claimed_command(store, service, claimed, launcher_factory, writer_facto
                 if existing.get("status") in ("reserved", "running"):
                     return _reconcile_active(store, service, {**claimed, "status": "running"}, claim_factory)
                 if existing.get("status") in ("completed", "failed", "interrupted"):
-                    # Execution genuinely reached terminal status (real
-                    # session, real provider outcome) but _existing_terminal
-                    # refused it above -- cleanup_evidence isn't fully
-                    # confirmed yet (e.g. a transient task-persistence
-                    # readback glitch, see retry_incomplete_terminal_persistence).
-                    # The caller's own exception (a worker teardown error, a
-                    # provider-stopped TaskError) is strictly LESS
-                    # authoritative than this already-terminal Execution
-                    # record -- deriving the Command's result from it
-                    # instead of the generic error/TaskError fallback below
-                    # is what keeps real session_id/status from degrading to
-                    # a generic null-session snapshot.
-                    terminal_status = "completed" if existing["status"] == "completed" else "failed"
-                    selected = {**claimed}
-                    if existing.get("account_id"):
-                        selected["account_id"] = existing["account_id"]
-                    if existing.get("provider"):
-                        selected["provider"] = existing["provider"]
-                    final = _terminal(selected, terminal_status,
-                                      _result(existing["status"], claimed["execution_id"], existing.get("session_id")))
-                    _write(store, final)
-                    return {"status": final["status"], "execution_id": claimed["execution_id"]}
+                    return _reconcile_active(store, service, {**claimed, "status": "running"}, claim_factory)
             except TaskError:
                 no_execution_created = True
             kind = getattr(exc, "classification", None) or type(exc).__name__
@@ -927,6 +906,14 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     except TaskError:
         return {"status": "rejected"}
     if command["status"] in ("completed", "failed"):
+        if command.get("execution_id"):
+            try:
+                execution = store.get("executions", command["project_id"], command["execution_id"])
+                if (execution.get("status") in ("completed", "failed", "interrupted")
+                        and not _terminal_cleanup_confirmed(execution)):
+                    return _reconcile_active(store, service, command, claim_factory)
+            except TaskError:
+                pass
         return {"status": command["status"], "skipped": True}
     if command["status"] in ("claimed", "running", "attention"):
         # Already-running authority is governed entirely by existing
@@ -1096,19 +1083,7 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
                 if existing.get("status") in ("reserved", "running"):
                     return _reconcile_active(store, service, running, claim_factory)
                 if existing.get("status") in ("completed", "failed", "interrupted"):
-                    # Same terminal-truth-over-generic-fallback derivation as
-                    # _run_claimed_command's async path above -- see its
-                    # comment for the full rationale.
-                    terminal_status = "completed" if existing["status"] == "completed" else "failed"
-                    selected = {**claimed}
-                    if existing.get("account_id"):
-                        selected["account_id"] = existing["account_id"]
-                    if existing.get("provider"):
-                        selected["provider"] = existing["provider"]
-                    final = _terminal(selected, terminal_status,
-                                      _result(existing["status"], claimed["execution_id"], existing.get("session_id")))
-                    _write(store, final)
-                    return {"status": final["status"], "execution_id": claimed["execution_id"]}
+                    return _reconcile_active(store, service, running, claim_factory)
             except TaskError:
                 no_execution_created = True
             # error_kind classification is unchanged from before this fix

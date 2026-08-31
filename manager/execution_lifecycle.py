@@ -440,7 +440,16 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
                 return False
     except Exception:
         return False
-    updated_evidence = {**evidence, "persistence": "complete", "persisted": ["execution", "handoff", "task"], "errors": []}
+    writer_release = "released" if (execution.get("cleanup_evidence") or {}).get("writer_release") == "released" else ("retained" if execution.get("access") == "production_write" else "not_required")
+    updated_evidence = {
+        **evidence,
+        "provider_outcome": status,
+        "persistence": "complete",
+        "persisted": ["execution", "handoff", "task"],
+        "writer_release": writer_release,
+        "task_claim_release": evidence.get("task_claim_release") or "retained",
+        "errors": [],
+    }
     terminal = store.get("executions", project_id, execution_id)
     terminal["cleanup_evidence"] = updated_evidence
     try:
