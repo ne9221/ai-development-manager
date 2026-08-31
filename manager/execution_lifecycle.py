@@ -385,7 +385,52 @@ def _retain_terminal_authority(store, execution, status, persisted, error):
     return audit
 
 
-def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_id):
+_PERSISTENCE_RANK = {"incomplete": 0, "partial": 1, "complete": 2}
+_PERSISTED_ORDER = ["execution", "handoff", "task"]
+
+
+def _claim_conflicts(claim_registry, project_id, task_id, execution_id):
+    """True only when the real GCS generation-CAS task-claim registry
+    (manager.task_claims) currently shows a DIFFERENT execution genuinely
+    holding this task's authority right now -- the hard, atomicity-backed
+    veto. An absent claim is never itself a conflict: Round46 claim-absent
+    convergence (see manager.command_watcher._reconcile_active's own
+    claim-is-None branch) already established that persistence recovery may
+    legitimately proceed once the physical claim is gone, so requiring a
+    held claim here would regress that design. A genuinely different
+    execution_id present, by contrast, can only have gotten there through
+    claim_task_execution()'s own atomic create-if-absent/CAS -- proof, not a
+    guess, that authority has moved on."""
+    current = check_task_execution_claim(claim_registry, project_id, task_id)
+    return current is not None and current.get("execution_id") != execution_id
+
+
+def _merge_cleanup_evidence_monotonically(fresh, updates):
+    """Merge `updates` onto the JUST-re-read `fresh` cleanup_evidence rather
+    than blindly replacing it with a snapshot captured at the start of a
+    possibly-long-running retry -- a concurrent process (recover_task_claim,
+    another reconciler) may have already advanced `fresh` past what
+    `updates` itself knows about. Never let this write regress: persistence
+    only moves incomplete -> partial -> complete; task_claim_release, once
+    'released', is sticky; `persisted` only grows; `historical_errors` only
+    grows (append-dedupe, never drops an entry)."""
+    fresh = dict(fresh or {})
+    merged = {**fresh, **updates}
+    if _PERSISTENCE_RANK.get(fresh.get("persistence"), -1) > _PERSISTENCE_RANK.get(updates.get("persistence"), -1):
+        merged["persistence"] = fresh["persistence"]
+    if fresh.get("task_claim_release") == "released":
+        merged["task_claim_release"] = "released"
+    merged["persisted"] = sorted(set(fresh.get("persisted") or []) | set(updates.get("persisted") or []),
+                                 key=_PERSISTED_ORDER.index)
+    merged_errors = list(fresh.get("historical_errors") or [])
+    for error in updates.get("historical_errors") or []:
+        if error not in merged_errors:
+            merged_errors.append(error)
+    merged["historical_errors"] = merged_errors
+    return merged
+
+
+def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_id, claim_registry):
     """Retry a terminal execution's incompletely-persisted handoff/task write.
 
     terminalize_execution() can raise after persisting 'execution' but before
@@ -413,7 +458,21 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
     Returns True once persistence is (now) complete, False otherwise --
     on any failure, leaves the execution's cleanup_evidence exactly as it
     was, so the caller's existing attention/refusal path still applies
-    unchanged."""
+    unchanged.
+
+    claim_registry is the same real GCS generation-CAS task-claim registry
+    (manager.task_claims) used everywhere else authority is checked -- see
+    _verify_terminal_authority(). Before EITHER write (Handoff or Task),
+    this vetoes on a genuinely conflicting claim via _claim_conflicts() --
+    not just the pre-existing Task-document soft check -- so a stale retry
+    can never leave a Handoff side effect behind either, not only overwrite
+    the Task. Drive itself has no atomic CAS primitive for the Task/Handoff
+    documents (see PHASE-3C-EXECUTION-LIFECYCLE.md Slice 3), so the claim
+    registry's own atomic generation is reused as authority instead of
+    inventing a second concurrency protocol; the Task write additionally
+    re-reads and compares against the exact snapshot used to derive its
+    expected content immediately before writing, closing the remaining
+    window Drive's own lack of CAS leaves open."""
     execution = store.get("executions", project_id, execution_id)
     if execution.get("status") not in ("completed", "failed", "interrupted"):
         return False
@@ -424,6 +483,8 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
     timestamp = execution.get("completed_at") or now_iso()
     summary = execution["notes"][-1] if execution.get("notes") else f"Execution {execution_id} {status}"
     try:
+        if _claim_conflicts(claim_registry, project_id, task_id, execution_id):
+            return False
         task = store.get("tasks", project_id, task_id)
         if (task.get("source_context") or {}).get("active_execution_id") != execution_id:
             # A newer execution already holds authority over this task --
@@ -434,6 +495,11 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
         expected_handoff = _terminal_handoff(execution, task, status, summary, timestamp)
         handoff = _optional_record(store, "handoffs", project_id, expected_handoff["handoff_id"])
         if handoff is None:
+            # Re-verify real CAS authority immediately before creating the
+            # Handoff -- closes the window between the checks above and
+            # this write, not just the one before the Task write below.
+            if _claim_conflicts(claim_registry, project_id, task_id, execution_id):
+                return False
             create_handoff(store, expected_handoff)
             if store.get("handoffs", project_id, expected_handoff["handoff_id"]) != expected_handoff:
                 return False
@@ -441,13 +507,14 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
             return False
         expected_task = _expected_terminal_task(task, execution_id, status, summary, timestamp)
         if task != expected_task:
-            # Drive has no atomic CAS primitive (see PHASE-3C-EXECUTION-
-            # LIFECYCLE.md Slice 3), so re-read immediately before writing
-            # and compare against the exact snapshot used to derive
-            # expected_task -- any concurrent change (task claimed by a
-            # newer execution, or any other write) means this retry's view
-            # is stale; abandon rather than clobber it. Same idiom as
-            # _rollback_task_record's own authority re-check.
+            # Real CAS veto, then re-read-and-compare against the exact
+            # snapshot used to derive expected_task immediately before
+            # writing -- any concurrent change (a newer execution's claim,
+            # or any other write) means this retry's view is stale; abandon
+            # rather than clobber it. Same idiom as _rollback_task_record's
+            # own authority re-check.
+            if _claim_conflicts(claim_registry, project_id, task_id, execution_id):
+                return False
             current_task = store.get("tasks", project_id, task_id)
             if current_task != task:
                 return False
@@ -478,7 +545,9 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
         "errors": [],
     }
     terminal = store.get("executions", project_id, execution_id)
-    terminal["cleanup_evidence"] = updated_evidence
+    # Merge onto the JUST-re-read terminal.cleanup_evidence, not a blind
+    # replace with this snapshot -- see _merge_cleanup_evidence_monotonically.
+    terminal["cleanup_evidence"] = _merge_cleanup_evidence_monotonically(terminal.get("cleanup_evidence"), updated_evidence)
     try:
         validate("execution", terminal)
         store.put("executions", project_id, execution_id, terminal)

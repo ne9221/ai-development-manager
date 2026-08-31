@@ -593,7 +593,7 @@ def _reconcile_active(store, service, command, claim_factory):
     if execution["status"] in ("completed", "failed", "interrupted"):
         evidence = execution.get("cleanup_evidence") or {}
         if evidence.get("persistence") != "complete":
-            if retry_incomplete_terminal_persistence(store, command["project_id"], command["task_id"], command["execution_id"]):
+            if retry_incomplete_terminal_persistence(store, command["project_id"], command["task_id"], command["execution_id"], claim_registry):
                 execution = store.get("executions", command["project_id"], command["execution_id"])
                 evidence = execution.get("cleanup_evidence") or {}
         try:
@@ -784,9 +784,17 @@ def _existing_terminal(store, command):
     # write rather than resetting it to None -- this reconciliation only
     # confirms durable cleanup, it never re-classifies a real outcome.
     existing_error_kind = (command.get("result") or {}).get("error_kind")
-    return _terminal(command, "completed" if execution["status"] == "completed" else "failed",
-                     _result(execution["status"], command["execution_id"], execution.get("session_id"),
-                             error_kind=existing_error_kind))
+    reconciled = _terminal(command, "completed" if execution["status"] == "completed" else "failed",
+                           _result(execution["status"], command["execution_id"], execution.get("session_id"),
+                                   error_kind=existing_error_kind))
+    # _terminal() always stamps now_iso() -- correct for a genuine first-time
+    # terminal transition, but this call site only ever confirms durable
+    # cleanup for an ALREADY-terminal Command. Preserve its real original
+    # completed_at when one already exists; only a genuinely missing
+    # timestamp may be backfilled with the current time.
+    if command.get("completed_at"):
+        reconciled["completed_at"] = command["completed_at"]
+    return reconciled
 
 
 def _run_claimed_command(store, service, claimed, launcher_factory, writer_factory,

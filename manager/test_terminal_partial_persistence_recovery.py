@@ -37,11 +37,12 @@ Command remains exactly as cheap as before (one extra read, no writes, no
 claim-registry round trip).
 """
 
-import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from copy import deepcopy
@@ -73,33 +74,282 @@ BASE_SHA = "4d53f8c019c3b2e13846fbecb8fc71cb53bf9c66"
 GIT = shutil.which("git")
 
 
-def _load_base_process_command():
-    """Load the literal manager/command_watcher.py source blob as it existed
-    at BASE_SHA (`git show <sha>:<path>`, the same primitive
-    manager.provenance/worktree_materializer already use to read historical
-    source) and exec it as a standalone module, returning its real
-    process_command. Its internal `from manager.xxx import ...` statements
-    resolve against the currently-installed manager package -- correct here
-    because every one of those dependency modules is unchanged between
-    BASE_SHA and this branch (only manager/command_watcher.py and
-    manager/execution_lifecycle.py differ), so this is the real base
-    process_command running with its real collaborators, not a mock."""
-    module_name = "_base_r17_command_watcher"
-    if module_name in sys.modules:
-        return sys.modules[module_name].process_command
-    source = subprocess.run(
-        [GIT, "show", f"{BASE_SHA}:manager/command_watcher.py"],
+_BASE_WORKTREE = {}
+
+_FAIL_BEFORE_DRIVER = '''
+import json
+from unittest.mock import patch
+
+from manager.command_watcher import process_command
+from manager.execution_lifecycle import enter_running_gate, terminalize_execution
+from manager.executions import reserve_execution
+from manager.tasks import create_project, create_task, now_iso, validate
+from manager.test_command_watcher import Store, command
+from manager.test_execution_lifecycle import project, quota_document, task
+from manager.test_task_claims import MemoryClaimRegistry
+
+PROJECT_ID = "p1"
+TASK_ID = "t1"
+EXECUTION_ID = "command-cmd-1"
+SESSION_ID = "codex:01a05796-1b5a-7fe2-bf89-0a0bacab751c"
+
+store = Store()
+create_project(store, project())
+create_task(store, task(read_only=True), assign=False)
+registry = MemoryClaimRegistry()
+
+reserve_execution(store, PROJECT_ID, TASK_ID, EXECUTION_ID, "codex", {"decision": "fresh"})
+with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+    enter_running_gate(store, object(), None, PROJECT_ID, TASK_ID, EXECUTION_ID, "codex",
+                       "read_only", task_claim_registry=registry)
+exec_doc = store.get("executions", PROJECT_ID, EXECUTION_ID)
+exec_doc["session_id"] = SESSION_ID
+store.put("executions", PROJECT_ID, EXECUTION_ID, exec_doc)
+with patch("manager.executions.read_drive_status", return_value=quota_document()):
+    terminalize_execution(store, object(), None, registry, PROJECT_ID, TASK_ID, EXECUTION_ID, "codex",
+                          "completed", 1, True, summary="Execution terminal completed")
+
+# Corrupt to the exact live R17 partial-persistence shape: only 'execution'
+# persisted, handoff missing, task rolled back to still-running, claim
+# retained/absent from GCS -- mirrors
+# TerminalPartialPersistenceRecoveryTests._corrupt_to_partial(["execution"]).
+exec_doc = store.get("executions", PROJECT_ID, EXECUTION_ID)
+exec_doc["cleanup_evidence"] = {
+    "provider_outcome": "completed", "persistence": "partial", "persisted": ["execution"],
+    "writer_release": "not_required", "task_claim_release": "retained",
+    "errors": ["Drive verification failed: dispatch-cgate5-r17-20260831T111932Z-completed-command-"
+              "dispatch-cgate5-r17-20260831T111932Z-0.json"],
+}
+validate("execution", exec_doc)
+store.put("executions", PROJECT_ID, EXECUTION_ID, exec_doc)
+for key in list(store.records):
+    if key[0] == "handoffs" and key[1] == PROJECT_ID and key[2].startswith(TASK_ID):
+        del store.records[key]
+task_doc = store.get("tasks", PROJECT_ID, TASK_ID)
+task_doc["status"] = "in_progress"
+task_doc["blocked_reason"] = None
+task_doc["current_progress"] = "still running (pre-terminal snapshot)"
+task_doc["next_action"] = "Continue provider supervision"
+task_doc.pop("completed_at", None)
+task_doc["source_context"] = {"active_execution_id": EXECUTION_ID}
+validate("task", task_doc)
+store.put("tasks", PROJECT_ID, TASK_ID, task_doc)
+registry.document = None
+
+cmd = command(status="completed", execution_id=EXECUTION_ID, project_id=PROJECT_ID, task_id=TASK_ID,
+             claimed_at=now_iso(), completed_at=now_iso(),
+             result={"status": "completed", "session_id": SESSION_ID, "error_kind": None})
+
+results = []
+for _ in range(6):
+    results.append(process_command(store, object(), cmd, claim_factory=lambda *_args: registry))
+
+final_exec = store.get("executions", PROJECT_ID, EXECUTION_ID)
+final_task = store.get("tasks", PROJECT_ID, TASK_ID)
+print(json.dumps({
+    "results": results,
+    "final_execution_cleanup_evidence": final_exec["cleanup_evidence"],
+    "final_task_status": final_task["status"],
+}))
+'''
+
+
+def _base_worktree():
+    """Create (once, memoized for this process) an isolated `git worktree`
+    checkout of BASE_SHA outside this branch's own repo -- not a bare `git
+    show`+exec of one file, so BASE's own manager.execution_lifecycle,
+    manager.executions, manager.test_command_watcher, etc. are ALL the
+    real base-SHA versions too, consistently, with zero risk of any of
+    them resolving back to this candidate branch's modified copies."""
+    if "path" in _BASE_WORKTREE:
+        return _BASE_WORKTREE["path"]
+    import atexit
+    subprocess.run([GIT, "worktree", "prune"], cwd=REPO_ROOT, capture_output=True, text=True)
+    worktree_dir = Path(tempfile.mkdtemp(prefix="adm-r17-base-worktree-"))
+    subprocess.run(
+        [GIT, "worktree", "add", "--detach", str(worktree_dir), BASE_SHA],
         cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-    ).stdout
-    spec = importlib.util.spec_from_loader(module_name, loader=None)
-    base_module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = base_module
-    try:
-        exec(compile(source, f"{BASE_SHA}:manager/command_watcher.py", "exec"), base_module.__dict__)
-    except Exception:
-        del sys.modules[module_name]
-        raise
-    return base_module.process_command
+    )
+
+    def _cleanup():
+        subprocess.run([GIT, "worktree", "remove", "--force", str(worktree_dir)],
+                       cwd=REPO_ROOT, capture_output=True, text=True)
+
+    atexit.register(_cleanup)
+    _BASE_WORKTREE["path"] = worktree_dir
+    return worktree_dir
+
+
+def _run_fail_before_in_isolated_base_worktree():
+    """Run the exact R17 durable-state FAIL-before scenario as a genuinely
+    separate OS subprocess, cwd'd into an isolated `git worktree` checkout
+    of BASE_SHA, with PYTHONPATH restricted to that worktree only -- so
+    every `manager.*` import the base code performs, transitively, resolves
+    to BASE_SHA's own source and NEVER to this candidate branch's modified
+    manager/command_watcher.py or manager/execution_lifecycle.py. Returns
+    the parsed JSON result dict the subprocess printed."""
+    worktree_dir = _base_worktree()
+    driver_path = worktree_dir / "_r17_fail_before_driver.py"
+    driver_path.write_text(_FAIL_BEFORE_DRIVER, encoding="utf-8")
+    env = {"PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
+    result = subprocess.run(
+        [sys.executable, str(driver_path)],
+        cwd=worktree_dir, env=env, capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"isolated base-worktree subprocess failed:\\n{result.stdout}\\n{result.stderr}")
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+_RESTART_PROCESS_1_DRIVER = '''
+import json
+import os
+from unittest.mock import patch
+
+from manager.command_watcher import process_command
+from manager.execution_lifecycle import enter_running_gate, terminalize_execution
+from manager.executions import reserve_execution
+from manager.tasks import TaskError, create_project, create_task, now_iso, validate
+from manager.test_command_watcher import Store, command
+from manager.test_execution_lifecycle import project, quota_document, task
+from manager.test_task_claims import MemoryClaimRegistry
+
+PROJECT_ID = "p1"
+TASK_ID = "t1"
+EXECUTION_ID = "command-cmd-1"
+SESSION_ID = "codex:01a05796-1b5a-7fe2-bf89-0a0bacab751c"
+
+
+class CrashyStore(Store):
+    """process 1 never succeeds writing a Handoff -- the exact partial-
+    persistence gap this restart proves survives the process boundary."""
+    def put(self, area, project_id, name, document):
+        if area == "handoffs":
+            raise TaskError("simulated persistent Drive failure writing handoffs")
+        return super().put(area, project_id, name, document)
+
+
+# Build the clean terminal baseline with a NORMAL store first -- it
+# genuinely needs one successful Handoff write -- then move the resulting
+# durable records into the always-fails-on-handoffs CrashyStore for the
+# actual (about to be interrupted) retry attempt below.
+clean_store = Store()
+create_project(clean_store, project())
+create_task(clean_store, task(read_only=True), assign=False)
+registry = MemoryClaimRegistry()
+
+reserve_execution(clean_store, PROJECT_ID, TASK_ID, EXECUTION_ID, "codex", {"decision": "fresh"})
+with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
+    enter_running_gate(clean_store, object(), None, PROJECT_ID, TASK_ID, EXECUTION_ID, "codex",
+                       "read_only", task_claim_registry=registry)
+exec_doc = clean_store.get("executions", PROJECT_ID, EXECUTION_ID)
+exec_doc["session_id"] = SESSION_ID
+clean_store.put("executions", PROJECT_ID, EXECUTION_ID, exec_doc)
+with patch("manager.executions.read_drive_status", return_value=quota_document()):
+    terminalize_execution(clean_store, object(), None, registry, PROJECT_ID, TASK_ID, EXECUTION_ID, "codex",
+                          "completed", 1, True, summary="Execution terminal completed")
+
+store = CrashyStore()
+store.records = dict(clean_store.records)
+
+exec_doc = store.get("executions", PROJECT_ID, EXECUTION_ID)
+exec_doc["cleanup_evidence"] = {
+    "provider_outcome": "completed", "persistence": "partial", "persisted": ["execution"],
+    "writer_release": "not_required", "task_claim_release": "retained",
+    "errors": ["Drive verification failed: simulated persistent Drive failure writing handoffs"],
+}
+validate("execution", exec_doc)
+store.put("executions", PROJECT_ID, EXECUTION_ID, exec_doc)
+for key in list(store.records):
+    if key[0] == "handoffs" and key[1] == PROJECT_ID and key[2].startswith(TASK_ID):
+        del store.records[key]
+task_doc = store.get("tasks", PROJECT_ID, TASK_ID)
+task_doc["status"] = "in_progress"
+task_doc["blocked_reason"] = None
+task_doc["current_progress"] = "still running (pre-terminal snapshot)"
+task_doc["next_action"] = "Continue provider supervision"
+task_doc.pop("completed_at", None)
+task_doc["source_context"] = {"active_execution_id": EXECUTION_ID}
+validate("task", task_doc)
+store.put("tasks", PROJECT_ID, TASK_ID, task_doc)
+registry.document = None
+
+cmd = command(status="completed", execution_id=EXECUTION_ID, project_id=PROJECT_ID, task_id=TASK_ID,
+             claimed_at=now_iso(), completed_at=now_iso(),
+             result={"status": "completed", "session_id": SESSION_ID, "error_kind": None})
+store.put("commands", PROJECT_ID, cmd["command_id"], cmd)
+
+with patch("manager.command_watcher.process_identity_state", return_value="stopped"):
+    process_command(store, object(), store.get("commands", PROJECT_ID, cmd["command_id"]),
+                    claim_factory=lambda *_args: registry)
+
+after = store.get("executions", PROJECT_ID, EXECUTION_ID)
+assert after["cleanup_evidence"]["persistence"] == "partial", after["cleanup_evidence"]
+
+# "process 1" crashes here: everything from this point on is durable-file
+# state only -- no Python object from this process is ever handed to
+# "process 2", which runs as a genuinely separate OS process below.
+fixture = {
+    "records": {"|".join(key): value for key, value in store.records.items()},
+    "claim_document": registry.document,
+    "claim_generation": registry.generation,
+    "command_id": cmd["command_id"],
+}
+with open(os.environ["ADM_FIXTURE_PATH"], "w", encoding="utf-8") as f:
+    json.dump(fixture, f)
+print(json.dumps({"process_1_persistence": after["cleanup_evidence"]["persistence"]}))
+'''
+
+_RESTART_PROCESS_2_DRIVER = '''
+import json
+import os
+from unittest.mock import patch
+
+from manager.command_watcher import process_command
+from manager.test_command_watcher import Store
+from manager.test_task_claims import MemoryClaimRegistry
+
+PROJECT_ID = "p1"
+TASK_ID = "t1"
+EXECUTION_ID = "command-cmd-1"
+
+with open(os.environ["ADM_FIXTURE_PATH"], "r", encoding="utf-8") as f:
+    fixture = json.load(f)
+
+store = Store()
+for key, value in fixture["records"].items():
+    area, project_id, name = key.split("|")
+    store.records[(area, project_id, name)] = value
+
+registry = MemoryClaimRegistry()
+registry.document = fixture["claim_document"]
+registry.generation = fixture["claim_generation"]
+
+cmd = store.get("commands", PROJECT_ID, fixture["command_id"])
+
+with patch("manager.command_watcher.process_identity_state", return_value="stopped"):
+    outcome = process_command(store, object(), cmd, claim_factory=lambda *_args: registry)
+
+final_exec = store.get("executions", PROJECT_ID, EXECUTION_ID)
+final_task = store.get("tasks", PROJECT_ID, TASK_ID)
+final_cmd = store.get("commands", PROJECT_ID, fixture["command_id"])
+print(json.dumps({
+    "outcome": outcome,
+    "final_execution_cleanup_evidence": final_exec["cleanup_evidence"],
+    "final_task_status": final_task["status"],
+    "final_command_status": final_cmd["status"],
+}))
+'''
+
+
+def _run_restart_driver(source, fixture_path):
+    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT), "ADM_FIXTURE_PATH": str(fixture_path)}
+    result = subprocess.run(
+        [sys.executable, "-c", source], cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"restart-boundary subprocess failed:\\n{result.stdout}\\n{result.stderr}")
+    return json.loads(result.stdout.strip().splitlines()[-1])
 
 
 def _claim_factory(registry):
@@ -124,29 +374,6 @@ class FlakyStore(Store):
             self.fail_remaining[area] = remaining - 1
             raise TaskError(f"simulated transient Drive failure writing {area}")
         return super().put(area, project_id, name, document)
-
-
-def _clone_store_via_serialization(store):
-    """Simulate a fresh watcher process that has crashed and restarted:
-    round-trips the store's records through JSON so nothing but plain,
-    durable data survives -- no shared Python objects, no in-memory
-    caches, no closures from the process that wrote them."""
-    plain = {f"{area}|{project_id}|{name}": value
-             for (area, project_id, name), value in store.records.items()}
-    restored = json.loads(json.dumps(plain))
-    fresh = Store()
-    for key, value in restored.items():
-        area, project_id, name = key.split("|")
-        fresh.records[(area, project_id, name)] = value
-    return fresh
-
-
-def _clone_registry_via_serialization(registry):
-    fresh = MemoryClaimRegistry()
-    if registry.document is not None:
-        fresh.document = json.loads(json.dumps(registry.document))
-        fresh.generation = registry.generation
-    return fresh
 
 
 class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
@@ -234,35 +461,27 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
     # ------------------------------------------------------------------
     @unittest.skipUnless(GIT, "git required")
     def test_01_r17_exact_shape_fail_before_and_pass_after(self):
+        # FAIL-BEFORE: run the REAL, unmodified manager/command_watcher.py
+        # (and its real manager.execution_lifecycle, manager.executions,
+        # etc. -- an entire pure BASE_SHA dependency graph, not just one
+        # file) as a genuinely separate OS subprocess, cwd'd into an
+        # isolated `git worktree` checkout of BASE_SHA with PYTHONPATH
+        # restricted to that worktree only. No import in this subprocess
+        # can resolve back to this candidate branch's modified
+        # manager/command_watcher.py or manager/execution_lifecycle.py.
+        fail_before = _run_fail_before_in_isolated_base_worktree()
+        for outcome in fail_before["results"]:
+            self.assertEqual({"status": "completed", "skipped": True}, outcome)
+        self.assertEqual("partial", fail_before["final_execution_cleanup_evidence"]["persistence"])
+        self.assertEqual(["execution"], fail_before["final_execution_cleanup_evidence"]["persisted"])
+        self.assertEqual("retained", fail_before["final_execution_cleanup_evidence"]["task_claim_release"])
+        self.assertEqual("in_progress", fail_before["final_task_status"])
+
+        # PASS-AFTER: the real (fixed) candidate process_command(), in this
+        # same process, on the exact same durable-state shape.
         self._build_terminal_baseline()
         cmd = self._corrupt_to_partial(["execution"])
         original_error = self.store.get("executions", PROJECT_ID, EXECUTION_ID)["cleanup_evidence"]["errors"]
-
-        # FAIL-BEFORE: run the REAL, unmodified manager/command_watcher.py
-        # source blob as it existed at BASE_SHA (loaded via `git show`, not
-        # hand-written) against the exact same durable state. This is
-        # literally the base-SHA code, not a guess at what it used to do.
-        unfixed_process_command = _load_base_process_command()
-
-        before = unfixed_process_command(self.store, object(), cmd, claim_factory=_claim_factory(self.registry))
-        self.assertEqual({"status": "completed", "skipped": True}, before)
-        stuck_exec = self.store.get("executions", PROJECT_ID, EXECUTION_ID)
-        self.assertEqual("partial", stuck_exec["cleanup_evidence"]["persistence"])
-        self.assertEqual(["execution"], stuck_exec["cleanup_evidence"]["persisted"])
-        self.assertEqual("retained", stuck_exec["cleanup_evidence"]["task_claim_release"])
-        stuck_task = self.store.get("tasks", PROJECT_ID, TASK_ID)
-        self.assertEqual("in_progress", stuck_task["status"])
-
-        # Simulate 40+ minutes / many natural ticks of the real base-SHA
-        # code: state never moves, because it never even reads
-        # cleanup_evidence before short-circuiting.
-        for _ in range(5):
-            unfixed_process_command(self.store, object(), cmd, claim_factory=_claim_factory(self.registry))
-        still_stuck = self.store.get("executions", PROJECT_ID, EXECUTION_ID)
-        self.assertEqual("partial", still_stuck["cleanup_evidence"]["persistence"])
-
-        # PASS-AFTER: the real (fixed) process_command() on the exact same
-        # durable state.
         with patch("manager.command_watcher.process_identity_state", return_value="stopped"):
             outcome = process_command(self.store, object(), cmd, claim_factory=_claim_factory(self.registry))
 
@@ -406,53 +625,32 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
         self.assertNotEqual("completed", final_task["status"])
 
     # ------------------------------------------------------------------
-    # 7. Restart durability: a fresh "process 2" resumes from durable
-    #    state only -- no in-memory carryover from "process 1".
+    # 7. Restart durability: "process 2" is a genuinely separate OS
+    #    subprocess resuming purely from a durable JSON fixture file --
+    #    not a JSON round-trip of Python objects staying inside the same
+    #    interpreter (that alone cannot prove no in-memory caches, module-
+    #    level state, or import-time singletons survived a real restart).
     # ------------------------------------------------------------------
     def test_07_persistence_retry_durable_across_restart(self):
-        self._build_terminal_baseline()
-        cmd = self._corrupt_to_partial(["execution"])
+        fixture_path = Path(tempfile.mkdtemp(prefix="adm-r17-restart-fixture-")) / "fixture.json"
+        try:
+            process_1 = _run_restart_driver(_RESTART_PROCESS_1_DRIVER, fixture_path)
+            self.assertEqual("partial", process_1["process_1_persistence"])
+            self.assertTrue(fixture_path.exists())
 
-        # "Process 1": one flaky attempt that fails partway through (the
-        # handoff write itself fails), then the process is discarded. The
-        # Command itself must be a durable record too -- persist it into the
-        # store like every other area, instead of only ever existing as a
-        # Python dict handed directly to process_command().
-        crashy_store = FlakyStore()
-        crashy_store.records = deepcopy(self.store.records)
-        crashy_store.put("commands", PROJECT_ID, cmd["command_id"], cmd)
-        crashy_store.fail_remaining["handoffs"] = 99  # never succeeds in "process 1"
-        crashy_registry = self.registry
-        process_1_cmd = crashy_store.get("commands", PROJECT_ID, cmd["command_id"])
-        with patch("manager.command_watcher.process_identity_state", return_value="stopped"):
-            process_command(crashy_store, object(), process_1_cmd, claim_factory=_claim_factory(crashy_registry))
-        self.assertEqual("partial", crashy_store.get("executions", PROJECT_ID, EXECUTION_ID)["cleanup_evidence"]["persistence"])
+            # "Process 1" has already exited by this point -- process_2 is
+            # launched fresh below with nothing but the fixture file on
+            # disk; no Python object, module cache, or interpreter state
+            # from process 1 is reachable from it.
+            process_2 = _run_restart_driver(_RESTART_PROCESS_2_DRIVER, fixture_path)
+        finally:
+            shutil.rmtree(fixture_path.parent, ignore_errors=True)
 
-        # "Process 1" crashes: nothing survives except what it already
-        # durably wrote. Simulate this with a full JSON round-trip into a
-        # brand new Store/registry pair -- no shared Python objects, no
-        # in-memory caches, no closures from "process 1" survive.
-        durable_store = _clone_store_via_serialization(crashy_store)
-        durable_registry = _clone_registry_via_serialization(crashy_registry)
-
-        # "Process 2": fresh call, fresh objects. The Command itself is also
-        # re-read from the fresh durable store rather than reusing "process
-        # 1"'s original `cmd`/`process_1_cmd` Python object -- proving
-        # recovery resumes purely from durable records, including the
-        # Command, not from anything still alive in the old process.
-        self.assertIsNot(process_1_cmd, durable_store.get("commands", PROJECT_ID, cmd["command_id"]))
-        process_2_cmd = durable_store.get("commands", PROJECT_ID, cmd["command_id"])
-        with patch("manager.command_watcher.process_identity_state", return_value="stopped"):
-            outcome = process_command(durable_store, object(), process_2_cmd, claim_factory=_claim_factory(durable_registry))
-
-        self.assertEqual("completed", outcome["status"])
-        final_exec = durable_store.get("executions", PROJECT_ID, EXECUTION_ID)
-        self.assertEqual("complete", final_exec["cleanup_evidence"]["persistence"])
-        self.assertEqual("released", final_exec["cleanup_evidence"]["task_claim_release"])
-        final_task = durable_store.get("tasks", PROJECT_ID, TASK_ID)
-        self.assertEqual("completed", final_task["status"])
-        final_cmd = durable_store.get("commands", PROJECT_ID, cmd["command_id"])
-        self.assertEqual("completed", final_cmd["status"])
+        self.assertEqual("completed", process_2["outcome"]["status"])
+        self.assertEqual("complete", process_2["final_execution_cleanup_evidence"]["persistence"])
+        self.assertEqual("released", process_2["final_execution_cleanup_evidence"]["task_claim_release"])
+        self.assertEqual("completed", process_2["final_task_status"])
+        self.assertEqual("completed", process_2["final_command_status"])
 
     # ------------------------------------------------------------------
     # 8. Concurrent reconcilers: no duplicate/conflicting terminal
@@ -485,10 +683,11 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
                     reads = getattr(self._local, "task_reads", 0) + 1
                     self._local.task_reads = reads
                     if reads == 1:
-                        try:
-                            self.barrier.wait(timeout=5)
-                        except threading.BrokenBarrierError:
-                            pass
+                        # No except here: a genuine BrokenBarrierError (not
+                        # every worker arriving in time) must propagate and
+                        # fail this test loudly, never be silently absorbed
+                        # into a degraded "raced by luck" run.
+                        self.barrier.wait(timeout=5)
                 return super().get(area, project_id, name)
 
         store = InstrumentedStore()
@@ -531,6 +730,21 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
                 t.join(timeout=10)
         finally:
             patcher.stop()
+            # BrokenBarrierError raised inside store.get() is caught by
+            # retry_incomplete_terminal_persistence()'s own (legitimate,
+            # real-Drive-failure-tolerant) `except Exception: return False`
+            # -- so a broken barrier would NOT necessarily surface as a
+            # raised exception in `exceptions` below. Capture the barrier's
+            # own state directly, the one place this can be checked
+            # independent of application code, before disarming it -- every
+            # subsequent store.get("tasks", ...) below is this single
+            # (main) thread doing final assertions, not another
+            # rendezvousing worker, and leaving the barrier armed would make
+            # that lone call block for the full timeout and then break too.
+            barrier_broken = store.barrier.broken
+            store.barrier = None
+
+        self.assertFalse(barrier_broken, "workers did not genuinely rendezvous -- barrier timed out")
 
         # ALL_WORKERS_RETURNED / THREAD_EXCEPTIONS: every thread must have
         # actually finished (not hung on the barrier/join) and none may have
@@ -542,12 +756,25 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
         for outcome in outcomes:
             self.assertIn(outcome["status"], ("completed", "attention"))
 
-        # HANDOFF_WRITE_ATTEMPTS: multiple concurrent attempts are expected
-        # (that's the whole point of the race), but exactly one durable
-        # Handoff record must exist -- no duplicate/conflicting write won.
-        self.assertGreaterEqual(store.put_attempts.get("handoffs", 0), 1)
+        # HANDOFF_WRITE_ATTEMPTS: this proves the LOGICAL layer only -- N
+        # concurrent attempts against the SAME in-memory dict key can only
+        # ever converge to one entry by construction (a later put() to an
+        # identical key always overwrites), so it cannot by itself prove
+        # PHYSICAL_DRIVE_HANDOFF_DUPLICATE_SAFE (see
+        # DriveRecordRaceTests.test_real_threaded_concurrent_terminal_
+        # handoff_create_does_not_duplicate in manager/test_tasks.py for
+        # that proof against the real DriveRecords create-then-verify
+        # path). What this DOES prove: every concurrent attempt derived and
+        # attempted to persist the exact same canonical content -- no
+        # thread ever computed or wrote a conflicting Handoff.
+        self.assertGreaterEqual(store.put_attempts.get("handoffs", 0), 2,
+                                "expected more than one worker to attempt the handoff write (proves real overlap, not one winner short-circuiting the rest)")
         handoff_keys = [k for k in store.records if k[0] == "handoffs" and k[1] == PROJECT_ID]
         self.assertEqual(1, len(handoff_keys))
+        canonical_handoff = store.records[handoff_keys[0]]
+        self.assertEqual(TASK_ID, canonical_handoff["task_id"])
+        self.assertEqual(SESSION_ID, canonical_handoff["from_session"])
+        self.assertEqual("completed", canonical_handoff["current_state"])
 
         final_exec = store.get("executions", PROJECT_ID, EXECUTION_ID)
         self.assertEqual("complete", final_exec["cleanup_evidence"]["persistence"])
@@ -695,12 +922,15 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
         self.assertEqual({"status": "completed", "skipped": True}, outcome)
 
     # ------------------------------------------------------------------
-    # 15. Stale-writer forced race: a newer execution takes authority over
-    #     the task DURING retry_incomplete_terminal_persistence()'s own
-    #     execution, between its internal read and its internal write --
-    #     not merely staged before the call (that's test_09). A
-    #     deterministic Event-based barrier forces the interleaving instead
-    #     of hoping two threads race by luck.
+    # 15. Stale-writer forced race: a newer execution takes REAL authority
+    #     (both the GCS claim registry and the Task document) over the task
+    #     DURING retry_incomplete_terminal_persistence()'s own execution,
+    #     between its internal read and its internal write -- not merely
+    #     staged before the call (that's test_09/test_19). The stale
+    #     worker's first Task read must genuinely complete and capture the
+    #     OLD snapshot BEFORE it pauses -- if the barrier sits before the
+    #     real read, the "stale" worker would actually observe the NEW
+    #     state once it resumes, and the race would test nothing.
     # ------------------------------------------------------------------
     def test_15_stale_writer_forced_race_does_not_overwrite_newer_task(self):
         self._build_terminal_baseline()
@@ -713,15 +943,22 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
         lock = threading.Lock()
 
         def racy_get(area, project_id, name):
-            if area == "tasks":
-                with lock:
-                    read_count["n"] += 1
-                    first_read = read_count["n"] == 1
-                if first_read:
-                    reader_arrived.set()
-                    if not newer_execution_done.wait(timeout=5):
-                        raise AssertionError("newer execution never signalled completion")
-            return original_get(area, project_id, name)
+            if area != "tasks":
+                return original_get(area, project_id, name)
+            # Perform the REAL read first and capture its (still-old)
+            # result before pausing -- the stale worker must walk away from
+            # this call already holding the pre-takeover snapshot, exactly
+            # as it would in a genuine OS-thread race where the read
+            # instruction itself completed before the context switch.
+            snapshot = original_get(area, project_id, name)
+            with lock:
+                read_count["n"] += 1
+                first_read = read_count["n"] == 1
+            if first_read:
+                reader_arrived.set()
+                if not newer_execution_done.wait(timeout=5):
+                    raise AssertionError("newer execution never signalled completion")
+            return snapshot
 
         self.store.get = racy_get
 
@@ -731,6 +968,13 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
             try:
                 if not reader_arrived.wait(timeout=5):
                     raise AssertionError("stale retry never reached its first task read")
+                # Real authority transfer, not just a document edit: the
+                # newer execution first wins the actual GCS generation-CAS
+                # claim (exactly as enter_running_gate's normal launch path
+                # would, once the old claim is genuinely gone) and only then
+                # updates the Task document -- the same two-step sequence
+                # production code follows.
+                claim_task_execution(self.registry, PROJECT_ID, TASK_ID, "newer-execution-id", "codex", now_iso())
                 task_doc = original_get("tasks", PROJECT_ID, TASK_ID)
                 task_doc["source_context"] = {"active_execution_id": "newer-execution-id"}
                 task_doc["status"] = "in_progress"
@@ -740,7 +984,7 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
                 task_doc.pop("completed_at", None)
                 validate("task", task_doc)
                 self.store.put("tasks", PROJECT_ID, TASK_ID, task_doc)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 -- captured, asserted below, never swallowed
                 exceptions.append(exc)
             finally:
                 newer_execution_done.set()
@@ -750,8 +994,8 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
         def run_stale_retry():
             try:
                 result_holder["result"] = retry_incomplete_terminal_persistence(
-                    self.store, PROJECT_ID, TASK_ID, EXECUTION_ID)
-            except Exception as exc:  # noqa: BLE001
+                    self.store, PROJECT_ID, TASK_ID, EXECUTION_ID, self.registry)
+            except Exception as exc:  # noqa: BLE001 -- captured, asserted below, never swallowed
                 exceptions.append(exc)
 
         stale_retry = threading.Thread(target=run_stale_retry)
@@ -761,17 +1005,27 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
         stale_retry.join(timeout=10)
         newer.join(timeout=10)
 
-        # ALL_WORKERS_RETURNED / THREAD_EXCEPTIONS
+        # ALL_WORKERS_RETURNED / THREAD_EXCEPTIONS_SILENTLY_SWALLOWED=NO
         self.assertFalse(stale_retry.is_alive())
         self.assertFalse(newer.is_alive())
         self.assertEqual([], exceptions)
 
+        # FORCED_RACE_ACTUALLY_USES_STALE_SNAPSHOT: prove the stale worker's
+        # captured read really was the pre-takeover snapshot, not the
+        # post-takeover one -- otherwise this test would not be exercising
+        # the race it claims to.
+        self.assertEqual(1, read_count["n"])
+
         # STALE_WRITER_SAFE: the stale retry must report failure/abandon,
-        # never a false "complete".
+        # never a false "complete" -- both because the real claim registry
+        # now shows a different owner (the CAS veto) and because the Task
+        # document itself changed underneath it.
         self.assertFalse(result_holder.get("result"))
 
-        # NEWER_EXECUTION_PROTECTED: the newer execution's Task write must
-        # survive completely untouched by the stale retry.
+        # NEWER_EXECUTION_PROTECTED: the newer execution's real claim and
+        # Task write must survive completely untouched by the stale retry.
+        newer_claim = check_task_execution_claim(self.registry, PROJECT_ID, TASK_ID)
+        self.assertEqual("newer-execution-id", newer_claim["execution_id"])
         final_task = self.store.get("tasks", PROJECT_ID, TASK_ID)
         self.assertEqual("newer-execution-id", (final_task.get("source_context") or {}).get("active_execution_id"))
         self.assertEqual("in_progress", final_task["status"])
@@ -779,6 +1033,8 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
 
         final_exec = self.store.get("executions", PROJECT_ID, EXECUTION_ID)
         self.assertNotEqual("complete", final_exec["cleanup_evidence"]["persistence"])
+        handoff_keys = [k for k in self.store.records if k[0] == "handoffs" and k[1] == PROJECT_ID]
+        self.assertEqual([], handoff_keys)
 
     # ------------------------------------------------------------------
     # 16. error_kind and other terminal metadata survive recovery as
@@ -859,6 +1115,92 @@ class TerminalPartialPersistenceRecoveryTests(unittest.TestCase):
         self.assertEqual({"status": "completed", "skipped": True}, outcome)
         untouched_exec = self.store.get("executions", PROJECT_ID, EXECUTION_ID)
         self.assertEqual("failed", untouched_exec["cleanup_evidence"]["provider_outcome"])
+
+    # ------------------------------------------------------------------
+    # 19. TASK_AUTHORITY_CAS_USED: isolate the real GCS generation-CAS
+    #     claim-registry veto from the pre-existing Task-document soft
+    #     check -- the Task document still identifies THIS execution as
+    #     active (the soft check alone would allow the write), so only the
+    #     claim registry showing a genuinely different execution can be
+    #     the reason this is refused.
+    # ------------------------------------------------------------------
+    def test_19_conflicting_real_claim_vetoes_write_even_when_task_document_unchanged(self):
+        self._build_terminal_baseline()
+        self._corrupt_to_partial(["execution"])
+        claim_task_execution(self.registry, PROJECT_ID, TASK_ID, "other-execution-id", "codex", now_iso())
+        before_task = self.store.get("tasks", PROJECT_ID, TASK_ID)
+        self.assertEqual(EXECUTION_ID, (before_task.get("source_context") or {}).get("active_execution_id"))
+
+        result = retry_incomplete_terminal_persistence(self.store, PROJECT_ID, TASK_ID, EXECUTION_ID, self.registry)
+
+        self.assertFalse(result)
+        final_exec = self.store.get("executions", PROJECT_ID, EXECUTION_ID)
+        self.assertNotEqual("complete", final_exec["cleanup_evidence"]["persistence"])
+        handoff_keys = [k for k in self.store.records if k[0] == "handoffs" and k[1] == PROJECT_ID]
+        self.assertEqual([], handoff_keys)
+        final_task = self.store.get("tasks", PROJECT_ID, TASK_ID)
+        self.assertEqual(before_task, final_task)
+
+    # ------------------------------------------------------------------
+    # 20. An ABSENT claim (Round46 claim-absent convergence) must remain a
+    #     permitted, non-conflicting state -- the real CAS veto only fires
+    #     on a genuinely different owner, never merely because nothing is
+    #     currently claimed.
+    # ------------------------------------------------------------------
+    def test_20_absent_claim_is_not_a_cas_conflict(self):
+        self._build_terminal_baseline()
+        self._corrupt_to_partial(["execution"], claim_in_gcs=False)
+        self.assertIsNone(self.registry.document)
+
+        result = retry_incomplete_terminal_persistence(self.store, PROJECT_ID, TASK_ID, EXECUTION_ID, self.registry)
+
+        self.assertTrue(result)
+        final_exec = self.store.get("executions", PROJECT_ID, EXECUTION_ID)
+        self.assertEqual("complete", final_exec["cleanup_evidence"]["persistence"])
+
+    # ------------------------------------------------------------------
+    # 21. Monotonic cleanup_evidence merge: a concurrent process advances
+    #     task_claim_release to 'released' WHILE this retry is still
+    #     running (between its own initial read and its final write) --
+    #     the retry's own write must never regress it back to 'retained'.
+    # ------------------------------------------------------------------
+    def test_21_cleanup_evidence_merge_never_regresses_concurrently_released_claim(self):
+        self._build_terminal_baseline()
+        cmd = self._corrupt_to_partial(["execution"])
+
+        original_put = self.store.put
+        released_mid_call = threading.Event()
+
+        def racy_put(area, project_id, name, document):
+            result = original_put(area, project_id, name, document)
+            if area == "handoffs" and not released_mid_call.is_set():
+                # Simulate a concurrent process (recover_task_claim, via a
+                # different reconciler) genuinely releasing the claim and
+                # advancing cleanup_evidence.task_claim_release to
+                # 'released' in the narrow window between this retry's own
+                # early reads and its final cleanup_evidence write.
+                concurrent_exec = self.store.get("executions", PROJECT_ID, EXECUTION_ID)
+                concurrent_exec["cleanup_evidence"] = {
+                    **(concurrent_exec.get("cleanup_evidence") or {}), "task_claim_release": "released",
+                }
+                original_put("executions", PROJECT_ID, EXECUTION_ID, concurrent_exec)
+                released_mid_call.set()
+            return result
+
+        self.store.put = racy_put
+        try:
+            with patch("manager.command_watcher.process_identity_state", return_value="stopped"):
+                outcome = process_command(self.store, object(), cmd, claim_factory=_claim_factory(self.registry))
+        finally:
+            self.store.put = original_put
+
+        self.assertEqual("completed", outcome["status"])
+        final_exec = self.store.get("executions", PROJECT_ID, EXECUTION_ID)
+        self.assertEqual("complete", final_exec["cleanup_evidence"]["persistence"])
+        # The concurrently-released claim must stay released -- this
+        # retry's own (stale-at-the-time-of-its-first-read) view of
+        # task_claim_release must never win and regress it back.
+        self.assertEqual("released", final_exec["cleanup_evidence"]["task_claim_release"])
 
 
 if __name__ == "__main__":

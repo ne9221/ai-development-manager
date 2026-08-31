@@ -1,8 +1,9 @@
+import json
 import re
 import threading
 import unittest
 from copy import deepcopy
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from manager.tasks import MIME_FOLDER, ROOT_FOLDER_ID, ROOT_FOLDERS, DriveRecords, TaskError, complete_task, create_handoff, create_project, create_task, logical_record_id, record_storage_id, update_task, validate
 
@@ -355,6 +356,125 @@ class DriveFolderRaceTests(unittest.TestCase):
         self.assertEqual([], errors)
         self.assertEqual(results["a"], results["b"])
         self.assertEqual(1, len(store.children(root, "project-a")))
+
+
+class DriveRecordRaceTests(unittest.TestCase):
+    """Regression coverage for the first-write TOCTOU race on Drive JSON
+    record creation (put(), not folder()): two processes both see "record
+    missing" and both create it, leaving two same-named physical JSON
+    files. This is the exact concurrency shape
+    manager.execution_lifecycle.retry_incomplete_terminal_persistence()
+    exercises when two watcher ticks race to create the same deterministic
+    terminal Handoff -- an in-memory dict Store can never reproduce this
+    (a second put() to the same key just overwrites), so this exercises the
+    real DriveRecords.put()/_reconcile_created_record() path instead. See
+    manager/test_terminal_partial_persistence_recovery.py's own
+    test_08_concurrent_reconcilers_no_duplicate_handoff for the logical-
+    layer coverage this complements at the physical-Drive layer."""
+
+    def test_single_writer_first_create_is_normal_path(self):
+        store = DriveRecords(FakeDriveService())
+        document = {"handoff_id": "t1-completed-exec-1-0", "task_id": "t1"}
+        self.assertEqual(document, store.put("handoffs", "project-a", "t1-completed-exec-1-0", document))
+        parent = store.project_folder("handoffs", "project-a", create=False)
+        self.assertEqual(1, len(store.children(parent, store.record_filename("t1-completed-exec-1-0"))))
+
+    def test_record_already_exists_is_updated_not_duplicated(self):
+        store = DriveRecords(FakeDriveService())
+        first = {"handoff_id": "t1-completed-exec-1-0", "version": 1}
+        second = {"handoff_id": "t1-completed-exec-1-0", "version": 2}
+        store.put("handoffs", "project-a", "t1-completed-exec-1-0", first)
+        store.put("handoffs", "project-a", "t1-completed-exec-1-0", second)
+        self.assertEqual(second, store.get("handoffs", "project-a", "t1-completed-exec-1-0"))
+        parent = store.project_folder("handoffs", "project-a", create=False)
+        self.assertEqual(1, len(store.children(parent, store.record_filename("t1-completed-exec-1-0"))))
+
+    def test_pre_existing_duplicate_records_still_fail_closed(self):
+        store = DriveRecords(FakeDriveService())
+        parent = store.project_folder("handoffs", "project-a")
+        filename = store.record_filename("t1-completed-exec-1-0")
+        raw = (json.dumps({"handoff_id": "t1-completed-exec-1-0"}, indent=2) + "\n").encode("utf-8")
+        for _ in range(2):
+            media = MagicMock()
+            media.getbytes.return_value = raw
+            store.files.create(body={"name": filename, "parents": [parent], "mimeType": "application/json"},
+                               media_body=media, fields="id").execute()
+        with self.assertRaisesRegex(TaskError, "duplicate Drive record"):
+            store.put("handoffs", "project-a", "t1-completed-exec-1-0", {"handoff_id": "t1-completed-exec-1-0"})
+        with self.assertRaisesRegex(TaskError, "expected one Drive record"):
+            store.get("handoffs", "project-a", "t1-completed-exec-1-0")
+
+    def _race_two_first_creates(self, document):
+        """Hand-orchestrate the exact TOCTOU interleaving: both racers
+        observe "no record" before either creates, then both create -- the
+        record-level analogue of DriveFolderRaceTests._race_two_first_creates."""
+        store = DriveRecords(FakeDriveService())
+        parent = store.project_folder("handoffs", "project-a")
+        filename = store.record_filename("t1-completed-exec-1-0")
+        self.assertEqual([], store.children(parent, filename))
+        raw = (json.dumps(document, indent=2) + "\n").encode("utf-8")
+        media_a, media_b = MagicMock(), MagicMock()
+        media_a.getbytes.return_value = raw
+        media_b.getbytes.return_value = raw
+        id_a = store.files.create(body={"name": filename, "parents": [parent], "mimeType": "application/json"},
+                                  media_body=media_a, fields="id").execute()["id"]
+        id_b = store.files.create(body={"name": filename, "parents": [parent], "mimeType": "application/json"},
+                                  media_body=media_b, fields="id").execute()["id"]
+        resolved_a = store._reconcile_created_record(parent, filename, id_a)
+        resolved_b = store._reconcile_created_record(parent, filename, id_b)
+        return store, parent, filename, resolved_a, resolved_b
+
+    def test_two_concurrent_writers_same_terminal_handoff_resolve_to_one_canonical_record(self):
+        document = {"handoff_id": "t1-completed-exec-1-0", "task_id": "t1", "reason": "completed"}
+        store, parent, filename, resolved_a, resolved_b = self._race_two_first_creates(document)
+        self.assertEqual(resolved_a, resolved_b)
+        remaining = store.children(parent, filename)
+        self.assertEqual(1, len(remaining))
+        self.assertEqual(resolved_a, remaining[0]["id"])
+
+    def test_real_threaded_concurrent_terminal_handoff_create_does_not_duplicate(self):
+        """Same race as above, but driven by actual OS threads paused at a
+        barrier inside list(), so both really do observe "missing" at the
+        same time -- not just a hand-sequenced simulation. Mirrors
+        DriveFolderRaceTests.test_real_threaded_concurrent_first_create_
+        does_not_duplicate_or_fail exactly, for a JSON record instead of a
+        folder."""
+        barrier = threading.Barrier(2, timeout=5)
+        seen = {"n": 0}
+        seen_lock = threading.Lock()
+        filename_marker = "t1-completed-exec-1-0.json"
+
+        def on_list(query):
+            if f"name='{filename_marker}'" not in query:
+                return
+            with seen_lock:
+                seen["n"] += 1
+                should_wait = seen["n"] <= 2
+            if should_wait:
+                barrier.wait()
+
+        store = DriveRecords(FakeDriveService(on_list=on_list))
+        document = {"handoff_id": "t1-completed-exec-1-0", "task_id": "t1", "reason": "completed"}
+
+        results, errors = {}, []
+
+        def racer(key):
+            try:
+                results[key] = store.put("handoffs", "project-a", "t1-completed-exec-1-0", document)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=racer, args=(key,)) for key in ("a", "b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertEqual([], errors)
+        self.assertEqual(results["a"], results["b"])
+        parent = store.project_folder("handoffs", "project-a", create=False)
+        self.assertEqual(1, len(store.children(parent, filename_marker)))
+        self.assertEqual(document, store.get("handoffs", "project-a", "t1-completed-exec-1-0"))
 
 
 class PaginatedFakeDriveFiles:

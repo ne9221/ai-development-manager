@@ -201,7 +201,7 @@ class TerminalMonotonicityAndCleanupTruthTests(unittest.TestCase):
         """F. Persistence incomplete triggers retry; when completed, converges cleanly."""
         cmd = self._setup_terminal_state(terminal_status="interrupted", persistence="incomplete")
 
-        def succeed_retry(store, proj, task_id, exec_id):
+        def succeed_retry(store, proj, task_id, exec_id, *_args, **_kwargs):
             e = store.get("executions", proj, exec_id)
             e["cleanup_evidence"]["persistence"] = "complete"
             e["cleanup_evidence"]["persisted"] = ["execution", "handoff", "task"]

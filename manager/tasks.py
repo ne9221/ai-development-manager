@@ -168,6 +168,35 @@ class DriveRecords:
             raise TaskError(f"expected one Drive record {filename}; found {len(matches)}")
         return parent, filename, matches[0]
 
+    def _reconcile_created_record(self, parent, filename, created_id):
+        """Resolve a concurrent first-create race for the same (parent,
+        filename) JSON record -- Drive has no atomic create-if-absent for
+        regular files (unlike GCS's ifGenerationMatch), so two writers that
+        both observe the record missing (put()'s own children() check above)
+        can both call files.create() and leave two same-named physical
+        files. This is the exact scenario two concurrent watcher ticks hit
+        when manager.execution_lifecycle.retry_incomplete_terminal_
+        persistence() both derive and attempt to create the same
+        deterministic terminal Handoff. Same algorithm
+        _reconcile_created_folder() already uses for folders: re-read
+        siblings right after our own create; if we're still the only match,
+        done. If a concurrent writer raced us, every racer deterministically
+        picks the same canonical winner (earliest createdTime, id as
+        tiebreak) and whichever racer did not win deletes the duplicate file
+        it just created (safe -- it only ever touches the id it holds) and
+        adopts the winner's id, so no two visible authoritative records are
+        ever left behind."""
+        matches = [item for item in self.children(parent, filename) if item.get("mimeType") == MIME_JSON]
+        if len(matches) == 1:
+            return created_id
+        if not matches or created_id not in {item["id"] for item in matches}:
+            raise TaskError(f"Drive record vanished during creation: {filename}")
+        winner = min(matches, key=lambda item: (item.get("createdTime") or "", item["id"]))
+        if winner["id"] == created_id:
+            return created_id
+        self.files.delete(fileId=created_id).execute()
+        return winner["id"]
+
     def put(self, area, project_id, name, document):
         from googleapiclient.http import MediaIoBaseUpload
         parent = self.project_folder(area, project_id)
@@ -181,7 +210,8 @@ class DriveRecords:
             file_id = matches[0]["id"]
             self.files.update(fileId=file_id, body={"name": filename}, media_body=media, fields="id").execute()
         else:
-            file_id = self.files.create(body={"name": filename, "parents": [parent], "mimeType": MIME_JSON}, media_body=media, fields="id").execute()["id"]
+            created_id = self.files.create(body={"name": filename, "parents": [parent], "mimeType": MIME_JSON}, media_body=media, fields="id").execute()["id"]
+            file_id = self._reconcile_created_record(parent, filename, created_id)
         remote = self.files.get_media(fileId=file_id).execute()
         final = self.children(parent, filename)
         if remote != raw or len(final) != 1 or final[0]["id"] != file_id:

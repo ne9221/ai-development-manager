@@ -3435,7 +3435,7 @@ class RetryIncompleteTerminalPersistenceTests(CommandWatcherTests):
             "task_claim_release": "retained", "errors": ["persistence failed: terminal task persistence verification failed"],
         }
         self.store.put("executions", "p1", "command-cmd-1", execution)
-        result = retry_incomplete_terminal_persistence(self.store, "p1", "t1", "command-cmd-1")
+        result = retry_incomplete_terminal_persistence(self.store, "p1", "t1", "command-cmd-1", claim)
         self.assertTrue(result)
         refreshed = self.store.get("executions", "p1", "command-cmd-1")
         self.assertEqual("complete", refreshed["cleanup_evidence"]["persistence"])
@@ -3459,7 +3459,7 @@ class RetryIncompleteTerminalPersistenceTests(CommandWatcherTests):
         }
         self.store.put("executions", "p1", "command-cmd-1", execution)
         before = self.store.get("executions", "p1", "command-cmd-1")
-        result = retry_incomplete_terminal_persistence(self.store, "p1", "t1", "command-cmd-1")
+        result = retry_incomplete_terminal_persistence(self.store, "p1", "t1", "command-cmd-1", claim)
         self.assertTrue(result)
         after = self.store.get("executions", "p1", "command-cmd-1")
         self.assertEqual(before, after, "must not touch an already-complete execution")
@@ -3486,7 +3486,7 @@ class RetryIncompleteTerminalPersistenceTests(CommandWatcherTests):
 
         self.store.put = failing_put
         try:
-            result = retry_incomplete_terminal_persistence(self.store, "p1", "t1", "command-cmd-1")
+            result = retry_incomplete_terminal_persistence(self.store, "p1", "t1", "command-cmd-1", claim)
         finally:
             self.store.put = original_put
         self.assertFalse(result)
@@ -3497,7 +3497,7 @@ class RetryIncompleteTerminalPersistenceTests(CommandWatcherTests):
         from manager.execution_lifecycle import retry_incomplete_terminal_persistence
         active, claim, execution = self.running_command()
         self.assertEqual("running", execution["status"])
-        result = retry_incomplete_terminal_persistence(self.store, "p1", "t1", "command-cmd-1")
+        result = retry_incomplete_terminal_persistence(self.store, "p1", "t1", "command-cmd-1", claim)
         self.assertFalse(result)
 
 
