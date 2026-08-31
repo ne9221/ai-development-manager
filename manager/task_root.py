@@ -510,7 +510,27 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
         if document.get("project_id") != project_id or document.get("task_id") != task_id:
             raise TaskError("malformed task root record: identity does not match the claim key")
         if not _is_strengthened(document):
-            raise TaskError("terminal bind requires a strengthened task root; acquire_task_root must run first")
+            # R17 legacy recovery gate: this Execution is ALREADY terminal
+            # and we hold no live acquire_task_root() caller to migrate it
+            # first -- migrate it here, in the same single-CAS-decision
+            # style acquire_task_root uses (migrate-then-loop, never
+            # migration and bind on one write). A legacy claim for a
+            # DIFFERENT execution_id is a real conflict: something else
+            # physically holds it and this execution cannot prove it is
+            # the unique terminal proposal.
+            if document.get("execution_id") != execution_id:
+                raise TerminalProposalLost(
+                    f"task root's legacy claim is owned by execution {document.get('execution_id')}, not {execution_id}",
+                    winner=None)
+            migrated = _migrate_legacy_document(document, project_id, task_id, None)
+            migrated["authority_active"] = True
+            try:
+                registry.compare_and_swap(generation, migrated)
+            except RegistryConflict:
+                continue
+            except Exception as exc:
+                raise TaskError("task root backend unavailable during legacy migration") from exc
+            continue
         if document.get("execution_id") != execution_id:
             raise TerminalProposalLost(
                 f"task root's current epoch is owned by execution {document.get('execution_id')}, not {execution_id}",

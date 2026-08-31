@@ -495,7 +495,14 @@ def _retain_terminal_authority(store, execution, status, persisted, error):
     return audit
 
 
-def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_id):
+def _attention_note(claim_registry, project_id, task_id, execution_id, view, note):
+    try:
+        task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, view, "attention", note=note)
+    except TaskError:
+        pass
+
+
+def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_id, claim_registry=None, drive_file_id_factory=None):
     """Retry a terminal execution's incompletely-persisted handoff/task write.
 
     terminalize_execution() can raise after persisting 'execution' but before
@@ -520,6 +527,24 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
     functions of the unchanged execution/task state, so a retry either
     completes the missing piece or safely no-ops.
 
+    Strengthened Design A (Checkpoints B-E): when `claim_registry` (the
+    task's single GCS Task Root Object) is given, this is also the R17
+    legacy-recovery integration point. Before touching Drive at all, it
+    CAS-binds the execution's terminal proposal via
+    task_root.commit_terminal_bind() -- a losing execution
+    (TerminalProposalLost) never materializes anything and returns False,
+    with the conflict recorded as durable evidence on its own
+    cleanup_evidence.errors (its own terminal status/outcome is never
+    rewritten). A winning bind carries the fixed Handoff Drive ID (frozen
+    once, never regenerated) and the expected Task/Handoff projection
+    digests, and materialization progress is tracked per-view
+    (task/handoff) via task_root.advance_materialization_view -- a
+    permanently-failing view lands in "attention" (recoverable, not a
+    dead end) rather than blocking the other view or wiping out the
+    execution's own terminal truth. `claim_registry` is optional so any
+    caller not yet migrated keeps the pre-Design-A, Drive-only behavior
+    exactly as before.
+
     Returns True once persistence is (now) complete, False otherwise --
     on any failure, leaves the execution's cleanup_evidence exactly as it
     was, so the caller's existing attention/refusal path still applies
@@ -533,26 +558,78 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
     status = execution["status"]
     timestamp = execution.get("completed_at") or now_iso()
     summary = execution["notes"][-1] if execution.get("notes") else f"Execution {execution_id} {status}"
+
+    handoff_drive_file_id = None
+    bound_projection = None
+    if claim_registry is not None:
+        try:
+            task = store.get("tasks", project_id, task_id)
+            expected_handoff_preview = _terminal_handoff(execution, task, status, summary, timestamp)
+            expected_task_preview = _expected_terminal_task(task, execution_id, status, summary, timestamp)
+        except Exception:
+            return False
+        try:
+            bound_document, _generation = task_root.commit_terminal_bind(
+                claim_registry, project_id, task_id, execution,
+                task_drive_id_factory=drive_file_id_factory, handoff_drive_id_factory=drive_file_id_factory,
+                expected_task_projection=expected_task_preview, expected_handoff_projection=expected_handoff_preview)
+        except task_root.TerminalProposalLost as exc:
+            current = store.get("executions", project_id, execution_id)
+            note = f"terminal commit lost to execution {exc.winner.get('execution_id')}: fail closed, no materialization"
+            current["cleanup_evidence"] = merge_cleanup_evidence(current.get("cleanup_evidence"), {"errors": [note]})
+            try:
+                validate("execution", current)
+                store.put("executions", project_id, execution_id, current)
+            except Exception:
+                pass
+            return False
+        except (task_root.TerminalProposalConflict, TaskError):
+            return False
+        bind = bound_document["terminal"]
+        handoff_drive_file_id = bind.get("handoff_drive_file_id")
+        bound_projection = task_root.projection_of(bind)
+
     try:
         task = store.get("tasks", project_id, task_id)
         expected_handoff = _terminal_handoff(execution, task, status, summary, timestamp)
         handoff = _optional_record(store, "handoffs", project_id, expected_handoff["handoff_id"])
         if handoff is None:
-            create_handoff(store, expected_handoff)
+            create_handoff(store, expected_handoff, drive_file_id=handoff_drive_file_id)
             if store.get("handoffs", project_id, expected_handoff["handoff_id"]) != expected_handoff:
+                if claim_registry is not None:
+                    _attention_note(claim_registry, project_id, task_id, execution_id, "handoff", "handoff persistence verification failed")
                 return False
         elif handoff != expected_handoff:
+            if claim_registry is not None:
+                _attention_note(claim_registry, project_id, task_id, execution_id, "handoff", "deterministic handoff conflicts with persisted content")
             return False
+        if claim_registry is not None:
+            task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "handoff", "pending")
+            task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "handoff", "verified")
+
         expected_task = _expected_terminal_task(task, execution_id, status, summary, timestamp)
+        if bound_projection is not None:
+            expected_task = {**expected_task,
+                             "source_context": {**expected_task["source_context"], "terminal_commit_projection": bound_projection}}
+            validate("task", expected_task)
         if task != expected_task:
             store.put("tasks", project_id, task_id, expected_task)
             if store.get("tasks", project_id, task_id) != expected_task:
+                if claim_registry is not None:
+                    _attention_note(claim_registry, project_id, task_id, execution_id, "task", "task persistence verification failed")
                 return False
-    except Exception:
+        if claim_registry is not None:
+            task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "task", "pending")
+            task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "task", "verified")
+    except Exception as exc:
+        if claim_registry is not None:
+            _attention_note(claim_registry, project_id, task_id, execution_id, "task", str(exc)[:300])
         return False
-    updated_evidence = {**evidence, "persistence": "complete", "persisted": ["execution", "handoff", "task"], "errors": []}
+
+    updates = {"provider_outcome": status, "persistence": "complete",
+               "persisted": ["execution", "handoff", "task"], "errors": []}
     terminal = store.get("executions", project_id, execution_id)
-    terminal["cleanup_evidence"] = updated_evidence
+    terminal["cleanup_evidence"] = merge_cleanup_evidence(terminal.get("cleanup_evidence"), updates)
     try:
         validate("execution", terminal)
         store.put("executions", project_id, execution_id, terminal)
@@ -618,12 +695,14 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
         _retain_terminal_authority(store, execution, status, persisted, exc)
         raise
 
-    pre_cleanup = {
+    terminal = store.get("executions", project_id, execution_id)
+    existing_cleanup = terminal.get("cleanup_evidence")
+    pre_updates = {
         "provider_outcome": status, "persistence": "complete", "persisted": persisted,
-        "writer_release": "released" if (writer_authority_released or (execution.get("cleanup_evidence") or {}).get("writer_release") == "released") else ("retained" if execution.get("access") == "production_write" else "not_required"),
+        "writer_release": "released" if (writer_authority_released or (existing_cleanup or {}).get("writer_release") == "released") else ("retained" if execution.get("access") == "production_write" else "not_required"),
         "task_claim_release": "retained", "errors": [],
     }
-    terminal = store.get("executions", project_id, execution_id)
+    pre_cleanup = merge_cleanup_evidence(existing_cleanup, pre_updates)
     terminal["cleanup_evidence"] = pre_cleanup
     try:
         validate("execution", terminal)
@@ -631,17 +710,20 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
         if store.get("executions", project_id, execution_id) != terminal:
             raise TaskError("complete persistence audit verification failed")
     except Exception as exc:
-        pre_cleanup["errors"].append(f"complete persistence audit failed; authority retained: {exc}")
+        pre_cleanup = merge_cleanup_evidence(pre_cleanup, {"errors": [f"complete persistence audit failed; authority retained: {exc}"]})
         return {"execution": terminal, "cleanup": pre_cleanup, "idempotent": False}
 
     cleanup = cleanup_execution(writer_registry, claim_registry, terminal, claim_generation, lease_token, writer_authority_released=writer_authority_released)
-    audit = {**cleanup, "provider_outcome": status, "persistence": "complete", "persisted": persisted}
+    fresh = store.get("executions", project_id, execution_id)
+    audit = merge_cleanup_evidence(fresh.get("cleanup_evidence"),
+                                   {**cleanup, "provider_outcome": status, "persistence": "complete", "persisted": persisted})
     try:
-        terminal["cleanup_evidence"] = audit
-        validate("execution", terminal)
-        store.put("executions", project_id, execution_id, terminal)
-        if store.get("executions", project_id, execution_id) != terminal:
+        fresh["cleanup_evidence"] = audit
+        validate("execution", fresh)
+        store.put("executions", project_id, execution_id, fresh)
+        if store.get("executions", project_id, execution_id) != fresh:
             raise TaskError("cleanup audit persistence verification failed")
+        terminal = fresh
     except Exception as audit_exc:
         cleanup["errors"].append(f"cleanup audit persistence failed: {audit_exc}")
     return {"execution": terminal, "cleanup": cleanup, "idempotent": False}

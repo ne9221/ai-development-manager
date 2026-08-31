@@ -3391,7 +3391,14 @@ class TerminalPersistenceRetryTests(CommandWatcherTests):
         result = _reconcile_active(self.store, object(), active, lambda *_: claim)
         self.assertEqual("completed", result["status"])
         self.assertTrue(result.get("reconciled"))
-        self.assertIsNone(claim.document, "claim must be released once persistence genuinely completes")
+        # Strengthened Design A: once persistence genuinely completes, the
+        # terminal proposal is CAS-bound as this task's durable winner, so
+        # the runtime claim is released (authority_active=False) WITHOUT
+        # deleting the Task Root object -- that bind is exactly the
+        # durable terminal authority this architecture exists to keep.
+        self.assertIsNotNone(claim.document, "a genuine terminal bind must never be deleted")
+        self.assertFalse(claim.document["authority_active"], "claim must be released once persistence genuinely completes")
+        self.assertEqual("command-cmd-1", claim.document["terminal"]["execution_id"])
         task = self.store.get("tasks", "p1", "t1")
         self.assertEqual("completed", task["status"])
         execution = self.store.get("executions", "p1", "command-cmd-1")

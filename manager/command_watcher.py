@@ -310,6 +310,30 @@ def _terminal_cleanup_confirmed(execution):
             if execution.get("access") == "read_only" else writer_release == "released")
 
 
+def _terminal_command_needs_recovery(store, command):
+    """R17: a Command already marked completed/failed must not be trusted
+    on its own -- its linked Execution may still have durable cleanup work
+    outstanding (persistence incomplete, or the task claim not yet
+    released), exactly the case where the old unconditional fast-path skip
+    below left a Task blocked forever with no route back to convergence.
+    Narrower than _terminal_cleanup_confirmed (which additionally requires
+    provider_outcome/persisted/writer_release to all agree): a harmless
+    cleanup_evidence variation with its own dedicated recovery path must
+    not pull an otherwise fully-converged Command back into reconciliation
+    on every tick."""
+    execution_id = command.get("execution_id")
+    if not execution_id:
+        return False
+    try:
+        execution = store.get("executions", command["project_id"], execution_id)
+    except TaskError:
+        return False
+    if execution.get("status") not in ("completed", "failed", "interrupted"):
+        return False
+    evidence = execution.get("cleanup_evidence") or {}
+    return evidence.get("persistence") != "complete" or evidence.get("task_claim_release") != "released"
+
+
 def _attention(store, command, execution, reason):
     # Authority Fence: Check if the authoritative Command in Drive is already terminal.
     try:
@@ -573,7 +597,9 @@ def _reconcile_active(store, service, command, claim_factory):
     if execution["status"] in ("completed", "failed", "interrupted"):
         evidence = execution.get("cleanup_evidence") or {}
         if evidence.get("persistence") != "complete":
-            if retry_incomplete_terminal_persistence(store, command["project_id"], command["task_id"], command["execution_id"]):
+            drive_file_id_factory = getattr(store, "generate_record_file_id", None)
+            if retry_incomplete_terminal_persistence(store, command["project_id"], command["task_id"], command["execution_id"],
+                                                     claim_registry=claim_registry, drive_file_id_factory=drive_file_id_factory):
                 execution = store.get("executions", command["project_id"], command["execution_id"])
                 evidence = execution.get("cleanup_evidence") or {}
         try:
@@ -759,8 +785,21 @@ def _existing_terminal(store, command):
     if (task.get("status") != expected_task_status
             or (task.get("source_context") or {}).get("active_execution_id") != command["execution_id"]):
         return None
-    return _terminal(command, "completed" if execution["status"] == "completed" else "failed",
-                     _result(execution["status"], command["execution_id"], execution.get("session_id")))
+    # Monotonic confirmation, not a fresh derivation: this call site only
+    # ever CONFIRMS durable cleanup for a Command that may already be
+    # terminal (see process_command's completed/failed reconciliation gate
+    # above) -- it never re-classifies a real outcome. Preserve the
+    # Command's own already-recorded completed_at/error_kind rather than
+    # restamping now_iso()/None, or every reconciliation pass on an
+    # already-terminal Command would silently drift its timestamp and wipe
+    # its error classification.
+    existing_error_kind = (command.get("result") or {}).get("error_kind")
+    reconciled = _terminal(command, "completed" if execution["status"] == "completed" else "failed",
+                           _result(execution["status"], command["execution_id"], execution.get("session_id"),
+                                   error_kind=existing_error_kind))
+    if command.get("completed_at"):
+        reconciled["completed_at"] = command["completed_at"]
+    return reconciled
 
 
 def _run_claimed_command(store, service, claimed, launcher_factory, writer_factory,
@@ -927,6 +966,8 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     except TaskError:
         return {"status": "rejected"}
     if command["status"] in ("completed", "failed"):
+        if _terminal_command_needs_recovery(store, command):
+            return _reconcile_active(store, service, command, claim_factory)
         return {"status": command["status"], "skipped": True}
     if command["status"] in ("claimed", "running", "attention"):
         # Already-running authority is governed entirely by existing

@@ -292,7 +292,11 @@ class WriteGuardPrecisionTests(unittest.TestCase):
         stored = helper.store.get("commands", "p1", "cmd-1")
         self.assertEqual("completed", stored["status"])
         self.assertEqual("completed", stored["result"]["status"])
-        self.assertIsNone(claim.document, "cleanup convergence must also release the now-confirmed claim")
+        # Strengthened Design A: cleanup convergence releases the runtime
+        # claim (authority_active=False) but never deletes the Task Root
+        # object once a genuine terminal bind exists for it.
+        self.assertIsNotNone(claim.document, "a genuine terminal bind must never be deleted")
+        self.assertFalse(claim.document["authority_active"], "cleanup convergence must also release the now-confirmed claim")
 
     def test_case_d_recovery_reason_completion_is_not_blocked_by_write_guard(self):
         """A later attention() write that only refines/clears
