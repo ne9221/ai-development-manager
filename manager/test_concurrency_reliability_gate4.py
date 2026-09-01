@@ -82,10 +82,13 @@ class MemoryRegistry:
             self.generation += 1
 
     def cas(self, etag, updated_document):
+        return self.compare_and_swap(etag, updated_document)
+
+    def compare_and_swap(self, expected_generation, document):
         with self._lock:
-            if self.generation != etag:
+            if self.generation != expected_generation:
                 raise RegistryConflict('generation mismatch')
-            self.document = dict(updated_document)
+            self.document = dict(document)
             self.generation += 1
             return self.generation
 

@@ -39,7 +39,9 @@ class TerminalLifecycleTests(unittest.TestCase):
                 self.assertEqual(status, result["execution"]["status"])
                 self.assertEqual("released", result["cleanup"]["writer_release"])
                 self.assertEqual("released", result["cleanup"]["task_claim_release"])
-                self.assertIsNone(claim.document)
+                self.assertIsNotNone(claim.document)
+                self.assertFalse(claim.document["authority_active"])
+                self.assertEqual("released", claim.document["cleanup"]["status"])
                 task = store.get("tasks", "p1", "t1")
                 self.assertEqual("completed" if status == "completed" else "blocked", task["status"])
                 handoff = store.get("handoffs", "p1", f"t1-{status}-exec-a-0")
@@ -98,7 +100,7 @@ class TerminalLifecycleTests(unittest.TestCase):
         claim.document = None
         fresh = claim_task_execution(claim, "p1", "t1", "exec-b", "claude", "2026-08-13T00:03:00Z")
         before = dict(store.records)
-        with self.assertRaisesRegex(TaskError, "exact task claim"):
+        with self.assertRaisesRegex(TaskError, "does not hold the task claim"):
             terminalize_execution(store, object(), writer, claim, "p1", "t1", "exec-a", "codex", "failed", old_generation, True, gate["lease"]["lease_token"])
         self.assertEqual(before, store.records)
         self.assertEqual(fresh["generation"], claim.generation)
@@ -108,7 +110,9 @@ class TerminalLifecycleTests(unittest.TestCase):
             _, _, claim, _, result = self.terminal("interrupted", read_only=True)
         writer_release.assert_not_called()
         self.assertEqual("not_required", result["cleanup"]["writer_release"])
-        self.assertIsNone(claim.document)
+        self.assertIsNotNone(claim.document)
+        self.assertFalse(claim.document["authority_active"])
+        self.assertEqual("released", claim.document["cleanup"]["status"])
 
     def test_terminal_persistence_failure_retains_authority_and_retry_succeeds(self):
         store, writer, claim, gate = self.running(); store.fail_running = False
@@ -130,7 +134,9 @@ class TerminalLifecycleTests(unittest.TestCase):
         with patch("manager.executions.read_drive_status", return_value=quota_document()):
             retry = terminalize_execution(store, object(), writer, claim, "p1", "t1", "exec-a", "codex", "completed", gate["task_claim"]["generation"], True, gate["lease"]["lease_token"], completed_at="2026-08-13T00:02:00Z", summary="completed")
         self.assertEqual("completed", retry["execution"]["status"])
-        self.assertIsNone(claim.document)
+        self.assertIsNotNone(claim.document)
+        self.assertFalse(claim.document["authority_active"])
+        self.assertEqual("released", claim.document["cleanup"]["status"])
         self.assertEqual("complete", retry["execution"]["cleanup_evidence"]["persistence"])
 
     def test_handoff_failure_preserves_outcome_and_retry_completes(self):
@@ -147,7 +153,9 @@ class TerminalLifecycleTests(unittest.TestCase):
         self.assertFalse(retry["idempotent"])
         self.assertEqual(original_timestamp, retry["execution"]["completed_at"])
         self.assertEqual("completed", store.get("tasks", "p1", "t1")["status"])
-        self.assertIsNone(claim.document)
+        self.assertIsNotNone(claim.document)
+        self.assertFalse(claim.document["authority_active"])
+        self.assertEqual("released", claim.document["cleanup"]["status"])
 
     def test_task_failure_retry_does_not_duplicate_handoff(self):
         store, writer, claim, gate = self.running(); real_put = store.put

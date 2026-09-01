@@ -419,7 +419,10 @@ class CommandWatcherTests(unittest.TestCase):
         active, claim, _ = self.running_command(heartbeat_minutes=16, pid=99_999_999)
         with patch("manager.executions.read_drive_status", return_value=quota_document()):
             result = process_command(self.store, object(), active, claim_factory=lambda *_: claim)
-        self.assertEqual("failed", result["status"]); self.assertIsNone(claim.document)
+        self.assertEqual("failed", result["status"])
+        self.assertIsNotNone(claim.document)
+        self.assertFalse(claim.document["authority_active"])
+        self.assertEqual("released", claim.document["cleanup"]["status"])
         self.assertEqual("interrupted", self.store.get("executions", "p1", "command-cmd-1")["status"])
         self.assertEqual("failed", self.store.get("commands", "p1", "cmd-1")["status"])
         self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
@@ -456,7 +459,10 @@ class CommandWatcherTests(unittest.TestCase):
         active, claim, _ = self.running_command(heartbeat_minutes=16, pid=99_999_999, provider="claude")
         with patch("manager.executions.read_drive_status", return_value=quota_document()):
             result = process_command(self.store, object(), active, claim_factory=lambda *_: claim)
-        self.assertEqual("failed", result["status"]); self.assertIsNone(claim.document)
+        self.assertEqual("failed", result["status"])
+        self.assertIsNotNone(claim.document)
+        self.assertFalse(claim.document["authority_active"])
+        self.assertEqual("released", claim.document["cleanup"]["status"])
         execution = self.store.get("executions", "p1", "command-cmd-1")
         self.assertEqual("interrupted", execution["status"])
         self.assertEqual("claude", execution["provider"])

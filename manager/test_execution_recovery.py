@@ -25,6 +25,15 @@ class RecoveryTests(unittest.TestCase):
             terminalize_execution(store, object(), writer, claim, "p1", "t1", "exec-a", "codex", "completed",
                                   gate["task_claim"]["generation"], True,
                                   lease_token=gate["lease"]["lease_token"] if gate["lease"] else None)
+        # terminalize_execution's own terminal bind now correctly preserves
+        # the Task Root object (authority_active=False, cleanup=released)
+        # rather than deleting it -- it holds real terminal-commit authority
+        # that must never be erased. This helper's purpose is to construct a
+        # STALE legacy-shaped claim record left behind after termination for
+        # recover_task_claim() to detect and release, which is a genuinely
+        # different physical shape; clear the slate first.
+        claim.document = None
+        claim.generation = 0
         return store, claim_task_execution(claim, "p1", "t1", "exec-a", "codex", "2026-08-13T01:00:00Z"), claim
 
     def test_terminal_execution_stale_claim_releases_and_repeats_safely(self):

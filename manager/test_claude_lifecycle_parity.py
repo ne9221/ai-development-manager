@@ -15,6 +15,7 @@ from manager.execution_lifecycle import enter_running_gate, terminalize_executio
 from manager.execution_recovery import recover_task_claim
 from manager.executions import execution_health, finish_execution, heartbeat_execution, prepare_task_retry
 from manager.task_claims import check_task_execution_claim, claim_task_execution
+from manager.task_root import read_task_root_or_legacy_claim
 from manager.tasks import TaskError
 from manager.test_execution_lifecycle import build_store, quota_document
 from manager.test_task_claims import MemoryClaimRegistry
@@ -116,7 +117,15 @@ class ClaudeTerminalizationParityTests(unittest.TestCase):
         execution = store.get("executions", "p1", "exec-a")
         self.assertEqual("released", execution["cleanup_evidence"]["task_claim_release"])
         self.assertEqual("not_required", execution["cleanup_evidence"]["writer_release"])
-        self.assertIsNone(check_task_execution_claim(claim, "p1", "t1"))
+        # The strengthened Task Root object is preserved (not deleted) once
+        # it holds terminal-commit authority, but read_task_root_or_legacy_claim
+        # correctly reads a released, inactive Root as "no active claim" --
+        # the pre-Design-A legacy check_task_execution_claim() cannot parse
+        # its (correctly different) schema, so it is not the right function
+        # to assert claim-release with here anymore.
+        self.assertIsNone(read_task_root_or_legacy_claim(claim, "p1", "t1"))
+        self.assertFalse(claim.document["authority_active"])
+        self.assertEqual("released", claim.document["cleanup"]["status"])
 
     def test_cleanup_evidence_shows_writer_and_claim_released_for_production_write_claude_execution(self):
         store, claim, terminal = self.terminal_claim(status="completed", read_only=False)
@@ -128,6 +137,14 @@ class ClaudeTerminalizationParityTests(unittest.TestCase):
     # the inline cleanup_execution() path -- both entry points must agree.
     def test_recover_task_claim_releases_a_terminal_claude_claim(self):
         store, claim, terminal = self.terminal_claim(status="completed")
+        # terminalize_execution's own terminal bind now correctly preserves
+        # the Task Root object (authority_active=False, cleanup=released)
+        # instead of deleting it. This test's purpose is to construct a
+        # STALE legacy-shaped claim record left behind after termination
+        # for recover_task_claim() to detect and release -- a genuinely
+        # different physical shape, so clear the slate first.
+        claim.document = None
+        claim.generation = 0
         stale = claim_task_execution(claim, "p1", "t1", "exec-a", PROVIDER, "2026-08-13T01:00:00Z")
         result = recover_task_claim(store, claim, "p1", "t1")
         self.assertEqual("released", result["status"])

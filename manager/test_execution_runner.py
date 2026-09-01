@@ -249,7 +249,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("completed", result["terminal"]["execution"]["status"])
         self.assertEqual("released", result["terminal"]["cleanup"]["writer_release"])
         self.assertEqual("released", result["terminal"]["cleanup"]["task_claim_release"])
-        self.assertIsNone(claim.document)
+        self.assertIsNotNone(claim.document)
+        self.assertFalse(claim.document["authority_active"])
+        self.assertEqual("released", claim.document["cleanup"]["status"])
         self.assertEqual("released", next(iter(writer.document["locks"].values()))["status"])
 
     def test_terminalize_is_never_called_while_process_live(self):
@@ -283,11 +285,15 @@ class RunnerTests(unittest.TestCase):
     def test_read_only_and_production_authority_use_existing_cleanup(self):
         _, _, read_claim, _, read_result = self.execute(read_only=True)
         self.assertEqual("not_required", read_result["terminal"]["cleanup"]["writer_release"])
-        self.assertIsNone(read_claim.document)
+        self.assertIsNotNone(read_claim.document)
+        self.assertFalse(read_claim.document["authority_active"])
+        self.assertEqual("released", read_claim.document["cleanup"]["status"])
         _, writer, claim, _, write_result = self.execute()
         self.assertEqual("released", write_result["terminal"]["cleanup"]["writer_release"])
         self.assertEqual("released", write_result["terminal"]["cleanup"]["task_claim_release"])
-        self.assertIsNone(claim.document)
+        self.assertIsNotNone(claim.document)
+        self.assertFalse(claim.document["authority_active"])
+        self.assertEqual("released", claim.document["cleanup"]["status"])
         self.assertEqual("released", next(iter(writer.document["locks"].values()))["status"])
 
     def test_read_only_launch_is_explicitly_sandboxed_without_approval_prompts(self):

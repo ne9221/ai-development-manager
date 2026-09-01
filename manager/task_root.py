@@ -695,16 +695,40 @@ def release_runtime_claim(registry, project_id, task_id, execution_id, generatio
     (acquire_task_root() is solely responsible for migrating a task going
     forward; release never needs to and must not -- it has no
     legacy_migration_lookup to decide it correctly). A strengthened-but-
-    never-bound object (today, EVERY execution: commit_terminal_bind is
-    not yet wired into the live completion path -- that lands in a later
-    checkpoint) also has nothing durable to preserve and is physically
-    deleted -- via a plain generation-matched delete rather than routing
-    through task_claims' own legacy schema validator, since this
-    document's schema_version is intentionally not the legacy one -- so a
-    strengthened shape by itself never changes this call's observable
-    behavior for the common case. Only once a real bind exists does this
-    switch to a CAS update that marks authority inactive without ever
-    deleting the object -- see module docstring."""
+    never-bound object (a prelaunch rollback in enter_running_gate, before
+    any terminal proposal exists) also has nothing durable to preserve and
+    is physically deleted -- via a plain generation-matched delete rather
+    than routing through task_claims' own legacy schema validator, since
+    this document's schema_version is intentionally not the legacy one --
+    so a strengthened shape by itself never changes this call's observable
+    behavior for the common pre-terminal case. Only once a real bind
+    exists does this switch to a CAS update that marks authority inactive
+    without ever deleting the object -- see module docstring.
+
+    `generation` is an exact-match precondition ONLY for the no-bind
+    (delete) branch, where nothing else should legitimately have touched
+    the object since the caller's own read (matching the original
+    task_claims.py invariant exactly). Once a bind exists, this object's
+    generation legitimately keeps advancing from commit_terminal_bind()/
+    advance_materialization_view() CAS writes made by the SAME owning
+    execution without ownership ever changing hands (see P0-1's normal-path
+    bind-before-materialization wiring) -- exact-match would then reject a
+    perfectly legitimate release for no real reason. Ownership
+    (document.get("execution_id") == execution_id, checked above
+    regardless of branch) is what actually matters there; the CAS write
+    itself still always uses the freshly re-read generation as its own
+    precondition, so it remains fully race-safe either way.
+
+    P0-2 fix: for a terminal-bound Root, this ALSO advances the Root's own
+    `cleanup.status` facet to "released" in the SAME CAS write as
+    authority_active=False -- never leaving that decision to a separate
+    caller. Before this fix, only Execution.cleanup_evidence.task_claim_release
+    ever became "released" (via merge_cleanup_evidence elsewhere);
+    Root.cleanup.status silently stayed "retained" forever, which
+    permanently blocked acquire_task_root()'s next-epoch gate (it requires
+    cleanup.status == "released" before a bound epoch may be superseded).
+    The two cleanup truths must converge on the same release, not one
+    lagging the other indefinitely."""
     try:
         existing = registry.read_if_exists()
     except Exception as exc:
@@ -718,9 +742,13 @@ def release_runtime_claim(registry, project_id, task_id, execution_id, generatio
         return release_task_execution_claim(registry, project_id, task_id, execution_id, generation, claim_token=claim_token)
     if document.get("execution_id") != execution_id:
         return {"released": False, "reason": "claim is owned by a different execution/epoch"}
-    if current_generation != generation:
-        raise TaskClaimConflict("task root generation changed; refusing to release under a stale generation")
     if document.get("terminal") is None:
+        # No bind exists yet, so nothing else should have legitimately
+        # advanced this object's generation since the caller's own read --
+        # exact match is still a valid, desirable staleness guard here,
+        # identical to the pre-Design-A task_claims.py semantics.
+        if current_generation != generation:
+            raise TaskClaimConflict("task root generation changed; refusing to release under a stale generation")
         try:
             registry.delete_if_generation_matches(current_generation)
         except RegistryConflict as exc:
@@ -735,7 +763,9 @@ def release_runtime_claim(registry, project_id, task_id, execution_id, generatio
             raise TaskError("task root release outcome is ambiguous") from exc
         return {"released": True, "generation": current_generation}
     for _ in range(attempts):
-        new_document = {**document, "authority_active": False}
+        current_cleanup_status = (document.get("cleanup") or {}).get("status", "retained")
+        new_cleanup_status = "released" if _CLEANUP_RANK.get(current_cleanup_status, 0) < _CLEANUP_RANK["released"] else current_cleanup_status
+        new_document = {**document, "authority_active": False, "cleanup": {"status": new_cleanup_status}}
         _reject_bind_mutation(document, new_document)
         try:
             new_generation = registry.compare_and_swap(current_generation, new_document)

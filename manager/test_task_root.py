@@ -721,8 +721,16 @@ class R17RoundRoundAndFreshProcessRecoveryTests(unittest.TestCase):
         downgrading terminal truth, or touching the (absent) Task Root."""
         self._seed_terminal_execution()
         cmd = self._corrupt_to_r17_shape()
-        # No legacy claim document seeded at all -- registry starts empty.
-        self.assertIsNone(self.registry.document)
+        # Force genuine absence: under Strengthened Design A, the normal
+        # terminalize_execution() path above already bound (and then
+        # preserved-but-inactive-released) a real Task Root object, so the
+        # registry is not naturally empty here the way it was in the
+        # pre-Design-A world. Round 46's actual scenario -- a prior release
+        # actually landed and the Task Root object is genuinely gone, e.g.
+        # deleted out-of-band -- is reproduced explicitly rather than relying
+        # on _seed_terminal_execution() to never have created one.
+        self.registry.document = None
+        self.registry.generation = 0
 
         with patch("manager.command_watcher.process_identity_state", return_value="stopped"):
             outcome = process_command(self.store, None, cmd, claim_factory=lambda *_: self.registry)

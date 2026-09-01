@@ -332,7 +332,31 @@ def _verify_terminal_authority(store, writer_registry, claim_registry, project_i
     if any(execution.get(key) != value for key, value in identity.items()):
         raise TaskError("terminal callback identity does not match execution")
     claim = task_root.read_task_root_or_legacy_claim(claim_registry, project_id, task_id)
-    if not claim or claim.get("execution_id") != execution_id or claim.get("provider") != provider or claim.get("generation") != claim_generation:
+    if not claim or claim.get("execution_id") != execution_id or claim.get("provider") != provider:
+        raise TaskError("terminal callback does not hold the task claim")
+    if "epoch" in claim:
+        # Strengthened Task Root: the SAME object also carries the
+        # terminal-bind/materialization CAS state, so its generation
+        # legitimately advances from writes this exact terminalization
+        # call itself makes (commit_terminal_bind, advance_materialization_view)
+        # without ownership ever changing hands -- unlike the legacy
+        # claim object below, exact generation identity is no longer a
+        # valid ownership proof here. Ownership is what actually matters
+        # (execution_id/provider, already checked above) and
+        # authority_active must still be true. `claim_generation` is still
+        # a meaningful plausibility check in ONE direction: a caller can
+        # only ever have legitimately observed a generation <= the
+        # object's actual current one (their own earlier read, now
+        # possibly stale from this task's own subsequent writes) -- a
+        # HIGHER claimed generation is fabricated/impossible and must
+        # still fail closed before any Drive mutation.
+        if claim.get("authority_active") is not True:
+            raise TaskError("terminal callback's task root claim is no longer active")
+        current_generation = claim.get("generation")
+        if (not isinstance(current_generation, int) or not isinstance(claim_generation, int)
+                or claim_generation > current_generation):
+            raise TaskError("terminal callback claims a task root generation that does not yet exist")
+    elif claim.get("generation") != claim_generation:
         raise TaskError("terminal callback does not hold the exact task claim generation")
     cleanup = execution.get("cleanup_evidence") or {}
     if execution.get("access") == "production_write" and cleanup.get("writer_release") != "released":
@@ -450,6 +474,76 @@ def _optional_record(store, area, project_id, record_id):
         raise
 
 
+def _resolve_handoff_drive_id_factory(store, project_id, expected_handoff):
+    """P0-3 fix: resolve the Handoff's TRUE physical Drive file ID BEFORE
+    any terminal bind freezes one, shared by the normal terminalize_execution()
+    path and the R17 retry_incomplete_terminal_persistence() recovery path
+    -- both must apply the identical terminal-bind invariant.
+
+    Returns a zero-arg factory suitable for task_root.commit_terminal_bind()'s
+    handoff_drive_id_factory parameter:
+      Case A (no existing logical Handoff): returns store's own
+        generate_record_file_id (or None if the store doesn't support
+        fixed IDs at all) -- the bind generates and freezes a fresh ID.
+      Case B (an existing Handoff whose content already matches what the
+        proposal would produce): returns a factory that always returns
+        THAT Handoff's exact physical file_id -- the bind must freeze the
+        file that was actually verified, never an unused freshly-generated
+        one a logical-name lookup then silently gets skipped around.
+      Case C (an existing Handoff with CONFLICTING content): raises
+        TaskError immediately -- fail closed, never bind, never
+        materialize, never mark verified.
+    """
+    get_with_token = getattr(store, "get_with_token", None)
+    generate = getattr(store, "generate_record_file_id", None)
+    if get_with_token is None:
+        return generate
+    try:
+        existing, token = get_with_token("handoffs", project_id, expected_handoff["handoff_id"])
+    except Exception:
+        existing, token = None, None
+    if existing is not None:
+        if existing != expected_handoff:
+            raise TaskError("existing handoff conflicts with the terminal proposal's expected content; fail closed")
+        resolved_id = token["file_id"]
+        return lambda: resolved_id
+    return generate
+
+
+def _materialize_terminal_handoff(store, project_id, expected_handoff, handoff_drive_file_id):
+    """Create or verify the Handoff Drive projection, shared by the normal
+    and R17 recovery paths. P0-3 fix: never marks a bound
+    handoff_drive_file_id as matched without confirming the ACTUAL
+    physical file it names is the one whose content was just verified --
+    an existing logical Handoff with matching content is only accepted
+    when its real physical file_id equals the bound one (when one was
+    bound at all; a caller with no claim_registry has nothing to check
+    against). Raises TaskError (fail closed) on any mismatch."""
+    get_with_token = getattr(store, "get_with_token", None)
+    if get_with_token is None:
+        handoff = _optional_record(store, "handoffs", project_id, expected_handoff["handoff_id"])
+        if handoff is None:
+            create_handoff(store, expected_handoff, drive_file_id=handoff_drive_file_id)
+            if store.get("handoffs", project_id, expected_handoff["handoff_id"]) != expected_handoff:
+                raise TaskError("terminal handoff persistence verification failed")
+            return expected_handoff
+        if handoff != expected_handoff:
+            raise TaskError("deterministic terminal handoff conflicts with persisted content")
+        return handoff
+    try:
+        existing, token = get_with_token("handoffs", project_id, expected_handoff["handoff_id"])
+    except Exception:
+        existing, token = None, None
+    if existing is None:
+        create_handoff(store, expected_handoff, drive_file_id=handoff_drive_file_id)
+        existing, token = get_with_token("handoffs", project_id, expected_handoff["handoff_id"])
+    if existing != expected_handoff:
+        raise TaskError("deterministic terminal handoff conflicts with persisted content")
+    if handoff_drive_file_id is not None and token["file_id"] != handoff_drive_file_id:
+        raise TaskError("bound handoff_drive_file_id does not match the actual physical Handoff file; fail closed")
+    return existing
+
+
 def _expected_terminal_task(task, execution_id, status, summary, timestamp):
     if (task.get("source_context") or {}).get("active_execution_id") != execution_id:
         raise TaskError("task no longer identifies the terminal execution")
@@ -564,6 +658,8 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
     if claim_registry is not None:
         try:
             task = store.get("tasks", project_id, task_id)
+            handoff_id_preview = _terminal_handoff(execution, task, status, summary, timestamp)
+            handoff_drive_id_factory = _resolve_handoff_drive_id_factory(store, project_id, handoff_id_preview)
         except Exception:
             return False
         # First pass: establish/confirm the bind to learn its authority
@@ -571,11 +667,15 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
         # needed to stamp the Task's source_context BEFORE its projection
         # digest can be computed, since the digest must cover the exact
         # record that will actually be written (stamp included), never a
-        # pre-stamp preview.
+        # pre-stamp preview. handoff_drive_id_factory (P0-3 fix) resolves
+        # an existing compatible Handoff's REAL physical file_id first --
+        # the bind must freeze the file that will actually be verified,
+        # never an unused freshly-generated one a later logical-name
+        # lookup would silently skip around.
         try:
             bound_document, _generation = task_root.commit_terminal_bind(
                 claim_registry, project_id, task_id, execution,
-                task_drive_id_factory=drive_file_id_factory, handoff_drive_id_factory=drive_file_id_factory)
+                task_drive_id_factory=drive_file_id_factory, handoff_drive_id_factory=handoff_drive_id_factory)
         except task_root.TerminalProposalLost as exc:
             current = store.get("executions", project_id, execution_id)
             note = f"terminal commit lost to execution {exc.winner.get('execution_id')}: fail closed, no materialization"
@@ -614,16 +714,11 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
     try:
         task = store.get("tasks", project_id, task_id)
         expected_handoff = expected_handoff_final if claim_registry is not None else _terminal_handoff(execution, task, status, summary, timestamp)
-        handoff = _optional_record(store, "handoffs", project_id, expected_handoff["handoff_id"])
-        if handoff is None:
-            create_handoff(store, expected_handoff, drive_file_id=handoff_drive_file_id)
-            if store.get("handoffs", project_id, expected_handoff["handoff_id"]) != expected_handoff:
-                if claim_registry is not None:
-                    _attention_note(claim_registry, project_id, task_id, execution_id, "handoff", "handoff persistence verification failed")
-                return False
-        elif handoff != expected_handoff:
+        try:
+            _materialize_terminal_handoff(store, project_id, expected_handoff, handoff_drive_file_id)
+        except TaskError as exc:
             if claim_registry is not None:
-                _attention_note(claim_registry, project_id, task_id, execution_id, "handoff", "deterministic handoff conflicts with persisted content")
+                _attention_note(claim_registry, project_id, task_id, execution_id, "handoff", str(exc)[:300])
             return False
         if claim_registry is not None:
             task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "handoff", "pending")
@@ -694,21 +789,54 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
             terminal = persist_terminal(store, service, project_id, execution_id, status, timestamp, summary)
         persisted.append("execution")
         task = store.get("tasks", project_id, task_id)
+
+        # P0-1 fix: commit the terminal proposal as this epoch's GCS-bound
+        # winner BEFORE any Handoff/Task write -- Drive is only ever a
+        # projection of this bind, identically on this normal path and on
+        # the R17 retry_incomplete_terminal_persistence() recovery path.
+        # Without this, a stale writer racing after this normal path's own
+        # Drive writes had no GCS authority/digest to be rejected against
+        # (the Task Root's `terminal` stayed None until a LATER recovery
+        # pass happened to run) -- a plain Drive write, first or last,
+        # could become the only truth. _resolve_handoff_drive_id_factory
+        # applies the shared P0-3 fixed-Handoff-ID invariant: an existing
+        # compatible Handoff's real physical file is what gets frozen,
+        # never an unused freshly-generated ID a logical-name lookup would
+        # silently skip around.
+        handoff_drive_file_id = None
+        bound_projection = None
+        if claim_registry is not None:
+            handoff_id_preview = _terminal_handoff(terminal, task, status, summary, timestamp)
+            handoff_drive_id_factory = _resolve_handoff_drive_id_factory(store, project_id, handoff_id_preview)
+            try:
+                bound_document, _generation = task_root.commit_terminal_bind(
+                    claim_registry, project_id, task_id, terminal, handoff_drive_id_factory=handoff_drive_id_factory)
+            except task_root.TerminalProposalLost as exc:
+                raise TaskError(f"terminal commit lost to execution {exc.winner.get('execution_id')}: fail closed") from exc
+            except task_root.TerminalProposalConflict as exc:
+                raise TaskError(f"terminal proposal conflicts with already-bound truth: {exc.conflicts}") from exc
+            bind = bound_document["terminal"]
+            handoff_drive_file_id = bind.get("handoff_drive_file_id")
+            bound_projection = task_root.projection_of(bind)
+
         expected_handoff = _terminal_handoff(terminal, task, status, summary, timestamp)
-        handoff = _optional_record(store, "handoffs", project_id, expected_handoff["handoff_id"])
-        if handoff is None:
-            create_handoff(store, expected_handoff)
-            if store.get("handoffs", project_id, expected_handoff["handoff_id"]) != expected_handoff:
-                raise TaskError("terminal handoff persistence verification failed")
-        elif handoff != expected_handoff:
-            raise TaskError("deterministic terminal handoff conflicts with persisted content")
+        _materialize_terminal_handoff(store, project_id, expected_handoff, handoff_drive_file_id)
         persisted.append("handoff")
         expected_task = _expected_terminal_task(task, execution_id, status, summary, timestamp)
+        if bound_projection is not None:
+            expected_task = {**expected_task,
+                             "source_context": {**expected_task["source_context"], "terminal_commit_projection": bound_projection}}
+            validate("task", expected_task)
         if task != expected_task:
             store.put("tasks", project_id, task_id, expected_task)
             if store.get("tasks", project_id, task_id) != expected_task:
                 raise TaskError("terminal task persistence verification failed")
         persisted.append("task")
+        if claim_registry is not None:
+            task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "handoff", "pending")
+            task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "handoff", "verified")
+            task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "task", "pending")
+            task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "task", "verified")
     except Exception as exc:
         _retain_terminal_authority(store, execution, status, persisted, exc)
         raise
