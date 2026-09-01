@@ -986,21 +986,35 @@ def queued_command_pending_only_health(store, command, allowlist=frozenset(), bu
 def process_command(store, service, command, launcher_factory=None, writer_factory=GCSLockRegistry.from_environment,
                     claim_factory=task_claim_registry, allowlist=frozenset(), health_check=session_center_healthy,
                     quota_check=None, ingress_registry_factory=dispatch_request_registry, origin_context=None,
-                    async_launch=False):
+                    async_launch=False, terminal_recovery_prevalidation=None):
     """Claim/reconcile one command; a claimed command is never automatically relaunched.
 
     launcher_factory/quota_check are explicit-override escape hatches (tests
     use them directly); when not given, both resolve from PROVIDER_RUNTIMES
     by the command's own provider. An unrecognized provider is rejected here
     -- it never silently falls back to Codex's launcher or quota gate.
-    """
+
+    `terminal_recovery_prevalidation`, if given, must be a
+    _TerminalRecoveryPrevalidation from _terminal_recovery_candidates()'s
+    own bounded, short-timeout classification lookup for THIS exact
+    command this tick (see poll_once()'s Phase 2c) -- blocker-1 fix
+    (third residual-P0-A review): reusing it here means the terminal
+    eligibility check happens exactly once per attempt, never twice (the
+    prior round's classification_store lookup plus a second, unbudgeted
+    lookup against the long-timeout primary `store` right here). Every
+    identity field is still re-validated against the CURRENT command
+    (_prevalidation_matches) before being trusted at all; any mismatch, or
+    any caller passing anything other than a genuine
+    _TerminalRecoveryPrevalidation, falls straight back to the normal,
+    full eligibility check below -- there is no bare boolean/truthy bypass
+    of the eligibility gate."""
     require_runtime_guard()
     try:
         validate("command", command)
     except TaskError:
         return {"status": "rejected"}
     if command["status"] in ("completed", "failed"):
-        if _terminal_command_needs_recovery(store, command):
+        if _prevalidation_matches(terminal_recovery_prevalidation, command) or _terminal_command_needs_recovery(store, command):
             return _reconcile_active(store, service, command, claim_factory)
         return {"status": command["status"], "skipped": True}
     if command["status"] in ("claimed", "running", "attention"):
@@ -1616,6 +1630,61 @@ def _prioritized_nonterminal_commands(commands):
 TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS = 10
 
 
+class _TerminalRecoveryPrevalidation:
+    """Internal-only proof that _terminal_recovery_candidates() already
+    performed exactly one bounded, short-timeout eligibility lookup for
+    this exact terminal Command this tick -- constructed ONLY inside that
+    function, for a genuinely eligible candidate, never by a plain
+    boolean/truthy value an arbitrary caller could pass to skip
+    process_command()'s eligibility gate on their own say-so (see
+    _prevalidation_matches() below, which process_command() uses to
+    re-validate every identity field against the CURRENT command before
+    trusting this at all).
+
+    Blocker-1 fix (third residual-P0-A review): without this, a candidate
+    _terminal_recovery_candidates() already paid one bounded classification_
+    store lookup to validate got a SECOND, entirely separate, unbudgeted
+    lookup against the shared ~45s-timeout primary `store` the instant
+    process_command() ran its own independent eligibility gate --
+    defeating both TERMINAL_LOOKUP_ATTEMPT_BUDGET_ENFORCED (the budget
+    only ever counted the first lookup) and the whole point of
+    classification_store's short timeout (the second lookup used the
+    primary store's long one). Threading this object from classification
+    through to process_command() means the SAME lookup's result is reused,
+    never re-derived -- "eligibility classification" happens exactly once
+    per attempt; any further reads process_command()'s existing recovery
+    path (_reconcile_active(), retry_incomplete_terminal_persistence())
+    performs afterward are ordinary idempotent RECOVERY reads, not a
+    second classification decision, and are unaffected by this."""
+    __slots__ = ("project_id", "command_id", "execution_id", "status")
+
+    def __init__(self, project_id, command_id, execution_id, status):
+        self.project_id = project_id
+        self.command_id = command_id
+        self.execution_id = execution_id
+        self.status = status
+
+
+def _prevalidation_matches(prevalidation, command):
+    """Fail-closed identity check: a prevalidation object is only ever
+    trusted when EVERY identity field it recorded still matches the
+    CURRENT command exactly. Anything else -- wrong type (so a stray
+    True/False/None a careless caller passed is silently ignored, never
+    crashes), a mismatched project_id/command_id/execution_id, or a
+    status that has somehow changed since classification -- returns False,
+    which sends process_command() back through its own normal, full
+    _terminal_command_needs_recovery() eligibility check exactly as if no
+    prevalidation had ever been offered. This is the only path by which a
+    prevalidation can ever grant anything: there is no bare boolean bypass
+    a caller could substitute for real classification."""
+    if not isinstance(prevalidation, _TerminalRecoveryPrevalidation):
+        return False
+    return (prevalidation.project_id == command.get("project_id")
+            and prevalidation.command_id == command.get("command_id")
+            and prevalidation.execution_id == command.get("execution_id")
+            and prevalidation.status == command.get("status"))
+
+
 def _terminal_recovery_candidates(commands, store, deadline, lookup_budget):
     """The SECOND, deliberately later, GLOBAL pass -- run only once EVERY
     project's nonterminal work for this tick has already had its turn (see
@@ -1679,7 +1748,15 @@ def _terminal_recovery_candidates(commands, store, deadline, lookup_budget):
     construction every kept record already shares the same "no explicit
     priority tier" default rank in _COMMAND_PRIORITY, and this pass never
     runs until every higher-priority record has already had its turn, so
-    no additional sort is meaningful here."""
+    no additional sort is meaningful here.
+
+    Blocker-1 fix: returns `(command, prevalidation)` pairs, not bare
+    commands -- `prevalidation` is a _TerminalRecoveryPrevalidation caller
+    must thread through to process_command() (see its
+    `terminal_recovery_prevalidation` parameter) so the ONE bounded,
+    short-timeout lookup already performed here is reused rather than
+    process_command() re-deriving the same answer with a second, entirely
+    unbudgeted lookup against the primary store."""
     candidates = []
     if lookup_budget <= 0:
         return candidates, lookup_budget
@@ -1701,7 +1778,10 @@ def _terminal_recovery_candidates(commands, store, deadline, lookup_budget):
             # still consumed above regardless of this outcome.
             eligible = False
         if eligible:
-            candidates.append(command)
+            prevalidation = _TerminalRecoveryPrevalidation(
+                project_id=command.get("project_id"), command_id=command.get("command_id"),
+                execution_id=command.get("execution_id"), status=command.get("status"))
+            candidates.append((command, prevalidation))
     return candidates, lookup_budget
 
 
@@ -1871,19 +1951,17 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     # already paid to fetch.
     processed = set()
     hydrated_commands_by_project = {}
-    projects_with_batches = []
 
     def _remember_batch(project_id, commands):
         bucket = hydrated_commands_by_project.setdefault(project_id, {})
-        if project_id not in projects_with_batches:
-            projects_with_batches.append(project_id)
         for c in commands:
             bucket[c["command_id"]] = c
 
-    def _run(project_id, command):
+    def _run(project_id, command, prevalidation=None):
         try:
             results.append(process_command(store, service, command, allowlist=allowlist,
-                                           origin_context=origin_context, async_launch=async_launch, **factories))
+                                           origin_context=origin_context, async_launch=async_launch,
+                                           terminal_recovery_prevalidation=prevalidation, **factories))
         except Exception as exc:
             # One command's processing must never take the rest of this
             # project's queue -- or any later-rotated project's -- down
@@ -1972,6 +2050,22 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     # backlog in a later-rotated project is never permanently starved by
     # an earlier one always consuming the whole budget first.
     #
+    # Blocker-2 fix (third residual-P0-A review): this iterates
+    # `project_ids` itself -- the SAME canonical rotated order the whole
+    # rest of this tick already used -- not the order projects happened to
+    # be inserted into `hydrated_commands_by_project`. Before this fix,
+    # that dict's insertion order followed whichever sweep call HAPPENED
+    # to succeed first for each project: if project p1's recent sweep
+    # raised TaskError (transient failure) but its full sweep succeeded
+    # later, while p2's recent sweep succeeded immediately, p2 would be
+    # inserted first regardless of p1 being the tick's true first-rotated
+    # project -- letting a project with a merely flaky recent sweep lose
+    # terminal-recovery priority to a later-rotated one indefinitely, even
+    # though `project_ids` itself correctly still rotates p1 first.
+    # `hydrated_commands_by_project.get(project_id)` is None/empty for any
+    # rotated project neither sweep reached or hydrated anything for this
+    # tick -- skipped, never re-enumerated.
+    #
     # `classification_store`, if given, is what actually bounds a single
     # lookup's own worst-case duration to something far shorter than the
     # whole poll budget (TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS, via a
@@ -1982,13 +2076,16 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     # yet updated to pass it.
     if len(results) < MAX_COMMANDS_PER_POLL and time.monotonic() < deadline:
         lookup_budget = MAX_COMMANDS_PER_POLL - len(results)
-        for project_id in projects_with_batches:
+        for project_id in project_ids:
             if lookup_budget <= 0 or len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= deadline:
                 break
-            commands = list(hydrated_commands_by_project[project_id].values())
+            bucket = hydrated_commands_by_project.get(project_id)
+            if not bucket:
+                continue
+            commands = list(bucket.values())
             candidates, lookup_budget = _terminal_recovery_candidates(
                 commands, classification_store, deadline, lookup_budget)
-            for command in candidates:
+            for command, prevalidation in candidates:
                 if (project_id, command["command_id"]) in just_promoted:
                     continue
                 if (project_id, command["command_id"]) in processed:
@@ -1997,7 +2094,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
                     break
                 if time.monotonic() >= deadline:
                     return results
-                _run(project_id, command)
+                _run(project_id, command, prevalidation=prevalidation)
     return results
 
 

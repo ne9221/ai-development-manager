@@ -18,6 +18,7 @@ from manager.command_watcher import (
     REQUIRED_TASK_POLICIES, _provider_state, _enumerate_waiting_quota_tasks, _promote_waiting_quota_task,
     _reconcile_active,
     _prioritized_nonterminal_commands, _terminal_recovery_candidates, _terminal_command_needs_recovery,
+    _TerminalRecoveryPrevalidation, _enumerate_recent_commands, _enumerate_commands,
     TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS,
     claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist,
     poll_once, process_command, provider_quota_reliable, resolve_provider_runtime, _spawn_claimed_worker,
@@ -2366,7 +2367,7 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
 
         with patch("manager.command_watcher.time.monotonic", side_effect=fake_monotonic):
             candidates, remaining = _terminal_recovery_candidates([cmd1, cmd2], self.store, deadline, lookup_budget=10)
-        self.assertEqual(["cmd-1"], [c["command_id"] for c in candidates])
+        self.assertEqual(["cmd-1"], [c["command_id"] for c, _prevalidation in candidates])
         self.assertEqual(9, remaining)
 
     # 7: lookup_budget (derived from MAX_COMMANDS_PER_POLL) strictly bounds
@@ -2433,7 +2434,7 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
         broken = command(command_id="cmd-broken", status="completed", execution_id="exec-does-not-exist")
         healthy, _claim = self._terminal_command_with_execution("completed", "partial", command_id="cmd-healthy", execution_id="exec-healthy")
         candidates, remaining = _terminal_recovery_candidates([broken, healthy], self.store, time.monotonic() + 1000.0, lookup_budget=10)
-        self.assertEqual(["cmd-healthy"], [c["command_id"] for c in candidates])
+        self.assertEqual(["cmd-healthy"], [c["command_id"] for c, _prevalidation in candidates])
         self.assertEqual(8, remaining)
 
     # 5/G: a generic (non-TaskError) transport-shaped exception from one
@@ -2453,7 +2454,7 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
                 return self.real.get(area, project_id, name)
 
         candidates, remaining = _terminal_recovery_candidates([broken, healthy], FlakyStore(self.store), time.monotonic() + 1000.0, lookup_budget=10)
-        self.assertEqual(["cmd-healthy"], [c["command_id"] for c in candidates])
+        self.assertEqual(["cmd-healthy"], [c["command_id"] for c, _prevalidation in candidates])
         self.assertEqual(8, remaining)
 
     def test_generic_transport_exception_does_not_abort_the_whole_tick(self):
@@ -2490,6 +2491,234 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
             results = poll_once(self.store, object(), allowlist=self.ALLOWLIST, deadline=time.monotonic() + 50.0,
                                 claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True)
         self.assertLessEqual(len(results), MAX_COMMANDS_PER_POLL)
+
+    # ================= Blocker 1: eligibility lookup exactly once =================
+
+    # 1/2/3: lookup_budget=1, one eligible terminal record -- the real
+    # Execution eligibility lookup must happen EXACTLY ONCE for the whole
+    # tick (the classification_store lookup), never a second time once the
+    # candidate reaches process_command(). Also confirms classification_
+    # store (not the primary store) is what performed it.
+    def test_eligibility_lookup_happens_exactly_once_per_attempt(self):
+        cmd, claim = self._terminal_command_with_execution("completed", "partial")
+        classification_store = Mock(wraps=self.store)
+        real_needs_recovery = _terminal_command_needs_recovery
+        calls = []
+
+        def tracking_needs_recovery(used_store, command_arg):
+            calls.append((used_store, command_arg["command_id"]))
+            return real_needs_recovery(used_store, command_arg)
+
+        with patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking_needs_recovery):
+            results = poll_once(self.store, object(), allowlist=self.ALLOWLIST, deadline=time.monotonic() + 50.0,
+                                classification_store=classification_store,
+                                claim_factory=lambda *_: claim, health_check=lambda: True, quota_check=lambda service: True)
+        self.assertEqual(1, len(calls), f"eligibility must be checked exactly once per attempt; calls were {calls}")
+        self.assertIs(classification_store, calls[0][0],
+                      "the one eligibility lookup must use classification_store, not the primary store")
+        self.assertEqual("cmd-1", calls[0][1])
+        self.assertTrue(results[0].get("reconciled"))
+
+    # 4: a prevalidated context whose identity no longer matches the
+    # CURRENT command must fail closed -- no recovery, no provider launch.
+    def test_prevalidation_identity_mismatch_fails_closed(self):
+        cmd, _claim = self._terminal_command_with_execution("completed", "complete", task_claim_release="released")
+        # A prevalidation object built for a DIFFERENT execution_id than
+        # this (fully-converged, genuinely non-eligible) command's real
+        # one -- simulating either a forged/stale context or a command
+        # that changed shape between classification and processing.
+        forged = _TerminalRecoveryPrevalidation(
+            project_id="p1", command_id="cmd-1", execution_id="exec-does-not-match", status="completed")
+        launcher = Mock()
+        with patch("manager.command_watcher.launch_task", launcher):
+            result = process_command(self.store, object(), cmd, claim_factory=lambda *_: object(),
+                                     terminal_recovery_prevalidation=forged)
+        launcher.assert_not_called()
+        self.assertEqual({"status": "completed", "skipped": True}, result)
+
+    def test_prevalidation_wrong_type_is_silently_ignored_not_trusted(self):
+        # A plain True/False/None (or any non-_TerminalRecoveryPrevalidation
+        # value) must never bypass the eligibility gate -- there is no bare
+        # boolean shortcut a careless or malicious caller could substitute.
+        cmd, _claim = self._terminal_command_with_execution("completed", "complete", task_claim_release="released")
+        launcher = Mock()
+        with patch("manager.command_watcher.launch_task", launcher):
+            result = process_command(self.store, object(), cmd, claim_factory=lambda *_: object(),
+                                     terminal_recovery_prevalidation=True)
+        launcher.assert_not_called()
+        self.assertEqual({"status": "completed", "skipped": True}, result)
+
+    # 5: a normal, direct process_command() caller with no prevalidated
+    # context must still use the original, safe, full eligibility check --
+    # unaffected by the new prevalidation path existing at all.
+    def test_direct_process_command_without_prevalidation_uses_normal_eligibility(self):
+        cmd, claim = self._terminal_command_with_execution("completed", "partial")
+        result = process_command(self.store, object(), cmd, claim_factory=lambda *_: claim)
+        self.assertTrue(result.get("reconciled"))
+        execution = self.store.get("executions", "p1", "command-cmd-1")
+        self.assertEqual("complete", execution["cleanup_evidence"]["persistence"])
+
+    def test_valid_prevalidation_still_reaches_reconciliation(self):
+        # A genuine, correctly-identity-matched prevalidation from
+        # _terminal_recovery_candidates() itself (not hand-forged) must
+        # still let process_command() reach _reconcile_active() -- the
+        # fix must not accidentally make prevalidation always fail closed.
+        cmd, claim = self._terminal_command_with_execution("completed", "partial")
+        candidates, _remaining = _terminal_recovery_candidates([cmd], self.store, time.monotonic() + 1000.0, lookup_budget=1)
+        self.assertEqual(1, len(candidates))
+        real_command, prevalidation = candidates[0]
+        result = process_command(self.store, object(), real_command, claim_factory=lambda *_: claim,
+                                 terminal_recovery_prevalidation=prevalidation)
+        self.assertTrue(result.get("reconciled"))
+
+    # ================= Blocker 2: canonical rotated project order =================
+
+    def _rig_sweep_success(self, recent_fails_for=(), full_fails_for=()):
+        """Patch _enumerate_recent_commands/_enumerate_commands so specific
+        projects' RECENT and/or FULL sweep raise TaskError (simulating a
+        transient hydration failure) while others succeed normally --
+        needed to reproduce blocker-2's exact shape: a project's terminal-
+        recovery priority must track its position in the canonical rotated
+        `project_ids`, never whichever sweep happened to hydrate it first."""
+        real_recent = _enumerate_recent_commands
+        real_full = _enumerate_commands
+
+        def fake_recent(store, project_id, deadline=None):
+            if project_id in recent_fails_for:
+                raise TaskError("simulated transient recent-sweep failure")
+            # The real _enumerate_recent_commands, for a store with no
+            # list_records_bounded (this test double), falls back to
+            # calling _enumerate_commands directly -- which would resolve
+            # to whatever `_enumerate_commands` is CURRENTLY patched to
+            # (fake_full below), making recent_fails_for/full_fails_for
+            # impossible to vary independently. Call the captured ORIGINAL
+            # full-sweep function directly instead, so a project whose
+            # recent sweep should succeed genuinely does, regardless of
+            # what full_fails_for says for it.
+            if not hasattr(store, "list_records_bounded"):
+                return real_full(store, project_id, deadline=deadline)
+            return real_recent(store, project_id, deadline=deadline)
+
+        def fake_full(store, project_id, deadline=None):
+            if project_id in full_fails_for:
+                raise TaskError("simulated transient full-sweep failure")
+            return real_full(store, project_id, deadline=deadline)
+
+        return patch("manager.command_watcher._enumerate_recent_commands", side_effect=fake_recent), \
+            patch("manager.command_watcher._enumerate_commands", side_effect=fake_full)
+
+    # 7: project_ids=[p1, p2] (natural/default rotation) -- p1's recent
+    # sweep fails, p2's recent sweep succeeds, p1's full sweep succeeds.
+    # The first terminal classification MUST still be p1's, because p1 is
+    # first in the canonical rotated order -- not p2's, even though p2
+    # was the first project whose batch actually landed in the cache.
+    def test_terminal_priority_follows_rotated_order_not_hydration_success_order(self):
+        self._add_project("p2")
+        allowlist = frozenset({("p1", "t1"), ("p2", "t1")})
+        self._bare_terminal_command("cmd-term-a", "exec-term-a", "partial", project_id="p1")
+        self._bare_terminal_command("cmd-term-b", "exec-term-b", "partial", project_id="p2")
+
+        order = []
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def tracking_needs_recovery(store, cmd):
+            order.append(cmd["project_id"])
+            return real_needs_recovery(store, cmd)
+
+        recent_patch, full_patch = self._rig_sweep_success(recent_fails_for={"p1"})
+        cursor_path = tempfile.mktemp(suffix=".json")
+        with recent_patch, full_patch, \
+             patch("manager.command_watcher.MAX_COMMANDS_PER_POLL", 1), \
+             patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking_needs_recovery):
+            poll_once(self.store, object(), allowlist=allowlist, deadline=time.monotonic() + 50.0,
+                     claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True,
+                     cursor_path=cursor_path)
+        self.assertTrue(order)
+        self.assertEqual("p1", order[0],
+                        f"canonical rotated order must decide terminal priority, not hydration success order; examined {order}")
+
+    # 8: reverse rotation -- project_ids=[p2, p1] -- first terminal
+    # classification must be p2's.
+    def test_terminal_priority_follows_reversed_rotated_order(self):
+        self._add_project("p2")
+        allowlist = frozenset({("p1", "t1"), ("p2", "t1")})
+        self._bare_terminal_command("cmd-term-a", "exec-term-a", "partial", project_id="p1")
+        self._bare_terminal_command("cmd-term-b", "exec-term-b", "partial", project_id="p2")
+
+        order = []
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def tracking_needs_recovery(store, cmd):
+            order.append(cmd["project_id"])
+            return real_needs_recovery(store, cmd)
+
+        # Rotation starts at p2 by seeding the durable cursor's
+        # project_cursor to point at index 1 ("p2", since list_projects()
+        # returns them alphabetically p1, p2) before the tick runs.
+        from manager.phase1_cursor import save_phase1_cursor
+        cursor_path = tempfile.mktemp(suffix=".json")
+        save_phase1_cursor({"project_cursor": 1, "per_project_record_cursor": {}, "generation": 0}, cursor_path=cursor_path)
+
+        recent_patch, full_patch = self._rig_sweep_success(recent_fails_for={"p2"})
+        with recent_patch, full_patch, \
+             patch("manager.command_watcher.MAX_COMMANDS_PER_POLL", 1), \
+             patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking_needs_recovery):
+            poll_once(self.store, object(), allowlist=allowlist, deadline=time.monotonic() + 50.0,
+                     claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True,
+                     cursor_path=cursor_path)
+        self.assertTrue(order)
+        self.assertEqual("p2", order[0],
+                        f"reversed rotation must classify p2's backlog first; examined {order}")
+
+    # 9: the same terminal Command appearing in BOTH the recent sweep's
+    # batch and the full sweep's batch for the same project must only be
+    # classified ONCE (deduplicated by command_id), never twice.
+    def test_same_command_in_both_sweeps_classified_only_once(self):
+        cmd, claim = self._terminal_command_with_execution("completed", "partial")
+        order = []
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def tracking_needs_recovery(store, cmd_arg):
+            order.append(cmd_arg["command_id"])
+            return real_needs_recovery(store, cmd_arg)
+
+        with patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking_needs_recovery):
+            poll_once(self.store, object(), allowlist=self.ALLOWLIST, deadline=time.monotonic() + 50.0,
+                     claim_factory=lambda *_: claim, health_check=lambda: True, quota_check=lambda service: True)
+        self.assertEqual(["cmd-1"], order)
+
+    # 10: whichever sweep (recent vs full) actually succeeds first for a
+    # given project must not change canonical Phase 2c project order --
+    # re-proven with p1's FULL sweep (not just recent) also failing, so
+    # p1's batch is hydrated ONLY by its recent sweep this time, while p2
+    # is hydrated by both -- p1 still wins terminal priority because it is
+    # first in rotation, regardless of which of ITS OWN sweeps supplied
+    # the batch.
+    def test_terminal_priority_unaffected_by_which_sweep_supplied_the_batch(self):
+        self._add_project("p2")
+        allowlist = frozenset({("p1", "t1"), ("p2", "t1")})
+        self._bare_terminal_command("cmd-term-a", "exec-term-a", "partial", project_id="p1")
+        self._bare_terminal_command("cmd-term-b", "exec-term-b", "partial", project_id="p2")
+
+        order = []
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def tracking_needs_recovery(store, cmd):
+            order.append(cmd["project_id"])
+            return real_needs_recovery(store, cmd)
+
+        # p1's FULL sweep fails this time (its recent sweep is what
+        # actually hydrates its batch); p2 hydrates normally via both.
+        recent_patch, full_patch = self._rig_sweep_success(full_fails_for={"p1"})
+        cursor_path = tempfile.mktemp(suffix=".json")
+        with recent_patch, full_patch, \
+             patch("manager.command_watcher.MAX_COMMANDS_PER_POLL", 1), \
+             patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking_needs_recovery):
+            poll_once(self.store, object(), allowlist=allowlist, deadline=time.monotonic() + 50.0,
+                     claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True,
+                     cursor_path=cursor_path)
+        self.assertTrue(order)
+        self.assertEqual("p1", order[0], f"which sweep supplied the batch must not affect project order; examined {order}")
 
     # Real end-to-end poll_once() reaches reconciliation for an R17-shaped
     # record, never launches a provider, and only performs cleanup/
