@@ -564,15 +564,18 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
     if claim_registry is not None:
         try:
             task = store.get("tasks", project_id, task_id)
-            expected_handoff_preview = _terminal_handoff(execution, task, status, summary, timestamp)
-            expected_task_preview = _expected_terminal_task(task, execution_id, status, summary, timestamp)
         except Exception:
             return False
+        # First pass: establish/confirm the bind to learn its authority
+        # tuple (execution_id, epoch, proposal_hash) and fixed Drive IDs --
+        # needed to stamp the Task's source_context BEFORE its projection
+        # digest can be computed, since the digest must cover the exact
+        # record that will actually be written (stamp included), never a
+        # pre-stamp preview.
         try:
             bound_document, _generation = task_root.commit_terminal_bind(
                 claim_registry, project_id, task_id, execution,
-                task_drive_id_factory=drive_file_id_factory, handoff_drive_id_factory=drive_file_id_factory,
-                expected_task_projection=expected_task_preview, expected_handoff_projection=expected_handoff_preview)
+                task_drive_id_factory=drive_file_id_factory, handoff_drive_id_factory=drive_file_id_factory)
         except task_root.TerminalProposalLost as exc:
             current = store.get("executions", project_id, execution_id)
             note = f"terminal commit lost to execution {exc.winner.get('execution_id')}: fail closed, no materialization"
@@ -589,9 +592,28 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
         handoff_drive_file_id = bind.get("handoff_drive_file_id")
         bound_projection = task_root.projection_of(bind)
 
+        try:
+            expected_handoff_final = _terminal_handoff(execution, task, status, summary, timestamp)
+            expected_task_final = _expected_terminal_task(task, execution_id, status, summary, timestamp)
+            expected_task_final = {**expected_task_final,
+                                   "source_context": {**expected_task_final["source_context"], "terminal_commit_projection": bound_projection}}
+            validate("task", expected_task_final)
+        except Exception:
+            return False
+        # Second pass: null-fill the expected digests over the FINAL,
+        # correctly-stamped payloads. Immutable once bound -- idempotent
+        # and safe to call again; a concurrent winner change here would
+        # still raise TerminalProposalLost/Conflict exactly as above.
+        try:
+            task_root.commit_terminal_bind(
+                claim_registry, project_id, task_id, execution,
+                expected_task_projection=expected_task_final, expected_handoff_projection=expected_handoff_final)
+        except (task_root.TerminalProposalLost, task_root.TerminalProposalConflict, TaskError):
+            return False
+
     try:
         task = store.get("tasks", project_id, task_id)
-        expected_handoff = _terminal_handoff(execution, task, status, summary, timestamp)
+        expected_handoff = expected_handoff_final if claim_registry is not None else _terminal_handoff(execution, task, status, summary, timestamp)
         handoff = _optional_record(store, "handoffs", project_id, expected_handoff["handoff_id"])
         if handoff is None:
             create_handoff(store, expected_handoff, drive_file_id=handoff_drive_file_id)
@@ -607,11 +629,7 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
             task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "handoff", "pending")
             task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "handoff", "verified")
 
-        expected_task = _expected_terminal_task(task, execution_id, status, summary, timestamp)
-        if bound_projection is not None:
-            expected_task = {**expected_task,
-                             "source_context": {**expected_task["source_context"], "terminal_commit_projection": bound_projection}}
-            validate("task", expected_task)
+        expected_task = expected_task_final if claim_registry is not None else _expected_terminal_task(task, execution_id, status, summary, timestamp)
         if task != expected_task:
             store.put("tasks", project_id, task_id, expected_task)
             if store.get("tasks", project_id, task_id) != expected_task:

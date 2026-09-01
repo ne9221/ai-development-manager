@@ -834,6 +834,25 @@ class R17RoundRoundAndFreshProcessRecoveryTests(unittest.TestCase):
         self.assertIsNone(repaired["blocked_reason"])
         self.assertNotEqual("corrupted by a straggling old writer", repaired["current_progress"])
 
+    def test_real_recovered_bind_validates_trusted_through_dashboard_reader(self):
+        """Bridges the R17 recovery flow to Gap 1's reader integration: the
+        REAL Task Root document + Task record produced by a genuine
+        process_command() recovery pass validate as fully trusted through
+        manager.dashboard_core.dashboard_terminal_state -- not just a
+        hand-constructed fixture."""
+        from manager.dashboard_core import dashboard_terminal_state
+
+        self._seed_terminal_execution()
+        cmd = self._corrupt_to_r17_shape()
+        self._seed_legacy_claim_document()
+        with patch("manager.command_watcher.process_identity_state", return_value="stopped"):
+            process_command(self.store, None, cmd, claim_factory=lambda *_: self.registry)
+
+        task_doc = self.store.get("tasks", "p1", "t1")
+        execution_doc = self.store.get("executions", "p1", self.execution_id)
+        state = dashboard_terminal_state(task_doc, execution_doc, self.registry.document)
+        self.assertEqual("completed", state)
+
 
 if __name__ == "__main__":
     unittest.main()

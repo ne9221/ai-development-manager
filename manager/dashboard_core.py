@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Union
 
+from manager import task_root
 from manager.quota_forecast import (
     AccountQuotaForecast,
     ActionRecommendation,
@@ -162,6 +163,66 @@ def determine_execution_state(execution: dict, now: datetime) -> str:
         return "running"
 
     return status
+
+
+# Strengthened Design A terminal truth reader. A Task never migrated to it
+# (task_root_document is None) sees zero behavior change: is_cleanup_confirmed()
+# above stays the sole authority, exactly as before this integration.
+TERMINAL_TRUTH_TRUSTED = "trusted_terminal"
+TERMINAL_TRUTH_STALE = "stale_projection"
+TERMINAL_TRUTH_MISSING = "missing_projection"
+TERMINAL_TRUTH_UNVERIFIED = "unverified"
+
+
+def resolve_terminal_truth(task: dict, execution: dict, task_root_document: Optional[dict] = None) -> str:
+    """The GCS-authority-aware terminal truth for one Task/Execution pair --
+    the single reader-side check every dashboard/current-truth consumer of
+    a strengthened Task must run before trusting Drive's own status fields.
+
+    `task_root_document` is the task's GCS Task Root object (or None for a
+    task never migrated to Strengthened Design A -- falls back to the
+    plain pre-Design-A Execution.cleanup_evidence check unchanged).
+
+    Never lets Drive alone declare terminal truth once a GCS terminal bind
+    exists: the Task's own stamped `terminal_commit_projection` (written by
+    execution_lifecycle.retry_incomplete_terminal_persistence at
+    materialization time) must name the SAME winning authority tuple
+    (execution_id, epoch, proposal_hash) the bind holds, and the Task
+    record's own recomputed digest must match the bind's expected digest --
+    catching both a stale/older execution's leftover projection AND a
+    same-winner projection a stale writer overwrote with different content.
+    """
+    bind = (task_root_document or {}).get("terminal") if task_root_document else None
+    if bind is None:
+        return TERMINAL_TRUTH_TRUSTED if is_cleanup_confirmed(execution) else TERMINAL_TRUTH_UNVERIFIED
+    drive_projection = (task.get("source_context") or {}).get("terminal_commit_projection")
+    if not isinstance(drive_projection, dict):
+        return TERMINAL_TRUTH_MISSING
+    if not task_root.verify_projection_matches_commit(bind, drive_projection):
+        return TERMINAL_TRUTH_STALE
+    if not task_root.verify_projection_digest(bind, "task", task):
+        return TERMINAL_TRUTH_STALE
+    return TERMINAL_TRUTH_TRUSTED
+
+
+def dashboard_terminal_state(task: dict, execution: dict, task_root_document: Optional[dict] = None,
+                             now: Optional[datetime] = None) -> str:
+    """Truthful dashboard state for one Task/Execution pair, incorporating
+    GCS terminal authority when the task has one. Never regresses to
+    "running"/"waiting"/any live state once a GCS terminal winner exists --
+    at worst this surfaces a terminal-committed-but-not-yet-materialized
+    state, never a fabricated in-progress one, and never a silent claim of
+    full completion Drive alone cannot back up.
+    """
+    now = now or datetime.now(timezone.utc)
+    truth = resolve_terminal_truth(task, execution, task_root_document)
+    if truth in (TERMINAL_TRUTH_STALE, TERMINAL_TRUTH_MISSING) and task_root_document is not None:
+        materialization = task_root_document.get("materialization") or {}
+        task_view_status = (materialization.get("task") or {}).get("status", "absent")
+        if task_view_status == "attention":
+            return "terminal_committed_materialization_attention"
+        return "terminal_committed_materialization_incomplete"
+    return determine_execution_state(execution, now)
 
 
 def is_execution_stale(execution: dict, now: datetime) -> bool:
