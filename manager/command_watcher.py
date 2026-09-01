@@ -255,49 +255,45 @@ def _write(store, command):
 
 
 def _on_execution_running(store, running_command):
-    # AUTO_OPEN_ADM (P0 Dashboard Live Proof follow-up, 2026-08-29): every
-    # real dispatch that actually reaches "running" -- not just an explicit
-    # OPEN_EXISTING_ADM_UI command (see the dedicated branch above in
-    # process_command) -- should bring the user-visible Dashboard onto the
-    # interactive desktop, so the user never has to know a task was even
-    # dispatched to go look at it. Reuses the exact same
-    # focus_existing_adm_ui() idempotent focus-or-launch-or-noop logic, so
-    # this can never spawn a duplicate Streamlit instance or duplicate
-    # browser window regardless of how many Commands reach "running" in the
-    # same tick or across ticks. This Scheduled Task only ever runs
-    # interactively-logged-on (LogonType=Interactive), the same desktop
-    # session the user's own Dashboard shortcut launches into, so this call
-    # is always attempted -- it fails closed (a truthful error_kind,
-    # swallowed here) rather than raising only when no interactive desktop
-    # is actually available (e.g. a locked/disconnected session).
-    #
-    # Deliberately best-effort and never allowed to affect dispatch: this
-    # runs after the execution has already, genuinely reached "running"
-    # (on_running fires only once launch_task's own provider-start proof
-    # succeeds), and any failure here is only ever logged, never raised --
-    # a user who can't currently see their screen must never be the reason
-    # a real dispatch fails.
+    # AUTO_OPEN_ADM moved to the queued -> claimed transition in
+    # process_command (see _focus_adm_ui_best_effort there): opening at
+    # claim time is strictly earlier user visibility, covers launches that
+    # die during prelaunch and never reach this callback at all (live
+    # incident 20260901), and firing it in exactly one lifecycle stage
+    # guarantees a single focus event per Command -- claim-then-running
+    # double focus would re-steal the foreground from whatever the user
+    # switched to during prelaunch.
     _write(store, running_command)
-    _focus_adm_ui_best_effort("running")
 
 
 def _focus_adm_ui_best_effort(stage):
-    """Best-effort, never-raising focus-or-open of the ADM Dashboard.
+    """Best-effort, detached, never-raising open/focus of the ADM Dashboard.
 
-    focus_existing_adm_ui() is idempotent (focus-or-launch-or-noop), so
-    calling it from more than one lifecycle stage can never spawn a
-    duplicate Streamlit instance or browser window. Each stage fires at
-    most once per Command (claim happens once; on_running fires once), so
-    repeated watcher ticks never re-steal focus. Any failure -- including
-    no interactive desktop (locked/disconnected session) -- is only ever
-    logged: user visibility must never affect dispatch or terminal truth.
+    Runs manager.open_existing_adm_ui in a detached helper process instead
+    of calling focus_existing_adm_ui() inline: the helper owns the full
+    focus-or-launch-or-noop logic AND its cost (dashboard cold start plus
+    window discovery can poll for ~30s worst-case), so a watcher tick's
+    claim path is never blocked by desktop work and can never overrun the
+    scheduled cadence because of it. The helper inherits this Scheduled
+    Task's interactive logon session, so Win32 focus works exactly as it
+    did inline; with no interactive desktop it fails closed inside the
+    helper. Fired from exactly one lifecycle stage (the queued -> claimed
+    transition, once per Command), so repeated ticks and later stages never
+    re-steal focus, and focus_existing_adm_ui()'s own single-instance logic
+    still guarantees no duplicate Dashboard/browser. Any spawn failure is
+    only ever logged: user visibility must never affect dispatch or
+    terminal truth.
     """
     try:
-        result = focus_existing_adm_ui()
-        if result.get("status") != "completed":
-            print(f"AUTO_OPEN_ADM[{stage}]: {result.get('error_kind', 'unknown')}", file=sys.stderr)
+        flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        kwargs = {"cwd": os.getcwd(), "stdin": subprocess.DEVNULL,
+                  "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+        if os.name == "nt":
+            kwargs["creationflags"] = flags
+        subprocess.Popen([sys.executable, "-m", "manager.open_existing_adm_ui"], **kwargs)
     except Exception as exc:
-        print(f"AUTO_OPEN_ADM[{stage}]: unexpected error: {exc}", file=sys.stderr)
+        print(f"AUTO_OPEN_ADM[{stage}]: helper spawn failed: {exc}", file=sys.stderr)
 
 
 def _claimed(command):
@@ -737,8 +733,27 @@ def _reconcile_active(store, service, command, claim_factory, launch_failure_obs
         # prelaunch: once it expires with the Execution still reserved, the
         # cancel below runs and the Command converges to a terminal
         # "failed" -- never an unbounded wait.
-        if not launch_failure_observed and not _claim_expired(command):
-            return {"status": command["status"], "skipped": True, "reason": "prelaunch_in_flight"}
+        if not launch_failure_observed:
+            if not _claim_expired(command):
+                return {"status": command["status"], "skipped": True, "reason": "prelaunch_in_flight"}
+            # Claim expiry alone is a schedule bound, not proof the worker is
+            # gone: a live recorded worker delayed past CLAIM_TIMEOUT_SECONDS
+            # (degraded Drive/GCS mid-prelaunch) must still never have its
+            # reservation cancelled underneath it -- the same liveness fence
+            # _release_orphan_pre_execution_claim already applies to the
+            # missing-execution shape. Only a worker proven stopped/replaced
+            # (or a legacy record that never carried worker identity at all,
+            # where the pre-existing cancel is the only route to
+            # convergence) may fall through to the cancel below; live or
+            # unknown state surfaces as attention and reconverges on a later
+            # tick once the process is provably gone.
+            observed_worker_pid = command.get("worker_pid")
+            if observed_worker_pid is not None:
+                worker_state = process_identity_state(observed_worker_pid, command.get("worker_creation_identity"))
+                if worker_state == "live":
+                    return _attention(store, command, execution, "reserved_execution_worker_still_live")
+                if worker_state not in ("stopped", "replaced"):
+                    return _attention(store, command, execution, "reserved_execution_worker_state_unknown")
         try:
             cancelled = cancel_reserved_execution(
                 store, claim_registry, command["project_id"], command["execution_id"],
@@ -1163,6 +1178,15 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     origin = command_origin(origin_context)
     claimed = {**_claimed(command), "process_provenance": origin}
     _write(store, claimed)
+    # AUTO_OPEN_ADM at claim time, for both the async and inline launch
+    # paths: the user should see the Dashboard as soon as a real dispatch
+    # enters execution (queued -> claimed), not only after prelaunch
+    # (minutes of Drive/GCS latency) finally reaches "running" -- and a
+    # launch that dies during prelaunch never reaches on_running at all
+    # (live incident 20260901: no window ever appeared). This is the ONLY
+    # lifecycle stage that fires it, and this transition happens exactly
+    # once per Command; subsequent ticks reconcile and never re-enter it.
+    _focus_adm_ui_best_effort("claimed")
     if async_launch:
         try:
             worker_pid = _spawn_claimed_worker(claimed)
@@ -1176,15 +1200,6 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
             }
             validate("command", claimed_with_worker)
             _write(store, claimed_with_worker)
-            # AUTO_OPEN_ADM at claim time: the user should see the Dashboard
-            # as soon as a real dispatch enters execution (claimed + worker
-            # spawned), not only after the worker's prelaunch (minutes of
-            # Drive/GCS latency) finally reaches "running" -- and a launch
-            # that dies during prelaunch never reaches on_running at all
-            # (live incident 20260901: no window ever appeared). This branch
-            # runs exactly once per Command (the queued -> claimed
-            # transition); subsequent ticks reconcile and never re-enter it.
-            _focus_adm_ui_best_effort("claimed")
             return {"status": "claimed", "execution_id": claimed["execution_id"], "worker_pid": worker_pid}
         except Exception as exc:
             kind = getattr(exc, "classification", None) or type(exc).__name__

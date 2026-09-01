@@ -1,6 +1,7 @@
 """Focus or open the ADM Dashboard without creating duplicate services."""
 
 import ctypes
+import json
 import os
 import socket
 import subprocess
@@ -203,3 +204,19 @@ def focus_existing_adm_ui(api=None):
         return {"status": "failed", "error_kind": "dashboard_start_timeout"}
     except Exception:
         return {"status": "failed", "error_kind": "desktop_unavailable"}
+
+
+def main(argv=None):
+    """Detached-helper entry point (see command_watcher._focus_adm_ui_best_
+    effort): runs the full focus-or-launch-or-noop logic in its own process
+    so the watcher's claim path never blocks on desktop work. Best-effort
+    by contract -- the result is printed for observability and the exit
+    code is always 0, because no auto-open outcome may ever look like a
+    dispatch failure to anything supervising this process."""
+    del argv
+    print(json.dumps(focus_existing_adm_ui()))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

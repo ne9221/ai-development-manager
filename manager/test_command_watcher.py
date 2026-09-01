@@ -24,7 +24,7 @@ from manager.command_watcher import (
     WATCHER_DISCOVERY_TIMEOUT_SECONDS,
     claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist,
     poll_once, process_command, provider_quota_reliable, resolve_provider_runtime, _spawn_claimed_worker,
-    terminal_recovery_once,
+    terminal_recovery_once, _focus_adm_ui_best_effort,
 )
 from manager.execution_lifecycle import enter_running_gate
 from manager.executions import cancel_reserved_execution, execution_health, heartbeat_execution, reserve_execution
@@ -81,13 +81,24 @@ class Store:
 _focus_existing_adm_ui_patch = patch("manager.command_watcher.focus_existing_adm_ui",
                                      Mock(return_value={"status": "completed", "window_title": "ADM Unified Operations Dashboard"}))
 
+# _focus_adm_ui_best_effort() now spawns a real DETACHED helper process
+# (python -m manager.open_existing_adm_ui) at every queued -> claimed
+# transition -- without this module-wide default patch, every test that
+# claims a command would launch a real process poking this machine's real
+# desktop. Tests that exercise the auto-open wiring itself patch locally on
+# top (shadowing this one); the direct unit tests of the real function call
+# the module-import-time binding, which this attribute patch does not touch.
+_focus_adm_ui_best_effort_patch = patch("manager.command_watcher._focus_adm_ui_best_effort", Mock())
+
 
 def setUpModule():
     _focus_existing_adm_ui_patch.start()
+    _focus_adm_ui_best_effort_patch.start()
 
 
 def tearDownModule():
     _focus_existing_adm_ui_patch.stop()
+    _focus_adm_ui_best_effort_patch.stop()
 
 
 def command(**changes):
@@ -554,6 +565,41 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
         self.assertEqual("prelaunch_failed", self.store.get("commands", "p1", "cmd-1")["result"]["error_kind"])
 
+    def test_expired_claim_with_live_recorded_worker_is_never_cancelled(self):
+        # Codex adversarial finding (delta round): claim expiry alone is a
+        # schedule bound, not proof the worker is gone. A recorded worker
+        # that is still LIVE past CLAIM_TIMEOUT_SECONDS (degraded Drive/GCS
+        # mid-prelaunch) must surface as attention -- never have its
+        # reservation cancelled underneath it, which is the original
+        # incident class merely postponed.
+        reserve_execution(self.store, "p1", "t1", "command-cmd-1", "codex", {"decision": "fresh"})
+        expired_at = self.iso(datetime.now(timezone.utc) - timedelta(seconds=CLAIM_TIMEOUT_SECONDS + 60))
+        live_pid = os.getpid()
+        stale = command(status="claimed", execution_id="command-cmd-1", claimed_at=expired_at,
+                        worker_pid=live_pid,
+                        worker_creation_identity=process_creation_identity(live_pid) or "test-process:missing",
+                        worker_spawned_at=expired_at)
+        self.store.put("commands", "p1", "cmd-1", stale)
+        result = process_command(self.store, object(), stale, claim_factory=lambda *_: MemoryClaimRegistry())
+        self.assertEqual("attention", result["status"])
+        self.assertEqual("reserved_execution_worker_still_live", result["recovery_reason"])
+        self.assertEqual("reserved", self.store.get("executions", "p1", "command-cmd-1")["status"])
+
+    def test_expired_claim_with_proven_dead_worker_cancels_and_converges(self):
+        # The bounded-convergence counterpart: once the recorded worker is
+        # provably stopped, the expired reservation cancels and the Command
+        # reaches a real terminal state.
+        reserve_execution(self.store, "p1", "t1", "command-cmd-1", "codex", {"decision": "fresh"})
+        expired_at = self.iso(datetime.now(timezone.utc) - timedelta(seconds=CLAIM_TIMEOUT_SECONDS + 60))
+        stale = command(status="claimed", execution_id="command-cmd-1", claimed_at=expired_at,
+                        worker_pid=99_999_999, worker_creation_identity="windows-filetime:1",
+                        worker_spawned_at=expired_at)
+        self.store.put("commands", "p1", "cmd-1", stale)
+        result = process_command(self.store, object(), stale, claim_factory=lambda *_: MemoryClaimRegistry())
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("cancelled", self.store.get("executions", "p1", "command-cmd-1")["status"])
+        self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+
     def test_cancelled_prelaunch_converges_to_failed_despite_foreign_repo_lock_owner(self):
         # The incident's non-convergence half, end to end: cancelled
         # execution + repo lock slot owned by ANOTHER task (status already
@@ -631,35 +677,51 @@ class CommandWatcherTests(unittest.TestCase):
         runner.assert_called_once()
         self.assertEqual("completed", result["status"])
 
-    def test_normal_dispatch_reaching_running_auto_opens_the_dashboard(self):
+    def test_normal_dispatch_auto_opens_exactly_once_across_claim_to_running(self):
         """AUTO_OPEN_ADM: a completely ordinary dispatch (no
-        OPEN_EXISTING_ADM_UI action at all) that genuinely reaches
-        "running" must, as a side effect, call the same user-visible
-        focus-or-launch-or-noop path -- so the Dashboard shows up on the
-        user's desktop for ANY real dispatch, not only one that explicitly
-        asked to open it."""
-        focus = Mock(return_value={"status": "completed", "window_title": "ADM Unified Operations Dashboard"})
+        OPEN_EXISTING_ADM_UI action at all) must bring the Dashboard up for
+        the user -- and exactly ONCE, at the queued -> claimed transition.
+        The full inline claim -> on_running -> terminal lifecycle runs here
+        and must not fire a second focus at the running stage (a
+        claim-then-running double focus would re-steal the foreground from
+        whatever the user switched to during prelaunch)."""
+        auto_open = Mock()
         runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])
-        with patch("manager.command_watcher.launch_task", runner), patch("manager.command_watcher.focus_existing_adm_ui", focus):
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher._focus_adm_ui_best_effort", auto_open):
             result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
-        focus.assert_called_once_with()
+        auto_open.assert_called_once_with("claimed")
         self.assertEqual("completed", result["status"])
 
-    def test_auto_open_dashboard_failure_never_blocks_or_fails_dispatch(self):
-        """A real dispatch's success must never depend on whether the
-        interactive desktop happened to be visible/available -- a failed or
-        raising focus_existing_adm_ui() is only ever logged (see
-        _on_execution_running), never allowed to change the Command/Task's
-        own terminal outcome."""
-        for focus in (
-            Mock(return_value={"status": "failed", "error_kind": "no_interactive_desktop"}),
-            Mock(side_effect=RuntimeError("unexpected desktop error")),
-        ):
-            with self.subTest(focus=focus):
-                runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])
-                with patch("manager.command_watcher.launch_task", runner), patch("manager.command_watcher.focus_existing_adm_ui", focus):
-                    result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
-                self.assertEqual("completed", result["status"])
+    def test_auto_open_helper_spawn_is_detached_and_failure_never_blocks_dispatch(self):
+        """The claim-time auto-open must (1) run as a DETACHED helper
+        process -- python -m manager.open_existing_adm_ui -- so the watcher
+        tick never blocks on dashboard cold start / window discovery, and
+        (2) swallow any spawn failure: a dispatch's outcome must never
+        depend on whether the interactive desktop was reachable. Calls the
+        REAL _focus_adm_ui_best_effort (module-import-time binding, not the
+        module-wide safety mock)."""
+        spawned = Mock()
+        with patch("manager.command_watcher.subprocess.Popen", spawned):
+            _focus_adm_ui_best_effort("claimed")
+        spawned.assert_called_once()
+        argv = spawned.call_args.args[0]
+        self.assertEqual(["-m", "manager.open_existing_adm_ui"], argv[1:])
+        if os.name == "nt":
+            flags = spawned.call_args.kwargs["creationflags"]
+            self.assertTrue(flags & __import__("subprocess").DETACHED_PROCESS)
+        # Spawn failure is logged, never raised -- and a real dispatch
+        # running with the REAL (unpatched-at-callsite) helper whose spawn
+        # fails still completes normally.
+        with patch("manager.command_watcher.subprocess.Popen", Mock(side_effect=OSError("no desktop"))):
+            _focus_adm_ui_best_effort("claimed")  # must not raise
+        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])
+        real_helper = _focus_adm_ui_best_effort
+        with patch("manager.command_watcher.launch_task", runner), \
+             patch("manager.command_watcher._focus_adm_ui_best_effort", real_helper), \
+             patch("manager.command_watcher.subprocess.Popen", Mock(side_effect=OSError("no desktop"))):
+            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
+        self.assertEqual("completed", result["status"])
 
     def test_open_existing_adm_ui_is_governed_and_does_not_launch_codex(self):
         focus = Mock(return_value={"status": "completed", "window_title": "ADM Unified Operations Dashboard"})
@@ -1799,38 +1861,41 @@ class AsyncClaimContinuationTests(unittest.TestCase):
 
     def test_async_claim_opens_adm_ui_once_and_repeated_tick_never_refocuses(self):
         # AUTO_OPEN_ADM at claim time: a real dispatch entering execution
-        # (claimed + worker spawned) must bring the Dashboard onto the
-        # interactive desktop immediately -- not only after prelaunch
-        # (minutes of Drive/GCS latency) reaches "running", which a launch
-        # dying mid-prelaunch never does (live incident 20260901: no window
-        # ever appeared). Exactly once per Command: the queued -> claimed
+        # (queued -> claimed) must bring the Dashboard onto the interactive
+        # desktop immediately -- not only after prelaunch (minutes of
+        # Drive/GCS latency) reaches "running", which a launch dying
+        # mid-prelaunch never does (live incident 20260901: no window ever
+        # appeared). Exactly once per Command: the queued -> claimed
         # transition happens once, and reconcile ticks never re-enter it.
-        focus = Mock(return_value={"status": "completed", "window_title": "ADM Unified Operations Dashboard"})
+        auto_open = Mock()
         with patch("manager.command_watcher._spawn_claimed_worker", return_value=4242), \
-             patch("manager.command_watcher.focus_existing_adm_ui", focus):
+             patch("manager.command_watcher._focus_adm_ui_best_effort", auto_open):
             result = process_command(
                 self.store, object(), command(), claim_factory=CommandWatcherTests.claim_factory,
                 allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True,
                 async_launch=True,
             )
         self.assertEqual("claimed", result["status"])
-        focus.assert_called_once_with()
+        auto_open.assert_called_once_with("claimed")
         stored = self.store.get("commands", "p1", "cmd-1")
-        refocus = Mock(return_value={"status": "completed", "window_title": "ADM Unified Operations Dashboard"})
-        with patch("manager.command_watcher.focus_existing_adm_ui", refocus):
+        reopen = Mock()
+        with patch("manager.command_watcher._focus_adm_ui_best_effort", reopen):
             repeat = process_command(self.store, object(), stored,
                                      claim_factory=CommandWatcherTests.claim_factory)
         self.assertEqual("claimed", repeat["status"])
         self.assertTrue(repeat.get("skipped"))
-        refocus.assert_not_called()
+        reopen.assert_not_called()
 
-    def test_async_claim_auto_open_failure_never_blocks_the_dispatch(self):
-        # User visibility is best-effort observability only: a raising or
-        # failing focus call must never affect the claim, the spawned
-        # worker's authority, or the persisted Command.
-        focus = Mock(side_effect=RuntimeError("no desktop"))
+    def test_async_claim_auto_open_spawn_failure_never_blocks_the_dispatch(self):
+        # User visibility is best-effort observability only: the REAL
+        # helper (its detached Popen failing) must never affect the claim,
+        # the spawned worker's authority, or the persisted Command. The
+        # worker spawn itself is mocked, so the failing Popen here is only
+        # ever the auto-open helper's.
+        real_helper = _focus_adm_ui_best_effort
         with patch("manager.command_watcher._spawn_claimed_worker", return_value=4242), \
-             patch("manager.command_watcher.focus_existing_adm_ui", focus):
+             patch("manager.command_watcher._focus_adm_ui_best_effort", real_helper), \
+             patch("manager.command_watcher.subprocess.Popen", Mock(side_effect=OSError("no desktop"))):
             result = process_command(
                 self.store, object(), command(), claim_factory=CommandWatcherTests.claim_factory,
                 allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True,

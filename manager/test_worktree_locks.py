@@ -211,6 +211,25 @@ class WorktreeLockTests(unittest.TestCase):
         self.assertEqual("clean", outcome["status"])
         self.assertEqual(version_before, registry.version)
 
+    def test_foreign_owner_clean_still_refuses_same_execution_partial_mismatch(self):
+        # Codex adversarial finding (delta round): "foreign" must mean a
+        # DIFFERENT execution_id, never merely any owner-field mismatch. A
+        # lock carrying the caller's own execution_id but a different
+        # provider (record corruption / version skew) may still be live
+        # authority for this very execution -- reporting it clean would let
+        # the caller terminalize over it. Fail closed instead, even with
+        # foreign_owner_clean=True, and leave the registry untouched.
+        registry = MemoryRegistry(); arguments = acquire_args(); arguments.pop("session_id")
+        result = acquire(registry, **arguments)
+        version_before = registry.version
+        with self.assertRaisesRegex(TaskError, "owner mismatch"):
+            reconcile_unlinked_terminal_lease(
+                registry, result["lock_id"], "p1", "task-a", "exec-a", "claude", "cancelled",
+                foreign_owner_clean=True,
+            )
+        self.assertEqual(version_before, registry.version)
+        self.assertEqual("active", registry.document["locks"][result["lock_id"]]["status"])
+
     def test_stopped_provider_reconciliation_releases_only_exact_linked_generation(self):
         registry = MemoryRegistry()
         result = acquire(registry, **acquire_args())

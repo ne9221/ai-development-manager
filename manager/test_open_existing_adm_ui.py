@@ -135,4 +135,25 @@ class SpawnDashboardArgsTests(unittest.TestCase):
         self.assertIn(str(DASHBOARD_PORT), args)
 
 
+class DetachedHelperMainTests(unittest.TestCase):
+    def test_main_prints_result_and_always_exits_zero(self):
+        # The detached-helper contract (command_watcher spawns
+        # `python -m manager.open_existing_adm_ui` at claim time): the
+        # outcome is printed for observability, and the exit code is 0 for
+        # BOTH success and failure -- no auto-open outcome may ever look
+        # like a dispatch failure to anything supervising this process.
+        import io, json
+        from contextlib import redirect_stdout
+        from manager.open_existing_adm_ui import main
+        for outcome in ({"status": "completed", "window_title": "ADM"},
+                        {"status": "failed", "error_kind": "no_interactive_desktop"}):
+            with self.subTest(outcome=outcome):
+                buffer = io.StringIO()
+                with patch("manager.open_existing_adm_ui.focus_existing_adm_ui", return_value=outcome), \
+                     redirect_stdout(buffer):
+                    exit_code = main([])
+                self.assertEqual(0, exit_code)
+                self.assertEqual(outcome, json.loads(buffer.getvalue()))
+
+
 if __name__ == "__main__": unittest.main()
