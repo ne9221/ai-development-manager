@@ -207,6 +207,7 @@ class MainCliTests(unittest.TestCase):
 
     def test_main_missing_token_env_returns_nonzero(self):
         with patch.dict(os.environ, env(ADM_GITHUB_DISPATCH_INGRESS_TOKEN=""), clear=False), \
+             patch("manager.github_dispatch_client._resolve_token_via_git_credential_manager", return_value=None), \
              patch("manager.github_dispatch_watcher.build_service", lambda: object()), \
              patch("manager.github_dispatch_watcher.DriveRecords", FakeStore):
             self.assertEqual(1, github_dispatch_watcher.main(["--once"]))
