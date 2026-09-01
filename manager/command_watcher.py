@@ -1691,6 +1691,22 @@ TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS = 10
 # between hydration yielding and Phase 2c's own headroom check running.
 TERMINAL_RECOVERY_RESERVED_SECONDS = TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS + 5
 
+# Budget for the INDEPENDENT terminal_recovery_once() pass (round-2 delta
+# review finding): the pass's hydration slice must be usable through the
+# real DriveRecords.list_records_bounded() guard, which refuses to START
+# hydrating a record unless a full single_request_worst_case
+# (WATCHER_DISCOVERY_TIMEOUT_SECONDS) still fits before the deadline.
+# A 15s pass minus 10s classification headroom left a 5s hydration slice
+# -- strictly smaller than that guard's 10s reserve, so with the real
+# production store the pass could never hydrate a single record (every
+# test double that skipped the guard hid this). Partition explicitly:
+# hydration gets the guard's own worst-case reserve PLUS a genuinely
+# usable start window, then classification keeps its full headroom on
+# top. All of it bounds STARTS only, like every deadline in this module.
+TERMINAL_RECOVERY_PASS_HYDRATION_SECONDS = WATCHER_DISCOVERY_TIMEOUT_SECONDS + 10
+TERMINAL_RECOVERY_PASS_BUDGET_SECONDS = (
+    TERMINAL_RECOVERY_PASS_HYDRATION_SECONDS + TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS)
+
 
 class _TerminalRecoveryPrevalidation:
     """Internal-only proof that _terminal_recovery_candidates() already
@@ -2242,8 +2258,8 @@ def terminal_recovery_once(store, service, allowlist=None, deadline=None, discov
 
     So terminal recovery gets its own sequential slot instead: main()
     calls this AFTER poll_once() returns, every cycle, with a fresh
-    deadline of TERMINAL_RECOVERY_RESERVED_SECONDS computed from its own
-    start time -- nothing that happened inside the poll (however
+    deadline of TERMINAL_RECOVERY_PASS_BUDGET_SECONDS computed from its
+    own start time -- nothing that happened inside the poll (however
     overrun) can consume it. Ordering after the poll preserves the
     active-work-first contract: a normal tick's active commands are all
     processed before this pass spends a single second.
@@ -2276,12 +2292,19 @@ def terminal_recovery_once(store, service, allowlist=None, deadline=None, discov
     if allowlist is None:
         allowlist = load_allowlist()
     if deadline is None:
-        deadline = time.monotonic() + TERMINAL_RECOVERY_RESERVED_SECONDS
+        deadline = time.monotonic() + TERMINAL_RECOVERY_PASS_BUDGET_SECONDS
     if discovery_store is None:
         discovery_store = store
     if classification_store is None:
         classification_store = store
     results = []
+    # Classification keeps its full short-transport headroom; what is
+    # left in front of it is the hydration slice, sized (see
+    # TERMINAL_RECOVERY_PASS_HYDRATION_SECONDS) so that the production
+    # list_records_bounded() guard -- never start a record hydration
+    # unless a full WATCHER_DISCOVERY_TIMEOUT_SECONDS worst case still
+    # fits -- leaves a genuinely usable start window rather than
+    # refusing every record outright.
     hydration_deadline = deadline - TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS
     if time.monotonic() >= hydration_deadline:
         return results

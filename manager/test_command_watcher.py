@@ -20,6 +20,8 @@ from manager.command_watcher import (
     _prioritized_nonterminal_commands, _terminal_recovery_candidates, _terminal_command_needs_recovery,
     _TerminalRecoveryPrevalidation, _enumerate_recent_commands, _enumerate_commands,
     TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS, TERMINAL_RECOVERY_RESERVED_SECONDS,
+    TERMINAL_RECOVERY_PASS_BUDGET_SECONDS, TERMINAL_RECOVERY_PASS_HYDRATION_SECONDS,
+    WATCHER_DISCOVERY_TIMEOUT_SECONDS,
     claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist,
     poll_once, process_command, provider_quota_reliable, resolve_provider_runtime, _spawn_claimed_worker,
     terminal_recovery_once,
@@ -3252,6 +3254,89 @@ class TerminalRecoveryBudgetReservationTests(unittest.TestCase):
         self.assertEqual(1, len(recovery))
         self.assertEqual("error", recovery[0]["status"])
         self.assertIn("boom", recovery[0]["error"])
+
+    # Round-2 delta review finding (P1): the pass's hydration slice must
+    # remain usable through the PRODUCTION list_records_bounded() guard
+    # ("never start a record hydration unless a full
+    # single_request_worst_case still fits before the deadline"). The
+    # original 15s pass budget left a 5s slice -- strictly under the 10s
+    # guard reserve -- so against the real store the pass hydrated
+    # nothing, ever; every in-memory double that skipped the guard hid
+    # this. This store double enforces the guard exactly, with a
+    # deterministic per-record cost on the same fake clock the pass runs
+    # under.
+    class _GuardEnforcingBoundedStore:
+        def __init__(self, inner, state, per_record_cost=1.0):
+            self._inner = inner
+            self._state = state
+            self._cost = per_record_cost
+            self.hydrated = []
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def list_records_bounded(self, area, project_id, deadline=None, single_request_worst_case=None,
+                                 max_records=None, order_by=None, rotate_offset=0):
+            items = self._inner.list_records(area, project_id)
+            if not order_by and rotate_offset and items:
+                offset = rotate_offset % len(items)
+                items = items[offset:] + items[:offset]
+            records = []
+            for record in items:
+                worst = single_request_worst_case if single_request_worst_case is not None else 45
+                if deadline is not None and self._state["now"] + worst >= deadline:
+                    # The production guard, verbatim in spirit: a record
+                    # whose own worst case could run past the deadline is
+                    # never even started.
+                    break
+                self._state["now"] += self._cost
+                records.append(record)
+                self.hydrated.append((area, project_id, record.get("command_id")))
+            return records
+
+    def test_terminal_recovery_pass_hydrates_through_the_production_bounded_guard(self):
+        cmd, claim = self._terminal_command_with_execution("completed", "partial")
+        state, monotonic, advance = self._fake_clock(start=11000.0)
+        bounded = self._GuardEnforcingBoundedStore(self.store, state)
+        with patch("manager.command_watcher.time.monotonic", side_effect=monotonic):
+            recovery = terminal_recovery_once(self.store, object(), allowlist=self.ALLOWLIST,
+                                              discovery_store=bounded,
+                                              claim_factory=lambda *_: claim,
+                                              health_check=lambda: True, quota_check=lambda service: True)
+        self.assertGreaterEqual(len(bounded.hydrated), 1,
+                                "the pass budget must leave a hydration start window the production "
+                                "single_request_worst_case guard actually permits")
+        self.assertTrue(any(r.get("reconciled") for r in recovery),
+                        f"the hydrated terminal candidate must be recovered; got {recovery}")
+
+    def test_terminal_recovery_pass_with_the_old_undersized_budget_hydrates_nothing(self):
+        # Mutation-sensitivity control reproducing the review's exact
+        # finding: a 15s pass deadline minus the 10s classification
+        # headroom leaves a 5s hydration slice -- under the 10s guard
+        # reserve -- so the guard-enforcing store must refuse every
+        # record and recovery must observably NOT happen.
+        cmd, _claim = self._terminal_command_with_execution("completed", "partial")
+        state, monotonic, advance = self._fake_clock(start=12000.0)
+        bounded = self._GuardEnforcingBoundedStore(self.store, state)
+        with patch("manager.command_watcher.time.monotonic", side_effect=monotonic):
+            recovery = terminal_recovery_once(self.store, object(), allowlist=self.ALLOWLIST,
+                                              discovery_store=bounded,
+                                              deadline=state["now"] + TERMINAL_RECOVERY_RESERVED_SECONDS)
+        self.assertEqual([], bounded.hydrated,
+                         "control: the undersized budget must be refused outright by the production guard")
+        self.assertEqual([], recovery)
+
+    def test_pass_budget_partition_leaves_a_usable_hydration_window(self):
+        # The arithmetic contract the fix depends on, stated directly:
+        # after subtracting classification headroom, the hydration slice
+        # must exceed the bounded-hydration guard's own worst-case
+        # reserve by a genuinely usable start window.
+        hydration_slice = TERMINAL_RECOVERY_PASS_BUDGET_SECONDS - TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS
+        self.assertEqual(TERMINAL_RECOVERY_PASS_HYDRATION_SECONDS, hydration_slice)
+        self.assertGreater(hydration_slice, WATCHER_DISCOVERY_TIMEOUT_SECONDS,
+                           "the slice must exceed the single_request_worst_case reserve or nothing can start")
+        self.assertGreaterEqual(hydration_slice - WATCHER_DISCOVERY_TIMEOUT_SECONDS, 10,
+                                "and leave a usable start window, not a sliver")
 
     # 14: repeated ticks against a large-history project can never
     # permanently starve terminal recovery -- with the reservation in
