@@ -18,6 +18,7 @@ from manager.command_watcher import (
     REQUIRED_TASK_POLICIES, _provider_state, _enumerate_waiting_quota_tasks, _promote_waiting_quota_task,
     _reconcile_active,
     _prioritized_nonterminal_commands, _terminal_recovery_candidates, _terminal_command_needs_recovery,
+    TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS,
     claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist,
     poll_once, process_command, provider_quota_reliable, resolve_provider_runtime, _spawn_claimed_worker,
 )
@@ -2041,7 +2042,7 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
         self.store.put("commands", "p1", command_id, cmd)
         return cmd, claim
 
-    def _bare_terminal_command(self, command_id, execution_id, persistence, task_claim_release="retained", status="completed"):
+    def _bare_terminal_command(self, command_id, execution_id, persistence, task_claim_release="retained", status="completed", project_id="p1"):
         """Lighter-weight than _terminal_command_with_execution: writes the
         Execution record directly instead of going through reserve_execution/
         enter_running_gate against the shared "t1" Task -- needed whenever a
@@ -2052,13 +2053,39 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
         nothing to do with what these tests are actually exercising
         (_terminal_recovery_candidates()'s own bounding/fail-closed
         behavior, which only ever reads the Execution record)."""
-        cmd = command(command_id=command_id, status=status, execution_id=execution_id)
-        self.store.put("executions", "p1", execution_id, {
-            "execution_id": execution_id, "project_id": "p1", "task_id": "t1", "status": status,
+        cmd = command(command_id=command_id, status=status, execution_id=execution_id, project_id=project_id, task_id="t1")
+        self.store.put("executions", project_id, execution_id, {
+            "execution_id": execution_id, "project_id": project_id, "task_id": "t1", "status": status,
             "cleanup_evidence": {"persistence": persistence, "task_claim_release": task_claim_release},
         })
-        self.store.put("commands", "p1", command_id, cmd)
+        self.store.put("commands", project_id, command_id, cmd)
         return cmd
+
+    def _add_project(self, project_id):
+        """A second (or third) fully allowlist-compliant project -- needed
+        for the GLOBAL cross-project ordering tests below, which must prove
+        a queued/claimed/running Command in a DIFFERENT project is never
+        starved by a terminal-recovery lookup in an earlier-rotated one.
+
+        The Store test double's own list_projects() is hardcoded to a
+        single "p1" (matching every OTHER test in this file, which is
+        correctly single-project) -- overridden here, once per store
+        instance, to reflect every project actually created via this
+        helper, in creation order, so poll_once()'s own project rotation
+        sees them all."""
+        proj = {**project(), "project_id": project_id, "active_tasks": ["t1"]}
+        create_project(self.store, proj)
+        create_task(self.store, {**task(read_only=True), "project_id": project_id}, assign=False)
+        compliant = self.store.get("tasks", project_id, "t1")
+        compliant["execution_policies"] = sorted(REQUIRED_TASK_POLICIES)
+        self.store.put("tasks", project_id, "t1", compliant)
+        store = self.store
+
+        def list_all_projects():
+            ids = sorted({pid for (area, pid, _name) in store.records if area == "projects"})
+            return [store.get("projects", pid, pid) for pid in ids]
+
+        store.list_projects = list_all_projects
 
     # --- _prioritized_nonterminal_commands() is provably lookup-free ---
 
@@ -2106,6 +2133,193 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
         self.assertLess(launch_index, first_terminal_lookup_index,
                         f"queued work must launch before any terminal lookup; order was {order}")
 
+    # A: project A's terminal lookup must never block project B's queued
+    # work -- the residual-P0-A defect this round of the fix closes. The
+    # earlier per-project two-phase split still processed "project A
+    # nonterminal -> project A terminal lookup -> project B nonterminal" in
+    # that interleaved order; the fix makes ALL projects' nonterminal work
+    # (across both sweeps) happen before ANY project's terminal lookup.
+    def test_cross_project_queued_not_starved_by_other_project_terminal_lookup(self):
+        self._add_project("p2")
+        allowlist = frozenset({("p1", "t1"), ("p2", "t1")})
+        self._bare_terminal_command("cmd-term", "exec-term", "partial", project_id="p1")
+        self.store.put("commands", "p2", "cmd-queued", command(command_id="cmd-queued", project_id="p2", task_id="t1"))
+
+        order = []
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def tracking_needs_recovery(store, cmd):
+            order.append(("terminal_lookup", cmd["project_id"], cmd["command_id"]))
+            return real_needs_recovery(store, cmd)
+
+        def tracking_launch(*args, **kwargs):
+            order.append(("launched", args[7]))
+            kwargs["on_running"](None)
+            return CommandWatcherTests.complete(args[7])
+
+        cursor_path = tempfile.mktemp(suffix=".json")
+        with patch("manager.command_watcher.launch_task", side_effect=tracking_launch), \
+             patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking_needs_recovery):
+            poll_once(self.store, object(), allowlist=allowlist, deadline=time.monotonic() + 50.0,
+                     claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True,
+                     cursor_path=cursor_path)
+
+        launch_index = next(i for i, e in enumerate(order) if e[0] == "launched")
+        terminal_index = next(i for i, e in enumerate(order) if e[0] == "terminal_lookup")
+        self.assertLess(launch_index, terminal_index,
+                        f"p2's queued work must process before p1's terminal lookup even starts; order was {order}")
+
+    # B: same as A, but project B's actionable work is active-lifecycle
+    # (claimed), not queued.
+    def test_cross_project_claimed_not_starved_by_other_project_terminal_lookup(self):
+        self._add_project("p2")
+        allowlist = frozenset({("p1", "t1"), ("p2", "t1")})
+        self._bare_terminal_command("cmd-term", "exec-term", "partial", project_id="p1")
+        self.store.put("commands", "p2", "cmd-claimed", command(
+            command_id="cmd-claimed", project_id="p2", task_id="t1", status="claimed",
+            execution_id="exec-missing-p2", claimed_at=now_iso()))
+
+        order = []
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def tracking_needs_recovery(store, cmd):
+            order.append(("terminal_lookup", cmd["project_id"], cmd["command_id"]))
+            return real_needs_recovery(store, cmd)
+
+        real_reconcile = _reconcile_active
+
+        def tracking_reconcile(store, service, cmd, claim_factory):
+            if cmd["project_id"] == "p2":
+                order.append(("reconciled", cmd["project_id"], cmd["command_id"]))
+            return real_reconcile(store, service, cmd, claim_factory)
+
+        cursor_path = tempfile.mktemp(suffix=".json")
+        with patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking_needs_recovery), \
+             patch("manager.command_watcher._reconcile_active", side_effect=tracking_reconcile):
+            poll_once(self.store, object(), allowlist=allowlist, deadline=time.monotonic() + 50.0,
+                     claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True,
+                     cursor_path=cursor_path)
+
+        reconciled_index = next(i for i, e in enumerate(order) if e[0] == "reconciled")
+        terminal_index = next(i for i, e in enumerate(order) if e[0] == "terminal_lookup")
+        self.assertLess(reconciled_index, terminal_index,
+                        f"p2's active-lifecycle claimed Command must process before p1's terminal lookup; order was {order}")
+
+    # C: 3 projects -- A and B both have a terminal-recovery candidate, C
+    # has a queued Command. C's queued work must process before EITHER A's
+    # or B's terminal lookup.
+    def test_cross_project_queued_in_third_project_not_starved_by_two_terminal_lookups(self):
+        self._add_project("p2")
+        self._add_project("p3")
+        allowlist = frozenset({("p1", "t1"), ("p2", "t1"), ("p3", "t1")})
+        self._bare_terminal_command("cmd-term-a", "exec-term-a", "partial", project_id="p1")
+        self._bare_terminal_command("cmd-term-b", "exec-term-b", "partial", project_id="p2")
+        self.store.put("commands", "p3", "cmd-queued", command(command_id="cmd-queued", project_id="p3", task_id="t1"))
+
+        order = []
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def tracking_needs_recovery(store, cmd):
+            order.append(("terminal_lookup", cmd["project_id"], cmd["command_id"]))
+            return real_needs_recovery(store, cmd)
+
+        def tracking_launch(*args, **kwargs):
+            order.append(("launched", args[7]))
+            kwargs["on_running"](None)
+            return CommandWatcherTests.complete(args[7])
+
+        cursor_path = tempfile.mktemp(suffix=".json")
+        with patch("manager.command_watcher.launch_task", side_effect=tracking_launch), \
+             patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking_needs_recovery):
+            poll_once(self.store, object(), allowlist=allowlist, deadline=time.monotonic() + 50.0,
+                     claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True,
+                     cursor_path=cursor_path)
+
+        launch_index = next(i for i, e in enumerate(order) if e[0] == "launched")
+        first_terminal_index = next(i for i, e in enumerate(order) if e[0] == "terminal_lookup")
+        self.assertLess(launch_index, first_terminal_index,
+                        f"p3's queued work must process before ANY project's terminal lookup; order was {order}")
+
+    # I: the recent sweep's own terminal candidates must not starve the
+    # full sweep's queued/running work either -- terminal classification is
+    # deferred past BOTH sweeps, not just the recent one.
+    def test_recent_sweep_terminal_candidate_does_not_starve_full_sweep_queued_work(self):
+        self._bare_terminal_command("cmd-term", "exec-term", "partial")
+        self.store.put("commands", "p1", "cmd-queued", command(command_id="cmd-queued"))
+
+        order = []
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def tracking_needs_recovery(store, cmd):
+            order.append(("terminal_lookup", cmd["command_id"]))
+            return real_needs_recovery(store, cmd)
+
+        def tracking_launch(*args, **kwargs):
+            order.append(("launched", args[7]))
+            kwargs["on_running"](None)
+            return CommandWatcherTests.complete(args[7])
+
+        cursor_path = tempfile.mktemp(suffix=".json")
+        with patch("manager.command_watcher.launch_task", side_effect=tracking_launch), \
+             patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking_needs_recovery):
+            poll_once(self.store, object(), allowlist=self.ALLOWLIST, deadline=time.monotonic() + 50.0,
+                     claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True,
+                     cursor_path=cursor_path)
+
+        launch_index = next(i for i, e in enumerate(order) if e[0] == "launched")
+        terminal_index = next(i for i, e in enumerate(order) if e[0] == "terminal_lookup")
+        self.assertLess(launch_index, terminal_index)
+
+    # J: cross-project terminal-recovery fairness -- with the lookup budget
+    # exhausted by an earlier-rotated project's terminal backlog, a
+    # later-rotated project's own terminal candidate still gets classified
+    # once rotation brings it to the front on a later tick (never
+    # permanently stuck behind project 0's backlog).
+    def test_terminal_recovery_lookup_budget_rotates_across_projects_over_ticks(self):
+        self._add_project("p2")
+        allowlist = frozenset({("p1", "t1"), ("p2", "t1")})
+        self._bare_terminal_command("cmd-term-a", "exec-term-a", "partial", project_id="p1")
+        self._bare_terminal_command("cmd-term-b", "exec-term-b", "partial", project_id="p2")
+        cursor_path = tempfile.mktemp(suffix=".json")
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def _examined_project(cursor_path):
+            examined = []
+
+            def tracking_needs_recovery(store, cmd):
+                examined.append(cmd["project_id"])
+                return real_needs_recovery(store, cmd)
+
+            with patch("manager.command_watcher.MAX_COMMANDS_PER_POLL", 1), \
+                 patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking_needs_recovery):
+                poll_once(self.store, object(), allowlist=allowlist, deadline=time.monotonic() + 50.0,
+                         claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True,
+                         cursor_path=cursor_path)
+            return examined
+
+        # With a lookup budget of exactly 1, each tick's CLASSIFICATION
+        # pass can only examine ONE project's terminal backlog -- a real
+        # per-tick choice, not "always reach every project because the
+        # budget is generous enough to." (process_command() itself
+        # separately re-checks eligibility once more, as its own
+        # independent, pre-existing safety gate, for whichever ONE
+        # candidate classification already selected and committed to
+        # processing -- that is a second, distinct lookup on the SAME
+        # already-chosen command, not a second classification attempt on a
+        # second command, so it is deduplicated by project below rather
+        # than asserted away.) Project rotation (the SAME durable phase1
+        # cursor mechanism every other phase already relies on) means
+        # which project gets that one look changes from tick to tick --
+        # p2's backlog is never permanently stuck behind p1's always
+        # winning first.
+        first_examined = set(_examined_project(cursor_path))
+        second_examined = set(_examined_project(cursor_path))
+        self.assertEqual(1, len(first_examined))
+        self.assertEqual(1, len(second_examined))
+        self.assertNotEqual(first_examined, second_examined,
+                            f"rotation must examine a DIFFERENT project's terminal backlog on the next tick; "
+                            f"tick 1 examined {first_examined}, tick 2 examined {second_examined}")
+
     # 3: a lookup that would start past the deadline is never attempted;
     # classification stops there, tick is not aborted.
     def test_terminal_lookup_never_attempted_once_past_deadline(self):
@@ -2115,8 +2329,26 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
             def get(self, *a, **k):
                 raise AssertionError("must not attempt a lookup once the deadline has already passed")
 
-        candidates = _terminal_recovery_candidates([cmd], ExplodingStore(), time.monotonic() - 1.0, remaining_slots=10)
+        candidates, remaining = _terminal_recovery_candidates([cmd], ExplodingStore(), time.monotonic() - 1.0, lookup_budget=10)
         self.assertEqual([], candidates)
+        self.assertEqual(10, remaining)
+
+    # Residual-P0-A: a lookup is never even started unless there is enough
+    # headroom for its own worst-case duration
+    # (TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS), not merely "not literally
+    # past the deadline yet" -- the same rule DriveRecords.
+    # list_records_bounded() already applies to hydration.
+    def test_terminal_lookup_not_attempted_without_full_worst_case_headroom(self):
+        cmd, _claim = self._terminal_command_with_execution("completed", "partial")
+
+        class ExplodingStore:
+            def get(self, *a, **k):
+                raise AssertionError("must not attempt a lookup without full worst-case headroom")
+
+        deadline = time.monotonic() + (TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS / 2)
+        candidates, remaining = _terminal_recovery_candidates([cmd], ExplodingStore(), deadline, lookup_budget=10)
+        self.assertEqual([], candidates)
+        self.assertEqual(10, remaining)
 
     def test_terminal_classification_stops_partway_once_deadline_is_reached(self):
         cmd1 = self._bare_terminal_command("cmd-1", "exec-1", "partial")
@@ -2127,42 +2359,86 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
 
         def fake_monotonic():
             calls["n"] += 1
-            # First check (before cmd1) is under budget; every check from
-            # the second call onward (before cmd2) is already past it.
-            return deadline - 10.0 if calls["n"] <= 1 else deadline + 10.0
+            # First two checks (before/after cmd1's lookup) are under
+            # budget; every check from the third call onward (before
+            # cmd2's lookup) is already past it.
+            return deadline - 10.0 if calls["n"] <= 2 else deadline + 10.0
 
         with patch("manager.command_watcher.time.monotonic", side_effect=fake_monotonic):
-            candidates = _terminal_recovery_candidates([cmd1, cmd2], self.store, deadline, remaining_slots=10)
+            candidates, remaining = _terminal_recovery_candidates([cmd1, cmd2], self.store, deadline, lookup_budget=10)
         self.assertEqual(["cmd-1"], [c["command_id"] for c in candidates])
+        self.assertEqual(9, remaining)
 
-    # 7: remaining_slots (derived from MAX_COMMANDS_PER_POLL) is strictly
-    # respected even with more eligible candidates available.
-    def test_remaining_slots_strictly_bounds_returned_candidates(self):
+    # 7: lookup_budget (derived from MAX_COMMANDS_PER_POLL) strictly bounds
+    # returned candidates when every attempt is eligible.
+    def test_lookup_budget_strictly_bounds_returned_candidates(self):
         cmd1 = self._bare_terminal_command("cmd-1", "exec-1", "partial")
         cmd2 = self._bare_terminal_command("cmd-2", "exec-2", "partial")
         cmd3 = self._bare_terminal_command("cmd-3", "exec-3", "partial")
-        candidates = _terminal_recovery_candidates([cmd1, cmd2, cmd3], self.store, time.monotonic() + 1000.0, remaining_slots=2)
+        candidates, remaining = _terminal_recovery_candidates([cmd1, cmd2, cmd3], self.store, time.monotonic() + 1000.0, lookup_budget=2)
         self.assertEqual(2, len(candidates))
+        self.assertEqual(0, remaining)
 
-    def test_zero_remaining_slots_skips_classification_entirely(self):
+    def test_zero_lookup_budget_skips_classification_entirely(self):
         cmd, _claim = self._terminal_command_with_execution("completed", "partial")
 
         class ExplodingStore:
             def get(self, *a, **k):
-                raise AssertionError("must not attempt any lookup with zero remaining slots")
+                raise AssertionError("must not attempt any lookup with zero remaining budget")
 
-        candidates = _terminal_recovery_candidates([cmd], ExplodingStore(), time.monotonic() + 1000.0, remaining_slots=0)
+        candidates, remaining = _terminal_recovery_candidates([cmd], ExplodingStore(), time.monotonic() + 1000.0, lookup_budget=0)
         self.assertEqual([], candidates)
+        self.assertEqual(0, remaining)
 
-    # 4: a TaskError from one candidate's lookup skips only that candidate.
+    # D: remaining_slots=1 + 5 ambiguous terminal records -> exactly 1
+    # lookup attempt is made, not 5 -- the budget bounds ATTEMPTS, not the
+    # count of eligible results (which would have stayed 0 here regardless,
+    # since none of these are actually eligible).
+    def test_lookup_budget_bounds_attempts_not_just_eligible_results(self):
+        commands = [self._bare_terminal_command(f"cmd-{i}", f"exec-{i}", "complete", task_claim_release="released")
+                   for i in range(5)]
+        attempts = []
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def counting_needs_recovery(store, cmd):
+            attempts.append(cmd["command_id"])
+            return real_needs_recovery(store, cmd)
+
+        with patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=counting_needs_recovery):
+            candidates, remaining = _terminal_recovery_candidates(commands, self.store, time.monotonic() + 1000.0, lookup_budget=1)
+        self.assertEqual(1, len(attempts))
+        self.assertEqual([], candidates)
+        self.assertEqual(0, remaining)
+
+    # E: remaining_slots=2 + 5 non-eligible terminal records -> at most 2
+    # lookup attempts.
+    def test_lookup_budget_of_two_bounds_attempts_to_two(self):
+        commands = [self._bare_terminal_command(f"cmd-{i}", f"exec-{i}", "complete", task_claim_release="released")
+                   for i in range(5)]
+        attempts = []
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def counting_needs_recovery(store, cmd):
+            attempts.append(cmd["command_id"])
+            return real_needs_recovery(store, cmd)
+
+        with patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=counting_needs_recovery):
+            candidates, remaining = _terminal_recovery_candidates(commands, self.store, time.monotonic() + 1000.0, lookup_budget=2)
+        self.assertLessEqual(len(attempts), 2)
+        self.assertEqual(0, remaining)
+
+    # 4/F: a TaskError from one candidate's lookup skips only that
+    # candidate, but still consumes its own attempt budget.
     def test_taskerror_from_one_candidate_skips_only_that_one(self):
         broken = command(command_id="cmd-broken", status="completed", execution_id="exec-does-not-exist")
         healthy, _claim = self._terminal_command_with_execution("completed", "partial", command_id="cmd-healthy", execution_id="exec-healthy")
-        candidates = _terminal_recovery_candidates([broken, healthy], self.store, time.monotonic() + 1000.0, remaining_slots=10)
+        candidates, remaining = _terminal_recovery_candidates([broken, healthy], self.store, time.monotonic() + 1000.0, lookup_budget=10)
         self.assertEqual(["cmd-healthy"], [c["command_id"] for c in candidates])
+        self.assertEqual(8, remaining)
 
-    # 5: a generic (non-TaskError) transport-shaped exception from one
-    # candidate's lookup also skips only that one -- never aborts.
+    # 5/G: a generic (non-TaskError) transport-shaped exception from one
+    # candidate's lookup also skips only that one -- never aborts -- but
+    # still consumes its own attempt budget.
     def test_generic_transport_exception_from_one_candidate_skips_only_that_one(self):
         broken = command(command_id="cmd-broken", status="completed", execution_id="exec-broken")
         healthy, _claim = self._terminal_command_with_execution("completed", "partial", command_id="cmd-healthy", execution_id="exec-healthy")
@@ -2176,8 +2452,9 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
                     raise ConnectionError("simulated transport failure")
                 return self.real.get(area, project_id, name)
 
-        candidates = _terminal_recovery_candidates([broken, healthy], FlakyStore(self.store), time.monotonic() + 1000.0, remaining_slots=10)
+        candidates, remaining = _terminal_recovery_candidates([broken, healthy], FlakyStore(self.store), time.monotonic() + 1000.0, lookup_budget=10)
         self.assertEqual(["cmd-healthy"], [c["command_id"] for c in candidates])
+        self.assertEqual(8, remaining)
 
     def test_generic_transport_exception_does_not_abort_the_whole_tick(self):
         broken, _c1 = self._terminal_command_with_execution("completed", "partial", command_id="cmd-broken", execution_id="exec-broken")
@@ -2705,7 +2982,8 @@ class MainOnceFastFailTests(unittest.TestCase):
         import io
         from contextlib import redirect_stdout
         from manager.command_watcher import (
-            RECENT_COMMAND_DISCOVERY_TIMEOUT_SECONDS, WATCHER_DISCOVERY_TIMEOUT_SECONDS, main,
+            RECENT_COMMAND_DISCOVERY_TIMEOUT_SECONDS, TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS,
+            WATCHER_DISCOVERY_TIMEOUT_SECONDS, main,
         )
 
         build_calls = []
@@ -2721,10 +2999,12 @@ class MainOnceFastFailTests(unittest.TestCase):
 
         # First call: the normal, full-timeout service (default -> None
         # means "use DRIVE_REQUEST_TIMEOUT_SECONDS", untouched by this fix).
-        # Second call: the discovery-only service, with an explicit,
-        # strictly shorter timeout than POLL_TIME_BUDGET_SECONDS.
+        # Second/third: the discovery-only and recent-sweep-only services.
+        # Fourth (residual-P0-A): the terminal-recovery classification
+        # service, also strictly shorter than POLL_TIME_BUDGET_SECONDS.
         self.assertEqual(
-            [None, WATCHER_DISCOVERY_TIMEOUT_SECONDS, RECENT_COMMAND_DISCOVERY_TIMEOUT_SECONDS],
+            [None, WATCHER_DISCOVERY_TIMEOUT_SECONDS, RECENT_COMMAND_DISCOVERY_TIMEOUT_SECONDS,
+             TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS],
             build_calls,
         )
 
@@ -2744,6 +3024,87 @@ class MainOnceFastFailTests(unittest.TestCase):
         worst_case_total = POLL_TIME_BUDGET_SECONDS + WATCHER_DISCOVERY_TIMEOUT_SECONDS
         self.assertLess(worst_case_total, POLL_SECONDS,
                          "budget + one worst-case discovery request must still fit before the next scheduled trigger")
+
+    # H: main() must wire a genuinely separate, short-timeout service+store
+    # into poll_once()'s `classification_store` -- the same "a real
+    # transport timeout is a property of the *service*, not something
+    # checked-against-a-number after the fact" fix already proven for
+    # discovery_store/recent_store above, now applied to terminal-recovery
+    # classification reads specifically (residual-P0-A: "45s lookup > 40s
+    # poll budget" is only actually solved by bounding the TRANSPORT
+    # itself, not by any monotonic-clock pre-check alone).
+    def test_main_builds_a_genuinely_separate_short_timeout_classification_service(self):
+        import io
+        from contextlib import redirect_stdout
+        from manager.command_watcher import TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS, main
+
+        build_calls = []
+
+        def fake_build_service(timeout=None):
+            build_calls.append(timeout)
+            return object()
+
+        with patch("manager.command_watcher.build_service", side_effect=fake_build_service), \
+             patch("manager.command_watcher.DriveRecords", return_value=Mock(list_project_ids=Mock(return_value=[]))), \
+             redirect_stdout(io.StringIO()):
+            main(["--once"])
+        self.assertIn(TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS, build_calls)
+
+    def test_main_passes_classification_store_into_poll_once(self):
+        import io
+        from contextlib import redirect_stdout
+        from manager.command_watcher import main
+
+        with patch("manager.command_watcher.build_service", return_value=object()), \
+             patch("manager.command_watcher.DriveRecords", return_value=Mock(list_project_ids=Mock(return_value=[]))), \
+             patch("manager.command_watcher.poll_once", return_value=[]) as poll, \
+             redirect_stdout(io.StringIO()):
+            main(["--once"])
+        self.assertIn("classification_store", poll.call_args.kwargs)
+        self.assertIsNotNone(poll.call_args.kwargs["classification_store"])
+
+    def test_classification_timeout_leaves_real_margin_under_the_poll_budget(self):
+        """Same math proof as discovery's own, for the classification
+        service: TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS is strictly
+        smaller than the poll budget, and budget + one worst-case
+        classification lookup still fits before the next scheduled
+        trigger."""
+        from manager.command_watcher import POLL_SECONDS, POLL_TIME_BUDGET_SECONDS, TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS
+
+        self.assertLess(TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS, POLL_TIME_BUDGET_SECONDS)
+        worst_case_total = POLL_TIME_BUDGET_SECONDS + TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS
+        self.assertLess(worst_case_total, POLL_SECONDS,
+                         "budget + one worst-case classification lookup must still fit before the next scheduled trigger")
+
+    def test_terminal_recovery_candidates_receives_the_dedicated_classification_store(self):
+        """Wiring proof at the poll_once() level: a distinct classification_store
+        object is what _terminal_recovery_candidates() actually receives for
+        its lookups -- not the default full-timeout `store` every write and
+        active-lifecycle call still correctly uses."""
+        store = CommandWatcherTests.allowlist_compliant_store()
+        cmd = command(command_id="cmd-term", status="completed", execution_id="exec-term")
+        store.put("executions", "p1", "exec-term", {
+            "execution_id": "exec-term", "project_id": "p1", "task_id": "t1", "status": "completed",
+            "cleanup_evidence": {"persistence": "partial", "task_claim_release": "retained"},
+        })
+        store.put("commands", "p1", "cmd-term", cmd)
+
+        classification_store = Mock(wraps=store)
+        real_needs_recovery = _terminal_command_needs_recovery
+        seen_stores = []
+
+        def tracking_needs_recovery(used_store, command_arg):
+            seen_stores.append(used_store)
+            return real_needs_recovery(used_store, command_arg)
+
+        cursor_path = tempfile.mktemp(suffix=".json")
+        with patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking_needs_recovery):
+            poll_once(store, object(), allowlist=frozenset({("p1", "t1")}), deadline=time.monotonic() + 50.0,
+                     classification_store=classification_store,
+                     claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True,
+                     cursor_path=cursor_path)
+        self.assertTrue(seen_stores)
+        self.assertIs(classification_store, seen_stores[0])
 
 
 def argparse_namespace(**overrides):

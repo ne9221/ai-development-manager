@@ -1613,72 +1613,100 @@ def _prioritized_nonterminal_commands(commands):
     )
 
 
-def _terminal_recovery_candidates(commands, store, deadline, remaining_slots):
-    """The SECOND, deliberately later pass over the SAME already-hydrated,
-    already-bounded Command batch _prioritized_nonterminal_commands() just
-    finished: pick out completed/failed records whose linked Execution
-    still needs cleanup/materialization recovery
+TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS = 10
+
+
+def _terminal_recovery_candidates(commands, store, deadline, lookup_budget):
+    """The SECOND, deliberately later, GLOBAL pass -- run only once EVERY
+    project's nonterminal work for this tick has already had its turn (see
+    poll_once()'s Phase 2c) -- over an already-hydrated, already-bounded
+    Command batch: pick out completed/failed records whose linked
+    Execution still needs cleanup/materialization recovery
     (_terminal_command_needs_recovery), so process_command()'s existing
     _reconcile_active() logic (added for R17, never able to fire from
     poll_once() before this fix) actually gets a chance to run.
 
-    P0-A fix, callers must only invoke this AFTER every nonterminal command
-    in the same batch has already been processed (or the tick ran out of
-    slots/time trying) -- never interleaved with or ahead of it. Bounded
-    and fail-closed by construction:
+    Residual-P0-A fix: `lookup_budget` bounds LOOKUP ATTEMPTS, not eligible
+    results -- every completed/failed record this function actually
+    examines (i.e. calls _terminal_command_needs_recovery for) consumes one
+    unit of budget REGARDLESS of the outcome (eligible, not eligible,
+    ambiguous, or an exception). Before this fix, a `remaining_slots` that
+    bounded only the COUNT OF ELIGIBLE RESULTS meant an unbounded number of
+    non-eligible/ambiguous candidates could each still trigger a real
+    Execution lookup -- 5 ambiguous terminal records with only 1 real
+    process_command() slot left still cost 5 lookups, not 1. Returns
+    `(candidates, remaining_lookup_budget)` so a caller iterating multiple
+    projects' cached batches in the same tick (poll_once()'s Phase 2c) can
+    thread the SAME shrinking budget across all of them, in rotated project
+    order, for cross-project terminal-recovery fairness -- see that
+    function's own docstring.
 
-    - `remaining_slots` <= 0 short-circuits to an empty list immediately --
-      no lookups are attempted when there is no process_command() slot left
-      to use them on.
-    - `time.monotonic() >= deadline` is checked BEFORE every single
-      candidate's Execution lookup, not just once at entry -- a lookup that
-      would start past the deadline is never attempted at all, and
-      classification simply stops there (whatever was already found is
-      still returned; nothing already-decided is thrown away).
+    Still bounded and fail-closed exactly as before:
+
+    - `lookup_budget` <= 0 short-circuits to `(candidates, lookup_budget)`
+      immediately -- no lookups are attempted once the tick has no budget
+      left to spend on them.
+    - Before every single candidate's lookup, this checks BOTH
+      `time.monotonic() >= deadline` AND (residual-P0-A fix)
+      `deadline - time.monotonic() < TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS`
+      -- a lookup is never even started unless there is enough headroom left
+      for its own worst-case duration, the same "never start a request whose
+      own worst case could run past the deadline" rule
+      DriveRecords.list_records_bounded() already uses for hydration. This
+      still cannot make an already-started call return early -- see `store`
+      below for the actual hard bound on that.
+    - `store` is expected to be a store built from a genuinely SHORT,
+      dedicated transport timeout (TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS,
+      not the ~45s default every write/active-lifecycle call uses) -- see
+      poll_once()'s `classification_store` parameter and main()'s
+      construction of it. This is what actually solves "a single lookup can
+      block past the whole poll budget": a real OS-level socket timeout
+      (the same httplib2 mechanism WATCHER_DISCOVERY_TIMEOUT_SECONDS/
+      RECENT_COMMAND_DISCOVERY_TIMEOUT_SECONDS already rely on elsewhere in
+      this module) bounds how long the call itself can possibly run,
+      independent of any monotonic-clock check here.
     - Each candidate's eligibility check is individually wrapped: ANY
-      exception (TaskError, a transport/timeout-shaped failure, or
-      anything else) is treated as "not eligible this tick" and moves on
-      to the NEXT candidate -- it never aborts this function, and
-      therefore never aborts the whole poll_once() tick the way an
-      unhandled exception from here reaching poll_once()'s outer per-
-      command try/except would still have contained, but only after
-      possibly burning the rest of the tick's budget first.
-    - Never a new/separate/unbounded scan: `commands` is exactly the same
-      small batch (RECENT_COMMANDS_PER_PROJECT=2 for the recent sweep, or
-      whatever a project's bounded hydration window returned for the full
-      sweep) already fetched by the caller -- at most one extra store.get()
-      per completed/failed record already in it.
+      exception (TaskError, the classification store's own bounded-timeout
+      transport failure, or anything else) is treated as "not eligible this
+      tick" and moves on to the NEXT candidate -- it never aborts this
+      function, and therefore never aborts the whole poll_once() tick.
+    - Never a new/separate/unbounded scan: `commands` is exactly one of the
+      same small batches (RECENT_COMMANDS_PER_PROJECT=2 for the recent
+      sweep, or whatever a project's bounded hydration window returned for
+      the full sweep) already fetched and cached by the caller.
 
     Returned in Drive's own original relative order (not re-sorted) -- by
     construction every kept record already shares the same "no explicit
     priority tier" default rank in _COMMAND_PRIORITY, and this pass never
     runs until every higher-priority record has already had its turn, so
     no additional sort is meaningful here."""
-    if remaining_slots <= 0:
-        return []
     candidates = []
+    if lookup_budget <= 0:
+        return candidates, lookup_budget
     for command in commands:
         if command.get("status") not in ("completed", "failed"):
             continue
-        if len(candidates) >= remaining_slots:
+        if lookup_budget <= 0:
             break
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= deadline or deadline - time.monotonic() < TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS:
             break
+        lookup_budget -= 1
         try:
             eligible = _terminal_command_needs_recovery(store, command)
         except Exception:
             # Fail closed FOR THIS CANDIDATE ONLY (P0-A): an ambiguous or
             # failed lookup is never treated as "needs recovery", and never
             # propagates -- the next candidate (and every already-processed
-            # nonterminal command) is completely unaffected.
+            # nonterminal command) is completely unaffected. The attempt is
+            # still consumed above regardless of this outcome.
             eligible = False
         if eligible:
             candidates.append(command)
-    return candidates
+    return candidates, lookup_budget
 
 
-def poll_once(store, service, allowlist=None, deadline=None, discovery_store=None, recent_store=None, origin_context=None,
-              async_launch=False, cursor_path=None, **factories):
+def poll_once(store, service, allowlist=None, deadline=None, discovery_store=None, recent_store=None,
+              classification_store=None, origin_context=None, async_launch=False, cursor_path=None, **factories):
     """`deadline`, if given, is a `time.monotonic()` value after which this
     call stops STARTING new project/command work and returns whatever it has
     so far -- any project/command not yet reached this tick is picked up on
@@ -1705,6 +1733,9 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     just a smaller number used for bookkeeping while the real transport
     could still block for the shared 45s. Defaults to `store` when omitted
     (every existing caller/test), reproducing prior behavior exactly.
+    `classification_store` is the same idea, dedicated to terminal-recovery
+    Execution lookups (see TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS/Phase 2c
+    below) -- also defaults to `store` when omitted.
 
     Project enumeration itself (_enumerate_project_ids above) is also
     deadline-aware and does not hydrate full project documents.
@@ -1721,13 +1752,21 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     discovery spends its one available process_command() slot on active-
     lifecycle authority or new actionable work before stale attention
     backlog. See _prioritized_nonterminal_commands()'s docstring for the
-    production trace that motivated this. Only once that pass is complete
-    (and only if a process_command() slot and time budget remain) does a
-    second, separate pass consider terminal-recovery backlog for the same
-    batch -- see _terminal_recovery_candidates()'s docstring for the P0-A
-    production trace (a slow/failing terminal-recovery Execution lookup
-    must never delay or starve the nonterminal pass) that motivated
-    splitting this into two passes instead of one combined sort."""
+    production trace that motivated this.
+
+    Terminal-recovery classification (a completed/failed Command whose
+    Execution still needs cleanup/materialization recovery) is a separate,
+    GLOBAL, deliberately LAST phase (2c): every rotated project's
+    nonterminal work (both the recent sweep and the full sweep) is given
+    its full turn first, across ALL projects, before ANY terminal
+    Execution lookup is attempted for ANY project -- not per-project, which
+    an earlier round of this fix still did and which could let a slow or
+    failing lookup in an early-rotated project delay a later-rotated
+    project's genuinely actionable queued/running/claimed work. See
+    _terminal_recovery_candidates()'s docstring for the full contract
+    (lookup-attempt budgeting, deadline headroom, and the dedicated
+    short-timeout `classification_store` that actually hard-bounds a
+    single lookup's own worst-case duration)."""
     if allowlist is None:
         allowlist = load_allowlist()
     if deadline is None:
@@ -1736,6 +1775,8 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         discovery_store = store
     if recent_store is None:
         recent_store = discovery_store
+    if classification_store is None:
+        classification_store = store
     results = []
     # DASHBOARD_TRUTH_CONNECTED gate 1/4: waiting_quota Task promotion is
     # this tick's OWN natural retry -- lazily fetched at most once per
@@ -1811,20 +1852,58 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     except Exception:
         pass
 
-    # Phase 2a: inspect a tiny modified-time-ordered batch from every project
-    # before historical hydration. The later full sweep remains the recovery
-    # path for older claimed/running/attention records.
+    # Phase 2a/2b: inspect a tiny modified-time-ordered batch from every
+    # project before historical hydration, then a regular full bounded
+    # sweep in the same rotated order using whatever budget remains -- both
+    # NONTERMINAL WORK ONLY. Residual-P0-A fix: nonterminal work (claimed/
+    # running/queued/attention) is processed GLOBALLY across every rotated
+    # project before terminal-recovery classification is considered for ANY
+    # project -- an earlier round of this fix still interleaved "project A
+    # nonterminal -> project A terminal lookup -> project B nonterminal"
+    # per-project, which let a slow/failing terminal lookup in an
+    # early-rotated project delay a later-rotated project's genuinely
+    # actionable queued/running/claimed work, exactly the starvation this
+    # whole fix exists to prevent, just moved up one level. Each project's
+    # already-hydrated, already-bounded batch is cached in
+    # `hydrated_commands_by_project` as it is fetched (from EITHER sweep),
+    # so the later global terminal-recovery phase (2c) never re-enumerates
+    # or re-hydrates anything -- it only ever looks at batches this tick
+    # already paid to fetch.
     processed = set()
-    recent_deadline = min(deadline, time.monotonic() + RECENT_COMMAND_SWEEP_BUDGET_SECONDS)
-    def _run_recent(project_id, command):
+    hydrated_commands_by_project = {}
+    projects_with_batches = []
+
+    def _remember_batch(project_id, commands):
+        bucket = hydrated_commands_by_project.setdefault(project_id, {})
+        if project_id not in projects_with_batches:
+            projects_with_batches.append(project_id)
+        for c in commands:
+            bucket[c["command_id"]] = c
+
+    def _run(project_id, command):
         try:
             results.append(process_command(store, service, command, allowlist=allowlist,
                                            origin_context=origin_context, async_launch=async_launch, **factories))
         except Exception as exc:
+            # One command's processing must never take the rest of this
+            # project's queue -- or any later-rotated project's -- down
+            # with it. Before this isolation existed, an uncaught exception
+            # here propagated straight out of poll_once() and was only ever
+            # caught by main()'s top-level `except Exception`, which
+            # discards the whole tick's results and retries next minute --
+            # with the SAME command still first in priority order
+            # (claimed/running always sort ahead of queued), so a command
+            # that reliably threw once reliably threw on every subsequent
+            # tick too, indefinitely starving every other command in the
+            # same project behind it. Recording the failure here and
+            # moving on to the next command keeps that guarantee real: a
+            # single bad record's blast radius is itself, not its
+            # neighbors.
             results.append({"status": "error", "project_id": project_id,
                             "command_id": command["command_id"], "error": repr(exc)})
         processed.add((project_id, command["command_id"]))
 
+    recent_deadline = min(deadline, time.monotonic() + RECENT_COMMAND_SWEEP_BUDGET_SECONDS)
     for project_id in project_ids:
         if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
             break
@@ -1832,35 +1911,18 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             commands = _enumerate_recent_commands(recent_store, project_id, deadline=recent_deadline)
         except TaskError:
             continue
-        # P0-A fix: zero-remote-lookup nonterminal priority work (claimed/
-        # running/queued/attention) is fully processed FIRST, in this
-        # already-hydrated bounded batch -- never delayed or starved by a
-        # terminal record's own recovery-eligibility check, which requires
-        # a real Execution lookup that can be slow or fail.
+        _remember_batch(project_id, commands)
+        # Zero-remote-lookup nonterminal priority work (claimed/running/
+        # queued/attention) only -- terminal-recovery eligibility (which
+        # requires a real Execution lookup) is entirely deferred to the
+        # GLOBAL Phase 2c below.
         for command in _prioritized_nonterminal_commands(commands):
             if (project_id, command["command_id"]) in just_promoted:
                 continue
             if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
                 break
-            _run_recent(project_id, command)
-        # Only once every nonterminal command in this SAME batch has been
-        # handled, and only if this tick still has both a process_command()
-        # slot and time budget left, consider terminal-recovery backlog --
-        # bounded to this already-hydrated batch (never a new/unbounded
-        # lookup pass) and deadline-checked before every single Execution
-        # read, so a slow or failing lookup can only ever cost the rest of
-        # ITS OWN classification, never the nonterminal work already done.
-        if len(results) < MAX_COMMANDS_PER_POLL and time.monotonic() < recent_deadline:
-            remaining_slots = MAX_COMMANDS_PER_POLL - len(results)
-            for command in _terminal_recovery_candidates(commands, store, recent_deadline, remaining_slots):
-                if (project_id, command["command_id"]) in just_promoted:
-                    continue
-                if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
-                    break
-                _run_recent(project_id, command)
+            _run(project_id, command)
 
-    # Phase 2b: regular full bounded command processing, same rotated project
-    # order, using whatever budget remains after the recent-command sweep.
     for project_id in project_ids:
         if time.monotonic() >= deadline:
             break
@@ -1876,32 +1938,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             # 1's waiting_quota sweep above is already independent of this
             # loop entirely, unlike before this restructure).
             continue
-
-        def _run_full(command):
-            try:
-                results.append(process_command(store, service, command, allowlist=allowlist,
-                                               origin_context=origin_context, async_launch=async_launch, **factories))
-            except Exception as exc:
-                # One command's processing must never take the rest of this
-                # project's queue -- or any later-rotated project's -- down
-                # with it. Before this isolation existed, an uncaught
-                # exception here propagated straight out of poll_once() and
-                # was only ever caught by main()'s top-level `except
-                # Exception`, which discards the whole tick's results and
-                # retries next minute -- with the SAME command still first
-                # in priority order (claimed/running always sort ahead of
-                # queued), so a command that reliably threw once reliably
-                # threw on every subsequent tick too, indefinitely starving
-                # every other command in the same project behind it.
-                # Recording the failure here and moving on to the next
-                # command keeps that guarantee real: a single bad record's
-                # blast radius is itself, not its neighbors.
-                results.append({"status": "error", "project_id": project_id,
-                                "command_id": command["command_id"], "error": repr(exc)})
-
-        # P0-A fix: same nonterminal-first, terminal-recovery-second split
-        # as Phase 2a above, over this phase's own (larger, still bounded)
-        # hydrated batch.
+        _remember_batch(project_id, commands)
         for command in _prioritized_nonterminal_commands(commands):
             if (project_id, command["command_id"]) in just_promoted:
                 continue  # promoted this same tick -- launches on a later natural tick, not this one
@@ -1921,10 +1958,37 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
                 break
             if time.monotonic() >= deadline:
                 return results
-            _run_full(command)
-        if len(results) < MAX_COMMANDS_PER_POLL and time.monotonic() < deadline:
-            remaining_slots = MAX_COMMANDS_PER_POLL - len(results)
-            for command in _terminal_recovery_candidates(commands, store, deadline, remaining_slots):
+            _run(project_id, command)
+
+    # Phase 2c: GLOBAL terminal-recovery classification -- only now, after
+    # EVERY rotated project's nonterminal work (both sweeps) has already
+    # had its turn, and only from the batches already cached above (never
+    # a new enumeration). `lookup_budget` bounds LOOKUP ATTEMPTS (not
+    # eligible results -- see _terminal_recovery_candidates()'s own
+    # docstring) and is threaded across every project's cached batch in
+    # the SAME rotated order used throughout this tick, so which project's
+    # terminal backlog gets first look at the budget naturally rotates
+    # tick over tick along with everything else -- historical R17-shaped
+    # backlog in a later-rotated project is never permanently starved by
+    # an earlier one always consuming the whole budget first.
+    #
+    # `classification_store`, if given, is what actually bounds a single
+    # lookup's own worst-case duration to something far shorter than the
+    # whole poll budget (TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS, via a
+    # genuinely different, shorter-timeout transport -- see main()'s
+    # construction of it and _terminal_recovery_candidates()'s docstring);
+    # defaults to `store` when omitted, exactly like `discovery_store`/
+    # `recent_store` above, reproducing prior behavior for any caller not
+    # yet updated to pass it.
+    if len(results) < MAX_COMMANDS_PER_POLL and time.monotonic() < deadline:
+        lookup_budget = MAX_COMMANDS_PER_POLL - len(results)
+        for project_id in projects_with_batches:
+            if lookup_budget <= 0 or len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= deadline:
+                break
+            commands = list(hydrated_commands_by_project[project_id].values())
+            candidates, lookup_budget = _terminal_recovery_candidates(
+                commands, classification_store, deadline, lookup_budget)
+            for command in candidates:
                 if (project_id, command["command_id"]) in just_promoted:
                     continue
                 if (project_id, command["command_id"]) in processed:
@@ -1933,7 +1997,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
                     break
                 if time.monotonic() >= deadline:
                     return results
-                _run_full(command)
+                _run(project_id, command)
     return results
 
 
@@ -1967,6 +2031,18 @@ def main(argv=None):
             discovery_store = DriveRecords(discovery_service)
             recent_service = build_service(timeout=RECENT_COMMAND_DISCOVERY_TIMEOUT_SECONDS)
             recent_store = DriveRecords(recent_service)
+            # Residual-P0-A fix: a THIRD separate, short-timeout service+store
+            # dedicated to terminal-recovery Execution lookups
+            # (poll_once()'s Phase 2c / _terminal_recovery_candidates()) --
+            # the same reasoning as discovery_store/recent_store above
+            # applies: a real transport timeout is a property of the
+            # *service* a DriveRecords was built from, so this is the only
+            # way to make a single classification lookup's own worst case
+            # genuinely bounded to TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS
+            # instead of the shared ~45s default every write/active-
+            # lifecycle call on `store` still correctly uses.
+            classification_service = build_service(timeout=TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS)
+            classification_store = DriveRecords(classification_service)
             ingress = []
             # embedded_ingress_enabled() gates this independent of the
             # folder-id env var below -- see its docstring for the
@@ -1975,6 +2051,7 @@ def main(argv=None):
                 from manager.drive_dispatch_ingress import poll_drive_dispatch_requests
                 ingress = poll_drive_dispatch_requests(store, service, os.environ.get("ADM_LOCK_GCS_BUCKET"))
             result = poll_once(store, service, discovery_store=discovery_store, recent_store=recent_store,
+                               classification_store=classification_store,
                                origin_context=invocation,
                                async_launch=True)
             print(json.dumps({"status": "ok", "host": socket.gethostname()[:100], "ingress": ingress,
