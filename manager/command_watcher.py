@@ -310,6 +310,10 @@ def _terminal_cleanup_confirmed(execution):
             if execution.get("access") == "read_only" else writer_release == "released")
 
 
+_RECOVERABLE_PERSISTENCE_VALUES = ("partial", "incomplete")
+_RECOVERABLE_TASK_CLAIM_RELEASE_VALUES = ("retained", "release_pending")
+
+
 def _terminal_command_needs_recovery(store, command):
     """R17: a Command already marked completed/failed must not be trusted
     on its own -- its linked Execution may still have durable cleanup work
@@ -320,7 +324,31 @@ def _terminal_command_needs_recovery(store, command):
     provider_outcome/persisted/writer_release to all agree): a harmless
     cleanup_evidence variation with its own dedicated recovery path must
     not pull an otherwise fully-converged Command back into reconciliation
-    on every tick."""
+    on every tick.
+
+    P0-B fix: eligibility requires AFFIRMATIVE durable evidence of
+    outstanding recovery work -- never inferred from missing/ambiguous
+    evidence. Before this fix, `execution.get("cleanup_evidence") or {}`
+    turned a genuinely absent/null cleanup_evidence into `{}`, and
+    `{}.get("persistence") != "complete"` then evaluated True: "we don't
+    know" was silently treated as "definitely still incomplete", which is
+    not something this durable record has actually proven. The real R17
+    shape (cleanup_evidence.persistence="partial",
+    task_claim_release="retained") is still eligible -- it is exactly the
+    affirmative case this function exists to catch -- but a Command whose
+    Execution has no cleanup_evidence at all, an empty one, or an
+    unrecognized/unexpected value for either field is now NOT eligible:
+    only a recognized, explicitly-recorded "still incomplete" value on
+    EITHER field is accepted (checked against a fixed allowlist of known
+    values, never a not-equal-to-known-good check, so an unknown enum
+    value fails closed the same way missing evidence does).
+
+    Any exception from the Execution lookup itself (a genuinely missing
+    record, a transport/timeout-shaped failure, or anything else) is
+    treated as "not eligible this tick", not raised -- see
+    _terminal_recovery_candidates()'s own per-candidate fail-closed
+    handling, which this defers to for anything beyond a plain missing
+    record."""
     execution_id = command.get("execution_id")
     if not execution_id:
         return False
@@ -330,8 +358,14 @@ def _terminal_command_needs_recovery(store, command):
         return False
     if execution.get("status") not in ("completed", "failed", "interrupted"):
         return False
-    evidence = execution.get("cleanup_evidence") or {}
-    return evidence.get("persistence") != "complete" or evidence.get("task_claim_release") != "released"
+    evidence = execution.get("cleanup_evidence")
+    if not isinstance(evidence, dict) or not evidence:
+        return False
+    if evidence.get("persistence") in _RECOVERABLE_PERSISTENCE_VALUES:
+        return True
+    if evidence.get("task_claim_release") in _RECOVERABLE_TASK_CLAIM_RELEASE_VALUES:
+        return True
+    return False
 
 
 def _attention(store, command, execution, reason):
@@ -1539,48 +1573,31 @@ def _promote_waiting_quota_task(store, service, task, quota_document):
 _COMMAND_PRIORITY = {"claimed": 0, "running": 0, "queued": 1, "attention": 2}
 
 
-def _prioritized_commands(commands, store=None):
+def _prioritized_nonterminal_commands(commands):
     """Stable-reorder one project's already-hydrated, already-hydration-bounded
     Command batch so active-lifecycle authority (claimed/running) is always
-    considered first, actionable new work (queued) second, and stale/recovery
-    backlog (attention, and now a terminal command still needing incomplete-
-    persistence recovery) last. This changes only the ORDER process_command()
-    is called in for an already-returned batch; it does not change which
-    records are in the batch (list_records_bounded's own deadline-bounded
-    hydration is untouched), how many get processed (MAX_COMMANDS_PER_POLL is
-    still enforced by the caller), or any process_command()/_reconcile_active()
-    semantics.
+    considered first, actionable new work (queued) second, and stale
+    backlog (attention) last. Pure and zero-remote-lookup: every completed/
+    failed Command is dropped here unconditionally, exactly like the
+    original inline filter poll_once() always had -- terminal-recovery
+    eligibility (which requires a real Execution lookup) is a SEPARATE,
+    deliberately later concern, see _terminal_recovery_candidates().
 
-    P0 fix: an ordinary, fully-converged completed/failed Command is still
-    dropped here (exactly as before) -- but one whose linked Execution still
-    has incomplete cleanup/materialization (_terminal_command_needs_recovery)
-    is now KEPT, sorting after "attention" (unmapped statuses fall through
-    _COMMAND_PRIORITY's default rank, already lower priority than every
-    mapped status) since it is exactly the same "stale/recovery backlog"
-    class of work. Before this fix, _prioritized_commands() unconditionally
-    dropped every completed/failed Command regardless of its Execution's
-    cleanup state, which meant process_command()'s own _terminal_command_
-    needs_recovery()/_reconcile_active() recovery logic (added for R17) could
-    never actually be reached via poll_once()'s scheduled path -- only a
-    direct process_command() call (e.g. a test, or a manual CLI) could ever
-    trigger it. A real historical stuck R17-shaped Command reproduced this
-    live: reconciliation logic that is provably correct when invoked was
-    simply never invoked by the one code path meant to invoke it naturally.
+    P0-A fix: this function previously (briefly) also decided terminal-
+    recovery eligibility inline, via an optional `store` argument -- that
+    made ordinary priority sorting do a synchronous primary-store Execution
+    lookup for every terminal record in the batch, which could let one
+    slow/failing lookup consume the tick's time budget or raise before
+    claimed/running/queued/attention work -- work that needs ZERO remote
+    calls -- ever got its chance to run. This function is now provably
+    lookup-free: it only ever reads fields already present on the
+    in-memory `commands` list.
 
-    Bounded/fair by construction, not by accident: `commands` here is
-    already the SAME small, deadline-hydrated batch this function always
-    received (RECENT_COMMANDS_PER_PROJECT=2 for the recent sweep, or
-    whatever a project's bounded hydration window returned for the full
-    sweep) -- checking each terminal candidate's Execution cleanup_evidence
-    is one extra store.get() per terminal record already IN that bounded
-    batch, never an unbounded scan of a project's full historical backlog.
-    `_terminal_command_needs_recovery` never launches a provider -- see its
-    own docstring and _reconcile_active()'s terminal branch, which only ever
-    calls retry_incomplete_terminal_persistence()/recover_task_claim().
-    `store=None` (e.g. an older/test caller that hasn't been updated)
-    preserves the exact prior behavior of dropping every terminal record,
-    since there is then no way to safely check for outstanding recovery
-    work.
+    This changes only the ORDER process_command() is called in for an
+    already-returned batch; it does not change which records are in the
+    batch (list_records_bounded's own deadline-bounded hydration is
+    untouched) or how many get processed (MAX_COMMANDS_PER_POLL is still
+    enforced by the caller).
 
     Why the attention-vs-queued ordering rule exists at all: a stale
     `attention` Command sitting ahead of a `queued` one in Drive's own
@@ -1590,16 +1607,74 @@ def _prioritized_commands(commands, store=None):
     indefinitely -- see the real production trace this fixes. Sorting is
     stable (Python's sorted()), so relative order within each priority group
     is preserved unchanged from Drive's own return order."""
-    def keep(command):
-        status = command.get("status")
-        if status not in ("completed", "failed"):
-            return True
-        return store is not None and _terminal_command_needs_recovery(store, command)
-
     return sorted(
-        (c for c in commands if keep(c)),
+        (c for c in commands if c.get("status") not in ("completed", "failed")),
         key=lambda c: _COMMAND_PRIORITY.get(c.get("status"), len(_COMMAND_PRIORITY)),
     )
+
+
+def _terminal_recovery_candidates(commands, store, deadline, remaining_slots):
+    """The SECOND, deliberately later pass over the SAME already-hydrated,
+    already-bounded Command batch _prioritized_nonterminal_commands() just
+    finished: pick out completed/failed records whose linked Execution
+    still needs cleanup/materialization recovery
+    (_terminal_command_needs_recovery), so process_command()'s existing
+    _reconcile_active() logic (added for R17, never able to fire from
+    poll_once() before this fix) actually gets a chance to run.
+
+    P0-A fix, callers must only invoke this AFTER every nonterminal command
+    in the same batch has already been processed (or the tick ran out of
+    slots/time trying) -- never interleaved with or ahead of it. Bounded
+    and fail-closed by construction:
+
+    - `remaining_slots` <= 0 short-circuits to an empty list immediately --
+      no lookups are attempted when there is no process_command() slot left
+      to use them on.
+    - `time.monotonic() >= deadline` is checked BEFORE every single
+      candidate's Execution lookup, not just once at entry -- a lookup that
+      would start past the deadline is never attempted at all, and
+      classification simply stops there (whatever was already found is
+      still returned; nothing already-decided is thrown away).
+    - Each candidate's eligibility check is individually wrapped: ANY
+      exception (TaskError, a transport/timeout-shaped failure, or
+      anything else) is treated as "not eligible this tick" and moves on
+      to the NEXT candidate -- it never aborts this function, and
+      therefore never aborts the whole poll_once() tick the way an
+      unhandled exception from here reaching poll_once()'s outer per-
+      command try/except would still have contained, but only after
+      possibly burning the rest of the tick's budget first.
+    - Never a new/separate/unbounded scan: `commands` is exactly the same
+      small batch (RECENT_COMMANDS_PER_PROJECT=2 for the recent sweep, or
+      whatever a project's bounded hydration window returned for the full
+      sweep) already fetched by the caller -- at most one extra store.get()
+      per completed/failed record already in it.
+
+    Returned in Drive's own original relative order (not re-sorted) -- by
+    construction every kept record already shares the same "no explicit
+    priority tier" default rank in _COMMAND_PRIORITY, and this pass never
+    runs until every higher-priority record has already had its turn, so
+    no additional sort is meaningful here."""
+    if remaining_slots <= 0:
+        return []
+    candidates = []
+    for command in commands:
+        if command.get("status") not in ("completed", "failed"):
+            continue
+        if len(candidates) >= remaining_slots:
+            break
+        if time.monotonic() >= deadline:
+            break
+        try:
+            eligible = _terminal_command_needs_recovery(store, command)
+        except Exception:
+            # Fail closed FOR THIS CANDIDATE ONLY (P0-A): an ambiguous or
+            # failed lookup is never treated as "needs recovery", and never
+            # propagates -- the next candidate (and every already-processed
+            # nonterminal command) is completely unaffected.
+            eligible = False
+        if eligible:
+            candidates.append(command)
+    return candidates
 
 
 def poll_once(store, service, allowlist=None, deadline=None, discovery_store=None, recent_store=None, origin_context=None,
@@ -1639,14 +1714,20 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     contiguously on each visit. This eliminates cross-project time starvation
     and orbital GCD record starvation caused by wall-clock aliasing.
 
-    Within one project's already-returned bounded batch, commands are
-    processed in _prioritized_commands() order (claimed/running, then
-    queued, then attention -- stable within each group), not Drive's own
-    return order, so a tight remaining budget after discovery spends its one
-    available process_command() slot on active-lifecycle authority or new
-    actionable work before stale attention/recovery backlog. See
-    _prioritized_commands()'s docstring for the production trace that
-    motivated this."""
+    Within one project's already-returned bounded batch, nonterminal
+    commands are processed in _prioritized_nonterminal_commands() order
+    (claimed/running, then queued, then attention -- stable within each
+    group), not Drive's own return order, so a tight remaining budget after
+    discovery spends its one available process_command() slot on active-
+    lifecycle authority or new actionable work before stale attention
+    backlog. See _prioritized_nonterminal_commands()'s docstring for the
+    production trace that motivated this. Only once that pass is complete
+    (and only if a process_command() slot and time budget remain) does a
+    second, separate pass consider terminal-recovery backlog for the same
+    batch -- see _terminal_recovery_candidates()'s docstring for the P0-A
+    production trace (a slow/failing terminal-recovery Execution lookup
+    must never delay or starve the nonterminal pass) that motivated
+    splitting this into two passes instead of one combined sort."""
     if allowlist is None:
         allowlist = load_allowlist()
     if deadline is None:
@@ -1735,6 +1816,15 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     # path for older claimed/running/attention records.
     processed = set()
     recent_deadline = min(deadline, time.monotonic() + RECENT_COMMAND_SWEEP_BUDGET_SECONDS)
+    def _run_recent(project_id, command):
+        try:
+            results.append(process_command(store, service, command, allowlist=allowlist,
+                                           origin_context=origin_context, async_launch=async_launch, **factories))
+        except Exception as exc:
+            results.append({"status": "error", "project_id": project_id,
+                            "command_id": command["command_id"], "error": repr(exc)})
+        processed.add((project_id, command["command_id"]))
+
     for project_id in project_ids:
         if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
             break
@@ -1742,19 +1832,32 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             commands = _enumerate_recent_commands(recent_store, project_id, deadline=recent_deadline)
         except TaskError:
             continue
-        for command in _prioritized_commands(commands, store=store):
+        # P0-A fix: zero-remote-lookup nonterminal priority work (claimed/
+        # running/queued/attention) is fully processed FIRST, in this
+        # already-hydrated bounded batch -- never delayed or starved by a
+        # terminal record's own recovery-eligibility check, which requires
+        # a real Execution lookup that can be slow or fail.
+        for command in _prioritized_nonterminal_commands(commands):
             if (project_id, command["command_id"]) in just_promoted:
                 continue
             if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
                 break
-            try:
-                results.append(process_command(store, service, command, allowlist=allowlist,
-                                               origin_context=origin_context, async_launch=async_launch, **factories))
-                processed.add((project_id, command["command_id"]))
-            except Exception as exc:
-                results.append({"status": "error", "project_id": project_id,
-                                "command_id": command["command_id"], "error": repr(exc)})
-                processed.add((project_id, command["command_id"]))
+            _run_recent(project_id, command)
+        # Only once every nonterminal command in this SAME batch has been
+        # handled, and only if this tick still has both a process_command()
+        # slot and time budget left, consider terminal-recovery backlog --
+        # bounded to this already-hydrated batch (never a new/unbounded
+        # lookup pass) and deadline-checked before every single Execution
+        # read, so a slow or failing lookup can only ever cost the rest of
+        # ITS OWN classification, never the nonterminal work already done.
+        if len(results) < MAX_COMMANDS_PER_POLL and time.monotonic() < recent_deadline:
+            remaining_slots = MAX_COMMANDS_PER_POLL - len(results)
+            for command in _terminal_recovery_candidates(commands, store, recent_deadline, remaining_slots):
+                if (project_id, command["command_id"]) in just_promoted:
+                    continue
+                if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
+                    break
+                _run_recent(project_id, command)
 
     # Phase 2b: regular full bounded command processing, same rotated project
     # order, using whatever budget remains after the recent-command sweep.
@@ -1773,7 +1876,33 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             # 1's waiting_quota sweep above is already independent of this
             # loop entirely, unlike before this restructure).
             continue
-        for command in _prioritized_commands(commands, store=store):
+
+        def _run_full(command):
+            try:
+                results.append(process_command(store, service, command, allowlist=allowlist,
+                                               origin_context=origin_context, async_launch=async_launch, **factories))
+            except Exception as exc:
+                # One command's processing must never take the rest of this
+                # project's queue -- or any later-rotated project's -- down
+                # with it. Before this isolation existed, an uncaught
+                # exception here propagated straight out of poll_once() and
+                # was only ever caught by main()'s top-level `except
+                # Exception`, which discards the whole tick's results and
+                # retries next minute -- with the SAME command still first
+                # in priority order (claimed/running always sort ahead of
+                # queued), so a command that reliably threw once reliably
+                # threw on every subsequent tick too, indefinitely starving
+                # every other command in the same project behind it.
+                # Recording the failure here and moving on to the next
+                # command keeps that guarantee real: a single bad record's
+                # blast radius is itself, not its neighbors.
+                results.append({"status": "error", "project_id": project_id,
+                                "command_id": command["command_id"], "error": repr(exc)})
+
+        # P0-A fix: same nonterminal-first, terminal-recovery-second split
+        # as Phase 2a above, over this phase's own (larger, still bounded)
+        # hydrated batch.
+        for command in _prioritized_nonterminal_commands(commands):
             if (project_id, command["command_id"]) in just_promoted:
                 continue  # promoted this same tick -- launches on a later natural tick, not this one
             if (project_id, command["command_id"]) in processed:
@@ -1792,27 +1921,19 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
                 break
             if time.monotonic() >= deadline:
                 return results
-            try:
-                results.append(process_command(store, service, command, allowlist=allowlist,
-                                               origin_context=origin_context, async_launch=async_launch, **factories))
-            except Exception as exc:
-                # One command's processing must never take the rest of this
-                # project's queue -- or any later-rotated project's -- down
-                # with it. Before this isolation existed, an uncaught
-                # exception here propagated straight out of poll_once() and
-                # was only ever caught by main()'s top-level `except
-                # Exception`, which discards the whole tick's results and
-                # retries next minute -- with the SAME command still first
-                # in _prioritized_commands() order (claimed/running always
-                # sort ahead of queued), so a command that reliably threw
-                # once reliably threw on every subsequent tick too,
-                # indefinitely starving every other command in the same
-                # project behind it. Recording the failure here and moving
-                # on to the next command keeps that guarantee real: a
-                # single bad record's blast radius is itself, not its
-                # neighbors.
-                results.append({"status": "error", "project_id": project_id,
-                                "command_id": command["command_id"], "error": repr(exc)})
+            _run_full(command)
+        if len(results) < MAX_COMMANDS_PER_POLL and time.monotonic() < deadline:
+            remaining_slots = MAX_COMMANDS_PER_POLL - len(results)
+            for command in _terminal_recovery_candidates(commands, store, deadline, remaining_slots):
+                if (project_id, command["command_id"]) in just_promoted:
+                    continue
+                if (project_id, command["command_id"]) in processed:
+                    continue
+                if len(results) == MAX_COMMANDS_PER_POLL:
+                    break
+                if time.monotonic() >= deadline:
+                    return results
+                _run_full(command)
     return results
 
 

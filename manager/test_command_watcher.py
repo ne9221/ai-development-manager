@@ -17,7 +17,8 @@ from manager.command_watcher import (
     POLL_TIME_BUDGET_SECONDS, PROVIDER_RUNTIMES,
     REQUIRED_TASK_POLICIES, _provider_state, _enumerate_waiting_quota_tasks, _promote_waiting_quota_task,
     _reconcile_active,
-    _prioritized_commands, claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist,
+    _prioritized_nonterminal_commands, _terminal_recovery_candidates, _terminal_command_needs_recovery,
+    claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist,
     poll_once, process_command, provider_quota_reliable, resolve_provider_runtime, _spawn_claimed_worker,
 )
 from manager.execution_lifecycle import enter_running_gate
@@ -1782,8 +1783,8 @@ class PollOncePerCommandIsolationTests(unittest.TestCase):
     """Covers a real P0: before this isolation existed, an uncaught
     exception raised while processing ONE command propagated straight out
     of poll_once() (the Phase 2 loop had no per-command try/except),
-    aborting the entire tick. Because _prioritized_commands() always sorts
-    claimed/running ahead of queued, a command that reliably threw on every
+    aborting the entire tick. Because _prioritized_nonterminal_commands()
+    always sorts claimed/running ahead of queued, a command that reliably threw on every
     attempt would reliably abort the tick before any LATER command in the
     same project -- or any later-rotated project -- was ever reached,
     starving them indefinitely. main()'s own top-level `except Exception`
@@ -1850,19 +1851,19 @@ class CommandProcessingPriorityTests(unittest.TestCase):
 
     def test_attention_then_queued_is_reordered_queued_first(self):
         batch = [command(command_id="c-attn", status="attention"), command(command_id="c-queued", status="queued")]
-        ordered = _prioritized_commands(batch)
+        ordered = _prioritized_nonterminal_commands(batch)
         self.assertEqual(["c-queued", "c-attn"], [c["command_id"] for c in ordered])
 
     def test_running_queued_attention_order_is_unchanged(self):
         batch = [command(command_id="c-run", status="running"), command(command_id="c-queued", status="queued"),
                  command(command_id="c-attn", status="attention")]
-        ordered = _prioritized_commands(batch)
+        ordered = _prioritized_nonterminal_commands(batch)
         self.assertEqual(["c-run", "c-queued", "c-attn"], [c["command_id"] for c in ordered])
 
     def test_claimed_queued_attention_order_is_unchanged(self):
         batch = [command(command_id="c-claim", status="claimed"), command(command_id="c-queued", status="queued"),
                  command(command_id="c-attn", status="attention")]
-        ordered = _prioritized_commands(batch)
+        ordered = _prioritized_nonterminal_commands(batch)
         self.assertEqual(["c-claim", "c-queued", "c-attn"], [c["command_id"] for c in ordered])
 
     def test_ordering_is_stable_within_each_priority_group(self):
@@ -1874,7 +1875,7 @@ class CommandProcessingPriorityTests(unittest.TestCase):
             command(command_id="c-run-1", status="running"),
             command(command_id="c-claim-1", status="claimed"),
         ]
-        ordered = _prioritized_commands(batch)
+        ordered = _prioritized_nonterminal_commands(batch)
         # claimed/running group keeps its own relative (Drive-return) order,
         # then queued group keeps its own relative order, then attention.
         self.assertEqual(
@@ -1889,7 +1890,7 @@ class CommandProcessingPriorityTests(unittest.TestCase):
             command(command_id="c-queued", status="queued"),
             command(command_id="c-attn", status="attention"),
         ]
-        ordered = _prioritized_commands(batch)
+        ordered = _prioritized_nonterminal_commands(batch)
         self.assertEqual(["c-queued", "c-attn"], [c["command_id"] for c in ordered])
 
     def test_project_rotation_is_untouched_by_this_fix(self):
@@ -1902,25 +1903,114 @@ class CommandProcessingPriorityTests(unittest.TestCase):
         self.assertEqual(_rotated_project_ids(ids, now=0.0), _rotated_project_ids(ids, now=0.0))
 
 
+class TerminalCommandNeedsRecoveryEligibilityTests(unittest.TestCase):
+    """P0-B fix: _terminal_command_needs_recovery() must classify eligibility
+    from AFFIRMATIVE durable evidence only, never from missing/ambiguous
+    evidence. Before this fix, `execution.get("cleanup_evidence") or {}`
+    turned a genuinely absent/null cleanup_evidence into `{}`, and
+    `{}.get(...) != "complete"` (or `!= "released"`) then evaluated True --
+    "we don't know" was silently misclassified as "definitely still
+    incomplete". The real R17 shape (persistence="partial",
+    task_claim_release="retained") must remain eligible throughout."""
+
+    def setUp(self):
+        self.store = CommandWatcherTests.allowlist_compliant_store()
+
+    def _execution(self, status="completed", cleanup_evidence=None):
+        exec_doc = {"execution_id": "exec-1", "project_id": "p1", "task_id": "t1", "status": status}
+        if cleanup_evidence is not None:
+            exec_doc["cleanup_evidence"] = cleanup_evidence
+        self.store.put("executions", "p1", "exec-1", exec_doc)
+        return command(command_id="cmd-1", status=status, execution_id="exec-1")
+
+    # 15: ordinary fully-converged terminal Command -> not eligible.
+    def test_persistence_complete_and_released_not_eligible(self):
+        cmd = self._execution(cleanup_evidence={"persistence": "complete", "task_claim_release": "released"})
+        self.assertFalse(_terminal_command_needs_recovery(self.store, cmd))
+
+    # 14: the real R17 shape -> still eligible.
+    def test_r17_shape_partial_and_retained_eligible(self):
+        cmd = self._execution(cleanup_evidence={"persistence": "partial", "task_claim_release": "retained"})
+        self.assertTrue(_terminal_command_needs_recovery(self.store, cmd))
+
+    # 9: cleanup_evidence is None -> not eligible (was the exact bug).
+    def test_cleanup_evidence_none_not_eligible(self):
+        cmd = self._execution(cleanup_evidence=None)
+        self.assertFalse(_terminal_command_needs_recovery(self.store, cmd))
+
+    # 10: cleanup_evidence is an empty dict -> not eligible.
+    def test_cleanup_evidence_empty_dict_not_eligible(self):
+        cmd = self._execution(cleanup_evidence={})
+        self.assertFalse(_terminal_command_needs_recovery(self.store, cmd))
+
+    # 11: persistence key entirely absent, and no other affirmative marker
+    # -> not eligible.
+    def test_missing_persistence_key_not_eligible(self):
+        cmd = self._execution(cleanup_evidence={"task_claim_release": "released"})
+        self.assertFalse(_terminal_command_needs_recovery(self.store, cmd))
+
+    # 12: task_claim_release key entirely absent, and no other affirmative
+    # marker -> not eligible.
+    def test_missing_task_claim_release_key_not_eligible(self):
+        cmd = self._execution(cleanup_evidence={"persistence": "complete"})
+        self.assertFalse(_terminal_command_needs_recovery(self.store, cmd))
+
+    # 13: an unrecognized/unexpected enum value on either field fails
+    # closed -- never treated as "not equal to complete/released, so it
+    # must be incomplete".
+    def test_unknown_persistence_enum_fails_closed(self):
+        cmd = self._execution(cleanup_evidence={"persistence": "mid-flight-unknown-value", "task_claim_release": "released"})
+        self.assertFalse(_terminal_command_needs_recovery(self.store, cmd))
+
+    def test_unknown_task_claim_release_enum_fails_closed(self):
+        cmd = self._execution(cleanup_evidence={"persistence": "complete", "task_claim_release": "somehow-else"})
+        self.assertFalse(_terminal_command_needs_recovery(self.store, cmd))
+
+    # 16: terminal Command whose linked Execution is not itself terminal
+    # -> not eligible (existing guard, still correct after the fix).
+    def test_non_terminal_execution_not_eligible(self):
+        cmd = self._execution(status="running", cleanup_evidence={"persistence": "partial", "task_claim_release": "retained"})
+        self.assertFalse(_terminal_command_needs_recovery(self.store, cmd))
+
+    # Either affirmative marker alone is sufficient ("at least one of A/B").
+    def test_persistence_partial_alone_is_sufficient_even_if_claim_released(self):
+        cmd = self._execution(cleanup_evidence={"persistence": "partial", "task_claim_release": "released"})
+        self.assertTrue(_terminal_command_needs_recovery(self.store, cmd))
+
+    def test_task_claim_retained_alone_is_sufficient_even_if_persistence_complete(self):
+        cmd = self._execution(cleanup_evidence={"persistence": "complete", "task_claim_release": "retained"})
+        self.assertTrue(_terminal_command_needs_recovery(self.store, cmd))
+
+    def test_missing_execution_not_eligible(self):
+        cmd = command(command_id="cmd-1", status="completed", execution_id="exec-does-not-exist")
+        self.assertFalse(_terminal_command_needs_recovery(self.store, cmd))
+
+
 class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
-    """P0 fix: a terminal (completed/failed) Command whose linked Execution
-    still has incomplete cleanup/materialization must be reachable by the
-    real scheduled poll_once() path, not just by a direct process_command()
-    call. Before this fix, _prioritized_commands() unconditionally dropped
-    every completed/failed Command before process_command() was ever
-    called on it -- process_command()'s own _terminal_command_needs_recovery()
-    /_reconcile_active() recovery logic (added for R17) was correct but
-    dead from poll_once()'s perspective. A real historical stuck R17-shaped
-    Command (Command completed, Execution completed, cleanup_evidence.
-    persistence='partial', task_claim_release='retained') reproduced this
-    live: still unconverged after 65+ real scheduled ticks."""
+    """P0-A fix: a terminal (completed/failed) Command whose linked
+    Execution still has incomplete cleanup/materialization must be
+    reachable by the real scheduled poll_once() path -- but NEVER at the
+    cost of delaying, starving, or risking an abort of already-actionable
+    claimed/running/queued/attention work, since checking terminal
+    eligibility requires a real Execution lookup that can be slow or fail.
+
+    Before this fix, terminal-recovery eligibility was decided as part of
+    the SAME priority-ordering pass as everything else
+    (_prioritized_commands(commands, store=store)), so a slow or failing
+    terminal lookup could consume the tick's time budget or raise before
+    zero-lookup nonterminal work ever got its turn. The fix splits this
+    into two passes -- _prioritized_nonterminal_commands() (pure, zero
+    lookups) always runs to completion first; _terminal_recovery_
+    candidates() (bounded, deadline-checked, per-candidate fail-closed)
+    only runs afterward, and only if a process_command() slot and time
+    budget remain."""
 
     ALLOWLIST = frozenset({("p1", "t1")})
 
     def setUp(self):
         self.store = CommandWatcherTests.allowlist_compliant_store()
 
-    def _terminal_command_with_execution(self, status, persistence, task_claim_release="retained"):
+    def _terminal_command_with_execution(self, status, persistence, task_claim_release="retained", command_id="cmd-1", execution_id="command-cmd-1"):
         """Build a real running Execution via enter_running_gate, then push
         it to a terminal outcome with the given cleanup_evidence.persistence
         -- mirrors CommandWatcherTests.test_terminal_execution_without_
@@ -1929,12 +2019,12 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
         the P0 fix contract requires (completed/failed x complete/partial)."""
         now = datetime.now(timezone.utc)
         started = CommandWatcherTests.iso(now - timedelta(minutes=5))
-        reserve_execution(self.store, "p1", "t1", "command-cmd-1", "codex", {"decision": "fresh"})
+        reserve_execution(self.store, "p1", "t1", execution_id, "codex", {"decision": "fresh"})
         claim = MemoryClaimRegistry()
         with patch("manager.execution_lifecycle.read_drive_status", return_value=quota_document()):
-            enter_running_gate(self.store, object(), None, "p1", "t1", "command-cmd-1", "codex",
+            enter_running_gate(self.store, object(), None, "p1", "t1", execution_id, "codex",
                                "read_only", started_at=started, task_claim_registry=claim)
-        execution = self.store.get("executions", "p1", "command-cmd-1")
+        execution = self.store.get("executions", "p1", execution_id)
         execution.update(
             status=status, completed_at=now_iso(), finished_at=now_iso(),
             elapsed_minutes=5, quota_after={}, quota_delta={}, terminal_reason=status,
@@ -1945,77 +2035,188 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
                 "errors": [] if persistence == "complete" else ["persistence failed: simulated Drive verification failure"],
             },
         )
-        self.store.put("executions", "p1", "command-cmd-1", execution)
-        cmd = command(status=status, execution_id="command-cmd-1", claimed_at=started,
+        self.store.put("executions", "p1", execution_id, execution)
+        cmd = command(command_id=command_id, status=status, execution_id=execution_id, claimed_at=started,
                       completed_at=now_iso(), result={"status": status, "session_id": None, "error_kind": None})
-        self.store.put("commands", "p1", "cmd-1", cmd)
+        self.store.put("commands", "p1", command_id, cmd)
         return cmd, claim
 
-    # 1 & 2: an ordinary, fully-converged terminal Command is still dropped.
-    def test_completed_with_persistence_complete_is_not_reprocessed(self):
-        cmd, _claim = self._terminal_command_with_execution("completed", "complete", task_claim_release="released")
-        kept = _prioritized_commands([cmd], store=self.store)
-        self.assertEqual([], kept)
+    def _bare_terminal_command(self, command_id, execution_id, persistence, task_claim_release="retained", status="completed"):
+        """Lighter-weight than _terminal_command_with_execution: writes the
+        Execution record directly instead of going through reserve_execution/
+        enter_running_gate against the shared "t1" Task -- needed whenever a
+        test wants MULTIPLE independent terminal Command/Execution pairs in
+        the same batch, since the real gate requires the Task to still be
+        "ready" and a second real reservation against the same Task after
+        the first has already claimed it would fail for reasons that have
+        nothing to do with what these tests are actually exercising
+        (_terminal_recovery_candidates()'s own bounding/fail-closed
+        behavior, which only ever reads the Execution record)."""
+        cmd = command(command_id=command_id, status=status, execution_id=execution_id)
+        self.store.put("executions", "p1", execution_id, {
+            "execution_id": execution_id, "project_id": "p1", "task_id": "t1", "status": status,
+            "cleanup_evidence": {"persistence": persistence, "task_claim_release": task_claim_release},
+        })
+        self.store.put("commands", "p1", command_id, cmd)
+        return cmd
 
-    def test_failed_with_persistence_complete_is_not_reprocessed(self):
-        cmd, _claim = self._terminal_command_with_execution("failed", "complete", task_claim_release="released")
-        kept = _prioritized_commands([cmd], store=self.store)
-        self.assertEqual([], kept)
+    # --- _prioritized_nonterminal_commands() is provably lookup-free ---
 
-    # 3 & 4: incomplete persistence is now a reconciliation candidate.
-    def test_completed_with_persistence_partial_reaches_reconciliation_candidacy(self):
+    def test_prioritized_nonterminal_commands_never_touches_the_store(self):
+        # Structural proof, not just behavioral: the function's signature
+        # takes no store/registry argument at all, so it is categorically
+        # unable to perform a remote lookup regardless of batch content.
         cmd, _claim = self._terminal_command_with_execution("completed", "partial")
-        kept = _prioritized_commands([cmd], store=self.store)
-        self.assertEqual(["cmd-1"], [c["command_id"] for c in kept])
+        batch = [cmd, command(command_id="c-queued", status="queued"), command(command_id="c-attn", status="attention")]
+        ordered = _prioritized_nonterminal_commands(batch)
+        self.assertEqual(["c-queued", "c-attn"], [c["command_id"] for c in ordered])
 
-    def test_failed_with_persistence_partial_reaches_reconciliation_candidacy(self):
-        cmd, _claim = self._terminal_command_with_execution("failed", "partial")
-        kept = _prioritized_commands([cmd], store=self.store)
-        self.assertEqual(["cmd-1"], [c["command_id"] for c in kept])
+    # 1, 2, 6: nonterminal work (claimed/running/queued/attention) is fully
+    # processed before ANY terminal-recovery Execution lookup is attempted,
+    # even with multiple terminal records ahead of it in Drive's own
+    # (arbitrary) listing order.
+    def test_all_nonterminal_processed_before_any_terminal_lookup(self):
+        term_cmd, claim = self._terminal_command_with_execution("completed", "partial")
+        self.store.put("commands", "p1", "cmd-done-2", command(
+            command_id="cmd-done-2", status="completed", execution_id="command-cmd-1",
+            completed_at="2026-08-01T00:00:00Z", result={"status": "completed"}))
+        self.store.put("commands", "p1", "cmd-queued", command(command_id="cmd-queued"))
+        self.store.put("commands", "p1", "cmd-attn", command(
+            command_id="cmd-attn", status="attention", execution_id="exec-missing"))
 
-    # 6: bounded fairness -- terminal-needing-recovery sorts after attention,
-    # same rank as any other unmapped/backlog status, never ahead of
-    # genuinely actionable claimed/running/queued work.
-    def test_terminal_recovery_candidate_sorts_after_attention_not_ahead_of_queued(self):
+        order = []
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def tracking_needs_recovery(store, cmd):
+            order.append(("terminal_lookup", cmd["command_id"]))
+            return real_needs_recovery(store, cmd)
+
+        def tracking_launch(*args, **kwargs):
+            order.append(("launched", args[7]))
+            kwargs["on_running"](None)
+            return CommandWatcherTests.complete(args[7])
+
+        with patch("manager.command_watcher.launch_task", side_effect=tracking_launch), \
+             patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking_needs_recovery):
+            poll_once(self.store, object(), allowlist=self.ALLOWLIST, deadline=time.monotonic() + 50.0,
+                     claim_factory=lambda *_: claim, health_check=lambda: True, quota_check=lambda service: True)
+
+        launch_index = next(i for i, e in enumerate(order) if e[0] == "launched")
+        first_terminal_lookup_index = next(i for i, e in enumerate(order) if e[0] == "terminal_lookup")
+        self.assertLess(launch_index, first_terminal_lookup_index,
+                        f"queued work must launch before any terminal lookup; order was {order}")
+
+    # 3: a lookup that would start past the deadline is never attempted;
+    # classification stops there, tick is not aborted.
+    def test_terminal_lookup_never_attempted_once_past_deadline(self):
         cmd, _claim = self._terminal_command_with_execution("completed", "partial")
-        batch = [cmd, command(command_id="c-attn", status="attention"), command(command_id="c-queued", status="queued")]
-        ordered = _prioritized_commands(batch, store=self.store)
-        self.assertEqual(["c-queued", "c-attn", "cmd-1"], [c["command_id"] for c in ordered])
 
-    # 7: many ordinary historical fully-converged terminal records mixed in
-    # -- only the genuine backlog item is kept, so this can never regress
-    # into sweeping a project's entire terminal history back into candidacy.
-    def test_many_ordinary_terminal_records_do_not_inflate_the_candidate_set(self):
+        class ExplodingStore:
+            def get(self, *a, **k):
+                raise AssertionError("must not attempt a lookup once the deadline has already passed")
+
+        candidates = _terminal_recovery_candidates([cmd], ExplodingStore(), time.monotonic() - 1.0, remaining_slots=10)
+        self.assertEqual([], candidates)
+
+    def test_terminal_classification_stops_partway_once_deadline_is_reached(self):
+        cmd1 = self._bare_terminal_command("cmd-1", "exec-1", "partial")
+        cmd2 = self._bare_terminal_command("cmd-2", "exec-2", "partial")
+        real_monotonic = time.monotonic
+        deadline = real_monotonic() + 1000.0
+        calls = {"n": 0}
+
+        def fake_monotonic():
+            calls["n"] += 1
+            # First check (before cmd1) is under budget; every check from
+            # the second call onward (before cmd2) is already past it.
+            return deadline - 10.0 if calls["n"] <= 1 else deadline + 10.0
+
+        with patch("manager.command_watcher.time.monotonic", side_effect=fake_monotonic):
+            candidates = _terminal_recovery_candidates([cmd1, cmd2], self.store, deadline, remaining_slots=10)
+        self.assertEqual(["cmd-1"], [c["command_id"] for c in candidates])
+
+    # 7: remaining_slots (derived from MAX_COMMANDS_PER_POLL) is strictly
+    # respected even with more eligible candidates available.
+    def test_remaining_slots_strictly_bounds_returned_candidates(self):
+        cmd1 = self._bare_terminal_command("cmd-1", "exec-1", "partial")
+        cmd2 = self._bare_terminal_command("cmd-2", "exec-2", "partial")
+        cmd3 = self._bare_terminal_command("cmd-3", "exec-3", "partial")
+        candidates = _terminal_recovery_candidates([cmd1, cmd2, cmd3], self.store, time.monotonic() + 1000.0, remaining_slots=2)
+        self.assertEqual(2, len(candidates))
+
+    def test_zero_remaining_slots_skips_classification_entirely(self):
         cmd, _claim = self._terminal_command_with_execution("completed", "partial")
-        noise = [
-            command(command_id=f"c-done-{i}", status="completed", execution_id="command-cmd-1",
-                   completed_at="2026-08-01T00:00:00Z", result={"status": "completed"})
-            for i in range(20)
-        ]
-        # Each noise record points at the SAME already-converged-looking
-        # execution shape by construction (a distinct Execution per historical
-        # Command isn't needed here -- _terminal_command_needs_recovery()
-        # looks up execution_id="command-cmd-1", the one real terminal
-        # Execution seeded above, which has persistence="partial" -- so this
-        # also proves multiple Commands sharing one Execution id all
-        # correctly resolve to the SAME (accurate) recovery verdict, not a
-        # per-Command cache of a stale answer.
-        kept = _prioritized_commands([cmd, *noise], store=self.store)
-        # All 21 resolve to needing recovery (they share the one partial
-        # Execution) -- the real bound here is the batch size itself
-        # (already capped by list_records_bounded upstream), not this
-        # function silently growing it.
-        self.assertEqual(21, len(kept))
-        kept_ids = [c["command_id"] for c in kept]
-        self.assertEqual(len(kept_ids), len(set(kept_ids)))
 
-    def test_store_none_preserves_prior_unconditional_drop_behavior(self):
-        cmd, _claim = self._terminal_command_with_execution("completed", "partial")
-        self.assertEqual([], _prioritized_commands([cmd]))
+        class ExplodingStore:
+            def get(self, *a, **k):
+                raise AssertionError("must not attempt any lookup with zero remaining slots")
 
-    # 5, 8, 9: real end-to-end poll_once() reaches reconciliation for an
-    # R17-shaped record, never launches a provider, and only performs
-    # cleanup/materialization recovery.
+        candidates = _terminal_recovery_candidates([cmd], ExplodingStore(), time.monotonic() + 1000.0, remaining_slots=0)
+        self.assertEqual([], candidates)
+
+    # 4: a TaskError from one candidate's lookup skips only that candidate.
+    def test_taskerror_from_one_candidate_skips_only_that_one(self):
+        broken = command(command_id="cmd-broken", status="completed", execution_id="exec-does-not-exist")
+        healthy, _claim = self._terminal_command_with_execution("completed", "partial", command_id="cmd-healthy", execution_id="exec-healthy")
+        candidates = _terminal_recovery_candidates([broken, healthy], self.store, time.monotonic() + 1000.0, remaining_slots=10)
+        self.assertEqual(["cmd-healthy"], [c["command_id"] for c in candidates])
+
+    # 5: a generic (non-TaskError) transport-shaped exception from one
+    # candidate's lookup also skips only that one -- never aborts.
+    def test_generic_transport_exception_from_one_candidate_skips_only_that_one(self):
+        broken = command(command_id="cmd-broken", status="completed", execution_id="exec-broken")
+        healthy, _claim = self._terminal_command_with_execution("completed", "partial", command_id="cmd-healthy", execution_id="exec-healthy")
+
+        class FlakyStore:
+            def __init__(self, real):
+                self.real = real
+
+            def get(self, area, project_id, name):
+                if area == "executions" and name == "exec-broken":
+                    raise ConnectionError("simulated transport failure")
+                return self.real.get(area, project_id, name)
+
+        candidates = _terminal_recovery_candidates([broken, healthy], FlakyStore(self.store), time.monotonic() + 1000.0, remaining_slots=10)
+        self.assertEqual(["cmd-healthy"], [c["command_id"] for c in candidates])
+
+    def test_generic_transport_exception_does_not_abort_the_whole_tick(self):
+        broken, _c1 = self._terminal_command_with_execution("completed", "partial", command_id="cmd-broken", execution_id="exec-broken")
+        self.store.put("commands", "p1", "cmd-queued", command(command_id="cmd-queued"))
+        real_get = self.store.get
+
+        def flaky_get(area, project_id, name):
+            if area == "executions" and name == "exec-broken":
+                raise ConnectionError("simulated transport failure")
+            return real_get(area, project_id, name)
+
+        runner = Mock(side_effect=lambda *a, **k: (k["on_running"](None), CommandWatcherTests.complete(a[7]))[1])
+        with patch("manager.command_watcher.launch_task", runner), patch.object(self.store, "get", side_effect=flaky_get):
+            results = poll_once(self.store, object(), allowlist=self.ALLOWLIST, deadline=time.monotonic() + 50.0,
+                                claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True)
+        # The tick survived and the queued command still completed --
+        # the broken terminal candidate is simply never in the results.
+        self.assertTrue(any(r.get("status") == "completed" for r in results))
+        self.assertEqual("completed", self.store.get("commands", "p1", "cmd-queued")["result"]["status"])
+
+    # 8: both poll_once() sweeps (recent + full) preserve boundedness --
+    # MAX_COMMANDS_PER_POLL holds even with a mixed nonterminal/terminal
+    # batch larger than the budget.
+    def test_max_commands_per_poll_strictly_enforced_with_mixed_batch(self):
+        for i in range(3):
+            self._bare_terminal_command(f"cmd-term-{i}", f"exec-term-{i}", "partial")
+        self.store.put("commands", "p1", "cmd-queued-1", command(command_id="cmd-queued-1"))
+        self.store.put("commands", "p1", "cmd-queued-2", command(command_id="cmd-queued-2"))
+        self.store.put("commands", "p1", "cmd-queued-3", command(command_id="cmd-queued-3"))
+
+        runner = Mock(side_effect=lambda *a, **k: (k["on_running"](None), CommandWatcherTests.complete(a[7]))[1])
+        with patch("manager.command_watcher.launch_task", runner):
+            results = poll_once(self.store, object(), allowlist=self.ALLOWLIST, deadline=time.monotonic() + 50.0,
+                                claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True)
+        self.assertLessEqual(len(results), MAX_COMMANDS_PER_POLL)
+
+    # Real end-to-end poll_once() reaches reconciliation for an R17-shaped
+    # record, never launches a provider, and only performs cleanup/
+    # materialization recovery -- the actual live production repro.
     def test_poll_once_reaches_r17_shaped_record_without_relaunching_provider(self):
         cmd, claim = self._terminal_command_with_execution("completed", "partial")
         launcher = Mock()
@@ -2030,6 +2231,18 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
         self.assertEqual(["execution", "handoff", "task"], execution["cleanup_evidence"]["persisted"])
         self.assertEqual("completed", self.store.get("commands", "p1", "cmd-1")["status"])
         self.assertEqual("completed", self.store.get("tasks", "p1", "t1")["status"])
+
+    # Ordinary fully-converged terminal records still never become
+    # candidates via the real poll_once() path either (not just the unit-
+    # level _terminal_recovery_candidates() check already covered above).
+    def test_poll_once_never_reprocesses_a_fully_converged_terminal_command(self):
+        cmd, _claim = self._terminal_command_with_execution("completed", "complete", task_claim_release="released")
+        launcher = Mock()
+        with patch("manager.command_watcher.launch_task", launcher):
+            results = poll_once(self.store, object(), allowlist=self.ALLOWLIST, deadline=time.monotonic() + 50.0,
+                                claim_factory=lambda *_: object(), health_check=lambda: True, quota_check=lambda service: True)
+        launcher.assert_not_called()
+        self.assertEqual([], results)
 
 
 class PollOnceProcessesQueuedBeforeStaleAttentionTests(unittest.TestCase):
