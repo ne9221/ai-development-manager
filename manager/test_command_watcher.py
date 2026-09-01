@@ -22,6 +22,7 @@ from manager.command_watcher import (
     TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS, TERMINAL_RECOVERY_RESERVED_SECONDS,
     claude_quota_reliable, codex_quota_reliable, embedded_ingress_enabled, load_allowlist,
     poll_once, process_command, provider_quota_reliable, resolve_provider_runtime, _spawn_claimed_worker,
+    terminal_recovery_once,
 )
 from manager.execution_lifecycle import enter_running_gate
 from manager.executions import execution_health, heartbeat_execution, reserve_execution
@@ -3094,23 +3095,35 @@ class TerminalRecoveryBudgetReservationTests(unittest.TestCase):
                          "control: without the independent window the 31s schedule must starve Phase 2c")
         self.assertFalse(any(r.get("reconciled") for r in results))
 
-    def test_phase2c_extension_is_hard_capped_so_ticks_stay_bounded(self):
+    def test_phase2c_extension_is_hard_capped_and_the_independent_pass_covers_the_gap(self):
         # A tick that overran past deadline + TERMINAL_RECOVERY_RESERVED_SECONDS
-        # (here: a 60s stall against a 40s budget) must SKIP Phase 2c for
-        # that tick rather than extend it unboundedly -- the reserved
-        # window is a bounded extension, never an open-ended one.
+        # (here: a 60s stall against a 40s budget) must SKIP the in-poll
+        # Phase 2c for that tick -- the extension window is a START bound
+        # capped at the reserved interval past the deadline, never a
+        # window that drifts along with the overrun. (Per poll_once()'s
+        # documented semantics, no deadline in this module bounds an
+        # already-started call's own duration -- only what may start.)
+        # The recovery guarantee for exactly this schedule lives in the
+        # independent terminal_recovery_once() pass, which main() runs
+        # with its own fresh budget after the poll: prove it here.
         (allowlist, claim, state, monotonic, slow_runner,
          attempts, tracking) = self._slow_nonterminal_run_harness(run_cost_seconds=60.0)
         deadline = state["now"] + POLL_TIME_BUDGET_SECONDS
         with patch("manager.command_watcher.time.monotonic", side_effect=monotonic), \
              patch("manager.command_watcher.launch_task", Mock(side_effect=slow_runner)), \
              patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking):
-            results = poll_once(self.store, object(), allowlist=allowlist, deadline=deadline,
-                                cursor_path=self._slow_run_cursor_path,
-                                claim_factory=lambda *_: claim, health_check=lambda: True, quota_check=lambda service: True)
-        self.assertEqual([], attempts,
-                         "an overrun past the hard cap must skip Phase 2c this tick, keeping ticks bounded")
-        self.assertLessEqual(state["now"], deadline + 60.0 + TERMINAL_RECOVERY_RESERVED_SECONDS)
+            poll_once(self.store, object(), allowlist=allowlist, deadline=deadline,
+                      cursor_path=self._slow_run_cursor_path,
+                      claim_factory=lambda *_: claim, health_check=lambda: True, quota_check=lambda service: True)
+            self.assertEqual([], attempts,
+                             "an overrun past the hard cap must skip the in-poll Phase 2c start window")
+            recovery = terminal_recovery_once(self.store, object(), allowlist=allowlist,
+                                              claim_factory=lambda *_: claim,
+                                              health_check=lambda: True, quota_check=lambda service: True)
+        self.assertGreaterEqual(len(attempts), 1,
+                                "the independent pass must still classify the cached candidate this same cycle")
+        self.assertTrue(any(r.get("reconciled") for r in recovery),
+                        f"the independent pass must recover the terminal candidate; got {recovery}")
 
     # P1 delta fix, finding 2 (independent adversarial review of
     # 95768752): the raw wall-clock rotation offset forms an arithmetic
@@ -3147,6 +3160,99 @@ class TerminalRecoveryBudgetReservationTests(unittest.TestCase):
                          _within_project_record_rotation_offset(now=1234.5, project_id="p-large"))
         self.assertEqual(10 * 7, _within_project_record_rotation_offset(now=600.0, stride=7))
 
+    # Second delta-review round, finding 1 (P1): a REPEATABLE schedule of
+    # legitimately slow active work (here 47s of launch/reconcile cost per
+    # tick, past the in-poll pass's guard headroom on every tick) must not
+    # be able to starve terminal recovery permanently. The in-poll Phase
+    # 2c is correctly starved tick after tick -- and the independent
+    # terminal_recovery_once() pass, running with its OWN fresh budget
+    # after each poll exactly as main() wires it, recovers the candidate
+    # anyway. This is the multi-tick regression the review asked for.
+    def test_persistent_slow_active_work_cannot_permanently_starve_terminal_recovery(self):
+        self._add_project = TerminalIncompleteRecoveryReachableViaPollTests._add_project.__get__(self)
+        self._add_project("p2")
+        allowlist = frozenset({("p1", "t1"), ("p2", "t1")})
+        cmd, claim = self._terminal_command_with_execution("completed", "partial")
+        state, monotonic, advance = self._fake_clock(start=9000.0)
+        cursor_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cursor_dir.cleanup)
+        cursor_path = os.path.join(cursor_dir.name, "phase1-cursor.json")
+
+        attempts_in_poll = []
+        real_needs_recovery = _terminal_command_needs_recovery
+
+        def tracking(store, command_arg):
+            attempts_in_poll.append(command_arg["command_id"])
+            return real_needs_recovery(store, command_arg)
+
+        def slow_runner(*a, **k):
+            advance(47.0)  # persistent, successful-but-slow active work, every tick
+            k["on_running"](None)
+            return CommandWatcherTests.complete(a[7])
+
+        with patch("manager.command_watcher.time.monotonic", side_effect=monotonic), \
+             patch("manager.command_watcher.launch_task", Mock(side_effect=slow_runner)), \
+             patch("manager.command_watcher._terminal_command_needs_recovery", side_effect=tracking):
+            for tick in (1, 2):
+                # fresh slow active work EVERY tick -- the repeatable schedule
+                self.store.put("commands", "p2", f"cmd-slow-{tick}",
+                               command(command_id=f"cmd-slow-{tick}", project_id="p2", task_id="t1"))
+                deadline = state["now"] + POLL_TIME_BUDGET_SECONDS
+                poll_once(self.store, object(), allowlist=allowlist, deadline=deadline, cursor_path=cursor_path,
+                          claim_factory=lambda *_: claim, health_check=lambda: True, quota_check=lambda service: True)
+                state["now"] = max(state["now"], deadline) + 5.0
+            self.assertEqual([], attempts_in_poll,
+                             "precondition: this schedule must genuinely starve the in-poll pass on every tick")
+            recovery = terminal_recovery_once(self.store, object(), allowlist=allowlist,
+                                              claim_factory=lambda *_: claim,
+                                              health_check=lambda: True, quota_check=lambda service: True)
+        self.assertGreaterEqual(len(attempts_in_poll), 1,
+                                "the independent pass must classify the candidate the schedule starved")
+        self.assertTrue(any(r.get("reconciled") for r in recovery),
+                        f"terminal recovery must converge via the independent pass; got {recovery}")
+
+    # The independent pass is recovery-ONLY: it must never touch queued/
+    # claimed/running work (that is poll_once()'s job), and a terminal
+    # command can never relaunch its provider through it.
+    def test_terminal_recovery_pass_never_touches_nonterminal_work(self):
+        cmd, claim = self._terminal_command_with_execution("completed", "partial")
+        self.store.put("commands", "p1", "cmd-queued",
+                       command(command_id="cmd-queued", project_id="p1", task_id="t1"))
+        runner = Mock()
+        with patch("manager.command_watcher.launch_task", runner):
+            recovery = terminal_recovery_once(self.store, object(), allowlist=self.ALLOWLIST,
+                                              claim_factory=lambda *_: claim,
+                                              health_check=lambda: True, quota_check=lambda service: True)
+        runner.assert_not_called()
+        self.assertEqual("queued", self.store.get("commands", "p1", "cmd-queued")["status"])
+        self.assertTrue(any(r.get("reconciled") for r in recovery))
+
+    # The pass is itself strictly bounded: with its deadline already
+    # inside the classification-headroom margin, it must return without
+    # attempting a single hydration or lookup.
+    def test_terminal_recovery_pass_fails_closed_without_headroom(self):
+        cmd, _claim = self._terminal_command_with_execution("completed", "partial")
+        attempts = []
+        with patch("manager.command_watcher._terminal_command_needs_recovery",
+                   side_effect=lambda *a: attempts.append(a) or False):
+            recovery = terminal_recovery_once(
+                self.store, object(), allowlist=self.ALLOWLIST,
+                deadline=time.monotonic() + (TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS / 2))
+        self.assertEqual([], recovery)
+        self.assertEqual([], attempts)
+
+    # Per-candidate blast radius: one candidate whose recovery raises must
+    # be recorded as an error and never abort the pass.
+    def test_terminal_recovery_pass_isolates_a_failing_candidate(self):
+        cmd, claim = self._terminal_command_with_execution("completed", "partial")
+        with patch("manager.command_watcher.process_command", side_effect=RuntimeError("boom")):
+            recovery = terminal_recovery_once(self.store, object(), allowlist=self.ALLOWLIST,
+                                              claim_factory=lambda *_: claim,
+                                              health_check=lambda: True, quota_check=lambda service: True)
+        self.assertEqual(1, len(recovery))
+        self.assertEqual("error", recovery[0]["status"])
+        self.assertIn("boom", recovery[0]["error"])
+
     # 14: repeated ticks against a large-history project can never
     # permanently starve terminal recovery -- with the reservation in
     # place, EVERY tick (not just an eventual lucky one) reserves enough
@@ -3167,6 +3273,24 @@ class TerminalRecoveryBudgetReservationTests(unittest.TestCase):
         else:
             self.fail("terminal recovery was not reached within 3 ticks despite the reservation")
         self.assertTrue(results[0].get("reconciled"))
+
+    # main() wiring: every scheduler cycle runs the independent pass with
+    # its own budget AFTER poll_once, and reports its results truthfully
+    # in the tick's JSON output.
+    def test_main_runs_the_independent_terminal_recovery_pass_after_the_poll(self):
+        import io
+        from contextlib import redirect_stdout
+        from manager.command_watcher import main
+        calls = []
+        out = io.StringIO()
+        with patch("manager.command_watcher.build_service", side_effect=lambda timeout=None: object()),              patch("manager.command_watcher.DriveRecords", return_value=Mock(list_project_ids=Mock(return_value=[]))),              patch("manager.command_watcher.poll_once", side_effect=lambda *a, **k: calls.append("poll") or []),              patch("manager.command_watcher.terminal_recovery_once",
+                   side_effect=lambda *a, **k: calls.append(("recovery", sorted(k))) or []),              redirect_stdout(out):
+            main(["--once"])
+        self.assertEqual("poll", calls[0])
+        self.assertEqual("recovery", calls[1][0])
+        self.assertIn("classification_store", calls[1][1])
+        self.assertIn("discovery_store", calls[1][1])
+        self.assertIn('"terminal_recovery":[]', out.getvalue())
 
     def test_reserved_seconds_covers_the_classification_timeout_with_margin(self):
         self.assertGreaterEqual(TERMINAL_RECOVERY_RESERVED_SECONDS, TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS)
