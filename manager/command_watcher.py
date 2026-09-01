@@ -1539,28 +1539,65 @@ def _promote_waiting_quota_task(store, service, task, quota_document):
 _COMMAND_PRIORITY = {"claimed": 0, "running": 0, "queued": 1, "attention": 2}
 
 
-def _prioritized_commands(commands):
+def _prioritized_commands(commands, store=None):
     """Stable-reorder one project's already-hydrated, already-hydration-bounded
     Command batch so active-lifecycle authority (claimed/running) is always
     considered first, actionable new work (queued) second, and stale/recovery
-    backlog (attention) last -- terminal completed/failed records are dropped
-    here exactly as poll_once's own inline filter did before this function
-    existed. This changes only the ORDER process_command() is called in for
-    an already-returned batch; it does not change which records are in the
-    batch (list_records_bounded's own deadline-bounded hydration is
-    untouched), how many get processed (MAX_COMMANDS_PER_POLL is still
-    enforced by the caller), or any process_command()/_reconcile_active()
+    backlog (attention, and now a terminal command still needing incomplete-
+    persistence recovery) last. This changes only the ORDER process_command()
+    is called in for an already-returned batch; it does not change which
+    records are in the batch (list_records_bounded's own deadline-bounded
+    hydration is untouched), how many get processed (MAX_COMMANDS_PER_POLL is
+    still enforced by the caller), or any process_command()/_reconcile_active()
     semantics.
 
-    Why: a stale `attention` Command sitting ahead of a `queued` one in
-    Drive's own (unspecified, effectively arbitrary) listing order could
-    consume the one process_command() slot a tight poll budget leaves after
-    discovery, starving genuinely actionable queued work behind old recovery
-    backlog indefinitely -- see the real production trace this fixes.
-    Sorting is stable (Python's sorted()), so relative order within each
-    priority group is preserved unchanged from Drive's own return order."""
+    P0 fix: an ordinary, fully-converged completed/failed Command is still
+    dropped here (exactly as before) -- but one whose linked Execution still
+    has incomplete cleanup/materialization (_terminal_command_needs_recovery)
+    is now KEPT, sorting after "attention" (unmapped statuses fall through
+    _COMMAND_PRIORITY's default rank, already lower priority than every
+    mapped status) since it is exactly the same "stale/recovery backlog"
+    class of work. Before this fix, _prioritized_commands() unconditionally
+    dropped every completed/failed Command regardless of its Execution's
+    cleanup state, which meant process_command()'s own _terminal_command_
+    needs_recovery()/_reconcile_active() recovery logic (added for R17) could
+    never actually be reached via poll_once()'s scheduled path -- only a
+    direct process_command() call (e.g. a test, or a manual CLI) could ever
+    trigger it. A real historical stuck R17-shaped Command reproduced this
+    live: reconciliation logic that is provably correct when invoked was
+    simply never invoked by the one code path meant to invoke it naturally.
+
+    Bounded/fair by construction, not by accident: `commands` here is
+    already the SAME small, deadline-hydrated batch this function always
+    received (RECENT_COMMANDS_PER_PROJECT=2 for the recent sweep, or
+    whatever a project's bounded hydration window returned for the full
+    sweep) -- checking each terminal candidate's Execution cleanup_evidence
+    is one extra store.get() per terminal record already IN that bounded
+    batch, never an unbounded scan of a project's full historical backlog.
+    `_terminal_command_needs_recovery` never launches a provider -- see its
+    own docstring and _reconcile_active()'s terminal branch, which only ever
+    calls retry_incomplete_terminal_persistence()/recover_task_claim().
+    `store=None` (e.g. an older/test caller that hasn't been updated)
+    preserves the exact prior behavior of dropping every terminal record,
+    since there is then no way to safely check for outstanding recovery
+    work.
+
+    Why the attention-vs-queued ordering rule exists at all: a stale
+    `attention` Command sitting ahead of a `queued` one in Drive's own
+    (unspecified, effectively arbitrary) listing order could consume the one
+    process_command() slot a tight poll budget leaves after discovery,
+    starving genuinely actionable queued work behind old recovery backlog
+    indefinitely -- see the real production trace this fixes. Sorting is
+    stable (Python's sorted()), so relative order within each priority group
+    is preserved unchanged from Drive's own return order."""
+    def keep(command):
+        status = command.get("status")
+        if status not in ("completed", "failed"):
+            return True
+        return store is not None and _terminal_command_needs_recovery(store, command)
+
     return sorted(
-        (c for c in commands if c.get("status") not in ("completed", "failed")),
+        (c for c in commands if keep(c)),
         key=lambda c: _COMMAND_PRIORITY.get(c.get("status"), len(_COMMAND_PRIORITY)),
     )
 
@@ -1705,7 +1742,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             commands = _enumerate_recent_commands(recent_store, project_id, deadline=recent_deadline)
         except TaskError:
             continue
-        for command in _prioritized_commands(commands):
+        for command in _prioritized_commands(commands, store=store):
             if (project_id, command["command_id"]) in just_promoted:
                 continue
             if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
@@ -1736,7 +1773,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             # 1's waiting_quota sweep above is already independent of this
             # loop entirely, unlike before this restructure).
             continue
-        for command in _prioritized_commands(commands):
+        for command in _prioritized_commands(commands, store=store):
             if (project_id, command["command_id"]) in just_promoted:
                 continue  # promoted this same tick -- launches on a later natural tick, not this one
             if (project_id, command["command_id"]) in processed:
