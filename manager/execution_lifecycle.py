@@ -589,10 +589,47 @@ def _retain_terminal_authority(store, execution, status, persisted, error):
     return audit
 
 
-def _attention_note(claim_registry, project_id, task_id, execution_id, view, note):
+def _attention_note(store, claim_registry, project_id, task_id, execution_id, view, note):
+    """Permanent materialization failure watchdog: durably records one
+    failed materialization attempt (task_root.record_materialization_failure
+    increments a retry_count on the Task Root object itself, surviving a
+    watcher restart between ticks -- no new scheduler/service). Below the
+    durable retry threshold the view is left retryable ("pending") exactly
+    as the pre-watchdog behavior always retried on the next tick. Once the
+    threshold is reached the view escalates to "attention" and runtime
+    claim authority is released immediately -- holding a running claim
+    hostage to a permanently-broken Drive write serves nothing, since the
+    terminal winner stays immutable and Execution.cleanup_evidence.
+    persistence is never marked complete while any view sits outside
+    "verified" (see retry_incomplete_terminal_persistence). The Execution's
+    own cleanup_evidence.task_claim_release is updated to "released" in
+    lockstep (sticky merge, idempotent) so the two release truths never
+    diverge -- exactly the P0-2/EXECUTION_AND_ROOT_RELEASE_TRUTH_CONVERGED
+    invariant, now also covering this watchdog-triggered release path, not
+    only the normal terminalize_execution() cleanup flow.
+
+    Recovery is not blocked: a later successful retry still calls
+    advance_materialization_view(..., "verified"), which resets retry_count
+    to 0, and repair never needs to reacquire a running claim (task_root's
+    facet-advance functions check execution_id ownership only, never
+    authority_active)."""
     try:
-        task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, view, "attention", note=note)
+        new_document, generation = task_root.record_materialization_failure(
+            claim_registry, project_id, task_id, execution_id, view, note)
     except TaskError:
+        return
+    if (new_document.get("materialization") or {}).get(view, {}).get("status") != "attention":
+        return
+    try:
+        task_root.release_runtime_claim(claim_registry, project_id, task_id, execution_id, generation)
+    except TaskError:
+        return
+    try:
+        current = store.get("executions", project_id, execution_id)
+        current["cleanup_evidence"] = merge_cleanup_evidence(current.get("cleanup_evidence"), {"task_claim_release": "released"})
+        validate("execution", current)
+        store.put("executions", project_id, execution_id, current)
+    except Exception:
         pass
 
 
@@ -718,7 +755,7 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
             _materialize_terminal_handoff(store, project_id, expected_handoff, handoff_drive_file_id)
         except TaskError as exc:
             if claim_registry is not None:
-                _attention_note(claim_registry, project_id, task_id, execution_id, "handoff", str(exc)[:300])
+                _attention_note(store, claim_registry, project_id, task_id, execution_id, "handoff", str(exc)[:300])
             return False
         if claim_registry is not None:
             task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "handoff", "pending")
@@ -729,14 +766,14 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
             store.put("tasks", project_id, task_id, expected_task)
             if store.get("tasks", project_id, task_id) != expected_task:
                 if claim_registry is not None:
-                    _attention_note(claim_registry, project_id, task_id, execution_id, "task", "task persistence verification failed")
+                    _attention_note(store, claim_registry, project_id, task_id, execution_id, "task", "task persistence verification failed")
                 return False
         if claim_registry is not None:
             task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "task", "pending")
             task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "task", "verified")
     except Exception as exc:
         if claim_registry is not None:
-            _attention_note(claim_registry, project_id, task_id, execution_id, "task", str(exc)[:300])
+            _attention_note(store, claim_registry, project_id, task_id, execution_id, "task", str(exc)[:300])
         return False
 
     updates = {"provider_outcome": status, "persistence": "complete",

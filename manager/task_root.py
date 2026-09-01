@@ -52,6 +52,16 @@ from manager.task_claims import TaskClaimConflict, _same_owner, check_task_execu
 SCHEMA_VERSION = "1.0.0"
 DEFAULT_ATTEMPTS = 5
 
+# Permanent materialization failure watchdog: how many consecutive failed
+# materialization attempts one view (task/handoff) durably tolerates before
+# escalating from "pending" straight to "attention" and releasing runtime
+# claim authority (see record_materialization_failure/release_runtime_claim).
+# Durable on the Task Root object itself, not process memory, so the count
+# survives a watcher restart between ticks -- no new scheduler/service is
+# introduced; this only changes what the EXISTING retry-on-next-tick call
+# already does with each failure.
+DEFAULT_MATERIALIZATION_ATTEMPTS = 3
+
 # Canonical proposal-hash spec (frozen -- bump CANONICALIZATION_VERSION,
 # never silently change field set/order/serialization for an existing
 # version). Deliberately excludes cleanup_evidence, materialization
@@ -630,7 +640,15 @@ def advance_materialization_view(registry, project_id, task_id, execution_id, vi
     whatever failed is retried and confirmed, so a permanently-broken
     Handoff can never trap a healthy Task view (or vice versa) below
     "verified". Never touches the terminal bind (guarded by
-    _reject_bind_mutation defensively)."""
+    _reject_bind_mutation defensively).
+
+    Only ever called on confirmed PROGRESS (a materialization attempt that
+    actually succeeded, or a durable "about to attempt" pending marker) --
+    never on a failed attempt, which is record_materialization_failure()'s
+    job. Every call here therefore resets the durable retry_count the
+    watchdog uses: real progress clears whatever failure history preceded
+    it, so a view that eventually succeeds after N failed attempts starts
+    counting from zero again if it ever regresses in a later epoch."""
     if view not in ("task", "handoff"):
         raise TaskError(f"unknown materialization view: {view}")
     if new_status not in MATERIALIZATION_STATUSES:
@@ -641,7 +659,7 @@ def advance_materialization_view(registry, project_id, task_id, execution_id, vi
         current = (materialization.get(view) or {}).get("status", "absent")
         if new_status not in _MATERIALIZATION_TRANSITIONS.get(current, set()) and new_status != current:
             raise TaskError(f"illegal materialization transition for '{view}': {current} -> {new_status}")
-        view_state = {"status": new_status}
+        view_state = {"status": new_status, "retry_count": 0}
         if note is not None:
             view_state["note"] = str(note)[:500]
         materialization[view] = view_state
@@ -655,6 +673,65 @@ def advance_materialization_view(registry, project_id, task_id, execution_id, vi
             raise TaskError("task root backend unavailable while advancing materialization") from exc
         return new_document, new_generation
     raise TaskError("materialization advance ambiguous after retries; failing closed")
+
+
+def record_materialization_failure(registry, project_id, task_id, execution_id, view, note,
+                                   threshold=DEFAULT_MATERIALIZATION_ATTEMPTS, attempts=DEFAULT_ATTEMPTS):
+    """Permanent materialization failure watchdog: durably record ONE failed
+    materialization attempt for a view, incrementing its retry_count on the
+    Task Root object itself (survives a watcher restart between ticks --
+    no new scheduler/service). While retry_count stays under `threshold`
+    the view is left/set "pending" so the existing retry-on-next-tick call
+    keeps trying it exactly as before. Once retry_count reaches `threshold`
+    the view escalates to "attention" -- the caller (retry_incomplete_
+    terminal_persistence) is then expected to release runtime claim
+    authority via release_runtime_claim(), since holding a running claim
+    hostage to a permanently-broken Drive write serves nothing: the
+    terminal winner (`terminal` bind) stays immutable either way, and
+    Execution.cleanup_evidence.persistence is never marked complete while
+    any view is outside {"verified"} -- see retry_incomplete_terminal_
+    persistence's own docstring. release_runtime_claim's cleanup facet is
+    independent of materialization (module docstring), so releasing here
+    never fabricates completion.
+
+    "attention" is not a dead end (_MATERIALIZATION_TRANSITIONS): a later
+    successful retry calls advance_materialization_view(..., "verified"),
+    which resets retry_count to 0 and lets a genuinely-recovered view
+    (e.g. a transient Drive outage that later clears) reach "verified"
+    even after previously escalating -- repair never needs to reacquire a
+    running execution claim, since _current_epoch_owner_document() (which
+    every facet-advance function goes through) only checks execution_id
+    ownership, never authority_active."""
+    if view not in ("task", "handoff"):
+        raise TaskError(f"unknown materialization view: {view}")
+    for _ in range(attempts):
+        document, generation = _current_epoch_owner_document(registry, project_id, task_id, execution_id)
+        materialization = dict(document.get("materialization") or _fresh_materialization())
+        current_state = materialization.get(view) or {"status": "absent"}
+        current = current_state.get("status", "absent")
+        if current == "verified":
+            raise TaskError(f"cannot record a materialization failure against an already-verified '{view}' view")
+        retry_count = current_state.get("retry_count", 0) + 1
+        new_status = "attention" if retry_count >= threshold else "pending"
+        # A recorded failure means an attempt was made, so for transition
+        # purposes "absent" (never even attempted) is treated as "pending"
+        # here -- otherwise a low `threshold` could try to jump straight
+        # from "absent" to "attention", which _MATERIALIZATION_TRANSITIONS
+        # correctly forbids (only "pending" legally reaches "attention").
+        transition_from = "pending" if current == "absent" else current
+        if new_status not in _MATERIALIZATION_TRANSITIONS.get(transition_from, set()) and new_status != transition_from:
+            raise TaskError(f"illegal materialization transition for '{view}': {current} -> {new_status}")
+        materialization[view] = {"status": new_status, "note": str(note)[:500], "retry_count": retry_count}
+        new_document = {**document, "materialization": materialization}
+        _reject_bind_mutation(document, new_document)
+        try:
+            new_generation = registry.compare_and_swap(generation, new_document)
+        except RegistryConflict:
+            continue
+        except Exception as exc:
+            raise TaskError("task root backend unavailable while recording materialization failure") from exc
+        return new_document, new_generation
+    raise TaskError("materialization failure record ambiguous after retries; failing closed")
 
 
 def advance_cleanup_facet(registry, project_id, task_id, execution_id, new_status, attempts=DEFAULT_ATTEMPTS):
