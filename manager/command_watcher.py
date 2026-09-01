@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import zlib
 from datetime import datetime, timezone
 
 from collectors.publish_drive import build_service
@@ -1278,7 +1279,7 @@ def _rotated_project_ids(project_ids, now=None):
     return project_ids[offset:] + project_ids[:offset]
 
 
-def _within_project_record_rotation_offset(now=None, stride=1):
+def _within_project_record_rotation_offset(now=None, stride=1, project_id=None):
     """Deterministic, cross-process, wall-clock-only rotation offset for
     ONE project's own historical Command or Task listing (see
     DriveRecords.list_records_bounded's `rotate_offset` parameter).
@@ -1306,14 +1307,47 @@ def _within_project_record_rotation_offset(now=None, stride=1):
     bound. Default stride=1 preserves the original one-position-per-tick
     behavior for every existing caller (e.g. _enumerate_commands).
 
-    This returns an ever-increasing integer (never reduced modulo a record
+    This returns a non-negative integer (never reduced modulo a record
     count the caller doesn't know yet -- `list_records_bounded` itself takes
-    `% len(items)`), advancing by `stride` approximately every POLL_SECONDS.
-    Purely a function of wall-clock time, never a process-local counter,
-    since every `--once` invocation is a fresh process with no memory of
-    prior ticks."""
+    `% len(items)`). Without `project_id` it is the raw tick counter times
+    `stride`, advancing approximately every POLL_SECONDS; with `project_id`
+    it is a per-(tick, project) stable hash instead -- see the inline
+    comment below for the aliasing defect that made the raw counter unsafe
+    for the multi-project full-sweep path. Either way it is purely a
+    function of wall-clock time (and the project's own id), never a
+    process-local counter, since every `--once` invocation is a fresh
+    process with no memory of prior ticks."""
     now = now if now is not None else time.time()
-    return int(now // POLL_SECONDS) * stride
+    tick = int(now // POLL_SECONDS)
+    if project_id is not None:
+        # P1 delta fix (independent adversarial review of 95768752,
+        # finding 2): a purely arithmetic offset progression aliases
+        # against multi-project rotation. When K projects rotate the
+        # front hydration slot, one given project is only actually
+        # ENUMERATED every K-th tick, so the offsets it ever sees form
+        # the arithmetic progression {0, K, 2K, ...} (mod N) -- and for
+        # any N sharing a factor with K, whole residue classes of that
+        # project's records land permanently outside every reachable
+        # hydration window, no matter how many ticks pass. (Concrete
+        # failing schedule from the review: 3 large-history projects, a
+        # per-visit window of 2 adjacent records, N divisible by 3 --
+        # offsets 2, 5, 8, ... are never returned, ever.)
+        #
+        # Fix: decorrelate the offset per (tick, project) with a stable
+        # hash instead of the raw tick counter. crc32 is deterministic
+        # across processes and platforms (same reason the raw wall-clock
+        # tick was chosen originally: every --once invocation is a fresh
+        # process), so concurrent/replayed invocations inside one tick
+        # still agree on the same offset -- but consecutive VISITS to the
+        # same project now start at effectively independent positions, so
+        # no revisit period can ever alias into a fixed unreachable
+        # residue class again: every record's per-visit reach probability
+        # is at least window/N, making permanent exclusion impossible
+        # rather than merely less likely. Callers using `stride` (the
+        # waiting_quota K-window sweep) pass no project_id and keep the
+        # exact original contiguous-interval guarantee documented above.
+        return zlib.crc32(("%d:%s" % (tick, project_id)).encode("utf-8"))
+    return tick * stride
 
 
 def _enumerate_commands(store, project_id, deadline=None):
@@ -1344,7 +1378,7 @@ def _enumerate_commands(store, project_id, deadline=None):
     if hasattr(store, "list_records_bounded"):
         return store.list_records_bounded("commands", project_id, deadline=deadline,
                                            single_request_worst_case=WATCHER_DISCOVERY_TIMEOUT_SECONDS,
-                                           rotate_offset=_within_project_record_rotation_offset())
+                                           rotate_offset=_within_project_record_rotation_offset(project_id=project_id))
     return store.list_records("commands", project_id)
 
 
@@ -1629,6 +1663,50 @@ def _prioritized_nonterminal_commands(commands):
 
 TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS = 10
 
+# LIVE P0 fix (terminal recovery budget starvation, observed on a real
+# production tick): a large project's FULL-sweep hydration
+# (_enumerate_commands(), one real Drive request per record within its own
+# bounded budget) can legitimately consume nearly the ENTIRE shared poll
+# deadline by itself -- a real live measurement against ai-development-
+# manager's 234-record Command history took ~28s of the ~40s
+# POLL_TIME_BUDGET_SECONDS. Phase 2c's own headroom guard
+# (deadline - now >= TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS) then
+# correctly, safely refuses to even attempt a classification lookup once
+# hydration alone has already spent the budget down to under that many
+# seconds of headroom -- which is the RIGHT thing for that guard to do in
+# isolation, but meant a genuinely reachable, already-cached terminal
+# candidate (confirmed present in the batch, at the front of it, with zero
+# competing nonterminal work) still got ZERO classification attempts,
+# tick after tick, forever: full hydration was never leaving Phase 2c
+# enough of the shared deadline to ever pass its own safety check.
+#
+# Fix: reserve a slice of the poll deadline for terminal recovery,
+# specifically by making Phase 2a/2b's HYDRATION calls (never their
+# processing of already-discovered nonterminal work, which must keep
+# using the full `deadline` -- see poll_once()) stop starting further
+# optional enumeration once fewer than this many seconds remain before
+# the real poll deadline. `TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS` alone
+# is the bare minimum a single classification lookup could need; a few
+# seconds of margin absorb the ordinary interpreter/bookkeeping overhead
+# between hydration yielding and Phase 2c's own headroom check running.
+TERMINAL_RECOVERY_RESERVED_SECONDS = TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS + 5
+
+# Budget for the INDEPENDENT terminal_recovery_once() pass (round-2 delta
+# review finding): the pass's hydration slice must be usable through the
+# real DriveRecords.list_records_bounded() guard, which refuses to START
+# hydrating a record unless a full single_request_worst_case
+# (WATCHER_DISCOVERY_TIMEOUT_SECONDS) still fits before the deadline.
+# A 15s pass minus 10s classification headroom left a 5s hydration slice
+# -- strictly smaller than that guard's 10s reserve, so with the real
+# production store the pass could never hydrate a single record (every
+# test double that skipped the guard hid this). Partition explicitly:
+# hydration gets the guard's own worst-case reserve PLUS a genuinely
+# usable start window, then classification keeps its full headroom on
+# top. All of it bounds STARTS only, like every deadline in this module.
+TERMINAL_RECOVERY_PASS_HYDRATION_SECONDS = WATCHER_DISCOVERY_TIMEOUT_SECONDS + 10
+TERMINAL_RECOVERY_PASS_BUDGET_SECONDS = (
+    TERMINAL_RECOVERY_PASS_HYDRATION_SECONDS + TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS)
+
 
 class _TerminalRecoveryPrevalidation:
     """Internal-only proof that _terminal_recovery_candidates() already
@@ -1790,7 +1868,10 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     """`deadline`, if given, is a `time.monotonic()` value after which this
     call stops STARTING new project/command work and returns whatever it has
     so far -- any project/command not yet reached this tick is picked up on
-    a later poll, with no state lost (nothing here writes anything before a
+    a later poll, with no state lost. (Sole, bounded exception: Phase 2c
+    terminal-recovery classification may still start inside its own
+    reserved window of at most TERMINAL_RECOVERY_RESERVED_SECONDS past
+    this deadline -- see the phase2c_deadline comment below.) (nothing here writes anything before a
     command is actually claimed inside process_command). This never
     interrupts a process_command() call already in progress: the deadline is
     only ever checked between iterations, before the next project's
@@ -1981,19 +2062,34 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
                             "command_id": command["command_id"], "error": repr(exc)})
         processed.add((project_id, command["command_id"]))
 
+    # LIVE P0 fix: hydration (fetching MORE projects'/records' Command
+    # batches) must yield once fewer than TERMINAL_RECOVERY_RESERVED_SECONDS
+    # remain before the real poll deadline -- see that constant's own
+    # docstring for the live production trace this closes. This bounds
+    # only STARTING further optional enumeration; a project's own
+    # already-hydrated nonterminal commands are still processed against
+    # the full, unreserved `deadline` below (`_run()`'s own checks), so
+    # already-discovered active/queued work is never held back by this
+    # reservation -- only additional, not-yet-fetched historical hydration
+    # is what yields.
+    hydration_deadline = deadline - TERMINAL_RECOVERY_RESERVED_SECONDS
+
     recent_deadline = min(deadline, time.monotonic() + RECENT_COMMAND_SWEEP_BUDGET_SECONDS)
+    recent_hydration_deadline = min(recent_deadline, hydration_deadline)
     for project_id in project_ids:
-        if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
+        if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_hydration_deadline:
             break
         try:
-            commands = _enumerate_recent_commands(recent_store, project_id, deadline=recent_deadline)
+            commands = _enumerate_recent_commands(recent_store, project_id, deadline=recent_hydration_deadline)
         except TaskError:
             continue
         _remember_batch(project_id, commands)
         # Zero-remote-lookup nonterminal priority work (claimed/running/
         # queued/attention) only -- terminal-recovery eligibility (which
         # requires a real Execution lookup) is entirely deferred to the
-        # GLOBAL Phase 2c below.
+        # GLOBAL Phase 2c below. Uses the full `recent_deadline`, not the
+        # tightened `recent_hydration_deadline` -- already-hydrated active
+        # work is never held back by the terminal-recovery reservation.
         for command in _prioritized_nonterminal_commands(commands):
             if (project_id, command["command_id"]) in just_promoted:
                 continue
@@ -2002,10 +2098,10 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             _run(project_id, command)
 
     for project_id in project_ids:
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= hydration_deadline:
             break
         try:
-            commands = _enumerate_commands(discovery_store, project_id, deadline=deadline)
+            commands = _enumerate_commands(discovery_store, project_id, deadline=hydration_deadline)
         except TaskError:
             # A project that has never had a single Command written to it
             # yet has no COMMANDS Drive folder at all --
@@ -2074,17 +2170,60 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     # defaults to `store` when omitted, exactly like `discovery_store`/
     # `recent_store` above, reproducing prior behavior for any caller not
     # yet updated to pass it.
-    if len(results) < MAX_COMMANDS_PER_POLL and time.monotonic() < deadline:
+    # P1 delta fix (independent adversarial review of 95768752, finding
+    # 1): the hydration_deadline reservation above bounds only optional
+    # ENUMERATION -- it cannot bound the nonterminal _run() calls both
+    # Phase 2 loops deliberately keep running against the full, unreserved
+    # `deadline` (that unreserved processing is itself a hard design
+    # requirement: already-discovered active work is never held back by
+    # terminal recovery). A single reconcile of a cached running command
+    # goes through the primary 45s-timeout `store`, so it can legitimately
+    # consume 30+ seconds AFTER hydration already yielded properly -- and
+    # when the same healthy-but-slow command sorts first every tick, Phase
+    # 2c once again got zero classification attempts forever, the exact
+    # starvation shape the reservation was supposed to close.
+    #
+    # Fix: Phase 2c gets its own INDEPENDENT bounded execution window
+    # instead of sharing whatever happens to be left of `deadline`:
+    #  - a tick with headroom to spare behaves exactly as before
+    #    (phase2c_deadline == deadline);
+    #  - a tick whose nonterminal processing ate into (or past) the
+    #    reserved slice extends Phase 2c's own window to
+    #    now + TERMINAL_RECOVERY_RESERVED_SECONDS, restoring the >=
+    #    TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS headroom its guard needs;
+    #  - the extension is HARD-CAPPED at
+    #    deadline + TERMINAL_RECOVERY_RESERVED_SECONDS, so a tick that
+    #    overran even further (e.g. a full 45s transport-timeout stall)
+    #    skips this in-poll pass for that tick rather than letting the
+    #    window drift with the overrun. Like every deadline in this
+    #    module, the cap bounds what may START -- an already-started
+    #    lookup or recovery _run() is never interrupted, so the cap is a
+    #    start bound, not a wall-clock tick-length bound (that has always
+    #    been poll_once()'s documented deadline semantics; see the
+    #    function docstring). A schedule whose active work overruns past
+    #    the cap on EVERY tick would therefore starve this in-poll pass
+    #    indefinitely -- which is exactly why it is no longer the only
+    #    path: terminal_recovery_once() below runs with its own
+    #    independent budget every scheduler cycle, AFTER poll_once(), and
+    #    cannot be starved by anything that happens inside this function.
+    #    This in-poll pass remains the cheap, same-tick fast path for the
+    #    common case (candidate already cached, tick healthy).
+    # Every single lookup inside stays bounded by classification_store's
+    # own short transport timeout exactly as before; the guard in
+    # _terminal_recovery_candidates() is unchanged.
+    phase2c_deadline = min(deadline + TERMINAL_RECOVERY_RESERVED_SECONDS,
+                           max(deadline, time.monotonic() + TERMINAL_RECOVERY_RESERVED_SECONDS))
+    if len(results) < MAX_COMMANDS_PER_POLL and time.monotonic() < phase2c_deadline:
         lookup_budget = MAX_COMMANDS_PER_POLL - len(results)
         for project_id in project_ids:
-            if lookup_budget <= 0 or len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= deadline:
+            if lookup_budget <= 0 or len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= phase2c_deadline:
                 break
             bucket = hydrated_commands_by_project.get(project_id)
             if not bucket:
                 continue
             commands = list(bucket.values())
             candidates, lookup_budget = _terminal_recovery_candidates(
-                commands, classification_store, deadline, lookup_budget)
+                commands, classification_store, phase2c_deadline, lookup_budget)
             for command, prevalidation in candidates:
                 if (project_id, command["command_id"]) in just_promoted:
                     continue
@@ -2092,9 +2231,120 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
                     continue
                 if len(results) == MAX_COMMANDS_PER_POLL:
                     break
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= phase2c_deadline:
                     return results
                 _run(project_id, command, prevalidation=prevalidation)
+    return results
+
+
+def terminal_recovery_once(store, service, allowlist=None, deadline=None, discovery_store=None,
+                           classification_store=None, origin_context=None, async_launch=False, **factories):
+    """Independent, bounded terminal-recovery pass -- the unstarveable
+    guarantee behind poll_once()'s own in-poll Phase 2c fast path.
+
+    Why this exists (second independent adversarial review round): any
+    terminal-recovery pass that runs INSIDE poll_once()'s shared tick can
+    be starved by legitimately slow active work, because nonterminal
+    _run() calls are deliberately never interrupted (a real provider
+    lifecycle must run to natural completion) and go through the primary
+    ~45s-timeout transport. A production-valid repeating schedule --
+    Phase 1 cost plus one persistent running command whose per-tick
+    reconciliation is slow-but-successful -- therefore reaches the
+    in-poll pass after even its capped extension window on EVERY tick,
+    forever. No amount of within-tick budget arithmetic can fix that
+    while also (a) never delaying active work behind terminal recovery
+    and (b) keeping tick length bounded: the three constraints are
+    mutually unsatisfiable inside one shared sequential budget.
+
+    So terminal recovery gets its own sequential slot instead: main()
+    calls this AFTER poll_once() returns, every cycle, with a fresh
+    deadline of TERMINAL_RECOVERY_PASS_BUDGET_SECONDS computed from its
+    own start time -- nothing that happened inside the poll (however
+    overrun) can consume it. Ordering after the poll preserves the
+    active-work-first contract: a normal tick's active commands are all
+    processed before this pass spends a single second.
+
+    Bounded and fail-closed the same way as everything else here:
+    - Hydration (project listing + bounded command enumeration, expected
+      on the short-timeout `discovery_store`) stops at
+      deadline - TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS, keeping full
+      classification headroom by construction.
+    - _enumerate_commands()'s per-(tick, project) hashed rotate offset
+      means the small per-cycle hydration window lands at effectively
+      independent positions each cycle, so a candidate anywhere in a
+      large history is reached in a bounded expected number of cycles --
+      never permanently excluded.
+    - Classification lookups go through `classification_store` (short
+      dedicated transport) under _terminal_recovery_candidates()'s
+      unchanged headroom guard and lookup budget.
+    - Eligible candidates run through the exact same
+      process_command(terminal_recovery_prevalidation=...) recovery-only
+      path as the in-poll pass: recovery is idempotent and self-limiting
+      (a recovered candidate stops being eligible), and a terminal
+      command can never relaunch its provider. Per-candidate errors are
+      recorded and isolated, never propagated.
+    - Deadlines bound what may START; an in-flight call is never
+      interrupted (same documented semantics as poll_once()).
+    - Project order comes from _rotated_project_ids() (wall-clock
+      round-robin), NOT the Phase-1 cursor -- this pass must never
+      advance or contend with poll_once()'s own durable cursor.
+    """
+    if allowlist is None:
+        allowlist = load_allowlist()
+    if deadline is None:
+        deadline = time.monotonic() + TERMINAL_RECOVERY_PASS_BUDGET_SECONDS
+    if discovery_store is None:
+        discovery_store = store
+    if classification_store is None:
+        classification_store = store
+    results = []
+    # Classification keeps its full short-transport headroom; what is
+    # left in front of it is the hydration slice, sized (see
+    # TERMINAL_RECOVERY_PASS_HYDRATION_SECONDS) so that the production
+    # list_records_bounded() guard -- never start a record hydration
+    # unless a full WATCHER_DISCOVERY_TIMEOUT_SECONDS worst case still
+    # fits -- leaves a genuinely usable start window rather than
+    # refusing every record outright.
+    hydration_deadline = deadline - TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS
+    if time.monotonic() >= hydration_deadline:
+        return results
+    try:
+        raw_project_ids = _enumerate_project_ids(discovery_store, deadline=hydration_deadline)
+    except TaskError:
+        return results
+    if not raw_project_ids:
+        return results
+    project_ids = _rotated_project_ids(raw_project_ids)
+    batches = {}
+    for project_id in project_ids:
+        if time.monotonic() >= hydration_deadline:
+            break
+        try:
+            commands = _enumerate_commands(discovery_store, project_id, deadline=hydration_deadline)
+        except TaskError:
+            continue
+        if commands:
+            batches[project_id] = commands
+    lookup_budget = MAX_COMMANDS_PER_POLL
+    for project_id in project_ids:
+        if lookup_budget <= 0 or len(results) >= MAX_COMMANDS_PER_POLL or time.monotonic() >= deadline:
+            break
+        commands = batches.get(project_id)
+        if not commands:
+            continue
+        candidates, lookup_budget = _terminal_recovery_candidates(
+            commands, classification_store, deadline, lookup_budget)
+        for command, prevalidation in candidates:
+            if len(results) >= MAX_COMMANDS_PER_POLL or time.monotonic() >= deadline:
+                break
+            try:
+                results.append(process_command(store, service, command, allowlist=allowlist,
+                                               origin_context=origin_context, async_launch=async_launch,
+                                               terminal_recovery_prevalidation=prevalidation, **factories))
+            except Exception as exc:
+                # Same per-record blast-radius rule as poll_once()'s _run().
+                results.append({"status": "error", "project_id": project_id,
+                                "command_id": command["command_id"], "error": repr(exc)})
     return results
 
 
@@ -2151,8 +2401,16 @@ def main(argv=None):
                                classification_store=classification_store,
                                origin_context=invocation,
                                async_launch=True)
+            # Independent terminal-recovery slot -- see
+            # terminal_recovery_once()'s docstring: runs with its OWN
+            # fresh bounded deadline after the poll, so no schedule of
+            # slow active work inside poll_once() can ever starve
+            # terminal recovery permanently.
+            recovery = terminal_recovery_once(store, service, discovery_store=discovery_store,
+                                              classification_store=classification_store,
+                                              origin_context=invocation, async_launch=True)
             print(json.dumps({"status": "ok", "host": socket.gethostname()[:100], "ingress": ingress,
-                              "commands": result}, separators=(",", ":")))
+                              "commands": result, "terminal_recovery": recovery}, separators=(",", ":")))
         except Exception:
             status = "failed"
             print(json.dumps({"status": "unavailable"}, separators=(",", ":")))
