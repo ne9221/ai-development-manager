@@ -91,17 +91,21 @@
         "owner": "ne9221",
         "name": "ledger-organizer"
       },
-      "default_branch": "main",
+      "default_branch": "fix/v2.6.1-financial-structure-first",
       "baseline_resolution_policy": {
-        "strategy": "origin_default",
-        "pinned_ref": null
+        "strategy": "pinned",
+        "pinned_ref": "9ae7bcd"
       },
       "common_governance": {
         "reference": "governance-rules.json",
         "version": "1.0.0"
       },
       "project_rules": {
-        "reference": "PROJECT-RULES.md"
+        "reference": "PROJECT-RULES.md",
+        "drive_pointer": {
+          "title": "PROJECT-RULES — LEDGER-ORGANIZER",
+          "doc_id": "1FeapR6zQnRI2mFF8IzgaiFFZcWffJU2CucoJrBH_baI"
+        }
       },
       "working_directory_policy": {
         "relative_path": "ledger-organizer",
@@ -134,8 +138,8 @@
         "overviews_area": "overviews"
       },
       "status": "enabled",
-      "resolution_status": "unresolved",
-      "unresolved_reason": "Remote repository metadata and PROJECT-RULES pending cloud SSOT verification"
+      "resolution_status": "verified",
+      "unresolved_reason": null
     },
     {
       "project_id": "outlook-mail",
