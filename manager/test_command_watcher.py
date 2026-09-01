@@ -27,7 +27,7 @@ from manager.command_watcher import (
     terminal_recovery_once,
 )
 from manager.execution_lifecycle import enter_running_gate
-from manager.executions import execution_health, heartbeat_execution, reserve_execution
+from manager.executions import cancel_reserved_execution, execution_health, heartbeat_execution, reserve_execution
 from manager.scheduler_provenance import command_origin
 from manager.task_claims import TaskClaimConflict
 from manager.tasks import TaskError, create_project, create_task, now_iso, validate
@@ -37,6 +37,8 @@ from manager.test_execution_lifecycle import project, task
 from manager.test_execution_lifecycle import quota_document
 from manager.test_execution_runner import AccountAwareClaudeStyleLauncher
 from manager.test_task_claims import MemoryClaimRegistry
+from manager.test_worktree_locks import MemoryRegistry
+from manager.worktree_locks import canonical_repository, repository_lock_id
 
 
 class Store:
@@ -504,6 +506,94 @@ class CommandWatcherTests(unittest.TestCase):
         self.assertEqual("failed", result["status"])
         self.assertEqual("cancelled", self.store.get("executions", "p1", "command-cmd-1")["status"])
         self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+
+    # --- Execution-convergence regression suite (live incident 20260901:
+    # dispatch-adm-close-gh-dispatch-test-determinism-20260901T155956Z).
+    # A watcher tick cancelled a 24-second-old reservation belonging to a
+    # live claimed worker mid-prelaunch, then the cancelled execution could
+    # never terminalize because the repo lock slot was owned by the
+    # PREVIOUS task (already released) and lease reconciliation raised
+    # "owner mismatch" on every subsequent tick -- permanent `attention`
+    # with recovery_reason=terminal_writer_authority_reconciliation_unknown.
+
+    def test_fresh_claimed_reservation_is_left_alone_by_watcher_tick(self):
+        reserve_execution(self.store, "p1", "t1", "command-cmd-1", "codex", {"decision": "fresh"})
+        claimed = command(status="claimed", execution_id="command-cmd-1", claimed_at=now_iso())
+        self.store.put("commands", "p1", "cmd-1", claimed)
+        result = process_command(self.store, object(), claimed, claim_factory=lambda *_: MemoryClaimRegistry())
+        self.assertEqual({"status": "claimed", "skipped": True, "reason": "prelaunch_in_flight"}, result)
+        # Nothing was cancelled or rewritten: the in-flight worker's
+        # reservation and the claimed Command are byte-identical to before.
+        self.assertEqual("reserved", self.store.get("executions", "p1", "command-cmd-1")["status"])
+        self.assertEqual(claimed, self.store.get("commands", "p1", "cmd-1"))
+        self.assertEqual("ready", self.store.get("tasks", "p1", "t1")["status"])
+
+    def test_attention_command_with_fresh_reserved_execution_is_not_cancelled(self):
+        # A transient earlier attention write (e.g. task_claim_backend_
+        # unavailable) does not stop the live worker -- a later tick must
+        # still respect the claim window instead of cancelling under it.
+        reserve_execution(self.store, "p1", "t1", "command-cmd-1", "codex", {"decision": "fresh"})
+        marked = command(status="attention", execution_id="command-cmd-1", claimed_at=now_iso(),
+                         stale_at=now_iso(), recovery_reason="task_claim_backend_unavailable")
+        self.store.put("commands", "p1", "cmd-1", marked)
+        result = process_command(self.store, object(), marked, claim_factory=lambda *_: MemoryClaimRegistry())
+        self.assertEqual({"status": "attention", "skipped": True, "reason": "prelaunch_in_flight"}, result)
+        self.assertEqual("reserved", self.store.get("executions", "p1", "command-cmd-1")["status"])
+
+    def test_expired_claim_reservation_still_cancels_and_converges_to_failed(self):
+        # Bounded convergence: once the claim window itself has expired with
+        # the Execution still reserved, the prelaunch is over-budget and the
+        # original cancel path must run to a real terminal state.
+        reserve_execution(self.store, "p1", "t1", "command-cmd-1", "codex", {"decision": "fresh"})
+        expired_at = self.iso(datetime.now(timezone.utc) - timedelta(seconds=CLAIM_TIMEOUT_SECONDS + 60))
+        stale = command(status="claimed", execution_id="command-cmd-1", claimed_at=expired_at)
+        self.store.put("commands", "p1", "cmd-1", stale)
+        result = process_command(self.store, object(), stale, claim_factory=lambda *_: MemoryClaimRegistry())
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("cancelled", self.store.get("executions", "p1", "command-cmd-1")["status"])
+        self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+        self.assertEqual("prelaunch_failed", self.store.get("commands", "p1", "cmd-1")["result"]["error_kind"])
+
+    def test_cancelled_prelaunch_converges_to_failed_despite_foreign_repo_lock_owner(self):
+        # The incident's non-convergence half, end to end: cancelled
+        # execution + repo lock slot owned by ANOTHER task (status already
+        # "released", exactly as observed live) must terminalize the Command
+        # as failed -- never loop in attention -- and must not touch the
+        # foreign lock.
+        writable = create_task(self.store, task(read_only=False), assign=False, persist=False)
+        self.store.put("tasks", "p1", "t1", writable)
+        reserve_execution(self.store, "p1", "t1", "command-cmd-1", "codex", {"decision": "fresh"})
+        cancel_reserved_execution(self.store, MemoryClaimRegistry(), "p1", "command-cmd-1",
+                                  "prelaunch failure left a reservation without provider authority")
+        canonical = canonical_repository(self.store.get("projects", "p1", "p1")["repo"])
+        lock_id = repository_lock_id(canonical)
+        foreign_lock = {
+            "project_id": "p1", "task_id": "t-previous", "execution_id": "command-t-previous",
+            "provider": "codex", "session_id": "codex:previous-session", "lock_id": lock_id,
+            "repository": canonical, "branch": "refs/heads/feat/previous", "scope": ["manager/executions.py"],
+            "baseline_head": "a" * 40, "access": "production", "status": "released", "generation": 40,
+            "lease_token_hash": "0" * 64, "created_at": "2026-09-01T15:43:14.000000Z",
+            "updated_at": "2026-09-01T15:52:10.000000Z", "expires_at": "2026-09-01T16:43:14.000000Z",
+            "released_at": "2026-09-01T15:52:10.000000Z",
+        }
+        registry = MemoryRegistry({"schema_version": "0.2.0", "locks": {lock_id: deepcopy(foreign_lock)}})
+        marked = command(status="attention", execution_id="command-cmd-1", claimed_at=now_iso(),
+                         stale_at=now_iso(), recovery_reason="terminal_writer_authority_reconciliation_unknown")
+        self.store.put("commands", "p1", "cmd-1", marked)
+        with patch("manager.command_watcher.GCSLockRegistry.from_environment", return_value=registry):
+            result = process_command(self.store, object(), marked, claim_factory=lambda *_: MemoryClaimRegistry())
+        self.assertEqual({"status": "failed", "reconciled": True}, result)
+        stored = self.store.get("commands", "p1", "cmd-1")
+        self.assertEqual("failed", stored["status"])
+        self.assertEqual("prelaunch_failed", stored["result"]["error_kind"])
+        self.assertEqual("blocked", self.store.get("tasks", "p1", "t1")["status"])
+        self.assertEqual("cancelled", self.store.get("executions", "p1", "command-cmd-1")["status"])
+        self.assertEqual(foreign_lock, registry.document["locks"][lock_id])
+        # Convergence is durable: a repeated tick sees the terminal Command
+        # and never reopens or relaunches it.
+        repeat = process_command(self.store, object(), stored, claim_factory=lambda *_: MemoryClaimRegistry())
+        self.assertEqual("failed", repeat["status"])
+        self.assertEqual("failed", self.store.get("commands", "p1", "cmd-1")["status"])
 
     def test_no_allowlist_means_zero_launch(self):
         self.store.put("commands", "p1", "cmd-1", command())
@@ -1706,6 +1796,50 @@ class AsyncClaimContinuationTests(unittest.TestCase):
         self.assertEqual(4242, persisted.get("worker_pid"))
         self.assertIsNotNone(persisted.get("worker_spawned_at"))
         validate("command", persisted)
+
+    def test_async_claim_opens_adm_ui_once_and_repeated_tick_never_refocuses(self):
+        # AUTO_OPEN_ADM at claim time: a real dispatch entering execution
+        # (claimed + worker spawned) must bring the Dashboard onto the
+        # interactive desktop immediately -- not only after prelaunch
+        # (minutes of Drive/GCS latency) reaches "running", which a launch
+        # dying mid-prelaunch never does (live incident 20260901: no window
+        # ever appeared). Exactly once per Command: the queued -> claimed
+        # transition happens once, and reconcile ticks never re-enter it.
+        focus = Mock(return_value={"status": "completed", "window_title": "ADM Unified Operations Dashboard"})
+        with patch("manager.command_watcher._spawn_claimed_worker", return_value=4242), \
+             patch("manager.command_watcher.focus_existing_adm_ui", focus):
+            result = process_command(
+                self.store, object(), command(), claim_factory=CommandWatcherTests.claim_factory,
+                allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True,
+                async_launch=True,
+            )
+        self.assertEqual("claimed", result["status"])
+        focus.assert_called_once_with()
+        stored = self.store.get("commands", "p1", "cmd-1")
+        refocus = Mock(return_value={"status": "completed", "window_title": "ADM Unified Operations Dashboard"})
+        with patch("manager.command_watcher.focus_existing_adm_ui", refocus):
+            repeat = process_command(self.store, object(), stored,
+                                     claim_factory=CommandWatcherTests.claim_factory)
+        self.assertEqual("claimed", repeat["status"])
+        self.assertTrue(repeat.get("skipped"))
+        refocus.assert_not_called()
+
+    def test_async_claim_auto_open_failure_never_blocks_the_dispatch(self):
+        # User visibility is best-effort observability only: a raising or
+        # failing focus call must never affect the claim, the spawned
+        # worker's authority, or the persisted Command.
+        focus = Mock(side_effect=RuntimeError("no desktop"))
+        with patch("manager.command_watcher._spawn_claimed_worker", return_value=4242), \
+             patch("manager.command_watcher.focus_existing_adm_ui", focus):
+            result = process_command(
+                self.store, object(), command(), claim_factory=CommandWatcherTests.claim_factory,
+                allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True,
+                async_launch=True,
+            )
+        self.assertEqual({"status": "claimed", "execution_id": "command-cmd-1", "worker_pid": 4242}, result)
+        persisted = self.store.get("commands", "p1", "cmd-1")
+        self.assertEqual("claimed", persisted["status"])
+        self.assertEqual(4242, persisted.get("worker_pid"))
 
 
 class PollOnceTimeBudgetTests(unittest.TestCase):

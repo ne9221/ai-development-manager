@@ -278,12 +278,26 @@ def _on_execution_running(store, running_command):
     # a user who can't currently see their screen must never be the reason
     # a real dispatch fails.
     _write(store, running_command)
+    _focus_adm_ui_best_effort("running")
+
+
+def _focus_adm_ui_best_effort(stage):
+    """Best-effort, never-raising focus-or-open of the ADM Dashboard.
+
+    focus_existing_adm_ui() is idempotent (focus-or-launch-or-noop), so
+    calling it from more than one lifecycle stage can never spawn a
+    duplicate Streamlit instance or browser window. Each stage fires at
+    most once per Command (claim happens once; on_running fires once), so
+    repeated watcher ticks never re-steal focus. Any failure -- including
+    no interactive desktop (locked/disconnected session) -- is only ever
+    logged: user visibility must never affect dispatch or terminal truth.
+    """
     try:
         result = focus_existing_adm_ui()
         if result.get("status") != "completed":
-            print(f"AUTO_OPEN_ADM: {result.get('error_kind', 'unknown')}", file=sys.stderr)
+            print(f"AUTO_OPEN_ADM[{stage}]: {result.get('error_kind', 'unknown')}", file=sys.stderr)
     except Exception as exc:
-        print(f"AUTO_OPEN_ADM: unexpected error: {exc}", file=sys.stderr)
+        print(f"AUTO_OPEN_ADM[{stage}]: unexpected error: {exc}", file=sys.stderr)
 
 
 def _claimed(command):
@@ -504,10 +518,19 @@ def _reconcile_terminal_writer_lease(store, command, execution):
     project = store.get("projects", command["project_id"], command["project_id"])
     validate("project", project)
     lock_id = repository_lock_id(canonical_repository(project["repo"]))
+    # foreign_owner_clean: the registry keeps one lock slot per repository,
+    # so a slot owned by ANY other task/execution proves this prelaunch
+    # rollback holds no lease there -- nothing of ours to release. Before
+    # this, a foreign owner (even one already "released" -- live incident
+    # 20260901: the previous task's released lock) raised
+    # "owner mismatch" -> attention on EVERY tick, and the Command could
+    # never terminalize (terminal_writer_authority_reconciliation_unknown
+    # forever). Matching-owner refusals (linked session, invalid status)
+    # are unchanged.
     return reconcile_unlinked_terminal_lease(
         GCSLockRegistry.from_environment(), lock_id,
         command["project_id"], command["task_id"], execution["execution_id"], execution["provider"],
-        execution["status"],
+        execution["status"], foreign_owner_clean=True,
     )
 
 
@@ -610,7 +633,21 @@ def _release_orphan_pre_execution_claim(store, command, claim_registry):
     return {"status": "queued", "reconciled": True, "orphan_claim_released": True}
 
 
-def _reconcile_active(store, service, command, claim_factory):
+def _reconcile_active(store, service, command, claim_factory, launch_failure_observed=False):
+    """Reconcile a claimed/running/attention Command against its Execution.
+
+    ``launch_failure_observed`` is set only by the launch path's own
+    exception handlers (_run_claimed_command/process_command), which have
+    first-hand proof that launch_task() already raised for this exact
+    claimed command -- for them a still-reserved Execution really is a
+    prelaunch failure and is cancelled immediately, exactly as before. A
+    watcher tick observing from outside has no such proof: a reservation
+    whose Command claim is still fresh is the NORMAL in-flight prelaunch
+    shape (reserve_execution() -> enter_running_gate() spans real Drive/GCS
+    latency, minutes on a slow tick -- live incident 20260901: a reservation
+    24 seconds old, worker PID alive, was cancelled as 'prelaunch failure'
+    by the next tick), so it is left alone until the claim itself expires.
+    """
     try:
         execution = store.get("executions", command["project_id"], command["execution_id"])
         validate("execution", execution)
@@ -691,6 +728,17 @@ def _reconcile_active(store, service, command, claim_factory):
             return {"status": terminal["status"], "reconciled": True}
         return _attention(store, command, execution, "terminal_cleanup_not_confirmed")
     if execution["status"] == "reserved":
+        # In-flight prelaunch protection: without first-hand launch-failure
+        # proof, a reservation under a still-fresh Command claim belongs to
+        # a live worker somewhere between reserve_execution() and the
+        # running gate's own "running" write. Cancelling it here races that
+        # worker and orphans the launch. The claim window
+        # (CLAIM_TIMEOUT_SECONDS) is the designed bound on the whole
+        # prelaunch: once it expires with the Execution still reserved, the
+        # cancel below runs and the Command converges to a terminal
+        # "failed" -- never an unbounded wait.
+        if not launch_failure_observed and not _claim_expired(command):
+            return {"status": command["status"], "skipped": True, "reason": "prelaunch_in_flight"}
         try:
             cancelled = cancel_reserved_execution(
                 store, claim_registry, command["project_id"], command["execution_id"],
@@ -871,7 +919,8 @@ def _run_claimed_command(store, service, claimed, launcher_factory, writer_facto
             try:
                 existing = store.get("executions", claimed["project_id"], claimed["execution_id"])
                 if existing.get("status") in ("reserved", "running"):
-                    return _reconcile_active(store, service, {**claimed, "status": "running"}, claim_factory)
+                    return _reconcile_active(store, service, {**claimed, "status": "running"}, claim_factory,
+                                             launch_failure_observed=True)
                 if existing.get("status") in ("completed", "failed", "interrupted"):
                     # Execution genuinely reached terminal status (real
                     # session, real provider outcome) but _existing_terminal
@@ -1127,6 +1176,15 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
             }
             validate("command", claimed_with_worker)
             _write(store, claimed_with_worker)
+            # AUTO_OPEN_ADM at claim time: the user should see the Dashboard
+            # as soon as a real dispatch enters execution (claimed + worker
+            # spawned), not only after the worker's prelaunch (minutes of
+            # Drive/GCS latency) finally reaches "running" -- and a launch
+            # that dies during prelaunch never reaches on_running at all
+            # (live incident 20260901: no window ever appeared). This branch
+            # runs exactly once per Command (the queued -> claimed
+            # transition); subsequent ticks reconcile and never re-enter it.
+            _focus_adm_ui_best_effort("claimed")
             return {"status": "claimed", "execution_id": claimed["execution_id"], "worker_pid": worker_pid}
         except Exception as exc:
             kind = getattr(exc, "classification", None) or type(exc).__name__
@@ -1184,7 +1242,8 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
             try:
                 existing = store.get("executions", claimed["project_id"], claimed["execution_id"])
                 if existing.get("status") in ("reserved", "running"):
-                    return _reconcile_active(store, service, running, claim_factory)
+                    return _reconcile_active(store, service, running, claim_factory,
+                                             launch_failure_observed=True)
                 if existing.get("status") in ("completed", "failed", "interrupted"):
                     # Same terminal-truth-over-generic-fallback derivation as
                     # _run_claimed_command's async path above -- see its

@@ -174,6 +174,43 @@ class WorktreeLockTests(unittest.TestCase):
         with self.assertRaisesRegex(TaskError, "linked provider session"):
             reconcile_unlinked_terminal_lease(registry, result["lock_id"], **owner_from(result), terminal_status="cancelled")
 
+    def test_terminal_reconciliation_owner_mismatch_defaults_to_refusal(self):
+        registry = MemoryRegistry(); arguments = acquire_args(); arguments.pop("session_id")
+        result = acquire(registry, **arguments)
+        with self.assertRaisesRegex(TaskError, "owner mismatch"):
+            reconcile_unlinked_terminal_lease(
+                registry, result["lock_id"], "p1", "task-b", "exec-b", "codex", "cancelled",
+            )
+        self.assertEqual("active", registry.document["locks"][result["lock_id"]]["status"])
+
+    def test_terminal_reconciliation_foreign_owner_clean_reports_clean_and_releases_nothing(self):
+        # Live incident 20260901 (terminal_writer_authority_reconciliation_
+        # unknown forever): the single per-repository lock slot occupied by a
+        # DIFFERENT task/execution proves the caller's execution holds no
+        # lease there. With foreign_owner_clean=True that is reported as
+        # clean -- and the registry must not be touched at all: releasing or
+        # mutating someone else's lock stays impossible.
+        registry = MemoryRegistry(); arguments = acquire_args(); arguments.pop("session_id")
+        result = acquire(registry, **arguments)
+        version_before = registry.version
+        outcome = reconcile_unlinked_terminal_lease(
+            registry, result["lock_id"], "p1", "task-b", "exec-b", "codex", "cancelled",
+            foreign_owner_clean=True,
+        )
+        self.assertEqual({"status": "clean", "released": False, "reason": "foreign_lock_owner"}, outcome)
+        self.assertEqual(version_before, registry.version)
+        self.assertEqual("active", registry.document["locks"][result["lock_id"]]["status"])
+        # The incident's exact shape -- a foreign lock already "released" --
+        # is equally clean (the owner check must answer before lock status).
+        registry.document["locks"][result["lock_id"]]["status"] = "released"
+        registry.document["locks"][result["lock_id"]]["released_at"] = registry.document["locks"][result["lock_id"]]["updated_at"]
+        outcome = reconcile_unlinked_terminal_lease(
+            registry, result["lock_id"], "p1", "task-b", "exec-b", "codex", "cancelled",
+            foreign_owner_clean=True,
+        )
+        self.assertEqual("clean", outcome["status"])
+        self.assertEqual(version_before, registry.version)
+
     def test_stopped_provider_reconciliation_releases_only_exact_linked_generation(self):
         registry = MemoryRegistry()
         result = acquire(registry, **acquire_args())

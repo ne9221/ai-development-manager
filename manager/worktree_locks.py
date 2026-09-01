@@ -297,7 +297,7 @@ def release(registry, lock_id, project_id, task_id, execution_id, provider, sess
 
 
 def reconcile_unlinked_terminal_lease(registry, lock_id, project_id, task_id, execution_id, provider,
-                                     terminal_status, attempts=5):
+                                     terminal_status, attempts=5, foreign_owner_clean=False):
     """Release a writer lease left by a proven prelaunch terminal rollback.
 
     This is deliberately narrower than ``release``: it accepts no token and
@@ -305,6 +305,16 @@ def reconcile_unlinked_terminal_lease(registry, lock_id, project_id, task_id, ex
     provider Session and whose execution is already terminal before the
     caller invokes this governance recovery path.  Running/completed leases,
     linked leases, and owner mismatches remain refused.
+
+    ``foreign_owner_clean=True`` narrows only the owner-mismatch outcome:
+    the registry holds exactly one lock slot per repository, so a slot
+    occupied by a DIFFERENT owner (any identity field mismatch) is positive
+    proof this exact execution holds no lease there -- there is nothing of
+    ours to release, and nothing is touched. The default (False) preserves
+    the original refusal for callers that treat a foreign owner as an
+    authority conflict. Never weakens any other refusal: a matching owner
+    with a linked provider session, an invalid status, or CAS contention
+    still raises exactly as before.
     """
     if terminal_status not in {"cancelled", "failed", "interrupted"}:
         raise TaskError("terminal lease reconciliation requires a non-running terminal status")
@@ -315,6 +325,8 @@ def reconcile_unlinked_terminal_lease(registry, lock_id, project_id, task_id, ex
         if not lock:
             return {"status": "clean", "released": False, "reason": "lock_not_found"}
         if not all(lock.get(key) == value for key, value in owner.items() if key != "session_id"):
+            if foreign_owner_clean:
+                return {"status": "clean", "released": False, "reason": "foreign_lock_owner"}
             raise TaskError("terminal lease reconciliation owner mismatch")
         if lock.get("session_id") is not None:
             raise TaskError("terminal lease reconciliation refuses a linked provider session")
