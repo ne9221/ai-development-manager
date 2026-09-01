@@ -255,35 +255,70 @@ def _write(store, command):
 
 
 def _on_execution_running(store, running_command):
-    # AUTO_OPEN_ADM (P0 Dashboard Live Proof follow-up, 2026-08-29): every
-    # real dispatch that actually reaches "running" -- not just an explicit
-    # OPEN_EXISTING_ADM_UI command (see the dedicated branch above in
-    # process_command) -- should bring the user-visible Dashboard onto the
-    # interactive desktop, so the user never has to know a task was even
-    # dispatched to go look at it. Reuses the exact same
-    # focus_existing_adm_ui() idempotent focus-or-launch-or-noop logic, so
-    # this can never spawn a duplicate Streamlit instance or duplicate
-    # browser window regardless of how many Commands reach "running" in the
-    # same tick or across ticks. This Scheduled Task only ever runs
-    # interactively-logged-on (LogonType=Interactive), the same desktop
-    # session the user's own Dashboard shortcut launches into, so this call
-    # is always attempted -- it fails closed (a truthful error_kind,
-    # swallowed here) rather than raising only when no interactive desktop
-    # is actually available (e.g. a locked/disconnected session).
-    #
-    # Deliberately best-effort and never allowed to affect dispatch: this
-    # runs after the execution has already, genuinely reached "running"
-    # (on_running fires only once launch_task's own provider-start proof
-    # succeeds), and any failure here is only ever logged, never raised --
-    # a user who can't currently see their screen must never be the reason
-    # a real dispatch fails.
+    # AUTO_OPEN_ADM moved to the queued -> claimed transition in
+    # process_command (see _focus_adm_ui_best_effort there): opening at
+    # claim time is strictly earlier user visibility, covers launches that
+    # die during prelaunch and never reach this callback at all (live
+    # incident 20260901), and firing it in exactly one lifecycle stage
+    # guarantees a single focus event per Command -- claim-then-running
+    # double focus would re-steal the foreground from whatever the user
+    # switched to during prelaunch.
     _write(store, running_command)
+
+
+def _focus_adm_ui_best_effort(stage):
+    """Best-effort, detached, never-raising open/focus of the ADM Dashboard.
+
+    Runs manager.open_existing_adm_ui in a detached helper process instead
+    of calling focus_existing_adm_ui() inline: the helper owns the full
+    focus-or-launch-or-noop logic AND its cost (dashboard cold start plus
+    window discovery can poll for ~30s worst-case), so a watcher tick's
+    claim path is never blocked by desktop work and can never overrun the
+    scheduled cadence because of it. The helper inherits this Scheduled
+    Task's interactive logon session, so Win32 focus works exactly as it
+    did inline; with no interactive desktop it fails closed inside the
+    helper. Fired from exactly one lifecycle stage (the queued -> claimed
+    transition, once per Command), so repeated ticks and later stages never
+    re-steal focus, and focus_existing_adm_ui()'s own single-instance logic
+    still guarantees no duplicate Dashboard/browser. Any spawn failure is
+    only ever logged: user visibility must never affect dispatch or
+    terminal truth.
+    """
+    log_handle = None
     try:
-        result = focus_existing_adm_ui()
-        if result.get("status") != "completed":
-            print(f"AUTO_OPEN_ADM: {result.get('error_kind', 'unknown')}", file=sys.stderr)
+        # Durable observability for a process whose outcome the watcher
+        # never waits on (delta-review finding): the helper's stdout (its
+        # JSON outcome) and stderr (import failures, tracebacks) append to
+        # a log under AI_MANAGER_HOME instead of vanishing into DEVNULL.
+        # Log-file trouble degrades to DEVNULL rather than losing the
+        # spawn itself -- visibility never outranks the dispatch.
+        try:
+            log_dir = os.path.join(os.environ.get("AI_MANAGER_HOME") or os.getcwd(), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_handle = open(os.path.join(log_dir, "auto-open-adm.log"), "ab")
+            log_handle.write(f"AUTO_OPEN_ADM[{stage}] helper spawned at {now_iso()}\n".encode("utf-8"))
+            log_handle.flush()
+        except OSError:
+            log_handle = None
+        sink = log_handle if log_handle is not None else subprocess.DEVNULL
+        flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        kwargs = {"cwd": os.getcwd(), "stdin": subprocess.DEVNULL,
+                  "stdout": sink, "stderr": sink, "close_fds": True}
+        if os.name == "nt":
+            kwargs["creationflags"] = flags
+        subprocess.Popen([sys.executable, "-m", "manager.open_existing_adm_ui"], **kwargs)
     except Exception as exc:
-        print(f"AUTO_OPEN_ADM: unexpected error: {exc}", file=sys.stderr)
+        print(f"AUTO_OPEN_ADM[{stage}]: helper spawn failed: {exc}", file=sys.stderr)
+    finally:
+        # The child owns its inherited handle copy; the parent's must close
+        # either way (spawn success or failure) or the watcher leaks one
+        # per claim.
+        if log_handle is not None:
+            try:
+                log_handle.close()
+            except OSError:
+                pass
 
 
 def _claimed(command):
@@ -504,10 +539,19 @@ def _reconcile_terminal_writer_lease(store, command, execution):
     project = store.get("projects", command["project_id"], command["project_id"])
     validate("project", project)
     lock_id = repository_lock_id(canonical_repository(project["repo"]))
+    # foreign_owner_clean: the registry keeps one lock slot per repository,
+    # so a slot owned by ANY other task/execution proves this prelaunch
+    # rollback holds no lease there -- nothing of ours to release. Before
+    # this, a foreign owner (even one already "released" -- live incident
+    # 20260901: the previous task's released lock) raised
+    # "owner mismatch" -> attention on EVERY tick, and the Command could
+    # never terminalize (terminal_writer_authority_reconciliation_unknown
+    # forever). Matching-owner refusals (linked session, invalid status)
+    # are unchanged.
     return reconcile_unlinked_terminal_lease(
         GCSLockRegistry.from_environment(), lock_id,
         command["project_id"], command["task_id"], execution["execution_id"], execution["provider"],
-        execution["status"],
+        execution["status"], foreign_owner_clean=True,
     )
 
 
@@ -610,7 +654,21 @@ def _release_orphan_pre_execution_claim(store, command, claim_registry):
     return {"status": "queued", "reconciled": True, "orphan_claim_released": True}
 
 
-def _reconcile_active(store, service, command, claim_factory):
+def _reconcile_active(store, service, command, claim_factory, launch_failure_observed=False):
+    """Reconcile a claimed/running/attention Command against its Execution.
+
+    ``launch_failure_observed`` is set only by the launch path's own
+    exception handlers (_run_claimed_command/process_command), which have
+    first-hand proof that launch_task() already raised for this exact
+    claimed command -- for them a still-reserved Execution really is a
+    prelaunch failure and is cancelled immediately, exactly as before. A
+    watcher tick observing from outside has no such proof: a reservation
+    whose Command claim is still fresh is the NORMAL in-flight prelaunch
+    shape (reserve_execution() -> enter_running_gate() spans real Drive/GCS
+    latency, minutes on a slow tick -- live incident 20260901: a reservation
+    24 seconds old, worker PID alive, was cancelled as 'prelaunch failure'
+    by the next tick), so it is left alone until the claim itself expires.
+    """
     try:
         execution = store.get("executions", command["project_id"], command["execution_id"])
         validate("execution", execution)
@@ -691,6 +749,36 @@ def _reconcile_active(store, service, command, claim_factory):
             return {"status": terminal["status"], "reconciled": True}
         return _attention(store, command, execution, "terminal_cleanup_not_confirmed")
     if execution["status"] == "reserved":
+        # In-flight prelaunch protection: without first-hand launch-failure
+        # proof, a reservation under a still-fresh Command claim belongs to
+        # a live worker somewhere between reserve_execution() and the
+        # running gate's own "running" write. Cancelling it here races that
+        # worker and orphans the launch. The claim window
+        # (CLAIM_TIMEOUT_SECONDS) is the designed bound on the whole
+        # prelaunch: once it expires with the Execution still reserved, the
+        # cancel below runs and the Command converges to a terminal
+        # "failed" -- never an unbounded wait.
+        if not launch_failure_observed:
+            if not _claim_expired(command):
+                return {"status": command["status"], "skipped": True, "reason": "prelaunch_in_flight"}
+            # Claim expiry alone is a schedule bound, not proof the worker is
+            # gone: a live recorded worker delayed past CLAIM_TIMEOUT_SECONDS
+            # (degraded Drive/GCS mid-prelaunch) must still never have its
+            # reservation cancelled underneath it -- the same liveness fence
+            # _release_orphan_pre_execution_claim already applies to the
+            # missing-execution shape. Only a worker proven stopped/replaced
+            # (or a legacy record that never carried worker identity at all,
+            # where the pre-existing cancel is the only route to
+            # convergence) may fall through to the cancel below; live or
+            # unknown state surfaces as attention and reconverges on a later
+            # tick once the process is provably gone.
+            observed_worker_pid = command.get("worker_pid")
+            if observed_worker_pid is not None:
+                worker_state = process_identity_state(observed_worker_pid, command.get("worker_creation_identity"))
+                if worker_state == "live":
+                    return _attention(store, command, execution, "reserved_execution_worker_still_live")
+                if worker_state not in ("stopped", "replaced"):
+                    return _attention(store, command, execution, "reserved_execution_worker_state_unknown")
         try:
             cancelled = cancel_reserved_execution(
                 store, claim_registry, command["project_id"], command["execution_id"],
@@ -871,7 +959,8 @@ def _run_claimed_command(store, service, claimed, launcher_factory, writer_facto
             try:
                 existing = store.get("executions", claimed["project_id"], claimed["execution_id"])
                 if existing.get("status") in ("reserved", "running"):
-                    return _reconcile_active(store, service, {**claimed, "status": "running"}, claim_factory)
+                    return _reconcile_active(store, service, {**claimed, "status": "running"}, claim_factory,
+                                             launch_failure_observed=True)
                 if existing.get("status") in ("completed", "failed", "interrupted"):
                     # Execution genuinely reached terminal status (real
                     # session, real provider outcome) but _existing_terminal
@@ -1114,6 +1203,15 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
     origin = command_origin(origin_context)
     claimed = {**_claimed(command), "process_provenance": origin}
     _write(store, claimed)
+    # AUTO_OPEN_ADM at claim time, for both the async and inline launch
+    # paths: the user should see the Dashboard as soon as a real dispatch
+    # enters execution (queued -> claimed), not only after prelaunch
+    # (minutes of Drive/GCS latency) finally reaches "running" -- and a
+    # launch that dies during prelaunch never reaches on_running at all
+    # (live incident 20260901: no window ever appeared). This is the ONLY
+    # lifecycle stage that fires it, and this transition happens exactly
+    # once per Command; subsequent ticks reconcile and never re-enter it.
+    _focus_adm_ui_best_effort("claimed")
     if async_launch:
         try:
             worker_pid = _spawn_claimed_worker(claimed)
@@ -1184,7 +1282,8 @@ def process_command(store, service, command, launcher_factory=None, writer_facto
             try:
                 existing = store.get("executions", claimed["project_id"], claimed["execution_id"])
                 if existing.get("status") in ("reserved", "running"):
-                    return _reconcile_active(store, service, running, claim_factory)
+                    return _reconcile_active(store, service, running, claim_factory,
+                                             launch_failure_observed=True)
                 if existing.get("status") in ("completed", "failed", "interrupted"):
                     # Same terminal-truth-over-generic-fallback derivation as
                     # _run_claimed_command's async path above -- see its
