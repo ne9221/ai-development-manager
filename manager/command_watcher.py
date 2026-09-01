@@ -1629,6 +1629,34 @@ def _prioritized_nonterminal_commands(commands):
 
 TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS = 10
 
+# LIVE P0 fix (terminal recovery budget starvation, observed on a real
+# production tick): a large project's FULL-sweep hydration
+# (_enumerate_commands(), one real Drive request per record within its own
+# bounded budget) can legitimately consume nearly the ENTIRE shared poll
+# deadline by itself -- a real live measurement against ai-development-
+# manager's 234-record Command history took ~28s of the ~40s
+# POLL_TIME_BUDGET_SECONDS. Phase 2c's own headroom guard
+# (deadline - now >= TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS) then
+# correctly, safely refuses to even attempt a classification lookup once
+# hydration alone has already spent the budget down to under that many
+# seconds of headroom -- which is the RIGHT thing for that guard to do in
+# isolation, but meant a genuinely reachable, already-cached terminal
+# candidate (confirmed present in the batch, at the front of it, with zero
+# competing nonterminal work) still got ZERO classification attempts,
+# tick after tick, forever: full hydration was never leaving Phase 2c
+# enough of the shared deadline to ever pass its own safety check.
+#
+# Fix: reserve a slice of the poll deadline for terminal recovery,
+# specifically by making Phase 2a/2b's HYDRATION calls (never their
+# processing of already-discovered nonterminal work, which must keep
+# using the full `deadline` -- see poll_once()) stop starting further
+# optional enumeration once fewer than this many seconds remain before
+# the real poll deadline. `TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS` alone
+# is the bare minimum a single classification lookup could need; a few
+# seconds of margin absorb the ordinary interpreter/bookkeeping overhead
+# between hydration yielding and Phase 2c's own headroom check running.
+TERMINAL_RECOVERY_RESERVED_SECONDS = TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS + 5
+
 
 class _TerminalRecoveryPrevalidation:
     """Internal-only proof that _terminal_recovery_candidates() already
@@ -1981,19 +2009,34 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
                             "command_id": command["command_id"], "error": repr(exc)})
         processed.add((project_id, command["command_id"]))
 
+    # LIVE P0 fix: hydration (fetching MORE projects'/records' Command
+    # batches) must yield once fewer than TERMINAL_RECOVERY_RESERVED_SECONDS
+    # remain before the real poll deadline -- see that constant's own
+    # docstring for the live production trace this closes. This bounds
+    # only STARTING further optional enumeration; a project's own
+    # already-hydrated nonterminal commands are still processed against
+    # the full, unreserved `deadline` below (`_run()`'s own checks), so
+    # already-discovered active/queued work is never held back by this
+    # reservation -- only additional, not-yet-fetched historical hydration
+    # is what yields.
+    hydration_deadline = deadline - TERMINAL_RECOVERY_RESERVED_SECONDS
+
     recent_deadline = min(deadline, time.monotonic() + RECENT_COMMAND_SWEEP_BUDGET_SECONDS)
+    recent_hydration_deadline = min(recent_deadline, hydration_deadline)
     for project_id in project_ids:
-        if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
+        if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_hydration_deadline:
             break
         try:
-            commands = _enumerate_recent_commands(recent_store, project_id, deadline=recent_deadline)
+            commands = _enumerate_recent_commands(recent_store, project_id, deadline=recent_hydration_deadline)
         except TaskError:
             continue
         _remember_batch(project_id, commands)
         # Zero-remote-lookup nonterminal priority work (claimed/running/
         # queued/attention) only -- terminal-recovery eligibility (which
         # requires a real Execution lookup) is entirely deferred to the
-        # GLOBAL Phase 2c below.
+        # GLOBAL Phase 2c below. Uses the full `recent_deadline`, not the
+        # tightened `recent_hydration_deadline` -- already-hydrated active
+        # work is never held back by the terminal-recovery reservation.
         for command in _prioritized_nonterminal_commands(commands):
             if (project_id, command["command_id"]) in just_promoted:
                 continue
@@ -2002,10 +2045,10 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             _run(project_id, command)
 
     for project_id in project_ids:
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= hydration_deadline:
             break
         try:
-            commands = _enumerate_commands(discovery_store, project_id, deadline=deadline)
+            commands = _enumerate_commands(discovery_store, project_id, deadline=hydration_deadline)
         except TaskError:
             # A project that has never had a single Command written to it
             # yet has no COMMANDS Drive folder at all --
