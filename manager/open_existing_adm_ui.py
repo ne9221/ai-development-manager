@@ -214,7 +214,15 @@ def main(argv=None):
     code is always 0, because no auto-open outcome may ever look like a
     dispatch failure to anything supervising this process."""
     del argv
-    print(json.dumps(focus_existing_adm_ui()))
+    try:
+        result = focus_existing_adm_ui()
+    except BaseException as exc:  # noqa: BLE001 -- outcome must always be printable
+        # focus_existing_adm_ui() already converts its own failures to
+        # result dicts; this catches anything above it (interpreter-level
+        # surprises) so the spawner's log always records SOME structured
+        # outcome instead of a bare traceback.
+        result = {"status": "failed", "error_kind": "helper_unexpected_error", "detail": str(exc)[:200]}
+    print(json.dumps(result))
     return 0
 
 

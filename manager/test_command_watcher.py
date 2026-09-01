@@ -702,26 +702,49 @@ class CommandWatcherTests(unittest.TestCase):
         REAL _focus_adm_ui_best_effort (module-import-time binding, not the
         module-wide safety mock)."""
         spawned = Mock()
-        with patch("manager.command_watcher.subprocess.Popen", spawned):
-            _focus_adm_ui_best_effort("claimed")
-        spawned.assert_called_once()
-        argv = spawned.call_args.args[0]
-        self.assertEqual(["-m", "manager.open_existing_adm_ui"], argv[1:])
-        if os.name == "nt":
-            flags = spawned.call_args.kwargs["creationflags"]
-            self.assertTrue(flags & __import__("subprocess").DETACHED_PROCESS)
-        # Spawn failure is logged, never raised -- and a real dispatch
-        # running with the REAL (unpatched-at-callsite) helper whose spawn
-        # fails still completes normally.
-        with patch("manager.command_watcher.subprocess.Popen", Mock(side_effect=OSError("no desktop"))):
-            _focus_adm_ui_best_effort("claimed")  # must not raise
-        runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])
-        real_helper = _focus_adm_ui_best_effort
-        with patch("manager.command_watcher.launch_task", runner), \
-             patch("manager.command_watcher._focus_adm_ui_best_effort", real_helper), \
-             patch("manager.command_watcher.subprocess.Popen", Mock(side_effect=OSError("no desktop"))):
-            result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
-        self.assertEqual("completed", result["status"])
+        with tempfile.TemporaryDirectory() as home:
+            with patch.dict(os.environ, {"AI_MANAGER_HOME": home}), \
+                 patch("manager.command_watcher.subprocess.Popen", spawned):
+                _focus_adm_ui_best_effort("claimed")
+            spawned.assert_called_once()
+            argv = spawned.call_args.args[0]
+            self.assertEqual(["-m", "manager.open_existing_adm_ui"], argv[1:])
+            if os.name == "nt":
+                flags = spawned.call_args.kwargs["creationflags"]
+                self.assertTrue(flags & __import__("subprocess").DETACHED_PROCESS)
+            # Observability (delta-review finding): the helper's stdout and
+            # stderr must both land in the durable auto-open log under
+            # AI_MANAGER_HOME -- never DEVNULL -- so a helper that spawns
+            # fine but later fails (no desktop, dashboard timeout, import
+            # error) leaves evidence. The spawner writes a stage header
+            # first, and the helper's main() (tested in
+            # test_open_existing_adm_ui) always prints a structured outcome
+            # onto this same handle.
+            devnull = __import__("subprocess").DEVNULL
+            self.assertIsNot(spawned.call_args.kwargs["stdout"], devnull)
+            self.assertIs(spawned.call_args.kwargs["stdout"], spawned.call_args.kwargs["stderr"])
+            log_path = Path(home) / "logs" / "auto-open-adm.log"
+            self.assertIn("AUTO_OPEN_ADM[claimed] helper spawned", log_path.read_text(encoding="utf-8"))
+            # Spawn failure is logged, never raised -- and a real dispatch
+            # running with the REAL (unpatched-at-callsite) helper whose
+            # spawn fails still completes normally. An unwritable log home
+            # degrades to DEVNULL without losing the spawn.
+            with patch.dict(os.environ, {"AI_MANAGER_HOME": home}), \
+                 patch("manager.command_watcher.subprocess.Popen", Mock(side_effect=OSError("no desktop"))):
+                _focus_adm_ui_best_effort("claimed")  # must not raise
+            fallback = Mock()
+            with patch.dict(os.environ, {"AI_MANAGER_HOME": str(Path(home) / "logs" / "auto-open-adm.log")}), \
+                 patch("manager.command_watcher.subprocess.Popen", fallback):
+                _focus_adm_ui_best_effort("claimed")  # log dir path is a file -> OSError -> DEVNULL fallback
+            self.assertIs(fallback.call_args.kwargs["stdout"], devnull)
+            runner = Mock(side_effect=lambda *args, **kwargs: (kwargs["on_running"](None), self.complete(args[7]))[1])
+            real_helper = _focus_adm_ui_best_effort
+            with patch.dict(os.environ, {"AI_MANAGER_HOME": home}), \
+                 patch("manager.command_watcher.launch_task", runner), \
+                 patch("manager.command_watcher._focus_adm_ui_best_effort", real_helper), \
+                 patch("manager.command_watcher.subprocess.Popen", Mock(side_effect=OSError("no desktop"))):
+                result = process_command(self.store, object(), command(), claim_factory=self.claim_factory, allowlist=self.ALLOWLIST, health_check=lambda: True, quota_check=lambda service: True)
+            self.assertEqual("completed", result["status"])
 
     def test_open_existing_adm_ui_is_governed_and_does_not_launch_codex(self):
         focus = Mock(return_value={"status": "completed", "window_title": "ADM Unified Operations Dashboard"})

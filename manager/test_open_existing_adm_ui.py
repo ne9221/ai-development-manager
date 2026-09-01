@@ -155,5 +155,24 @@ class DetachedHelperMainTests(unittest.TestCase):
                 self.assertEqual(0, exit_code)
                 self.assertEqual(outcome, json.loads(buffer.getvalue()))
 
+    def test_main_records_structured_outcome_even_on_unexpected_crash(self):
+        # Observability contract with command_watcher's detached spawn: the
+        # spawner pipes this process's stdout into the durable auto-open
+        # log, so even an exception ABOVE focus_existing_adm_ui's own
+        # error handling must still print a structured outcome (and exit
+        # 0) rather than dying with only a traceback.
+        import io, json
+        from contextlib import redirect_stdout
+        from manager.open_existing_adm_ui import main
+        buffer = io.StringIO()
+        with patch("manager.open_existing_adm_ui.focus_existing_adm_ui",
+                   side_effect=KeyboardInterrupt("supervisor interrupt")), \
+             redirect_stdout(buffer):
+            exit_code = main([])
+        self.assertEqual(0, exit_code)
+        printed = json.loads(buffer.getvalue())
+        self.assertEqual("failed", printed["status"])
+        self.assertEqual("helper_unexpected_error", printed["error_kind"])
+
 
 if __name__ == "__main__": unittest.main()

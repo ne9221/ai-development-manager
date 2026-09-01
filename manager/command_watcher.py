@@ -284,16 +284,41 @@ def _focus_adm_ui_best_effort(stage):
     only ever logged: user visibility must never affect dispatch or
     terminal truth.
     """
+    log_handle = None
     try:
+        # Durable observability for a process whose outcome the watcher
+        # never waits on (delta-review finding): the helper's stdout (its
+        # JSON outcome) and stderr (import failures, tracebacks) append to
+        # a log under AI_MANAGER_HOME instead of vanishing into DEVNULL.
+        # Log-file trouble degrades to DEVNULL rather than losing the
+        # spawn itself -- visibility never outranks the dispatch.
+        try:
+            log_dir = os.path.join(os.environ.get("AI_MANAGER_HOME") or os.getcwd(), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_handle = open(os.path.join(log_dir, "auto-open-adm.log"), "ab")
+            log_handle.write(f"AUTO_OPEN_ADM[{stage}] helper spawned at {now_iso()}\n".encode("utf-8"))
+            log_handle.flush()
+        except OSError:
+            log_handle = None
+        sink = log_handle if log_handle is not None else subprocess.DEVNULL
         flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
                  | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
         kwargs = {"cwd": os.getcwd(), "stdin": subprocess.DEVNULL,
-                  "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+                  "stdout": sink, "stderr": sink, "close_fds": True}
         if os.name == "nt":
             kwargs["creationflags"] = flags
         subprocess.Popen([sys.executable, "-m", "manager.open_existing_adm_ui"], **kwargs)
     except Exception as exc:
         print(f"AUTO_OPEN_ADM[{stage}]: helper spawn failed: {exc}", file=sys.stderr)
+    finally:
+        # The child owns its inherited handle copy; the parent's must close
+        # either way (spawn success or failure) or the watcher leaks one
+        # per claim.
+        if log_handle is not None:
+            try:
+                log_handle.close()
+            except OSError:
+                pass
 
 
 def _claimed(command):
