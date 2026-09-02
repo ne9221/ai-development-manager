@@ -359,6 +359,35 @@ def format_burn_rate(val: Optional[float]) -> str:
     return f"{val:.1f}%/hr"
 
 
+LEGACY_AGGREGATE_ACCOUNT_ID = None
+
+
+def drop_legacy_aggregate_items(items):
+    """Split raw provider entries into (kept, hidden_provider_ids).
+
+    A provider entry with account_id=None is a legacy provider-level
+    aggregate. It is a real, first-class entry when it is the ONLY entry for
+    its provider (Codex has no account concept), but for a provider that also
+    carries named accounts it is neither a third account nor a routing
+    authority -- manager.quota_reader._provider_summary already derives
+    provider eligibility from named accounts only. Live 20260902 the Claude
+    aggregate (collected from the same default ~/.claude credentials as
+    account-a) rendered as a nameless "Claude Code STALE" card next to
+    account-a/account-b, so the Dashboard showed three Claude entities and
+    two page-wide STALE banners for what is one real problem."""
+    named = {item.get("provider") for item in items
+             if isinstance(item, dict) and item.get("account_id") is not LEGACY_AGGREGATE_ACCOUNT_ID}
+    kept, hidden = [], []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("account_id") is LEGACY_AGGREGATE_ACCOUNT_ID and item.get("provider") in named:
+            hidden.append(str(item.get("provider")))
+            continue
+        kept.append(item)
+    return kept, hidden
+
+
 @dataclass
 class AccountQuotaCardViewModel:
     """UI ViewModel for a single provider/account quota card."""
@@ -420,6 +449,13 @@ class AccountQuotaCardViewModel:
     effective_availability: str = "unknown"
 
     # Formatted display strings
+    # Why the last refresh did not land (manager.refresh_status writes
+    # metadata.refresh on every non-success cycle); None when the entry
+    # refreshed successfully or carries no diagnostic.
+    refresh_outcome: Optional[str] = None
+    refresh_error: Optional[str] = None
+    refresh_attempted_at: Optional[str] = None
+
     formatted_five_hour_remaining: str = "Unknown"
     formatted_weekly_remaining: str = "—"
     formatted_five_hour_countdown: str = "—"
@@ -445,6 +481,10 @@ class DailyBriefViewModel:
     telemetry_warnings: List[str] = field(default_factory=list)
     summary_counts: Dict[str, int] = field(default_factory=dict)
     accounts: List[AccountQuotaCardViewModel] = field(default_factory=list)
+    # Provider ids whose legacy account_id=None aggregate entry was hidden
+    # because named accounts exist for that provider (see
+    # drop_legacy_aggregate_items). Transparency only; never rendered as a card.
+    hidden_legacy_accounts: List[str] = field(default_factory=list)
 
 
 def build_account_quota_card_vm(fc: AccountQuotaForecast) -> AccountQuotaCardViewModel:
@@ -466,9 +506,12 @@ def build_account_quota_card_vm(fc: AccountQuotaForecast) -> AccountQuotaCardVie
     elif w5 is None and fc.windows:
         w5 = fc.windows[0]
 
-    # Find weekly / 7-day window
+    # Find weekly / 7-day window. Codex names its windows primary/secondary
+    # (secondary = the 7-day window, duration 10080 minutes); live 20260902
+    # the Dashboard showed Codex with 5H only because "secondary" was never
+    # recognized here even though status.json carried it every cycle.
     w_week = None
-    for name in ("seven_day", "weekly"):
+    for name in ("seven_day", "weekly", "secondary"):
         for w in fc.windows:
             if w.window_name == name:
                 w_week = w
@@ -606,6 +649,14 @@ def build_daily_brief_vm(
             normalized_input = normalized_input.get("providers")
         elif normalized_input.get("accounts"):
             normalized_input = normalized_input.get("accounts")
+    # One filter, at the input: everything downstream (forecast, unsafe list,
+    # nearest reset, recommendation scoring, cards) sees only real entities.
+    normalized_input, hidden_legacy = drop_legacy_aggregate_items(
+        normalized_input if isinstance(normalized_input, list) else [])
+    refresh_notes = {
+        (item.get("provider"), item.get("account_id")): (item.get("metadata") or {}).get("refresh")
+        for item in normalized_input if isinstance(item.get("metadata"), dict)
+    }
 
     # Fail-safe extraction
     try:
@@ -628,6 +679,12 @@ def build_daily_brief_vm(
         )
 
     account_vms = [build_account_quota_card_vm(fc) for fc in brief_fc.accounts]
+    for vm in account_vms:
+        note = refresh_notes.get((vm.provider, vm.account_id))
+        if isinstance(note, dict):
+            vm.refresh_outcome = note.get("outcome")
+            vm.refresh_error = note.get("error")
+            vm.refresh_attempted_at = note.get("attempted_at")
 
     # Find unsafe accounts (stale, hold, conserve, exhausted)
     unsafe = [
@@ -740,6 +797,7 @@ def build_daily_brief_vm(
         nearest_reset_countdown=nearest_countdown,
         telemetry_warnings=warnings,
         summary_counts=brief_fc.summary_counts,
+        hidden_legacy_accounts=hidden_legacy,
         accounts=account_vms,
     )
 

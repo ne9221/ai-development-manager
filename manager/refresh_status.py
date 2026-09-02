@@ -95,7 +95,20 @@ def claude_snapshot(path, account_id=None):
     return provider
 
 
-def claude_oauth_snapshot(config_dir, account_id=None, timeout=15, collector=collect_claude_oauth, log_path=None):
+def refresh_diagnostic(outcome, error, attempted_at):
+    """The per-entry `metadata.refresh` record (schema: metadata is freeform)
+    that explains WHY a Claude entry did not refresh this cycle. Live
+    20260902: account-a sat STALE for 12+ hours while refresh.log only said
+    `claude oauth unavailable: CredentialsUnavailableError` -- the actual
+    cause (an empty accessToken in the default ~/.claude credentials file,
+    i.e. the account needs a re-login) was invisible both in the log and on
+    the Dashboard. Error text here is the collector's own fixed message
+    (never a token, never response bodies)."""
+    return {"outcome": outcome, "error": error, "attempted_at": attempted_at}
+
+
+def claude_oauth_snapshot(config_dir, account_id=None, timeout=15, collector=collect_claude_oauth, log_path=None,
+                          diagnostics=None):
     """Attempts one real OAuth usage fetch for one account. Returns
     (outcome, provider_or_None):
       - ("success", provider) on a real 200 response with at least one window
@@ -104,19 +117,28 @@ def claude_oauth_snapshot(config_dir, account_id=None, timeout=15, collector=col
       - ("unavailable", None) on missing/unreadable credentials, HTTP 401,
         malformed JSON, or any other collector failure -- caller may still
         try the statusline compatibility fallback
-    Never logs or returns the access token; only exception type names are
-    logged, matching the rest of this module's logging convention."""
+    Never logs or returns the access token. The exception's own message IS
+    logged (and stored into `diagnostics["error"]` when a dict is given):
+    every collectors.claude_oauth error message is a fixed string
+    ("access token missing from credentials", "access token rejected
+    (401)", ...) -- never a token, never a response body -- and without it
+    the log could not distinguish "needs re-login" from "file missing"."""
     try:
         provider = collector(config_dir, account_id, timeout=timeout)
         return "success", provider
     except ClaudeOauthRateLimited as exc:
+        retry_note = f" retry_after={exc.retry_after}" if exc.retry_after else ""
         if log_path is not None:
-            retry_note = f" retry_after={exc.retry_after}" if exc.retry_after else ""
             log_line(log_path, f"claude oauth rate_limited{retry_note}")
+        if diagnostics is not None:
+            diagnostics["error"] = f"{type(exc).__name__}:{retry_note or ' rate limited'}".replace(": ", ":").strip()
         return "rate_limited", None
     except ClaudeOauthError as exc:
+        reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
         if log_path is not None:
-            log_line(log_path, f"claude oauth unavailable: {type(exc).__name__}")
+            log_line(log_path, f"claude oauth unavailable: {reason}")
+        if diagnostics is not None:
+            diagnostics["error"] = reason
         return "unavailable", None
 
 
@@ -204,17 +226,18 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_a
             outcome_key = "claude" if account_id is None else f"claude:{account_id}"
             try:
                 claude = None
+                diagnostics = {}
                 if account_id in config_dirs:
                     cache_key = str(config_dirs[account_id]) if config_dirs[account_id] else "<default>"
                     if cache_key in oauth_cache:
-                        oauth_outcome, oauth_provider = oauth_cache[cache_key]
+                        oauth_outcome, oauth_provider, diagnostics = oauth_cache[cache_key]
                     else:
                         oauth_outcome, oauth_provider = claude_oauth_snapshot(
                             config_dirs[account_id], account_id=account_id,
                             timeout=claude_oauth_timeout, collector=claude_oauth_collector,
-                            log_path=log_path,
+                            log_path=log_path, diagnostics=diagnostics,
                         )
-                        oauth_cache[cache_key] = (oauth_outcome, oauth_provider)
+                        oauth_cache[cache_key] = (oauth_outcome, oauth_provider, diagnostics)
                     if oauth_provider is not None:
                         oauth_provider = dict(oauth_provider, account_id=account_id)
                     if oauth_outcome == "rate_limited":
@@ -257,7 +280,18 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_a
                         outcomes[outcome_key] = "unchanged"
                 else:
                     outcomes[outcome_key] = "unavailable"
-                log_line(log_path, f"provider {outcome_key} {outcomes[outcome_key]}")
+                reason = diagnostics.get("error")
+                if outcomes[outcome_key] != "success" and existing is not None:
+                    # Keep the last-good numbers exactly as they are (they
+                    # still carry their own real last_updated, so freshness
+                    # is judged truthfully) but record WHY nothing newer
+                    # landed, so the Dashboard can say "needs re-login"
+                    # instead of a bare STALE.
+                    existing.setdefault("metadata", {})
+                    if not isinstance(existing["metadata"], dict):
+                        existing["metadata"] = {}
+                    existing["metadata"]["refresh"] = refresh_diagnostic(outcomes[outcome_key], reason, now_iso())
+                log_line(log_path, f"provider {outcome_key} {outcomes[outcome_key]}" + (f" ({reason})" if reason else ""))
             except Exception as exc:
                 outcomes[outcome_key] = "unavailable"
                 log_line(log_path, f"provider {outcome_key} unavailable: {type(exc).__name__}")

@@ -199,5 +199,76 @@ class MainObservabilityTests(unittest.TestCase):
         self.assertIn("refresh initialization failed: RuntimeError", self.log_path.read_text(encoding="utf-8"))
 
 
+
+
+class ClaudeRefreshDiagnosticTests(RefreshTests):
+    """Live 20260902: account-a was STALE for 12+ hours while refresh.log said
+    only `claude oauth unavailable: CredentialsUnavailableError`. The real
+    cause -- an EMPTY accessToken in the default ~/.claude credentials file
+    (the account needs a re-login) -- must be visible in the log and on the
+    entry itself, without ever touching the last-good numbers."""
+
+    def _old_with_account_a(self):
+        old = status()
+        account_a = deepcopy(next(p for p in old["providers"] if p["provider"] == "claude"))
+        account_a.update({
+            "account_id": "account-a", "confidence": "official", "status": "ok",
+            "last_updated": "2026-09-01T14:41:18Z",
+            "windows": [{"name": "five_hour", "used_percent": 0, "remaining_percent": 100, "resets_at": None}],
+        })
+        old["providers"].append(account_a)
+        return old
+
+    def test_oauth_unavailable_reason_is_logged_and_recorded_on_the_entry(self):
+        from collectors.claude_oauth import CredentialsUnavailableError
+
+        old = self._old_with_account_a()
+
+        def failing_collector(config_dir, account_id, timeout=15):
+            raise CredentialsUnavailableError("access token missing from credentials")
+
+        result, _, _ = self.run_refresh(
+            reader=lambda **_: deepcopy(old),
+            claude_accounts={"account-a": self.base / "missing-a.json"},
+            claude_config_dirs={None: None, "account-a": None},
+            claude_oauth_collector=failing_collector,
+        )
+        log = (self.base / "refresh.log").read_text(encoding="utf-8")
+        self.assertIn("claude oauth unavailable: CredentialsUnavailableError: access token missing from credentials", log)
+        # No statusline fallback payload exists in this harness, so the
+        # outcome is "unavailable" (production, where the old payload file
+        # exists, logs "unchanged"); either way the reason rides on the line.
+        self.assertRegex(log, r"provider claude:account-a (unchanged|unavailable) \(CredentialsUnavailableError: access token missing from credentials\)")
+        entry = next(p for p in result["document"]["providers"]
+                     if p["provider"] == "claude" and p.get("account_id") == "account-a")
+        # Last-good numbers and their real timestamp are untouched ...
+        self.assertEqual("2026-09-01T14:41:18Z", entry["last_updated"])
+        self.assertEqual(100, entry["windows"][0]["remaining_percent"])
+        # ... but the entry now says WHY it did not refresh.
+        self.assertIn(entry["metadata"]["refresh"]["outcome"], ("unchanged", "unavailable"))
+        self.assertEqual("CredentialsUnavailableError: access token missing from credentials",
+                         entry["metadata"]["refresh"]["error"])
+        self.assertTrue(entry["metadata"]["refresh"]["attempted_at"].endswith("Z"))
+        self.assertNotIn("token", entry["metadata"]["refresh"]["error"].split(":")[0].lower())
+
+    def test_successful_refresh_replaces_the_diagnostic(self):
+        old = self._old_with_account_a()
+        old["providers"][-1]["metadata"] = {"refresh": {"outcome": "unchanged", "error": "old", "attempted_at": "x"}}
+        fresh = deepcopy(old["providers"][-1])
+        fresh.update({"last_updated": "2026-09-02T02:00:00Z", "metadata": {}})
+        fresh["windows"] = [{"name": "five_hour", "used_percent": 10, "remaining_percent": 90, "resets_at": None}]
+
+        result, _, _ = self.run_refresh(
+            reader=lambda **_: deepcopy(old),
+            claude_accounts={"account-a": self.base / "missing-a.json"},
+            claude_config_dirs={"account-a": None},
+            claude_oauth_collector=lambda config_dir, account_id, timeout=15: deepcopy(fresh),
+        )
+        entry = next(p for p in result["document"]["providers"]
+                     if p["provider"] == "claude" and p.get("account_id") == "account-a")
+        self.assertEqual(90, entry["windows"][0]["remaining_percent"])
+        self.assertNotIn("refresh", entry.get("metadata") or {})
+
+
 if __name__ == "__main__":
     unittest.main()
