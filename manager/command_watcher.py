@@ -37,6 +37,7 @@ from manager.worktree_locks import (canonical_repository, reconcile_stopped_prov
                                     reconcile_unlinked_terminal_lease, repository_lock_id)
 from manager.dispatch_requests import dispatch_request_registry
 from manager.production_guard import RuntimeGuardError, require_runtime_guard
+from manager.runtime_home import resolve_ai_manager_home
 
 
 POLL_SECONDS = 60
@@ -294,7 +295,7 @@ def _focus_adm_ui_best_effort(stage):
         # Log-file trouble degrades to DEVNULL rather than losing the
         # spawn itself -- visibility never outranks the dispatch.
         try:
-            log_dir = os.path.join(os.environ.get("AI_MANAGER_HOME") or os.getcwd(), "logs")
+            log_dir = os.path.join(str(resolve_ai_manager_home()), "logs")
             os.makedirs(log_dir, exist_ok=True)
             log_handle = open(os.path.join(log_dir, "auto-open-adm.log"), "ab")
             log_handle.write(f"AUTO_OPEN_ADM[{stage}] helper spawned at {now_iso()}\n".encode("utf-8"))
@@ -2522,7 +2523,7 @@ def main(argv=None):
         print(json.dumps({"status": "blocked", "reason": exc.code}, separators=(",", ":")))
         return 1
     from manager.scheduler_provenance import finish, start
-    invocation = start(os.environ.get("AI_MANAGER_HOME", "."), "command_watcher")
+    invocation = start(resolve_ai_manager_home(), "command_watcher")
     while True:
         status = "completed"
         try:
@@ -2576,8 +2577,8 @@ def main(argv=None):
             status = "failed"
             print(json.dumps({"status": "unavailable"}, separators=(",", ":")))
         if args.once:
-            finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, status)
-            try_check_and_recover(os.environ.get("AI_MANAGER_HOME", "."))
+            finish(resolve_ai_manager_home(), invocation, status)
+            try_check_and_recover(resolve_ai_manager_home())
             return 0
         time.sleep(args.interval_seconds)
 

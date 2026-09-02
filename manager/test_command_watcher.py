@@ -4246,6 +4246,7 @@ class EmbeddedIngressMainWiringTests(unittest.TestCase):
 
     def _run_once(self, env):
         import io
+        import tempfile
         from contextlib import redirect_stdout
         from manager.command_watcher import main
 
@@ -4255,12 +4256,21 @@ class EmbeddedIngressMainWiringTests(unittest.TestCase):
             ingress_calls.append((store, service, bucket))
             return []
 
-        with patch.dict(os.environ, env, clear=True), \
-             patch("manager.command_watcher.build_service", return_value=object()), \
-             patch("manager.command_watcher.DriveRecords", return_value=Mock(list_project_ids=Mock(return_value=[]))), \
-             patch("manager.drive_dispatch_ingress.poll_drive_dispatch_requests", side_effect=fake_poll), \
-             redirect_stdout(io.StringIO()):
-            main(["--once"])
+        # `clear=True` also wipes USERPROFILE/HOME, which no real production
+        # invocation ever does. Supply an explicit AI_MANAGER_HOME -- exactly
+        # what every production wrapper exports from its MANDATORY
+        # -ManagerHome -- so main()'s scheduler-provenance records land in a
+        # temp home instead of being resolved relative to cwd. Before the
+        # runtime-home fix these tests wrote real runtime/, logs/ and
+        # health-evidence.json into whatever checkout pytest ran from; that
+        # cwd fallback is the proven cause of the 2026-09-02 outage.
+        with tempfile.TemporaryDirectory() as manager_home:
+            with patch.dict(os.environ, {**env, "AI_MANAGER_HOME": manager_home}, clear=True), \
+                 patch("manager.command_watcher.build_service", return_value=object()), \
+                 patch("manager.command_watcher.DriveRecords", return_value=Mock(list_project_ids=Mock(return_value=[]))), \
+                 patch("manager.drive_dispatch_ingress.poll_drive_dispatch_requests", side_effect=fake_poll), \
+                 redirect_stdout(io.StringIO()):
+                main(["--once"])
         return ingress_calls
 
     # 1: folder id present, switch unset (default enabled) -> ingress polled, current behavior preserved
@@ -4294,12 +4304,19 @@ class EmbeddedIngressMainWiringTests(unittest.TestCase):
     # 3: disabled mode still proceeds to poll_once() (command polling unaffected)
     def test_disabled_switch_still_runs_poll_once(self):
         import io
+        import tempfile
         from contextlib import redirect_stdout
         from manager.command_watcher import main
 
+        # Explicit AI_MANAGER_HOME for the same reason as _run_once() above:
+        # clear=True wipes USERPROFILE/HOME, and the runtime home must never
+        # be resolved from cwd.
+        manager_home_ctx = tempfile.TemporaryDirectory()
+        self.addCleanup(manager_home_ctx.cleanup)
         with patch.dict(os.environ, {
             "ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID": "folder-1",
             "ADM_COMMAND_WATCHER_EMBEDDED_INGRESS": "0",
+            "AI_MANAGER_HOME": manager_home_ctx.name,
         }, clear=True), \
              patch("manager.command_watcher.build_service", return_value=object()), \
              patch("manager.command_watcher.DriveRecords", return_value=Mock(list_project_ids=Mock(return_value=[]))), \

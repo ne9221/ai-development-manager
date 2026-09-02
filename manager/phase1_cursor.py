@@ -6,6 +6,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from manager.runtime_home import resolve_ai_manager_home
+
 
 class StaleCursorError(Exception):
     """Raised when a concurrent/stale writer attempts to overwrite a newer cursor generation."""
@@ -17,10 +19,20 @@ def now_iso():
 
 
 def _resolve_cursor_path(manager_home=None, cursor_path=None):
+    """Resolve the durable cursor path WITHOUT ever consulting cwd.
+
+    This previously ended in `os.environ.get("AI_MANAGER_HOME", ".")`,
+    which is the proven root cause of the 2026-09-02 production outage:
+    a process with no explicit AI_MANAGER_HOME, running with cwd set to
+    the production checkout, silently wrote a durable
+    `<checkout>/runtime/phase1-cursor.json`, dirtied the checkout, and
+    made the Rule 18 provenance guard fail-close every ADM component for
+    ~54 minutes. `resolve_ai_manager_home()` fails closed instead of
+    degrading to cwd -- see manager/runtime_home.py.
+    """
     if cursor_path is not None:
         return Path(cursor_path)
-    home = manager_home if manager_home is not None else os.environ.get("AI_MANAGER_HOME", ".")
-    return Path(home) / "runtime" / "phase1-cursor.json"
+    return resolve_ai_manager_home(manager_home) / "runtime" / "phase1-cursor.json"
 
 
 def _default_cursor():

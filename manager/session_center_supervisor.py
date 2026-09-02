@@ -53,6 +53,7 @@ from manager.refresh_status import RefreshError, runtime_lock, write_atomic
 from manager.tasks import DriveRecords, TaskError
 from manager.trusted_ingress import verify_trusted_ingress_admission
 from manager.production_guard import RuntimeGuardError, require_runtime_guard
+from manager.runtime_home import resolve_ai_manager_home
 
 # A queued Command has no provider process or Execution to correlate. Following
 # one lets an abandoned historical queue item occupy :8765 indefinitely.
@@ -426,7 +427,7 @@ def main(argv=None):
         return 1
 
     from manager.scheduler_provenance import finish, start
-    invocation = start(os.environ.get("AI_MANAGER_HOME", "."), "session_center_supervisor")
+    invocation = start(resolve_ai_manager_home(), "session_center_supervisor")
     try:
         with runtime_lock(lock_path_for(args.state_file)):
             runtime = Path(args.manager_home) / "runtime"
@@ -450,10 +451,10 @@ def main(argv=None):
         # nothing. This is not a failure -- it is mutual exclusion working.
         result = {"status": "locked"}
     print(json.dumps(result))
-    finish(os.environ.get("AI_MANAGER_HOME", "."), invocation,
+    finish(resolve_ai_manager_home(), invocation,
            "failed" if result.get("status") == "unavailable" else "completed")
     from manager.runtime_supervisor import try_check_and_recover
-    try_check_and_recover(os.environ.get("AI_MANAGER_HOME", "."))
+    try_check_and_recover(resolve_ai_manager_home())
     return 0
 
 

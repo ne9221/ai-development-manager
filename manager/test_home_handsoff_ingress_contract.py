@@ -29,6 +29,7 @@ of the two convergence hardenings applied on top of the merge:
 import ast
 import inspect
 import io
+import tempfile
 import json
 import os
 import unittest
@@ -150,7 +151,14 @@ class SafeRunnerStderrTests(unittest.TestCase):
 
     def test_missing_bucket_env_failure_still_returns_nonzero_and_is_safe(self):
         stderr = io.StringIO()
-        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": ""}, clear=True), \
+        # This test is about a missing BUCKET, not a missing runtime home:
+        # clear=True also wipes USERPROFILE/HOME, and the runtime home is
+        # now resolved fail-closed rather than from cwd, so supply the
+        # explicit home every production wrapper already exports.
+        manager_home_ctx = tempfile.TemporaryDirectory()
+        self.addCleanup(manager_home_ctx.cleanup)
+        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "",
+                                     "AI_MANAGER_HOME": manager_home_ctx.name}, clear=True), \
              patch("sys.stderr", stderr):
             exit_code = drive_dispatch_watcher.main(["--once"])
         self.assertEqual(1, exit_code)
