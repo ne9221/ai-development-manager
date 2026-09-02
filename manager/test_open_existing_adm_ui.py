@@ -1,7 +1,14 @@
+import os
+import re
+import subprocess
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import Mock, patch
 
-from manager.open_existing_adm_ui import DASHBOARD_LAUNCHER, DASHBOARD_PORT, _spawn_dashboard, focus_existing_adm_ui
+from manager.open_existing_adm_ui import (
+    DASHBOARD_LAUNCHER, DASHBOARD_PORT, DASHBOARD_PORT_TIMEOUT_SECONDS, DASHBOARD_WINDOW_TIMEOUT_SECONDS,
+    TITLE_MARKERS, _find_matching_window, _spawn_dashboard, focus_existing_adm_ui,
+)
 
 
 class FakeApi:
@@ -31,7 +38,89 @@ class FakeApi:
     def sleep(self, seconds): self.now += seconds
 
 
+class TimedApi(FakeApi):
+    """FakeApi whose port and window become available at wall-clock offsets,
+    so cold-start timing (measured live: ~17s to a bound port) can be
+    modelled against the bounded stage timeouts exactly."""
+
+    def __init__(self, port_after=None, window_after=None, window=(9, "AI 開發管理器｜工作台 - Google Chrome"), **kwargs):
+        super().__init__(**kwargs)
+        self.port_after, self.window_after, self.window = port_after, window_after, window
+        self.spawned_at = None
+
+    def spawn_dashboard(self):
+        self.spawned += 1
+        self.spawned_at = self.now
+
+    def port_open(self):
+        return self.port_after is not None and self.spawned_at is not None and self.now >= self.spawned_at + self.port_after
+
+    def windows(self):
+        if self.window_after is None or self.spawned_at is None:
+            return ()
+        return (self.window,) if self.now >= self.spawned_at + self.window_after else ()
+
+
 class OpenExistingAdmUiTests(unittest.TestCase):
+    def test_title_markers_recognize_dashboard_py_current_page_title(self):
+        """Drift guard (live 20260902): dashboard.py had been renamed to
+        page_title="AI 開發管理器｜工作台" while TITLE_MARKERS still only knew
+        the old English title and an older zh-TW shortcut name, so the real
+        window ("<page_title> - Google Chrome") was never recognized and
+        never focused. This reads the ACTUAL page_title out of dashboard.py
+        and proves the matcher recognizes the window title Chrome derives
+        from it -- a future rename must update TITLE_MARKERS or fail here."""
+        source = (Path(__file__).resolve().parent.parent / "dashboard.py").read_text(encoding="utf-8")
+        match = re.search(r'page_title\s*=\s*"([^"]+)"', source)
+        self.assertIsNotNone(match, "dashboard.py must declare st.set_page_config(page_title=...)")
+        page_title = match.group(1)
+        hwnd, title = _find_matching_window(FakeApi(windows=((7, f"{page_title} - Google Chrome"),)))
+        self.assertEqual(7, hwnd, f"TITLE_MARKERS {TITLE_MARKERS!r} do not recognize {page_title!r}")
+        self.assertIn(page_title, TITLE_MARKERS)
+
+    def test_focuses_and_reuses_existing_window_with_current_zh_tw_title(self):
+        api = FakeApi(windows=((7, "AI 開發管理器｜工作台 - Google Chrome"),))
+        result = focus_existing_adm_ui(api)
+        self.assertEqual("completed", result["status"])
+        self.assertTrue(result["reused_existing_window"])
+        self.assertEqual([7], api.focused)
+        self.assertEqual(0, api.spawned)
+        self.assertEqual(0, api.opened)
+
+    def test_cold_start_slower_than_old_15s_bound_succeeds_within_new_bound(self):
+        # Live measurement 20260902: 17s from launch to a bound port. The
+        # previous 15s bound could never succeed; the new port bound must,
+        # while still being finite.
+        api = TimedApi(port_after=17.0, window_after=21.0)
+        result = focus_existing_adm_ui(api)
+        self.assertEqual("completed", result["status"], result)
+        self.assertEqual(1, api.spawned)
+        self.assertEqual(0, api.opened)
+        self.assertEqual([9], api.focused)
+        # Stages recorded separately, for the log.
+        self.assertEqual("cold_started", result["service"])
+        self.assertGreaterEqual(result["port_seconds"], 17.0)
+        self.assertLess(result["port_seconds"], 18.0)
+        self.assertGreaterEqual(result["window_seconds"], 3.5)
+        self.assertGreater(DASHBOARD_PORT_TIMEOUT_SECONDS, 17.0)
+
+    def test_cold_start_port_wait_is_bounded_and_reports_the_stage(self):
+        api = TimedApi(port_after=None)
+        result = focus_existing_adm_ui(api)
+        self.assertEqual("dashboard_start_timeout", result["error_kind"])
+        self.assertEqual("port", result["stage"])
+        self.assertAlmostEqual(DASHBOARD_PORT_TIMEOUT_SECONDS, result["port_wait_seconds"], delta=1.0)
+        self.assertEqual(1, api.spawned)
+
+    def test_window_wait_after_port_is_bounded_and_reports_the_stage(self):
+        api = TimedApi(port_after=5.0, window_after=None)
+        result = focus_existing_adm_ui(api)
+        self.assertEqual("dashboard_window_not_found", result["error_kind"])
+        self.assertEqual("window", result["stage"])
+        self.assertEqual("cold_started", result["service"])
+        self.assertAlmostEqual(5.0, result["port_seconds"], delta=0.6)
+        self.assertAlmostEqual(DASHBOARD_WINDOW_TIMEOUT_SECONDS, result["window_wait_seconds"], delta=1.0)
+
     def test_focuses_existing_dashboard_window(self):
         api = FakeApi(windows=((7, "ADM Unified Operations Dashboard - Google Chrome"),))
         self.assertEqual("completed", focus_existing_adm_ui(api)["status"])
@@ -117,8 +206,28 @@ class SpawnDashboardArgsTests(unittest.TestCase):
     this machine: `powershell.exe -Non-Interactive ...` errors with "term
     not recognized" and never runs the target script."""
 
+    @unittest.skipUnless(os.name == "nt", "Windows job-object semantics")
+    def test_spawn_dashboard_breaks_away_from_the_scheduler_job(self):
+        """Live 20260902: the Dashboard launched from inside the Command
+        Watcher's Scheduled Task job never bound port 8501 and its process
+        vanished (killed with the job when the tick ended); the identical
+        launcher started outside the job bound in <=17s and stayed up. The
+        spawn must therefore carry CREATE_BREAKAWAY_FROM_JOB -- through the
+        exact same shared launcher _spawn_claimed_worker already proved --
+        and keep the same OSError fallback."""
+        with patch("manager.detached_process.subprocess.Popen", return_value=Mock(pid=1)) as popen:
+            _spawn_dashboard()
+        flags = popen.call_args.kwargs["creationflags"]
+        self.assertTrue(flags & subprocess.CREATE_BREAKAWAY_FROM_JOB)
+        self.assertTrue(flags & subprocess.DETACHED_PROCESS)
+        from manager.command_watcher import _spawn_claimed_worker
+        with patch("manager.detached_process.subprocess.Popen", return_value=Mock(pid=2)) as worker_popen:
+            _spawn_claimed_worker({"project_id": "p", "task_id": "t", "execution_id": "e"})
+        self.assertEqual(worker_popen.call_args.kwargs["creationflags"], flags,
+                         "Dashboard and claimed-worker spawns must use one identical flag contract")
+
     def test_spawn_uses_valid_powershell_flags_and_launcher_path(self):
-        with patch("manager.open_existing_adm_ui.subprocess.Popen") as popen:
+        with patch("manager.detached_process.subprocess.Popen") as popen:
             _spawn_dashboard()
         args = popen.call_args.args[0]
         self.assertEqual("powershell.exe", args[0])

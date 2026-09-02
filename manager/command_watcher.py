@@ -16,6 +16,7 @@ from manager.claude_account_selector import load_claude_accounts
 from manager.ag_runner import AgRunner
 from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_creation_identity, process_identity_state
+from manager.detached_process import popen_detached
 from manager.execution_lifecycle import merge_cleanup_evidence, retry_incomplete_terminal_persistence, terminalize_execution
 from manager.execution_runner import launch_task
 from manager.open_existing_adm_ui import focus_existing_adm_ui
@@ -301,13 +302,12 @@ def _focus_adm_ui_best_effort(stage):
         except OSError:
             log_handle = None
         sink = log_handle if log_handle is not None else subprocess.DEVNULL
-        flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
-                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-        kwargs = {"cwd": os.getcwd(), "stdin": subprocess.DEVNULL,
-                  "stdout": sink, "stderr": sink, "close_fds": True}
-        if os.name == "nt":
-            kwargs["creationflags"] = flags
-        subprocess.Popen([sys.executable, "-m", "manager.open_existing_adm_ui"], **kwargs)
+        # Shared detached + CREATE_BREAKAWAY_FROM_JOB launcher (same contract
+        # as _spawn_claimed_worker and _spawn_dashboard): the helper now
+        # waits up to ~75s across its port/window stages, longer than a
+        # tick may live, so it must not die with the tick's job object.
+        popen_detached([sys.executable, "-m", "manager.open_existing_adm_ui"],
+                       cwd=os.getcwd(), stdin=subprocess.DEVNULL, stdout=sink, stderr=sink, close_fds=True)
     except Exception as exc:
         print(f"AUTO_OPEN_ADM[{stage}]: helper spawn failed: {exc}", file=sys.stderr)
     finally:
@@ -995,36 +995,19 @@ def _run_claimed_command(store, service, claimed, launcher_factory, writer_facto
 
 
 def _spawn_claimed_worker(claimed):
-    """Continue provider work outside the one-minute watcher invocation."""
-    flags = (
-        getattr(subprocess, "DETACHED_PROCESS", 0)
-        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+    """Continue provider work outside the one-minute watcher invocation.
+
+    The detached + CREATE_BREAKAWAY_FROM_JOB flag contract (and its OSError
+    fallback) this function proved in production now lives once, in
+    manager.detached_process.popen_detached, shared with the AUTO_OPEN_ADM
+    helper and the Dashboard launcher so the three can never drift apart.
+    """
+    process = popen_detached(
+        [sys.executable, "-m", "manager.command_watcher_worker",
+         claimed["project_id"], claimed["task_id"], claimed["execution_id"]],
+        cwd=os.getcwd(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, close_fds=True,
     )
-    kwargs = {
-        "cwd": os.getcwd(),
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if os.name == "nt":
-        kwargs["creationflags"] = flags
-    try:
-        process = subprocess.Popen(
-            [sys.executable, "-m", "manager.command_watcher_worker",
-             claimed["project_id"], claimed["task_id"], claimed["execution_id"]],
-            **kwargs,
-        )
-    except OSError:
-        if os.name != "nt" or not (flags & getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)):
-            raise
-        kwargs["creationflags"] = flags & ~getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
-        process = subprocess.Popen(
-            [sys.executable, "-m", "manager.command_watcher_worker",
-             claimed["project_id"], claimed["task_id"], claimed["execution_id"]],
-            **kwargs,
-        )
     return process.pid
 
 

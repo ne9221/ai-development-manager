@@ -712,6 +712,10 @@ class CommandWatcherTests(unittest.TestCase):
             if os.name == "nt":
                 flags = spawned.call_args.kwargs["creationflags"]
                 self.assertTrue(flags & __import__("subprocess").DETACHED_PROCESS)
+                # The helper now waits up to ~75s across its port/window
+                # stages -- longer than a tick may live -- so it must leave
+                # the Scheduled Task's job object like the worker does.
+                self.assertTrue(flags & __import__("subprocess").CREATE_BREAKAWAY_FROM_JOB)
             # Observability (delta-review finding): the helper's stdout and
             # stderr must both land in the durable auto-open log under
             # AI_MANAGER_HOME -- never DEVNULL -- so a helper that spawns
