@@ -25,9 +25,12 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
+import json
+
 from manager.command_watcher import (
     RECENT_COMMANDS_PER_PROJECT, _attention, _prioritized_nonterminal_commands, poll_once,
 )
+from manager.phase1_cursor import load_phase1_cursor, save_phase1_cursor
 from manager.execution_lifecycle import enter_running_gate
 from manager.executions import cancel_reserved_execution, reserve_execution
 from manager.tasks import TaskError, create_project, create_task, now_iso
@@ -257,10 +260,10 @@ class ProductionStarvationReproductionTests(unittest.TestCase):
         self.assertEqual(2, RECENT_COMMANDS_PER_PROJECT)
 
     def ticks(self, count):
-        for _ in range(count):
+        for gap in (120.0, 90.0, 180.0, 120.0, 90.0, 120.0)[:count]:
             self.fixture.tick(self.launch, self.cursor_path)
             self.clock.advance(60.0)
-            self.clock.next_tick()
+            self.clock.wall += gap  # real cadence: never a tidy 60s bucket
 
     def test_stuck_rank1_command_converges_within_bounded_ticks(self):
         # Before the fix this stayed attention forever (60+ real minutes).
@@ -302,12 +305,87 @@ class ProductionStarvationReproductionTests(unittest.TestCase):
         # goes first within RECENT_COMMANDS_PER_PROJECT consecutive ticks.
         expensive = ProductionShapeFixture(self.clock, read_cost=6.0, write_cost=6.0)
         cursor_path = tempfile.mktemp(suffix=".json")
-        for _ in range(4):
+        for gap in (120.0, 120.0, 120.0, 120.0):  # constant even cadence: wall-clock parity never changes
             expensive.tick(self.launch, cursor_path)
             self.clock.advance(60.0)
-            self.clock.next_tick()
+            self.clock.wall += gap
         self.assertEqual("failed", expensive.store.get("commands", "p1", "cmd-1")["status"])
         self.launch.assert_not_called()
+
+
+class DurableVisitRotationTests(unittest.TestCase):
+    """Independent-review finding (round 1): rotation must not depend on the
+    wall clock. Real ticks run ~90-120s apart, so a per-60s bucket counter
+    advances by 2 per sweep -- a 2-record attention group would then NEVER
+    rotate, and skipped buckets can exclude a residue class of a larger
+    group forever. The rotation base is now a durable per-project count of
+    actual sweeps, so cadence cannot matter."""
+
+    def _attention_batch_store(self, clock, count):
+        store = CostedStore(clock, ["p1"], read_cost=1.0, write_cost=6.0)
+        create_project(store, {**project(), "project_id": "p1", "active_tasks": []})
+        for index in range(count):
+            store.put("commands", "p1", f"att-{index}", command(
+                command_id=f"att-{index}", task_id=f"t-{index}", status="attention", execution_id=f"exec-{index}",
+                claimed_at="2026-08-21T16:27:17Z", stale_at="2026-08-21T16:31:24Z", recovery_reason="some_reason"))
+        return store
+
+    def _sweep(self, store, clock, cursor_path, first_seen, wall_gap):
+        # Each reconciliation of an attention record burns the whole
+        # recent-sweep budget, so only the FIRST attention record of the
+        # batch is ever processed per sweep -- the live shape.
+        def reconcile(_store, _service, cmd, _claims, **_kw):
+            first_seen.append(cmd["command_id"])
+            clock.advance(30.0)
+            return {"status": "attention", "execution_id": cmd["execution_id"], "recovery_reason": "some_reason"}
+
+        with patch("manager.command_watcher.time", clock), \
+             patch("manager.command_watcher.RECENT_COMMANDS_PER_PROJECT", 3), \
+             patch("manager.command_watcher._reconcile_active", side_effect=reconcile), \
+             patch("manager.command_watcher.launch_task", Mock(side_effect=AssertionError("no launch"))):
+            poll_once(store, object(), allowlist=frozenset(), claim_factory=lambda *_: MemoryClaimRegistry(),
+                      health_check=lambda: True, quota_check=lambda service: True, cursor_path=cursor_path)
+        clock.advance(60.0)
+        clock.wall += wall_gap
+
+    def test_three_record_group_with_skipped_wall_clock_buckets_is_a_strict_round_robin(self):
+        clock = FakeClock()
+        store = self._attention_batch_store(clock, 3)
+        cursor_path = tempfile.mktemp(suffix=".json")
+        first_seen = []
+        # The exact cadence from the review: ~90s sweeps skip every third
+        # 60s bucket (0,1,3,4,6,7,...); plus one 180s gap for good measure.
+        for gap in (90.0, 90.0, 180.0, 90.0, 90.0, 120.0):
+            self._sweep(store, clock, cursor_path, first_seen, gap)
+        self.assertEqual(6, len(first_seen))
+        self.assertEqual({"att-0", "att-1", "att-2"}, set(first_seen[:3]),
+                         f"every attention record must be first within 3 consecutive sweeps; got {first_seen}")
+        self.assertEqual({"att-0", "att-1", "att-2"}, set(first_seen[3:6]))
+        cursor = load_phase1_cursor(cursor_path=cursor_path)
+        self.assertEqual(6, cursor["per_project_attention_visits"]["p1"])
+
+    def test_visit_counter_persists_without_advancing_the_invocation_generation(self):
+        cursor_path = tempfile.mktemp(suffix=".json")
+        saved = save_phase1_cursor({"project_cursor": 1, "per_project_record_cursor": {"p1": 4},
+                                    "per_project_attention_visits": {"p1": 2}, "generation": 10}, cursor_path=cursor_path)
+        self.assertEqual(11, saved["generation"])
+        again = save_phase1_cursor({**saved, "per_project_attention_visits": {"p1": 3}}, cursor_path=cursor_path,
+                                   expected_generation=11, advance_generation=False)
+        self.assertEqual(11, again["generation"])
+        loaded = load_phase1_cursor(cursor_path=cursor_path)
+        self.assertEqual({"p1": 3}, loaded["per_project_attention_visits"])
+        self.assertEqual({"p1": 4}, loaded["per_project_record_cursor"])
+        # Legacy cursor files without the field load cleanly.
+        pathlib_path = __import__("pathlib").Path(cursor_path)
+        pathlib_path.write_text(json.dumps({"project_cursor": 0, "per_project_record_cursor": {}, "generation": 3}), encoding="utf-8")
+        self.assertEqual({}, load_phase1_cursor(cursor_path=cursor_path)["per_project_attention_visits"])
+
+    def test_single_attention_record_does_not_consume_a_visit(self):
+        clock = FakeClock()
+        store = self._attention_batch_store(clock, 1)
+        cursor_path = tempfile.mktemp(suffix=".json")
+        self._sweep(store, clock, cursor_path, [], 90.0)
+        self.assertEqual({}, load_phase1_cursor(cursor_path=cursor_path)["per_project_attention_visits"])
 
 
 class MultiProjectFairnessTests(unittest.TestCase):

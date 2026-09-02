@@ -2124,9 +2124,9 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     cursor["project_cursor"] = (proj_idx + 1) % num_projects
     cursor["per_project_record_cursor"][target_project_id] = record_offset + WAITING_QUOTA_DISCOVERY_WINDOW
     try:
-        save_phase1_cursor(cursor, cursor_path=cursor_path, expected_generation=current_gen)
+        phase1_saved = save_phase1_cursor(cursor, cursor_path=cursor_path, expected_generation=current_gen)
     except Exception:
-        pass
+        phase1_saved = None
 
     # Phase 2a/2b: inspect a tiny modified-time-ordered batch from every
     # project before historical hydration, then a regular full bounded
@@ -2191,11 +2191,27 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
 
     recent_deadline = min(deadline, time.monotonic() + RECENT_COMMAND_SWEEP_BUDGET_SECONDS)
     recent_hydration_deadline = min(recent_deadline, hydration_deadline)
-    # Same wall-clock tick counter every --once process derives on its own
-    # (no persisted state): the recent sweep visits every project each
-    # tick, so a plain per-tick counter is a strict round-robin over each
-    # batch's attention group (see _prioritized_nonterminal_commands).
-    attention_rotation = _within_project_record_rotation_offset()
+    # Attention-group rotation base (see _prioritized_nonterminal_commands):
+    # a DURABLE per-project visit counter from the Phase-1 cursor, advanced
+    # only when that project's batch is actually swept with more than one
+    # attention record in it. Independent adversarial review of the first
+    # round rejected a wall-clock tick counter for this: real ticks run
+    # ~90-120s apart (60s trigger + IgnoreNew), so int(time()//60) advances
+    # by 2 per sweep and a 2-record attention group never rotated at all,
+    # and any skipped bucket can permanently exclude a residue class of a
+    # larger group. Counting actual sweeps of this exact project makes the
+    # round-robin strict regardless of cadence, budget, or which invocations
+    # happen to reach the project.
+    attention_visits = dict(cursor.get("per_project_attention_visits") or {})
+    attention_rotation_by_project = {}
+    attention_visited = set()
+
+    def _attention_rotation(project_id, commands):
+        rotation = attention_rotation_by_project.setdefault(project_id, attention_visits.get(project_id, 0))
+        if project_id not in attention_visited and sum(1 for c in commands if c.get("status") == "attention") > 1:
+            attention_visited.add(project_id)
+            attention_visits[project_id] = rotation + 1
+        return rotation
     for project_id in project_ids:
         if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_hydration_deadline:
             break
@@ -2210,7 +2226,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         # GLOBAL Phase 2c below. Uses the full `recent_deadline`, not the
         # tightened `recent_hydration_deadline` -- already-hydrated active
         # work is never held back by the terminal-recovery reservation.
-        for command in _prioritized_nonterminal_commands(commands, attention_rotation=attention_rotation):
+        for command in _prioritized_nonterminal_commands(commands, attention_rotation=_attention_rotation(project_id, commands)):
             if (project_id, command["command_id"]) in just_promoted:
                 continue
             if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
@@ -2233,7 +2249,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             # loop entirely, unlike before this restructure).
             continue
         _remember_batch(project_id, commands)
-        for command in _prioritized_nonterminal_commands(commands, attention_rotation=attention_rotation):
+        for command in _prioritized_nonterminal_commands(commands, attention_rotation=_attention_rotation(project_id, commands)):
             if (project_id, command["command_id"]) in just_promoted:
                 continue  # promoted this same tick -- launches on a later natural tick, not this one
             if (project_id, command["command_id"]) in processed:
@@ -2253,6 +2269,19 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             if time.monotonic() >= deadline:
                 return results
             _run(project_id, command)
+
+    # Persist this tick's attention-visit advances against the generation the
+    # Phase-1 save just established (same invocation, so the generation is
+    # deliberately NOT advanced again). Skipped entirely when the Phase-1
+    # save itself failed the CAS -- another invocation owns the cursor.
+    if attention_visited and phase1_saved is not None:
+        cursor["per_project_attention_visits"] = attention_visits
+        cursor["generation"] = phase1_saved["generation"]
+        try:
+            save_phase1_cursor(cursor, cursor_path=cursor_path, expected_generation=phase1_saved["generation"],
+                               advance_generation=False)
+        except Exception:
+            pass
 
     # Phase 2c: GLOBAL terminal-recovery classification -- only now, after
     # EVERY rotated project's nonterminal work (both sweeps) has already
