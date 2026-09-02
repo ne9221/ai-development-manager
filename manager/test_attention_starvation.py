@@ -30,7 +30,7 @@ import json
 from manager.command_watcher import (
     RECENT_COMMANDS_PER_PROJECT, _attention, _prioritized_nonterminal_commands, poll_once,
 )
-from manager.phase1_cursor import load_phase1_cursor, save_phase1_cursor
+from manager.phase1_cursor import CREATE_ONLY, load_phase1_cursor, save_phase1_cursor
 from manager.execution_lifecycle import enter_running_gate
 from manager.executions import cancel_reserved_execution, reserve_execution
 from manager.tasks import TaskError, create_project, create_task, now_iso
@@ -373,21 +373,24 @@ class DurableVisitRotationTests(unittest.TestCase):
         # generation like every other save, so a delayed writer holding an
         # older generation can never roll the file backward.
         cursor_path = tempfile.mktemp(suffix=".json")
+        # The caller's own "generation": 10 is inert -- a created cursor is
+        # generation 1, because the generation comes from durable state.
         saved = save_phase1_cursor({"project_cursor": 1, "per_project_record_cursor": {"p1": 4},
-                                    "per_project_attention_visits": {"p1": 2}, "generation": 10}, cursor_path=cursor_path)
-        self.assertEqual(11, saved["generation"])
+                                    "per_project_attention_visits": {"p1": 2}, "generation": 10},
+                                   cursor_path=cursor_path, expected_generation=CREATE_ONLY)
+        self.assertEqual(1, saved["generation"])
         again = save_phase1_cursor({**saved, "per_project_attention_visits": {"p1": 3}}, cursor_path=cursor_path,
-                                   expected_generation=11)
-        self.assertEqual(12, again["generation"])
+                                   expected_generation=1)
+        self.assertEqual(2, again["generation"])
         loaded = load_phase1_cursor(cursor_path=cursor_path)
         self.assertEqual({"p1": 3}, loaded["per_project_attention_visits"])
         self.assertEqual({"p1": 4}, loaded["per_project_record_cursor"])
-        self.assertEqual(12, loaded["generation"])
+        self.assertEqual(2, loaded["generation"])
         # A writer that lost the race (stale expected generation) is refused, never applied.
         from manager.phase1_cursor import StaleCursorError
         with self.assertRaises(StaleCursorError):
             save_phase1_cursor({**saved, "per_project_attention_visits": {"p1": 99}}, cursor_path=cursor_path,
-                               expected_generation=11)
+                               expected_generation=1)
         self.assertEqual({"p1": 3}, load_phase1_cursor(cursor_path=cursor_path)["per_project_attention_visits"])
         # Legacy cursor files without the field load cleanly.
         pathlib_path = __import__("pathlib").Path(cursor_path)

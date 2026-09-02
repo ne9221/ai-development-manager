@@ -26,6 +26,7 @@ from manager.manager_home import (
     resolve_manager_home,
 )
 from manager.phase1_cursor import (
+    CREATE_ONLY,
     _resolve_cursor_path,
     load_phase1_cursor,
     save_phase1_cursor,
@@ -67,7 +68,7 @@ class CursorPathResolutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "explicit-home"
             save_phase1_cursor({"project_cursor": 3, "generation": 0},
-                               manager_home=home)
+                               manager_home=home, expected_generation=CREATE_ONLY)
             written = home / "runtime" / "phase1-cursor.json"
             self.assertTrue(written.exists())
             document = json.loads(written.read_text(encoding="utf-8"))
@@ -77,7 +78,8 @@ class CursorPathResolutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "env-home"
             with patch.dict(os.environ, {"AI_MANAGER_HOME": str(home)}):
-                save_phase1_cursor({"project_cursor": 7, "generation": 0})
+                save_phase1_cursor({"project_cursor": 7, "generation": 0},
+                                   expected_generation=CREATE_ONLY)
             self.assertTrue((home / "runtime" / "phase1-cursor.json").exists())
 
     def test_canonical_user_level_home_is_used_when_env_is_absent(self):
@@ -111,7 +113,8 @@ class CursorPathResolutionTests(unittest.TestCase):
             before = set(checkout.rglob("*"))
             with patch.dict(os.environ, {"AI_MANAGER_HOME": str(checkout)}):
                 with self.assertRaises(ManagerHomeError):
-                    save_phase1_cursor({"project_cursor": 1, "generation": 0})
+                    save_phase1_cursor({"project_cursor": 1, "generation": 0},
+                                                   expected_generation=CREATE_ONLY)
             self.assertEqual(set(checkout.rglob("*")), before)
             self.assertFalse((checkout / "runtime").exists())
 
@@ -135,7 +138,8 @@ class CheckoutContaminationTests(unittest.TestCase):
                     save_phase1_cursor({"project_cursor": 1,
                                         "per_project_record_cursor": {"p1": 4},
                                         "per_project_attention_visits": {"p1": 1},
-                                        "generation": 5})
+                                        "generation": 5},
+                                       expected_generation=CREATE_ONLY)
             finally:
                 os.chdir(original)
 
@@ -157,8 +161,9 @@ class CheckoutContaminationTests(unittest.TestCase):
             env.pop("AI_MANAGER_HOME", None)
             env["USERPROFILE"] = env["HOME"] = str(external)
             env["PYTHONPATH"] = str(REPO_ROOT)
-            script = ("from manager.phase1_cursor import save_phase1_cursor;"
-                      "save_phase1_cursor({'project_cursor': 2, 'generation': 0})")
+            script = ("from manager.phase1_cursor import save_phase1_cursor, CREATE_ONLY;"
+                      "save_phase1_cursor({'project_cursor': 2, 'generation': 0},"
+                      " expected_generation=CREATE_ONLY)")
             proc = subprocess.run([sys.executable, "-c", script], cwd=str(checkout),
                                   env=env, capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -219,7 +224,8 @@ class CanonicalStatePreservationTests(unittest.TestCase):
                     {"project_cursor": 4,
                      "per_project_record_cursor": {"a": 1, "b": 2},
                      "per_project_attention_visits": {"a": 3},
-                     "generation": 0})
+                     "generation": 0},
+                    expected_generation=CREATE_ONLY)
                 reloaded = load_phase1_cursor()
             self.assertEqual(reloaded, first)
             self.assertEqual(reloaded["project_cursor"], 4)

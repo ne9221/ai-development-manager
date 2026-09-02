@@ -2081,10 +2081,36 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     if not raw_project_ids:
         return results
 
-    from manager.phase1_cursor import load_phase1_cursor, save_phase1_cursor
+    from manager.phase1_cursor import (CREATE_ONLY, CursorLockError, CursorMissingError,
+                                       CursorStateError, StaleCursorError, default_phase1_cursor,
+                                       load_phase1_cursor, save_phase1_cursor)
 
-    cursor = load_phase1_cursor(cursor_path=cursor_path)
-    current_gen = cursor.get("generation", 0)
+    # `cursor_cas_token` is this invocation's write permit, and the three
+    # branches below are the three states the durable cursor can be in.
+    # Keeping them apart is the whole fix: the old loader collapsed all
+    # three into "generation 0", so a cursor that merely failed to read
+    # was indistinguishable from one that had never existed, and the next
+    # save rebuilt it from zero.
+    #
+    #   absent      -> CREATE_ONLY. Genuine first-ever boot; create it.
+    #   present     -> its durable generation. Normal CAS amendment.
+    #   unreadable  -> None, meaning "do not persist at all". The tick
+    #                  still serves commands, but it will not overwrite
+    #                  state it could not read -- that is precisely how a
+    #                  generation-2458 file becomes a generation-1 one
+    #                  holding 5 projects instead of 13. The bad file is
+    #                  left exactly as it is, as evidence for a human.
+    try:
+        cursor = load_phase1_cursor(cursor_path=cursor_path, missing_ok=False)
+        cursor_cas_token = cursor["generation"]
+    except CursorMissingError:
+        cursor = default_phase1_cursor()
+        cursor_cas_token = CREATE_ONLY
+    except CursorStateError as exc:
+        print(f"PHASE1_CURSOR: durable cursor unusable, not persisting this tick: {exc}", file=sys.stderr)
+        cursor = default_phase1_cursor()
+        cursor_cas_token = None
+
     num_projects = len(raw_project_ids)
     proj_idx = cursor.get("project_cursor", 0) % num_projects
 
@@ -2233,11 +2259,22 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         # same rotation next tick (bounded delta review, round 2). CAS on
         # the generation this invocation loaded; losing that CAS means
         # another invocation owns the cursor and nothing is written.
+        if cursor_cas_token is None:
+            return
         cursor["per_project_attention_visits"] = attention_visits
         try:
-            save_phase1_cursor(cursor, cursor_path=cursor_path, expected_generation=current_gen)
-        except Exception:
-            pass
+            save_phase1_cursor(cursor, cursor_path=cursor_path,
+                               expected_generation=cursor_cas_token)
+        except (StaleCursorError, CursorStateError, CursorLockError, OSError) as exc:
+            # Every one of these means "someone else owns the cursor, or
+            # it cannot be trusted right now". Skipping the save costs one
+            # tick of rotation; writing anyway costs the durable state.
+            # CursorContractError is deliberately NOT caught: it can only
+            # mean this call site stopped presenting a valid CAS token,
+            # and swallowing that is how the original footgun stayed
+            # invisible for as long as it did.
+            print(f"PHASE1_CURSOR: not persisting this tick: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
 
     try:
         for project_id in project_ids:

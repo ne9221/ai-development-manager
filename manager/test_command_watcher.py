@@ -2884,9 +2884,10 @@ class TerminalIncompleteRecoveryReachableViaPollTests(unittest.TestCase):
         # Rotation starts at p2 by seeding the durable cursor's
         # project_cursor to point at index 1 ("p2", since list_projects()
         # returns them alphabetically p1, p2) before the tick runs.
-        from manager.phase1_cursor import save_phase1_cursor
+        from manager.phase1_cursor import CREATE_ONLY, save_phase1_cursor
         cursor_path = tempfile.mktemp(suffix=".json")
-        save_phase1_cursor({"project_cursor": 1, "per_project_record_cursor": {}, "generation": 0}, cursor_path=cursor_path)
+        save_phase1_cursor({"project_cursor": 1, "per_project_record_cursor": {}, "generation": 0},
+                           cursor_path=cursor_path, expected_generation=CREATE_ONLY)
 
         recent_patch, full_patch = self._rig_sweep_success(recent_fails_for={"p2"})
         with recent_patch, full_patch, \

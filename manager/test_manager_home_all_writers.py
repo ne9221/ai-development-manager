@@ -254,14 +254,15 @@ class DurableWriterAdversarialTests(unittest.TestCase):
         """No external home at all: raise, and write nothing anywhere."""
         from manager import claude_config_locks, refresh_status
         from manager.quota_history import get_default_quota_history_store
-        from manager.phase1_cursor import save_phase1_cursor
+        from manager.phase1_cursor import CREATE_ONLY, save_phase1_cursor
 
         cases = (
             ("claude_config_locks", claude_config_locks.default_state_path),
             ("quota_history", get_default_quota_history_store),
             ("refresh_status", refresh_status.discover_claude_accounts),
             ("phase1_cursor",
-             lambda: save_phase1_cursor({"project_cursor": 1, "generation": 0})),
+             lambda: save_phase1_cursor({"project_cursor": 1, "generation": 0},
+                                        expected_generation=CREATE_ONLY)),
         )
         # No AI_MANAGER_HOME, no USERPROFILE, no HOME, and a degenerate
         # Path.home(): there is nowhere safe left, so every writer must

@@ -19,6 +19,8 @@ from manager.command_watcher import (
     poll_once,
 )
 from manager.phase1_cursor import (
+    CREATE_ONLY,
+    CursorParseError,
     StaleCursorError,
     load_phase1_cursor,
     save_phase1_cursor,
@@ -212,20 +214,34 @@ class TestPhase1FairScheduling(unittest.TestCase):
         self.assertEqual(4, cursor["per_project_record_cursor"]["p0"])
         self.assertEqual(["p0"], [w[0] for w in store.visited_windows])
 
-    def test_G_cursor_corrupted_fail_safe(self):
-        """Scenario G: Corrupted cursor file safely recovers to defaults without crashing."""
+    def test_G_cursor_corrupted_serves_without_rebuilding_from_zero(self):
+        """Scenario G: a corrupted cursor degrades service, never durable state.
+
+        This used to assert the opposite -- that the tick "recovers to
+        defaults" and writes project_cursor 1. That recovery WAS the
+        defect: an unreadable generation-2458 file read as generation 0
+        and was replaced by a generation-1 one holding a fraction of the
+        projects (2026-09-02). The tick must still serve, but a cursor it
+        could not read is one it has no business overwriting.
+        """
+        corrupt = "{invalid-json-content...!!"
         with open(self.cursor_path, "w", encoding="utf-8") as f:
-            f.write("{invalid-json-content...!!")
+            f.write(corrupt)
 
         project_ids = ["p0", "p1"]
         projects_data = {pid: self._make_tasks(pid, 8) for pid in project_ids}
         store = MemoryDiscoveryStore(projects_data)
 
-        # Must not throw
+        # Must not throw: unreadable durable state is not a reason to stop
+        # serving commands.
         poll_once(store, None, discovery_store=store, cursor_path=self.cursor_path, allowlist=frozenset())
-        cursor = load_phase1_cursor(cursor_path=self.cursor_path)
-        self.assertEqual(1, cursor["project_cursor"])
         self.assertEqual(["p0"], [w[0] for w in store.visited_windows])
+
+        # ...but nothing was written, and the evidence is intact.
+        self.assertEqual(corrupt, Path(self.cursor_path).read_text(encoding="utf-8"),
+                         "the unreadable cursor must be left exactly as found")
+        with self.assertRaises(CursorParseError):
+            load_phase1_cursor(cursor_path=self.cursor_path)
 
     def test_H_project_add_remove_dynamic_P(self):
         """Scenario H: P dynamically changes (add/remove project). Bounds and coverage remain intact."""
@@ -316,12 +332,13 @@ class TestPhase1FairScheduling(unittest.TestCase):
 
     def test_L_concurrent_stale_cursor_writer_protection(self):
         """Scenario L: Stale writer with older generation is rejected with StaleCursorError."""
+        # No cursor exists yet, so writer 1 must say so explicitly.
         cursor = load_phase1_cursor(cursor_path=self.cursor_path)
         gen0 = cursor["generation"]
 
         # Writer 1 succeeds and advances generation to 1
         cursor["project_cursor"] = 1
-        save_phase1_cursor(cursor, cursor_path=self.cursor_path, expected_generation=gen0)
+        save_phase1_cursor(cursor, cursor_path=self.cursor_path, expected_generation=CREATE_ONLY)
 
         # Writer 2 with stale gen0 attempts write -> StaleCursorError
         stale_cursor = {"project_cursor": 99, "per_project_record_cursor": {}, "generation": gen0}
