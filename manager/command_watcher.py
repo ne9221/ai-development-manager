@@ -16,6 +16,7 @@ from manager.claude_account_selector import load_claude_accounts
 from manager.ag_runner import AgRunner
 from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_creation_identity, process_identity_state
+from manager.detached_process import popen_detached
 from manager.execution_lifecycle import merge_cleanup_evidence, retry_incomplete_terminal_persistence, terminalize_execution
 from manager.execution_runner import launch_task
 from manager.open_existing_adm_ui import focus_existing_adm_ui
@@ -301,13 +302,12 @@ def _focus_adm_ui_best_effort(stage):
         except OSError:
             log_handle = None
         sink = log_handle if log_handle is not None else subprocess.DEVNULL
-        flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
-                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-        kwargs = {"cwd": os.getcwd(), "stdin": subprocess.DEVNULL,
-                  "stdout": sink, "stderr": sink, "close_fds": True}
-        if os.name == "nt":
-            kwargs["creationflags"] = flags
-        subprocess.Popen([sys.executable, "-m", "manager.open_existing_adm_ui"], **kwargs)
+        # Shared detached + CREATE_BREAKAWAY_FROM_JOB launcher (same contract
+        # as _spawn_claimed_worker and _spawn_dashboard): the helper now
+        # waits up to ~75s across its port/window stages, longer than a
+        # tick may live, so it must not die with the tick's job object.
+        popen_detached([sys.executable, "-m", "manager.open_existing_adm_ui"],
+                       cwd=os.getcwd(), stdin=subprocess.DEVNULL, stdout=sink, stderr=sink, close_fds=True)
     except Exception as exc:
         print(f"AUTO_OPEN_ADM[{stage}]: helper spawn failed: {exc}", file=sys.stderr)
     finally:
@@ -428,23 +428,40 @@ def _attention(store, command, execution, reason):
             or (curr_exec.get("cleanup_evidence") or {}).get("persistence") != "complete"
         )
         if curr_exec.get("status") not in ("completed", "failed", "interrupted"):
+            unchanged_exec = dict(curr_exec)
             curr_exec.update(stale_at=curr_exec.get("stale_at") or timestamp, recovery_reason=reason)
             validate("execution", curr_exec)
-            store.put("executions", command["project_id"], command["execution_id"], curr_exec)
+            if curr_exec != unchanged_exec:
+                store.put("executions", command["project_id"], command["execution_id"], curr_exec)
         if should_block_task:
             try:
                 task = store.get("tasks", command["project_id"], command["task_id"])
                 if (task.get("source_context") or {}).get("active_execution_id") == command["execution_id"]:
+                    unchanged_task = dict(task)
                     task.update(status="blocked", updated_at=timestamp,
                                 blocked_reason=f"Execution recovery required: {reason}",
                                 current_progress="Execution requires attention",
                                 next_action="Verify provider/process and authority evidence; do not start a duplicate")
                     validate("task", task)
-                    store.put("tasks", command["project_id"], command["task_id"], task)
+                    if task != unchanged_task:
+                        store.put("tasks", command["project_id"], command["task_id"], task)
             except TaskError:
                 pass
     marked = {**command, "status": "attention", "stale_at": timestamp,
               "recovery_reason": reason, "completed_at": None, "result": None}
+    # No-op suppression (live 20260902 starvation): an attention Command
+    # whose stored record is ALREADY byte-identical to what would be written
+    # is not rewritten. Before this, every tick rewrote it unchanged, which
+    # refreshed its Drive modifiedTime, which kept it permanently at rank 0
+    # of the `modifiedTime desc` recent sweep (RECENT_COMMANDS_PER_PROJECT=2)
+    # -- a self-perpetuating monopoly that starved the rank-1 record for
+    # 60+ minutes of healthy ticks. Any real change (new reason, new
+    # stale_at, any field) still persists exactly as before; only the
+    # authoritative store's own current record (never the caller's possibly
+    # stale copy) is trusted as "already identical".
+    if current_cmd is not command and current_cmd == marked:
+        return {"status": "attention", "execution_id": command.get("execution_id"),
+                "recovery_reason": reason, "unchanged": True}
     _write(store, marked)
     return {"status": "attention", "execution_id": command.get("execution_id"), "recovery_reason": reason}
 
@@ -995,36 +1012,19 @@ def _run_claimed_command(store, service, claimed, launcher_factory, writer_facto
 
 
 def _spawn_claimed_worker(claimed):
-    """Continue provider work outside the one-minute watcher invocation."""
-    flags = (
-        getattr(subprocess, "DETACHED_PROCESS", 0)
-        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+    """Continue provider work outside the one-minute watcher invocation.
+
+    The detached + CREATE_BREAKAWAY_FROM_JOB flag contract (and its OSError
+    fallback) this function proved in production now lives once, in
+    manager.detached_process.popen_detached, shared with the AUTO_OPEN_ADM
+    helper and the Dashboard launcher so the three can never drift apart.
+    """
+    process = popen_detached(
+        [sys.executable, "-m", "manager.command_watcher_worker",
+         claimed["project_id"], claimed["task_id"], claimed["execution_id"]],
+        cwd=os.getcwd(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, close_fds=True,
     )
-    kwargs = {
-        "cwd": os.getcwd(),
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if os.name == "nt":
-        kwargs["creationflags"] = flags
-    try:
-        process = subprocess.Popen(
-            [sys.executable, "-m", "manager.command_watcher_worker",
-             claimed["project_id"], claimed["task_id"], claimed["execution_id"]],
-            **kwargs,
-        )
-    except OSError:
-        if os.name != "nt" or not (flags & getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)):
-            raise
-        kwargs["creationflags"] = flags & ~getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
-        process = subprocess.Popen(
-            [sys.executable, "-m", "manager.command_watcher_worker",
-             claimed["project_id"], claimed["task_id"], claimed["execution_id"]],
-            **kwargs,
-        )
     return process.pid
 
 
@@ -1720,7 +1720,7 @@ def _promote_waiting_quota_task(store, service, task, quota_document):
 _COMMAND_PRIORITY = {"claimed": 0, "running": 0, "queued": 1, "attention": 2}
 
 
-def _prioritized_nonterminal_commands(commands):
+def _prioritized_nonterminal_commands(commands, attention_rotation=0):
     """Stable-reorder one project's already-hydrated, already-hydration-bounded
     Command batch so active-lifecycle authority (claimed/running) is always
     considered first, actionable new work (queued) second, and stale
@@ -1754,10 +1754,26 @@ def _prioritized_nonterminal_commands(commands):
     indefinitely -- see the real production trace this fixes. Sorting is
     stable (Python's sorted()), so relative order within each priority group
     is preserved unchanged from Drive's own return order."""
-    return sorted(
+    ordered = sorted(
         (c for c in commands if c.get("status") not in ("completed", "failed")),
         key=lambda c: _COMMAND_PRIORITY.get(c.get("status"), len(_COMMAND_PRIORITY)),
     )
+    # Bounded fairness INSIDE the attention group (live 20260902): with two
+    # attention records in one hydrated batch, the stable sort always put
+    # the same one first, and a tick whose remaining recent-sweep budget
+    # was consumed by that first record's own reconciliation broke out of
+    # the loop before the second one every single tick. Rotating the
+    # attention suffix by `attention_rotation` (poll_once passes the
+    # wall-clock tick counter) guarantees every attention record in a batch
+    # of n is first within n consecutive ticks -- independent of how much
+    # budget its neighbors burn. claimed/running/queued ordering is
+    # untouched, and attention still never precedes them.
+    attention_start = next((i for i, c in enumerate(ordered) if c.get("status") == "attention"), len(ordered))
+    attention = ordered[attention_start:]
+    if len(attention) > 1 and attention_rotation:
+        shift = attention_rotation % len(attention)
+        attention = attention[shift:] + attention[:shift]
+    return ordered[:attention_start] + attention
 
 
 TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS = 10
@@ -2104,13 +2120,16 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         except TaskError:
             continue
 
-    # Advance project cursor to next project (0 -> 1 -> ... -> P-1 -> 0) and advance target project's record offset
+    # Advance project cursor to next project (0 -> 1 -> ... -> P-1 -> 0) and advance target project's record offset.
+    # Persisted ONCE per invocation, together with this tick's attention-visit
+    # advances, by _persist_cursor() in the `finally` below -- one save per
+    # invocation, so the actual-invocation generation stays exactly that
+    # (bounded delta review round 3: two advancing saves per invocation let
+    # an overlapping writer's second save be rolled back by the first
+    # writer's stale payload; a single save leaves only the pre-existing,
+    # out-of-scope equal-generation lost update of the non-atomic CAS).
     cursor["project_cursor"] = (proj_idx + 1) % num_projects
     cursor["per_project_record_cursor"][target_project_id] = record_offset + WAITING_QUOTA_DISCOVERY_WINDOW
-    try:
-        save_phase1_cursor(cursor, cursor_path=cursor_path, expected_generation=current_gen)
-    except Exception:
-        pass
 
     # Phase 2a/2b: inspect a tiny modified-time-ordered batch from every
     # project before historical hydration, then a regular full bounded
@@ -2175,63 +2194,106 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
 
     recent_deadline = min(deadline, time.monotonic() + RECENT_COMMAND_SWEEP_BUDGET_SECONDS)
     recent_hydration_deadline = min(recent_deadline, hydration_deadline)
-    for project_id in project_ids:
-        if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_hydration_deadline:
-            break
-        try:
-            commands = _enumerate_recent_commands(recent_store, project_id, deadline=recent_hydration_deadline)
-        except TaskError:
-            continue
-        _remember_batch(project_id, commands)
-        # Zero-remote-lookup nonterminal priority work (claimed/running/
-        # queued/attention) only -- terminal-recovery eligibility (which
-        # requires a real Execution lookup) is entirely deferred to the
-        # GLOBAL Phase 2c below. Uses the full `recent_deadline`, not the
-        # tightened `recent_hydration_deadline` -- already-hydrated active
-        # work is never held back by the terminal-recovery reservation.
-        for command in _prioritized_nonterminal_commands(commands):
-            if (project_id, command["command_id"]) in just_promoted:
-                continue
-            if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
-                break
-            _run(project_id, command)
+    # Attention-group rotation base (see _prioritized_nonterminal_commands):
+    # a DURABLE per-project visit counter from the Phase-1 cursor, advanced
+    # only when that project's batch is actually swept with more than one
+    # attention record in it. Independent adversarial review of the first
+    # round rejected a wall-clock tick counter for this: real ticks run
+    # ~90-120s apart (60s trigger + IgnoreNew), so int(time()//60) advances
+    # by 2 per sweep and a 2-record attention group never rotated at all,
+    # and any skipped bucket can permanently exclude a residue class of a
+    # larger group. Counting actual sweeps of this exact project makes the
+    # round-robin strict regardless of cadence, budget, or which invocations
+    # happen to reach the project.
+    attention_visits = dict(cursor.get("per_project_attention_visits") or {})
+    attention_rotation_by_project = {}
+    attention_visited = set()
 
-    for project_id in project_ids:
-        if time.monotonic() >= hydration_deadline:
-            break
+    def _attention_rotation(project_id, commands):
+        rotation = attention_rotation_by_project.setdefault(project_id, attention_visits.get(project_id, 0))
+        if project_id not in attention_visited and sum(1 for c in commands if c.get("status") == "attention") > 1:
+            attention_visited.add(project_id)
+            attention_visits[project_id] = rotation + 1
+        return rotation
+
+    def _persist_cursor():
+        # The single durable cursor save of this invocation: Phase 1's
+        # project/record advance plus this tick's attention-visit advances.
+        # Runs on EVERY exit of the nonterminal sweeps below (normal
+        # completion, the full sweep's deadline `return`, MAX_COMMANDS
+        # break, or an exception) -- bounded round-robin only holds if a
+        # visit that already decided this tick's rotation is durably
+        # counted; a deadline exit that dropped it would restore the exact
+        # same rotation next tick (bounded delta review, round 2). CAS on
+        # the generation this invocation loaded; losing that CAS means
+        # another invocation owns the cursor and nothing is written.
+        cursor["per_project_attention_visits"] = attention_visits
         try:
-            commands = _enumerate_commands(discovery_store, project_id, deadline=hydration_deadline)
-        except TaskError:
-            # A project that has never had a single Command written to it
-            # yet has no COMMANDS Drive folder at all --
-            # list_records_bounded()/list_records() raise TaskError("Drive
-            # folder not found") for that completely normal case, not a
-            # real error; nothing here needs any per-project fallback
-            # beyond skipping this project's own command processing (Phase
-            # 1's waiting_quota sweep above is already independent of this
-            # loop entirely, unlike before this restructure).
-            continue
-        _remember_batch(project_id, commands)
-        for command in _prioritized_nonterminal_commands(commands):
-            if (project_id, command["command_id"]) in just_promoted:
-                continue  # promoted this same tick -- launches on a later natural tick, not this one
-            if (project_id, command["command_id"]) in processed:
-                continue
-            if len(results) == MAX_COMMANDS_PER_POLL:
-                # Global command-processing budget reached. `break` (not
-                # `return`) only stops processing MORE commands for THIS
-                # project -- every later-rotated project's own command loop
-                # hits this same check on its first iteration and breaks
-                # immediately too (the shared `results` list is still full),
-                # so the total command-processing budget stays exactly as
-                # bounded as before this fix. Phase 1 above has already run
-                # to completion for every project regardless, so this can
-                # never again starve anyone's waiting_quota sweep the way
-                # the pre-fix combined single-pass loop did.
+            save_phase1_cursor(cursor, cursor_path=cursor_path, expected_generation=current_gen)
+        except Exception:
+            pass
+
+    try:
+        for project_id in project_ids:
+            if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_hydration_deadline:
                 break
-            if time.monotonic() >= deadline:
-                return results
-            _run(project_id, command)
+            try:
+                commands = _enumerate_recent_commands(recent_store, project_id, deadline=recent_hydration_deadline)
+            except TaskError:
+                continue
+            _remember_batch(project_id, commands)
+            # Zero-remote-lookup nonterminal priority work (claimed/running/
+            # queued/attention) only -- terminal-recovery eligibility (which
+            # requires a real Execution lookup) is entirely deferred to the
+            # GLOBAL Phase 2c below. Uses the full `recent_deadline`, not the
+            # tightened `recent_hydration_deadline` -- already-hydrated active
+            # work is never held back by the terminal-recovery reservation.
+            for command in _prioritized_nonterminal_commands(commands, attention_rotation=_attention_rotation(project_id, commands)):
+                if (project_id, command["command_id"]) in just_promoted:
+                    continue
+                if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
+                    break
+                _run(project_id, command)
+
+        for project_id in project_ids:
+            if time.monotonic() >= hydration_deadline:
+                break
+            try:
+                commands = _enumerate_commands(discovery_store, project_id, deadline=hydration_deadline)
+            except TaskError:
+                # A project that has never had a single Command written to it
+                # yet has no COMMANDS Drive folder at all --
+                # list_records_bounded()/list_records() raise TaskError("Drive
+                # folder not found") for that completely normal case, not a
+                # real error; nothing here needs any per-project fallback
+                # beyond skipping this project's own command processing (Phase
+                # 1's waiting_quota sweep above is already independent of this
+                # loop entirely, unlike before this restructure).
+                continue
+            _remember_batch(project_id, commands)
+            for command in _prioritized_nonterminal_commands(commands, attention_rotation=_attention_rotation(project_id, commands)):
+                if (project_id, command["command_id"]) in just_promoted:
+                    continue  # promoted this same tick -- launches on a later natural tick, not this one
+                if (project_id, command["command_id"]) in processed:
+                    continue
+                if len(results) == MAX_COMMANDS_PER_POLL:
+                    # Global command-processing budget reached. `break` (not
+                    # `return`) only stops processing MORE commands for THIS
+                    # project -- every later-rotated project's own command loop
+                    # hits this same check on its first iteration and breaks
+                    # immediately too (the shared `results` list is still full),
+                    # so the total command-processing budget stays exactly as
+                    # bounded as before this fix. Phase 1 above has already run
+                    # to completion for every project regardless, so this can
+                    # never again starve anyone's waiting_quota sweep the way
+                    # the pre-fix combined single-pass loop did.
+                    break
+                if time.monotonic() >= deadline:
+                    return results
+                _run(project_id, command)
+    finally:
+        _persist_cursor()
+
 
     # Phase 2c: GLOBAL terminal-recovery classification -- only now, after
     # EVERY rotated project's nonterminal work (both sweeps) has already

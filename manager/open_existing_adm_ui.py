@@ -4,9 +4,10 @@ import ctypes
 import json
 import os
 import socket
-import subprocess
 import time
 from pathlib import Path
+
+from manager.detached_process import popen_detached
 
 
 DASHBOARD_PORT = 8501
@@ -25,8 +26,31 @@ DASHBOARD_LAUNCHER = Path(__file__).resolve().parent.parent / "desktop" / "Start
 # instead of focusing the existing one. Kept alongside the English markers
 # (never replacing them) since a different desktop/locale may still show
 # the literal page_title or URL instead.
-TITLE_MARKERS = ("ADM Unified Operations Dashboard", f"localhost:{DASHBOARD_PORT}", "ADM 營運儀表板")
-START_TIMEOUT_SECONDS = 15.0
+#
+# "AI 開發管理器｜工作台" is dashboard.py's CURRENT st.set_page_config(page_title=
+# ...) (the zh-TW workbench rename) and therefore the real browser window
+# title today ("AI 開發管理器｜工作台 - Google Chrome", observed live
+# 20260902 while the helper still reported dashboard_window_not_found
+# against it). Every marker that ever matched a real window stays listed;
+# test_title_markers_recognize_dashboard_py_current_page_title pins this
+# tuple to dashboard.py's actual page_title so the two can never drift
+# apart silently again.
+TITLE_MARKERS = (
+    "AI 開發管理器｜工作台",
+    "ADM Unified Operations Dashboard",
+    f"localhost:{DASHBOARD_PORT}",
+    "ADM 營運儀表板",
+)
+# Cold start: desktop/Start-Dashboard.ps1 -> Streamlit binding DASHBOARD_PORT.
+# Measured live 20260902 on this machine: 17 seconds from launch to a bound
+# port (the previous 15s bound could never have succeeded). Bounded, never
+# open-ended: a launcher that has not bound the port by then is reported as
+# dashboard_start_timeout with the seconds actually waited.
+DASHBOARD_PORT_TIMEOUT_SECONDS = 45.0
+# Window: from "port bound" (or "browser open requested") to a real,
+# focusable Dashboard-titled top-level window. Streamlit's own headless=false
+# browser launch, plus Chrome start-up, sit inside this bound.
+DASHBOARD_WINDOW_TIMEOUT_SECONDS = 30.0
 POLL_INTERVAL_SECONDS = 0.5
 
 
@@ -47,13 +71,15 @@ def _open_browser(url=DASHBOARD_URL):
 
 
 def _spawn_dashboard():
-    flags = 0
-    if os.name == "nt":
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-    return subprocess.Popen(
+    # Same detached + CREATE_BREAKAWAY_FROM_JOB contract (with the same
+    # OSError fallback) as manager.command_watcher._spawn_claimed_worker,
+    # via the single shared launcher. Without breakaway the Dashboard dies
+    # with the Scheduled Task's job object as soon as the spawning tick
+    # ends -- see manager.detached_process for the live 20260902 evidence.
+    return popen_detached(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
          "-File", str(DASHBOARD_LAUNCHER), "-Port", str(DASHBOARD_PORT)],
-        creationflags=flags, close_fds=True,
+        close_fds=True,
     )
 
 
@@ -136,7 +162,7 @@ def _find_matching_window(api):
     return None, None
 
 
-def _wait_for_window_and_focus(api, timeout_seconds=START_TIMEOUT_SECONDS):
+def _wait_for_window_and_focus(api, timeout_seconds=DASHBOARD_WINDOW_TIMEOUT_SECONDS, stages=None):
     """Poll for a Dashboard-titled top-level window to appear and actively
     focus it via api.focus() (AttachThreadInput + SetForegroundWindow), the
     same real foreground-lock workaround used for an already-open window.
@@ -158,15 +184,20 @@ def _wait_for_window_and_focus(api, timeout_seconds=START_TIMEOUT_SECONDS):
     already-open window gets, and only reports "completed" once that
     succeeds -- never merely because the action of opening a tab/process was
     attempted."""
-    deadline = api.monotonic() + timeout_seconds
+    stages = dict(stages or {})
+    started = api.monotonic()
+    deadline = started + timeout_seconds
     while api.monotonic() < deadline:
         hwnd, title = _find_matching_window(api)
         if hwnd is not None:
+            stages["window_seconds"] = round(api.monotonic() - started, 1)
             if api.focus(hwnd):
-                return {"status": "completed", "window_title": title}
-            return {"status": "failed", "error_kind": "dashboard_focus_denied"}
+                return {"status": "completed", "window_title": title, **stages}
+            return {"status": "failed", "error_kind": "dashboard_focus_denied", "stage": "focus",
+                    "window_title": title, **stages}
         api.sleep(POLL_INTERVAL_SECONDS)
-    return {"status": "failed", "error_kind": "dashboard_window_not_found"}
+    stages["window_wait_seconds"] = round(api.monotonic() - started, 1)
+    return {"status": "failed", "error_kind": "dashboard_window_not_found", "stage": "window", **stages}
 
 
 def focus_existing_adm_ui(api=None):
@@ -178,16 +209,17 @@ def focus_existing_adm_ui(api=None):
         hwnd, title = _find_matching_window(api)
         if hwnd is not None:
             if api.focus(hwnd):
-                return {"status": "completed", "window_title": title}
-            return {"status": "failed", "error_kind": "dashboard_focus_denied"}
+                return {"status": "completed", "window_title": title, "reused_existing_window": True}
+            return {"status": "failed", "error_kind": "dashboard_focus_denied", "stage": "focus",
+                    "window_title": title}
         if api.port_open():
             api.open_browser()
-            return _wait_for_window_and_focus(api)
+            return _wait_for_window_and_focus(api, stages={"service": "already_running"})
 
         try:
             api.spawn_dashboard()
         except Exception:
-            return {"status": "failed", "error_kind": "dashboard_start_failed"}
+            return {"status": "failed", "error_kind": "dashboard_start_failed", "stage": "spawn"}
 
         # desktop/Start-Dashboard.ps1 runs Streamlit with --server.headless
         # false, which makes Streamlit's own startup sequence open a browser
@@ -196,12 +228,20 @@ def focus_existing_adm_ui(api=None):
         # "never more than one new browser window per invocation" contract.
         # Only the already-running-service branch above (state 2) needs an
         # explicit open, since nothing else is about to open one for it.
-        deadline = api.monotonic() + START_TIMEOUT_SECONDS
+        #
+        # Port and window are recorded as SEPARATE stages so a failure log
+        # line says which one did not happen (port never bound vs. port
+        # bound but no window) and how long each actually took.
+        spawned_at = api.monotonic()
+        deadline = spawned_at + DASHBOARD_PORT_TIMEOUT_SECONDS
         while api.monotonic() < deadline:
             if api.port_open():
-                return _wait_for_window_and_focus(api)
+                port_seconds = round(api.monotonic() - spawned_at, 1)
+                return _wait_for_window_and_focus(
+                    api, stages={"service": "cold_started", "port_seconds": port_seconds})
             api.sleep(POLL_INTERVAL_SECONDS)
-        return {"status": "failed", "error_kind": "dashboard_start_timeout"}
+        return {"status": "failed", "error_kind": "dashboard_start_timeout", "stage": "port",
+                "port_wait_seconds": round(api.monotonic() - spawned_at, 1)}
     except Exception:
         return {"status": "failed", "error_kind": "desktop_unavailable"}
 

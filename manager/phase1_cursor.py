@@ -27,6 +27,7 @@ def _default_cursor():
     return {
         "project_cursor": 0,
         "per_project_record_cursor": {},
+        "per_project_attention_visits": {},
         "generation": 0,
         "updated_at": None,
     }
@@ -54,6 +55,12 @@ def load_phase1_cursor(manager_home=None, cursor_path=None):
                 if isinstance(k, str) and isinstance(v, int) and v >= 0:
                     clean_records[k] = v
             record_cursors = clean_records
+        attention_visits = data.get("per_project_attention_visits")
+        if not isinstance(attention_visits, dict):
+            attention_visits = {}
+        else:
+            attention_visits = {k: v for k, v in attention_visits.items()
+                                if isinstance(k, str) and isinstance(v, int) and v >= 0}
         generation = data.get("generation")
         if not isinstance(generation, int) or generation < 0:
             generation = 0
@@ -63,6 +70,7 @@ def load_phase1_cursor(manager_home=None, cursor_path=None):
         return {
             "project_cursor": project_cursor,
             "per_project_record_cursor": record_cursors,
+            "per_project_attention_visits": attention_visits,
             "generation": generation,
             "updated_at": updated_at,
         }
@@ -71,7 +79,14 @@ def load_phase1_cursor(manager_home=None, cursor_path=None):
 
 
 def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None, expected_generation=None):
-    """Atomically persist Phase-1 cursor with optional CAS generation verification."""
+    """Atomically persist Phase-1 cursor with optional CAS generation verification.
+
+    ``generation`` is a strictly increasing write serial (every successful
+    save advances it by one); ``expected_generation`` is the CAS token a
+    writer must present. poll_once() saves exactly once per invocation
+    (its Phase-1 advance and its attention-visit advances together), so
+    the generation is also the actual-invocation count.
+    """
     path = _resolve_cursor_path(manager_home=manager_home, cursor_path=cursor_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -91,10 +106,15 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None, expecte
     if not isinstance(record_cursors, dict):
         record_cursors = {}
     clean_records = {str(k): int(v) for k, v in record_cursors.items() if isinstance(v, (int, float)) and v >= 0}
+    attention_visits = cursor_data.get("per_project_attention_visits", {})
+    if not isinstance(attention_visits, dict):
+        attention_visits = {}
+    clean_visits = {str(k): int(v) for k, v in attention_visits.items() if isinstance(v, (int, float)) and v >= 0}
 
     payload = {
         "project_cursor": project_cursor,
         "per_project_record_cursor": clean_records,
+        "per_project_attention_visits": clean_visits,
         "generation": new_generation,
         "updated_at": now_iso(),
     }
