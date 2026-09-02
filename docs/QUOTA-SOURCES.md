@@ -79,7 +79,46 @@ collector/refresh code defect:
   fix) or a periodic human-attended interactive session - not a change to
   `collectors/claude.py` or `manager/refresh_status.py`.
 
-## Antigravity - manual in v0.1, CDP path inconclusive
+## Antigravity - verified automatic, official (2026-09-02)
+
+Supersedes the v0.1 "manual / CDP inconclusive" finding below, which is kept
+for history.
+
+- Antigravity IDE 1.107.0 on this machine ships **no standalone `agy` binary**
+  (whole-machine search). Its real machine surface is the bundled language
+  server `resources/app/extensions/antigravity/bin/language_server_windows_x64.exe`
+  (build label `agy_ls_release_branch/2.7`), which the IDE starts with a
+  per-run `--csrf_token <uuid>` argument and which listens on two random
+  loopback ports (HTTPS/gRPC and plain HTTP). `~/.gemini/antigravity-ide/bin/
+  agentapi.bat` is only a thin wrapper around `language_server ... agentapi`.
+- Real request/response captured against the live server (Connect-RPC JSON,
+  header `x-codeium-csrf-token`, **no API key needed**, no model turn consumed):
+  `POST http://127.0.0.1:<http_port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`
+  -> `{"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+  {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.675,
+  "resetTime":"2026-09-04T08:20:30Z"},{"bucketId":"gemini-5h","window":"5h",
+  "remainingFraction":1,"resetTime":...}]},{"displayName":"Claude and GPT
+  models","buckets":[{"bucketId":"3p-weekly",...},{"bucketId":"3p-5h",...}]}]}}`.
+  `GetUserStatus` adds `userStatus.email/name`, `planStatus.planInfo.planName`
+  (Pro), prompt/flow credits and per-model `quotaInfo.remainingFraction/resetTime`.
+- protobuf JSON omits zero-valued scalars: a bucket with no `remainingFraction`
+  but a `resetTime` is an exhausted bucket (0), not an unknown one.
+- Discovery: `manager/ag_language_server.py` enumerates the same-user
+  `language_server*` process (Win32_Process argv -> CSRF nonce, `--app_data_dir
+  antigravity-ide`, executable under a real Antigravity install), lists its
+  listening ports (`netstat -ano`) and probes `GetStatus` to tell the HTTP port
+  from the HTTPS one. The IDE must be running (or the language server left
+  alive via the IDE setting `antigravity.persistentLanguageServer`); otherwise
+  the collector fails closed with `ide_not_running` and the last-good entry is
+  kept with `metadata.refresh` explaining why.
+- Collector: `collectors/antigravity.py` -> `source =
+  antigravity_language_server_quota_summary`, `source_type = official`,
+  `confidence = official`, four windows named by bucket id (`gemini-5h`,
+  `gemini-weekly`, `3p-5h`, `3p-weekly`; 300 / 10080 minutes). The CSRF nonce
+  is never logged or persisted; the Google OAuth token is never read (it stays
+  in the IDE, which performs every authenticated call).
+
+## Antigravity - manual in v0.1, CDP path inconclusive (historical)
 
 - Filesystem scan of `AppData\Roaming\Antigravity\` (app_storage.json,
   Preferences, Local State, logs\*.log, Local Storage\leveldb) found zero

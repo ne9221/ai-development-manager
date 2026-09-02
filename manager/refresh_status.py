@@ -16,6 +16,7 @@ from collectors.claude_oauth import (
     RateLimitedError as ClaudeOauthRateLimited,
     collect as collect_claude_oauth,
 )
+from collectors.antigravity import collect as collect_antigravity
 from collectors.codex import collect as collect_codex
 from collectors.publish_drive import build_service, sync_drive
 from manager.manager_home import ManagerHomeError, resolve_manager_home
@@ -153,7 +154,7 @@ def write_atomic(path, document):
 
 def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_accounts=None,
             claude_config_dirs=None, claude_oauth_collector=collect_claude_oauth, claude_oauth_timeout=15,
-            reader=read_drive_status, codex_collector=collect_codex,
+            reader=read_drive_status, codex_collector=collect_codex, antigravity_collector=collect_antigravity,
             publisher=sync_drive, validator=validate_status, history_store=None):
     """`claude_path` remains the single/legacy-account payload path (account_id=None),
     unchanged from before. `claude_accounts`, if given, is an additional
@@ -208,6 +209,36 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_a
         except Exception as exc:
             outcomes["codex"] = "unavailable"
             log_line(log_path, f"provider codex unavailable: {type(exc).__name__}")
+
+        # Antigravity: read from the running IDE's language server (official
+        # RPC, no model turn). Same last-good contract as Codex/Claude: a
+        # failed read never overwrites the previous entry; it only records
+        # WHY (metadata.refresh) so the Dashboard can say "IDE not running"
+        # instead of a bare STALE. `antigravity_collector=False` disables the
+        # read entirely (tests/offline callers) and leaves the entry untouched.
+        if antigravity_collector:
+            try:
+                _, ag_document = antigravity_collector(timeout=20)
+                antigravity = next(item for item in ag_document["providers"] if item.get("provider") == "antigravity")
+                replace_provider(document, antigravity)
+                outcomes["antigravity"] = "success"
+                log_line(log_path, "provider antigravity success")
+                if resolved_history_store is not None and antigravity.get("windows"):
+                    try:
+                        resolved_history_store.append_snapshot(antigravity)
+                        log_line(log_path, "quota history antigravity recorded")
+                    except Exception as exc:
+                        log_line(log_path, f"quota history antigravity warning: {type(exc).__name__}")
+            except Exception as exc:
+                outcomes["antigravity"] = "unavailable"
+                reason = getattr(exc, "classification", None) or type(exc).__name__
+                existing = next((item for item in document["providers"]
+                                 if item.get("provider") == "antigravity" and item.get("account_id") is None), None)
+                if existing is not None:
+                    if not isinstance(existing.get("metadata"), dict):
+                        existing["metadata"] = {}
+                    existing["metadata"]["refresh"] = refresh_diagnostic("unavailable", str(reason), now_iso())
+                log_line(log_path, f"provider antigravity unavailable: {reason}")
 
         accounts = {None: claude_path, **(claude_accounts or {})}
         # Deliberately NOT auto-injecting a {None: None} default here: unlike

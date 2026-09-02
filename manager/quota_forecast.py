@@ -19,6 +19,7 @@ DEFAULT_MAX_AGE_MINUTES = 60
 RELIABLE_SOURCES = {
     "codex": {"codex_app_server", "official_app_server"},
     "claude": {"claude_code_statusline_rate_limits", "official_statusline"},
+    "antigravity": {"antigravity_language_server_quota_summary"},
 }
 
 

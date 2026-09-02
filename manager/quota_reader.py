@@ -23,6 +23,9 @@ FUTURE_SKEW_MINUTES = 5
 RELIABLE_SOURCES = {
     "codex": {"codex_app_server", "official_app_server"},
     "claude": {"claude_code_statusline_rate_limits", "official_statusline"},
+    # collectors/antigravity.py: the IDE language server's own
+    # RetrieveUserQuotaSummary RPC (the same source the IDE UI renders).
+    "antigravity": {"antigravity_language_server_quota_summary"},
 }
 
 
