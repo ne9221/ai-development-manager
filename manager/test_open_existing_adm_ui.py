@@ -219,12 +219,22 @@ class SpawnDashboardArgsTests(unittest.TestCase):
             _spawn_dashboard()
         flags = popen.call_args.kwargs["creationflags"]
         self.assertTrue(flags & subprocess.CREATE_BREAKAWAY_FROM_JOB)
-        self.assertTrue(flags & subprocess.DETACHED_PROCESS)
+        # powershell.exe needs a real (hidden) console: DETACHED_PROCESS
+        # makes it exit 0 without ever running the launcher script.
+        self.assertTrue(flags & subprocess.CREATE_NO_WINDOW)
+        self.assertFalse(flags & subprocess.DETACHED_PROCESS)
+        # The launcher must not inherit and hold the caller's log handle.
+        self.assertIs(popen.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(popen.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        # The python worker keeps DETACHED_PROCESS (no console needed) but
+        # shares the identical breakaway + process-group contract.
         from manager.command_watcher import _spawn_claimed_worker
         with patch("manager.detached_process.subprocess.Popen", return_value=Mock(pid=2)) as worker_popen:
             _spawn_claimed_worker({"project_id": "p", "task_id": "t", "execution_id": "e"})
-        self.assertEqual(worker_popen.call_args.kwargs["creationflags"], flags,
-                         "Dashboard and claimed-worker spawns must use one identical flag contract")
+        worker_flags = worker_popen.call_args.kwargs["creationflags"]
+        self.assertTrue(worker_flags & subprocess.CREATE_BREAKAWAY_FROM_JOB)
+        self.assertTrue(worker_flags & subprocess.CREATE_NEW_PROCESS_GROUP)
+        self.assertTrue(worker_flags & subprocess.DETACHED_PROCESS)
 
     def test_spawn_uses_valid_powershell_flags_and_launcher_path(self):
         with patch("manager.detached_process.subprocess.Popen") as popen:

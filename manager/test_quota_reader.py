@@ -340,5 +340,21 @@ class MissingAccountIdKeyDedupesWithExplicitNone(unittest.TestCase):
         self.assertEqual(accounts[0]["windows"][0]["remaining_percent"], 99)
 
 
+
+
+class LegacyAggregateNeverRescuesNamedAccounts(unittest.TestCase):
+    def test_fresh_legacy_aggregate_cannot_make_provider_usable_when_named_accounts_are_stale(self):
+        stale = NOW.replace(hour=0)
+        result = summarize(
+            doc(claude_item(None, remaining=95), claude_item("A", remaining=95, updated=stale),
+                claude_item("B", remaining=95, updated=stale)),
+            now=NOW,
+        )
+        claude = next(p for p in result["providers"] if p["provider"] == "claude")
+        self.assertFalse(claude["has_usable_quota"])
+        self.assertFalse(claude["has_reliable_quota"])
+        self.assertEqual({"scope": "eligible_named_account", "eligible_account_ids": []}, claude["availability"])
+
+
 if __name__ == "__main__":
     unittest.main()

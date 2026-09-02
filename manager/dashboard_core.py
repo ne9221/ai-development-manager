@@ -359,6 +359,59 @@ def format_burn_rate(val: Optional[float]) -> str:
     return f"{val:.1f}%/hr"
 
 
+LEGACY_AGGREGATE_ACCOUNT_ID = None
+
+
+def is_live_execution(execution, now=None):
+    """True only when an Execution may be shown as 執行中: canonical status
+    running, REAL process evidence (host + pid) persisted by the launcher,
+    manager.executions.execution_health() reporting healthy (which itself
+    fails a session-bearing record without provider evidence, an expired
+    hard timeout, and stale progress), and the UI's own staleness check.
+    A persisted 'running' record with a session id but no host/PID proof
+    is never live (bounded review finding, 20260902)."""
+    from manager.executions import execution_health
+
+    if not isinstance(execution, dict) or execution.get("status") != "running":
+        return False
+    evidence = execution.get("provider_evidence") or {}
+    if not isinstance(evidence, dict) or not evidence.get("host") or evidence.get("pid") is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    try:
+        if execution_health(execution, now)["state"] != "healthy":
+            return False
+    except Exception:
+        return False
+    return determine_execution_state(execution, now) == "running" and not is_execution_stale(execution, now)
+
+
+def drop_legacy_aggregate_items(items):
+    """Split raw provider entries into (kept, hidden_provider_ids).
+
+    A provider entry with account_id=None is a legacy provider-level
+    aggregate. It is a real, first-class entry when it is the ONLY entry for
+    its provider (Codex has no account concept), but for a provider that also
+    carries named accounts it is neither a third account nor a routing
+    authority -- manager.quota_reader._provider_summary already derives
+    provider eligibility from named accounts only. Live 20260902 the Claude
+    aggregate (collected from the same default ~/.claude credentials as
+    account-a) rendered as a nameless "Claude Code STALE" card next to
+    account-a/account-b, so the Dashboard showed three Claude entities and
+    two page-wide STALE banners for what is one real problem."""
+    named = {item.get("provider") for item in items
+             if isinstance(item, dict) and item.get("account_id") is not LEGACY_AGGREGATE_ACCOUNT_ID}
+    kept, hidden = [], []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("account_id") is LEGACY_AGGREGATE_ACCOUNT_ID and item.get("provider") in named:
+            hidden.append(str(item.get("provider")))
+            continue
+        kept.append(item)
+    return kept, hidden
+
+
 @dataclass
 class AccountQuotaCardViewModel:
     """UI ViewModel for a single provider/account quota card."""
@@ -420,6 +473,13 @@ class AccountQuotaCardViewModel:
     effective_availability: str = "unknown"
 
     # Formatted display strings
+    # Why the last refresh did not land (manager.refresh_status writes
+    # metadata.refresh on every non-success cycle); None when the entry
+    # refreshed successfully or carries no diagnostic.
+    refresh_outcome: Optional[str] = None
+    refresh_error: Optional[str] = None
+    refresh_attempted_at: Optional[str] = None
+
     formatted_five_hour_remaining: str = "Unknown"
     formatted_weekly_remaining: str = "—"
     formatted_five_hour_countdown: str = "—"
@@ -445,6 +505,10 @@ class DailyBriefViewModel:
     telemetry_warnings: List[str] = field(default_factory=list)
     summary_counts: Dict[str, int] = field(default_factory=dict)
     accounts: List[AccountQuotaCardViewModel] = field(default_factory=list)
+    # Provider ids whose legacy account_id=None aggregate entry was hidden
+    # because named accounts exist for that provider (see
+    # drop_legacy_aggregate_items). Transparency only; never rendered as a card.
+    hidden_legacy_accounts: List[str] = field(default_factory=list)
 
 
 def build_account_quota_card_vm(fc: AccountQuotaForecast) -> AccountQuotaCardViewModel:
@@ -452,29 +516,34 @@ def build_account_quota_card_vm(fc: AccountQuotaForecast) -> AccountQuotaCardVie
     account_label = f" (Account {fc.account_id})" if fc.account_id else ""
     card_title = f"{fc.display_name}{account_label}" if fc.account_id and fc.account_id not in fc.display_name else fc.display_name
 
-    # Find 5-hour / primary window
+    # Find weekly / 7-day window FIRST. Codex names its windows
+    # primary/secondary (secondary = the 7-day window, duration 10080
+    # minutes); live 20260902 the Dashboard showed Codex with 5H only because
+    # "secondary" was never recognized here even though status.json carried
+    # it every cycle. "secondary" counts as weekly only with a compatible
+    # 7-day duration -- a "secondary" of any other length is not invented
+    # into a weekly window.
+    w_week = None
+    for w in fc.windows:
+        if w.window_name in ("seven_day", "weekly") or (w.window_name == "secondary" and w.duration_minutes == 10080):
+            w_week = w
+            break
+
+    # Find 5-hour / primary window. The weekly window is never reused as the
+    # 5H window: a secondary-only payload renders weekly + UNKNOWN 5H, never
+    # the same number twice under two labels (bounded review finding).
     w5 = None
     for name in ("five_hour", "primary"):
         for w in fc.windows:
-            if w.window_name == name:
+            if w.window_name == name and w is not w_week:
                 w5 = w
                 break
         if w5:
             break
-    if w5 is None and fc.primary_window:
+    if w5 is None and fc.primary_window and fc.primary_window is not w_week:
         w5 = fc.primary_window
-    elif w5 is None and fc.windows:
-        w5 = fc.windows[0]
-
-    # Find weekly / 7-day window
-    w_week = None
-    for name in ("seven_day", "weekly"):
-        for w in fc.windows:
-            if w.window_name == name:
-                w_week = w
-                break
-        if w_week:
-            break
+    elif w5 is None:
+        w5 = next((w for w in fc.windows if w is not w_week and w.window_name not in ("seven_day", "weekly", "secondary")), None)
 
     # 5-hour metrics
     f5_rem = w5.remaining_percent if w5 else None
@@ -606,6 +675,14 @@ def build_daily_brief_vm(
             normalized_input = normalized_input.get("providers")
         elif normalized_input.get("accounts"):
             normalized_input = normalized_input.get("accounts")
+    # One filter, at the input: everything downstream (forecast, unsafe list,
+    # nearest reset, recommendation scoring, cards) sees only real entities.
+    normalized_input, hidden_legacy = drop_legacy_aggregate_items(
+        normalized_input if isinstance(normalized_input, list) else [])
+    refresh_notes = {
+        (item.get("provider"), item.get("account_id")): (item.get("metadata") or {}).get("refresh")
+        for item in normalized_input if isinstance(item.get("metadata"), dict)
+    }
 
     # Fail-safe extraction
     try:
@@ -628,6 +705,12 @@ def build_daily_brief_vm(
         )
 
     account_vms = [build_account_quota_card_vm(fc) for fc in brief_fc.accounts]
+    for vm in account_vms:
+        note = refresh_notes.get((vm.provider, vm.account_id))
+        if isinstance(note, dict):
+            vm.refresh_outcome = note.get("outcome")
+            vm.refresh_error = note.get("error")
+            vm.refresh_attempted_at = note.get("attempted_at")
 
     # Find unsafe accounts (stale, hold, conserve, exhausted)
     unsafe = [
@@ -740,6 +823,7 @@ def build_daily_brief_vm(
         nearest_reset_countdown=nearest_countdown,
         telemetry_warnings=warnings,
         summary_counts=brief_fc.summary_counts,
+        hidden_legacy_accounts=hidden_legacy,
         accounts=account_vms,
     )
 

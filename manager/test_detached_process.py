@@ -31,6 +31,24 @@ class DetachedProcessTests(unittest.TestCase):
         self.assertTrue(kwargs["close_fds"])
         self.assertTrue(kwargs["creationflags"] & subprocess.CREATE_BREAKAWAY_FROM_JOB)
 
+    def test_no_window_swaps_detached_for_create_no_window(self):
+        """powershell.exe with DETACHED_PROCESS exits immediately (status 0,
+        script never runs) because it gets no console at all -- live 20260902:
+        cold start reported dashboard_start_timeout and no Streamlit process
+        ever appeared, while the identical argv under CREATE_NO_WINDOW bound
+        port 8501 in ~2s and stayed up. Console hosts therefore keep a real
+        but hidden console; breakaway is unchanged."""
+        flags = detached_creationflags(no_window=True)
+        self.assertTrue(flags & subprocess.CREATE_NO_WINDOW)
+        self.assertFalse(flags & subprocess.DETACHED_PROCESS)
+        self.assertTrue(flags & subprocess.CREATE_BREAKAWAY_FROM_JOB)
+        self.assertTrue(flags & subprocess.CREATE_NEW_PROCESS_GROUP)
+        with patch("manager.detached_process.subprocess.Popen", return_value=Mock(pid=3)) as popen:
+            popen_detached(["powershell.exe", "-File", "x.ps1"], no_window=True)
+        spawned = popen.call_args.kwargs["creationflags"]
+        self.assertTrue(spawned & subprocess.CREATE_NO_WINDOW)
+        self.assertFalse(spawned & subprocess.DETACHED_PROCESS)
+
     def test_popen_detached_retries_without_breakaway_only_on_oserror(self):
         # Exactly the fallback _spawn_claimed_worker proved in production: a
         # job that forbids breakaway rejects the flag with OSError, and a

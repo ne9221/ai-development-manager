@@ -1984,5 +1984,164 @@ class ResolveDispatchStatusReadFailureTests(unittest.TestCase):
         self.assertFalse(resolved["dispatch_request_read_failed"])
 
 
+
+
+class QuotaTruthEntityTests(unittest.TestCase):
+    """The Dashboard shows exactly three quota entities -- Codex, Claude A,
+    Claude B -- from the same summarize() the dispatcher uses."""
+
+    NOW = datetime(2026, 9, 2, 2, 20, 0, tzinfo=timezone.utc)
+
+    def _entry(self, provider, account_id=None, five=50, weekly=60, updated=None, names=("five_hour", "seven_day"),
+               metadata=None):
+        updated = updated or self.NOW.isoformat().replace("+00:00", "Z")
+        windows = [
+            {"name": names[0], "duration_minutes": 300, "used_percent": 100 - five, "remaining_percent": five,
+             "resets_at": (self.NOW + timedelta(hours=2)).isoformat().replace("+00:00", "Z")},
+            {"name": names[1], "duration_minutes": 10080, "used_percent": 100 - weekly, "remaining_percent": weekly,
+             "resets_at": (self.NOW + timedelta(days=4)).isoformat().replace("+00:00", "Z")},
+        ]
+        entry = {
+            "provider": provider, "account_id": account_id,
+            "display_name": "Codex" if provider == "codex" else "Claude Code",
+            "collection_mode": "automatic",
+            "source": "codex_app_server" if provider == "codex" else "claude_oauth_usage",
+            "source_type": "official", "confidence": "official", "status": "ok",
+            "last_updated": updated, "windows": windows,
+        }
+        if metadata is not None:
+            entry["metadata"] = metadata
+        return entry
+
+    def _brief(self, *entries):
+        from manager.quota_reader import summarize
+        doc = {"generated_at": self.NOW.isoformat(), "providers": list(entries)}
+        return build_daily_brief_vm(summarize(doc, max_age_minutes=60, now=self.NOW), now=self.NOW)
+
+    def test_codex_secondary_window_is_shown_as_the_weekly_window(self):
+        # Live status.json shape: Codex reports primary (5H) + secondary (7d).
+        brief = self._brief(self._entry("codex", five=75, weekly=39, names=("primary", "secondary")))
+        codex = next(a for a in brief.accounts if a.provider == "codex")
+        self.assertEqual(75, codex.five_hour_remaining_pct)
+        self.assertTrue(codex.has_weekly_window, "Codex 'secondary' must be recognized as the weekly window")
+        self.assertEqual(39, codex.weekly_remaining_pct)
+        self.assertIsNotNone(codex.weekly_resets_at)
+
+    def test_legacy_claude_aggregate_is_hidden_when_named_accounts_exist(self):
+        brief = self._brief(
+            self._entry("claude", None, five=100, weekly=6, updated="2026-09-01T14:41:18Z"),
+            self._entry("claude", "account-a", five=100, weekly=6, updated="2026-09-01T14:41:18Z"),
+            self._entry("codex", None, five=75, weekly=39, names=("primary", "secondary")),
+            self._entry("claude", "account-b", five=51, weekly=93),
+        )
+        identities = [(a.provider, a.account_id) for a in brief.accounts]
+        self.assertEqual({("codex", None), ("claude", "account-a"), ("claude", "account-b")}, set(identities))
+        self.assertEqual(3, len(identities), "exactly Codex, Claude A, Claude B -- never a nameless Claude card")
+        self.assertEqual(["claude"], brief.hidden_legacy_accounts)
+        # Codex's own account_id=None entry is a real entity, not a legacy aggregate.
+        self.assertIn(("codex", None), identities)
+
+    def test_legacy_aggregate_is_never_recommended_over_stale_named_accounts(self):
+        stale = "2026-09-01T14:41:18Z"
+        brief = self._brief(
+            self._entry("claude", None, five=95, weekly=95),  # fresh legacy aggregate
+            self._entry("claude", "account-a", five=95, weekly=95, updated=stale),
+            self._entry("claude", "account-b", five=95, weekly=95, updated=stale),
+        )
+        self.assertEqual(["claude"], brief.hidden_legacy_accounts)
+        self.assertNotEqual("claude", brief.recommended_provider,
+                            "a legacy aggregate must never become the routing authority for a provider with named accounts")
+        self.assertTrue(all(a.stale for a in brief.accounts))
+
+    def test_each_named_claude_account_keeps_its_own_freshness(self):
+        brief = self._brief(
+            self._entry("claude", "account-a", five=100, weekly=6, updated="2026-09-01T14:41:18Z"),
+            self._entry("claude", "account-b", five=51, weekly=93),
+        )
+        a = next(x for x in brief.accounts if x.account_id == "account-a")
+        b = next(x for x in brief.accounts if x.account_id == "account-b")
+        self.assertTrue(a.stale)
+        self.assertFalse(b.stale)
+        self.assertEqual(51, b.five_hour_remaining_pct)
+        self.assertEqual(93, b.weekly_remaining_pct)
+        self.assertEqual(100, a.five_hour_remaining_pct, "stale never means 0 -- the last-good number stays visible as stale")
+
+    def test_refresh_diagnostic_surfaces_on_the_card(self):
+        note = {"outcome": "unchanged", "error": "CredentialsUnavailableError: access token missing from credentials",
+                "attempted_at": "2026-09-02T02:08:27Z"}
+        brief = self._brief(
+            self._entry("claude", "account-a", updated="2026-09-01T14:41:18Z", metadata={"refresh": note}),
+            self._entry("claude", "account-b"),
+        )
+        a = next(x for x in brief.accounts if x.account_id == "account-a")
+        b = next(x for x in brief.accounts if x.account_id == "account-b")
+        self.assertEqual("unchanged", a.refresh_outcome)
+        self.assertIn("access token missing", a.refresh_error)
+        self.assertEqual("2026-09-02T02:08:27Z", a.refresh_attempted_at)
+        self.assertIsNone(b.refresh_error)
+
+
+
+
+class LiveExecutionPredicateTests(unittest.TestCase):
+    """執行中 requires canonical health AND real process evidence (bounded
+    review finding: a persisted running record with a session id but no
+    host/PID proof must never look live)."""
+
+    NOW = datetime(2026, 9, 2, 3, 0, 0, tzinfo=timezone.utc)
+
+    def _running(self, **changes):
+        started = (self.NOW - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+        execution = {
+            "execution_id": "e1", "task_id": "t1", "project_id": "p1", "provider": "claude", "status": "running",
+            "started_at": started, "heartbeat_at": started, "progress_updated_at": started,
+            "hard_timeout_at": (self.NOW + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+            "session_id": "claude:abc", "provider_session_id": "abc", "task_snapshot": {"expected_minutes": 20},
+            "provider_evidence": {"host": "HOST", "pid": 1234, "creation_identity": "windows-filetime:1"},
+        }
+        execution.update(changes)
+        return execution
+
+    def test_healthy_running_execution_with_process_evidence_is_live(self):
+        from manager.dashboard_core import is_live_execution
+        self.assertTrue(is_live_execution(self._running(), self.NOW))
+
+    def test_session_without_process_evidence_is_never_live(self):
+        from manager.dashboard_core import is_live_execution
+        self.assertFalse(is_live_execution(self._running(provider_evidence=None), self.NOW))
+        self.assertFalse(is_live_execution(self._running(provider_evidence={"host": "HOST"}), self.NOW))
+
+    def test_expired_hard_timeout_is_not_live(self):
+        from manager.dashboard_core import is_live_execution
+        expired = (self.NOW - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+        self.assertFalse(is_live_execution(self._running(hard_timeout_at=expired), self.NOW))
+
+    def test_stale_progress_and_non_running_status_are_not_live(self):
+        from manager.dashboard_core import is_live_execution
+        stale = (self.NOW - timedelta(minutes=40)).isoformat().replace("+00:00", "Z")
+        self.assertFalse(is_live_execution(self._running(started_at=stale, heartbeat_at=stale, progress_updated_at=stale), self.NOW))
+        self.assertFalse(is_live_execution(self._running(status="reserved"), self.NOW))
+        self.assertFalse(is_live_execution(self._running(status="completed"), self.NOW))
+
+
+class WindowRecognitionDegradedInputTests(QuotaTruthEntityTests):
+    def test_secondary_only_codex_payload_is_weekly_with_unknown_five_hour(self):
+        entry = self._entry("codex", None, five=0, weekly=39, names=("primary", "secondary"))
+        entry["windows"] = [entry["windows"][1]]  # only the 7-day "secondary" window survives
+        brief = self._brief(entry)
+        codex = next(a for a in brief.accounts if a.provider == "codex")
+        self.assertTrue(codex.has_weekly_window)
+        self.assertEqual(39, codex.weekly_remaining_pct)
+        self.assertIsNone(codex.five_hour_remaining_pct, "the weekly window must never be re-used as the 5H window")
+
+    def test_secondary_window_with_non_weekly_duration_is_not_a_weekly_window(self):
+        entry = self._entry("codex", None, five=75, weekly=39, names=("primary", "secondary"))
+        entry["windows"][1]["duration_minutes"] = 300
+        brief = self._brief(entry)
+        codex = next(a for a in brief.accounts if a.provider == "codex")
+        self.assertEqual(75, codex.five_hour_remaining_pct)
+        self.assertFalse(codex.has_weekly_window, "a 'secondary' of a non-7-day length is not invented into a weekly window")
+
+
 if __name__ == "__main__":
     unittest.main()
