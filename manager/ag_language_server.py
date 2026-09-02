@@ -464,6 +464,34 @@ def _account_records(user_status: dict[str, Any]) -> tuple[dict[str, Any] | None
     return account, models[:40]
 
 
+def probe_dispatch_route(client: AgLanguageServerClient) -> dict[str, Any]:
+    """Can this language server actually accept a NEW conversation from ADM?
+
+    Quota readability and dispatchability are different facts and must not be
+    conflated. Verified live on Antigravity IDE 1.107.0 (2026-09-02): an
+    IDE-hosted language server answers every read-only status/quota RPC, but
+    its projects store is not initialized, so the official
+    ``agentapi new-conversation`` route fails closed with
+    ``projectsStore is nil, but projectEnvConfig was provided`` (or
+    ``project_id is required when providing project_env_config`` when no
+    project id is supplied) -- it always sends a project_env_config. This
+    probe is read-only (``ReadProject``) and consumes no model turn.
+
+    Returns ``{"available": bool, "reason": str|None, "detail": str|None}``.
+    """
+    try:
+        client.call("ReadProject", {})
+    except AgLsError as exc:
+        detail = (exc.detail or "").lower()
+        if "projects store not initialized" in detail or "projectsstore is nil" in detail:
+            return {"available": False, "reason": "projects_store_unavailable", "detail": exc.detail}
+        if exc.classification in ("rpc_invalid_argument", "rpc_not_found"):
+            # The store answered and merely rejected an empty request: it exists.
+            return {"available": True, "reason": None, "detail": None}
+        return {"available": False, "reason": exc.classification, "detail": exc.detail}
+    return {"available": True, "reason": None, "detail": None}
+
+
 def availability_snapshot(*, discover: Callable[..., LanguageServerEndpoint] | None = None,
                           client_factory: Callable[..., AgLanguageServerClient] | None = None,
                           now: str | None = None, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
@@ -481,7 +509,7 @@ def availability_snapshot(*, discover: Callable[..., LanguageServerEndpoint] | N
         "provider": "antigravity", "status": "unavailable", "source": SOURCE, "observed_at": observed_at,
         "freshness": "fresh", "confidence": "unknown", "account": None, "models": [], "buckets": [],
         "remaining": None, "remaining_percent": None, "reset_at": None, "unavailable_until": None,
-        "reason": None, "language_server": None, "can_accept_new_task": False,
+        "reason": None, "language_server": None, "dispatch_route": None, "can_accept_new_task": False,
     }
     try:
         endpoint = discover(timeout=timeout)
@@ -499,6 +527,8 @@ def availability_snapshot(*, discover: Callable[..., LanguageServerEndpoint] | N
         return snapshot
     account, models = _account_records(user_status)
     snapshot.update(account=account, models=models, buckets=buckets, confidence="official")
+    route = probe_dispatch_route(client)
+    snapshot["dispatch_route"] = route
     if account is None or not account.get("email"):
         snapshot.update(status="unverified", reason="account_identity_unavailable")
         return snapshot
@@ -515,6 +545,12 @@ def availability_snapshot(*, discover: Callable[..., LanguageServerEndpoint] | N
                         can_accept_new_task=True)
     else:
         snapshot.update(status="available", can_accept_new_task=True)
+    if not route["available"]:
+        # Quota stays truthfully readable/fresh; only dispatch is refused.
+        snapshot["can_accept_new_task"] = False
+        if snapshot["status"] == "available":
+            snapshot["status"] = "degraded"
+        snapshot["reason"] = snapshot["reason"] or route["reason"]
     return snapshot
 
 
