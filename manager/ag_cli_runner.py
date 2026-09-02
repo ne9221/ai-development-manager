@@ -1,25 +1,60 @@
-"""Official Antigravity CLI dispatch adapter with strict Fail-Closed Auth Guard.
+"""Antigravity execution adapter: official ``agentapi`` CLI + IDE language-server RPCs.
 
-This module resolves and executes the official Antigravity CLI (agentapi / agy) or
-bundled language server in non-interactive / headless mode. It enforces that the execution
-strictly runs under the authenticated local Google AI Pro account profile, strips secondary
-API billing credentials, and normalizes output into standardized events.
+Verified transport (2026-09-02, Antigravity IDE 1.107.0): there is no ``agy``
+binary; the official machine surface is ``language_server_windows_x64.exe
+agentapi new-conversation|send-message|get-conversation-metadata`` talking to
+the IDE-started language server (see manager/ag_language_server.py). The
+conversation itself runs *inside* the language server -- the CLI returns as
+soon as the conversation exists -- so this adapter observes, terminalizes and
+cancels through the server's trajectory RPCs, never through the CLI's exit
+code.
+
+Lifecycle (same prepare/start/wait/close contract as CodexLauncher /
+ClaudeLauncher, routed by manager/ag_runner.AgRunner):
+
+* ``prepare``  -- READY handshake, no side effects on AG: language server
+  discovered, ``GetStatus`` answers, ``GetUserStatus`` carries an account,
+  ``RetrieveUserQuotaSummary`` shows the model group is not exhausted, the
+  requested model maps onto an ``agentapi`` model, the CLI route exists.
+  Assigns the ADM-owned ``thread_id`` (provider_session_id) and persists a
+  ``prepared`` run-state record.
+* ``start``    -- ``agentapi new-conversation`` (env from the endpoint, CSRF
+  never logged), bounded; parses the conversation id; verifies the workspace
+  mapping when the server exposes one; persists ``running`` run state.
+* ``wait``     -- polls ``GetAllCascadeTrajectories`` / ``GetCascadeTrajectorySteps``
+  / ``GetCascadeTrajectoryExecutorMetadatas``; terminal truth = run status
+  IDLE + executor termination reason + step statuses + a non-empty final
+  response. Exit code 0 is never success. Permission stalls, quota
+  exhaustion, timeouts, provider errors and cancellation all get distinct
+  failure classifications.
+* ``cancel``   -- ``CancelCascadeInvocation`` + ``ForceStopCascadeTree`` +
+  kill of the CLI process tree, then reconciliation until the server reports
+  IDLE; cancellation evidence is persisted.
+* ``close``    -- cancels anything still running so ``provider_stopped`` can be
+  proven by execution_runner._stopped() through the ``_process`` handle.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import queue
-import shutil
+import re
 import subprocess
-import threading
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Generator
+from typing import Any, Callable
 
+from manager.ag_language_server import (
+    AgLanguageServerClient,
+    AgLsError,
+    LanguageServerEndpoint,
+    _bucket_records,
+    discover_language_server,
+    probe_dispatch_route,
+    redact,
+)
+from manager.ag_run_state import TERMINAL_STATUSES, read_run_state, update_run_state, write_run_state
 from manager.ag_runner import (
     AgLaunchError,
     AgNormalizedEvent,
@@ -31,7 +66,6 @@ from manager.ag_runner import (
     utc_now,
 )
 
-
 SECONDARY_BILLING_ENV_VARS = (
     "GOOGLE_API_KEY",
     "GEMINI_API_KEY",
@@ -42,6 +76,30 @@ SECONDARY_BILLING_ENV_VARS = (
     "GOOGLE_GENAI_USE_VERTEXAI",
 )
 
+AGENTAPI_MODELS = ("flash_lite", "flash", "pro")
+PROJECT_ID_ENV = "ADM_ANTIGRAVITY_PROJECT_ID"
+RUN_STATUS_ACTIVE = ("CASCADE_RUN_STATUS_RUNNING", "CASCADE_RUN_STATUS_BUSY", "CASCADE_RUN_STATUS_CANCELING")
+RUN_STATUS_IDLE = "CASCADE_RUN_STATUS_IDLE"
+STEP_DONE = "CORTEX_STEP_STATUS_DONE"
+STEP_ERROR = "CORTEX_STEP_STATUS_ERROR"
+STEP_CANCELED = "CORTEX_STEP_STATUS_CANCELED"
+STEP_WAITING = "CORTEX_STEP_STATUS_WAITING"
+STEP_ACTIVE = ("CORTEX_STEP_STATUS_RUNNING", "CORTEX_STEP_STATUS_GENERATING", "CORTEX_STEP_STATUS_PENDING", "CORTEX_STEP_STATUS_QUEUED")
+STEP_USER_INPUT = "CORTEX_STEP_TYPE_USER_INPUT"
+STEP_PLANNER_RESPONSE = "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
+STEP_ERROR_MESSAGE = "CORTEX_STEP_TYPE_ERROR_MESSAGE"
+STEP_ASK_QUESTION = "CORTEX_STEP_TYPE_ASK_QUESTION"
+TERMINATION_CANCELED = "EXECUTOR_TERMINATION_REASON_USER_CANCELED"
+TERMINATION_ERROR = "EXECUTOR_TERMINATION_REASON_ERROR"
+TERMINATION_TOKEN_BUDGET = "EXECUTOR_TERMINATION_REASON_MAX_TOKEN_BUDGET_EXCEEDED"
+TERMINATION_MAX_INVOCATIONS = ("EXECUTOR_TERMINATION_REASON_MAX_INVOCATIONS", "EXECUTOR_TERMINATION_REASON_MAX_FORCED_INVOCATIONS")
+QUOTA_ERROR_PATTERN = re.compile(r"(quota|rate.?limit|resource.?exhausted|exhausted|capacity|429)", re.IGNORECASE)
+AUTH_ERROR_PATTERN = re.compile(r"(unauthenticated|unauthorized|permission.?denied|auth|login|token expired)", re.IGNORECASE)
+MAX_RESPONSE_CHARS = 20000
+MAX_EVIDENCE_CHARS = 500
+IDLE_GRACE_SECONDS = 20.0
+MAX_CONSECUTIVE_POLL_FAILURES = 5
+
 
 def _safe_home() -> Path:
     try:
@@ -51,7 +109,7 @@ def _safe_home() -> Path:
 
 
 def sanitize_ag_environment(base_env: dict[str, str] | None = None) -> dict[str, str]:
-    """Strip secondary billing/API keys to ensure child process strictly uses local Google account profile."""
+    """Strip secondary billing/API keys so the child strictly uses the IDE's own Google account."""
     env = dict(os.environ if base_env is None else base_env)
     for var in SECONDARY_BILLING_ENV_VARS:
         env.pop(var, None)
@@ -59,395 +117,727 @@ def sanitize_ag_environment(base_env: dict[str, str] | None = None) -> dict[str,
 
 
 def verify_auth_identity() -> str:
-    """Verify that Antigravity execution uses a verified local Google account profile.
+    """Legacy local-profile presence check (kept for the headless fallback route).
 
-    Strictly fails closed if local IDE configuration or credential profile cannot be proven.
-    GOOGLE_API_KEY is not accepted as evidence of local Google AI Pro account identity.
+    The real authentication proof for the language-server route is
+    ``GetUserStatus`` carrying an account e-mail (see OfficialAgCliRunner.prepare).
     """
     gemini_home = Path(os.environ.get("GEMINI_HOME", _safe_home() / ".gemini"))
-
-    # Local credentials directory / config check
     oauth_file = gemini_home / "oauth_credentials.json"
     config_dir = gemini_home / "config"
     ide_dir = gemini_home / "antigravity-ide"
     antigravity_dir = gemini_home / "antigravity"
-
-    # Local storage state in AppData
     appdata = os.environ.get("APPDATA")
     state_db = Path(appdata) / "Antigravity IDE" / "User" / "globalStorage" / "state.vscdb" if appdata else None
-
     has_local_profile = (
-        config_dir.is_dir()
-        or ide_dir.is_dir()
-        or antigravity_dir.is_dir()
-        or oauth_file.is_file()
+        config_dir.is_dir() or ide_dir.is_dir() or antigravity_dir.is_dir() or oauth_file.is_file()
         or (state_db and state_db.is_file())
     )
-
     if not has_local_profile:
         raise AgLaunchError(
             "unverified_identity",
             "Cannot prove Antigravity local identity: no local configuration directory (~/.gemini/config, ~/.gemini/antigravity-ide) or OAuth credential profile found. Fail closed.",
         )
-
     return "local_google_account_profile"
 
 
 def resolve_ag_cli_executable(explicit: str | None = None) -> tuple[str, list[str]]:
-    r"""Locate the official Antigravity CLI binary / entrypoint and leading subcommands.
+    r"""Locate an ``agentapi`` entrypoint on disk. Returns (executable_path, prefix_args).
 
-    Returns (executable_path, prefix_args).
-    For example:
-      - ('C:/Users/EE/.gemini/antigravity-ide/bin/agentapi.bat', [])
-      - ('c:/.../language_server_windows_x64.exe', ['agentapi'])
+    Prefer the language-server executable itself with an ``agentapi`` prefix
+    (what Antigravity's own sidecar helper does via ANTIGRAVITY_AGENTAPI_EXE);
+    the ``.bat`` shim is accepted only as a last resort.
     """
+    import shutil
+
     if explicit:
         path = shutil.which(explicit) or (explicit if Path(explicit).is_file() else None)
         if path:
-            return str(Path(path).resolve()), []
+            resolved = str(Path(path).resolve())
+            return resolved, (["agentapi"] if "language_server" in Path(resolved).name.lower() else [])
         raise AgLaunchError("executable_not_found", f"Explicit Antigravity CLI executable not found: {explicit}")
 
-    # Check environment variable overrides
-    env_bin = os.environ.get("AGENTAPI_BIN") or os.environ.get("ANTIGRAVITY_BIN") or os.environ.get("AGY_BIN") or os.environ.get("GEMINI_BIN")
+    env_bin = os.environ.get("ANTIGRAVITY_AGENTAPI_EXE") or os.environ.get("AGENTAPI_BIN") or os.environ.get("ANTIGRAVITY_BIN") or os.environ.get("AGY_BIN")
     if env_bin:
         path = shutil.which(env_bin) or (env_bin if Path(env_bin).is_file() else None)
         if path:
             resolved = str(Path(path).resolve())
-            if "language_server" in Path(resolved).name.lower():
-                return resolved, ["agentapi"]
-            return resolved, []
+            return resolved, (["agentapi"] if "language_server" in Path(resolved).name.lower() else [])
 
-    # 1. Search PATH for agentapi
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        for ls_path in (
+            Path(local_appdata) / "Programs" / "Antigravity IDE" / "resources" / "app" / "extensions" / "antigravity" / "bin" / "language_server_windows_x64.exe",
+            Path(local_appdata) / "Programs" / "antigravity" / "resources" / "bin" / "language_server.exe",
+        ):
+            if ls_path.is_file():
+                return str(ls_path.resolve()), ["agentapi"]
+
+    gemini_home = Path(os.environ.get("GEMINI_HOME", _safe_home() / ".gemini"))
+    for sub in ("antigravity-ide/bin/agentapi.bat", "antigravity-ide/bin/agentapi", "antigravity/bin/agentapi.bat", "antigravity/bin/agentapi"):
+        cand = gemini_home / sub
+        if cand.is_file():
+            return str(cand.resolve()), []
+
     names = ("agentapi.bat", "agentapi.cmd", "agentapi.exe", "agentapi") if os.name == "nt" else ("agentapi",)
     for name in names:
         found = shutil.which(name)
         if found:
             return str(Path(found).resolve()), []
+    raise AgLaunchError("executable_not_found", "Official Antigravity agentapi entrypoint was not found")
 
-    # 2. Known default installation locations under ~/.gemini
-    gemini_home = Path(os.environ.get("GEMINI_HOME", _safe_home() / ".gemini"))
-    for sub in (
-        "antigravity-ide/bin/agentapi.bat",
-        "antigravity-ide/bin/agentapi.cmd",
-        "antigravity-ide/bin/agentapi.exe",
-        "antigravity-ide/bin/agentapi",
-        "antigravity/bin/agentapi.bat",
-        "antigravity/bin/agentapi.cmd",
-        "antigravity/bin/agentapi.exe",
-        "antigravity/bin/agentapi",
-    ):
-        cand = gemini_home / sub
-        if cand.is_file():
-            return str(cand.resolve()), []
 
-    # 3. Known Language Server binaries in LocalAppData
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if local_appdata:
-        ls_candidates = (
-            Path(local_appdata) / "Programs" / "Antigravity IDE" / "resources" / "app" / "extensions" / "antigravity" / "bin" / "language_server_windows_x64.exe",
-            Path(local_appdata) / "Programs" / "antigravity" / "resources" / "bin" / "language_server.exe",
-        )
-        for ls_path in ls_candidates:
-            if ls_path.is_file():
-                return str(ls_path.resolve()), ["agentapi"]
+def map_agentapi_model(model: str | None) -> str | None:
+    """ADM/user model names -> the only values ``agentapi --model`` accepts, or raise ``unknown_model``."""
+    if model is None or not str(model).strip():
+        return None
+    text = str(model).strip().lower().replace("-", "_")
+    if text in AGENTAPI_MODELS:
+        return text
+    if "flash_lite" in text or "flashlite" in text or "lite" in text:
+        return "flash_lite"
+    if "flash" in text:
+        return "flash"
+    if "pro" in text:
+        return "pro"
+    raise AgLaunchError("unknown_model", f"model {model!r} does not map onto agentapi models {AGENTAPI_MODELS}")
 
-    # 4. Search PATH for agy / antigravity / gemini
-    fallback_names = (
-        ("agy.cmd", "agy.exe", "agy", "antigravity.cmd", "antigravity.exe", "antigravity", "gemini.cmd", "gemini.exe", "gemini")
-        if os.name == "nt"
-        else ("agy", "antigravity", "gemini")
-    )
-    for name in fallback_names:
-        found = shutil.which(name)
-        if found:
-            return str(Path(found).resolve()), []
 
-    # 5. Check NPM global directory
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        for npm_name in ("gemini.cmd", "agy.cmd", "antigravity.cmd"):
-            npm_cand = Path(appdata) / "npm" / npm_name
-            if npm_cand.is_file():
-                return str(npm_cand.resolve()), []
+def _kill_process_tree(process: Any) -> None:
+    """Terminate the CLI process and everything it spawned (Windows: taskkill /T)."""
+    pid = getattr(process, "pid", None)
+    if os.name == "nt" and isinstance(pid, int) and pid > 0:
+        try:
+            kwargs: dict[str, Any] = {"capture_output": True, "timeout": 10}
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            kwargs["startupinfo"] = startupinfo
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], **kwargs)
+        except Exception:
+            pass
+    try:
+        process.kill()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=5)
+    except Exception:
+        pass
 
-    raise AgLaunchError("executable_not_found", "Official Antigravity CLI executable (agentapi/agy) was not found")
+
+def _find_conversation_id(payload: Any, depth: int = 0) -> str | None:
+    if depth > 6:
+        return None
+    if isinstance(payload, dict):
+        for key in ("conversationId", "conversation_id", "cascadeId", "cascade_id", "rootConversationId", "id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in payload.values():
+            found = _find_conversation_id(value, depth + 1)
+            if found:
+                return found
+    if isinstance(payload, list):
+        for item in payload:
+            found = _find_conversation_id(item, depth + 1)
+            if found:
+                return found
+    return None
+
+
+def parse_new_conversation_output(stdout: str) -> str:
+    """Extract the conversation id from ``agentapi new-conversation`` JSON; classify failures."""
+    text = (stdout or "").strip()
+    if not text:
+        raise AgLaunchError("dispatch_failed", "agentapi new-conversation produced no output")
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        raise AgLaunchError("malformed_output", f"agentapi output is not JSON: {text[:MAX_EVIDENCE_CHARS]}") from exc
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if error:
+        message = str(error)
+        if QUOTA_ERROR_PATTERN.search(message):
+            raise AgLaunchError("quota_exhausted", message)
+        if "project" in message.lower():
+            raise AgLaunchError("project_unresolved", message)
+        if "Unavailable" in message or "connection" in message.lower() or "ANTIGRAVITY_LS_ADDRESS" in message:
+            raise AgLaunchError("ls_unreachable", message)
+        if AUTH_ERROR_PATTERN.search(message):
+            raise AgLaunchError("auth_transient", message)
+        raise AgLaunchError("dispatch_failed", message)
+    conversation_id = _find_conversation_id(payload)
+    if not conversation_id:
+        raise AgLaunchError("malformed_output", f"agentapi output carried no conversation id: {text[:MAX_EVIDENCE_CHARS]}")
+    return conversation_id
+
+
+def _step_text(step: dict[str, Any]) -> str:
+    """Best-effort human text of a trajectory step (planner response / error message)."""
+    for key in ("plannerResponse", "errorMessage", "userInput", "askQuestion", "message"):
+        body = step.get(key)
+        if isinstance(body, dict):
+            for inner in ("response", "text", "message", "content", "userResponse"):
+                value = body.get(inner)
+                if isinstance(value, str) and value.strip():
+                    return value
+            items = body.get("items")
+            if isinstance(items, list):
+                texts = [item.get("text") for item in items if isinstance(item, dict) and isinstance(item.get("text"), str)]
+                if texts:
+                    return "\n".join(texts)
+        elif isinstance(body, str) and body.strip():
+            return body
+    for key in ("response", "text", "content"):
+        value = step.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _uri_path(uri: str) -> str:
+    text = str(uri)
+    if text.lower().startswith("file:///"):
+        text = text[8:]
+        if len(text) > 1 and text[1] != ":" and text[0] == "/":
+            text = "/" + text
+    elif text.lower().startswith("file://"):
+        text = text[7:]
+    from urllib.parse import unquote
+    return unquote(text)
+
+
+def _same_path(left: str, right: str) -> bool:
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return os.path.normcase(os.path.normpath(left)) == os.path.normcase(os.path.normpath(right))
+
+
+def classify_run(summary: dict[str, Any] | None, steps: list[dict[str, Any]] | None,
+                 executor_metadatas: list[dict[str, Any]] | None, *, seconds_since_start: float,
+                 idle_grace_seconds: float = IDLE_GRACE_SECONDS) -> dict[str, Any]:
+    """Pure terminal-truth classifier over the language server's own state.
+
+    Returns ``{"state": running|waiting_permission|completed|failed|interrupted,
+    "classification": ..., "detail": ..., "response_text": ..., "termination_reason": ...}``.
+    """
+    status = (summary or {}).get("status") or ""
+    steps = [step for step in (steps or []) if isinstance(step, dict)]
+    metadatas = [item for item in (executor_metadatas or []) if isinstance(item, dict)]
+    statuses = [str(step.get("status") or "") for step in steps]
+    types = [str(step.get("type") or "") for step in steps]
+    waiting = any(state == STEP_WAITING for state in statuses) or (STEP_ASK_QUESTION in types and status == RUN_STATUS_IDLE)
+    error_texts = [_step_text(step) for step, kind, state in zip(steps, types, statuses) if kind == STEP_ERROR_MESSAGE or state == STEP_ERROR]
+    error_text = next((text for text in error_texts if text), "")
+    planner_text = ""
+    for step, kind, state in zip(reversed(steps), reversed(types), reversed(statuses)):
+        if kind == STEP_PLANNER_RESPONSE and state == STEP_DONE:
+            planner_text = _step_text(step)
+            if planner_text:
+                break
+    latest = max(metadatas, key=lambda item: int(item.get("lastStepIdx") or 0), default=None)
+    termination = str((latest or {}).get("terminationReason") or "")
+    quota_hit = bool(error_text) and bool(QUOTA_ERROR_PATTERN.search(error_text))
+
+    if status in RUN_STATUS_ACTIVE:
+        if waiting:
+            return {"state": "waiting_permission", "classification": "permission_required", "detail": "provider is waiting for a permission/answer", "response_text": planner_text, "termination_reason": termination}
+        return {"state": "running", "classification": None, "detail": None, "response_text": planner_text, "termination_reason": termination}
+    if status != RUN_STATUS_IDLE:
+        return {"state": "running", "classification": None, "detail": f"run status {status or 'unknown'}", "response_text": planner_text, "termination_reason": termination}
+    # IDLE: the language server reports nothing running for this conversation.
+    if not steps and seconds_since_start < idle_grace_seconds:
+        return {"state": "running", "classification": None, "detail": "idle before first step (grace)", "response_text": "", "termination_reason": termination}
+    if termination == TERMINATION_CANCELED or any(state == STEP_CANCELED for state in statuses):
+        return {"state": "interrupted", "classification": "cancelled", "detail": "provider reports user cancellation", "response_text": planner_text, "termination_reason": termination}
+    if quota_hit:
+        return {"state": "failed", "classification": "quota_exhausted", "detail": error_text[:MAX_EVIDENCE_CHARS], "response_text": planner_text, "termination_reason": termination}
+    if termination == TERMINATION_TOKEN_BUDGET:
+        return {"state": "failed", "classification": "token_budget_exceeded", "detail": termination, "response_text": planner_text, "termination_reason": termination}
+    if termination in TERMINATION_MAX_INVOCATIONS:
+        return {"state": "failed", "classification": "max_invocations", "detail": termination, "response_text": planner_text, "termination_reason": termination}
+    if termination == TERMINATION_ERROR or error_text:
+        detail = error_text[:MAX_EVIDENCE_CHARS] or termination
+        if AUTH_ERROR_PATTERN.search(detail):
+            return {"state": "failed", "classification": "auth_transient", "detail": detail, "response_text": planner_text, "termination_reason": termination}
+        return {"state": "failed", "classification": "provider_error", "detail": detail, "response_text": planner_text, "termination_reason": termination}
+    if waiting:
+        return {"state": "waiting_permission", "classification": "permission_required", "detail": "provider idle on an unanswered permission/question", "response_text": planner_text, "termination_reason": termination}
+    if not latest and not planner_text:
+        if seconds_since_start < idle_grace_seconds:
+            return {"state": "running", "classification": None, "detail": "idle before the executor started (grace)", "response_text": "", "termination_reason": termination}
+        return {"state": "failed", "classification": "prompt_not_started", "detail": "conversation exists but the executor never ran (prompt swallowed before READY?)", "response_text": "", "termination_reason": termination}
+    if not planner_text:
+        return {"state": "failed", "classification": "empty_response", "detail": "run finished without a final planner response", "response_text": "", "termination_reason": termination}
+    return {"state": "completed", "classification": None, "detail": None, "response_text": planner_text[:MAX_RESPONSE_CHARS], "termination_reason": termination}
 
 
 class AgCliProcess:
-    """Manages the subprocess execution, streaming I/O, and lifecycle of an Antigravity CLI process."""
+    """Bounded runner for one ``agentapi`` CLI invocation (JSON on stdout)."""
 
-    def __init__(self, process: subprocess.Popen, timeout: float = 30.0):
+    def __init__(self, process: subprocess.Popen, timeout: float = 60.0):
         self.process = process
         self.timeout = timeout
-        self._queue: queue.Queue[AgNormalizedEvent] = queue.Queue()
-        self._closed = False
-        self._stderr_lines: list[str] = []
-        self._accumulated_messages: list[str] = []
+        self.stdout = ""
+        self.stderr = ""
+        self.timed_out = False
 
-        self._stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
-        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
-        self._stdout_thread.start()
-        self._stderr_thread.start()
-
-    def _read_stdout(self) -> None:
-        stdout = self.process.stdout
-        if not stdout:
-            self._closed = True
-            return
-        for line in iter(stdout.readline, ""):
-            if not line:
-                break
-            line_str = line.strip()
-            if not line_str:
-                continue
-            try:
-                raw_event = json.loads(line_str)
-                event = normalize_event(raw_event)
-                self._queue.put(event)
-                if event.event_type == "message":
-                    self._accumulated_messages.append(event.payload.get("content", ""))
-            except json.JSONDecodeError:
-                # Wrap unstructured line as message
-                self._accumulated_messages.append(line_str)
-                self._queue.put(AgNormalizedEvent(event_type="message", payload={"content": line_str}))
-
-        self._closed = True
-
-    def _read_stderr(self) -> None:
-        stderr = self.process.stderr
-        if not stderr:
-            return
-        for line in iter(stderr.readline, ""):
-            if not line:
-                break
-            line_str = line.strip()
-            if line_str:
-                self._stderr_lines.append(line_str)
-
-    def get_stderr_summary(self, max_chars: int = 500) -> str:
-        full = "\n".join(self._stderr_lines).strip()
-        return full[:max_chars]
-
-    def get_accumulated_output(self) -> str:
-        return "\n".join(self._accumulated_messages).strip()
-
-    def read_events(self, timeout: float = 1.0) -> Generator[AgNormalizedEvent, None, None]:
-        while not self._closed or not self._queue.empty():
-            try:
-                event = self._queue.get(timeout=timeout)
-                yield event
-                if event.event_type in ("result", "error"):
-                    break
-            except queue.Empty:
-                if self._closed and self._queue.empty():
-                    break
+    def communicate(self) -> tuple[str, str]:
+        try:
+            self.stdout, self.stderr = self.process.communicate(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            self.timed_out = True
+            _kill_process_tree(self.process)
+            raise AgLaunchError("dispatch_timeout", f"agentapi did not return within {self.timeout:g}s; process tree terminated")
+        return self.stdout or "", self.stderr or ""
 
     def terminate(self) -> None:
-        try:
-            self.process.terminate()
-            self.process.wait(timeout=2.0)
-        except Exception:
-            try:
-                self.process.kill()
-            except Exception:
-                pass
+        if self.process.poll() is None:
+            _kill_process_tree(self.process)
+
+
+class _ConversationHandle:
+    """Process-like handle so execution_runner._stopped() can prove the provider stopped."""
+
+    def __init__(self, runner: "OfficialAgCliRunner", prepared: PreparedLaunch):
+        self._runner = runner
+        self._prepared = prepared
+        self.pid = prepared.pid
+
+    def poll(self):
+        state = self._prepared._target
+        if not state.get("conversation_id") or state.get("status") in TERMINAL_STATUSES:
+            return 0
+        return None
+
+    def wait(self, timeout=None):
+        deadline = self._runner._clock() + (timeout if timeout is not None else 0)
+        while self.poll() is None:
+            self._runner._refresh_terminal_state(self._prepared)
+            if self.poll() is not None:
+                break
+            if self._runner._clock() >= deadline:
+                raise subprocess.TimeoutExpired("antigravity conversation", timeout)
+            self._runner._sleep(min(1.0, self._runner.poll_interval_seconds))
+        return 0
 
 
 class OfficialAgCliRunner:
-    """Official Antigravity CLI adapter with strict Fail-Closed Auth Guard."""
+    """Language-server-backed Antigravity adapter (mode ``cli``)."""
 
-    def __init__(
-        self,
-        executable_resolver: Callable[..., Any] | None = None,
-        auth_verifier: Callable[[], str] | None = None,
-        default_mode: str = "cli",
-    ):
-        self._resolve_executable = executable_resolver or resolve_ag_cli_executable
-        self._verify_auth = auth_verifier or verify_auth_identity
+    def __init__(self, executable_resolver: Callable[..., Any] | None = None,
+                 auth_verifier: Callable[[], str] | None = None, default_mode: str = "cli", *,
+                 discover: Callable[..., LanguageServerEndpoint] | None = None,
+                 client_factory: Callable[..., AgLanguageServerClient] | None = None,
+                 popen: Callable[..., Any] = subprocess.Popen,
+                 poll_interval_seconds: float = 2.0, agentapi_timeout_seconds: float = 60.0,
+                 permission_stall_seconds: float = 90.0, cancel_reconcile_seconds: float = 30.0,
+                 manager_home: str | None = None, clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep, kill_tree: Callable[[Any], None] = _kill_process_tree):
+        self._resolve_executable = executable_resolver
+        self._verify_auth = auth_verifier
         self.default_mode = default_mode
+        self._discover = discover or discover_language_server
+        self._client_factory = client_factory or AgLanguageServerClient
+        self._popen = popen
+        self.poll_interval_seconds = poll_interval_seconds
+        self.agentapi_timeout_seconds = agentapi_timeout_seconds
+        self.permission_stall_seconds = permission_stall_seconds
+        self.cancel_reconcile_seconds = cancel_reconcile_seconds
+        self._manager_home = manager_home
+        self._clock = clock
+        self._sleep = sleep
+        self._kill_tree = kill_tree
 
-    def _get_resolved_executable(self) -> tuple[str, list[str]]:
-        res = self._resolve_executable()
-        if isinstance(res, tuple):
-            return res[0], list(res[1])
-        return str(res), []
+    # ------------------------------------------------------------------ helpers
+    def _launcher_argv(self, endpoint: LanguageServerEndpoint) -> list[str]:
+        if self._resolve_executable is not None:
+            resolved = self._resolve_executable()
+            if isinstance(resolved, tuple):
+                return [str(resolved[0]), *list(resolved[1])]
+            return [str(resolved)]
+        if endpoint.executable and Path(endpoint.executable).is_file():
+            return [endpoint.executable, "agentapi"]
+        executable, prefix = resolve_ag_cli_executable()
+        return [executable, *prefix]
+
+    def _state(self, prepared: PreparedLaunch) -> dict[str, Any]:
+        return prepared._target
+
+    def _persist(self, prepared: PreparedLaunch, **fields: Any) -> None:
+        state = self._state(prepared)
+        state.update(fields)
+        try:
+            write_run_state(state, self._manager_home)
+        except Exception:
+            # Local readback state must never break the live run.
+            pass
+
+    def _client(self, prepared: PreparedLaunch) -> AgLanguageServerClient:
+        client = getattr(prepared, "_ls_client", None)
+        if client is None:
+            client = self._client_factory(prepared._endpoint, timeout=prepared._request.timeout_seconds)
+            prepared._ls_client = client
+        return client
+
+    # ------------------------------------------------------------------ READY handshake
+    def ready_probe(self, client: AgLanguageServerClient, request: LaunchRequest) -> dict[str, Any]:
+        """Raise AgLaunchError unless AG is provably ready for a new task; return readiness evidence."""
+        try:
+            client.get_status()
+        except AgLsError as exc:
+            raise AgLaunchError("ls_unreachable", exc.detail) from exc
+        try:
+            user_status = client.get_user_status()
+        except AgLsError as exc:
+            classification = "auth_unavailable" if exc.classification == "rpc_unauthenticated" else "ls_unreachable"
+            raise AgLaunchError(classification, exc.detail) from exc
+        status = user_status.get("userStatus") if isinstance(user_status, dict) else None
+        email = (status or {}).get("email") if isinstance(status, dict) else None
+        if not email:
+            raise AgLaunchError("auth_unavailable", "GetUserStatus carries no signed-in account; the IDE is not logged in")
+        try:
+            buckets = _bucket_records(client.retrieve_user_quota_summary())
+        except AgLsError as exc:
+            raise AgLaunchError("quota_unverified", exc.detail) from exc
+        model = map_agentapi_model(request.model)
+        # agentapi models are Gemini models: gate on the Gemini group when it is
+        # identifiable, otherwise on every bucket.
+        gemini = [b for b in buckets if "gemini" in (b["bucket_id"] + " " + b["group"]).lower()]
+        relevant = gemini or buckets
+        exhausted = [b for b in relevant if b["remaining_fraction"] <= 0.0]
+        if exhausted and len(exhausted) == len(relevant):
+            until = max((b["reset_time"] for b in exhausted if b.get("reset_time")), default=None)
+            raise AgLaunchError("quota_exhausted", f"unavailable_until={until}; buckets={[b['bucket_id'] for b in exhausted]}")
+        # Quota readability does not imply dispatchability: an IDE-hosted
+        # language server answers every status RPC while its projects store
+        # stays uninitialized, which is exactly what `agentapi
+        # new-conversation` needs (it always sends a project_env_config).
+        # Refuse to launch rather than spawn a CLI that cannot create a
+        # conversation -- read-only probe, no model turn.
+        route = probe_dispatch_route(client)
+        if not route["available"]:
+            raise AgLaunchError("dispatch_route_unavailable", f"{route['reason']}: {route.get('detail') or ''}")
+        configs = ((status or {}).get("cascadeModelConfigData") or {}).get("clientModelConfigs") if isinstance(status, dict) else None
+        model_ids = [c.get("modelId") for c in (configs or []) if isinstance(c, dict)]
+        return {
+            "ready": True, "account_email": email, "plan_name": ((status.get("planStatus") or {}).get("planInfo") or {}).get("planName"),
+            "agentapi_model": model, "models_available": len(model_ids), "dispatch_route": route,
+            "quota_min_remaining_fraction": min(b["remaining_fraction"] for b in relevant),
+            "quota_degraded": bool(exhausted), "observed_at": utc_now(),
+        }
 
     def prepare(self, request: LaunchRequest) -> PreparedLaunch:
-        # Strict Fail-Closed Auth Verification
-        identity = self._verify_auth()
-
-        executable, prefix_args = self._get_resolved_executable()
+        cwd = Path(str(request.working_directory or ""))
+        if not str(request.working_directory or "").strip() or not cwd.is_absolute() or not cwd.is_dir():
+            raise AgLaunchError("invalid_request", "working_directory must be an existing absolute directory")
+        if self._verify_auth is not None:
+            self._verify_auth()
+        try:
+            endpoint = self._discover(timeout=request.timeout_seconds)
+        except AgLsError as exc:
+            raise AgLaunchError(exc.classification, exc.detail) from exc
+        client = self._client_factory(endpoint, timeout=request.timeout_seconds)
+        readiness = self.ready_probe(client, request)
+        argv = self._launcher_argv(endpoint)
+        if not Path(argv[0]).is_file():
+            raise AgLaunchError("route_unavailable", f"agentapi entrypoint not found: {argv[0]}")
         mode = request.force_mode if request.force_mode in ("cli", "headless") else self.default_mode
         thread_id = f"ag-{mode}-{uuid.uuid4().hex[:12]}"
         now = utc_now()
-
-        home = _safe_home()
-        session_path = str(home / ".gemini" / "antigravity-ide" / "brain" / thread_id / "transcript.jsonl")
-
-        return PreparedLaunch(
-            thread_id=thread_id,
-            session_path=session_path,
-            pid=0,  # Assigned on process spawn in start()
-            process_creation_identity=f"{mode}-{identity}",
-            prepared_at=now,
-            mode=mode,
-            _target=None,
-            _request=request,
+        state = {
+            "thread_id": thread_id, "provider": "antigravity", "status": "prepared", "conversation_id": None,
+            "project_id": request.project_id, "working_directory": str(cwd), "model": request.model,
+            "agentapi_model": readiness["agentapi_model"], "language_server": endpoint.evidence(),
+            "readiness": readiness, "prepared_at": now, "started_at": None, "last_event": "provider_prepared",
+            "last_event_at": now, "step_cursor": 0, "transcript_path": None, "termination_reason": None,
+            "cancel_evidence": None, "workspace_check": None,
+        }
+        prepared = PreparedLaunch(
+            thread_id=thread_id, session_path=None, pid=endpoint.pid,
+            process_creation_identity=endpoint.creation_identity or f"ls-pid-{endpoint.pid}",
+            prepared_at=now, mode=mode, _target=state, _request=request,
         )
+        prepared._endpoint = endpoint
+        prepared._ls_client = client
+        prepared._argv = argv
+        prepared._process = _ConversationHandle(self, prepared)
+        prepared._cli = None
+        prepared._closed = False
+        self._persist(prepared)
+        return prepared
 
+    # ------------------------------------------------------------------ dispatch
     def start(self, prepared: PreparedLaunch, prompt: str) -> RunningLaunch:
         if prepared._started:
             raise AgLaunchError("already_started", "Prepared Antigravity launch was already started")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise AgLaunchError("invalid_request", "prompt must be non-empty")
         prepared._started = True
-
-        executable, prefix_args = self._get_resolved_executable()
-        req = prepared._request
-
-        args = [executable]
-        args.extend(prefix_args)
-
-        # Build CLI arguments based on target tool
-        basename = Path(executable).name.lower()
-        is_agentapi = "agentapi" in basename or (prefix_args and "agentapi" in prefix_args)
-        if is_agentapi:
-            if not req.project_id:
-                raise AgLaunchError(
-                    "missing_project_id",
-                    "AgentAPI requires project_id when resolving the working-directory project environment",
-                )
-            args.extend(["new-conversation"])
-            if req.model:
-                args.extend(["--model", req.model])
-            args.extend(["--title", f"adm-{prepared.thread_id}"])
-            args.append(prompt)
-        else:
-            # Generic agy / gemini CLI syntax
-            args.extend(["-p", prompt, "--output-format", "stream-json", "--approval-mode", "plan"])
-            if req.model:
-                args.extend(["--model", req.model])
-
-        # Sanitize environment to prevent secondary billing / external API key injection
-        env = sanitize_ag_environment(os.environ)
-        if is_agentapi:
-            env["ANTIGRAVITY_PROJECT_ID"] = req.project_id
-
-        # Enforce sandbox and working directory
-        cwd = req.working_directory if Path(req.working_directory).is_dir() else None
-
+        request = prepared._request
+        endpoint: LanguageServerEndpoint = prepared._endpoint
+        client = self._client(prepared)
         try:
-            proc = subprocess.Popen(
-                args,
-                cwd=cwd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            )
+            client.get_status()
+        except AgLsError as exc:
+            raise AgLaunchError("ls_unreachable", f"language server went away before dispatch: {exc.detail}") from exc
+
+        state = self._state(prepared)
+        argv = [*prepared._argv, "new-conversation"]
+        if state.get("agentapi_model"):
+            argv.append(f"--model={state['agentapi_model']}")
+        argv.append(f"--title=adm-{prepared.thread_id}")
+        argv.append(prompt)
+        env = sanitize_ag_environment(os.environ)
+        env.update(endpoint.agentapi_env())
+        project_override = os.environ.get(PROJECT_ID_ENV)
+        if project_override:
+            env["ANTIGRAVITY_PROJECT_ID"] = project_override
+        try:
+            process = self._popen(argv, cwd=str(request.working_directory), env=env, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
         except Exception as exc:
-            raise AgLaunchError("spawn_failed", f"Failed to spawn Antigravity CLI binary: {exc}")
+            raise AgLaunchError("spawn_failed", f"failed to spawn agentapi: {exc}") from exc
+        cli = AgCliProcess(process, timeout=self.agentapi_timeout_seconds)
+        prepared._cli = cli
+        state["agentapi_pid"] = getattr(process, "pid", None)
+        try:
+            stdout, stderr = cli.communicate()
+        except AgLaunchError as exc:
+            self._persist(prepared, status="failed", last_event="dispatch_timeout", last_event_at=utc_now(), termination_reason=exc.classification)
+            raise
+        try:
+            conversation_id = parse_new_conversation_output(stdout)
+        except AgLaunchError as exc:
+            detail = exc.detail
+            if stderr.strip():
+                detail = f"{detail} | stderr: {redact(stderr.strip())[:MAX_EVIDENCE_CHARS]}"
+            self._persist(prepared, status="failed", last_event="dispatch_failed", last_event_at=utc_now(), termination_reason=exc.classification)
+            raise AgLaunchError(exc.classification, detail) from exc
+        transcript = str(_safe_home() / ".gemini" / "antigravity-ide" / "brain" / conversation_id / ".system_generated" / "logs" / "transcript.jsonl")
+        started_at = utc_now()
+        prepared.session_path = transcript
+        self._persist(prepared, conversation_id=conversation_id, status="running", started_at=started_at,
+                      last_event="turn_started", last_event_at=started_at, transcript_path=transcript)
+        self._verify_workspace(prepared, conversation_id)
+        running = RunningLaunch(prepared=prepared, turn_id=f"turn-{uuid.uuid4().hex[:8]}", started_at=started_at)
+        running._started_clock = self._clock()
+        return running
 
-        prepared.pid = proc.pid
-        cli_proc = AgCliProcess(proc, timeout=req.turn_timeout_seconds)
-        prepared._target = cli_proc
-        prepared._process = proc
-
-        turn_id = f"turn-{uuid.uuid4().hex[:8]}"
-        now = utc_now()
-        return RunningLaunch(prepared=prepared, turn_id=turn_id, started_at=now)
+    def _verify_workspace(self, prepared: PreparedLaunch, conversation_id: str) -> None:
+        """STOP (cancel + fail) when the provider's workspace provably differs from ADM's working directory."""
+        request = prepared._request
+        client = self._client(prepared)
+        uris: list[str] = []
+        try:
+            metadata = client.get_conversation_metadata(conversation_id).get("metadata") or {}
+            raw = metadata.get("workspaceUris") or []
+            uris = [str(item) for item in raw if isinstance(item, str)]
+            for item in metadata.get("workspaces") or []:
+                if isinstance(item, dict):
+                    for key in ("uri", "workspaceUri", "path"):
+                        if isinstance(item.get(key), str):
+                            uris.append(item[key])
+        except AgLsError as exc:
+            self._persist(prepared, workspace_check={"result": "unverified", "reason": exc.classification})
+            return
+        if not uris:
+            verdict = {"result": "unverified", "reason": "provider exposes no workspace for the conversation"}
+            self._persist(prepared, workspace_check=verdict)
+            if request.sandbox != "read-only":
+                self.cancel(prepared, reason="workspace_unverified")
+                raise AgLaunchError("workspace_unverified", "cannot prove the Antigravity workspace matches the ADM working directory; write task refused")
+            return
+        matches = [uri for uri in uris if _same_path(_uri_path(uri), str(request.working_directory))]
+        if matches:
+            self._persist(prepared, workspace_check={"result": "verified", "workspace": matches[0]})
+            return
+        self._persist(prepared, workspace_check={"result": "mismatch", "workspaces": uris[:5]})
+        self.cancel(prepared, reason="workspace_mismatch")
+        raise AgLaunchError("workspace_mismatch", f"Antigravity conversation workspace {uris[:3]} != {request.working_directory}")
 
     def set_heartbeat(self, running: RunningLaunch, callback: Callable[[str], Any]) -> None:
         running._heartbeat = callback
 
-    def wait(self, running: RunningLaunch) -> LaunchOutcome:
-        cli_proc: AgCliProcess = running.prepared._target
-        timeout = running.prepared._request.turn_timeout_seconds
-        deadline = time.time() + timeout
+    # ------------------------------------------------------------------ observation
+    def _observe(self, prepared: PreparedLaunch, *, fetch_steps: bool) -> tuple[dict | None, list | None, list | None]:
+        client = self._client(prepared)
+        conversation_id = self._state(prepared)["conversation_id"]
+        summaries = client.get_all_cascade_trajectories().get("trajectorySummaries") or {}
+        summary = summaries.get(conversation_id) if isinstance(summaries, dict) else None
+        steps = metadatas = None
+        if fetch_steps:
+            steps = client.get_cascade_trajectory_steps(conversation_id).get("steps")
+            if not isinstance(steps, list):
+                raise AgLaunchError("malformed_provider_state", "GetCascadeTrajectorySteps.steps is not a list")
+            try:
+                metadatas = client.get_cascade_trajectory_executor_metadatas(conversation_id).get("executorMetadata") or []
+            except AgLsError:
+                metadatas = []
+        return summary, steps, metadatas
 
-        final_response = ""
-        stats: dict[str, Any] = {}
-        status = "completed"
-        failure_kind = None
-        failure_msg = None
-
+    def _refresh_terminal_state(self, prepared: PreparedLaunch) -> None:
+        state = self._state(prepared)
+        if not state.get("conversation_id") or state.get("status") in TERMINAL_STATUSES:
+            return
         try:
-            while time.time() < deadline:
-                if running._cancelled:
-                    cli_proc.terminate()
-                    status = "interrupted"
-                    failure_kind = "cancelled"
-                    failure_msg = "Execution was cancelled by runner"
+            summary, steps, metadatas = self._observe(prepared, fetch_steps=True)
+        except (AgLsError, AgLaunchError):
+            return
+        verdict = classify_run(summary, steps, metadatas, seconds_since_start=float("inf"))
+        if verdict["state"] in ("completed", "failed", "interrupted"):
+            self._persist(prepared, status=verdict["state"], termination_reason=verdict["termination_reason"],
+                          last_event="turn_terminal", last_event_at=utc_now())
+
+    def wait(self, running: RunningLaunch) -> LaunchOutcome:
+        prepared = running.prepared
+        state = self._state(prepared)
+        request = prepared._request
+        started = getattr(running, "_started_clock", None)
+        if started is None:
+            started = self._clock()
+        deadline = started + request.turn_timeout_seconds
+        last_step_count = -1
+        waiting_since: float | None = None
+        consecutive_failures = 0
+        verdict: dict[str, Any] | None = None
+        cancel_evidence = None
+
+        def outcome(status: str, classification: str | None, detail: str | None, response: str | None, extra: dict | None = None) -> LaunchOutcome:
+            stats = {
+                "conversation_id": state.get("conversation_id"), "provider_run_ref": f"antigravity:conversation:{state.get('conversation_id')}",
+                "language_server_pid": state.get("language_server", {}).get("pid"), "steps_observed": max(last_step_count, 0),
+                "termination_reason": (verdict or {}).get("termination_reason"), "transcript_path": state.get("transcript_path"),
+                "workspace_check": state.get("workspace_check"), "cancel_evidence": cancel_evidence or state.get("cancel_evidence"),
+            }
+            if extra:
+                stats.update(extra)
+            self._persist(prepared, status=status if status != "interrupted" else ("cancelled" if classification == "cancelled" else "interrupted"),
+                          last_event="turn_terminal", last_event_at=utc_now(), termination_reason=classification or stats["termination_reason"])
+            return LaunchOutcome(status=status, thread_id=prepared.thread_id, turn_id=running.turn_id, completed_at=utc_now(),
+                                 failure_classification=classification, failure_detail=detail, response_text=response or None, stats=stats)
+
+        while True:
+            if running._cancelled:
+                cancel_evidence = self.cancel(prepared, reason="cancelled_by_runner")
+                return outcome("interrupted", "cancelled", "Execution was cancelled by runner", None)
+            now = self._clock()
+            if now >= deadline:
+                cancel_evidence = self.cancel(prepared, reason="turn_timeout")
+                return outcome("failed", "turn_timeout", f"Antigravity turn exceeded timeout of {request.turn_timeout_seconds:g} seconds; conversation stopped", None)
+            try:
+                summary, _, _ = self._observe(prepared, fetch_steps=False)
+                step_count = int((summary or {}).get("stepCount") or 0)
+                fetch = step_count != last_step_count or (summary or {}).get("status") not in RUN_STATUS_ACTIVE
+                steps = metadatas = None
+                if fetch:
+                    _, steps, metadatas = self._observe(prepared, fetch_steps=True)
+                consecutive_failures = 0
+            except (AgLsError, AgLaunchError) as exc:
+                consecutive_failures += 1
+                if isinstance(exc, AgLaunchError) and exc.classification == "malformed_provider_state":
+                    cancel_evidence = self.cancel(prepared, reason="malformed_provider_state")
+                    return outcome("failed", "malformed_provider_state", exc.detail, None)
+                if consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES:
+                    classification = "ls_unreachable" if getattr(exc, "classification", "") in ("ls_unreachable", "malformed_response") else "provider_state_unavailable"
+                    return outcome("failed", classification, f"language server stopped answering while the conversation was running: {getattr(exc, 'detail', exc)}", None)
+                self._sleep(self.poll_interval_seconds)
+                continue
+            if steps is not None:
+                if step_count > last_step_count:
+                    if running._heartbeat and last_step_count >= 0:
+                        running._heartbeat("provider_event")
+                    last_step_count = step_count
+                    self._persist(prepared, step_cursor=step_count, last_event="provider_event", last_event_at=utc_now())
+                elif running._heartbeat:
+                    running._heartbeat("provider_heartbeat")
+                verdict = classify_run(summary, steps, metadatas, seconds_since_start=now - started)
+            elif running._heartbeat:
+                running._heartbeat("provider_heartbeat")
+            if verdict is not None:
+                if verdict["state"] == "completed":
+                    return outcome("completed", None, None, verdict["response_text"])
+                if verdict["state"] == "failed":
+                    return outcome("failed", verdict["classification"], verdict["detail"], verdict["response_text"] or None)
+                if verdict["state"] == "interrupted":
+                    return outcome("interrupted", verdict["classification"], verdict["detail"], verdict["response_text"] or None)
+                if verdict["state"] == "waiting_permission":
+                    waiting_since = waiting_since if waiting_since is not None else now
+                    if now - waiting_since >= self.permission_stall_seconds:
+                        cancel_evidence = self.cancel(prepared, reason="permission_stall")
+                        return outcome("failed", "permission_stall", f"provider waited on a permission/question for {self.permission_stall_seconds:g}s without a headless answer; conversation stopped", verdict["response_text"] or None)
+                else:
+                    waiting_since = None
+            self._sleep(self.poll_interval_seconds)
+
+    # ------------------------------------------------------------------ cancellation
+    def cancel(self, handle: PreparedLaunch | RunningLaunch, reason: str = "cancelled") -> dict[str, Any]:
+        """Stop the conversation, kill the CLI tree, reconcile with the server, persist evidence."""
+        prepared = handle.prepared if isinstance(handle, RunningLaunch) else handle
+        state = self._state(prepared)
+        evidence: dict[str, Any] = {"reason": reason, "requested_at": utc_now(), "rpc": {}, "cli_process_killed": False,
+                                    "confirmed": False, "final_run_status": None, "confirmed_at": None}
+        cli = getattr(prepared, "_cli", None)
+        if cli is not None and cli.process.poll() is None:
+            self._kill_tree(cli.process)
+            evidence["cli_process_killed"] = True
+        conversation_id = state.get("conversation_id")
+        if conversation_id:
+            client = self._client(prepared)
+            body = {"cascadeId": conversation_id, "conversationId": conversation_id}
+            for rpc in ("CancelCascadeInvocation", "ForceStopCascadeTree"):
+                try:
+                    client.call(rpc, body)
+                    evidence["rpc"][rpc] = "ok"
+                except AgLsError as exc:
+                    evidence["rpc"][rpc] = exc.classification
+            deadline = self._clock() + self.cancel_reconcile_seconds
+            while True:
+                try:
+                    summaries = client.get_all_cascade_trajectories().get("trajectorySummaries") or {}
+                    status = (summaries.get(conversation_id) or {}).get("status") if isinstance(summaries, dict) else None
+                except AgLsError as exc:
+                    status = f"unobservable:{exc.classification}"
+                evidence["final_run_status"] = status
+                if status is None or status == RUN_STATUS_IDLE or (isinstance(status, str) and status.startswith("unobservable")):
+                    evidence["confirmed"] = status == RUN_STATUS_IDLE or status is None
+                    evidence["confirmed_at"] = utc_now()
                     break
-
-                for event in cli_proc.read_events(timeout=min(1.0, max(0.1, deadline - time.time()))):
-                    if running._heartbeat:
-                        progress = event.event_type in ("tool_call", "tool_result", "message", "thought")
-                        running._heartbeat("provider_event" if progress else "provider_heartbeat")
-
-                    if event.event_type == "result":
-                        final_response = str(event.payload.get("response", ""))
-                        stats = event.payload.get("stats", {})
-                        return LaunchOutcome(
-                            status="completed",
-                            thread_id=running.prepared.thread_id,
-                            turn_id=running.turn_id,
-                            completed_at=utc_now(),
-                            response_text=final_response,
-                            stats=stats,
-                        )
-                    if event.event_type == "error":
-                        return LaunchOutcome(
-                            status="failed",
-                            thread_id=running.prepared.thread_id,
-                            turn_id=running.turn_id,
-                            completed_at=utc_now(),
-                            failure_classification=event.payload.get("code") or "provider_error",
-                            failure_detail=str(event.payload.get("error")),
-                        )
-
-                if cli_proc.process.poll() is not None:
-                    # Process exited
-                    if cli_proc.process.returncode != 0:
-                        status = "failed"
-                        failure_kind = f"exit_code_{cli_proc.process.returncode}"
-                        stderr_sum = cli_proc.get_stderr_summary()
-                        failure_msg = f"Antigravity CLI process exited with code {cli_proc.process.returncode}"
-                        if stderr_sum:
-                            failure_msg += f": {stderr_sum}"
-                    else:
-                        # Process exited 0; if no explicit result event was found, collect accumulated output
-                        if not final_response:
-                            final_response = cli_proc.get_accumulated_output()
+                if self._clock() >= deadline:
                     break
+                self._sleep(min(1.0, self.poll_interval_seconds))
+        else:
+            evidence["confirmed"] = True
+            evidence["confirmed_at"] = utc_now()
+        state["cancel_evidence"] = evidence
+        if state.get("status") not in TERMINAL_STATUSES:
+            self._persist(prepared, status="cancelled" if evidence["confirmed"] else "interrupted", last_event="cancelled",
+                          last_event_at=utc_now(), termination_reason=reason)
+        else:
+            self._persist(prepared)
+        return evidence
 
-            if time.time() >= deadline:
-                cli_proc.terminate()
-                status = "failed"
-                failure_kind = "turn_timeout"
-                failure_msg = f"Antigravity turn exceeded timeout of {timeout} seconds"
+    def close(self, handle: PreparedLaunch | RunningLaunch) -> None:
+        prepared = handle.prepared if isinstance(handle, RunningLaunch) else handle
+        if prepared is None or getattr(prepared, "_closed", False):
+            return
+        try:
+            state = self._state(prepared)
+            if state.get("conversation_id") and state.get("status") not in TERMINAL_STATUSES:
+                self.cancel(prepared, reason="closed_while_running")
+            cli = getattr(prepared, "_cli", None)
+            if cli is not None:
+                cli.terminate()
+        finally:
+            prepared._closed = True
 
-        except Exception as exc:
-            status = "failed"
-            failure_kind = "cli_exception"
-            failure_msg = str(exc)
-
-        return LaunchOutcome(
-            status=status,
-            thread_id=running.prepared.thread_id,
-            turn_id=running.turn_id,
-            completed_at=utc_now(),
-            failure_classification=failure_kind,
-            failure_detail=failure_msg,
-            response_text=final_response or None,
-            stats=stats or None,
-        )
-
-    def close(self, prepared: PreparedLaunch) -> None:
-        proc: AgCliProcess | None = prepared._target
-        if proc and hasattr(proc, "terminate"):
-            proc.terminate()
+    # ------------------------------------------------------------------ readback
+    def read_back(self, thread_id: str) -> dict[str, Any] | None:
+        """Durable run-state readback (restart-safe); see manager.ag_run_state."""
+        return read_run_state(thread_id, self._manager_home)
 
 
 # Backward compatibility aliases

@@ -9,6 +9,7 @@ from manager.ag_language_server import (
     LanguageServerEndpoint,
     availability_snapshot,
     discover_language_server,
+    probe_dispatch_route,
     executable_is_trusted,
     parse_command_line,
     parse_listening_ports,
@@ -234,17 +235,55 @@ class ClientTests(unittest.TestCase):
         self.assertEqual("malformed_response", ctx.exception.classification)
 
 
+class DispatchRouteProbeTests(unittest.TestCase):
+    """Readable quota and dispatchability are separate facts (live 2026-09-02)."""
+
+    def probe(self, response):
+        return probe_dispatch_route(AgLanguageServerClient(endpoint(), opener=FakeOpener({"ReadProject": response})))
+
+    def test_initialized_projects_store_is_available(self):
+        self.assertEqual({"available": True, "reason": None, "detail": None}, self.probe((200, {"project": {}})))
+
+    def test_uninitialized_projects_store_blocks_dispatch(self):
+        result = self.probe((500, {"code": "unknown", "message": "projects store not initialized (error ID: abc)"}))
+        self.assertEqual((False, "projects_store_unavailable"), (result["available"], result["reason"]))
+        self.assertIn("projects store not initialized", result["detail"])
+
+    def test_agentapi_project_env_error_also_blocks_dispatch(self):
+        result = self.probe((500, {"code": "unknown", "message": "projectsStore is nil, but projectEnvConfig was provided"}))
+        self.assertEqual((False, "projects_store_unavailable"), (result["available"], result["reason"]))
+
+    def test_argument_rejection_means_the_store_exists(self):
+        result = self.probe((400, {"code": "invalid_argument", "message": "project_id is required"}))
+        self.assertTrue(result["available"])
+
+    def test_transport_failure_blocks_dispatch_with_its_own_reason(self):
+        result = self.probe((403, {"message": "Invalid CSRF token"}))
+        self.assertEqual((False, "rpc_unauthenticated"), (result["available"], result["reason"]))
+
+
 class AvailabilitySnapshotTests(unittest.TestCase):
     def snapshot(self, responses=None, discover=None):
-        opener = FakeOpener(responses if responses is not None else {
-            "GetUserStatus": (200, user_status()), "RetrieveUserQuotaSummary": (200, quota_summary())})
+        base = {"GetUserStatus": (200, user_status()), "RetrieveUserQuotaSummary": (200, quota_summary()),
+                "ReadProject": (200, {"project": {}})}
+        if responses is not None:
+            base.update(responses)
+        opener = FakeOpener(base)
         return availability_snapshot(discover=discover or (lambda timeout: endpoint()),
                                      client_factory=lambda ep, timeout: AgLanguageServerClient(ep, opener=opener),
                                      now="2026-09-02T12:30:00Z")
 
+    def test_blocked_dispatch_route_degrades_without_touching_quota_truth(self):
+        snap = self.snapshot({"ReadProject": (500, {"code": "unknown", "message": "projects store not initialized"})})
+        self.assertEqual(("degraded", "projects_store_unavailable", False),
+                         (snap["status"], snap["reason"], snap["can_accept_new_task"]))
+        self.assertEqual((0.65, "official", "fresh"), (snap["remaining"], snap["confidence"], snap["freshness"]))
+        self.assertFalse(snap["dispatch_route"]["available"])
+
     def test_available_with_account_models_and_buckets(self):
         snap = self.snapshot()
         self.assertEqual("available", snap["status"])
+        self.assertTrue(snap["dispatch_route"]["available"])
         self.assertTrue(snap["can_accept_new_task"])
         self.assertEqual(("antigravity_language_server", "fresh", "official", None),
                          (snap["source"], snap["freshness"], snap["confidence"], snap["reason"]))

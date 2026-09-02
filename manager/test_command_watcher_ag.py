@@ -112,27 +112,55 @@ class TestProviderRuntimesRegistration(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestAgAvailabilityCheck(unittest.TestCase):
-    """Both proofs are required: fresh official SSOT quota AND a reachable local language server."""
+    """Three proofs are required: fresh official SSOT quota, a reachable local
+    language server, and a language server that can actually accept a new
+    conversation (readable quota is never treated as dispatchability)."""
 
-    def test_gate_passes_when_quota_reliable_and_language_server_reachable(self):
-        with patch("manager.command_watcher.provider_quota_reliable", return_value=True) as quota,              patch("manager.ag_language_server.discover_language_server", return_value=object()) as discover:
+    ROUTE_OK = {"available": True, "reason": None, "detail": None}
+    ROUTE_BLOCKED = {"available": False, "reason": "projects_store_unavailable",
+                     "detail": "ReadProject: HTTP 500 unknown: projects store not initialized"}
+
+    def test_gate_passes_when_quota_reliable_server_reachable_and_route_available(self):
+        with patch("manager.command_watcher.provider_quota_reliable", return_value=True) as quota, \
+             patch("manager.ag_language_server.discover_language_server", return_value=object()) as discover, \
+             patch("manager.ag_language_server.AgLanguageServerClient"), \
+             patch("manager.ag_language_server.probe_dispatch_route", return_value=self.ROUTE_OK) as route:
             result = ag_availability_check(service="svc")
         self.assertTrue(result)
         quota.assert_called_once_with("svc", "antigravity")
         discover.assert_called_once_with()
+        route.assert_called_once()
+
+    def test_gate_fails_closed_when_readable_quota_but_no_dispatch_route(self):
+        """Live 2026-09-02: an IDE-hosted language server answers every
+        status/quota RPC while its projects store stays uninitialized, so the
+        official `agentapi new-conversation` route cannot create a
+        conversation. Fresh quota must never be enough to dispatch."""
+        with patch("manager.command_watcher.provider_quota_reliable", return_value=True), \
+             patch("manager.ag_language_server.discover_language_server", return_value=object()), \
+             patch("manager.ag_language_server.AgLanguageServerClient"), \
+             patch("manager.ag_language_server.probe_dispatch_route", return_value=self.ROUTE_BLOCKED):
+            result = ag_availability_check(service="svc")
+        self.assertFalse(result)
 
     def test_gate_fails_closed_when_quota_unreliable_without_touching_transport(self):
-        with patch("manager.command_watcher.provider_quota_reliable", return_value=False),              patch("manager.ag_language_server.discover_language_server") as discover:
+        with patch("manager.command_watcher.provider_quota_reliable", return_value=False), \
+             patch("manager.ag_language_server.discover_language_server") as discover, \
+             patch("manager.ag_language_server.probe_dispatch_route") as route:
             result = ag_availability_check(service="svc")
         self.assertFalse(result)
         discover.assert_not_called()
+        route.assert_not_called()
 
     def test_gate_fails_closed_when_language_server_missing(self):
         from manager.ag_language_server import AgLsError
-        with patch("manager.command_watcher.provider_quota_reliable", return_value=True),              patch("manager.ag_language_server.discover_language_server",
-                   side_effect=AgLsError("ide_not_running", "no process")):
+        with patch("manager.command_watcher.provider_quota_reliable", return_value=True), \
+             patch("manager.ag_language_server.discover_language_server",
+                   side_effect=AgLsError("ide_not_running", "no process")), \
+             patch("manager.ag_language_server.probe_dispatch_route") as route:
             result = ag_availability_check(service="svc")
         self.assertFalse(result)
+        route.assert_not_called()
 
     def test_gate_fails_closed_on_unexpected_exception(self):
         with patch("manager.command_watcher.provider_quota_reliable", side_effect=RuntimeError("unexpected")):
@@ -143,7 +171,10 @@ class TestAgAvailabilityCheck(unittest.TestCase):
         """One provider's fresh quota must never satisfy AG's gate."""
         def by_provider(service, provider, account_id=None):
             return provider == "codex"
-        with patch("manager.command_watcher.provider_quota_reliable", side_effect=by_provider),              patch("manager.ag_language_server.discover_language_server", return_value=object()):
+        with patch("manager.command_watcher.provider_quota_reliable", side_effect=by_provider), \
+             patch("manager.ag_language_server.discover_language_server", return_value=object()), \
+             patch("manager.ag_language_server.AgLanguageServerClient"), \
+             patch("manager.ag_language_server.probe_dispatch_route", return_value=self.ROUTE_OK):
             self.assertFalse(ag_availability_check(service="svc"))
 
 

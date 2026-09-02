@@ -199,16 +199,21 @@ def ag_availability_check(service):
        (collectors/antigravity.py via the same `provider_quota_reliable()`
        rule Codex and Claude already use -- stale/unknown/exhausted rejects);
     2. the Antigravity IDE's language server -- the only execution transport
-       the adapter has (manager/ag_language_server.py) -- is running and
-       answering on this host right now.
+       the adapter has (manager/ag_language_server.py) -- is running, answering
+       on this host right now, AND able to accept a new conversation
+       (`probe_dispatch_route`; read-only, consumes no model turn). Readable
+       quota alone is never treated as dispatchability: a live IDE-hosted
+       language server answers every status/quota RPC while its projects store
+       stays uninitialized, which the official `agentapi new-conversation`
+       route requires -- see docs/ANTIGRAVITY-PROVIDER.md.
     False on any failure, including unexpected exceptions.
     """
     try:
         if not provider_quota_reliable(service, "antigravity"):
             return False
-        from manager.ag_language_server import discover_language_server
-        discover_language_server()
-        return True
+        from manager.ag_language_server import AgLanguageServerClient, discover_language_server, probe_dispatch_route
+        endpoint = discover_language_server()
+        return bool(probe_dispatch_route(AgLanguageServerClient(endpoint))["available"])
     except Exception:
         return False
 
