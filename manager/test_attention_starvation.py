@@ -330,21 +330,25 @@ class DurableVisitRotationTests(unittest.TestCase):
                 claimed_at="2026-08-21T16:27:17Z", stale_at="2026-08-21T16:31:24Z", recovery_reason="some_reason"))
         return store
 
-    def _sweep(self, store, clock, cursor_path, first_seen, wall_gap):
+    def _sweep(self, store, clock, cursor_path, first_seen, wall_gap, reconcile_cost=30.0, recent=3, max_commands=4,
+               exits=None):
         # Each reconciliation of an attention record burns the whole
         # recent-sweep budget, so only the FIRST attention record of the
         # batch is ever processed per sweep -- the live shape.
         def reconcile(_store, _service, cmd, _claims, **_kw):
             first_seen.append(cmd["command_id"])
-            clock.advance(30.0)
+            clock.advance(reconcile_cost)
             return {"status": "attention", "execution_id": cmd["execution_id"], "recovery_reason": "some_reason"}
 
         with patch("manager.command_watcher.time", clock), \
-             patch("manager.command_watcher.RECENT_COMMANDS_PER_PROJECT", 3), \
+             patch("manager.command_watcher.RECENT_COMMANDS_PER_PROJECT", recent), \
+             patch("manager.command_watcher.MAX_COMMANDS_PER_POLL", max_commands), \
              patch("manager.command_watcher._reconcile_active", side_effect=reconcile), \
              patch("manager.command_watcher.launch_task", Mock(side_effect=AssertionError("no launch"))):
-            poll_once(store, object(), allowlist=frozenset(), claim_factory=lambda *_: MemoryClaimRegistry(),
-                      health_check=lambda: True, quota_check=lambda service: True, cursor_path=cursor_path)
+            results = poll_once(store, object(), allowlist=frozenset(), claim_factory=lambda *_: MemoryClaimRegistry(),
+                                health_check=lambda: True, quota_check=lambda service: True, cursor_path=cursor_path)
+        if exits is not None:
+            exits.append(len(results))
         clock.advance(60.0)
         clock.wall += wall_gap
 
@@ -364,21 +368,57 @@ class DurableVisitRotationTests(unittest.TestCase):
         cursor = load_phase1_cursor(cursor_path=cursor_path)
         self.assertEqual(6, cursor["per_project_attention_visits"]["p1"])
 
-    def test_visit_counter_persists_without_advancing_the_invocation_generation(self):
+    def test_visit_counter_persists_and_generation_only_ever_increases(self):
+        # Bounded delta review round 2: the visit save must advance the
+        # generation like every other save, so a delayed writer holding an
+        # older generation can never roll the file backward.
         cursor_path = tempfile.mktemp(suffix=".json")
         saved = save_phase1_cursor({"project_cursor": 1, "per_project_record_cursor": {"p1": 4},
                                     "per_project_attention_visits": {"p1": 2}, "generation": 10}, cursor_path=cursor_path)
         self.assertEqual(11, saved["generation"])
         again = save_phase1_cursor({**saved, "per_project_attention_visits": {"p1": 3}}, cursor_path=cursor_path,
-                                   expected_generation=11, advance_generation=False)
-        self.assertEqual(11, again["generation"])
+                                   expected_generation=11)
+        self.assertEqual(12, again["generation"])
         loaded = load_phase1_cursor(cursor_path=cursor_path)
         self.assertEqual({"p1": 3}, loaded["per_project_attention_visits"])
         self.assertEqual({"p1": 4}, loaded["per_project_record_cursor"])
+        self.assertEqual(12, loaded["generation"])
+        # A writer that lost the race (stale expected generation) is refused, never applied.
+        from manager.phase1_cursor import StaleCursorError
+        with self.assertRaises(StaleCursorError):
+            save_phase1_cursor({**saved, "per_project_attention_visits": {"p1": 99}}, cursor_path=cursor_path,
+                               expected_generation=11)
+        self.assertEqual({"p1": 3}, load_phase1_cursor(cursor_path=cursor_path)["per_project_attention_visits"])
         # Legacy cursor files without the field load cleanly.
         pathlib_path = __import__("pathlib").Path(cursor_path)
         pathlib_path.write_text(json.dumps({"project_cursor": 0, "per_project_record_cursor": {}, "generation": 3}), encoding="utf-8")
         self.assertEqual({}, load_phase1_cursor(cursor_path=cursor_path)["per_project_attention_visits"])
+
+    def test_visit_is_persisted_even_when_the_full_sweep_exits_on_its_deadline(self):
+        # Bounded delta review round 2 (high): the full sweep `return`s when
+        # the poll deadline passes mid-batch. That exit happens AFTER the
+        # recent sweep already decided this tick's rotation, so the visit
+        # must still be counted or next tick repeats the same rotation
+        # forever. Timing (40s poll deadline, 25s recent budget, 10s per
+        # reconciliation, 2-record recent window, 5 attention records,
+        # per-poll command cap lifted): recent sweep processes 2 (~23s), the
+        # full sweep hydrates before its 25s hydration deadline, processes
+        # the 3rd (~34s) and 4th (~44s), then crosses the 40s poll deadline
+        # before the 5th -> `return results` with 4 results.
+        clock = FakeClock()
+        store = self._attention_batch_store(clock, 5)
+        cursor_path = tempfile.mktemp(suffix=".json")
+        first_seen, exits = [], []
+        self._sweep(store, clock, cursor_path, first_seen, 120.0, reconcile_cost=10.0, recent=2, max_commands=10, exits=exits)
+        self.assertEqual([4], exits, "the sweep must have exited on the deadline `return` after 4 of 5 records")
+        self.assertEqual(1, load_phase1_cursor(cursor_path=cursor_path)["per_project_attention_visits"].get("p1"),
+                         "the visit must be durable even though the sweep exited on its deadline")
+        first_of_sweep_1 = first_seen[0]
+        self._sweep(store, clock, cursor_path, first_seen, 120.0, reconcile_cost=10.0, recent=2, max_commands=10, exits=exits)
+        self.assertEqual([4, 4], exits)
+        self.assertEqual(2, load_phase1_cursor(cursor_path=cursor_path)["per_project_attention_visits"].get("p1"))
+        self.assertNotEqual(first_of_sweep_1, first_seen[4],
+                            "rotation must advance across a deadline exit, not replay the same first record")
 
     def test_single_attention_record_does_not_consume_a_visit(self):
         clock = FakeClock()

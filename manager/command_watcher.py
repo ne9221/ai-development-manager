@@ -2212,76 +2212,88 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             attention_visited.add(project_id)
             attention_visits[project_id] = rotation + 1
         return rotation
-    for project_id in project_ids:
-        if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_hydration_deadline:
-            break
-        try:
-            commands = _enumerate_recent_commands(recent_store, project_id, deadline=recent_hydration_deadline)
-        except TaskError:
-            continue
-        _remember_batch(project_id, commands)
-        # Zero-remote-lookup nonterminal priority work (claimed/running/
-        # queued/attention) only -- terminal-recovery eligibility (which
-        # requires a real Execution lookup) is entirely deferred to the
-        # GLOBAL Phase 2c below. Uses the full `recent_deadline`, not the
-        # tightened `recent_hydration_deadline` -- already-hydrated active
-        # work is never held back by the terminal-recovery reservation.
-        for command in _prioritized_nonterminal_commands(commands, attention_rotation=_attention_rotation(project_id, commands)):
-            if (project_id, command["command_id"]) in just_promoted:
-                continue
-            if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
-                break
-            _run(project_id, command)
 
-    for project_id in project_ids:
-        if time.monotonic() >= hydration_deadline:
-            break
-        try:
-            commands = _enumerate_commands(discovery_store, project_id, deadline=hydration_deadline)
-        except TaskError:
-            # A project that has never had a single Command written to it
-            # yet has no COMMANDS Drive folder at all --
-            # list_records_bounded()/list_records() raise TaskError("Drive
-            # folder not found") for that completely normal case, not a
-            # real error; nothing here needs any per-project fallback
-            # beyond skipping this project's own command processing (Phase
-            # 1's waiting_quota sweep above is already independent of this
-            # loop entirely, unlike before this restructure).
-            continue
-        _remember_batch(project_id, commands)
-        for command in _prioritized_nonterminal_commands(commands, attention_rotation=_attention_rotation(project_id, commands)):
-            if (project_id, command["command_id"]) in just_promoted:
-                continue  # promoted this same tick -- launches on a later natural tick, not this one
-            if (project_id, command["command_id"]) in processed:
-                continue
-            if len(results) == MAX_COMMANDS_PER_POLL:
-                # Global command-processing budget reached. `break` (not
-                # `return`) only stops processing MORE commands for THIS
-                # project -- every later-rotated project's own command loop
-                # hits this same check on its first iteration and breaks
-                # immediately too (the shared `results` list is still full),
-                # so the total command-processing budget stays exactly as
-                # bounded as before this fix. Phase 1 above has already run
-                # to completion for every project regardless, so this can
-                # never again starve anyone's waiting_quota sweep the way
-                # the pre-fix combined single-pass loop did.
-                break
-            if time.monotonic() >= deadline:
-                return results
-            _run(project_id, command)
-
-    # Persist this tick's attention-visit advances against the generation the
-    # Phase-1 save just established (same invocation, so the generation is
-    # deliberately NOT advanced again). Skipped entirely when the Phase-1
-    # save itself failed the CAS -- another invocation owns the cursor.
-    if attention_visited and phase1_saved is not None:
+    def _persist_attention_visits():
+        # Runs on EVERY exit of the nonterminal sweeps below (normal
+        # completion, the full sweep's deadline `return`, MAX_COMMANDS
+        # break, or an exception) -- bounded round-robin only holds if a
+        # visit that already decided this tick's rotation is durably
+        # counted; a deadline exit that dropped it would restore the exact
+        # same rotation next tick (bounded delta review, round 2). Saves
+        # with the ordinary generation advance and the Phase-1 save's
+        # generation as CAS token, so it can never roll the file back to an
+        # older generation; skipped entirely when the Phase-1 save itself
+        # lost the CAS -- another invocation owns the cursor.
+        if not attention_visited or phase1_saved is None:
+            return
         cursor["per_project_attention_visits"] = attention_visits
         cursor["generation"] = phase1_saved["generation"]
         try:
-            save_phase1_cursor(cursor, cursor_path=cursor_path, expected_generation=phase1_saved["generation"],
-                               advance_generation=False)
+            save_phase1_cursor(cursor, cursor_path=cursor_path, expected_generation=phase1_saved["generation"])
         except Exception:
             pass
+
+    try:
+        for project_id in project_ids:
+            if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_hydration_deadline:
+                break
+            try:
+                commands = _enumerate_recent_commands(recent_store, project_id, deadline=recent_hydration_deadline)
+            except TaskError:
+                continue
+            _remember_batch(project_id, commands)
+            # Zero-remote-lookup nonterminal priority work (claimed/running/
+            # queued/attention) only -- terminal-recovery eligibility (which
+            # requires a real Execution lookup) is entirely deferred to the
+            # GLOBAL Phase 2c below. Uses the full `recent_deadline`, not the
+            # tightened `recent_hydration_deadline` -- already-hydrated active
+            # work is never held back by the terminal-recovery reservation.
+            for command in _prioritized_nonterminal_commands(commands, attention_rotation=_attention_rotation(project_id, commands)):
+                if (project_id, command["command_id"]) in just_promoted:
+                    continue
+                if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
+                    break
+                _run(project_id, command)
+
+        for project_id in project_ids:
+            if time.monotonic() >= hydration_deadline:
+                break
+            try:
+                commands = _enumerate_commands(discovery_store, project_id, deadline=hydration_deadline)
+            except TaskError:
+                # A project that has never had a single Command written to it
+                # yet has no COMMANDS Drive folder at all --
+                # list_records_bounded()/list_records() raise TaskError("Drive
+                # folder not found") for that completely normal case, not a
+                # real error; nothing here needs any per-project fallback
+                # beyond skipping this project's own command processing (Phase
+                # 1's waiting_quota sweep above is already independent of this
+                # loop entirely, unlike before this restructure).
+                continue
+            _remember_batch(project_id, commands)
+            for command in _prioritized_nonterminal_commands(commands, attention_rotation=_attention_rotation(project_id, commands)):
+                if (project_id, command["command_id"]) in just_promoted:
+                    continue  # promoted this same tick -- launches on a later natural tick, not this one
+                if (project_id, command["command_id"]) in processed:
+                    continue
+                if len(results) == MAX_COMMANDS_PER_POLL:
+                    # Global command-processing budget reached. `break` (not
+                    # `return`) only stops processing MORE commands for THIS
+                    # project -- every later-rotated project's own command loop
+                    # hits this same check on its first iteration and breaks
+                    # immediately too (the shared `results` list is still full),
+                    # so the total command-processing budget stays exactly as
+                    # bounded as before this fix. Phase 1 above has already run
+                    # to completion for every project regardless, so this can
+                    # never again starve anyone's waiting_quota sweep the way
+                    # the pre-fix combined single-pass loop did.
+                    break
+                if time.monotonic() >= deadline:
+                    return results
+                _run(project_id, command)
+    finally:
+        _persist_attention_visits()
+
 
     # Phase 2c: GLOBAL terminal-recovery classification -- only now, after
     # EVERY rotated project's nonterminal work (both sweeps) has already

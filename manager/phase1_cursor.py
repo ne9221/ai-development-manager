@@ -78,14 +78,14 @@ def load_phase1_cursor(manager_home=None, cursor_path=None):
         return _default_cursor()
 
 
-def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None, expected_generation=None,
-                       advance_generation=True):
+def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None, expected_generation=None):
     """Atomically persist Phase-1 cursor with optional CAS generation verification.
 
-    ``advance_generation=False`` re-persists the SAME actual-invocation
-    generation (used for the same tick's later per-project attention-visit
-    update, so one invocation still counts as exactly one generation);
-    the CAS check via ``expected_generation`` still applies.
+    ``generation`` is a strictly increasing write serial (every successful
+    save advances it by one), so a delayed writer can never roll the file
+    back to an older generation; ``expected_generation`` is the CAS token
+    a writer must present. One invocation may legitimately save twice
+    (Phase-1 cursor advance, then its attention-visit advances).
     """
     path = _resolve_cursor_path(manager_home=manager_home, cursor_path=cursor_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,7 +97,7 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None, expecte
                 f"Cursor generation mismatch: expected {expected_generation}, found {current.get('generation')}"
             )
 
-    new_generation = (cursor_data.get("generation") or 0) + (1 if advance_generation else 0)
+    new_generation = (cursor_data.get("generation") or 0) + 1
     project_cursor = int(cursor_data.get("project_cursor", 0))
     if project_cursor < 0:
         project_cursor = 0
