@@ -292,6 +292,34 @@ st.markdown("""
     .quota-compact-card .quota-number { font-size: 1.02rem; letter-spacing: -.02em; }
     .quota-compact-card .quota-meta { font-size: .77rem; line-height: 1.5; }
     .quiet-note { color: var(--adm-muted); font-size: .82rem; }
+    /* Quota entity cards: one identical card per real entity (Codex / Claude A / Claude B).
+       Two window rows (5H, 每週), a freshness state that is text first and color second,
+       and the last capture time -- warnings live inside the card, never as page banners. */
+    .qe-card { background: var(--adm-panel); border: 1px solid var(--adm-line); border-radius: 14px; padding: 14px 16px 12px; min-height: 178px; display: flex; flex-direction: column; gap: 8px; box-shadow: 0 6px 18px rgba(39,66,51,.05); }
+    .qe-card.qe-stale, .qe-card.qe-error { border-color: #d9b9a0; background: #fffaf5; }
+    .qe-card.qe-exhausted { border-color: #e2b8b8; }
+    .qe-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+    .qe-title { font-size: 1.05rem; font-weight: 750; letter-spacing: -.01em; }
+    .qe-state { font-size: .74rem; font-weight: 700; padding: 3px 9px; border-radius: 999px; white-space: nowrap; }
+    .qe-state-fresh { background: #e3f1ea; color: #1f5f45; }
+    .qe-state-stale { background: #f7e6cf; color: #7a4c0b; }
+    .qe-state-unknown { background: #e6e9ec; color: #43536b; }
+    .qe-state-error, .qe-state-exhausted { background: #f5dada; color: #7d2323; }
+    .qw-row { display: grid; grid-template-columns: 2.6rem 3.2rem 1fr; gap: 8px 10px; align-items: center; font-size: .84rem; }
+    .qw-label { color: var(--adm-muted); font-weight: 650; }
+    .qw-value { font-weight: 750; font-variant-numeric: tabular-nums; }
+    .qw-bar { display: block; height: 6px; border-radius: 999px; background: #e5ece7; overflow: hidden; }
+    .qw-bar i { display: block; height: 100%; border-radius: 999px; background: var(--adm-blue); }
+    .qe-stale .qw-bar i, .qe-unknown .qw-bar i { background: #bfc9c2; }
+    .qe-exhausted .qw-bar i { background: var(--adm-red); }
+    .qw-reset { grid-column: 2 / span 2; color: var(--adm-muted); font-size: .78rem; font-variant-numeric: tabular-nums; }
+    .qw-missing { color: var(--adm-muted); font-size: .8rem; }
+    .qe-foot { margin-top: auto; color: var(--adm-muted); font-size: .76rem; font-variant-numeric: tabular-nums; }
+    .qe-note { font-size: .8rem; color: #7a4c0b; background: #fbf1e2; border-radius: 8px; padding: 6px 9px; }
+    .qe-note.qe-note-error { color: #7d2323; background: #f9e7e7; }
+    .qe-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    @media (max-width: 1100px) { .qe-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 720px) { .qe-grid { grid-template-columns: 1fr; } }
     @media (max-width: 768px) { .block-container { padding: 1.25rem .9rem 3rem; } h1 { font-size: 1.8rem !important; } .hero-card { padding: 18px; } }
 </style>
 """, unsafe_allow_html=True)
@@ -589,23 +617,29 @@ def load_all_data(include_all_projects=False):
 # UI v3: the home screen is a small operational brief. Detail data stays on
 # explicit secondary routes so the first paint answers the operator's first
 # questions without turning the dashboard into a history table.
+# zh-TW information architecture: 總覽 (now) / 專案 / 任務 / 執行 (the real
+# Task -> Command -> Execution -> Session chain) / 配額 / 想法 (pre-admission
+# ideas, never tasks) / 系統健康 (watcher, scheduled tasks, runtime SHA,
+# provenance, recent records). Query keys stay English and stable for links.
 NAV_OVERVIEW = "總覽"
-NAV_PROJECTS = "Projects"
-NAV_TASKS = "Tasks"
-NAV_SESSIONS = "Sessions"
-NAV_HISTORY = "History"
-NAV_QUOTA = "Quota"
-NAV_LOGS = "Logs"
-NAV_OPTIONS = [NAV_OVERVIEW, NAV_PROJECTS, NAV_TASKS, NAV_SESSIONS, NAV_HISTORY, NAV_QUOTA, NAV_LOGS]
+NAV_PROJECTS = "專案"
+NAV_TASKS = "任務"
+NAV_EXECUTIONS = "執行"
+NAV_QUOTA = "配額"
+NAV_IDEAS = "想法"
+NAV_HEALTH = "系統健康"
+NAV_OPTIONS = [NAV_OVERVIEW, NAV_PROJECTS, NAV_TASKS, NAV_EXECUTIONS, NAV_QUOTA, NAV_IDEAS, NAV_HEALTH]
 NAV_QUERY_VALUES = {
     NAV_OVERVIEW: "overview",
     NAV_PROJECTS: "projects",
     NAV_TASKS: "tasks",
-    NAV_SESSIONS: "sessions",
-    NAV_HISTORY: "history",
+    NAV_EXECUTIONS: "executions",
     NAV_QUOTA: "quota",
-    NAV_LOGS: "logs",
+    NAV_IDEAS: "ideas",
+    NAV_HEALTH: "health",
 }
+# Older bookmarks keep working: sessions -> 執行, history/logs -> 系統健康.
+NAV_QUERY_ALIASES = {"sessions": "executions", "history": "health", "logs": "health"}
 
 
 def _ui_text(value, fallback="未知"):
@@ -649,77 +683,164 @@ def _ui_task_for_execution(execution, tasks):
                   and task.get("task_id") == execution.get("task_id")), {})
 
 
-def _ui_quota_status(card):
+def _ui_entity_title(card):
+    """Codex / Claude A / Claude B -- never a nameless provider aggregate."""
+    provider = str(card.provider or "").casefold()
+    base = "Codex" if provider == "codex" else "Claude" if provider == "claude" else _ui_text(card.display_name)
+    account = card.account_id
+    if not account:
+        return base
+    suffix = str(account)
+    if suffix.casefold().startswith("account-"):
+        suffix = suffix[len("account-"):]
+    return f"{base} {suffix.upper() if len(suffix) <= 2 else _ui_text(suffix)}"
+
+
+def _ui_quota_state(card):
+    """(code, label). Text first, colour second: STALE != 0, UNKNOWN != 0,
+    STALE != EXHAUSTED -- each is its own word."""
     if card.stale:
-        return "STALE"
-    if str(card.status or "unknown").casefold() != "ok":
-        return str(card.status or "UNKNOWN").upper()
+        return "stale", "過期"
+    status = str(card.status or "unknown").casefold()
+    if status == "error":
+        return "error", "來源錯誤"
     if card.five_hour_remaining_pct is None:
-        return "UNKNOWN"
-    return "OK"
+        return "unknown", "未知"
+    five = float(card.five_hour_remaining_pct)
+    weekly = float(card.weekly_remaining_pct) if card.has_weekly_window and card.weekly_remaining_pct is not None else None
+    if five <= 0 or (weekly is not None and weekly <= 0):
+        if card.effective_availability == "available_via_credits":
+            return "fresh", "額度用盡・可用點數"
+        return "exhausted", "已用盡"
+    return "fresh", "最新"
+
+
+def _ui_quota_status(card):
+    """Legacy uppercase code kept for existing callers/tests."""
+    code, _label = _ui_quota_state(card)
+    return {"fresh": "OK", "stale": "STALE", "error": "ERROR", "unknown": "UNKNOWN", "exhausted": "EXHAUSTED"}[code]
+
+
+def _ui_hours_text(hours):
+    if hours is None:
+        return None
+    total_minutes = max(0, int(round(float(hours) * 60)))
+    days, rem = divmod(total_minutes, 24 * 60)
+    hrs, mins = divmod(rem, 60)
+    if days:
+        return f"{days} 天 {hrs} 小時後"
+    if hrs:
+        return f"{hrs} 小時 {mins} 分後"
+    return f"{mins} 分後"
+
+
+def _ui_reset_text(resets_at, hours_to_reset):
+    relative = _ui_hours_text(hours_to_reset)
+    absolute = _ui_time(resets_at) if resets_at else None
+    if relative and absolute and absolute != "未知":
+        return f"重置 {relative}（{absolute}）"
+    if absolute and absolute != "未知":
+        return f"重置 {absolute}"
+    if relative:
+        return f"重置 {relative}"
+    return "重置時間未知"
+
+
+def _ui_relative_time(value, now=None):
+    parsed = parse_time(value)
+    if not parsed:
+        return "未知"
+    now = now or datetime.now(timezone.utc)
+    seconds = max(0, int((now - parsed).total_seconds()))
+    if seconds < 60:
+        rel = "剛剛"
+    elif seconds < 3600:
+        rel = f"{seconds // 60} 分鐘前"
+    elif seconds < 86400:
+        rel = f"{seconds // 3600} 小時前"
+    else:
+        rel = f"{seconds // 86400} 天前"
+    return f"{rel}（{_ui_time(value)}）"
+
+
+def _ui_refresh_note(card):
+    """Why the entry did not refresh, in the user's words; None when nothing to say."""
+    error = card.refresh_error
+    if not error:
+        return None, None
+    lowered = str(error).casefold()
+    when = _ui_relative_time(card.refresh_attempted_at) if card.refresh_attempted_at else "剛才"
+    if "access token missing" in lowered or "credentials file" in lowered or "oauth section" in lowered:
+        return f"需要重新登入此帳號（憑證檔沒有有效 token）。上次嘗試：{when}", "error"
+    if "401" in lowered or "authstale" in lowered:
+        return f"登入已失效，需要重新登入。上次嘗試：{when}", "error"
+    if "ratelimited" in lowered or "rate limited" in lowered:
+        return f"採集被限流，稍後會自動重試。上次嘗試：{when}", "warn"
+    return f"上次更新失敗：{_ui_text(error)}。上次嘗試：{when}", "warn"
+
+
+def _ui_window_row(label, pct, resets_at, hours_to_reset):
+    if pct is None:
+        value, width = "未知", 0
+    else:
+        width = max(0.0, min(100.0, float(pct)))
+        value = f"{width:.0f}%"
+    return (f'<div class="qw-row"><span class="qw-label">{label}</span>'
+            f'<span class="qw-value">{value}</span>'
+            f'<span class="qw-bar" aria-hidden="true"><i style="width:{width:.0f}%"></i></span>'
+            f'<span class="qw-reset">{_ui_reset_text(resets_at, hours_to_reset)}</span></div>')
+
+
+def _quota_entity_card_html(card):
+    code, label = _ui_quota_state(card)
+    rows = [_ui_window_row("5H", card.five_hour_remaining_pct, card.five_hour_resets_at, card.five_hour_hours_to_reset)]
+    if card.has_weekly_window:
+        rows.append(_ui_window_row("每週", card.weekly_remaining_pct, card.weekly_resets_at, card.weekly_hours_to_reset))
+    else:
+        rows.append('<div class="qw-missing">每週窗口：來源未提供</div>')
+    note, note_kind = _ui_refresh_note(card)
+    note_html = f'<div class="qe-note{" qe-note-error" if note_kind == "error" else ""}">{note}</div>' if note else ""
+    if code == "stale" and not note:
+        note_html = '<div class="qe-note">資料已過期，不能用來派工；等待下一次成功更新。</div>'
+    credits = ""
+    if card.extra_credits_available is True:
+        credits = f'<div class="qw-missing">額外點數：{_ui_text(card.formatted_extra_credits)}</div>'
+    return (f'<div class="qe-card qe-{code}" role="group" aria-label="{_ui_entity_title(card)} 配額">'
+            f'<div class="qe-head"><span class="qe-title">{_ui_entity_title(card)}</span>'
+            f'<span class="qe-state qe-state-{code}">{label}</span></div>'
+            + "".join(rows) + credits + note_html +
+            f'<div class="qe-foot">最後更新 {_ui_relative_time(card.last_updated)}</div></div>')
+
+
+def _render_quota_entities(accounts):
+    if not accounts:
+        st.info("目前沒有可驗證的配額資料。")
+        return
+    st.markdown('<div class="qe-grid">' + "".join(_quota_entity_card_html(card) for card in accounts) + "</div>",
+                unsafe_allow_html=True)
+
+
+def _render_quota_page_alert(brief):
+    """The ONE page-level quota warning: only when nothing at all is dispatchable."""
+    if brief is None or not getattr(brief, "accounts", None):
+        return
+    if brief.recommended_provider is None:
+        st.warning(f"目前沒有可派工的 AI 帳戶：{_ui_text(brief.reason, '所有帳戶資料過期、未知或已用盡')}")
 
 
 def _render_quota_card(card, compact=False):
+    """One entity card; `compact` keeps the same card and only skips the technical details."""
+    st.markdown(_quota_entity_card_html(card), unsafe_allow_html=True)
     if compact:
-        status = _ui_quota_status(card)
-        if status == "STALE":
-            st.warning(f"{_ui_text(card.card_title)} 配額資料 STALE（已過期）；不可用於派工判定。")
-        elif status == "ERROR":
-            st.error(f"{_ui_text(card.card_title)} 配額來源回報 ERROR；不可用於派工判定。")
-        elif status == "UNKNOWN" or card.five_hour_remaining_pct is None:
-            st.info(f"{_ui_text(card.card_title)} 尚未回報百分比：UNKNOWN（不等於 0%）。")
-        usable = status == "OK" and card.five_hour_remaining_pct is not None
-        outer = max(0.0, min(100.0, float(card.five_hour_remaining_pct))) if usable else 0.0
-        weekly = (card.has_weekly_window and card.weekly_remaining_pct is not None
-                  and status == "OK")
-        inner = max(0.0, min(100.0, float(card.weekly_remaining_pct))) if weekly else 0.0
-        ring_class = "double" if weekly else "single"
-        ring_style = f"--outer:{outer};--inner:{inner}" if weekly else f"--pct:{outer}"
-        center = f"{inner:.0f}%<br>每週" if weekly else (f"{outer:.0f}%<br>5H" if usable else status)
-        weekly_line = (f"<br>每週 {card.formatted_weekly_remaining} · {card.weekly_resets_at or card.formatted_weekly_countdown or '未知'}"
-                       if weekly else "")
-        freshness = "過期" if card.stale else "最新"
-        freshness_class = "state-attention" if card.stale or status != "OK" else "state-running"
-        st.markdown(f"""
-        <div class="quota-compact-card">
-          <div class="quota-ring {ring_class}" style="{ring_style}">
-            <div class="quota-ring-inner"><span>{center}</span></div>
-          </div>
-          <div>
-            <div class="quota-number">{_ui_text(card.card_title)}</div>
-            <div class="quota-meta"><b>5H {card.formatted_five_hour_remaining if usable else status}</b> · {card.five_hour_resets_at or card.formatted_five_hour_countdown or '未知'}{weekly_line}<br>
-              <span class="{freshness_class}">{freshness}</span>
-            </div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
         return
-
-    st.markdown(f"### {_ui_text(card.card_title)}")
-    status = _ui_quota_status(card)
-    st.caption(f"狀態：{status}  |  Provider：{_ui_text(card.provider)}")
-    if status == "STALE":
-        st.warning(f"{_ui_text(card.card_title)} 配額資料為 STALE，不能用目前數字做派工判定。")
-    elif status == "ERROR":
-        st.error(f"{_ui_text(card.card_title)} 配額來源回報 ERROR，不能用目前數字做派工判定。")
-    elif status == "UNKNOWN" or card.five_hour_remaining_pct is None:
-        st.info("尚未回報百分比：UNKNOWN（不等於 0%）")
-    else:
-        st.progress(max(0.0, min(1.0, float(card.five_hour_remaining_pct) / 100.0)))
-        st.write(f"五小時剩餘：**{card.formatted_five_hour_remaining}**")
-
-    st.write(f"重置：`{card.formatted_five_hour_countdown or '未知'}`")
-    if card.has_weekly_window:
-        st.write(f"每週剩餘：**{card.formatted_weekly_remaining}**，重置 `{card.formatted_weekly_countdown}`")
-    if not compact:
-        st.caption(f"來源：`{_ui_text(card.source)}`，可信度：`{_ui_text(card.confidence)}`")
-        st.caption(f"最後更新：`{_ui_text(card.last_updated)}`")
-        st.caption(f"重置時間：`{card.five_hour_resets_at or '未知'}`")
-        if card.extra_credits_available is not None:
-            st.write(f"額外額度：`{_ui_text(card.formatted_extra_credits)}`")
-        st.write(f"實際可用性：`{_ui_text(card.formatted_effective_availability)}`")
+    with st.expander(f"{_ui_entity_title(card)} 技術詳情", expanded=False):
+        st.caption(f"來源：`{_ui_text(card.source)}`　可信度：`{_ui_text(card.confidence)}`　狀態碼：`{_ui_quota_status(card)}`")
+        st.caption(f"最後更新（原始）：`{_ui_text(card.last_updated)}`　5H 重置（原始）：`{_ui_text(card.five_hour_resets_at)}`　每週重置（原始）：`{_ui_text(card.weekly_resets_at)}`")
+        st.caption(f"實際可用性：`{_ui_text(card.formatted_effective_availability)}`")
         if card.warning_reason:
-            st.caption(f"提示：{_ui_text(card.warning_reason)}")
+            st.caption(f"風險說明：{_ui_text(card.warning_reason)}")
+        if card.refresh_error:
+            st.caption(f"上次更新錯誤（原始）：`{_ui_text(card.refresh_error)}`　嘗試時間：`{_ui_text(card.refresh_attempted_at)}`")
 
 
 def _render_execution_snapshot(data):
@@ -831,7 +952,7 @@ def _render_overview(data):
         current_task = next((task for task in tasks if task.get("task_id") == queued[0].get("task_id")), {})
 
     if active:
-        headline = "工作中"
+        headline = "執行中"
         headline_detail = f"{_ui_text(current_task.get('title') or active[0].get('task_id'))} 正由 {_ui_text(active[0].get('provider'))} 執行"
         next_action = current_task.get("next_action") or active[0].get("last_provider_event") or "等待下一個 provider 事件"
     elif has_attention:
@@ -839,8 +960,8 @@ def _render_overview(data):
         headline_detail = "有執行紀錄需要人工確認，系統沒有把它算成正常工作中"
         next_action = "先查看異常，再決定是否重試或調整下一步"
     elif queued:
-        headline = "等待接單"
-        headline_detail = "已有任務或 request，但尚未證實 provider 正在執行"
+        headline = "排隊中"
+        headline_detail = "已有任務或 request 在佇列，但尚未證實 provider 正在執行"
         next_action = current_task.get("next_action") or "查看任務佇列與可用配額"
     else:
         headline = "目前閒置"
@@ -925,14 +1046,9 @@ def _render_overview(data):
             st.warning(f"{_ui_text(task.get('title') or task.get('task_id'))}：任務 {_ui_state(task.get('status'))}，下一步 {_ui_text(task.get('next_action'))}。")
 
     st.header("配額與重置")
-    accounts = brief.accounts if brief else []
-    if not accounts:
-        st.info("目前沒有可驗證的 provider account 配額資料。")
-    else:
-        quota_cols = st.columns(min(len(accounts), 3))
-        for index, card in enumerate(accounts):
-            with quota_cols[index % len(quota_cols)]:
-                _render_quota_card(card, compact=True)
+    _render_quota_page_alert(brief)
+    _render_quota_entities(brief.accounts if brief else [])
+    _render_sync_status_line(data)
     _render_task_detail(data)
     if data.get("warnings"):
         with st.expander(f"資料警告（{len(data['warnings'])}）", expanded=False):
@@ -943,8 +1059,8 @@ def _render_overview(data):
 def _render_projects(data):
     projects = data.get("projects", [])
     tasks = data.get("all_tasks", [])
-    st.title("Projects")
-    st.caption("專案是下鑽入口，首頁只保留目前工作的摘要。")
+    st.title("專案")
+    st.caption("每個專案的里程碑、進度、目前任務與阻塞；首頁只保留目前工作的摘要。")
     if not projects:
         st.info("目前沒有可驗證的專案資料。")
         return
@@ -960,8 +1076,8 @@ def _render_projects(data):
 
 def _render_tasks(data):
     tasks = data.get("all_tasks", [])
-    st.title("Tasks")
-    st.caption("只看需要下鑽的任務明細；首頁不承擔歷史 backlog。")
+    st.title("任務")
+    st.caption("待處理／進行中／等待驗收／已完成的任務明細；首頁不承擔歷史 backlog。")
     if not tasks:
         st.info("目前沒有可驗證的任務資料。")
         return
@@ -974,34 +1090,67 @@ def _render_tasks(data):
         """, unsafe_allow_html=True)
 
 
-def _render_sessions(data):
+def _render_sync_status_line(data):
+    """Last GitHub / Drive / runtime sync facts, one line, human words."""
+    evidence = read_provenance_evidence_file() or {}
+    running = str(evidence.get("running_sha") or "")[:7] or "未知"
+    consistent = bool(evidence.get("running_sha")) and evidence.get("running_sha") == evidence.get("tested_sha") == evidence.get("activated_sha")
+    captured = _ui_relative_time(evidence.get("captured_at")) if evidence.get("captured_at") else "未知"
+    read_status = data.get("read_status") or {}
+    drive_ok = all((value[0] if isinstance(value, tuple) else value) == READ_STATUS_OK for value in read_status.values()) if read_status else bool(data.get("success"))
+    st.caption(f"同步狀態：Drive 讀取 {'正常' if drive_ok else '部分失敗'}　·　Runtime {running}（{'TESTED／ACTIVATED／RUNNING 一致' if consistent else '版本一致性未證實'}，證據更新 {captured}）")
+
+
+def _render_executions(data):
     executions = data.get("all_executions", [])
     sessions = data.get("all_sessions", [])
-    st.title("Sessions")
-    st.caption("Provider session 只有在 canonical Execution 或 Session record 證實時才顯示。")
+    commands = {c.get("execution_id"): c for c in data.get("all_commands", []) if c.get("execution_id")}
+    tasks = data.get("all_tasks", [])
+    now = datetime.now(timezone.utc)
+    st.title("執行")
+    st.caption("真實執行鏈：Task → Command → Execution → Provider Session。只有真實 OS 進程與真實 Execution 才會顯示「執行中」。")
     rows = []
-    for execution in executions[:12]:
+    for execution in executions[:24]:
+        snapshot = execution.get("task_snapshot") or {}
+        command = commands.get(execution.get("execution_id")) or {}
+        evidence = execution.get("provider_evidence") or {}
+        terminal = execution.get("status") in TERMINAL_EXECUTION_STATUSES
+        if terminal:
+            state = _ui_state(execution.get("status"))
+        elif determine_execution_state(execution, now) == "running" and not is_execution_stale(execution, now):
+            state = "執行中"
+        elif is_execution_stale(execution, now):
+            state = "需要處理"
+        else:
+            state = _ui_state(execution.get("status"))
+        task = _ui_task_for_execution(execution, tasks)
         rows.append({
-            "狀態": _ui_state(execution.get("status")),
-            "Provider": execution.get("provider") or "未知",
-            "Account": execution.get("account_id") or "未知",
-            "Session": execution.get("provider_session_id") or execution.get("session_id") or "UNKNOWN",
-            "Task": execution.get("task_id") or "UNKNOWN",
-            "最後更新": _ui_time(_ui_record_time(execution)),
-        })
-    for session in sessions[:max(0, 12 - len(rows))]:
-        rows.append({
-            "狀態": _ui_state(session.get("status")), "Provider": session.get("provider") or "未知",
-            "Account": session.get("account_id") or "未知", "Session": session.get("provider_session_id") or session.get("session_id") or "UNKNOWN",
-            "Task": session.get("task_id") or "UNKNOWN", "最後更新": _ui_time(_ui_record_time(session)),
+            "狀態": state,
+            "任務": task.get("title") or execution.get("task_id") or "未知",
+            "Command": command.get("command_id") or "—",
+            "Execution": execution.get("execution_id") or "—",
+            "AI／帳戶": f"{execution.get('provider') or '未知'} / {execution.get('account_id') or '—'}",
+            "Session": execution.get("provider_session_id") or execution.get("session_id") or "—",
+            "分支／基準": f"{(snapshot.get('branch') or '—').replace('refs/heads/', '')} @ {str(snapshot.get('baseline_head') or '')[:7] or '—'}",
+            "主機／PID": f"{evidence.get('host') or '—'} / {evidence.get('pid') or '—'}",
+            "最近心跳": _ui_time(execution.get("heartbeat_at")) if execution.get("heartbeat_at") else "—",
+            "最後事件": execution.get("last_provider_event") or "—",
+            "結果": execution.get("terminal_reason") or ((execution.get("cleanup_evidence") or {}).get("provider_outcome")) or "—",
         })
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
-        st.info("目前沒有可驗證的 Session。")
+        st.info("目前沒有可驗證的 Execution。")
+    if sessions:
+        with st.expander(f"Provider Session（{len(sessions)}）", expanded=False):
+            st.dataframe(pd.DataFrame([{
+                "狀態": _ui_state(session.get("status")), "Provider": session.get("provider") or "未知",
+                "帳戶": session.get("account_id") or "—", "Session": session.get("provider_session_id") or session.get("session_id") or "—",
+                "Task": session.get("task_id") or "—", "最後更新": _ui_time(_ui_record_time(session)),
+            } for session in sessions[:24]]), use_container_width=True, hide_index=True)
 
 
-def _render_history(data):
+def _render_history(data, embedded=False):
     records = []
     for kind in ("all_tasks", "all_commands", "all_executions", "all_handoffs"):
         for record in data.get(kind, []):
@@ -1014,8 +1163,9 @@ def _render_history(data):
                 "排序": _ui_record_time(record),
             })
     records.sort(key=lambda row: row["排序"], reverse=True)
-    st.title("History")
-    st.caption("最近的 lifecycle activity。完整 raw record 僅在需要時查看。")
+    if not embedded:
+        st.title("紀錄")
+    st.caption("最近的 lifecycle 紀錄。原始 record 只在需要時展開查看。")
     if records:
         st.dataframe(pd.DataFrame([{key: row[key] for key in ("時間", "類型", "狀態", "Task", "事件")} for row in records[:24]]), use_container_width=True, hide_index=True)
     else:
@@ -1023,45 +1173,83 @@ def _render_history(data):
 
 
 def _render_quota(data):
-    st.title("Quota")
-    st.caption("依 provider contract 顯示。5H 與 weekly 只在來源真的提供時出現；UNKNOWN、STALE、ERROR 不會偽裝成 0%。")
-    accounts = getattr(data.get("daily_brief_vm"), "accounts", [])
+    brief = data.get("daily_brief_vm")
+    st.title("配額與重置")
+    st.caption("三個獨立實體：Codex、Claude A、Claude B。每張卡同時顯示 5H 與每週；UNKNOWN、STALE、已用盡各自是不同狀態，不會偽裝成 0%。")
+    _render_quota_page_alert(brief)
+    accounts = getattr(brief, "accounts", [])
     if not accounts:
-        st.info("目前沒有可驗證的 provider account 配額資料。")
+        st.info("目前沒有可驗證的配額資料。")
         return
     for card in accounts:
-        with st.container():
-            _render_quota_card(card)
-            st.markdown("---")
+        _render_quota_card(card)
+    hidden = getattr(brief, "hidden_legacy_accounts", [])
+    if hidden:
+        st.caption(f"已隱藏 {len(hidden)} 筆沒有帳號 ID 的舊版彙總紀錄（{'、'.join(hidden)}）；它們不參與派工，也不算第三個帳號。")
 
 
-def _render_logs(data):
-    st.title("Logs")
-    st.caption("以最近事件為主，避免首頁被 debug payload 淹沒。")
+def _render_ideas(data):
+    st.title("想法")
+    st.caption("想法在正式 admission 之前不是開發任務；這裡只讀取本機 ideas.json。")
+    home = os.environ.get("AI_MANAGER_HOME") or os.path.expanduser("~/.ai-development-manager")
+    try:
+        ideas = json.loads((Path(home) / "ideas.json").read_text(encoding="utf-8"))
+    except Exception:
+        ideas = []
+    if isinstance(ideas, dict):
+        ideas = ideas.get("ideas") or []
+    if not ideas:
+        st.info("目前沒有想法紀錄。新增想法後，需經 ADM admission 才會成為任務。")
+        return
+    for idea in ideas[:50]:
+        if not isinstance(idea, dict):
+            continue
+        st.markdown(f"""
+        <div class="glass-card"><div class="metric-label">{_ui_text(idea.get('status'), '未分類')} · {_ui_time(idea.get('created_at'))}</div>
+        <div class="hero-title">{_ui_text(idea.get('title') or idea.get('idea_id'))}</div>
+        <div class="hero-copy">{_ui_text(idea.get('summary') or idea.get('description'), '')}</div></div>
+        """, unsafe_allow_html=True)
+
+
+def _render_health(data):
+    st.title("系統健康")
+    st.caption("Watcher／Supervisor／Scheduled Task、Drive／GitHub 讀取、Runtime SHA 與 provenance 一致性，以及最近紀錄。")
+    now = datetime.now(timezone.utc)
+    active = _ui_active_executions(data.get("all_executions", []), now)
+    try:
+        watcher_vm, supervisor_vm, session_vm = load_infra_health(active if data.get("success") else None)
+        cols = st.columns(3)
+        labels = {"Online": "正常", "Offline": "離線", "Unknown": "未知"}
+        for col, vm in zip(cols, (watcher_vm, supervisor_vm, session_vm)):
+            with col:
+                st.markdown(f"""
+                <div class="glass-card"><div class="metric-label">{_ui_text(vm.name)}</div>
+                <div class="hero-title">{labels.get(vm.status_label, _ui_text(vm.status_label))}</div>
+                <div class="hero-copy">{_ui_text(vm.detail)}</div></div>
+                """, unsafe_allow_html=True)
+    except Exception as exc:
+        st.warning(f"無法評估 Watcher 或 Session Center 健康狀態：{_ui_text(exc)}")
+    evidence = read_provenance_evidence_file() or {}
+    st.subheader("Runtime 與 provenance")
+    if evidence:
+        consistent = evidence.get("running_sha") == evidence.get("tested_sha") == evidence.get("activated_sha")
+        st.markdown(f"- RUNNING `{_ui_text(evidence.get('running_sha'))}`\n- TESTED `{_ui_text(evidence.get('tested_sha'))}`\n- ACTIVATED `{_ui_text(evidence.get('activated_sha'))}`\n- 一致性：**{'一致' if consistent else '不一致'}**　證據更新：{_ui_relative_time(evidence.get('captured_at'))}\n- 位置：`{_ui_text(evidence.get('repository_path'))}`（{_ui_text(evidence.get('branch'))}）")
+    else:
+        st.info("找不到 provenance runtime 證據檔；無法證實 TESTED／ACTIVATED／RUNNING 一致。")
+    _render_sync_status_line(data)
     warnings = data.get("warnings", [])
     if warnings:
-        for warning in warnings[:12]:
-            st.warning(warning)
-    else:
-        st.info("目前沒有資料讀取警告。")
-    events = []
-    for kind in ("all_tasks", "all_commands", "all_executions", "all_handoffs"):
-        for record in data.get(kind, []):
-            events.append({
-                "時間": _ui_time(_ui_record_time(record)),
-                "類型": kind.removeprefix("all_").rstrip("s").upper(),
-                "Task": record.get("task_id") or "UNKNOWN",
-                "事件": record.get("last_provider_event") or record.get("current_progress") or record.get("next_action") or record.get("reason") or "UNKNOWN",
-                "排序": _ui_record_time(record),
-            })
-    events.sort(key=lambda row: row["排序"], reverse=True)
-    if events:
-        st.dataframe(pd.DataFrame([{key: row[key] for key in ("時間", "類型", "Task", "事件")} for row in events[:24]]), use_container_width=True, hide_index=True)
+        with st.expander(f"資料讀取警告（{len(warnings)}）", expanded=False):
+            for warning in warnings[:24]:
+                st.warning(warning)
+    st.subheader("最近紀錄")
+    _render_history(data, embedded=True)
 
 
 def _render_ui_v3():
     query = getattr(st, "query_params", {})
     requested = query.get("view") if hasattr(query, "get") else None
+    requested = NAV_QUERY_ALIASES.get(requested, requested)
     requested_route = next((label for label, value in NAV_QUERY_VALUES.items() if value == requested), NAV_OVERVIEW)
 
     with st.sidebar:
@@ -1086,14 +1274,14 @@ def _render_ui_v3():
         _render_projects(data)
     elif selected == NAV_TASKS:
         _render_tasks(data)
-    elif selected == NAV_SESSIONS:
-        _render_sessions(data)
-    elif selected == NAV_HISTORY:
-        _render_history(data)
+    elif selected == NAV_EXECUTIONS:
+        _render_executions(data)
     elif selected == NAV_QUOTA:
         _render_quota(data)
+    elif selected == NAV_IDEAS:
+        _render_ideas(data)
     else:
-        _render_logs(data)
+        _render_health(data)
 
 
 # Main App Loop
