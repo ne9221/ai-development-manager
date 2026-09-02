@@ -64,6 +64,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from manager.codex_launcher import process_creation_identity, process_identity_state
+from manager.manager_home import resolve_manager_home
 from manager.refresh_status import RefreshError, runtime_lock, write_atomic
 from manager.tasks import TaskError
 
@@ -118,7 +119,13 @@ class ConfigLockBusyError(TaskError):
 
 
 def _home() -> Path:
-    return Path(os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
+    """The one ADM runtime home contract; raises rather than guessing.
+
+    These locks guard concurrent Claude launches, so an unresolvable home
+    must fail closed: a lock written into whatever directory the process
+    started in protects nothing.
+    """
+    return resolve_manager_home()
 
 
 def default_state_path() -> Path:

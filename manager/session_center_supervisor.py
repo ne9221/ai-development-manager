@@ -53,6 +53,7 @@ from manager.refresh_status import RefreshError, runtime_lock, write_atomic
 from manager.tasks import DriveRecords, TaskError
 from manager.trusted_ingress import verify_trusted_ingress_admission
 from manager.production_guard import RuntimeGuardError, require_runtime_guard
+from manager.manager_home import ManagerHomeError, resolve_manager_home
 
 # A queued Command has no provider process or Execution to correlate. Following
 # one lets an abandoned historical queue item occupy :8765 indefinitely.
@@ -419,20 +420,26 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--wait-seconds", type=float, default=1800.0)
     args = parser.parse_args(argv)
+    # --manager-home is required, so it is authoritative here -- but it is
+    # still put through the one resolver rather than trusted raw, so a
+    # blank or checkout-relative -ManagerHome fails closed instead of
+    # writing runtime state into a git work tree.
     try:
-        require_runtime_guard(args.repository_path, args.manager_home)
+        manager_home = resolve_manager_home(args.manager_home)
+    except ManagerHomeError as exc:
+        print(json.dumps({"status": "blocked", "reason": str(exc).split(":", 1)[0]}))
+        return 1
+    try:
+        require_runtime_guard(args.repository_path, manager_home)
     except RuntimeGuardError as exc:
         print(json.dumps({"status": "blocked", "reason": exc.code}))
         return 1
 
     from manager.scheduler_provenance import finish, start
-    # --manager-home is a required argument: use it rather than re-reading
-    # the environment, whose old default was "." (the working directory).
-    manager_home = args.manager_home
     invocation = start(manager_home, "session_center_supervisor")
     try:
         with runtime_lock(lock_path_for(args.state_file)):
-            runtime = Path(args.manager_home) / "runtime"
+            runtime = manager_home / "runtime"
             watcher = maintain_command_watcher(
                 args.repository_path,
                 runtime / "watcher-maintenance.json",

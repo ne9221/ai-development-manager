@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from manager.manager_home import resolve_manager_home
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = "0.1.0"
@@ -395,7 +397,7 @@ def get_default_quota_history_store(path: Optional[Union[str, Path]] = None) -> 
     """Get standard file-backed QuotaHistoryStore in AI manager runtime folder."""
     if path is not None:
         return QuotaHistoryStore(path)
-    home = Path(os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
+    home = resolve_manager_home()
     return QuotaHistoryStore(home / "runtime" / "quota_history.json")
 
 

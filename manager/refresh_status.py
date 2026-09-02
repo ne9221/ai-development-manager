@@ -18,6 +18,7 @@ from collectors.claude_oauth import (
 )
 from collectors.codex import collect as collect_codex
 from collectors.publish_drive import build_service, sync_drive
+from manager.manager_home import ManagerHomeError, resolve_manager_home
 from manager.quota_reader import read_drive_status, validate_status
 
 
@@ -352,7 +353,7 @@ def discover_claude_accounts(home_path=None):
     """Discover enabled Claude accounts from claude_accounts.json in config dir,
     and merge with any explicit CLAUDE_STATUSLINE_PAYLOADS environment variable overrides.
     Returns {account_id: payload_path}."""
-    home = Path(home_path or os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
+    home = resolve_manager_home(home_path)
     registry_path = home / "config" / "claude_accounts.json"
     accounts_map = {}
     if registry_path.is_file():
@@ -383,7 +384,7 @@ def discover_claude_config_dirs(home_path=None):
     collectors.claude_oauth.read_access_token's own default. Never reads or
     returns any credential contents itself, only the directory path the
     OAuth collector should look in."""
-    home = Path(home_path or os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
+    home = resolve_manager_home(home_path)
     registry_path = home / "config" / "claude_accounts.json"
     config_dirs = {}
     if registry_path.is_file():
@@ -398,7 +399,15 @@ def discover_claude_config_dirs(home_path=None):
 
 
 def main():
-    home = Path(os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
+    # Fail closed before touching disk: with no resolvable home there is
+    # nowhere legitimate to write refresh.log, status.json or refresh.lock,
+    # and the pre-fix spelling would have used the working directory.
+    try:
+        home = resolve_manager_home()
+    except ManagerHomeError as exc:
+        print(json.dumps({"status": "blocked", "reason": str(exc).split(":", 1)[0]}),
+              file=sys.stderr)
+        return 1
     log_path = home / "logs" / "refresh.log"
     try:
         from manager.production_guard import RuntimeGuardError, require_runtime_guard

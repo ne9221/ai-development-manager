@@ -10,6 +10,7 @@ from pathlib import Path
 from collectors.publish_drive import FOLDER_ID, FILE_NAME, build_service
 from jsonschema import Draft202012Validator, FormatChecker
 from manager.acceptance_gate import apply_controlled_unavailability
+from manager.manager_home import ManagerHomeError, resolve_manager_home
 
 
 EXPECTED_PROVIDERS = {
@@ -69,23 +70,38 @@ def read_drive_status(service=None, folder_id=FOLDER_ID, schema_path=None, valid
         # or the MCP adapter can create. Applied after validate_status()
         # above (the real fetched document must itself validate cleanly) so
         # this can never mask a real schema problem in the actual SSOT.
-        return apply_controlled_unavailability(document, os.environ.get("AI_MANAGER_HOME"))
+        return apply_controlled_unavailability(document, _gate_home())
     except QuotaReaderError:
         raise
     except Exception as exc:
         raise QuotaReaderError(f"Drive status read failed: {exc}") from exc
 
 
+def _gate_home():
+    """The manager home for the local acceptance gate, or None.
+
+    The gate is a local test affordance that may append to an audit log, so
+    the home it is handed must come from the one canonical resolver rather
+    than a second spelling of the fallback. An unresolvable home makes the
+    gate a no-op -- exactly what an unset AI_MANAGER_HOME already did --
+    because a controlled-acceptance feature must never break a real quota
+    read.
+    """
+    try:
+        return resolve_manager_home()
+    except ManagerHomeError:
+        return None
+
 def read_local_status(path=None, schema_path=None, validate_document=True):
     """Read the refresh worker's local runtime status without inventing data."""
-    home = Path(os.environ.get("AI_MANAGER_HOME", Path.home() / ".ai-development-manager"))
-    path = Path(path) if path is not None else home / "runtime" / "status.json"
+    path = (Path(path) if path is not None
+            else resolve_manager_home() / "runtime" / "status.json")
     schema_path = schema_path or Path(__file__).parents[1] / "schema" / "status.schema.json"
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
         if validate_document:
             validate_status(document, schema_path)
-        return apply_controlled_unavailability(document, os.environ.get("AI_MANAGER_HOME"))
+        return apply_controlled_unavailability(document, _gate_home())
     except Exception as exc:
         raise QuotaReaderError(f"local runtime status read failed: {exc}") from exc
 
