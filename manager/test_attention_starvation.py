@@ -420,6 +420,30 @@ class DurableVisitRotationTests(unittest.TestCase):
         self.assertNotEqual(first_of_sweep_1, first_seen[4],
                             "rotation must advance across a deadline exit, not replay the same first record")
 
+    def test_one_invocation_saves_the_cursor_exactly_once_with_its_visit(self):
+        # Bounded delta review round 3: two advancing saves per invocation
+        # let an overlapping writer roll the generation back through the
+        # non-atomic CAS. One save per invocation carries the Phase-1
+        # advance AND the attention visit together.
+        from manager.phase1_cursor import save_phase1_cursor as real_save
+        clock = FakeClock()
+        store = self._attention_batch_store(clock, 5)
+        cursor_path = tempfile.mktemp(suffix=".json")
+        saves = []
+
+        def counting_save(cursor_data, **kwargs):
+            saves.append(deepcopy(cursor_data))
+            return real_save(cursor_data, **kwargs)
+
+        with patch("manager.phase1_cursor.save_phase1_cursor", side_effect=counting_save):
+            self._sweep(store, clock, cursor_path, [], 120.0, reconcile_cost=10.0, recent=2, max_commands=10)
+        self.assertEqual(1, len(saves), f"exactly one cursor save per invocation, got {len(saves)}")
+        self.assertEqual(1, saves[0]["per_project_attention_visits"]["p1"])
+        loaded = load_phase1_cursor(cursor_path=cursor_path)
+        self.assertEqual(1, loaded["generation"], "one invocation advances the generation exactly once")
+        self.assertEqual(1, loaded["per_project_attention_visits"]["p1"])
+        self.assertIn("p1", loaded["per_project_record_cursor"], "the Phase-1 record advance rides in the same save")
+
     def test_single_attention_record_does_not_consume_a_visit(self):
         clock = FakeClock()
         store = self._attention_batch_store(clock, 1)

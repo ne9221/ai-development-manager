@@ -2120,13 +2120,16 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         except TaskError:
             continue
 
-    # Advance project cursor to next project (0 -> 1 -> ... -> P-1 -> 0) and advance target project's record offset
+    # Advance project cursor to next project (0 -> 1 -> ... -> P-1 -> 0) and advance target project's record offset.
+    # Persisted ONCE per invocation, together with this tick's attention-visit
+    # advances, by _persist_cursor() in the `finally` below -- one save per
+    # invocation, so the actual-invocation generation stays exactly that
+    # (bounded delta review round 3: two advancing saves per invocation let
+    # an overlapping writer's second save be rolled back by the first
+    # writer's stale payload; a single save leaves only the pre-existing,
+    # out-of-scope equal-generation lost update of the non-atomic CAS).
     cursor["project_cursor"] = (proj_idx + 1) % num_projects
     cursor["per_project_record_cursor"][target_project_id] = record_offset + WAITING_QUOTA_DISCOVERY_WINDOW
-    try:
-        phase1_saved = save_phase1_cursor(cursor, cursor_path=cursor_path, expected_generation=current_gen)
-    except Exception:
-        phase1_saved = None
 
     # Phase 2a/2b: inspect a tiny modified-time-ordered batch from every
     # project before historical hydration, then a regular full bounded
@@ -2213,23 +2216,20 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             attention_visits[project_id] = rotation + 1
         return rotation
 
-    def _persist_attention_visits():
+    def _persist_cursor():
+        # The single durable cursor save of this invocation: Phase 1's
+        # project/record advance plus this tick's attention-visit advances.
         # Runs on EVERY exit of the nonterminal sweeps below (normal
         # completion, the full sweep's deadline `return`, MAX_COMMANDS
         # break, or an exception) -- bounded round-robin only holds if a
         # visit that already decided this tick's rotation is durably
         # counted; a deadline exit that dropped it would restore the exact
-        # same rotation next tick (bounded delta review, round 2). Saves
-        # with the ordinary generation advance and the Phase-1 save's
-        # generation as CAS token, so it can never roll the file back to an
-        # older generation; skipped entirely when the Phase-1 save itself
-        # lost the CAS -- another invocation owns the cursor.
-        if not attention_visited or phase1_saved is None:
-            return
+        # same rotation next tick (bounded delta review, round 2). CAS on
+        # the generation this invocation loaded; losing that CAS means
+        # another invocation owns the cursor and nothing is written.
         cursor["per_project_attention_visits"] = attention_visits
-        cursor["generation"] = phase1_saved["generation"]
         try:
-            save_phase1_cursor(cursor, cursor_path=cursor_path, expected_generation=phase1_saved["generation"])
+            save_phase1_cursor(cursor, cursor_path=cursor_path, expected_generation=current_gen)
         except Exception:
             pass
 
@@ -2292,7 +2292,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
                     return results
                 _run(project_id, command)
     finally:
-        _persist_attention_visits()
+        _persist_cursor()
 
 
     # Phase 2c: GLOBAL terminal-recovery classification -- only now, after

@@ -82,10 +82,10 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None, expecte
     """Atomically persist Phase-1 cursor with optional CAS generation verification.
 
     ``generation`` is a strictly increasing write serial (every successful
-    save advances it by one), so a delayed writer can never roll the file
-    back to an older generation; ``expected_generation`` is the CAS token
-    a writer must present. One invocation may legitimately save twice
-    (Phase-1 cursor advance, then its attention-visit advances).
+    save advances it by one); ``expected_generation`` is the CAS token a
+    writer must present. poll_once() saves exactly once per invocation
+    (its Phase-1 advance and its attention-visit advances together), so
+    the generation is also the actual-invocation count.
     """
     path = _resolve_cursor_path(manager_home=manager_home, cursor_path=cursor_path)
     path.parent.mkdir(parents=True, exist_ok=True)
