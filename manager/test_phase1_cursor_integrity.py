@@ -27,6 +27,8 @@ from unittest.mock import patch
 from manager.manager_home import ManagerHomeError
 from manager.phase1_cursor import (
     CREATE_ONLY,
+    INIT_MARKER_SUFFIX,
+    CursorRecoveryRequiredError,
     CursorContractError,
     CursorLockError,
     CursorMissingError,
@@ -346,7 +348,8 @@ class TestPathBinding(CursorTestCase):
         before = {p.name for p in self.runtime.iterdir()}
         self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
         created = {p.name for p in self.runtime.iterdir()} - before
-        self.assertTrue(created.issubset({"phase1-cursor.json", "phase1-cursor.json.lock"}),
+        self.assertTrue(created.issubset({"phase1-cursor.json", "phase1-cursor.json.lock",
+                                          "phase1-cursor.json" + INIT_MARKER_SUFFIX}),
                         f"unexpected files written: {created}")
 
 
@@ -443,39 +446,91 @@ class TestMutationRaces(CursorTestCase):
                          "generation must never decrease over the run")
 
     def test_14_write_is_atomic_and_leaves_no_debris(self):
+        """Two atomic renames now: take custody, then swap in the new file."""
         self.seed(10)
         replaced = []
         real_replace = os.replace
 
         def recording(src, dst):
-            replaced.append((src, dst))
-            # The target must still hold the OLD content at this instant.
-            self.assertEqual(10, json.loads(Path(dst).read_text(encoding="utf-8"))["generation"])
+            replaced.append((str(src), str(dst)))
             return real_replace(src, dst)
 
         with patch("manager.phase1_cursor.os.replace", side_effect=recording):
             self.save({"project_cursor": 1, "generation": 10}, expected_generation=10)
 
-        self.assertEqual(1, len(replaced), "exactly one atomic replace per save")
-        src, dst = replaced[0]
-        self.assertEqual(str(self.cursor_path), dst)
-        self.assertEqual(self.cursor_path.parent, Path(src).parent,
+        self.assertEqual(2, len(replaced),
+                         f"expected a custody rename and a swap, got {replaced}")
+        custody_src, custody_dst = replaced[0]
+        self.assertEqual(str(self.cursor_path), custody_src)
+        self.assertIn(".claim-", custody_dst)
+        swap_src, swap_dst = replaced[1]
+        self.assertEqual(str(self.cursor_path), swap_dst)
+        self.assertEqual(self.cursor_path.parent, Path(swap_src).parent,
                          "the temp file must be on the same filesystem as the target")
+        self.assertEqual(11, self.durable()["generation"])
         leftovers = [p.name for p in self.runtime.iterdir()
-                     if p.name not in ("phase1-cursor.json", "phase1-cursor.json.lock")]
-        self.assertEqual([], leftovers, f"temp debris left behind: {leftovers}")
+                     if p.name not in ("phase1-cursor.json", "phase1-cursor.json.lock",
+                                       "phase1-cursor.json" + INIT_MARKER_SUFFIX)]
+        self.assertEqual([], leftovers, f"temp or claim debris left behind: {leftovers}")
 
-    def test_14b_a_failed_replace_leaves_the_durable_cursor_untouched(self):
+    def test_14b_a_failed_swap_leaves_the_durable_cursor_untouched(self):
+        """The custody rename must be undone if the swap cannot complete."""
         self.seed(2458, records=dict(PROD_13_PROJECTS))
-        with patch("manager.phase1_cursor.os.replace", side_effect=OSError("disk full")):
+        before = self.cursor_path.read_bytes()
+        real_replace = os.replace
+
+        def fail_only_the_swap(src, dst):
+            # Fail writing the NEW file into place, the way a full disk
+            # would. The custody rename and the restore rename move an
+            # existing file and allocate nothing, so they still work --
+            # failing those too would be modelling a filesystem that has
+            # stopped working altogether, which is a different test.
+            if ".claim-" not in str(src) and str(dst) == str(self.cursor_path):
+                raise OSError("disk full")
+            return real_replace(src, dst)
+
+        with patch("manager.phase1_cursor.os.replace", side_effect=fail_only_the_swap):
             with self.assertRaises(OSError):
                 self.save({"project_cursor": 0, "generation": 2458}, expected_generation=2458)
-        after = self.durable()
-        self.assertEqual(2458, after["generation"])
-        self.assertEqual(13, len(after["per_project_record_cursor"]))
+        self.assertTrue(self.cursor_path.exists(),
+                        "the durable cursor was left in custody instead of restored")
+        self.assertEqual(before, self.cursor_path.read_bytes())
         leftovers = [p.name for p in self.runtime.iterdir()
-                     if p.name not in ("phase1-cursor.json", "phase1-cursor.json.lock")]
-        self.assertEqual([], leftovers, f"temp debris left behind: {leftovers}")
+                     if p.name not in ("phase1-cursor.json", "phase1-cursor.json.lock",
+                                       "phase1-cursor.json" + INIT_MARKER_SUFFIX)]
+        self.assertEqual([], leftovers, f"temp or claim debris left behind: {leftovers}")
+
+    def test_if_even_the_restore_fails_the_state_survives_under_the_claim(self):
+        """Worst case: the durable bytes are preserved and the runtime fails closed.
+
+        If the swap AND the restore both fail, the cursor is not at its
+        canonical name any more. That is bad, but it is the safe kind of
+        bad: the bytes still exist under the claim name for a human to
+        recover, and because the initialization marker is already
+        established the next tick refuses to reinitialise from zero
+        rather than inventing a generation-1 cursor.
+        """
+        self.seed(2458, records=dict(PROD_13_PROJECTS))
+        self.save({"project_cursor": 0, "generation": 2458}, expected_generation=2458)
+        before = self.cursor_path.read_bytes()
+        real_replace = os.replace
+
+        def fail_everything_but_custody(src, dst):
+            if ".claim-" in str(dst):
+                return real_replace(src, dst)
+            raise OSError("filesystem is gone")
+
+        with patch("manager.phase1_cursor.os.replace", side_effect=fail_everything_but_custody):
+            with self.assertRaises(OSError):
+                self.save({"project_cursor": 0, "generation": 2459}, expected_generation=2459)
+
+        claims = [p for p in self.runtime.iterdir() if ".claim-" in p.name]
+        self.assertEqual(1, len(claims), "the durable bytes were lost entirely")
+        self.assertEqual(before, claims[0].read_bytes(), "the preserved bytes are not the cursor")
+        self.assertFalse(self.cursor_path.exists())
+        # And the next tick refuses to start over.
+        with self.assertRaises(CursorRecoveryRequiredError):
+            self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
 
 
 class TestWatcherCaller(CursorTestCase):
@@ -529,6 +584,251 @@ class TestWatcherCaller(CursorTestCase):
             self.assertEqual(previous + 1, saved["generation"])
             previous = saved["generation"]
         self.assertEqual(51, self.durable()["generation"])
+
+
+class TestInitializationFence(CursorTestCase):
+    """Round 2, blocker 1: absence and never-having-existed are different.
+
+    An independent review deleted a generation-2459 cursor covering 13
+    projects and watched the next Watcher tick recreate it at generation 1
+    covering 1. CREATE_ONLY only knew "no file right now", which a
+    deletion satisfies just as well as a first boot does. The cursor file
+    cannot answer the question -- its own absence is the thing being
+    diagnosed -- so a separate durable marker does.
+    """
+
+    def marker(self):
+        return self.cursor_path.with_name(self.cursor_path.name + INIT_MARKER_SUFFIX)
+
+    def test_first_ever_initialization_still_works(self):
+        self.assertFalse(self.marker().exists())
+        saved = self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
+        self.assertEqual(1, saved["generation"])
+        self.assertTrue(self.marker().exists(), "creating a cursor must record that it happened")
+
+    def test_marker_survives_deletion_of_the_cursor(self):
+        self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
+        self.cursor_path.unlink()
+        self.assertTrue(self.marker().exists(),
+                        "deleting the cursor must not erase initialization history")
+
+    def test_create_only_refuses_after_prior_existence(self):
+        self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
+        self.save({"project_cursor": 1}, expected_generation=1)
+        self.assertEqual(2, self.durable()["generation"])
+        self.cursor_path.unlink()
+        with self.assertRaises(CursorRecoveryRequiredError):
+            self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
+        self.assertFalse(self.cursor_path.exists(),
+                         "a lost cursor must not be silently reinitialized")
+
+    def test_recovery_required_is_not_catchable_as_corruption_or_absence(self):
+        """Nothing may handle a lost cursor by handling something milder."""
+        self.assertFalse(issubclass(CursorRecoveryRequiredError, CursorStateError))
+        self.assertFalse(issubclass(CursorRecoveryRequiredError, CursorMissingError))
+        self.assertFalse(issubclass(CursorMissingError, CursorRecoveryRequiredError))
+
+    def test_an_existing_unmarked_cursor_is_fenced_on_its_first_write(self):
+        """The production cursor predates the marker; its next tick fences it."""
+        self.seed(2458, records=dict(PROD_13_PROJECTS))
+        self.assertFalse(self.marker().exists())
+        self.save({"project_cursor": 1}, expected_generation=2458)
+        self.assertTrue(self.marker().exists())
+        self.cursor_path.unlink()
+        with self.assertRaises(CursorRecoveryRequiredError):
+            self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
+
+    def test_marker_carries_no_cursor_authority(self):
+        """It is a fence, not a second cursor."""
+        self.save({"project_cursor": 5, "per_project_record_cursor": {"p": 9}},
+                  expected_generation=CREATE_ONLY)
+        body = json.loads(self.marker().read_text(encoding="utf-8"))
+        self.assertEqual({"schema", "initialized_at"}, set(body))
+        for forbidden in ("generation", "project_cursor", "per_project_record_cursor",
+                          "per_project_attention_visits"):
+            self.assertNotIn(forbidden, body)
+
+    def test_watcher_tick_does_not_rebuild_a_lost_cursor(self):
+        """The end-to-end scenario, through the real poll_once."""
+        from manager.command_watcher import poll_once
+        from manager.test_phase1_fair_scheduling import MemoryDiscoveryStore
+        from manager.trusted_ingress import TRUSTED_INGRESS_ORIGIN
+
+        def tasks(pid):
+            return [{"project_id": pid, "task_id": "%s-t%d" % (pid, i), "title": "T",
+                     "status": "queued", "recommended_provider": None,
+                     "quota_evidence": {"codex": {}},
+                     "source_context": {"origin": TRUSTED_INGRESS_ORIGIN}} for i in range(6)]
+
+        def tick():
+            store = MemoryDiscoveryStore({p: tasks(p) for p in ("p0", "p1")})
+            with patch("manager.command_watcher.read_drive_status",
+                       return_value={"codex": {"status": "available"}}):
+                poll_once(store, None, discovery_store=store,
+                          cursor_path=str(self.cursor_path), allowlist=frozenset())
+
+        tick()
+        tick()
+        self.assertEqual(2, self.durable()["generation"])
+        self.cursor_path.unlink()
+        tick()
+        self.assertFalse(self.cursor_path.exists(),
+                         "the Watcher recreated a lost cursor from zero")
+
+
+class TestSwapLinearization(CursorTestCase):
+    """Round 2, blocker 2: the last check must be adjacent to the swap.
+
+    An independent review let the target pass its final verification, then
+    installed generation 2500, and watched generation 2459 replace it.
+    Verifying and then replacing is not a compare-and-swap; the durable
+    file has to be taken into custody so the verification describes
+    something no competitor can still reach by name.
+    """
+
+    def test_competitor_landing_after_the_final_check_is_not_clobbered(self):
+        self.seed(2458, records=dict(PROD_13_PROJECTS))
+        import manager.phase1_cursor as pc
+        real = pc._fingerprint
+
+        def install_competitor(path):
+            fingerprint = real(path)
+            if ".claim-" in path.name:
+                self.seed(2500, records={"newer": 1})
+            return fingerprint
+
+        with patch.object(pc, "_fingerprint", side_effect=install_competitor):
+            with self.assertRaises(StaleCursorError):
+                self.save({"project_cursor": 0, "generation": 2458}, expected_generation=2458)
+        self.assertEqual(2500, self.durable()["generation"],
+                         "the newer writer's state was destroyed")
+
+    def test_competitor_landing_just_before_the_swap_is_not_clobbered(self):
+        self.seed(2458, records=dict(PROD_13_PROJECTS))
+        import manager.phase1_cursor as pc
+        real = pc._write_temp
+
+        def install_competitor(path, payload):
+            self.seed(2500, records={"newer": 1})
+            return real(path, payload)
+
+        with patch.object(pc, "_write_temp", side_effect=install_competitor):
+            with self.assertRaises(StaleCursorError):
+                self.save({"project_cursor": 0, "generation": 2458}, expected_generation=2458)
+        self.assertEqual(2500, self.durable()["generation"])
+
+    def test_destroying_the_file_mid_swap_aborts_without_recreating(self):
+        self.seed(2458, records=dict(PROD_13_PROJECTS))
+        import manager.phase1_cursor as pc
+        real = pc._fingerprint
+
+        def destroy(path):
+            if ".claim-" in path.name and path.exists():
+                path.unlink()
+            return real(path)
+
+        with patch.object(pc, "_fingerprint", side_effect=destroy):
+            with self.assertRaises(StaleCursorError):
+                self.save({"project_cursor": 0, "generation": 2458}, expected_generation=2458)
+        self.assertFalse(self.cursor_path.exists(),
+                         "a destroyed cursor must not be resurrected")
+
+    def test_an_aborted_swap_restores_the_durable_file(self):
+        """Refusing must leave the state untouched, not merely unwritten."""
+        self.seed(2458, records=dict(PROD_13_PROJECTS))
+        before = self.cursor_path.read_bytes()
+        import manager.phase1_cursor as pc
+        genuine = pc._fingerprint(self.cursor_path)
+        with patch.object(pc, "_fingerprint", side_effect=[genuine, ("bogus", 0, 0, 0)]):
+            with self.assertRaises(StaleCursorError):
+                self.save({"project_cursor": 0, "generation": 2458}, expected_generation=2458)
+        self.assertEqual(before, self.cursor_path.read_bytes())
+
+    def test_no_claim_debris_after_success(self):
+        self.seed(10)
+        self.save({"project_cursor": 1, "generation": 10}, expected_generation=10)
+        leftovers = [p.name for p in self.runtime.iterdir() if ".claim-" in p.name]
+        self.assertEqual([], leftovers, "claim debris left behind: %s" % leftovers)
+
+
+class TestAbsolutePathBinding(CursorTestCase):
+    """Round 2, blocker 3: resolved once is worthless if it resolved to a relative path."""
+
+    def test_relative_cursor_path_is_bound_absolutely(self):
+        original = os.getcwd()
+        decoy = self.home / "decoy"
+        (decoy / "runtime").mkdir(parents=True)
+        self.seed(10, records={"kept": 1})
+        import manager.phase1_cursor as pc
+        real_now = pc.now_iso
+
+        def chdir_away():
+            os.chdir(str(decoy))
+            return real_now()
+
+        try:
+            os.chdir(str(self.home))
+            with patch.object(pc, "now_iso", side_effect=chdir_away):
+                saved = save_phase1_cursor({"project_cursor": 1, "generation": 10},
+                                           cursor_path="runtime/phase1-cursor.json",
+                                           expected_generation=10)
+        finally:
+            os.chdir(original)
+        self.assertEqual(11, saved["generation"])
+        self.assertEqual(11, self.durable()["generation"])
+        self.assertFalse((decoy / "runtime" / "phase1-cursor.json").exists(),
+                         "the write followed the working directory instead of its binding")
+
+    def test_relative_manager_home_is_bound_absolutely(self):
+        original = os.getcwd()
+        decoy = self.home / "decoy2"
+        (decoy / "runtime").mkdir(parents=True)
+        self.seed(20, records={"kept": 1})
+        import manager.phase1_cursor as pc
+        real_now = pc.now_iso
+
+        def chdir_away():
+            os.chdir(str(decoy))
+            os.environ["AI_MANAGER_HOME"] = str(decoy)
+            return real_now()
+
+        try:
+            os.chdir(str(self.home.parent))
+            with patch.dict(os.environ, {"AI_MANAGER_HOME": self.home.name}):
+                with patch.object(pc, "now_iso", side_effect=chdir_away):
+                    saved = save_phase1_cursor({"project_cursor": 1, "generation": 20},
+                                               expected_generation=20)
+        finally:
+            os.chdir(original)
+        self.assertEqual(21, saved["generation"])
+        self.assertEqual(21, self.durable()["generation"])
+        self.assertFalse((decoy / "runtime" / "phase1-cursor.json").exists())
+
+    def test_resolver_returns_absolute_paths(self):
+        with patch.dict(os.environ, {"AI_MANAGER_HOME": str(self.home)}):
+            self.assertTrue(_resolve_cursor_path().is_absolute())
+        self.assertTrue(_resolve_cursor_path(cursor_path="relative/cursor.json").is_absolute())
+        original = os.getcwd()
+        try:
+            os.chdir(str(self.home))
+            resolved = _resolve_cursor_path(manager_home="sub-home")
+        finally:
+            os.chdir(original)
+        self.assertTrue(resolved.is_absolute())
+        self.assertEqual((self.home / "sub-home" / "runtime" / "phase1-cursor.json").resolve(),
+                         resolved)
+
+    def test_a_relative_home_that_lands_in_a_checkout_is_still_rejected(self):
+        """Resolving relative paths must not smuggle one past the worktree guard."""
+        original = os.getcwd()
+        checkout = self.home / "co"
+        (checkout / ".git").mkdir(parents=True)
+        try:
+            os.chdir(str(self.home))
+            with self.assertRaises(ManagerHomeError):
+                _resolve_cursor_path(manager_home="co")
+        finally:
+            os.chdir(original)
 
 
 if __name__ == "__main__":

@@ -2082,8 +2082,10 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         return results
 
     from manager.phase1_cursor import (CREATE_ONLY, CursorLockError, CursorMissingError,
-                                       CursorStateError, StaleCursorError, default_phase1_cursor,
-                                       load_phase1_cursor, save_phase1_cursor)
+                                       CursorRecoveryRequiredError, CursorStateError,
+                                       StaleCursorError, default_phase1_cursor,
+                                       load_phase1_cursor, phase1_cursor_initialized,
+                                       save_phase1_cursor)
 
     # `cursor_cas_token` is this invocation's write permit, and the three
     # branches below are the three states the durable cursor can be in.
@@ -2092,7 +2094,11 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     # was indistinguishable from one that had never existed, and the next
     # save rebuilt it from zero.
     #
-    #   absent      -> CREATE_ONLY. Genuine first-ever boot; create it.
+    #   absent, never initialized -> CREATE_ONLY. Genuine first boot.
+    #   absent, but initialized before -> None. The cursor EXISTED and is
+    #                  gone. Recreating it from zero is the 2026-09-02
+    #                  incident, so the tick refuses and leaves the
+    #                  reconstruction decision to a human.
     #   present     -> its durable generation. Normal CAS amendment.
     #   unreadable  -> None, meaning "do not persist at all". The tick
     #                  still serves commands, but it will not overwrite
@@ -2105,7 +2111,15 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         cursor_cas_token = cursor["generation"]
     except CursorMissingError:
         cursor = default_phase1_cursor()
-        cursor_cas_token = CREATE_ONLY
+        # Absence alone does not authorise creation; the initialization
+        # marker is what separates a first boot from a lost cursor.
+        if phase1_cursor_initialized(cursor_path=cursor_path):
+            print("PHASE1_CURSOR: durable cursor is MISSING but was initialized here before; "
+                  "refusing to reinitialize Phase-1 rotation from zero. Not persisting this tick. "
+                  "This needs a human: find out why the cursor vanished.", file=sys.stderr)
+            cursor_cas_token = None
+        else:
+            cursor_cas_token = CREATE_ONLY
     except CursorStateError as exc:
         print(f"PHASE1_CURSOR: durable cursor unusable, not persisting this tick: {exc}", file=sys.stderr)
         cursor = default_phase1_cursor()
@@ -2265,7 +2279,8 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         try:
             save_phase1_cursor(cursor, cursor_path=cursor_path,
                                expected_generation=cursor_cas_token)
-        except (StaleCursorError, CursorStateError, CursorLockError, OSError) as exc:
+        except (StaleCursorError, CursorStateError, CursorLockError,
+                CursorRecoveryRequiredError, OSError) as exc:
             # Every one of these means "someone else owns the cursor, or
             # it cannot be trusted right now". Skipping the save costs one
             # tick of rotation; writing anyway costs the durable state.

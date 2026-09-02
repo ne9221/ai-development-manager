@@ -80,11 +80,13 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from manager import health_evidence, scheduler_provenance
+from manager.manager_home import ManagerHomeError, resolve_manager_home
 from manager.dashboard_core import ServiceHealthViewModel, parse_scheduled_task_health
 
 SCHTASKS_TIMEOUT_SECONDS = 10
@@ -484,11 +486,27 @@ def main(argv=None):
     parser.add_argument("--force", action="store_true", help="bypass the sweep debounce for a manual/test run")
     parser.add_argument("--dry-run", action="store_true", help="evaluate and record evidence but never recover")
     args = parser.parse_args(argv)
+
+    # Validate the home BEFORE the first durable write. --manager-home is
+    # required, so there was never a silent fallback here, but it was
+    # consumed raw: a caller passing a checkout path wrote
+    # runtime/supervisor-last-sweep.json and health-evidence.json straight
+    # into the work tree, which is the exact class of contamination that
+    # fail-closed every Scheduled Task for ~54 minutes (2026-09-02). The
+    # resolver is the single authority for "is this a safe manager home";
+    # this only routes the CLI argument through it, and the helpers below
+    # keep taking an already-validated home.
+    try:
+        manager_home = resolve_manager_home(args.manager_home)
+    except ManagerHomeError as exc:
+        print(json.dumps({"status": "refused", "reason": str(exc)}), file=sys.stderr)
+        return 2
+
     now = _now()
-    if not args.force and not _should_run_sweep(args.manager_home, now):
+    if not args.force and not _should_run_sweep(manager_home, now):
         print(json.dumps({"status": "skipped_debounce"}))
         return 0
-    results = check_and_recover(args.manager_home, now=now, dry_run=args.dry_run)
+    results = check_and_recover(manager_home, now=now, dry_run=args.dry_run)
     print(json.dumps(results, default=str))
     return 0
 

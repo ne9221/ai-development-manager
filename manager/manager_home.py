@@ -111,7 +111,14 @@ def resolve_manager_home(explicit=None, *, environ=None):
             "be derived safely; refusing to fall back to the working directory"
         )
 
-    home = Path(home).expanduser()
+    # Absolute, once, here. A relative home (".", "runtime", "../x") that
+    # survived this call would be re-interpreted against whatever the
+    # working directory happened to be at each later use, so a cwd change
+    # mid-operation could silently move a durable write to a decoy
+    # location -- the cwd bug of 2026-09-02 wearing a different hat.
+    # Resolution is the resolver's job precisely so no caller has to
+    # remember to do it.
+    home = Path(home).expanduser().resolve()
     worktree = _enclosing_git_worktree(home)
     if worktree is not None:
         raise ManagerHomeError(
