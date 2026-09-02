@@ -428,23 +428,40 @@ def _attention(store, command, execution, reason):
             or (curr_exec.get("cleanup_evidence") or {}).get("persistence") != "complete"
         )
         if curr_exec.get("status") not in ("completed", "failed", "interrupted"):
+            unchanged_exec = dict(curr_exec)
             curr_exec.update(stale_at=curr_exec.get("stale_at") or timestamp, recovery_reason=reason)
             validate("execution", curr_exec)
-            store.put("executions", command["project_id"], command["execution_id"], curr_exec)
+            if curr_exec != unchanged_exec:
+                store.put("executions", command["project_id"], command["execution_id"], curr_exec)
         if should_block_task:
             try:
                 task = store.get("tasks", command["project_id"], command["task_id"])
                 if (task.get("source_context") or {}).get("active_execution_id") == command["execution_id"]:
+                    unchanged_task = dict(task)
                     task.update(status="blocked", updated_at=timestamp,
                                 blocked_reason=f"Execution recovery required: {reason}",
                                 current_progress="Execution requires attention",
                                 next_action="Verify provider/process and authority evidence; do not start a duplicate")
                     validate("task", task)
-                    store.put("tasks", command["project_id"], command["task_id"], task)
+                    if task != unchanged_task:
+                        store.put("tasks", command["project_id"], command["task_id"], task)
             except TaskError:
                 pass
     marked = {**command, "status": "attention", "stale_at": timestamp,
               "recovery_reason": reason, "completed_at": None, "result": None}
+    # No-op suppression (live 20260902 starvation): an attention Command
+    # whose stored record is ALREADY byte-identical to what would be written
+    # is not rewritten. Before this, every tick rewrote it unchanged, which
+    # refreshed its Drive modifiedTime, which kept it permanently at rank 0
+    # of the `modifiedTime desc` recent sweep (RECENT_COMMANDS_PER_PROJECT=2)
+    # -- a self-perpetuating monopoly that starved the rank-1 record for
+    # 60+ minutes of healthy ticks. Any real change (new reason, new
+    # stale_at, any field) still persists exactly as before; only the
+    # authoritative store's own current record (never the caller's possibly
+    # stale copy) is trusted as "already identical".
+    if current_cmd is not command and current_cmd == marked:
+        return {"status": "attention", "execution_id": command.get("execution_id"),
+                "recovery_reason": reason, "unchanged": True}
     _write(store, marked)
     return {"status": "attention", "execution_id": command.get("execution_id"), "recovery_reason": reason}
 
@@ -1703,7 +1720,7 @@ def _promote_waiting_quota_task(store, service, task, quota_document):
 _COMMAND_PRIORITY = {"claimed": 0, "running": 0, "queued": 1, "attention": 2}
 
 
-def _prioritized_nonterminal_commands(commands):
+def _prioritized_nonterminal_commands(commands, attention_rotation=0):
     """Stable-reorder one project's already-hydrated, already-hydration-bounded
     Command batch so active-lifecycle authority (claimed/running) is always
     considered first, actionable new work (queued) second, and stale
@@ -1737,10 +1754,26 @@ def _prioritized_nonterminal_commands(commands):
     indefinitely -- see the real production trace this fixes. Sorting is
     stable (Python's sorted()), so relative order within each priority group
     is preserved unchanged from Drive's own return order."""
-    return sorted(
+    ordered = sorted(
         (c for c in commands if c.get("status") not in ("completed", "failed")),
         key=lambda c: _COMMAND_PRIORITY.get(c.get("status"), len(_COMMAND_PRIORITY)),
     )
+    # Bounded fairness INSIDE the attention group (live 20260902): with two
+    # attention records in one hydrated batch, the stable sort always put
+    # the same one first, and a tick whose remaining recent-sweep budget
+    # was consumed by that first record's own reconciliation broke out of
+    # the loop before the second one every single tick. Rotating the
+    # attention suffix by `attention_rotation` (poll_once passes the
+    # wall-clock tick counter) guarantees every attention record in a batch
+    # of n is first within n consecutive ticks -- independent of how much
+    # budget its neighbors burn. claimed/running/queued ordering is
+    # untouched, and attention still never precedes them.
+    attention_start = next((i for i, c in enumerate(ordered) if c.get("status") == "attention"), len(ordered))
+    attention = ordered[attention_start:]
+    if len(attention) > 1 and attention_rotation:
+        shift = attention_rotation % len(attention)
+        attention = attention[shift:] + attention[:shift]
+    return ordered[:attention_start] + attention
 
 
 TERMINAL_CLASSIFICATION_TIMEOUT_SECONDS = 10
@@ -2158,6 +2191,11 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
 
     recent_deadline = min(deadline, time.monotonic() + RECENT_COMMAND_SWEEP_BUDGET_SECONDS)
     recent_hydration_deadline = min(recent_deadline, hydration_deadline)
+    # Same wall-clock tick counter every --once process derives on its own
+    # (no persisted state): the recent sweep visits every project each
+    # tick, so a plain per-tick counter is a strict round-robin over each
+    # batch's attention group (see _prioritized_nonterminal_commands).
+    attention_rotation = _within_project_record_rotation_offset()
     for project_id in project_ids:
         if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_hydration_deadline:
             break
@@ -2172,7 +2210,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
         # GLOBAL Phase 2c below. Uses the full `recent_deadline`, not the
         # tightened `recent_hydration_deadline` -- already-hydrated active
         # work is never held back by the terminal-recovery reservation.
-        for command in _prioritized_nonterminal_commands(commands):
+        for command in _prioritized_nonterminal_commands(commands, attention_rotation=attention_rotation):
             if (project_id, command["command_id"]) in just_promoted:
                 continue
             if len(results) == MAX_COMMANDS_PER_POLL or time.monotonic() >= recent_deadline:
@@ -2195,7 +2233,7 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             # loop entirely, unlike before this restructure).
             continue
         _remember_batch(project_id, commands)
-        for command in _prioritized_nonterminal_commands(commands):
+        for command in _prioritized_nonterminal_commands(commands, attention_rotation=attention_rotation):
             if (project_id, command["command_id"]) in just_promoted:
                 continue  # promoted this same tick -- launches on a later natural tick, not this one
             if (project_id, command["command_id"]) in processed:
