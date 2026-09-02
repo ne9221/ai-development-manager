@@ -362,6 +362,30 @@ def format_burn_rate(val: Optional[float]) -> str:
 LEGACY_AGGREGATE_ACCOUNT_ID = None
 
 
+def is_live_execution(execution, now=None):
+    """True only when an Execution may be shown as 執行中: canonical status
+    running, REAL process evidence (host + pid) persisted by the launcher,
+    manager.executions.execution_health() reporting healthy (which itself
+    fails a session-bearing record without provider evidence, an expired
+    hard timeout, and stale progress), and the UI's own staleness check.
+    A persisted 'running' record with a session id but no host/PID proof
+    is never live (bounded review finding, 20260902)."""
+    from manager.executions import execution_health
+
+    if not isinstance(execution, dict) or execution.get("status") != "running":
+        return False
+    evidence = execution.get("provider_evidence") or {}
+    if not isinstance(evidence, dict) or not evidence.get("host") or evidence.get("pid") is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    try:
+        if execution_health(execution, now)["state"] != "healthy":
+            return False
+    except Exception:
+        return False
+    return determine_execution_state(execution, now) == "running" and not is_execution_stale(execution, now)
+
+
 def drop_legacy_aggregate_items(items):
     """Split raw provider entries into (kept, hidden_provider_ids).
 
@@ -492,32 +516,34 @@ def build_account_quota_card_vm(fc: AccountQuotaForecast) -> AccountQuotaCardVie
     account_label = f" (Account {fc.account_id})" if fc.account_id else ""
     card_title = f"{fc.display_name}{account_label}" if fc.account_id and fc.account_id not in fc.display_name else fc.display_name
 
-    # Find 5-hour / primary window
+    # Find weekly / 7-day window FIRST. Codex names its windows
+    # primary/secondary (secondary = the 7-day window, duration 10080
+    # minutes); live 20260902 the Dashboard showed Codex with 5H only because
+    # "secondary" was never recognized here even though status.json carried
+    # it every cycle. "secondary" counts as weekly only with a compatible
+    # 7-day duration -- a "secondary" of any other length is not invented
+    # into a weekly window.
+    w_week = None
+    for w in fc.windows:
+        if w.window_name in ("seven_day", "weekly") or (w.window_name == "secondary" and w.duration_minutes == 10080):
+            w_week = w
+            break
+
+    # Find 5-hour / primary window. The weekly window is never reused as the
+    # 5H window: a secondary-only payload renders weekly + UNKNOWN 5H, never
+    # the same number twice under two labels (bounded review finding).
     w5 = None
     for name in ("five_hour", "primary"):
         for w in fc.windows:
-            if w.window_name == name:
+            if w.window_name == name and w is not w_week:
                 w5 = w
                 break
         if w5:
             break
-    if w5 is None and fc.primary_window:
+    if w5 is None and fc.primary_window and fc.primary_window is not w_week:
         w5 = fc.primary_window
-    elif w5 is None and fc.windows:
-        w5 = fc.windows[0]
-
-    # Find weekly / 7-day window. Codex names its windows primary/secondary
-    # (secondary = the 7-day window, duration 10080 minutes); live 20260902
-    # the Dashboard showed Codex with 5H only because "secondary" was never
-    # recognized here even though status.json carried it every cycle.
-    w_week = None
-    for name in ("seven_day", "weekly", "secondary"):
-        for w in fc.windows:
-            if w.window_name == name:
-                w_week = w
-                break
-        if w_week:
-            break
+    elif w5 is None:
+        w5 = next((w for w in fc.windows if w is not w_week and w.window_name not in ("seven_day", "weekly", "secondary")), None)
 
     # 5-hour metrics
     f5_rem = w5.remaining_percent if w5 else None

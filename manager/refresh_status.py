@@ -131,7 +131,8 @@ def claude_oauth_snapshot(config_dir, account_id=None, timeout=15, collector=col
         if log_path is not None:
             log_line(log_path, f"claude oauth rate_limited{retry_note}")
         if diagnostics is not None:
-            diagnostics["error"] = f"{type(exc).__name__}:{retry_note or ' rate limited'}".replace(": ", ":").strip()
+            diagnostics["error"] = (f"{type(exc).__name__}: retry_after={exc.retry_after}" if exc.retry_after
+                                    else f"{type(exc).__name__}: rate limited")
         return "rate_limited", None
     except ClaudeOauthError as exc:
         reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
@@ -247,7 +248,22 @@ def refresh(*, service, runtime_path, log_path, lock_path, claude_path, claude_a
                         # exactly as it was, and freshness is judged purely
                         # from that last-good entry's own captured_at.
                         outcomes[outcome_key] = "rate_limited"
-                        log_line(log_path, f"provider {outcome_key} rate_limited")
+                        # Windows and last_updated stay exactly as they are;
+                        # only the WHY is recorded (bounded review finding:
+                        # the 429 path used to continue before the
+                        # metadata.refresh write, so the card could never
+                        # explain a rate-limited account).
+                        rate_limited_entry = next(
+                            (item for item in document["providers"]
+                             if item.get("provider") == "claude" and item.get("account_id") == account_id),
+                            None,
+                        )
+                        if rate_limited_entry is not None:
+                            if not isinstance(rate_limited_entry.get("metadata"), dict):
+                                rate_limited_entry["metadata"] = {}
+                            rate_limited_entry["metadata"]["refresh"] = refresh_diagnostic(
+                                "rate_limited", diagnostics.get("error"), now_iso())
+                        log_line(log_path, f"provider {outcome_key} rate_limited" + (f" ({diagnostics.get('error')})" if diagnostics.get("error") else ""))
                         continue
                     if oauth_outcome == "success":
                         claude = oauth_provider

@@ -270,5 +270,33 @@ class ClaudeRefreshDiagnosticTests(RefreshTests):
         self.assertNotIn("refresh", entry.get("metadata") or {})
 
 
+
+
+class ClaudeRateLimitDiagnosticTests(ClaudeRefreshDiagnosticTests):
+    def test_rate_limited_keeps_last_good_and_records_the_diagnostic(self):
+        from collectors.claude_oauth import RateLimitedError
+
+        old = self._old_with_account_a()
+
+        def limited_collector(config_dir, account_id, timeout=15):
+            raise RateLimitedError(30)
+
+        result, _, _ = self.run_refresh(
+            reader=lambda **_: deepcopy(old),
+            claude_accounts={"account-a": self.base / "missing-a.json"},
+            claude_config_dirs={"account-a": None},
+            claude_oauth_collector=limited_collector,
+        )
+        entry = next(p for p in result["document"]["providers"]
+                     if p["provider"] == "claude" and p.get("account_id") == "account-a")
+        self.assertEqual("2026-09-01T14:41:18Z", entry["last_updated"])
+        self.assertEqual(100, entry["windows"][0]["remaining_percent"])
+        self.assertEqual("rate_limited", entry["metadata"]["refresh"]["outcome"])
+        self.assertIn("RateLimitedError", entry["metadata"]["refresh"]["error"])
+        self.assertIn("retry_after=30", entry["metadata"]["refresh"]["error"])
+        log = (self.base / "refresh.log").read_text(encoding="utf-8")
+        self.assertIn("provider claude:account-a rate_limited (RateLimitedError: retry_after=30)", log)
+
+
 if __name__ == "__main__":
     unittest.main()

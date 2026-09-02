@@ -2081,5 +2081,67 @@ class QuotaTruthEntityTests(unittest.TestCase):
         self.assertIsNone(b.refresh_error)
 
 
+
+
+class LiveExecutionPredicateTests(unittest.TestCase):
+    """執行中 requires canonical health AND real process evidence (bounded
+    review finding: a persisted running record with a session id but no
+    host/PID proof must never look live)."""
+
+    NOW = datetime(2026, 9, 2, 3, 0, 0, tzinfo=timezone.utc)
+
+    def _running(self, **changes):
+        started = (self.NOW - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+        execution = {
+            "execution_id": "e1", "task_id": "t1", "project_id": "p1", "provider": "claude", "status": "running",
+            "started_at": started, "heartbeat_at": started, "progress_updated_at": started,
+            "hard_timeout_at": (self.NOW + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+            "session_id": "claude:abc", "provider_session_id": "abc", "task_snapshot": {"expected_minutes": 20},
+            "provider_evidence": {"host": "HOST", "pid": 1234, "creation_identity": "windows-filetime:1"},
+        }
+        execution.update(changes)
+        return execution
+
+    def test_healthy_running_execution_with_process_evidence_is_live(self):
+        from manager.dashboard_core import is_live_execution
+        self.assertTrue(is_live_execution(self._running(), self.NOW))
+
+    def test_session_without_process_evidence_is_never_live(self):
+        from manager.dashboard_core import is_live_execution
+        self.assertFalse(is_live_execution(self._running(provider_evidence=None), self.NOW))
+        self.assertFalse(is_live_execution(self._running(provider_evidence={"host": "HOST"}), self.NOW))
+
+    def test_expired_hard_timeout_is_not_live(self):
+        from manager.dashboard_core import is_live_execution
+        expired = (self.NOW - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+        self.assertFalse(is_live_execution(self._running(hard_timeout_at=expired), self.NOW))
+
+    def test_stale_progress_and_non_running_status_are_not_live(self):
+        from manager.dashboard_core import is_live_execution
+        stale = (self.NOW - timedelta(minutes=40)).isoformat().replace("+00:00", "Z")
+        self.assertFalse(is_live_execution(self._running(started_at=stale, heartbeat_at=stale, progress_updated_at=stale), self.NOW))
+        self.assertFalse(is_live_execution(self._running(status="reserved"), self.NOW))
+        self.assertFalse(is_live_execution(self._running(status="completed"), self.NOW))
+
+
+class WindowRecognitionDegradedInputTests(QuotaTruthEntityTests):
+    def test_secondary_only_codex_payload_is_weekly_with_unknown_five_hour(self):
+        entry = self._entry("codex", None, five=0, weekly=39, names=("primary", "secondary"))
+        entry["windows"] = [entry["windows"][1]]  # only the 7-day "secondary" window survives
+        brief = self._brief(entry)
+        codex = next(a for a in brief.accounts if a.provider == "codex")
+        self.assertTrue(codex.has_weekly_window)
+        self.assertEqual(39, codex.weekly_remaining_pct)
+        self.assertIsNone(codex.five_hour_remaining_pct, "the weekly window must never be re-used as the 5H window")
+
+    def test_secondary_window_with_non_weekly_duration_is_not_a_weekly_window(self):
+        entry = self._entry("codex", None, five=75, weekly=39, names=("primary", "secondary"))
+        entry["windows"][1]["duration_minutes"] = 300
+        brief = self._brief(entry)
+        codex = next(a for a in brief.accounts if a.provider == "codex")
+        self.assertEqual(75, codex.five_hour_remaining_pct)
+        self.assertFalse(codex.has_weekly_window, "a 'secondary' of a non-7-day length is not invented into a weekly window")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -714,5 +714,25 @@ class TestQuotaEntityCardsAndInformationArchitecture(unittest.TestCase):
         for label in ("Projects", "Tasks", "Sessions", "History", "Logs", "Quota"):
             self.assertNotIn(f">{label}<", html)
 
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_unknown_status_with_numeric_window_renders_as_unknown_not_fresh(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+        from datetime import datetime, timezone
+        now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        entry = _entry("claude", "account-b", 51, 93, now_str)
+        entry["status"] = "unknown"
+        mock_read_drive_status.return_value = {"providers": [entry]}
+        mock_drive_records.return_value.list_projects.return_value = []
+        at = AppTest.from_file("../dashboard.py")
+        run_full_data_view(at)
+        self.assertFalse(at.exception, f"App crashed: {at.exception}")
+        html = "\n".join(str(el.value) for el in at.markdown)
+        self.assertIn('qe-state-unknown">未知', html)
+        self.assertNotIn('qe-state-fresh">最新', html)
+        # The retained numeric evidence is still shown as itself, never as 0%.
+        self.assertIn('<span class="qw-value">51%</span>', html)
+
 if __name__ == "__main__":
     unittest.main()

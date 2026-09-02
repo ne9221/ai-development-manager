@@ -30,6 +30,7 @@ from manager.dashboard_core import (
     get_global_summary,
     map_task_board,
     build_daily_brief_vm,
+    is_live_execution,
     DailyBriefViewModel,
     AccountQuotaCardViewModel,
     parse_scheduled_task_health,
@@ -670,12 +671,9 @@ def _ui_record_time(record):
 
 
 def _ui_active_executions(executions, now):
-    return [
-        execution for execution in executions
-        if execution.get("status") not in TERMINAL_EXECUTION_STATUSES
-        and determine_execution_state(execution, now) == "running"
-        and not is_execution_stale(execution, now)
-    ]
+    # 執行中 only with canonical health AND real process evidence -- see
+    # manager.dashboard_core.is_live_execution.
+    return [execution for execution in executions if is_live_execution(execution, now)]
 
 
 def _ui_task_for_execution(execution, tasks):
@@ -704,7 +702,13 @@ def _ui_quota_state(card):
     status = str(card.status or "unknown").casefold()
     if status == "error":
         return "error", "來源錯誤"
-    if card.five_hour_remaining_pct is None:
+    if status == "exhausted":
+        return "exhausted", "已用盡"
+    # Schema: status is authoritative for manual providers (abundant / normal
+    # / low / exhausted / unknown) and "ok" for automatic ones. Anything
+    # else -- including "unknown" with a retained numeric window -- is
+    # UNKNOWN, never 最新 (bounded review finding).
+    if status not in ("ok", "abundant", "normal", "low") or card.five_hour_remaining_pct is None:
         return "unknown", "未知"
     five = float(card.five_hour_remaining_pct)
     weekly = float(card.weekly_remaining_pct) if card.has_weekly_window and card.weekly_remaining_pct is not None else None
@@ -939,10 +943,14 @@ def _render_overview(data):
     executions = data.get("all_executions", [])
     brief = data.get("daily_brief_vm")
     active = _ui_active_executions(executions, now)
+    # A record persisted as "running" without live proof (no host/PID
+    # evidence, expired hard timeout, stale progress) is never 執行中 -- it
+    # is something a person must look at.
     attention = [
         execution for execution in executions
         if execution.get("status") in {"failed", "interrupted", "cancelled"}
         or is_execution_stale(execution, now)
+        or (execution.get("status") == "running" and not is_live_execution(execution, now))
     ]
     attention_tasks = [task for task in tasks if task.get("status") in {"blocked", "attention"}]
     has_attention = bool(attention or attention_tasks)
@@ -1041,7 +1049,7 @@ def _render_overview(data):
         st.header("需要處理")
         for execution in attention[:3]:
             task = _ui_task_for_execution(execution, tasks)
-            st.warning(f"{_ui_text(task.get('title') or execution.get('task_id'))}：執行狀態 {_ui_state(execution.get('status'))}，請查看 History。")
+            st.warning(f"{_ui_text(task.get('title') or execution.get('task_id'))}：執行狀態 {_ui_state(execution.get('status'))}，未證實仍在執行，請到「執行」頁查看。")
         for task in attention_tasks[:max(0, 3 - len(attention))]:
             st.warning(f"{_ui_text(task.get('title') or task.get('task_id'))}：任務 {_ui_state(task.get('status'))}，下一步 {_ui_text(task.get('next_action'))}。")
 
@@ -1117,9 +1125,11 @@ def _render_executions(data):
         terminal = execution.get("status") in TERMINAL_EXECUTION_STATUSES
         if terminal:
             state = _ui_state(execution.get("status"))
-        elif determine_execution_state(execution, now) == "running" and not is_execution_stale(execution, now):
+        elif is_live_execution(execution, now):
             state = "執行中"
-        elif is_execution_stale(execution, now):
+        elif execution.get("status") == "running":
+            # Persisted as running but without live proof (no host/PID
+            # evidence, expired hard timeout, stale progress): never 執行中.
             state = "需要處理"
         else:
             state = _ui_state(execution.get("status"))
