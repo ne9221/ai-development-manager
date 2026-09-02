@@ -24,6 +24,10 @@ def provider(name, windows=None, updated="2026-08-09T00:00:00Z"):
     }
 
 
+def antigravity_offline(**_):
+    raise RuntimeError("offline")
+
+
 def status():
     window = [{"name": "primary", "used_percent": 20, "remaining_percent": 80, "resets_at": None}]
     return {"schema_version": "0.1.0", "generated_at": "2026-08-09T00:00:00Z", "providers": [
@@ -48,6 +52,7 @@ class RefreshTests(unittest.TestCase):
             lock_path=self.base / "refresh.lock", claude_path=self.base / "missing.json",
             reader=lambda **_: deepcopy(old),
             codex_collector=lambda **_: ({}, {"providers": [provider("codex", new_window, "2026-08-30T01:00:00Z")]}),
+            antigravity_collector=antigravity_offline,
             publisher=lambda service, path: published.append(json.loads(path.read_text())) or {"action": "updated", "id": "1"},
         )
         defaults.update(overrides)
@@ -300,3 +305,60 @@ class ClaudeRateLimitDiagnosticTests(ClaudeRefreshDiagnosticTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AntigravityRefreshTests(RefreshTests):
+    """collectors/antigravity.py is wired with the same last-good contract as Codex."""
+
+    def ag_document(self, remaining=67.5, updated="2026-08-30T02:00:00Z"):
+        windows = [{"name": "gemini-weekly", "duration_minutes": 10080, "used_percent": 100 - remaining,
+                    "remaining_percent": remaining, "resets_at": "2026-09-04T08:20:30Z"},
+                   {"name": "gemini-5h", "duration_minutes": 300, "used_percent": 0, "remaining_percent": 100, "resets_at": None}]
+        entry = provider("antigravity", windows, updated)
+        entry.update(collection_mode="automatic", source="antigravity_language_server_quota_summary",
+                     source_type="official", confidence="official", metadata={"account_email": "user@example.com"})
+        return {"schema_version": "0.1.0", "generated_at": updated, "providers": [entry]}
+
+    def test_antigravity_success_replaces_manual_entry_and_records_history(self):
+        recorded = []
+        class History:
+            def append_snapshot(self, snapshot):
+                recorded.append(snapshot["provider"])
+                return True
+        result, _, published = self.run_refresh(antigravity_collector=lambda **_: ({}, self.ag_document()), history_store=History())
+        self.assertEqual("success", result["providers"]["antigravity"])
+        current = {item["provider"]: item for item in result["document"]["providers"]}
+        self.assertEqual("official", current["antigravity"]["source_type"])
+        self.assertEqual(67.5, current["antigravity"]["windows"][0]["remaining_percent"])
+        self.assertEqual(1, sum(1 for item in result["document"]["providers"] if item["provider"] == "antigravity"))
+        self.assertIn("antigravity", recorded)
+        self.assertEqual(1, len(published))
+        self.assertIn("provider antigravity success", (self.base / "refresh.log").read_text(encoding="utf-8"))
+
+    def test_antigravity_unavailable_keeps_last_good_and_records_reason(self):
+        class Offline(RuntimeError):
+            classification = "ide_not_running"
+        def unavailable(**_):
+            raise Offline("no process")
+        result, old, _ = self.run_refresh(antigravity_collector=unavailable)
+        self.assertEqual("unavailable", result["providers"]["antigravity"])
+        current = next(item for item in result["document"]["providers"] if item["provider"] == "antigravity")
+        old_entry = next(item for item in old["providers"] if item["provider"] == "antigravity")
+        self.assertEqual(old_entry["windows"], current["windows"])
+        self.assertEqual(old_entry["last_updated"], current["last_updated"])
+        self.assertEqual("unavailable", current["metadata"]["refresh"]["outcome"])
+        self.assertIn("ide_not_running", current["metadata"]["refresh"]["error"])
+        self.assertIn("provider antigravity unavailable: ide_not_running", (self.base / "refresh.log").read_text(encoding="utf-8"))
+
+    def test_antigravity_collector_disabled_leaves_entry_untouched(self):
+        result, old, _ = self.run_refresh(antigravity_collector=False)
+        self.assertNotIn("antigravity", result["providers"])
+        current = next(item for item in result["document"]["providers"] if item["provider"] == "antigravity")
+        self.assertEqual(next(item for item in old["providers"] if item["provider"] == "antigravity"), current)
+
+    def test_antigravity_failure_never_blocks_codex_or_claude(self):
+        def unavailable(**_):
+            raise RuntimeError("offline")
+        result, _, published = self.run_refresh(antigravity_collector=unavailable)
+        self.assertEqual("success", result["providers"]["codex"])
+        self.assertEqual(1, len(published))

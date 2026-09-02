@@ -193,18 +193,20 @@ def claude_quota_reliable(service, account_id=None):
 def ag_availability_check(service):
     """Fail-closed AG availability gate.
 
-    AG has no reliable headless quota source; this gate proves only what is
-    actually observable on the local machine: that a resolvable AG CLI binary
-    exists and that a verified local Google account identity can be confirmed.
-    Returns True only when both are satisfied; False in all other cases,
-    including any unexpected exception.  The `service` argument is accepted
-    for interface parity with the quota_check contract but is not used --
-    AG availability is a local host concern, not a Drive-readable signal.
+    Two independent proofs, both required, neither guessed:
+    1. the Drive SSOT carries FRESH, official, non-exhausted Antigravity quota
+       (collectors/antigravity.py via the same `provider_quota_reliable()`
+       rule Codex and Claude already use -- stale/unknown/exhausted rejects);
+    2. the Antigravity IDE's language server -- the only execution transport
+       the adapter has (manager/ag_language_server.py) -- is running and
+       answering on this host right now.
+    False on any failure, including unexpected exceptions.
     """
     try:
-        from manager.ag_cli_runner import resolve_ag_cli_executable, verify_auth_identity
-        verify_auth_identity()
-        resolve_ag_cli_executable()
+        if not provider_quota_reliable(service, "antigravity"):
+            return False
+        from manager.ag_language_server import discover_language_server
+        discover_language_server()
         return True
     except Exception:
         return False

@@ -112,39 +112,39 @@ class TestProviderRuntimesRegistration(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestAgAvailabilityCheck(unittest.TestCase):
-    def test_gate_passes_when_auth_and_binary_ok(self):
-        with patch("manager.ag_cli_runner.verify_auth_identity", return_value="user@example.com"), \
-             patch("manager.ag_cli_runner.resolve_ag_cli_executable", return_value=("agy", [])):
-            result = ag_availability_check(service=None)
+    """Both proofs are required: fresh official SSOT quota AND a reachable local language server."""
+
+    def test_gate_passes_when_quota_reliable_and_language_server_reachable(self):
+        with patch("manager.command_watcher.provider_quota_reliable", return_value=True) as quota,              patch("manager.ag_language_server.discover_language_server", return_value=object()) as discover:
+            result = ag_availability_check(service="svc")
         self.assertTrue(result)
+        quota.assert_called_once_with("svc", "antigravity")
+        discover.assert_called_once_with()
 
-    def test_gate_fails_closed_when_auth_raises(self):
-        from manager.ag_runner import AgLaunchError
-        with patch("manager.ag_cli_runner.verify_auth_identity",
-                   side_effect=AgLaunchError("auth_not_proven", "no local profile")), \
-             patch("manager.ag_cli_runner.resolve_ag_cli_executable", return_value=("agy", [])):
-            result = ag_availability_check(service=None)
+    def test_gate_fails_closed_when_quota_unreliable_without_touching_transport(self):
+        with patch("manager.command_watcher.provider_quota_reliable", return_value=False),              patch("manager.ag_language_server.discover_language_server") as discover:
+            result = ag_availability_check(service="svc")
         self.assertFalse(result)
+        discover.assert_not_called()
 
-    def test_gate_fails_closed_when_binary_not_found(self):
-        with patch("manager.ag_cli_runner.verify_auth_identity", return_value="user@example.com"), \
-             patch("manager.ag_cli_runner.resolve_ag_cli_executable",
-                   side_effect=FileNotFoundError("agy not found")):
-            result = ag_availability_check(service=None)
+    def test_gate_fails_closed_when_language_server_missing(self):
+        from manager.ag_language_server import AgLsError
+        with patch("manager.command_watcher.provider_quota_reliable", return_value=True),              patch("manager.ag_language_server.discover_language_server",
+                   side_effect=AgLsError("ide_not_running", "no process")):
+            result = ag_availability_check(service="svc")
         self.assertFalse(result)
 
     def test_gate_fails_closed_on_unexpected_exception(self):
-        with patch("manager.ag_cli_runner.verify_auth_identity",
-                   side_effect=RuntimeError("unexpected")):
+        with patch("manager.command_watcher.provider_quota_reliable", side_effect=RuntimeError("unexpected")):
             result = ag_availability_check(service=None)
         self.assertFalse(result)
 
-    def test_gate_service_arg_accepted_but_not_forwarded(self):
-        """service accepted for interface parity; gate outcome must not depend on it."""
-        with patch("manager.ag_cli_runner.verify_auth_identity", return_value="u@g.com"), \
-             patch("manager.ag_cli_runner.resolve_ag_cli_executable", return_value=("agy", [])):
-            self.assertTrue(ag_availability_check(service=MagicMock()))
-            self.assertTrue(ag_availability_check(service=None))
+    def test_gate_reads_antigravity_quota_only_never_another_provider(self):
+        """One provider's fresh quota must never satisfy AG's gate."""
+        def by_provider(service, provider, account_id=None):
+            return provider == "codex"
+        with patch("manager.command_watcher.provider_quota_reliable", side_effect=by_provider),              patch("manager.ag_language_server.discover_language_server", return_value=object()):
+            self.assertFalse(ag_availability_check(service="svc"))
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +216,12 @@ class TestProcessCommandAgRouting(unittest.TestCase):
             result = process_command(
                 store, MagicMock(), cmd,
                 quota_check=lambda svc: True,
+                # process_command's Session Center gate is the injectable
+                # `health_check` parameter (default session_center_healthy,
+                # bound at definition time) -- patching the module attribute
+                # alone never reaches it, which is why this test was failing
+                # on main with reason=session_center_unavailable.
+                health_check=lambda: True,
                 claim_factory=lambda *_args: MemoryClaimRegistry(),
                 allowlist=frozenset({("p1", "t1")}),
             )

@@ -358,3 +358,51 @@ class LegacyAggregateNeverRescuesNamedAccounts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def antigravity_item(remaining=(67.5, 100.0, 65.5, 100.0), updated=NOW, source="antigravity_language_server_quota_summary",
+                     source_type="official", confidence="official"):
+    names = ("gemini-weekly", "gemini-5h", "3p-weekly", "3p-5h")
+    durations = (10080, 300, 10080, 300)
+    return {
+        "provider": "antigravity", "display_name": "Antigravity", "collection_mode": "automatic",
+        "source": source, "source_type": source_type, "confidence": confidence,
+        "last_updated": updated.isoformat(), "status": "ok",
+        "windows": [{"name": name, "duration_minutes": duration, "remaining_percent": value,
+                     "used_percent": round(100 - value, 1), "resets_at": None}
+                    for name, duration, value in zip(names, durations, remaining)],
+    }
+
+
+class AntigravityQuotaTests(unittest.TestCase):
+    """collectors/antigravity.py entries are judged by the exact same rules as Codex/Claude."""
+
+    def test_official_language_server_entry_is_reliable_and_usable(self):
+        item = next(p for p in summarize(doc(antigravity_item()), now=NOW)["providers"] if p["provider"] == "antigravity")
+        self.assertTrue(item["source_reliable"])
+        self.assertTrue(item["source_verified"])
+        self.assertTrue(item["has_reliable_quota"])
+        self.assertTrue(item["has_usable_quota"])
+        self.assertEqual("fresh", item["freshness"])
+        self.assertEqual(4, len(item["windows"]))
+
+    def test_one_exhausted_bucket_makes_it_unusable_but_still_reliable(self):
+        item = next(p for p in summarize(doc(antigravity_item(remaining=(0.0, 100.0, 65.5, 100.0))), now=NOW)["providers"]
+                    if p["provider"] == "antigravity")
+        self.assertTrue(item["has_reliable_quota"])
+        self.assertFalse(item["has_usable_quota"])
+
+    def test_stale_or_manual_antigravity_stays_unusable(self):
+        from datetime import timedelta
+        stale = next(p for p in summarize(doc(antigravity_item(updated=NOW - timedelta(hours=2))), now=NOW)["providers"]
+                     if p["provider"] == "antigravity")
+        self.assertEqual("stale", stale["freshness"])
+        self.assertFalse(stale["has_usable_quota"])
+        manual = next(p for p in summarize(doc(antigravity_item(source="manual_report", source_type="manual", confidence="manual")), now=NOW)["providers"]
+                      if p["provider"] == "antigravity")
+        self.assertFalse(manual["source_reliable"])
+        self.assertFalse(manual["has_reliable_quota"])
+        unknown_source = next(p for p in summarize(doc(antigravity_item(source="some_cache")), now=NOW)["providers"]
+                              if p["provider"] == "antigravity")
+        self.assertTrue(unknown_source["source_reliable"])
+        self.assertFalse(unknown_source["source_verified"])
