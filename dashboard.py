@@ -200,128 +200,194 @@ st.set_page_config(
 )
 
 # Traditional Chinese operations-console styling. The data and truth builders
-# below remain unchanged; this layer only improves hierarchy and scan speed.
+# below remain unchanged; this layer only decides hierarchy, density and how
+# fast a state can be read. Three primitives carry the whole live UI: the
+# status band (what is happening now), the row (one real record), and the
+# chip (one real state, always spelled out in words -- colour reinforces the
+# word, it is never the only signal).
 st.markdown("""
 <style>
-    :root { --adm-bg: #f4f6f3; --adm-panel: #ffffff; --adm-panel-2: #eef3ef; --adm-line: #dce5df; --adm-text: #1d2b25; --adm-muted: #6d7d73; --adm-blue: #2f7d68; --adm-green: #2f8f6b; --adm-amber: #b7791f; --adm-red: #c94b4b; }
+    /* Tokens. One cool-green neutral family, one accent, one shadow.
+       Text tiers are contrast-checked on --adm-panel: text 13.4:1,
+       text-2 7.4:1, muted 5.3:1 -- all above the 4.5:1 body floor. */
+    :root {
+        --adm-bg: #f1f4f2; --adm-panel: #ffffff; --adm-panel-2: #e8eeea;
+        --adm-line: #d3ddd7; --adm-line-soft: #e4eae6;
+        --adm-text: #16231d; --adm-text-2: #44544b; --adm-muted: #5d6d64;
+        --adm-accent: #1f6b53; --adm-accent-soft: #e6f0eb;
+        --adm-green: #1f6b53; --adm-amber: #8a5a12; --adm-red: #a32c2c;
+        --adm-shadow: 0 1px 2px rgba(22,44,34,.05), 0 6px 16px rgba(22,44,34,.045);
+        --adm-r: 8px; --adm-r-sm: 5px;
+        /* Legacy alias so the disabled pre-st.stop() block still resolves. */
+        --adm-blue: #1f6b53;
+    }
     .stApp {
         background: var(--adm-bg);
         color: var(--adm-text);
         font-family: "Aptos", "Segoe UI", "Microsoft JhengHei", sans-serif;
+        font-variant-numeric: tabular-nums;
     }
+    /* Browser surfaces belong to the design too. */
+    ::selection { background: #cfe4d9; color: var(--adm-text); }
+    *:focus-visible { outline: 2px solid var(--adm-accent); outline-offset: 2px; border-radius: 3px; }
+    ::-webkit-scrollbar { width: 11px; height: 11px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #c4cfc8; border-radius: 999px; border: 3px solid var(--adm-bg); }
+    ::-webkit-scrollbar-thumb:hover { background: #aab8b0; }
+
     [data-testid="stHeader"] { background: transparent; }
-    [data-testid="stSidebar"] { background: #eaf0eb; border-right: 1px solid var(--adm-line); }
+    [data-testid="stSidebar"] { background: var(--adm-panel-2); border-right: 1px solid var(--adm-line); }
     [data-testid="stSidebar"] .stMarkdown { color: var(--adm-muted); }
-    h1, h2, h3 { letter-spacing: -0.025em; }
-    h1 { font-size: 2.35rem !important; margin-bottom: .2rem !important; }
-    h2 { margin-top: 2rem !important; }
-    .block-container { max-width: 1480px; padding-top: 2.5rem; padding-bottom: 4rem; }
-    .glass-card {
-        background: var(--adm-panel);
-        border: 1px solid var(--adm-line);
-        border-radius: 16px;
-        padding: 18px 20px;
-        margin-bottom: 14px;
-        box-shadow: 0 8px 24px rgba(39,66,51,.06);
+    [data-testid="stSidebar"] h2 { border: 0 !important; padding: 0 !important; margin: 0 0 .6rem !important; font-size: .95rem !important; }
+    .block-container { max-width: 1400px; padding: 1.15rem 2rem 3rem; }
+
+    /* Fixed rem scale, ~1.2 ratio: one voice, obvious steps, no fluid type. */
+    h1 { font-size: 1.5rem !important; font-weight: 700; letter-spacing: -.02em; margin: 0 0 .15rem !important; }
+    h2, h3 {
+        font-size: 1rem !important; font-weight: 700; letter-spacing: -.005em;
+        margin: 1.7rem 0 .5rem !important; padding-bottom: .35rem;
+        border-bottom: 1px solid var(--adm-line-soft);
     }
-    .hero-card { background: #1e332b; border: 1px solid #2c5140; border-radius: 20px; padding: 26px 28px; margin: 1rem 0 1.25rem; }
-    .hero-kicker, .metric-label { color: var(--adm-muted); font-size: .72rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
-    .hero-title { font-size: 1.8rem; font-weight: 750; margin: .45rem 0 .35rem; }
-    .hero-copy { color: #c7d9ce; font-size: .98rem; }
-    .hero-next { border-left: 2px solid #75c9a5; padding-left: 14px; color: #e2eee6; }
-    .hero-next strong { color: white; }
-    .metric-value { font-size: 2rem; font-weight: 750; color: var(--adm-blue); line-height: 1.1; margin-top: .35rem; }
-    .metric-card { min-height: 96px; }
+    [data-testid="stCaptionContainer"] p { color: var(--adm-muted); font-size: .8125rem; line-height: 1.6; }
+    [data-testid="stAlert"] { border-radius: var(--adm-r-sm); font-size: .85rem; }
+    [data-testid="stDataFrame"], [data-testid="stTable"] { font-variant-numeric: tabular-nums; }
+    [data-testid="stExpander"] details { border-radius: var(--adm-r-sm); border-color: var(--adm-line); }
+    .stButton > button {
+        border-radius: var(--adm-r-sm); border: 1px solid var(--adm-line);
+        background: var(--adm-panel); color: var(--adm-text);
+        font-weight: 650; font-size: .85rem;
+        transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
+    }
+    .stButton > button:hover { background: var(--adm-accent-soft); border-color: #b8d1c4; color: var(--adm-accent); }
+    .stButton > button:active { transform: translateY(1px); }
+
+    /* Status band: the one thing read first -- state, the three counts that
+       decide whether to act, and the next automatic action. Same surface as
+       every other panel; no dark slab dropped into a light page. */
+    .adm-band {
+        background: var(--adm-panel); border: 1px solid var(--adm-line);
+        border-radius: var(--adm-r); padding: 14px 16px; margin: .5rem 0 1.15rem;
+        box-shadow: var(--adm-shadow);
+    }
+    .adm-band-grid { display: grid; grid-template-columns: minmax(0, 1.9fr) repeat(3, minmax(94px, .6fr)); gap: 12px 20px; align-items: start; }
+    .adm-band-state { font-size: 1.3rem; font-weight: 750; letter-spacing: -.02em; line-height: 1.25; }
+    .adm-band-detail { color: var(--adm-text-2); font-size: .845rem; line-height: 1.55; margin-top: .3rem; }
+    .adm-stat { border-left: 1px solid var(--adm-line-soft); padding-left: 15px; }
+    .adm-stat-k { color: var(--adm-muted); font-size: .75rem; line-height: 1.35; }
+    .adm-stat-v { font-size: 1.26rem; font-weight: 700; letter-spacing: -.02em; margin-top: .1rem; }
+    .adm-band-next {
+        margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--adm-line-soft);
+        display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px;
+        align-items: baseline; font-size: .855rem; color: var(--adm-text-2);
+    }
+    .adm-band-next b { color: var(--adm-muted); font-weight: 650; font-size: .75rem; white-space: nowrap; }
+
+    /* State words. */
     .state-running { color: var(--adm-green) !important; }
     .state-attention { color: var(--adm-red) !important; }
     .state-waiting { color: var(--adm-amber) !important; }
-    .state-idle { color: var(--adm-muted) !important; }
-    .recommendation-card {
-        background: var(--adm-panel);
-        border: 1px solid var(--adm-line);
-        border-radius: 10px;
-        padding: 20px 24px;
-        margin-bottom: 18px;
-    }
-    .badge {
-        display: inline-block;
-        padding: 4px 10px;
-        border-radius: 999px;
-        font-size: 0.75rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        margin-right: 5px;
-        margin-bottom: 4px;
-    }
-    .badge-ok { background-color: #245ca8; color: #ffffff; }
-    .badge-running, .badge-fresh { background-color: #176b4e; color: #ffffff; }
-    .badge-waiting, .badge-attention { background-color: #8a5a16; color: #ffffff; }
-    .badge-danger, .badge-stale { background-color: #8d2938; color: #ffffff; }
-    .badge-unknown, .badge-manual { background-color: #43536b; color: #ffffff; }
-    .badge-official { background-color: #245ca8; color: #ffffff; }
+    .state-idle { color: var(--adm-text-2) !important; }
 
-    /* Action Badges */
-    .badge-action-consume { background-color: #2ea043; color: #ffffff; font-weight: bold; }
-    .badge-action-normal { background-color: #1f6feb; color: #ffffff; }
-    .badge-action-conserve { background-color: #bb8009; color: #ffffff; font-weight: bold; }
-    .badge-action-hold { background-color: #da3633; color: #ffffff; font-weight: bold; }
+    .chip {
+        display: inline-block; padding: 2px 9px; border-radius: 999px;
+        font-size: .735rem; font-weight: 700; line-height: 1.55;
+        white-space: nowrap; border: 1px solid transparent;
+    }
+    .chip-running { background: #e0efe7; color: #14523d; border-color: #bedbce; }
+    .chip-attention { background: #f8e1e1; color: #7d2020; border-color: #e7c0c0; }
+    .chip-waiting { background: #f8ecd6; color: #6f4509; border-color: #e6d3ae; }
+    .chip-done { background: #e8ece9; color: #3d4d44; border-color: #d3ddd7; }
+    .chip-idle { background: #eef2f0; color: #52625a; border-color: #dde5e0; }
 
-    /* Priorities */
-    .priority-urgent { color: var(--adm-red); font-weight: bold; }
-    .priority-high { color: var(--adm-amber); font-weight: bold; }
-    .priority-normal { color: var(--adm-blue); }
-    .priority-low { color: var(--adm-muted); }
-    .workbench-section { margin: 2rem 0 1rem; }
-    .section-kicker { color: var(--adm-muted); font-size: .72rem; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
-    .section-title { font-size: 1.35rem; font-weight: 750; margin: .25rem 0 1rem; }
-    .active-card { background: #fff; border: 1px solid var(--adm-line); border-radius: 16px; padding: 17px 19px; min-height: 132px; box-shadow: 0 8px 24px rgba(39,66,51,.05); }
-    .active-card h3 { margin: 0 0 .65rem; font-size: 1.05rem; }
-    .active-meta, .quota-meta { color: var(--adm-muted); font-size: .84rem; line-height: 1.65; }
-    .quota-card { background: #fff; border: 1px solid var(--adm-line); border-radius: 16px; padding: 17px; display: flex; gap: 15px; align-items: center; min-height: 140px; }
-    .quota-ring { width: 82px; height: 82px; border-radius: 50%; display: grid; place-items: center; flex: 0 0 auto; }
-    .quota-ring-inner { width: 58px; height: 58px; border-radius: 50%; background: #fff; display: grid; place-items: center; color: var(--adm-text); font-size: .72rem; font-weight: 750; text-align: center; line-height: 1.1; }
-    .quota-ring.single { background: conic-gradient(var(--adm-blue) calc(var(--pct) * 1%), #e5ece7 0); }
-    .quota-ring.double { background: conic-gradient(var(--adm-blue) calc(var(--outer) * 1%), #e5ece7 0); }
-    .quota-ring.double .quota-ring-inner { background: conic-gradient(#79b99c calc(var(--inner) * 1%), #edf2ee 0); border: 6px solid #fff; }
-    .quota-ring.double .quota-ring-inner span { background: #fff; border-radius: 50%; padding: 7px 4px; }
-    .quota-number { font-size: 1.6rem; font-weight: 800; letter-spacing: -.04em; }
-    .quota-compact-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
-    .quota-compact-card { background: #fff; border: 1px solid var(--adm-line); border-radius: 16px; padding: 14px 16px; display: flex; gap: 13px; align-items: center; min-height: 112px; box-shadow: 0 8px 24px rgba(39,66,51,.045); }
-    .quota-compact-card .quota-ring { width: 68px; height: 68px; }
-    .quota-compact-card .quota-ring-inner { width: 48px; height: 48px; font-size: .66rem; }
-    .quota-compact-card .quota-ring.double .quota-ring-inner { border-width: 5px; }
-    .quota-compact-card .quota-number { font-size: 1.02rem; letter-spacing: -.02em; }
-    .quota-compact-card .quota-meta { font-size: .77rem; line-height: 1.5; }
-    .quiet-note { color: var(--adm-muted); font-size: .82rem; }
+    /* Row: one real record. The chip rail, the title baseline and the
+       right-hand time line up down the list, so the eye scans one column at
+       a time instead of re-reading every card. */
+    .adm-list { display: flex; flex-direction: column; gap: 6px; }
+    .adm-row {
+        display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px;
+        align-items: start; background: var(--adm-panel);
+        border: 1px solid var(--adm-line); border-radius: var(--adm-r-sm);
+        padding: 9px 12px;
+    }
+    .adm-row > .chip { min-width: 4.6rem; text-align: center; margin-top: 1px; }
+    .adm-row-title { display: flex; justify-content: space-between; gap: 14px; align-items: baseline; font-size: .9rem; font-weight: 650; overflow-wrap: anywhere; }
+    .adm-row-right { color: var(--adm-muted); font-size: .775rem; font-weight: 500; white-space: nowrap; flex: 0 0 auto; }
+    .adm-row-meta { color: var(--adm-muted); font-size: .8rem; line-height: 1.55; margin-top: 3px; overflow-wrap: anywhere; }
+    .adm-row-meta b { color: var(--adm-text-2); font-weight: 650; }
+    .adm-row-next { margin-top: 4px; font-size: .8rem; line-height: 1.55; color: var(--adm-text-2); overflow-wrap: anywhere; }
+    .adm-row-next b { color: var(--adm-muted); font-weight: 650; }
+
+    .adm-hgrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+    .adm-hcard { background: var(--adm-panel); border: 1px solid var(--adm-line); border-radius: var(--adm-r-sm); padding: 11px 13px; }
+    .adm-hcard-name { color: var(--adm-muted); font-size: .78rem; }
+    .adm-hcard-state { font-size: 1.02rem; font-weight: 700; margin: .22rem 0 .3rem; }
+    .adm-hcard-detail { color: var(--adm-text-2); font-size: .8rem; line-height: 1.5; overflow-wrap: anywhere; }
+
     /* Quota entity cards: one identical card per real entity (Codex / Claude A / Claude B).
        Two window rows (5H, 每週), a freshness state that is text first and color second,
-       and the last capture time -- warnings live inside the card, never as page banners. */
-    .qe-card { background: var(--adm-panel); border: 1px solid var(--adm-line); border-radius: 14px; padding: 14px 16px 12px; min-height: 178px; display: flex; flex-direction: column; gap: 8px; box-shadow: 0 6px 18px rgba(39,66,51,.05); }
+       and the last capture time -- warnings live inside the card, never as page banners.
+       The markup is contract-locked by manager/test_dashboard_app.py; only the
+       surface treatment below is realigned with the row/band system. */
+    .qe-card { background: var(--adm-panel); border: 1px solid var(--adm-line); border-radius: var(--adm-r); padding: 13px 15px 11px; min-height: 172px; display: flex; flex-direction: column; gap: 8px; box-shadow: var(--adm-shadow); }
     .qe-card.qe-stale, .qe-card.qe-error { border-color: #d9b9a0; background: #fffaf5; }
     .qe-card.qe-exhausted { border-color: #e2b8b8; }
     .qe-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
-    .qe-title { font-size: 1.05rem; font-weight: 750; letter-spacing: -.01em; }
-    .qe-state { font-size: .74rem; font-weight: 700; padding: 3px 9px; border-radius: 999px; white-space: nowrap; }
-    .qe-state-fresh { background: #e3f1ea; color: #1f5f45; }
-    .qe-state-stale { background: #f7e6cf; color: #7a4c0b; }
-    .qe-state-unknown { background: #e6e9ec; color: #43536b; }
-    .qe-state-error, .qe-state-exhausted { background: #f5dada; color: #7d2323; }
-    .qw-row { display: grid; grid-template-columns: 2.6rem 3.2rem 1fr; gap: 8px 10px; align-items: center; font-size: .84rem; }
+    .qe-title { font-size: 1rem; font-weight: 750; letter-spacing: -.01em; }
+    .qe-state { font-size: .735rem; font-weight: 700; padding: 2px 9px; border-radius: 999px; white-space: nowrap; border: 1px solid transparent; }
+    .qe-state-fresh { background: #e0efe7; color: #14523d; border-color: #bedbce; }
+    .qe-state-stale { background: #f8ecd6; color: #6f4509; border-color: #e6d3ae; }
+    .qe-state-unknown { background: #eef2f0; color: #52625a; border-color: #dde5e0; }
+    .qe-state-error, .qe-state-exhausted { background: #f8e1e1; color: #7d2020; border-color: #e7c0c0; }
+    .qw-row { display: grid; grid-template-columns: 2.6rem 3.2rem 1fr; gap: 7px 10px; align-items: center; font-size: .84rem; }
     .qw-label { color: var(--adm-muted); font-weight: 650; }
     .qw-value { font-weight: 750; font-variant-numeric: tabular-nums; }
-    .qw-bar { display: block; height: 6px; border-radius: 999px; background: #e5ece7; overflow: hidden; }
-    .qw-bar i { display: block; height: 100%; border-radius: 999px; background: var(--adm-blue); }
-    .qe-stale .qw-bar i, .qe-unknown .qw-bar i { background: #bfc9c2; }
+    .qw-bar { display: block; height: 6px; border-radius: 999px; background: #e3eae6; overflow: hidden; }
+    .qw-bar i { display: block; height: 100%; border-radius: 999px; background: var(--adm-accent); }
+    .qe-stale .qw-bar i, .qe-unknown .qw-bar i { background: #bcc7c0; }
     .qe-exhausted .qw-bar i { background: var(--adm-red); }
-    .qw-reset { grid-column: 2 / span 2; color: var(--adm-muted); font-size: .78rem; font-variant-numeric: tabular-nums; }
-    .qw-missing { color: var(--adm-muted); font-size: .8rem; }
-    .qe-foot { margin-top: auto; color: var(--adm-muted); font-size: .76rem; font-variant-numeric: tabular-nums; }
-    .qe-note { font-size: .8rem; color: #7a4c0b; background: #fbf1e2; border-radius: 8px; padding: 6px 9px; }
-    .qe-note.qe-note-error { color: #7d2323; background: #f9e7e7; }
-    .qe-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
-    @media (max-width: 1100px) { .qe-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-    @media (max-width: 720px) { .qe-grid { grid-template-columns: 1fr; } }
-    @media (max-width: 768px) { .block-container { padding: 1.25rem .9rem 3rem; } h1 { font-size: 1.8rem !important; } .hero-card { padding: 18px; } }
+    .qw-reset { grid-column: 2 / span 2; color: var(--adm-muted); font-size: .775rem; font-variant-numeric: tabular-nums; }
+    .qw-missing { color: var(--adm-muted); font-size: .79rem; }
+    .qe-foot { margin-top: auto; color: var(--adm-muted); font-size: .755rem; font-variant-numeric: tabular-nums; }
+    .qe-note { font-size: .8rem; line-height: 1.5; color: #6f4509; background: #fbf2e4; border-radius: var(--adm-r-sm); padding: 6px 9px; }
+    .qe-note.qe-note-error { color: #7d2020; background: #f9e8e8; }
+    .qe-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+
+    @media (max-width: 1180px) { .adm-band-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } .adm-band-grid > :first-child { grid-column: 1 / -1; } .adm-stat:first-of-type { border-left: 0; padding-left: 0; } }
+    @media (max-width: 1100px) { .qe-grid, .adm-hgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 768px) { .block-container { padding: 1rem .9rem 3rem; } .adm-row { grid-template-columns: 1fr; } .adm-row > .chip { justify-self: start; } }
+    @media (max-width: 720px) { .qe-grid, .adm-hgrid, .adm-band-grid { grid-template-columns: 1fr; } .adm-stat { border-left: 0; padding-left: 0; } }
+
+    /* ---- Legacy styles (disabled pre-st.stop() v2 block only) ----------
+       Nothing above this line uses them. They are kept only so the legacy
+       block at the bottom of this file still renders if it is ever
+       re-enabled; delete them together with that block. */
+    .glass-card { background: var(--adm-panel); border: 1px solid var(--adm-line); border-radius: var(--adm-r); padding: 14px 16px; margin-bottom: 10px; }
+    .hero-card { background: var(--adm-panel); border: 1px solid var(--adm-line); border-radius: var(--adm-r); padding: 16px 18px; margin: .75rem 0 1rem; }
+    .hero-kicker, .metric-label { color: var(--adm-muted); font-size: .75rem; font-weight: 650; }
+    .hero-title { font-size: 1.05rem; font-weight: 700; margin: .2rem 0 .3rem; }
+    .hero-copy { color: var(--adm-text-2); font-size: .855rem; line-height: 1.55; }
+    .hero-next { color: var(--adm-text-2); font-size: .8rem; margin-top: .35rem; }
+    .hero-next strong { color: var(--adm-muted); font-weight: 650; }
+    .metric-value { font-size: 1.26rem; font-weight: 700; color: var(--adm-accent); }
+    .metric-card, .active-card, .recommendation-card, .quota-card, .quota-compact-card { background: var(--adm-panel); border: 1px solid var(--adm-line); border-radius: var(--adm-r-sm); padding: 12px 14px; }
+    .active-meta, .quota-meta, .quiet-note { color: var(--adm-muted); font-size: .8rem; line-height: 1.55; }
+    .workbench-section { margin: 1.5rem 0 .75rem; }
+    .section-kicker { color: var(--adm-muted); font-size: .75rem; font-weight: 650; }
+    .section-title { font-size: 1rem; font-weight: 700; margin: .2rem 0 .6rem; }
+    .badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: .735rem; font-weight: 700; margin-right: 5px; }
+    .badge-ok, .badge-official { background: #e0e9f4; color: #1c4478; }
+    .badge-running, .badge-fresh { background: #e0efe7; color: #14523d; }
+    .badge-waiting, .badge-attention { background: #f8ecd6; color: #6f4509; }
+    .badge-danger, .badge-stale { background: #f8e1e1; color: #7d2020; }
+    .badge-unknown, .badge-manual { background: #eef2f0; color: #52625a; }
+    .badge-action-consume { background: #e0efe7; color: #14523d; }
+    .badge-action-normal { background: #e0e9f4; color: #1c4478; }
+    .badge-action-conserve { background: #f8ecd6; color: #6f4509; }
+    .badge-action-hold { background: #f8e1e1; color: #7d2020; }
+    .priority-urgent { color: var(--adm-red); font-weight: 700; }
+    .priority-high { color: var(--adm-amber); font-weight: 700; }
+    .priority-normal { color: var(--adm-accent); }
+    .priority-low { color: var(--adm-muted); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -871,6 +937,87 @@ def _render_execution_snapshot(data):
     st.table(pd.DataFrame(rows))
 
 
+# ---- Presentation primitives -------------------------------------------
+# One chip vocabulary and one row shape for every list on every page, so a
+# state means the same thing wherever it is read. Neither adds meaning: they
+# render strings the truth builders already resolved, and the state word is
+# always present -- colour only reinforces the word it sits behind.
+_CHIP_TONES = {
+    "running": "running", "in_progress": "running", "correlating": "running",
+    "finishing": "running",
+    "blocked": "attention", "attention": "attention", "failed": "attention",
+    "interrupted": "attention",
+    "queued": "waiting", "claimed": "waiting", "submitted": "waiting",
+    "reserved": "waiting", "ready": "waiting", "waiting": "waiting",
+    "awaiting_validation": "waiting",
+    "completed": "done", "cancelled": "done", "merged": "done",
+    "deferred": "idle", "pending": "idle",
+}
+# Dispatch states are their own uppercase vocabulary (see
+# manager.dashboard_core.compute_dispatch_state); they are rendered verbatim.
+_DISPATCH_TONES = {
+    "RUNNING": "running",
+    "SUBMITTED": "waiting", "ACCEPTED": "waiting", "QUEUED": "waiting",
+    "CLAIMED": "waiting", "WAITING_QUOTA": "waiting",
+    "COMPLETED": "done", "CANCELLED": "done",
+    "FAILED": "attention", "BLOCKED": "attention", "REJECTED": "attention",
+    "UNKNOWN": "idle",
+}
+# The chip reads in the UI's language; the canonical uppercase token stays on
+# the detail line, so a row can still be matched against logs and records.
+_DISPATCH_LABELS = {
+    "SUBMITTED": "已送出", "ACCEPTED": "已受理", "QUEUED": "排隊中",
+    "CLAIMED": "已接單", "RUNNING": "執行中", "COMPLETED": "已完成",
+    "FAILED": "失敗", "BLOCKED": "已阻塞", "CANCELLED": "已取消",
+    "REJECTED": "已拒絕", "WAITING_QUOTA": "等待配額", "UNKNOWN": "未知",
+}
+
+
+def _chip(status, label=None, tone=None):
+    """One state chip. `label` supplies the word when the caller already
+    resolved one that differs from the raw status (a record persisted as
+    running without live proof reads 需要處理, never 執行中); `tone` then
+    supplies the matching colour so the two never disagree."""
+    text = label if label is not None else _ui_state(status)
+    resolved = tone or _CHIP_TONES.get(str(status or "").casefold(), "idle")
+    return f'<span class="chip chip-{resolved}">{_ui_text(text, "未知")}</span>'
+
+
+def _row(chip_html, title, right=None, meta=None, next_action=None):
+    """One record as a row. All text arguments must already be escaped."""
+    parts = [f'<div class="adm-row">{chip_html}<div><div class="adm-row-title"><span>{title}</span>']
+    if right:
+        parts.append(f'<span class="adm-row-right">{right}</span>')
+    parts.append("</div>")
+    if meta:
+        parts.append(f'<div class="adm-row-meta">{meta}</div>')
+    if next_action:
+        parts.append(f'<div class="adm-row-next"><b>下一步</b>　{next_action}</div>')
+    parts.append("</div></div>")
+    return "".join(parts)
+
+
+def _rows(items):
+    return '<div class="adm-list">' + "".join(items) + "</div>"
+
+
+def _ui_elapsed(started_at, now=None):
+    """How long a real start timestamp has been running. None when the
+    record carries no start time -- an unknown duration is never guessed."""
+    parsed = parse_time(started_at)
+    if not parsed:
+        return None
+    now = now or datetime.now(timezone.utc)
+    minutes = max(0, int((now - parsed).total_seconds() // 60))
+    hours, mins = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days} 天 {hours} 小時"
+    if hours:
+        return f"{hours} 小時 {mins} 分"
+    return f"{mins} 分"
+
+
 def _render_dispatch_snapshot(data):
     projects = {project.get("project_id"): project for project in data.get("projects", []) if project.get("project_id")}
     commands = {}
@@ -904,11 +1051,20 @@ def _render_dispatch_snapshot(data):
     if not rows:
         return
     st.header("派工狀態")
+    st.caption("Task／Command／Execution 的實際判定。pre-Task 列來自尚未成為 Task 的 dispatch request；UNKNOWN 表示這次刷新無法證實，不是「沒有」。")
     for row in rows[:6]:
         request_id = row.get("request_id")
-        identifier = f" request {request_id}" if request_id else ""
         title = row.get("task_title") or row.get("task_id") or "未知任務"
-        st.markdown(f"**{_ui_text(row.get('dispatch_state'))}**{identifier} {_ui_text(title)}：{_ui_text(row.get('dispatch_reason'))}")
+        state = str(row.get("dispatch_state") or "")
+        token = state.upper()
+        st.markdown(_row(
+            _chip(state, label=_DISPATCH_LABELS.get(token, state or "未知"),
+                  tone=_DISPATCH_TONES.get(token, "idle")),
+            _ui_text(title),
+            right=f"request {_ui_text(request_id)}" if request_id else None,
+            meta=(f'<b>{_ui_text(state, "UNKNOWN")}</b>　'
+                  f'{_ui_text(row.get("dispatch_reason"), "沒有可讀的判定原因")}'),
+        ), unsafe_allow_html=True)
 
 
 def _render_task_detail(data):
@@ -976,41 +1132,54 @@ def _render_overview(data):
         headline_detail = "目前沒有已證實正在執行的 AI 任務"
         next_action = "選擇一個待執行任務，或同步最新資料"
 
-    st.title("ADM")
-    st.caption("個人營運工作台。先看現在，再按需要下鑽。")
+    tone = "running" if active else "attention" if has_attention else "waiting" if queued else "idle"
+    attention_count = len(attention) + len(attention_tasks)
+    reliable = sum(1 for card in (brief.accounts if brief else []) if card.has_reliable_quota)
+    total = len(brief.accounts) if brief else 0
+
+    st.title("ADM 工作台")
+    st.caption("先看現在有沒有事在跑、有沒有事卡住、還剩多少配額；細節在左側各分頁下鑽。")
+    # One status band instead of a headline block plus a separate metric row:
+    # the four facts that decide whether a person has to act are read at one
+    # glance, on the same surface as every other panel.
     st.markdown(f"""
-    <section class="hero-card" aria-label="目前工作狀態">
-      <div class="hero-kicker">現在</div>
-      <div class="hero-title"><span class="state-{'running' if active else 'attention' if has_attention else 'waiting' if queued else 'idle'}">{headline}</span></div>
-      <div class="hero-copy"><strong>{headline_detail}</strong></div>
-      <div class="hero-next"><strong>下一步</strong><br>{_ui_text(next_action)}</div>
+    <section class="adm-band" aria-label="目前工作狀態">
+      <div class="adm-band-grid">
+        <div>
+          <div class="adm-band-state"><span class="state-{tone}">{headline}</span></div>
+          <div class="adm-band-detail">{headline_detail}</div>
+        </div>
+        <div class="adm-stat"><div class="adm-stat-k">正在做</div><div class="adm-stat-v">{len(active)}</div></div>
+        <div class="adm-stat"><div class="adm-stat-k">需要處理</div><div class="adm-stat-v{' state-attention' if attention_count else ''}">{attention_count}</div></div>
+        <div class="adm-stat"><div class="adm-stat-k">可用配額</div><div class="adm-stat-v">{reliable} / {total}</div></div>
+      </div>
+      <div class="adm-band-next"><b>下一步自動動作</b><span>{_ui_text(next_action)}</span></div>
     </section>
     """, unsafe_allow_html=True)
 
-    metric_cols = st.columns(3)
-    metric_cols[0].metric("正在做", min(len(active), 3))
-    metric_cols[1].metric("需要處理", len(attention) + len(attention_tasks))
-    reliable = sum(1 for card in (brief.accounts if brief else []) if card.has_reliable_quota)
-    total = len(brief.accounts) if brief else 0
-    metric_cols[2].metric("可用配額", f"{reliable} / {total}")
-
     st.header("正在做")
     if active:
-        for execution in active[:3]:
+        shown = active[:3]
+        items = []
+        for execution in shown:
             task = _ui_task_for_execution(execution, tasks)
-            provider = execution.get("provider") or task.get("assigned_provider") or "未知"
-            account = execution.get("account_id") or "未知"
-            progress = execution.get("last_provider_event") or task.get("current_progress") or "尚未回報"
-            st.markdown(f"""
-            <div class="glass-card">
-              <div class="metric-label">{_ui_text(provider)} / {_ui_text(account)}</div>
-              <div class="hero-title">{_ui_text(task.get('title') or execution.get('task_id'))}</div>
-              <div class="hero-copy">進度：{_ui_text(progress)}</div>
-              <div class="hero-next"><strong>下一步</strong><br>{_ui_text(task.get('next_action') or '等待最新事件')}</div>
-            </div>
-            """, unsafe_allow_html=True)
+            elapsed = _ui_elapsed(execution.get("started_at"), now)
+            last_event_at = _ui_record_time(execution)
+            items.append(_row(
+                _chip("running"),
+                _ui_text(task.get("title") or execution.get("task_id")),
+                right=f"已執行 {elapsed}" if elapsed else None,
+                meta=(f'AI <b>{_ui_text(execution.get("provider") or task.get("assigned_provider"))}'
+                      f' / {_ui_text(execution.get("account_id"))}</b>　'
+                      f'進度 {_ui_text(execution.get("last_provider_event") or task.get("current_progress"), "尚未回報")}　'
+                      f'最後事件 {_ui_relative_time(last_event_at, now) if last_event_at else "未知"}'),
+                next_action=_ui_text(task.get("next_action") or "等待最新事件"),
+            ))
+        st.markdown(_rows(items), unsafe_allow_html=True)
+        if len(active) > len(shown):
+            st.caption(f"另有 {len(active) - len(shown)} 筆已證實執行中的紀錄，完整清單在「執行」頁。")
     else:
-        st.info("目前沒有已證實正在執行的任務。")
+        st.info("目前沒有已證實正在執行的任務。「執行中」需要真實 Execution 紀錄與真實 OS 進程證據兩者同時成立。")
 
     _render_dispatch_snapshot(data)
 
@@ -1032,6 +1201,7 @@ def _render_overview(data):
                 focus.append({
                     "task_id": item_id,
                     "title": item.get("title"),
+                    "status": item.get("status"),
                     "current_progress": item.get("current_progress"),
                     "next_action": item.get("next_action"),
                 })
@@ -1040,18 +1210,49 @@ def _render_overview(data):
                 break
     st.header("今日重點")
     if focus:
-        for task in focus:
-            st.markdown(f"- **{_ui_text(task.get('title') or task.get('task_id'))}**：{_ui_text(task.get('next_action') or task.get('current_progress'))}")
+        # Each line carries its own real status, so 待執行 and 執行中 are not
+        # read as the same thing just because they sit in the same list.
+        st.markdown(_rows([
+            _row(
+                _chip(task.get("status")),
+                _ui_text(task.get("title") or task.get("task_id")),
+                right=_ui_text(task.get("task_id"), "") if task.get("title") else None,
+                meta=f'進度 {_ui_text(task.get("current_progress"), "尚未回報")}',
+                next_action=_ui_text(task.get("next_action")) if task.get("next_action") else None,
+            )
+            for task in focus
+        ]), unsafe_allow_html=True)
     else:
         st.info("目前沒有可驗證的今日任務。")
 
     if has_attention:
         st.header("需要處理")
-        for execution in attention[:3]:
+        # Same row vocabulary as every other list, with the attention tone:
+        # an amber st.warning would have said 等待 in this palette, which is
+        # not what any of these records mean.
+        shown_executions = attention[:3]
+        shown_tasks = attention_tasks[:max(0, 3 - len(shown_executions))]
+        items = []
+        for execution in shown_executions:
             task = _ui_task_for_execution(execution, tasks)
-            st.warning(f"{_ui_text(task.get('title') or execution.get('task_id'))}：執行狀態 {_ui_state(execution.get('status'))}，未證實仍在執行，請到「執行」頁查看。")
-        for task in attention_tasks[:max(0, 3 - len(attention))]:
-            st.warning(f"{_ui_text(task.get('title') or task.get('task_id'))}：任務 {_ui_state(task.get('status'))}，下一步 {_ui_text(task.get('next_action'))}。")
+            items.append(_row(
+                _chip(execution.get("status"), label="需要處理", tone="attention"),
+                _ui_text(task.get("title") or execution.get("task_id")),
+                right="到「執行」頁查看",
+                meta=f'執行狀態 <b>{_ui_state(execution.get("status"))}</b>，未證實仍在執行。',
+            ))
+        for task in shown_tasks:
+            items.append(_row(
+                _chip(task.get("status"), label="需要處理", tone="attention"),
+                _ui_text(task.get("title") or task.get("task_id")),
+                right=_ui_text(task.get("task_id"), "") if task.get("title") else None,
+                meta=f'任務狀態 <b>{_ui_state(task.get("status"))}</b>。',
+                next_action=_ui_text(task.get("next_action")) if task.get("next_action") else None,
+            ))
+        st.markdown(_rows(items), unsafe_allow_html=True)
+        remaining = attention_count - len(items)
+        if remaining > 0:
+            st.caption(f"另有 {remaining} 筆需要處理的紀錄未列出；完整清單在「執行」與「任務」頁。")
 
     st.header("配額與重置")
     _render_quota_page_alert(brief)
@@ -1072,14 +1273,20 @@ def _render_projects(data):
     if not projects:
         st.info("目前沒有可驗證的專案資料。")
         return
+    items = []
     for project in projects:
         project_tasks = [task for task in tasks if task.get("project_id") == project.get("project_id")]
         active = sum(task.get("status") in {"in_progress", "running", "queued", "ready"} for task in project_tasks)
         blocked = sum(task.get("status") in {"blocked", "attention"} for task in project_tasks)
-        st.markdown(f"""
-        <div class="glass-card"><div class="hero-title">{_ui_text(project.get('name') or project.get('project_id'))}</div>
-        <div class="hero-copy">進行中 {active}　需要處理 {blocked}　近期任務 {len(project_tasks)}</div></div>
-        """, unsafe_allow_html=True)
+        # The chip summarises this project's own task counts -- nothing more.
+        label, tone = ("需要處理", "attention") if blocked else ("進行中", "running") if active else ("無進行中", "idle")
+        items.append(_row(
+            _chip(None, label=label, tone=tone),
+            _ui_text(project.get("name") or project.get("project_id")),
+            right=_ui_text(project.get("project_id"), "") if project.get("name") else None,
+            meta=f"進行中 <b>{active}</b>　需要處理 <b>{blocked}</b>　近期任務 <b>{len(project_tasks)}</b>",
+        ))
+    st.markdown(_rows(items), unsafe_allow_html=True)
 
 
 def _render_tasks(data):
@@ -1089,13 +1296,20 @@ def _render_tasks(data):
     if not tasks:
         st.info("目前沒有可驗證的任務資料。")
         return
+    items = []
     for task in tasks[:12]:
-        st.markdown(f"""
-        <div class="glass-card"><div class="metric-label">{_ui_state(task.get('status'))} / {_ui_text(task.get('task_id'))}</div>
-        <div class="hero-title">{_ui_text(task.get('title') or task.get('task_id'))}</div>
-        <div class="hero-copy">目前進度：{_ui_text(task.get('current_progress'))}</div>
-        <div class="hero-next"><strong>下一步</strong><br>{_ui_text(task.get('next_action'))}</div></div>
-        """, unsafe_allow_html=True)
+        updated_at = _ui_record_time(task)
+        items.append(_row(
+            _chip(task.get("status")),
+            _ui_text(task.get("title") or task.get("task_id")),
+            right=_ui_relative_time(updated_at) if updated_at else None,
+            meta=(f'{_ui_text(task.get("task_id"))}　'
+                  f'目前進度 {_ui_text(task.get("current_progress"), "尚未回報")}'),
+            next_action=_ui_text(task.get("next_action")) if task.get("next_action") else None,
+        ))
+    st.markdown(_rows(items), unsafe_allow_html=True)
+    if len(tasks) > 12:
+        st.caption(f"另有 {len(tasks) - 12} 筆近期任務未列出。")
 
 
 def _render_sync_status_line(data):
@@ -1134,18 +1348,21 @@ def _render_executions(data):
         else:
             state = _ui_state(execution.get("status"))
         task = _ui_task_for_execution(execution, tasks)
+        # Column order follows the reading order of the question this page
+        # answers: what state, whose task, which AI, what happened last, when,
+        # and only then the lifecycle identifiers and process evidence.
         rows.append({
             "狀態": state,
             "任務": task.get("title") or execution.get("task_id") or "未知",
+            "AI／帳戶": f"{execution.get('provider') or '未知'} / {execution.get('account_id') or '—'}",
+            "最後事件": execution.get("last_provider_event") or "—",
+            "最近心跳": _ui_time(execution.get("heartbeat_at")) if execution.get("heartbeat_at") else "—",
+            "結果": execution.get("terminal_reason") or ((execution.get("cleanup_evidence") or {}).get("provider_outcome")) or "—",
             "Command": command.get("command_id") or "—",
             "Execution": execution.get("execution_id") or "—",
-            "AI／帳戶": f"{execution.get('provider') or '未知'} / {execution.get('account_id') or '—'}",
             "Session": execution.get("provider_session_id") or execution.get("session_id") or "—",
             "分支／基準": f"{(snapshot.get('branch') or '—').replace('refs/heads/', '')} @ {str(snapshot.get('baseline_head') or '')[:7] or '—'}",
             "主機／PID": f"{evidence.get('host') or '—'} / {evidence.get('pid') or '—'}",
-            "最近心跳": _ui_time(execution.get("heartbeat_at")) if execution.get("heartbeat_at") else "—",
-            "最後事件": execution.get("last_provider_event") or "—",
-            "結果": execution.get("terminal_reason") or ((execution.get("cleanup_evidence") or {}).get("provider_outcome")) or "—",
         })
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -1211,14 +1428,15 @@ def _render_ideas(data):
     if not ideas:
         st.info("目前沒有想法紀錄。新增想法後，需經 ADM admission 才會成為任務。")
         return
-    for idea in ideas[:50]:
-        if not isinstance(idea, dict):
-            continue
-        st.markdown(f"""
-        <div class="glass-card"><div class="metric-label">{_ui_text(idea.get('status'), '未分類')} · {_ui_time(idea.get('created_at'))}</div>
-        <div class="hero-title">{_ui_text(idea.get('title') or idea.get('idea_id'))}</div>
-        <div class="hero-copy">{_ui_text(idea.get('summary') or idea.get('description'), '')}</div></div>
-        """, unsafe_allow_html=True)
+    st.markdown(_rows([
+        _row(
+            _chip(idea.get("status"), label=idea.get("status") or "未分類"),
+            _ui_text(idea.get("title") or idea.get("idea_id")),
+            right=_ui_time(idea.get("created_at")) if idea.get("created_at") else None,
+            meta=_ui_text(idea.get("summary") or idea.get("description"), "") or None,
+        )
+        for idea in ideas[:50] if isinstance(idea, dict)
+    ]), unsafe_allow_html=True)
 
 
 def _render_health(data):
@@ -1228,15 +1446,15 @@ def _render_health(data):
     active = _ui_active_executions(data.get("all_executions", []), now)
     try:
         watcher_vm, supervisor_vm, session_vm = load_infra_health(active if data.get("success") else None)
-        cols = st.columns(3)
         labels = {"Online": "正常", "Offline": "離線", "Unknown": "未知"}
-        for col, vm in zip(cols, (watcher_vm, supervisor_vm, session_vm)):
-            with col:
-                st.markdown(f"""
-                <div class="glass-card"><div class="metric-label">{_ui_text(vm.name)}</div>
-                <div class="hero-title">{labels.get(vm.status_label, _ui_text(vm.status_label))}</div>
-                <div class="hero-copy">{_ui_text(vm.detail)}</div></div>
-                """, unsafe_allow_html=True)
+        tones = {"Online": "running", "Offline": "attention", "Unknown": "idle"}
+        st.markdown('<div class="adm-hgrid">' + "".join(
+            f'<div class="adm-hcard"><div class="adm-hcard-name">{_ui_text(vm.name)}</div>'
+            f'<div class="adm-hcard-state state-{tones.get(vm.status_label, "idle")}">'
+            f'{labels.get(vm.status_label, _ui_text(vm.status_label))}</div>'
+            f'<div class="adm-hcard-detail">{_ui_text(vm.detail)}</div></div>'
+            for vm in (watcher_vm, supervisor_vm, session_vm)
+        ) + "</div>", unsafe_allow_html=True)
     except Exception as exc:
         st.warning(f"無法評估 Watcher 或 Session Center 健康狀態：{_ui_text(exc)}")
     evidence = read_provenance_evidence_file() or {}

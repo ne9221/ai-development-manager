@@ -734,5 +734,82 @@ class TestQuotaEntityCardsAndInformationArchitecture(unittest.TestCase):
         # The retained numeric evidence is still shown as itself, never as 0%.
         self.assertIn('<span class="qw-value">51%</span>', html)
 
+class TestEverySecondaryRouteRenders(unittest.TestCase):
+    """Every sidebar route must render without an exception against real
+    record shapes. The other AppTest classes only ever paint 總覽, so a
+    regression in 專案／任務／執行／配額／想法／系統健康 -- the routes that
+    carry most of the custom presentation markup -- would otherwise reach a
+    person before it reached a test."""
+
+    def setUp(self):
+        st.cache_data.clear()
+
+    def _records(self):
+        now = datetime.now(timezone.utc)
+        recent = now.isoformat().replace("+00:00", "Z")
+        return {
+            "tasks": [{"project_id": "test-project", "task_id": "task-1", "title": "Route smoke task",
+                       "status": "blocked", "priority": "high", "current_progress": "Waiting on review",
+                       "next_action": "Confirm the gate", "updated_at": recent}],
+            "commands": [{"project_id": "test-project", "task_id": "task-1", "command_id": "cmd-1",
+                          "execution_id": "exec-1", "status": "claimed", "created_at": recent}],
+            "executions": [{"project_id": "test-project", "task_id": "task-1", "execution_id": "exec-1",
+                            "provider": "claude", "account_id": "account-b", "status": "running",
+                            "provider_session_id": "sess-1", "started_at": recent, "heartbeat_at": recent,
+                            "last_provider_event": "still working",
+                            "provider_evidence": {"host": "HOST", "pid": 4242},
+                            "task_snapshot": {"branch": "refs/heads/feature", "baseline_head": "0123456789abcdef",
+                                              "model": "claude-3", "mode": "auto", "effort": "high"}}],
+            "sessions": [{"project_id": "test-project", "task_id": "task-1", "provider": "claude",
+                          "account_id": "account-b", "provider_session_id": "sess-1", "status": "running",
+                          "updated_at": recent}],
+        }
+
+    @patch("manager.tasks.DriveRecords")
+    @patch("manager.quota_reader.read_drive_status")
+    @patch("collectors.publish_drive.build_service")
+    def test_all_routes_render_without_exception(self, mock_build_service, mock_read_drive_status, mock_drive_records):
+        mock_read_drive_status.return_value = {"providers": [
+            _entry("codex", None, 75, 39, datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                   names=("primary", "secondary")),
+        ]}
+        records = self._records()
+        area_of = {"tasks": "tasks", "commands": "commands", "executions": "executions", "sessions": "sessions"}
+        mock_store = mock_drive_records.return_value
+        mock_store.list_projects.return_value = [{"project_id": "test-project", "title": "Test Project"}]
+        mock_store.project_folder.side_effect = lambda area, project_id, create=False: f"folder-{area}"
+        mock_store.children.side_effect = lambda parent, name=None: [
+            {"name": f"{area}-1.json", "mimeType": "application/json"}
+            for area in area_of if f"/{area}" in parent or parent.endswith(area)
+        ]
+        mock_store.get.side_effect = lambda area, project_id, name: (
+            records.get(area, [{}])[0] if records.get(area) else {}
+        )
+
+        at = AppTest.from_file("../dashboard.py")
+        at.run(timeout=30)
+        self.assertFalse(at.exception, f"Overview crashed: {at.exception}")
+        nav = next(r for r in at.sidebar.radio if r.key == "adm_ui_route")
+        for route in ("專案", "任務", "執行", "配額", "想法", "系統健康", "總覽"):
+            nav.set_value(route)
+            at.run(timeout=30)
+            self.assertFalse(at.exception, f"route {route} crashed: {at.exception}")
+            html = "\n".join(str(el.value) for el in at.markdown)
+            if route == "任務":
+                # Proves the route rendered the real record rather than an
+                # empty state -- otherwise this whole smoke test is vacuous.
+                self.assertIn("Route smoke task", html)
+                self.assertIn('class="chip chip-attention">已阻塞', html)
+                self.assertIn("Confirm the gate", html)
+            if route == "專案":
+                # The project row falls back to project_id when the registry
+                # record carries no `name`, and its chip summarises that
+                # project's own task counts.
+                self.assertIn("test-project", html)
+                self.assertIn('class="chip chip-attention">需要處理', html)
+                self.assertIn("需要處理 <b>1</b>", html)
+            nav = next(r for r in at.sidebar.radio if r.key == "adm_ui_route")
+
+
 if __name__ == "__main__":
     unittest.main()
