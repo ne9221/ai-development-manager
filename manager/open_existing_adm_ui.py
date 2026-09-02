@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 import socket
+import subprocess
 import time
 from pathlib import Path
 
@@ -71,15 +72,21 @@ def _open_browser(url=DASHBOARD_URL):
 
 
 def _spawn_dashboard():
-    # Same detached + CREATE_BREAKAWAY_FROM_JOB contract (with the same
-    # OSError fallback) as manager.command_watcher._spawn_claimed_worker,
-    # via the single shared launcher. Without breakaway the Dashboard dies
-    # with the Scheduled Task's job object as soon as the spawning tick
-    # ends -- see manager.detached_process for the live 20260902 evidence.
+    # CREATE_NO_WINDOW (not DETACHED_PROCESS) plus the same
+    # CREATE_BREAKAWAY_FROM_JOB contract and OSError fallback as
+    # manager.command_watcher._spawn_claimed_worker, via the single shared
+    # launcher. powershell.exe with DETACHED_PROCESS exits immediately
+    # (status 0, script never runs) because it has no console at all --
+    # live-reproduced 20260902, which is why cold start reported
+    # dashboard_start_timeout with no Streamlit process ever appearing.
+    # Breakaway still matters so the Dashboard outlives the Scheduled
+    # Task tick's job object. stdio is explicitly DEVNULL: the launcher
+    # must never inherit and hold open the caller's log handle.
     return popen_detached(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
          "-File", str(DASHBOARD_LAUNCHER), "-Port", str(DASHBOARD_PORT)],
-        close_fds=True,
+        no_window=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, close_fds=True,
     )
 
 
