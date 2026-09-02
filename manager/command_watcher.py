@@ -22,6 +22,7 @@ from manager.execution_runner import launch_task
 from manager.open_existing_adm_ui import focus_existing_adm_ui
 from manager.executions import cancel_reserved_execution, execution_health, prepare_task_retry
 from manager.gcs_lock_registry import GCSLockRegistry
+from manager.manager_home import ManagerHomeError, resolve_manager_home
 from manager.governance import validate_task_enforcement
 from manager.quota_reader import read_drive_status, summarize
 from manager.runtime_bridge import all_projects
@@ -294,12 +295,17 @@ def _focus_adm_ui_best_effort(stage):
         # Log-file trouble degrades to DEVNULL rather than losing the
         # spawn itself -- visibility never outranks the dispatch.
         try:
-            log_dir = os.path.join(os.environ.get("AI_MANAGER_HOME") or os.getcwd(), "logs")
+            # resolve_manager_home() rather than os.getcwd(): the cwd
+            # fallback put a logs/ directory inside whatever checkout the
+            # process started in. An unresolvable home degrades to DEVNULL
+            # like any other log-file trouble -- visibility never outranks
+            # the dispatch.
+            log_dir = os.path.join(resolve_manager_home(), "logs")
             os.makedirs(log_dir, exist_ok=True)
             log_handle = open(os.path.join(log_dir, "auto-open-adm.log"), "ab")
             log_handle.write(f"AUTO_OPEN_ADM[{stage}] helper spawned at {now_iso()}\n".encode("utf-8"))
             log_handle.flush()
-        except OSError:
+        except (OSError, ManagerHomeError):
             log_handle = None
         sink = log_handle if log_handle is not None else subprocess.DEVNULL
         # Shared detached + CREATE_BREAKAWAY_FROM_JOB launcher (same contract
@@ -2521,8 +2527,17 @@ def main(argv=None):
     except RuntimeGuardError as exc:
         print(json.dumps({"status": "blocked", "reason": exc.code}, separators=(",", ":")))
         return 1
+    # Resolve the home once, up front, and fail closed rather than
+    # defaulting to "." (the working directory) as this call site did
+    # before the 2026-09-02 checkout-contamination outage.
+    try:
+        manager_home = resolve_manager_home()
+    except ManagerHomeError as exc:
+        print(json.dumps({"status": "blocked", "reason": str(exc).split(":", 1)[0]},
+                          separators=(",", ":")))
+        return 1
     from manager.scheduler_provenance import finish, start
-    invocation = start(os.environ.get("AI_MANAGER_HOME", "."), "command_watcher")
+    invocation = start(manager_home, "command_watcher")
     while True:
         status = "completed"
         try:
@@ -2576,8 +2591,8 @@ def main(argv=None):
             status = "failed"
             print(json.dumps({"status": "unavailable"}, separators=(",", ":")))
         if args.once:
-            finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, status)
-            try_check_and_recover(os.environ.get("AI_MANAGER_HOME", "."))
+            finish(manager_home, invocation, status)
+            try_check_and_recover(manager_home)
             return 0
         time.sleep(args.interval_seconds)
 

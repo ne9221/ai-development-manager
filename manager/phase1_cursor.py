@@ -6,6 +6,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from manager.manager_home import ManagerHomeError, resolve_manager_home
+
 
 class StaleCursorError(Exception):
     """Raised when a concurrent/stale writer attempts to overwrite a newer cursor generation."""
@@ -17,10 +19,18 @@ def now_iso():
 
 
 def _resolve_cursor_path(manager_home=None, cursor_path=None):
+    """Locate the durable cursor, or raise ManagerHomeError -- never cwd.
+
+    The old default here read AI_MANAGER_HOME with the working directory
+    as its fallback, so it wrote ``runtime/phase1-cursor.json`` into
+    whatever directory the process happened to start in.  When that
+    directory was the activated production checkout it dirtied the tree
+    and fail-closed every Scheduled Task (2026-09-02 outage).  Resolution
+    now goes through the single canonical resolver, which fails closed.
+    """
     if cursor_path is not None:
         return Path(cursor_path)
-    home = manager_home if manager_home is not None else os.environ.get("AI_MANAGER_HOME", ".")
-    return Path(home) / "runtime" / "phase1-cursor.json"
+    return resolve_manager_home(manager_home) / "runtime" / "phase1-cursor.json"
 
 
 def _default_cursor():

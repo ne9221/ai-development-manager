@@ -31,6 +31,7 @@ import inspect
 import io
 import json
 import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -150,7 +151,12 @@ class SafeRunnerStderrTests(unittest.TestCase):
 
     def test_missing_bucket_env_failure_still_returns_nonzero_and_is_safe(self):
         stderr = io.StringIO()
-        with patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": ""}, clear=True), \
+        # clear=True wipes USERPROFILE, so main() would fail closed on
+        # manager-home resolution before ever reaching the bucket check this
+        # test is about. Inject an explicit throwaway home.
+        with tempfile.TemporaryDirectory() as home, \
+             patch.dict(os.environ, {"ADM_LOCK_GCS_BUCKET": "",
+                                     "AI_MANAGER_HOME": home}, clear=True), \
              patch("sys.stderr", stderr):
             exit_code = drive_dispatch_watcher.main(["--once"])
         self.assertEqual(1, exit_code)

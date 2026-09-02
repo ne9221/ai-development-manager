@@ -426,7 +426,10 @@ def main(argv=None):
         return 1
 
     from manager.scheduler_provenance import finish, start
-    invocation = start(os.environ.get("AI_MANAGER_HOME", "."), "session_center_supervisor")
+    # --manager-home is a required argument: use it rather than re-reading
+    # the environment, whose old default was "." (the working directory).
+    manager_home = args.manager_home
+    invocation = start(manager_home, "session_center_supervisor")
     try:
         with runtime_lock(lock_path_for(args.state_file)):
             runtime = Path(args.manager_home) / "runtime"
@@ -450,10 +453,10 @@ def main(argv=None):
         # nothing. This is not a failure -- it is mutual exclusion working.
         result = {"status": "locked"}
     print(json.dumps(result))
-    finish(os.environ.get("AI_MANAGER_HOME", "."), invocation,
+    finish(manager_home, invocation,
            "failed" if result.get("status") == "unavailable" else "completed")
     from manager.runtime_supervisor import try_check_and_recover
-    try_check_and_recover(os.environ.get("AI_MANAGER_HOME", "."))
+    try_check_and_recover(manager_home)
     return 0
 
 

@@ -40,6 +40,7 @@ from manager.gcs_lock_registry import BUCKET_ENV
 from manager.runtime_supervisor import try_check_and_recover
 from manager.tasks import DriveRecords, TaskError
 from manager.production_guard import RuntimeGuardError, require_runtime_guard
+from manager.manager_home import ManagerHomeError, resolve_manager_home
 
 
 def run_once(build_service_fn=build_service, store_factory=DriveRecords, poll=poll_drive_dispatch_requests):
@@ -69,8 +70,17 @@ def main(argv=None):
     parser.add_argument("--once", action="store_true", required=True,
                          help="required: this runner only ever performs exactly one bounded poll, never a loop")
     parser.parse_args(argv)
+    # Resolve the home once, up front, and fail closed: the old inline
+    # os.environ.get("AI_MANAGER_HOME", ".") defaulted to the working
+    # directory, so a scheduler tick started in a checkout wrote its
+    # runtime state into that checkout (2026-09-02 outage).
+    try:
+        manager_home = resolve_manager_home()
+    except ManagerHomeError as exc:
+        _print_error(str(exc).split(":", 1)[0], kind="ManagerHomeError")
+        return 1
     from manager.scheduler_provenance import finish, start
-    invocation = start(os.environ.get("AI_MANAGER_HOME", "."), "drive_dispatch_ingress")
+    invocation = start(manager_home, "drive_dispatch_ingress")
     try:
         require_runtime_guard()
     except RuntimeGuardError as exc:
@@ -84,22 +94,27 @@ def main(argv=None):
         result = run_once(build_service_fn=build_service, store_factory=DriveRecords)
     except TaskError as exc:
         _print_safe_failure(exc, "Drive dispatch ingress configuration or validation error")
-        finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, "failed")
-        try_check_and_recover(os.environ.get("AI_MANAGER_HOME", "."))
+        finish(manager_home, invocation, "failed")
+        try_check_and_recover(manager_home)
         return 1
     except Exception as exc:
         _print_safe_failure(exc, "Drive dispatch ingress poll failed")
-        finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, "failed")
-        try_check_and_recover(os.environ.get("AI_MANAGER_HOME", "."))
+        finish(manager_home, invocation, "failed")
+        try_check_and_recover(manager_home)
         return 1
     print(json.dumps(result, separators=(",", ":")))
-    finish(os.environ.get("AI_MANAGER_HOME", "."), invocation, "completed")
+    finish(manager_home, invocation, "completed")
     # Best-effort, bounded, debounced runtime self-heal sweep -- see
     # manager.runtime_supervisor's module docstring for why this call site
     # (rather than a dedicated Scheduled Task) is what makes the sweep
     # independent of any single component's own health. Never raises.
-    try_check_and_recover(os.environ.get("AI_MANAGER_HOME", "."))
+    try_check_and_recover(manager_home)
     return 0
+
+
+def _print_error(code, kind="RuntimeGuardError"):
+    print(json.dumps({"status": "error", "error_kind": kind, "message": code},
+                      separators=(",", ":")), file=sys.stderr)
 
 
 def _print_safe_failure(exc, message):

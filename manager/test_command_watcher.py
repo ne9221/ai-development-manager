@@ -4244,6 +4244,11 @@ class EmbeddedIngressMainWiringTests(unittest.TestCase):
     main() -- the unit-level embedded_ingress_enabled() tests above prove the
     switch's own truth table, these prove main() actually obeys it."""
 
+    def setUp(self):
+        self._home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._home.cleanup)
+        self.manager_home = self._home.name
+
     def _run_once(self, env):
         import io
         from contextlib import redirect_stdout
@@ -4255,6 +4260,11 @@ class EmbeddedIngressMainWiringTests(unittest.TestCase):
             ingress_calls.append((store, service, bucket))
             return []
 
+        # clear=True wipes USERPROFILE too, so main()'s manager-home
+        # resolution now fails closed before reaching the ingress call site
+        # these tests are actually about. Inject an explicit throwaway home
+        # rather than depending on any ambient default.
+        env = {**env, "AI_MANAGER_HOME": self.manager_home}
         with patch.dict(os.environ, env, clear=True), \
              patch("manager.command_watcher.build_service", return_value=object()), \
              patch("manager.command_watcher.DriveRecords", return_value=Mock(list_project_ids=Mock(return_value=[]))), \
@@ -4300,6 +4310,7 @@ class EmbeddedIngressMainWiringTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "ADM_DRIVE_DISPATCH_INGRESS_FOLDER_ID": "folder-1",
             "ADM_COMMAND_WATCHER_EMBEDDED_INGRESS": "0",
+            "AI_MANAGER_HOME": self.manager_home,
         }, clear=True), \
              patch("manager.command_watcher.build_service", return_value=object()), \
              patch("manager.command_watcher.DriveRecords", return_value=Mock(list_project_ids=Mock(return_value=[]))), \
