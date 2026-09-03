@@ -1,20 +1,28 @@
 """Static audit: nothing in this repository writes the Phase-1 cursor except its mutation path.
 
-Prevention, not detection of a present defect: the repo audit found no
-rogue writer, but the previous check (a grep for call sites) would have
-missed a writer that spelled the path over two lines, used ``open(...,
-"w")``, renamed through ``Path.rename``, lived in a nested module or a
-root-level script, or built the path into a variable and wrote through
-the alias later.
+Prevention, not detection of a present defect: the repo audit finds no
+rogue writer, but a line-oriented check would have missed a writer that
+spelled the path over two lines, used ``open(..., "w")``, renamed
+through ``Path.rename``, lived in a nested module or a root-level
+script, or built the path into a variable and wrote through the alias
+later.
 
 This is deliberately NOT a complete static analyzer. It recognises the
-dangerous sink families listed in ``SINK_ATTRS`` / ``SINK_FUNCS`` and
-associates them with the cursor by (a) the ``phase1-cursor`` literal
-anywhere in the sink's arguments, (b) a name in the same scope assigned
-from a path-shaped expression that mentions the literal (transitively),
-or (c) a function parameter that such a name is passed into. The
-negative controls below are the contract: each synthetic rogue writer
-must be caught, and each innocent module must not be.
+sink families in ``SINK_ATTRS`` / ``SINK_FUNCS`` and associates them
+with the cursor by tracking which expressions *evaluate to* the cursor
+path. That tracking is lexically scoped, because Python is: a nested
+function sees the names its enclosing function bound, and an earlier
+version of this audit did not model that. A rogue write planted inside
+``poll_once``'s own ``_persist_cursor`` closure -- the most natural
+place in the entire repository for one to appear -- went undetected,
+along with a module-level path constant, a ``self.cursor`` attribute, a
+helper that returns the path, and a path held in a container. Each of
+those is a negative control below.
+
+Derivation is tracked separately from mere reference on purpose:
+``load_phase1_cursor(cursor_path=p)`` *mentions* the cursor but returns
+a dict, and treating that dict as a path floods the scope with false
+positives (it made this audit fail on ``command_watcher.py``).
 """
 
 import ast
@@ -32,17 +40,38 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pytest_ca
 
 # Method-style sinks: <receiver>.<attr>(...)
 SINK_ATTRS = {"write_text", "write_bytes", "rename", "replace", "unlink", "remove", "move", "link",
-              "touch", "symlink_to", "hardlink_to"}
+              "touch", "symlink_to", "hardlink_to", "truncate"}
 # Function-style sinks reached through a module: os.rename(...), shutil.move(...)
 SINK_FUNCS = {("os", "rename"), ("os", "replace"), ("os", "remove"), ("os", "unlink"), ("os", "link"),
+              ("os", "truncate"), ("os", "mkdir"), ("os", "makedirs"),
               ("shutil", "move"), ("shutil", "copyfile"), ("shutil", "copy"), ("shutil", "copy2")}
 WRITE_MODE_CHARS = set("wax+")
 PATH_SOURCE_FUNCS = {"_resolve_cursor_path", "bind_phase1_cursor_path"}
-# Calls whose RESULT is path-shaped when an argument/receiver is.
+# Calls whose RESULT is path-shaped when an argument or receiver is.
 PATH_BUILDERS = {"Path", "PurePath", "PureWindowsPath", "PurePosixPath", "WindowsPath", "PosixPath",
                  "str", "fspath", "join", "abspath", "realpath", "normpath", "expanduser", "format"}
 PATH_METHODS = {"with_name", "with_suffix", "with_stem", "joinpath", "resolve", "absolute", "expanduser",
                 "parent", "parents", "name", "format", "strip", "rstrip", "lstrip", "replace", "lower"}
+
+
+class _Context:
+    """Whole-module derivation facts shared by every scope.
+
+    ``returns`` -- functions whose return value is a cursor path, so
+    ``cursor_for(home).write_text(...)`` is caught.
+    ``attrs`` -- attribute names ever assigned a cursor path, so
+    ``self.cursor = <path>`` in one method and ``self.cursor.unlink()``
+    in another are connected.
+    """
+
+    __slots__ = ("returns", "attrs")
+
+    def __init__(self):
+        self.returns = set()
+        self.attrs = set()
+
+
+_EMPTY = _Context()
 
 
 def _mentions_literal(node):
@@ -65,78 +94,95 @@ def _base_name(node):
             return None
 
 
-def _refers_to(node, aliases):
-    """Does this expression mention the cursor literal, an alias, or a path-source call?"""
+def _refers_to(node, aliases, ctx=_EMPTY):
+    """Does this expression mention the cursor literal, an alias, or a path source?"""
     if _mentions_literal(node):
         return True
     for sub in ast.walk(node):
         if isinstance(sub, ast.Name) and sub.id in aliases:
             return True
+        if isinstance(sub, ast.Attribute) and sub.attr in ctx.attrs:
+            return True
         if isinstance(sub, ast.Call):
             func = sub.func
             name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-            if name in PATH_SOURCE_FUNCS:
+            if name in PATH_SOURCE_FUNCS or name in ctx.returns:
                 return True
     return False
 
 
-def _derives_path(node, aliases):
+def _derives_path(node, aliases, ctx=_EMPTY):
     """Does this expression EVALUATE TO something built from the cursor path?
 
-    Narrower than :func:`_refers_to`: ``load_cursor(cursor_path)`` refers
-    to the path but evaluates to a dict, and tainting that dict would
-    flood the scope with false aliases. Only path-shaped constructions
-    propagate: the literal, an alias, attribute/method chains rooted in
-    one, ``/`` and ``+`` joins, f-strings, and path builders such as
-    ``Path(...)``, ``os.path.join(...)`` and ``str(...)``.
+    Narrower than :func:`_refers_to` on purpose -- see the module
+    docstring on why a loader's return value must not propagate.
     """
+    if node is None:
+        return False
     if isinstance(node, ast.Constant):
         return isinstance(node.value, str) and CURSOR_LITERAL in node.value
     if isinstance(node, ast.Name):
         return node.id in aliases
-    if isinstance(node, (ast.Attribute, ast.Subscript)):
-        return _derives_path(node.value, aliases)
+    if isinstance(node, ast.Attribute):
+        return node.attr in ctx.attrs or _derives_path(node.value, aliases, ctx)
+    if isinstance(node, ast.Subscript):
+        return _derives_path(node.value, aliases, ctx)
     if isinstance(node, ast.BinOp):
-        return _derives_path(node.left, aliases) or _derives_path(node.right, aliases)
+        return (_derives_path(node.left, aliases, ctx)
+                or _derives_path(node.right, aliases, ctx))
     if isinstance(node, ast.JoinedStr):
-        return any(_derives_path(v.value, aliases) for v in node.values if isinstance(v, ast.FormattedValue))
+        return any(_derives_path(v.value, aliases, ctx)
+                   for v in node.values if isinstance(v, ast.FormattedValue))
     if isinstance(node, ast.IfExp):
-        return _derives_path(node.body, aliases) or _derives_path(node.orelse, aliases)
-    if isinstance(node, (ast.Tuple, ast.List)):
-        return any(_derives_path(e, aliases) for e in node.elts)
+        return (_derives_path(node.body, aliases, ctx)
+                or _derives_path(node.orelse, aliases, ctx))
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return any(_derives_path(e, aliases, ctx) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return any(_derives_path(v, aliases, ctx) for v in node.values)
     if isinstance(node, ast.NamedExpr):
-        return _derives_path(node.value, aliases)
+        return _derives_path(node.value, aliases, ctx)
+    if isinstance(node, ast.Await):
+        return _derives_path(node.value, aliases, ctx)
     if isinstance(node, ast.Call):
         func = node.func
         operands = list(node.args) + [k.value for k in node.keywords]
         if isinstance(func, ast.Name):
-            if func.id in PATH_SOURCE_FUNCS:
+            if func.id in PATH_SOURCE_FUNCS or func.id in ctx.returns:
                 return True
             if func.id in PATH_BUILDERS:
-                return any(_derives_path(a, aliases) for a in operands)
+                return any(_derives_path(a, aliases, ctx) for a in operands)
             return False
         if isinstance(func, ast.Attribute):
-            if func.attr in PATH_SOURCE_FUNCS:
+            if func.attr in PATH_SOURCE_FUNCS or func.attr in ctx.returns:
                 return True
             if func.attr in PATH_BUILDERS or func.attr in PATH_METHODS:
-                return _derives_path(func.value, aliases) or any(_derives_path(a, aliases) for a in operands)
+                return (_derives_path(func.value, aliases, ctx)
+                        or any(_derives_path(a, aliases, ctx) for a in operands))
         return False
     return False
 
 
+def _split_targets(target):
+    """(plain names, attribute names) bound by one assignment target."""
+    names, attrs = [], []
+    stack = [target]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.Name):
+            names.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            attrs.append(node.attr)
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            stack.extend(node.elts)
+        elif isinstance(node, ast.Starred):
+            stack.append(node.value)
+    return names, attrs
+
+
 def _target_names(target):
-    if isinstance(target, ast.Name):
-        return [target.id]
-    if isinstance(target, ast.Attribute):
-        return [target.attr]
-    if isinstance(target, (ast.Tuple, ast.List)):
-        names = []
-        for elt in target.elts:
-            names.extend(_target_names(elt))
-        return names
-    if isinstance(target, ast.Starred):
-        return _target_names(target.value)
-    return []
+    names, attrs = _split_targets(target)
+    return names + attrs
 
 
 def _scope_nodes(scope):
@@ -152,42 +198,91 @@ def _scope_nodes(scope):
     return out
 
 
-def _scopes(tree):
-    yield tree
-    for node in ast.walk(tree):
+def _child_scopes(scope):
+    """The scopes defined directly inside ``scope``, at any statement depth.
+
+    Does not descend into them, so what comes back are immediate
+    children -- a function nested three ``if`` blocks deep still belongs
+    to this scope, but a function inside one of those functions does not.
+    """
+    out = []
+    stack = list(ast.iter_child_nodes(scope))
+    while stack:
+        node = stack.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            yield node
+            out.append(node)
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+    return out
+
+
+def _scope_parents(tree):
+    """{scope: immediately enclosing scope}, so aliases inherit lexically."""
+    parents = {tree: None}
+    stack = [tree]
+    while stack:
+        scope = stack.pop()
+        for child in _child_scopes(scope):
+            parents[child] = scope
+            stack.append(child)
+    return parents
 
 
 def _collect_aliases(tree, seed=()):
     """Per scope: names that (transitively) hold something built from the cursor path.
 
-    Returns ``({scope: names}, {scope: nodes})``. An alias passed as an
-    argument to a same-file function taints that function's parameter, so
-    the fixpoint runs across scopes until nothing changes.
+    Returns ``({scope: names}, {scope: nodes})``. The name sets are
+    *effective*: each already includes everything its enclosing scopes
+    bound, because a nested function reads those names too. An alias
+    passed as an argument to a same-file function taints that function's
+    parameter, and a function that returns a cursor path makes its own
+    call sites derive one, so the fixpoint runs until nothing changes.
     """
-    functions = {n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    scope_list = list(_scopes(tree))
+    functions = {n.name: n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    parents = _scope_parents(tree)
+    scope_list = list(parents)
     bodies = {scope: _scope_nodes(scope) for scope in scope_list}
-    aliases = {scope: set(seed) for scope in scope_list}
+    own = {scope: set(seed) for scope in scope_list}
+    ctx = _Context()
+
+    def effective(scope):
+        names = set()
+        cursor = scope
+        while cursor is not None:
+            names |= own[cursor]
+            cursor = parents.get(cursor)
+        return names
+
     while True:
         changed = False
         for scope in scope_list:
-            names = aliases[scope]
+            names = effective(scope)
+            added, added_attrs = set(), set()
             for node in bodies[scope]:
-                added = set()
                 if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
-                    if node.value is not None and _derives_path(node.value, names):
+                    if _derives_path(node.value, names, ctx):
                         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                         for target in targets:
-                            added.update(_target_names(target))
+                            plain, attrs = _split_targets(target)
+                            added.update(plain)
+                            added_attrs.update(attrs)
                 elif isinstance(node, (ast.With, ast.AsyncWith)):
                     for item in node.items:
-                        if item.optional_vars is not None and _derives_path(item.context_expr, names):
-                            added.update(_target_names(item.optional_vars))
+                        if item.optional_vars is not None and _derives_path(item.context_expr, names, ctx):
+                            plain, attrs = _split_targets(item.optional_vars)
+                            added.update(plain)
+                            added_attrs.update(attrs)
                 elif isinstance(node, ast.For):
-                    if _derives_path(node.iter, names):
-                        added.update(_target_names(node.target))
+                    if _derives_path(node.iter, names, ctx):
+                        plain, attrs = _split_targets(node.target)
+                        added.update(plain)
+                        added_attrs.update(attrs)
+                elif isinstance(node, ast.Return):
+                    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)) and \
+                            _derives_path(node.value, names, ctx) and scope.name not in ctx.returns:
+                        ctx.returns.add(scope.name)
+                        changed = True
                 elif isinstance(node, ast.Call):
                     func_name = node.func.id if isinstance(node.func, ast.Name) else None
                     function = functions.get(func_name)
@@ -195,19 +290,22 @@ def _collect_aliases(tree, seed=()):
                         params = [a.arg for a in function.args.posonlyargs + function.args.args]
                         tainted = set()
                         for index, arg in enumerate(node.args):
-                            if index < len(params) and _derives_path(arg, names):
+                            if index < len(params) and _derives_path(arg, names, ctx):
                                 tainted.add(params[index])
                         for keyword in node.keywords:
-                            if keyword.arg in params and _derives_path(keyword.value, names):
+                            if keyword.arg in params and _derives_path(keyword.value, names, ctx):
                                 tainted.add(keyword.arg)
-                        if tainted - aliases[function]:
-                            aliases[function] |= tainted
+                        if tainted - own[function]:
+                            own[function] |= tainted
                             changed = True
-                if added - names:
-                    names |= added
-                    changed = True
+            if added - own[scope]:
+                own[scope] |= added
+                changed = True
+            if added_attrs - ctx.attrs:
+                ctx.attrs |= added_attrs
+                changed = True
         if not changed:
-            return aliases, bodies
+            return {scope: effective(scope) for scope in scope_list}, bodies, ctx
 
 
 def _open_mode(call):
@@ -228,13 +326,27 @@ def _is_write_mode(mode):
     return mode == "?" or bool(WRITE_MODE_CHARS & set(mode))
 
 
+def _os_open_is_writable(call):
+    """os.open(path, flags): writable unless the flags are provably read-only."""
+    flags = call.args[1] if len(call.args) >= 2 else None
+    for keyword in call.keywords:
+        if keyword.arg == "flags":
+            flags = keyword.value
+    if flags is None:
+        return True
+    names = {sub.attr for sub in ast.walk(flags) if isinstance(sub, ast.Attribute)}
+    if not names:
+        return True
+    return not names <= {"O_RDONLY"}
+
+
 def audit_source(source, label, aliases_seed=()):
     """Return the sorted list of (label, lineno, kind) cursor-writer findings in one module."""
     tree = ast.parse(source, filename=label)
     if not _mentions_literal(tree) and not any(
             isinstance(n, ast.Name) and n.id in PATH_SOURCE_FUNCS for n in ast.walk(tree)):
         return []
-    aliases, bodies = _collect_aliases(tree, aliases_seed)
+    aliases, bodies, ctx = _collect_aliases(tree, aliases_seed)
     findings = set()
     for scope, nodes in bodies.items():
         names = aliases[scope]
@@ -243,16 +355,19 @@ def audit_source(source, label, aliases_seed=()):
                 continue
             func = node.func
             args = list(node.args) + [k.value for k in node.keywords]
-            touches = any(_refers_to(a, names) for a in args)
+            touches = any(_refers_to(a, names, ctx) for a in args)
             if isinstance(func, ast.Name):
                 if func.id == "open" and touches and _is_write_mode(_open_mode(node)):
                     findings.add((label, node.lineno, "open(write-mode)"))
-                elif func.id in {"rename", "replace", "remove", "unlink", "move"} and touches:
+                elif func.id in {"rename", "replace", "remove", "unlink", "move", "truncate"} and touches:
                     findings.add((label, node.lineno, f"{func.id}()"))
             elif isinstance(func, ast.Attribute):
                 base = _base_name(func.value)
-                receiver = _derives_path(func.value, names)
-                if (base, func.attr) in SINK_FUNCS and touches:
+                receiver = _derives_path(func.value, names, ctx)
+                if (base, func.attr) == ("os", "open"):
+                    if touches and _os_open_is_writable(node):
+                        findings.add((label, node.lineno, "os.open(write-flags)"))
+                elif (base, func.attr) in SINK_FUNCS and touches:
                     findings.add((label, node.lineno, f"{base}.{func.attr}()"))
                 elif func.attr == "open":
                     if (touches or receiver) and _is_write_mode(_open_mode(node)):
@@ -304,13 +419,34 @@ class RepositoryAuditTests(unittest.TestCase):
         self.assertTrue(kinds, "the audit cannot even see the sanctioned writer")
         self.assertTrue({"os.replace()", "os.link()"} & kinds, kinds)
 
-    def test_the_watcher_is_cursor_aware_but_only_mutates_through_the_api(self):
+    def test_the_watchers_bound_cursor_path_is_tracked_into_its_persist_closure(self):
+        """The regression that motivated lexical scoping.
+
+        ``_persist_cursor`` is a closure that uses ``phase1_cursor_path``
+        from ``poll_once``. If the audit cannot see that name inside the
+        closure, the single most likely place in the repo for a rogue
+        cursor write is invisible to it.
+        """
         source = (REPO_ROOT / "manager" / "command_watcher.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
-        aliases, _ = _collect_aliases(tree)
-        self.assertTrue(any("phase1_cursor_path" in names for names in aliases.values()),
-                        "the bound cursor path in poll_once must be tracked as an alias")
+        aliases, _, _ = _collect_aliases(tree)
+        closures = [s for s in aliases if isinstance(s, ast.FunctionDef) and s.name == "_persist_cursor"]
+        self.assertTrue(closures, "_persist_cursor closure not found")
+        for closure in closures:
+            self.assertIn("phase1_cursor_path", aliases[closure],
+                          "the bound cursor path is invisible inside the persist closure")
         self.assertEqual([], audit_source(source, "manager/command_watcher.py"))
+
+    def test_a_rogue_write_inside_that_closure_is_detected(self):
+        """Live negative control against the real production file."""
+        source = (REPO_ROOT / "manager" / "command_watcher.py").read_text(encoding="utf-8")
+        anchor = '        cursor["per_project_attention_visits"] = attention_visits\n'
+        self.assertIn(anchor, source)
+        rogue = source.replace(
+            anchor, anchor + '        phase1_cursor_path.write_text("{}", encoding="utf-8")\n', 1)
+        findings = audit_source(rogue, "manager/command_watcher.py")
+        self.assertTrue(findings, "a rogue write inside _persist_cursor was not detected")
+        self.assertIn(".write_text()", {kind for _, _, kind in findings})
 
 
 ROGUES = {
@@ -389,6 +525,67 @@ ROGUES = {
             bound = bind_phase1_cursor_path()
             bound.write_text("{}")
     ''',
+    # --- the six bypasses an adversarial re-review of round 3 found ---
+    "nested/closure_writer.py": '''
+        from pathlib import Path
+
+        def outer(home):
+            cursor = Path(home) / "runtime" / "phase1-cursor.json"
+
+            def inner():
+                cursor.write_text("{}")
+            inner()
+    ''',
+    "nested/module_constant.py": '''
+        import os
+        from pathlib import Path
+
+        CURSOR = Path(os.environ["AI_MANAGER_HOME"]) / "runtime" / "phase1-cursor.json"
+
+        def wipe():
+            CURSOR.unlink()
+    ''',
+    "nested/class_attribute.py": '''
+        from pathlib import Path
+
+        class Rotator:
+            def __init__(self, home):
+                self.cursor = Path(home) / "runtime" / "phase1-cursor.json"
+
+            def reset(self):
+                self.cursor.write_text("{}")
+    ''',
+    "nested/helper_return.py": '''
+        from pathlib import Path
+
+        def cursor_for(home):
+            return Path(home) / "runtime" / "phase1-cursor.json"
+
+        def reset(home):
+            cursor_for(home).write_text("{}")
+    ''',
+    "nested/container_indirection.py": '''
+        from pathlib import Path
+
+        def reset(home):
+            paths = {"cursor": Path(home) / "runtime" / "phase1-cursor.json"}
+            paths["cursor"].write_text("{}")
+    ''',
+    "nested/os_truncate.py": '''
+        import os
+
+        def zap(home):
+            os.truncate(os.path.join(home, "runtime", "phase1-cursor.json"), 0)
+    ''',
+    "nested/os_open_write.py": '''
+        import os
+
+        def reset(home):
+            target = os.path.join(home, "runtime", "phase1-cursor.json")
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+            os.write(fd, b'{"generation": 0}')
+            os.close(fd)
+    ''',
 }
 
 INNOCENT = {
@@ -422,6 +619,16 @@ INNOCENT = {
             pending.remove(1)
             return stamp, pending
     ''',
+    "nested/readonly_os_open.py": '''
+        import os
+
+        def read(home):
+            fd = os.open(os.path.join(home, "runtime", "phase1-cursor.json"), os.O_RDONLY)
+            try:
+                return os.read(fd, 4096)
+            finally:
+                os.close(fd)
+    ''',
 }
 
 
@@ -452,15 +659,25 @@ class NegativeControlTests(unittest.TestCase):
             self.plant(rel, body)
         findings, _ = audit_tree(self.root, sanctioned=())
         kinds = {(label, kind) for label, _, kind in findings}
-        self.assertIn(("nested/multiline_open_w.py", "open(write-mode)"), kinds)
-        self.assertIn(("root_script.py", ".write_text()"), kinds)
-        self.assertIn(("nested/deeper/path_rename.py", ".rename()"), kinds)
-        self.assertIn(("nested/os_replace_alias.py", "os.replace()"), kinds)
-        self.assertIn(("nested/param_flow.py", ".write_bytes()"), kinds)
-        self.assertIn(("nested/shutil_move.py", "shutil.move()"), kinds)
-        self.assertIn(("nested/os_remove.py", "os.remove()"), kinds)
-        self.assertIn(("nested/unlink_alias.py", ".unlink()"), kinds)
-        self.assertIn(("nested/bound_path_writer.py", ".write_text()"), kinds)
+        for expected in [
+            ("nested/multiline_open_w.py", "open(write-mode)"),
+            ("root_script.py", ".write_text()"),
+            ("nested/deeper/path_rename.py", ".rename()"),
+            ("nested/os_replace_alias.py", "os.replace()"),
+            ("nested/param_flow.py", ".write_bytes()"),
+            ("nested/shutil_move.py", "shutil.move()"),
+            ("nested/os_remove.py", "os.remove()"),
+            ("nested/unlink_alias.py", ".unlink()"),
+            ("nested/bound_path_writer.py", ".write_text()"),
+            ("nested/closure_writer.py", ".write_text()"),
+            ("nested/module_constant.py", ".unlink()"),
+            ("nested/class_attribute.py", ".write_text()"),
+            ("nested/helper_return.py", ".write_text()"),
+            ("nested/container_indirection.py", ".write_text()"),
+            ("nested/os_truncate.py", "os.truncate()"),
+            ("nested/os_open_write.py", "os.open(write-flags)"),
+        ]:
+            self.assertIn(expected, kinds)
 
     def test_innocent_modules_are_not_flagged(self):
         for rel, body in INNOCENT.items():
