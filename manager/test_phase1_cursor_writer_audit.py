@@ -85,6 +85,9 @@ SINK_FUNCS = {("os", "rename"), ("os", "replace"), ("os", "remove"), ("os", "unl
               ("os", "truncate"), ("os", "mkdir"), ("os", "makedirs"),
               ("shutil", "move"), ("shutil", "copyfile"), ("shutil", "copy"), ("shutil", "copy2")}
 WRITE_MODE_CHARS = set("wax+")
+#: The modules :data:`SINK_FUNCS` names. Kept derived so a new sink module
+#: cannot be added to one and forgotten in the other.
+SINK_MODULES = {module for module, _ in SINK_FUNCS}
 PATH_SOURCE_FUNCS = {"_resolve_cursor_path", "bind_phase1_cursor_path"}
 # Calls whose RESULT is path-shaped when an argument or receiver is.
 PATH_BUILDERS = {"Path", "PurePath", "PureWindowsPath", "PurePosixPath", "WindowsPath", "PosixPath",
@@ -466,6 +469,29 @@ def _os_open_is_writable(call):
     return not names <= {"O_RDONLY"}
 
 
+def sink_module_aliases(tree):
+    """``{local name: canonical module}`` for every imported sink module.
+
+    ``import shutil as sh`` then ``sh.copyfile(src, cursor)`` was a
+    one-line bypass of this whole audit: :data:`SINK_FUNCS` is keyed by
+    the module's REAL name, and the lookup used whatever the source
+    happened to call it. ``os.remove``, ``os.unlink``, ``os.truncate``,
+    ``shutil.copyfile`` and ``shutil.copy2`` were invisible behind an
+    alias -- each of them destroys or replaces the destination outright.
+
+    ``import os`` maps ``os`` to itself, so the unaliased spelling goes
+    through exactly the same lookup rather than a separate path.
+    """
+    out = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Import):
+            continue
+        for alias in node.names:
+            if alias.name in SINK_MODULES:
+                out[alias.asname or alias.name] = alias.name
+    return out
+
+
 def _imported_sink_names(tree):
     """{local name: reported kind} for sinks pulled in by ``from os import ...``.
 
@@ -498,6 +524,7 @@ def audit_source(source, label, aliases_seed=()):
         return []
     aliases, bodies, ctx = _collect_aliases(tree, aliases_seed, returns_seed=source_aliases)
     imported_sinks = _imported_sink_names(tree)
+    module_aliases = sink_module_aliases(tree)
     findings = set()
     for scope, nodes in bodies.items():
         names = aliases[scope]
@@ -516,7 +543,14 @@ def audit_source(source, label, aliases_seed=()):
                 elif func.id in {"rename", "replace", "remove", "unlink", "move", "truncate"} and touches:
                     findings.add((label, node.lineno, f"{func.id}()"))
             elif isinstance(func, ast.Attribute):
+                # Canonicalise the module BEFORE the SINK_FUNCS lookup: the
+                # pair is keyed by the module's real name, and `import os as o`
+                # otherwise hid o.remove/o.unlink/o.truncate behind a name the
+                # table does not contain. A receiver that is not an imported
+                # sink module keeps its own name and falls through to the
+                # method-form rules below, exactly as before.
                 base = _base_name(func.value)
+                base = module_aliases.get(base, base)
                 receiver = _derives_path(func.value, names, ctx)
                 if (base, func.attr) == ("os", "open"):
                     if touches and _os_open_is_writable(node):
@@ -838,6 +872,81 @@ ROGUES = {
         def restore(home, backup):
             move(backup, str(Path(home) / "runtime" / "phase1-cursor.json"))
     ''',
+    # --- P1-A: the sink MODULE renamed at its import. SINK_FUNCS is keyed
+    # by the real module name, so `import shutil as sh` hid every shutil
+    # sink and `import os as o` hid the destructive ones. os.replace,
+    # os.rename and shutil.move survived only by accident, through the
+    # unrelated method-form fallback; these five did not.
+    "nested/alias_shutil_copyfile.py": '''
+        import shutil as sh
+        from pathlib import Path
+
+        def restore(home, backup):
+            sh.copyfile(backup, str(Path(home) / "runtime" / "phase1-cursor.json"))
+    ''',
+    "nested/alias_shutil_copy2.py": '''
+        import shutil as sh
+        from pathlib import Path
+
+        def restore(home, backup):
+            sh.copy2(backup, str(Path(home) / "runtime" / "phase1-cursor.json"))
+    ''',
+    "nested/alias_os_remove.py": '''
+        import os as o
+        from pathlib import Path
+
+        def wipe(home):
+            o.remove(str(Path(home) / "runtime" / "phase1-cursor.json"))
+    ''',
+    "nested/alias_os_unlink.py": '''
+        import os as filesystem
+        from pathlib import Path
+
+        def wipe(home):
+            filesystem.unlink(str(Path(home) / "runtime" / "phase1-cursor.json"))
+    ''',
+    "nested/alias_os_truncate.py": '''
+        import os as o
+        from pathlib import Path
+
+        def wipe(home):
+            o.truncate(str(Path(home) / "runtime" / "phase1-cursor.json"), 0)
+    ''',
+    "nested/alias_os_replace.py": '''
+        import os as o
+        from pathlib import Path
+
+        def rotate(home, staged):
+            o.replace(staged, str(Path(home) / "runtime" / "phase1-cursor.json"))
+    ''',
+    "nested/alias_shutil_move.py": '''
+        import shutil as files
+        from pathlib import Path
+
+        def restore(home, backup):
+            files.move(backup, str(Path(home) / "runtime" / "phase1-cursor.json"))
+    ''',
+    "nested/alias_from_copy2.py": '''
+        from shutil import copy2 as duplicate
+        from pathlib import Path
+
+        def restore(home, backup):
+            duplicate(backup, str(Path(home) / "runtime" / "phase1-cursor.json"))
+    ''',
+    "nested/alias_from_truncate.py": '''
+        from os import truncate as cut
+        from pathlib import Path
+
+        def wipe(home):
+            cut(str(Path(home) / "runtime" / "phase1-cursor.json"), 0)
+    ''',
+    "nested/alias_from_copyfile.py": '''
+        from shutil import copyfile as cp
+        from pathlib import Path
+
+        def restore(home, backup):
+            cp(backup, str(Path(home) / "runtime" / "phase1-cursor.json"))
+    ''',
     # --- F3: os.rename in its FUNCTION form. The method form
     # (``p.rename()``) was pinned; the function form was not, so deleting
     # ("os", "rename") from SINK_FUNCS left the whole suite green. Three
@@ -935,6 +1044,19 @@ INNOCENT = {
 
         def write_log(home):
             (Path(home) / "logs" / "watcher.log").write_text("ok")
+    ''',
+    # P1-A negative controls: teaching the audit about aliased sink
+    # modules must not turn every aliased sink into a finding. The test
+    # is still sink AND canonical destination, never the sink alone.
+    "nested/alias_sink_unrelated_destination.py": '''
+        import os as o
+        import shutil as sh
+        from pathlib import Path
+
+        def housekeep(home, source):
+            o.remove(str(Path(home) / "runtime" / "scratch.tmp"))
+            o.truncate(str(Path(home) / "logs" / "watcher.log"), 0)
+            sh.copyfile(source, str(Path(home) / "reports" / "daily.json"))
     ''',
     "nested/dict_not_path.py": '''
         from pathlib import Path
@@ -1062,6 +1184,91 @@ class PathSourceAliasTests(unittest.TestCase):
         self.assertEqual([], audit_source("import os\nos.rename('a', 'b')\n", "x.py"))
 
 
+class SinkModuleAliasTests(unittest.TestCase):
+    """P1-A. ``SINK_FUNCS`` is keyed by the module's REAL name.
+
+    An independent review renamed the module at its import and walked
+    five destructive sinks straight past this audit:
+    ``shutil.copyfile``, ``shutil.copy2``, ``os.remove``, ``os.unlink``
+    and ``os.truncate``. ``os.replace``, ``os.rename`` and
+    ``shutil.move`` happened to survive, but only through the unrelated
+    method-form fallback -- accidental coverage, not a decision.
+    """
+
+    CURSOR = 'str(Path(home) / "runtime" / "phase1-cursor.json")'
+
+    def audit(self, imports, call):
+        source = "%s\nfrom pathlib import Path\n\n\ndef f(home, src):\n    %s\n" % (imports, call)
+        return audit_source(source, "nested/probe.py")
+
+    def test_every_aliased_sink_module_resolves_to_its_real_name(self):
+        for imports, call, kind in [
+            ("import os as o", "o.remove(%s)" % self.CURSOR, "os.remove()"),
+            ("import os as o", "o.unlink(%s)" % self.CURSOR, "os.unlink()"),
+            ("import os as o", "o.truncate(%s, 0)" % self.CURSOR, "os.truncate()"),
+            ("import os as o", "o.replace(src, %s)" % self.CURSOR, "os.replace()"),
+            ("import os as o", "o.rename(src, %s)" % self.CURSOR, "os.rename()"),
+            ("import shutil as sh", "sh.copyfile(src, %s)" % self.CURSOR, "shutil.copyfile()"),
+            ("import shutil as sh", "sh.copy2(src, %s)" % self.CURSOR, "shutil.copy2()"),
+            ("import shutil as sh", "sh.move(src, %s)" % self.CURSOR, "shutil.move()"),
+            # the alias is arbitrary; nothing may key off a short name
+            ("import os as filesystem", "filesystem.unlink(%s)" % self.CURSOR, "os.unlink()"),
+            ("import shutil as files", "files.copyfile(src, %s)" % self.CURSOR,
+             "shutil.copyfile()"),
+        ]:
+            with self.subTest(call=call):
+                found = self.audit(imports, call)
+                self.assertTrue(found, f"{imports}; {call} was not detected")
+                self.assertEqual(kind, found[0][2])
+
+    def test_unaliased_imports_still_resolve(self):
+        for imports, call, kind in [
+            ("import os", "os.remove(%s)" % self.CURSOR, "os.remove()"),
+            ("import shutil", "shutil.copyfile(src, %s)" % self.CURSOR, "shutil.copyfile()"),
+        ]:
+            with self.subTest(call=call):
+                self.assertEqual(kind, self.audit(imports, call)[0][2])
+
+    def test_from_import_aliases_are_unchanged(self):
+        for imports, call, kind in [
+            ("from os import replace as swap", "swap(src, %s)" % self.CURSOR, "os.replace()"),
+            ("from os import rename as move", "move(src, %s)" % self.CURSOR, "os.rename()"),
+            ("from os import truncate as cut", "cut(%s, 0)" % self.CURSOR, "os.truncate()"),
+            ("from shutil import copyfile as cp", "cp(src, %s)" % self.CURSOR,
+             "shutil.copyfile()"),
+            ("from shutil import copy2 as duplicate", "duplicate(src, %s)" % self.CURSOR,
+             "shutil.copy2()"),
+        ]:
+            with self.subTest(call=call):
+                self.assertEqual(kind, self.audit(imports, call)[0][2])
+
+    def test_an_aliased_sink_over_an_unrelated_destination_is_not_a_finding(self):
+        """The test is sink AND canonical destination -- never the sink alone."""
+        for imports, call in [
+            ("import os as o", 'o.remove(str(Path(home) / "runtime" / "scratch.tmp"))'),
+            ("import os as o", 'o.truncate(str(Path(home) / "logs" / "w.log"), 0)'),
+            ("import shutil as sh", 'sh.copyfile(src, str(Path(home) / "reports" / "r.json"))'),
+            ("from shutil import copyfile as cp", 'cp(src, str(Path(home) / "r" / "r.json"))'),
+        ]:
+            with self.subTest(call=call):
+                self.assertEqual([], self.audit(imports, call))
+
+    def test_a_local_named_like_a_module_is_not_treated_as_one(self):
+        """No ``import os as o``, so ``o`` is just a path object."""
+        source = ("from pathlib import Path\n\n\n"
+                  "def f(home):\n"
+                  '    o = Path(home) / "runtime" / "phase1-cursor.json"\n'
+                  "    o.unlink()\n")
+        found = audit_source(source, "nested/probe.py")
+        self.assertEqual(".unlink()", found[0][2], "method form must still be reported as such")
+
+    def test_the_alias_map_is_derived_from_the_sink_table(self):
+        """A sink module added to SINK_FUNCS is aliasable without a second edit."""
+        self.assertEqual({module for module, _ in SINK_FUNCS}, SINK_MODULES)
+        tree = ast.parse("import os as o\nimport shutil as sh\nimport json as j\n")
+        self.assertEqual({"o": "os", "sh": "shutil"}, sink_module_aliases(tree))
+
+
 class NegativeControlTests(unittest.TestCase):
     """Each synthetic rogue writer MUST be caught; each innocent module must not be."""
 
@@ -1117,6 +1324,18 @@ class NegativeControlTests(unittest.TestCase):
             ("nested/source_resolver_alias.py", ".unlink()"),
             ("nested/source_rebound_function.py", ".write_text()"),
             ("nested/split_literal.py", ".write_text()"),
+            # P1-A: every one of these was MISSED while the module kept its
+            # real name in SINK_FUNCS and its alias in the source.
+            ("nested/alias_shutil_copyfile.py", "shutil.copyfile()"),
+            ("nested/alias_shutil_copy2.py", "shutil.copy2()"),
+            ("nested/alias_os_remove.py", "os.remove()"),
+            ("nested/alias_os_unlink.py", "os.unlink()"),
+            ("nested/alias_os_truncate.py", "os.truncate()"),
+            ("nested/alias_os_replace.py", "os.replace()"),
+            ("nested/alias_shutil_move.py", "shutil.move()"),
+            ("nested/alias_from_copy2.py", "shutil.copy2()"),
+            ("nested/alias_from_truncate.py", "os.truncate()"),
+            ("nested/alias_from_copyfile.py", "shutil.copyfile()"),
         ]:
             self.assertIn(expected, kinds)
 

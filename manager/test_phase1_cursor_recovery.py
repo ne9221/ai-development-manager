@@ -55,6 +55,7 @@ from manager.test_phase1_cursor_writer_audit import (
     _Context,
     _collect_aliases,
     _fold_string_constants,
+    sink_module_aliases,
 )
 
 PROD_13_PROJECTS = {f"proj-{i:02d}": 100 + i for i in range(13)}
@@ -87,6 +88,29 @@ ALWAYS_REPLACING_FUNCS = {("os", "replace"), ("shutil", "move"), ("shutil", "cop
 #: Replacing on POSIX, non-replacing on Windows: permitted only under an
 #: explicit ``os.name == "nt"`` guard, which is what makes it safe.
 POSIX_REPLACING_FUNCS = {("os", "rename")}
+#: Truncating function-form sinks: they do not install a new file, they
+#: destroy the bytes already at the destination. ``os.truncate`` on the
+#: canonical name loses the durable cursor just as completely as an
+#: overwrite does, and this module never truncates anything.
+TRUNCATING_FUNCS = {("os", "truncate")}
+#: DELIBERATELY NOT a sink here: ``os.remove`` / ``os.unlink``.
+#:
+#: ``_publish_exclusively`` rolls back a canonical file THIS CALL just
+#: created exclusively -- ``_discard(path)`` on the failure branch, behind
+#: an ``os.path.samestat`` identity check that proves the file being
+#: removed is the one just created and not a competitor's. Interprocedural
+#: taint reaches ``_discard``'s parameter from that call site, so listing
+#: unlink here would report correct rollback code as a violation on every
+#: run. Deciding that branch safe needs the samestat check, which is far
+#: outside a bounded AST model -- so the exclusion is recorded here and
+#: pinned by a test rather than left as a silent gap. Deletion of the
+#: canonical is covered by the protocol's own claim/rollback tests.
+NOT_GUARDED_FUNCS = {("os", "remove"), ("os", "unlink")}
+#: The modules this guard's function-form tables name. Derived, so adding a
+#: sink from a new module cannot leave the alias resolver behind.
+GUARDED_SINK_MODULES = {module for module, _ in
+                        (ALWAYS_REPLACING_FUNCS | POSIX_REPLACING_FUNCS
+                         | TRUNCATING_FUNCS | {("os", "open")})}
 ALWAYS_REPLACING_METHODS = {"replace"}
 POSIX_REPLACING_METHODS = {"rename"}
 #: Writes that truncate whatever the destination already holds.
@@ -165,7 +189,49 @@ def _is_nt_guard(test):
     return False
 
 
-def _replacing_sink(call):
+def imported_sink_funcs(tree):
+    """``{local name: (module, function)}`` for ``from os import replace as swap``.
+
+    The writer audit has always understood this spelling; this guard did
+    not, even though the audit SKIPS ``manager/phase1_cursor.py`` as its
+    sanctioned path and this is therefore the only check that can see a
+    replacing install inside it. Two spellings walked straight past it.
+    """
+    out = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or node.module not in {"os", "shutil"}:
+            continue
+        for alias in node.names:
+            out[alias.asname or alias.name] = (node.module, alias.name)
+    return out
+
+
+def _resolve_sink_call(call, module_aliases, imported):
+    """The ``(module, function)`` a call names, through either alias spelling.
+
+    One resolver for both, so a sink cannot be understood in the
+    attribute form and missed in the imported form (or vice versa). The
+    classification tables below are then keyed by the REAL module name,
+    never by whatever the source chose to call it.
+    """
+    func = call.func
+    if isinstance(func, ast.Name):
+        return imported.get(func.id)
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        name = func.value.id
+        # An alias wins; otherwise a receiver spelled with the module's own
+        # name IS that module. The fallback matters because a fragment need
+        # not carry its imports -- requiring one would have turned every
+        # existing `os.replace(tmp, path)` control into a false negative.
+        module = module_aliases.get(name)
+        if module is None and name in GUARDED_SINK_MODULES:
+            module = name
+        if module is not None:
+            return (module, func.attr)
+    return None
+
+
+def _replacing_sink(call, module_aliases=None, imported=None):
     """``(kind, destination, posix_only)`` for a replacing install, else None.
 
     A rename is not the only way to land on top of the canonical name.
@@ -177,6 +243,8 @@ def _replacing_sink(call):
     publication fallback opens the canonical name WITH ``O_EXCL``, which
     is precisely what makes it a publication rather than an overwrite.
     """
+    module_aliases = {} if module_aliases is None else module_aliases
+    imported = {} if imported is None else imported
     func = call.func
     if isinstance(func, ast.Name) and func.id == "open" and call.args:
         mode = call.args[1] if len(call.args) >= 2 else next(
@@ -185,15 +253,21 @@ def _replacing_sink(call):
         if isinstance(text, str) and set(text) & WRITE_MODE_CHARS:
             return ('open(%r)' % text, call.args[0], False)
         return None
-    if isinstance(func, ast.Attribute):
-        if isinstance(func.value, ast.Name) and len(call.args) >= 2:
-            pair = (func.value.id, func.attr)
+    # Function-form sinks, resolved to their REAL module first so that
+    # `import os as o` and `from os import replace as swap` reach the same
+    # tables as the plain spelling.
+    pair = _resolve_sink_call(call, module_aliases, imported)
+    if pair is not None:
+        if len(call.args) >= 2:
             if pair in ALWAYS_REPLACING_FUNCS:
                 return ("%s.%s()" % pair, call.args[1], False)
             if pair in POSIX_REPLACING_FUNCS:
                 return ("%s.%s()" % pair, call.args[1], True)
             if pair == ("os", "open") and not _mentions_o_excl(call.args[1]):
                 return ("os.open() without O_EXCL", call.args[0], False)
+        if call.args and pair in TRUNCATING_FUNCS:
+            return ("%s.%s()" % pair, call.args[0], False)
+    if isinstance(func, ast.Attribute):
         if len(call.args) == 1 and not call.keywords:
             # Method form: the RECEIVER is the source, the argument the
             # destination. ``Path.replace``/``rename`` take exactly one
@@ -258,15 +332,15 @@ def _undecidable_params(tree):
     return out
 
 
-def _scan_scope(node, aliases, ctx, unknown, nt_guarded, out):
+def _scan_scope(node, aliases, ctx, unknown, nt_guarded, out, sinks=(None, None)):
     if isinstance(node, ast.If) and _is_nt_guard(node.test):
         for stmt in node.body:
-            _scan_scope(stmt, aliases, ctx, unknown, True, out)
+            _scan_scope(stmt, aliases, ctx, unknown, True, out, sinks)
         for stmt in node.orelse:
-            _scan_scope(stmt, aliases, ctx, unknown, nt_guarded, out)
+            _scan_scope(stmt, aliases, ctx, unknown, nt_guarded, out, sinks)
         return
     if isinstance(node, ast.Call):
-        sink = _replacing_sink(node)
+        sink = _replacing_sink(node, sinks[0], sinks[1])
         if sink is not None:
             kind, destination, posix_only = sink
             if not (posix_only and nt_guarded):
@@ -279,7 +353,7 @@ def _scan_scope(node, aliases, ctx, unknown, nt_guarded, out):
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue  # its own scope, walked separately
-        _scan_scope(child, aliases, ctx, unknown, nt_guarded, out)
+        _scan_scope(child, aliases, ctx, unknown, nt_guarded, out, sinks)
 
 
 def replacing_installs_over_the_cursor(source):
@@ -295,13 +369,17 @@ def replacing_installs_over_the_cursor(source):
     aliases, _bodies, ctx = _collect_aliases(
         tree, seed={CANONICAL_NAME}, returns_seed=PATH_SOURCES, derives=_names_canonical)
     unknown_by_scope = _undecidable_params(tree)
+    # Both alias spellings are resolved once for the whole module and
+    # handed to every scope, so no scope can see a weaker set of sinks
+    # than another.
+    sinks = (sink_module_aliases(tree), imported_sink_funcs(tree))
     violations = []
     for scope, names in aliases.items():
         unknown = unknown_by_scope.get(scope, frozenset()) - names
         for child in ast.iter_child_nodes(scope):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
-            _scan_scope(child, names, ctx, unknown, False, violations)
+            _scan_scope(child, names, ctx, unknown, False, violations, sinks)
     return sorted(set(violations))
 
 
@@ -956,6 +1034,78 @@ class TestNoOverwritePublication(RecoveryTestCase):
                 self.assertNotEqual([], found, f"reviewer control {label} was not detected")
                 detected += 1
         self.assertEqual(6, detected, "all six reviewer controls must be exercised")
+
+    def test_sink_aliases_cannot_hide_a_replacing_install(self):
+        """P1-B. This guard understood one spelling of a sink; the audit knew two.
+
+        That asymmetry mattered more than it looks: the writer audit
+        SKIPS ``manager/phase1_cursor.py`` as its sanctioned path, so
+        this guard is the only check that can ever see a replacing
+        install inside the publishing module -- and it was the weaker of
+        the two. ``import os as o`` and ``from os import replace as
+        swap`` both walked past it.
+        """
+        for label, source in [
+            ("module alias, os.replace",
+             "import os as o\n\ndef publish(path, tmp):\n    o.replace(tmp, path)\n"),
+            ("module alias, os.rename",
+             "import os as o\n\ndef publish(path, tmp):\n    o.rename(tmp, path)\n"),
+            ("module alias, shutil.copyfile",
+             "import shutil as sh\n\ndef publish(path, tmp):\n    sh.copyfile(tmp, path)\n"),
+            ("arbitrary module alias",
+             "import shutil as files\n\ndef publish(path, tmp):\n    files.move(tmp, path)\n"),
+            ("from-import alias, replace",
+             "from os import replace as swap\n\ndef publish(path, tmp):\n    swap(tmp, path)\n"),
+            ("from-import alias, rename",
+             "from os import rename as move\n\ndef publish(path, tmp):\n    move(tmp, path)\n"),
+            ("from-import alias, copyfile",
+             "from shutil import copyfile as cp\n\ndef publish(path, tmp):\n    cp(tmp, path)\n"),
+            ("truncating the canonical outright",
+             "from os import truncate as cut\n\ndef publish(path):\n    cut(path, 0)\n"),
+            ("module-aliased truncate",
+             "import os as o\n\ndef publish(path):\n    o.truncate(path, 0)\n"),
+        ]:
+            with self.subTest(spelling=label):
+                self.assertNotEqual([], replacing_installs_over_the_cursor(source),
+                                    f"{label} was not detected")
+
+    def test_aliased_sinks_over_siblings_are_still_permitted(self):
+        """Widening the sink set must not start flagging the module's own work."""
+        for label, source in [
+            ("aliased replace onto a sibling",
+             "import os as o\n\ndef publish(path, tmp):\n"
+             "    o.replace(tmp, str(path.with_name(path.name + '.claim')))\n"),
+            ("aliased copyfile onto a candidate",
+             "import shutil as sh\n\ndef publish(path, tmp):\n"
+             "    sh.copyfile(tmp, str(path.with_name('candidate.tmp')))\n"),
+            ("from-import alias onto a sibling",
+             "from os import replace as swap\n\ndef publish(path, tmp):\n"
+             "    swap(tmp, str(path.with_name('.init-state')))\n"),
+        ]:
+            with self.subTest(spelling=label):
+                self.assertEqual([], replacing_installs_over_the_cursor(source), label)
+
+    def test_deletion_is_deliberately_outside_this_guard(self):
+        """``os.remove``/``os.unlink`` are excluded ON PURPOSE, and it is pinned.
+
+        ``_publish_exclusively`` rolls back a canonical file it just
+        created exclusively, via ``_discard(path)``, behind an
+        ``os.path.samestat`` identity check. Interprocedural taint
+        reaches ``_discard``'s parameter from that call site, so treating
+        unlink as a sink here would report correct rollback code as a
+        violation on every run -- and a guard that cries wolf on its own
+        module gets deleted. Recorded as an exclusion rather than left as
+        a silent gap; the writer audit DOES cover these two everywhere
+        else in the tree.
+        """
+        self.assertEqual({("os", "remove"), ("os", "unlink")}, NOT_GUARDED_FUNCS)
+        self.assertFalse(NOT_GUARDED_FUNCS & (ALWAYS_REPLACING_FUNCS | POSIX_REPLACING_FUNCS
+                                              | TRUNCATING_FUNCS))
+        source = "import os as o\n\ndef publish(path):\n    o.unlink(path)\n"
+        self.assertEqual([], replacing_installs_over_the_cursor(source))
+        # ...and the real module's rollback stays clean, which is the point.
+        module = (Path(pc.__file__)).read_text(encoding="utf-8")
+        self.assertEqual([], replacing_installs_over_the_cursor(module))
 
     def test_an_unprovable_destination_is_reported_and_a_provable_one_is_not(self):
         """Taint has to start somewhere; a caller-supplied destination has no origin.
