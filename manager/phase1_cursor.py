@@ -641,7 +641,26 @@ def _publish_exclusively(source, path):
     On success the source name is released (best effort). On an occupied
     destination :class:`FileExistsError` propagates and ``source`` is left
     exactly where it was, so a claim used as the source is never lost.
+
+    Returns the ``os.stat_result`` identity of the file THIS call installed
+    at ``path``, or ``None`` if it could not be established. Only this
+    function knows which primitive published, and therefore which file the
+    canonical name now points at, so only this function can answer the
+    question without a gap. Reading the identity back off ``path`` after
+    publication instead is what let an external writer's file be adopted
+    as this transaction's own and then deleted by the rollback.
+
+    ``os.link`` and ``os.rename`` both preserve identity -- the link makes
+    the canonical a second name for the source's inode, and NTFS keeps the
+    file id across a rename -- so the source's pre-publication stat IS the
+    canonical's. The exclusive-create fallback makes a NEW file, so it
+    reports the ``fstat`` of the descriptor it created instead.
     """
+    installed = None
+    try:
+        installed = os.stat(str(source))
+    except OSError:
+        pass
     try:
         os.link(str(source), str(path))
     except FileExistsError:
@@ -651,7 +670,7 @@ def _publish_exclusively(source, path):
             raise FileExistsError(errno.EEXIST, str(exc), str(path)) from exc
         if os.name == "nt":
             os.rename(str(source), str(path))
-            return
+            return installed
         # Claims the NAME atomically, but the bytes arrive afterwards, so a
         # reader can briefly see a partial file. Only reachable where hard
         # links are unavailable and the platform is not Windows -- never on
@@ -661,6 +680,8 @@ def _publish_exclusively(source, path):
         fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
             created = os.fstat(fd)
+            # A brand-new file, so the source's identity does NOT describe it.
+            installed = created
             with open(fd, "wb", closefd=True) as handle:
                 handle.write(Path(source).read_bytes())
                 handle.flush()
@@ -673,6 +694,7 @@ def _publish_exclusively(source, path):
                 pass
             raise
     _discard(source)
+    return installed
 
 
 # --------------------------------------------------------------------------
@@ -1014,10 +1036,28 @@ def _create_exclusively(path, payload):
     that exact file and not a successor or an in-place rewrite. ``None``
     means the token could not be established, which
     :func:`_discard_if_same` treats as "do not delete".
+
+    BOTH halves are established BEFORE the canonical name is observed,
+    and neither is ever read back off ``path``:
+
+    * the identity comes from :func:`_publish_exclusively`, which is the
+      only code that knows which primitive published and therefore which
+      file the name now denotes;
+    * the content is the payload written to the candidate, which is by
+      construction what publication installed.
+
+    Reading either back off the canonical after publication is what let a
+    writer who won the name in that gap have its own file adopted as this
+    transaction's and then deleted by the rollback. There is no gap left
+    to lose: nothing here consults ``path``.
     """
     temp_name = _write_temp(path, payload)
     try:
-        _publish_exclusively(temp_name, path)
+        owned_bytes = Path(str(temp_name)).read_bytes()
+    except OSError:
+        owned_bytes = None
+    try:
+        installed = _publish_exclusively(temp_name, path)
     except FileExistsError as exc:
         _discard(temp_name)
         raise StaleCursorError(
@@ -1026,10 +1066,9 @@ def _create_exclusively(path, payload):
     except BaseException:
         _discard(temp_name)
         raise
-    try:
-        return os.stat(str(path)), Path(str(path)).read_bytes()
-    except OSError:
+    if installed is None or owned_bytes is None:
         return None
+    return installed, owned_bytes
 
 
 # --------------------------------------------------------------------------

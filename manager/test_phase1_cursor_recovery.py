@@ -23,6 +23,7 @@ The numbers 2458 / 13 / 2500 are the reviewer's.
 """
 
 import ast
+import contextlib
 import json
 import os
 import shutil
@@ -838,18 +839,95 @@ class TestFirstBootTransaction(RecoveryTestCase):
             other.write_bytes(same)
             os.replace(str(other), str(path))
 
+        def same_size_rewrite(path):
+            """Same inode AND same length -- only the bytes differ.
+
+            A length check masquerading as a content check would pass this.
+            """
+            original = path.read_bytes()
+            path.write_bytes(b"X" * len(original))
+
         for label, tamper, survives_as in [
             ("competitor replaced the file (new inode)", replaced, 2458),
             ("competitor truncated in place (same inode)", truncated_in_place, 2458),
             ("competitor rewrote in place (same inode)", appended_in_place, 1),
             ("competitor replaced with byte-identical content", replaced_with_identical_bytes, 1),
+            ("competitor rewrote same-size, different bytes", same_size_rewrite, None),
         ]:
             with self.subTest(shape=label):
                 self.setUp()
                 self._fail_commit_after(tamper)
                 self.assertTrue(self.cursor_path.exists(),
                                 f"{label}: the rollback destroyed a file it did not create")
-                self.assertEqual(survives_as, self.durable()["generation"], label)
+                if survives_as is not None:
+                    self.assertEqual(survives_as, self.durable()["generation"], label)
+
+    def test_a_writer_that_wins_the_name_before_the_token_is_taken_is_not_adopted(self):
+        """The ownership token must describe what publication INSTALLED.
+
+        A review defeated the first version of this check by winning the
+        canonical name in the gap between ``_publish_exclusively``
+        returning and the token being read back off that name: the
+        external file's own stat and bytes became the token, so the
+        rollback "proved" it owned a generation-3000 cursor it had never
+        created, and deleted it. Nothing may consult the canonical name
+        to establish ownership.
+        """
+        real_publish = pc._publish_exclusively
+
+        def publish_then_lose_the_race(source, dest):
+            installed = real_publish(source, dest)
+            target = Path(str(dest))
+            usurper = target.with_name(target.name + ".usurper")
+            usurper.write_text(json.dumps({
+                "project_cursor": 0,
+                "per_project_record_cursor": dict(PROD_13_PROJECTS),
+                "per_project_attention_visits": {},
+                "generation": 3000, "updated_at": None}), encoding="utf-8")
+            os.replace(str(usurper), str(target))
+            return installed
+
+        with patch.object(pc, "_publish_exclusively",
+                          side_effect=publish_then_lose_the_race):
+            self._fail_commit_after(None)
+        self.assertTrue(self.cursor_path.exists(),
+                        "the rollback deleted a cursor that won the name before the token")
+        self.assertEqual(3000, self.durable()["generation"])
+
+    def test_publication_reports_the_identity_of_what_it_installed(self):
+        """Every publication primitive must answer for its own install.
+
+        ``os.link`` and ``os.rename`` preserve identity, so the source's
+        pre-publication stat IS the canonical's; the exclusive-create
+        fallback makes a NEW file and must report the descriptor it
+        created instead. Getting this wrong in either direction either
+        adopts a stranger's file or silently disables the rollback.
+        """
+        for label, break_link, platform in [
+            ("os.link", False, os.name),
+            ("Windows os.rename fallback", True, "nt"),
+            ("POSIX exclusive-create fallback", True, "posix"),
+        ]:
+            with self.subTest(primitive=label):
+                source = self.runtime / f"candidate-{label.split()[0]}.tmp"
+                source.write_bytes(b'{"generation": 1}\n')
+                dest = self.runtime / f"published-{abs(hash(label))}.json"
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(pc.os, "name", platform))
+                    if break_link:
+                        stack.enter_context(patch.object(
+                            pc.os, "link", side_effect=NotImplementedError("no hard links")))
+                    installed = pc._publish_exclusively(source, dest)
+                self.assertIsNotNone(installed, f"{label}: no identity reported")
+                self.assertTrue(dest.exists(), f"{label}: nothing was published")
+                self.assertTrue(os.path.samestat(os.stat(str(dest)), installed),
+                                f"{label}: reported identity is not the published file")
+                # ...and a stranger at the same name must NOT match it.
+                stranger = dest.with_name(dest.name + ".stranger")
+                stranger.write_bytes(b'{"generation": 3000}\n')
+                os.replace(str(stranger), str(dest))
+                self.assertFalse(os.path.samestat(os.stat(str(dest)), installed),
+                                 f"{label}: a replacement still matched the token")
 
     def test_the_rollback_still_removes_the_file_it_did_create(self):
         """The identity check must not turn the rollback off.
