@@ -51,6 +51,11 @@ from manager.phase1_cursor import (
     save_phase1_cursor,
 )
 from manager.test_phase1_cursor_integrity import fail_canonical_install
+from manager.test_phase1_cursor_writer_audit import (
+    _Context,
+    _collect_aliases,
+    _fold_string_constants,
+)
 
 PROD_13_PROJECTS = {f"proj-{i:02d}": 100 + i for i in range(13)}
 
@@ -87,29 +92,67 @@ POSIX_REPLACING_METHODS = {"rename"}
 #: Writes that truncate whatever the destination already holds.
 TRUNCATING_METHODS = {"write_text", "write_bytes"}
 WRITE_MODE_CHARS = set("wax+")
-#: The module's name for the one bound canonical cursor path.
+#: The module's name for the one bound canonical cursor path. A SEED for
+#: the taint model below, no longer the whole of it: an independent review
+#: defeated the name-matching predecessor with five one-line spellings that
+#: simply called the destination something else.
 CANONICAL_NAME = "path"
 #: Calls that wrap a path without naming a DIFFERENT file.
-PATH_WRAPPERS = {"str", "Path", "fspath"}
+PATH_WRAPPERS = {"str", "Path", "fspath", "PurePath", "WindowsPath", "PosixPath"}
 #: Calls that hand back the canonical cursor path.
 PATH_SOURCES = {"_resolve_cursor_path", "bind_phase1_cursor_path"}
 
+_EMPTY_CTX = _Context()
 
-def _names_canonical(node, aliases):
-    """Does this expression name the canonical cursor file itself?
 
-    Deliberately narrow: ``path.parent`` and ``path.with_name(...)`` name
-    other files, so only the bare name and transparent wrappers count.
+def _names_canonical(node, aliases, ctx=_EMPTY_CTX):
+    """Does this expression evaluate to the canonical cursor file itself?
+
+    A bounded taint model, not a name match. Taint originates at the bound
+    canonical path (:data:`CANONICAL_NAME`) and at the resolvers in
+    :data:`PATH_SOURCES`, and :func:`_collect_aliases` propagates it
+    through assignment, argument-to-parameter, helper return, containers
+    and ``self.attr`` -- the five mechanisms the review used to walk past
+    the old check.
+
+    It stays deliberately NARROWER than the writer audit's
+    :func:`~manager.test_phase1_cursor_writer_audit._derives_path`, and
+    that difference is the whole point of not sharing the rule: this
+    module legitimately installs files at ``path.with_name(...)`` names
+    (the claim, the candidate, the record, the lock) many times over. A
+    predicate that let taint through ``with_name``/``parent`` would call
+    every one of those a violation, and a guard that cries wolf on its own
+    module gets deleted. Only the bare name and transparent wrappers --
+    ``str()``, ``Path()``, ``os.fspath()`` -- keep naming the same file.
     """
+    if node is None:
+        return False
     if isinstance(node, ast.Name):
         return node.id in aliases
+    if isinstance(node, ast.Attribute):
+        # ``self.dest = path`` then ``self.dest``: the attribute NAME
+        # carries the taint. ``path.parent``/``path.name`` deliberately do
+        # not -- they name a different file, which is why the receiver is
+        # not consulted here.
+        return node.attr in ctx.attrs
+    if isinstance(node, ast.Subscript):
+        return _names_canonical(node.value, aliases, ctx)
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return any(_names_canonical(e, aliases, ctx) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return any(_names_canonical(v, aliases, ctx) for v in node.values)
+    if isinstance(node, ast.IfExp):
+        return (_names_canonical(node.body, aliases, ctx)
+                or _names_canonical(node.orelse, aliases, ctx))
+    if isinstance(node, (ast.NamedExpr, ast.Await, ast.Starred)):
+        return _names_canonical(node.value, aliases, ctx)
     if isinstance(node, ast.Call):
         func = node.func
         name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-        if name in PATH_SOURCES:
+        if name in PATH_SOURCES or name in ctx.returns:
             return True
         if name in PATH_WRAPPERS:
-            return any(_names_canonical(a, aliases) for a in node.args)
+            return any(_names_canonical(a, aliases, ctx) for a in node.args)
     return False
 
 
@@ -170,45 +213,109 @@ def _mentions_o_excl(flags):
     return any(isinstance(sub, ast.Attribute) and sub.attr == "O_EXCL" for sub in ast.walk(flags))
 
 
-def _scan_scope(node, aliases, nt_guarded, out):
+def _bare_name(node):
+    """The Name an expression reduces to through transparent wrappers, or None."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name in PATH_WRAPPERS:
+            for arg in node.args:
+                found = _bare_name(arg)
+                if found is not None:
+                    return found
+    return None
+
+
+def _undecidable_params(tree):
+    """{scope: parameter names no in-module call site ever binds}.
+
+    Taint has to start somewhere, and a parameter of a function nothing in
+    this source calls has no known origin: whether it is the canonical
+    cursor depends entirely on a caller that is not here. Installing over
+    such a destination with a replacing primitive is therefore not
+    provably safe, and this guard exists to demand proof.
+
+    Deliberately narrow -- ONLY parameters of functions with no in-module
+    call site, and only when the destination reduces to that bare
+    parameter. Every replacing install in ``manager/phase1_cursor.py``
+    lands on a LOCAL whose origin is visible (``path.with_name(...)`` for
+    the claim, the candidate, the record and the lock), so nothing in the
+    real module depends on this branch.
+    """
+    called = {node.func.id for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    out = {}
+    for scope in ast.walk(tree):
+        if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if scope.name in called:
+            continue
+        args = scope.args
+        out[scope] = {a.arg for a in
+                      args.posonlyargs + args.args + args.kwonlyargs}
+    return out
+
+
+def _scan_scope(node, aliases, ctx, unknown, nt_guarded, out):
     if isinstance(node, ast.If) and _is_nt_guard(node.test):
         for stmt in node.body:
-            _scan_scope(stmt, aliases, True, out)
+            _scan_scope(stmt, aliases, ctx, unknown, True, out)
         for stmt in node.orelse:
-            _scan_scope(stmt, aliases, nt_guarded, out)
+            _scan_scope(stmt, aliases, ctx, unknown, nt_guarded, out)
         return
     if isinstance(node, ast.Call):
         sink = _replacing_sink(node)
         if sink is not None:
             kind, destination, posix_only = sink
-            if _names_canonical(destination, aliases) and not (posix_only and nt_guarded):
-                out.append("%s over the canonical cursor at line %d" % (kind, node.lineno))
+            if not (posix_only and nt_guarded):
+                if _names_canonical(destination, aliases, ctx):
+                    out.append("%s over the canonical cursor at line %d" % (kind, node.lineno))
+                elif _bare_name(destination) in unknown:
+                    out.append("%s over an unproven destination (%s, a parameter no call site "
+                               "binds) at line %d"
+                               % (kind, _bare_name(destination), node.lineno))
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue  # its own scope, walked separately
-        _scan_scope(child, aliases, nt_guarded, out)
+        _scan_scope(child, aliases, ctx, unknown, nt_guarded, out)
 
 
 def replacing_installs_over_the_cursor(source):
-    """Every replacing install whose destination is the canonical cursor."""
-    tree = ast.parse(textwrap.dedent(source))
-    scopes = [tree] + [n for n in ast.walk(tree)
-                       if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    """Every replacing install whose destination is TAINTED as the canonical cursor.
+
+    The scope walk and the taint fixpoint are the writer audit's, reused
+    rather than reimplemented; only the derivation rule
+    (:func:`_names_canonical`) is this module's own. That is what makes
+    ``_install(tmp, path)`` -- a destination that reaches its sink as a
+    differently-named parameter of a helper -- a violation here.
+    """
+    tree = _fold_string_constants(ast.parse(textwrap.dedent(source)))
+    aliases, _bodies, ctx = _collect_aliases(
+        tree, seed={CANONICAL_NAME}, returns_seed=PATH_SOURCES, derives=_names_canonical)
+    unknown_by_scope = _undecidable_params(tree)
     violations = []
-    for scope in scopes:
-        aliases = {CANONICAL_NAME}
-        for sub in ast.walk(scope):
-            if isinstance(sub, ast.Assign) and _names_canonical(sub.value, aliases):
-                aliases.update(t.id for t in sub.targets if isinstance(t, ast.Name))
+    for scope, names in aliases.items():
+        unknown = unknown_by_scope.get(scope, frozenset()) - names
         for child in ast.iter_child_nodes(scope):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
-            _scan_scope(child, aliases, False, violations)
+            _scan_scope(child, names, ctx, unknown, False, violations)
     return sorted(set(violations))
 
 
+#: Legitimate code, shaped the way the real module shapes it: every
+#: destination other than the canonical name is a LOCAL derived through
+#: ``with_name``, so its origin is visible and provably a sibling. The
+#: earlier version of this control passed those destinations in as
+#: parameters, which no function in ``manager/phase1_cursor.py``
+#: actually does -- and an unbound parameter is precisely the case the
+#: guard can no longer wave through (reviewer control G5).
 REPLACING_INSTALL_CONTROL = """
-def publish(path, temp_name, claim, record_path, source):
+def publish(path, temp_name, txid, source):
+    claim = path.with_name(path.name + ".claim-" + txid)
+    record_path = path.with_name(path.name + ".init-state")
     os.replace(str(path), str(claim))
     os.replace(temp_name, str(record_path))
     stamp = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -216,6 +323,8 @@ def publish(path, temp_name, claim, record_path, source):
     if os.name == "nt":
         os.rename(str(source), str(path))
     return stamp, label
+
+publish(_resolve_cursor_path(), "tmp", "tx", "src")
 """
 
 REPLACING_INSTALL_MUTANTS = {
@@ -267,7 +376,57 @@ def publish(path, payload):
 def publish(path):
     return os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o600)
 """,
+    # --- the five taint mechanisms an independent review used to walk
+    # past the name-matching predecessor. Each reaches the SAME sink by a
+    # different route, so one broken propagation rule fails exactly one.
+    "G1 destination is a differently-named parameter of a helper": """
+def _install(source, destination):
+    os.replace(source, destination)
+
+def publish(path, temp_name):
+    _install(temp_name, path)
+""",
+    "G2 destination held in a container": """
+def publish(path, temp_name):
+    slots = {"dest": path}
+    os.replace(temp_name, str(slots["dest"]))
+""",
+    "G3 destination reached through an instance attribute": """
+class Writer:
+    def bind(self, path):
+        self.dest = path
+
+    def publish(self, temp_name):
+        os.replace(temp_name, str(self.dest))
+""",
+    "G4 destination returned by a local helper": """
+def _dest(x):
+    return x
+
+def publish(path, temp_name):
+    os.replace(temp_name, str(_dest(path)))
+""",
+    "G5 destination bound to a name other than 'path'": """
+def publish(path, temp_name):
+    cursor_file = path
+    os.replace(temp_name, str(cursor_file))
+""",
 }
+
+#: The six controls the Final Adversarial Review ran against the
+#: predecessor of this guard: 5 MISSED, 1 CAUGHT. Named here so the count
+#: is asserted rather than inferred from the mutant table's length. G6 --
+#: the plain ``os.replace(str(temp_name), str(path))`` the old guard did
+#: catch -- is the "trailing comment" entry above, which is that exact
+#: call plus the comment that used to defeat the line-oriented check.
+REVIEWER_STATIC_GUARD_CONTROLS = (
+    "G1 destination is a differently-named parameter of a helper",
+    "G2 destination held in a container",
+    "G3 destination reached through an instance attribute",
+    "G4 destination returned by a local helper",
+    "G5 destination bound to a name other than 'path'",
+    "trailing comment naming a claim",
+)
 
 
 def _tasks(pid):
@@ -775,6 +934,85 @@ class TestNoOverwritePublication(RecoveryTestCase):
                 self.assertNotEqual([], replacing_installs_over_the_cursor(body),
                                     f"{label} was not detected")
         self.assertEqual([], replacing_installs_over_the_cursor(REPLACING_INSTALL_CONTROL))
+
+    def test_all_six_reviewer_static_guard_controls_are_detected(self):
+        """The Final Adversarial Review's own six controls: 5 MISSED, now 6/6.
+
+        Name-matching was the defect. Each control below reaches the same
+        ``os.replace`` by a different route -- a helper parameter, a dict
+        entry, an instance attribute, a helper's return value, a plain
+        rebinding -- and the old guard, which only recognised a variable
+        literally called ``path``, saw none of the first five. This matters
+        more than its size suggests: the writer audit skips
+        ``manager/phase1_cursor.py`` as its sanctioned path, so this guard
+        is the ONLY check that can ever see a replacing install inside the
+        mutation module.
+        """
+        detected = 0
+        for label in REVIEWER_STATIC_GUARD_CONTROLS:
+            with self.subTest(control=label):
+                self.assertIn(label, REPLACING_INSTALL_MUTANTS)
+                found = replacing_installs_over_the_cursor(REPLACING_INSTALL_MUTANTS[label])
+                self.assertNotEqual([], found, f"reviewer control {label} was not detected")
+                detected += 1
+        self.assertEqual(6, detected, "all six reviewer controls must be exercised")
+
+    def test_an_unprovable_destination_is_reported_and_a_provable_one_is_not(self):
+        """Taint has to start somewhere; a caller-supplied destination has no origin.
+
+        The review's own G5 spelling installs over a bare parameter that
+        no call site in the source binds. It is not provably the canonical
+        cursor -- and it is not provably anything else either, which is
+        the point: the guard demands proof rather than assuming safety.
+        Bind the same parameter from a call site and it becomes decidable,
+        and legitimate, again.
+        """
+        unproven = """
+def publish(cursor_file, temp_name):
+    os.replace(temp_name, str(cursor_file))
+"""
+        self.assertNotEqual([], replacing_installs_over_the_cursor(unproven))
+        proven_sibling = """
+def publish(cursor_file, temp_name):
+    os.replace(temp_name, str(cursor_file))
+
+def caller(path, temp_name):
+    publish(path.with_name(path.name + ".init-state"), temp_name)
+"""
+        self.assertEqual([], replacing_installs_over_the_cursor(proven_sibling),
+                         "a destination whose origin IS visible must not be reported")
+        proven_canonical = """
+def publish(cursor_file, temp_name):
+    os.replace(temp_name, str(cursor_file))
+
+def caller(path, temp_name):
+    publish(path, temp_name)
+"""
+        self.assertNotEqual([], replacing_installs_over_the_cursor(proven_canonical))
+
+    def test_the_taint_model_does_not_leak_through_sibling_paths(self):
+        """The other half of correctness: this module's own installs are NOT violations.
+
+        ``path.with_name(...)`` names the claim, the candidate, the record
+        and the lock. A taint rule that propagated through it would call
+        every legitimate install in the module a replacing overwrite, and
+        a guard that fails on correct code gets switched off.
+        """
+        for label, body in {
+            "claim install": "def swap(path, txid):\n"
+                             "    claim = path.with_name(path.name + '.claim-' + txid)\n"
+                             "    os.replace(str(path), str(claim))\n",
+            "record install": "def record(path, temp_name):\n"
+                              "    record_path = path.with_name(path.name + '.init-state')\n"
+                              "    os.replace(temp_name, str(record_path))\n",
+            "lock open without O_EXCL": "def lock(path):\n"
+                                        "    lock_path = path.with_name(path.name + '.lock')\n"
+                                        "    return os.open(str(lock_path), os.O_RDWR | os.O_CREAT)\n",
+            "parent directory": "def prepare(path):\n    path.parent.mkdir(parents=True)\n",
+        }.items():
+            with self.subTest(shape=label):
+                self.assertEqual([], replacing_installs_over_the_cursor(body),
+                                 f"false positive on a legitimate sibling install: {label}")
 
     def test_publish_primitive_refuses_an_occupied_destination(self):
         source = self.runtime / "candidate"
