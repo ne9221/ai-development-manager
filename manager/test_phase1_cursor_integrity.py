@@ -48,6 +48,27 @@ PROD_13_PROJECTS = {f"proj-{i:02d}": 100 + i for i in range(13)}
 CALLER_5_PROJECTS = {f"proj-{i:02d}": 1 for i in range(5)}
 
 
+def fail_canonical_install(cursor_path, only_candidates=False):
+    """Fault injection at the OS layer: installing ANY file at the canonical
+    cursor name fails, whichever primitive (link, rename, replace) the code
+    reaches for. Custody renames (destination is a claim) still work. With
+    ``only_candidates`` the restore of a claim still works too, modelling a
+    full disk rather than a filesystem that has stopped working."""
+    import manager.phase1_cursor as pc
+    canonical = os.path.normcase(str(cursor_path))
+    real = {"replace": os.replace, "rename": os.rename, "link": os.link}
+
+    def guard(name):
+        def wrapped(src, dst, *args, **kwargs):
+            if os.path.normcase(str(dst)) == canonical and (
+                    not only_candidates or ".candidate-" in str(src)):
+                raise OSError(f"injected: {name} to the canonical cursor name refused")
+            return real[name](src, dst, *args, **kwargs)
+        return wrapped
+
+    return patch.multiple(pc.os, replace=guard("replace"), rename=guard("rename"), link=guard("link"))
+
+
 class CursorTestCase(unittest.TestCase):
     """A throwaway manager home per test. Never the production one."""
 
@@ -446,7 +467,7 @@ class TestMutationRaces(CursorTestCase):
                          "generation must never decrease over the run")
 
     def test_14_write_is_atomic_and_leaves_no_debris(self):
-        """Two atomic renames now: take custody, then swap in the new file."""
+        """One custody rename, one no-overwrite publish, and nothing unconditional over the cursor."""
         self.seed(10)
         replaced = []
         real_replace = os.replace
@@ -458,15 +479,11 @@ class TestMutationRaces(CursorTestCase):
         with patch("manager.phase1_cursor.os.replace", side_effect=recording):
             self.save({"project_cursor": 1, "generation": 10}, expected_generation=10)
 
-        self.assertEqual(2, len(replaced),
-                         f"expected a custody rename and a swap, got {replaced}")
-        custody_src, custody_dst = replaced[0]
-        self.assertEqual(str(self.cursor_path), custody_src)
-        self.assertIn(".claim-", custody_dst)
-        swap_src, swap_dst = replaced[1]
-        self.assertEqual(str(self.cursor_path), swap_dst)
-        self.assertEqual(self.cursor_path.parent, Path(swap_src).parent,
-                         "the temp file must be on the same filesystem as the target")
+        custody = [(s, d) for s, d in replaced if s == str(self.cursor_path)]
+        self.assertEqual(1, len(custody), f"expected exactly one custody rename, got {replaced}")
+        self.assertIn(".claim-", custody[0][1])
+        self.assertEqual([], [(s, d) for s, d in replaced if d == str(self.cursor_path)],
+                         "nothing may os.replace over the canonical cursor name")
         self.assertEqual(11, self.durable()["generation"])
         leftovers = [p.name for p in self.runtime.iterdir()
                      if p.name not in ("phase1-cursor.json", "phase1-cursor.json.lock",
@@ -474,22 +491,16 @@ class TestMutationRaces(CursorTestCase):
         self.assertEqual([], leftovers, f"temp or claim debris left behind: {leftovers}")
 
     def test_14b_a_failed_swap_leaves_the_durable_cursor_untouched(self):
-        """The custody rename must be undone if the swap cannot complete."""
+        """The custody rename must be undone if publication cannot complete."""
         self.seed(2458, records=dict(PROD_13_PROJECTS))
         before = self.cursor_path.read_bytes()
-        real_replace = os.replace
 
-        def fail_only_the_swap(src, dst):
-            # Fail writing the NEW file into place, the way a full disk
-            # would. The custody rename and the restore rename move an
-            # existing file and allocate nothing, so they still work --
-            # failing those too would be modelling a filesystem that has
-            # stopped working altogether, which is a different test.
-            if ".claim-" not in str(src) and str(dst) == str(self.cursor_path):
-                raise OSError("disk full")
-            return real_replace(src, dst)
-
-        with patch("manager.phase1_cursor.os.replace", side_effect=fail_only_the_swap):
+        # Fail installing the NEW file, the way a full disk would. The
+        # custody rename and the restore move an existing file and
+        # allocate nothing, so they still work -- failing those too would
+        # be modelling a filesystem that has stopped working altogether,
+        # which is the next test.
+        with fail_canonical_install(self.cursor_path, only_candidates=True):
             with self.assertRaises(OSError):
                 self.save({"project_cursor": 0, "generation": 2458}, expected_generation=2458)
         self.assertTrue(self.cursor_path.exists(),
@@ -503,24 +514,17 @@ class TestMutationRaces(CursorTestCase):
     def test_if_even_the_restore_fails_the_state_survives_under_the_claim(self):
         """Worst case: the durable bytes are preserved and the runtime fails closed.
 
-        If the swap AND the restore both fail, the cursor is not at its
+        If publication AND the restore both fail, the cursor is not at its
         canonical name any more. That is bad, but it is the safe kind of
         bad: the bytes still exist under the claim name for a human to
-        recover, and because the initialization marker is already
-        established the next tick refuses to reinitialise from zero
-        rather than inventing a generation-1 cursor.
+        recover, and any existing claim means the next tick refuses to
+        reinitialise from zero rather than inventing a generation-1 cursor.
         """
         self.seed(2458, records=dict(PROD_13_PROJECTS))
         self.save({"project_cursor": 0, "generation": 2458}, expected_generation=2458)
         before = self.cursor_path.read_bytes()
-        real_replace = os.replace
 
-        def fail_everything_but_custody(src, dst):
-            if ".claim-" in str(dst):
-                return real_replace(src, dst)
-            raise OSError("filesystem is gone")
-
-        with patch("manager.phase1_cursor.os.replace", side_effect=fail_everything_but_custody):
+        with fail_canonical_install(self.cursor_path):
             with self.assertRaises(OSError):
                 self.save({"project_cursor": 0, "generation": 2459}, expected_generation=2459)
 
@@ -639,11 +643,13 @@ class TestInitializationFence(CursorTestCase):
             self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
 
     def test_marker_carries_no_cursor_authority(self):
-        """It is a fence, not a second cursor."""
+        """It is provenance, not a second cursor."""
         self.save({"project_cursor": 5, "per_project_record_cursor": {"p": 9}},
                   expected_generation=CREATE_ONLY)
         body = json.loads(self.marker().read_text(encoding="utf-8"))
-        self.assertEqual({"schema", "initialized_at"}, set(body))
+        self.assertEqual({"schema", "cursor", "state", "txid", "recorded_at"}, set(body))
+        self.assertEqual("committed", body["state"])
+        self.assertEqual(self.cursor_path.name, body["cursor"])
         for forbidden in ("generation", "project_cursor", "per_project_record_cursor",
                           "per_project_attention_visits"):
             self.assertNotIn(forbidden, body)

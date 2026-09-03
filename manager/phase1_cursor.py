@@ -10,7 +10,7 @@ Three invariants govern every durable write here:
   cursor already held. A caller that knows about one project cannot
   erase the other twelve.
 * **One winner.** Concurrent writers presenting the same generation do
-  not both succeed. Read, compare and replace are one critical section
+  not both succeed. Read, compare and publish are one critical section
   over one path resolved exactly once.
 
 All three used to be defeatable, by four separate routes:
@@ -31,15 +31,22 @@ All three used to be defeatable, by four separate routes:
 
 Each is closed below, and each has a named regression test in
 ``manager/test_phase1_cursor_integrity.py``.
+
+On top of those, a mutation is a small **custody transaction** with
+deterministic recovery semantics (see "Recovery protocol" below). Every
+combination of the durable artifacts beside the cursor -- the cursor
+itself, the initialization-state record, and any custody claims -- has
+exactly one meaning, and the only one that ever creates a generation-1
+cursor is a *proven* first initialization.
 """
 
 import errno
 import hashlib
 import json
 import os
-import tempfile
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,6 +94,17 @@ class CursorSchemaError(CursorStateError):
     pass
 
 
+class CursorInitStateError(CursorStateError):
+    """The initialization-state record exists but is not a valid record.
+
+    A zero-byte, truncated, mis-schema'd or mis-addressed record is
+    neither "initialized" nor "never initialized": it is untrustworthy,
+    and the only safe reading of untrustworthy provenance is to refuse to
+    mutate until a human has looked.
+    """
+    pass
+
+
 class CursorMissingError(PhaseCursorError):
     """No durable cursor exists.
 
@@ -99,14 +117,15 @@ class CursorMissingError(PhaseCursorError):
 
 
 class CursorRecoveryRequiredError(PhaseCursorError):
-    """A durable cursor that once existed is gone, and a human must say why.
+    """The durable artifacts say "not a first boot", but there is no live cursor to amend.
 
     Deliberately NOT a :class:`CursorStateError` and NOT a
     :class:`CursorMissingError`: it is neither ordinary corruption nor a
     legitimate first boot, and nothing may catch it as either. It is the
     one condition the runtime cannot resolve on its own, because every
     automatic resolution available to it -- recreate from zero -- is the
-    2026-09-02 incident.
+    2026-09-02 incident. The message always names the artifacts a human
+    needs to look at.
     """
     pass
 
@@ -173,15 +192,34 @@ def _resolve_cursor_path(manager_home=None, cursor_path=None):
 
     The returned path is always ABSOLUTE. Resolving once is not enough on
     its own: a relative ``cursor_path`` resolved once is still relative,
-    and every later use of it -- the CAS re-read, the pre-replace check,
-    ``os.replace`` -- would be re-interpreted against the working
-    directory at that moment. A ``chdir`` mid-mutation would then split
-    the read from the write. Binding to an absolute path here is what
-    makes "resolved once" mean "bound to one file".
+    and every later use of it -- the CAS re-read, the custody rename, the
+    publish -- would be re-interpreted against the working directory at
+    that moment. A ``chdir`` mid-mutation would then split the read from
+    the write. Binding to an absolute path here is what makes "resolved
+    once" mean "bound to one file".
+
+    An absolute input resolves to itself regardless of cwd or
+    environment, which is what lets a caller bind once per *tick* (see
+    :func:`bind_phase1_cursor_path`) and hand the same bound path to
+    every call it makes.
     """
     if cursor_path is not None:
         return Path(cursor_path).expanduser().resolve()
     return (resolve_manager_home(manager_home) / "runtime" / "phase1-cursor.json").resolve()
+
+
+def bind_phase1_cursor_path(manager_home=None, cursor_path=None):
+    """Resolve the cursor path once, for a caller that will make several calls.
+
+    The Watcher tick loads, classifies, and later saves. Each of those
+    used to resolve the path for itself, so a relative home plus a
+    working-directory change between the load and the save made the tick
+    read one file and advance a different one. A caller binds here at the
+    START of its unit of work and passes the returned absolute path to
+    every subsequent call; those calls re-derive the same path from it no
+    matter what cwd or the environment do in between.
+    """
+    return _resolve_cursor_path(manager_home=manager_home, cursor_path=cursor_path)
 
 
 def default_phase1_cursor():
@@ -363,13 +401,13 @@ def _unlock_fd(fd):
 
 @contextmanager
 def _cursor_mutation_lock(path, timeout=None):
-    """Serialize read-compare-replace for one bound cursor path.
+    """Serialize read-compare-publish for one bound cursor path.
 
     A sidecar ``.lock`` file, never the cursor itself: locking the cursor
-    would mean holding an open handle to the very file ``os.replace``
-    swaps out. The OS drops the lock when the holder exits, so a crashed
-    writer cannot wedge the runtime -- which is why this is an OS lock
-    and not a lock file whose staleness someone has to adjudicate.
+    would mean holding an open handle to the very file custody renames.
+    The OS drops the lock when the holder exits, so a crashed writer
+    cannot wedge the runtime -- which is why this is an OS lock and not a
+    lock file whose staleness someone has to adjudicate.
     """
     if timeout is None:
         timeout = CURSOR_LOCK_TIMEOUT_SECONDS
@@ -410,7 +448,7 @@ def _fingerprint(path):
     Content hash plus filesystem identity. The hash alone would miss a
     replace-with-identical-bytes; the identity alone would miss an
     in-place rewrite that kept the inode. Together they answer the only
-    question the swap cares about: "is this still the file I read?"
+    question custody cares about: "is this still the file I read?"
     """
     try:
         raw = path.read_bytes()
@@ -422,54 +460,343 @@ def _fingerprint(path):
     return (hashlib.sha256(raw).hexdigest(), st.st_dev, st.st_ino, st.st_size)
 
 
-def _write_temp(path, payload):
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        return handle.name
+# --------------------------------------------------------------------------
+# Durable artifacts beside the cursor
+#
+#   <cursor>                     the durable cursor; rotation authority
+#   <cursor>.init-state          initialization-state record (validated)
+#   <cursor>.claim-<txid>        a custody claim: the durable file, renamed
+#                                out of the way by ONE mutation transaction
+#   <cursor>.candidate-<txid>    a serialized candidate awaiting publication;
+#                                never authoritative, safe to discard
+#   <cursor>.lock                the mutation lock sidecar
+#
+# Claim and candidate names carry a fresh transaction id per attempt. A
+# fixed claim name was how a second failed attempt overwrote the only
+# surviving copy of the original cursor: the rename INTO the claim name
+# clobbered what the previous failure had left there.
+# --------------------------------------------------------------------------
+
+INIT_STATE_SUFFIX = ".init-state"
+#: Retained name from the previous round; the record it points at is now
+#: a validated state record rather than an existence-only marker.
+INIT_MARKER_SUFFIX = INIT_STATE_SUFFIX
+CLAIM_INFIX = ".claim-"
+CANDIDATE_INFIX = ".candidate-"
+
+INIT_STATE_SCHEMA = 2
+INIT_PREPARED = "prepared"
+INIT_COMMITTED = "committed"
 
 
-def _discard(temp_name):
-    if temp_name and os.path.exists(temp_name):
+def _new_txid():
+    return uuid.uuid4().hex
+
+
+def _init_state_path_for(path):
+    return path.with_name(path.name + INIT_STATE_SUFFIX)
+
+
+# Retained private name from the previous round for the existing tests.
+_marker_path_for = _init_state_path_for
+
+
+def _claim_path_for(path, txid):
+    return path.with_name(f"{path.name}{CLAIM_INFIX}{txid}")
+
+
+def _candidate_path_for(path, txid):
+    return path.with_name(f"{path.name}{CANDIDATE_INFIX}{txid}")
+
+
+def _siblings_with(path, infix):
+    prefix = path.name + infix
+    try:
+        entries = list(path.parent.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise CursorReadError(f"{path.parent}: cannot list the cursor directory: {exc}") from exc
+    return sorted(p for p in entries if p.name.startswith(prefix) and p.name != prefix)
+
+
+def _list_claims(path):
+    return _siblings_with(path, CLAIM_INFIX)
+
+
+def _list_candidates(path):
+    return _siblings_with(path, CANDIDATE_INFIX)
+
+
+def _discard(name):
+    """Remove a file that is NOT durable truth (a candidate, a temp). Best effort."""
+    if name and os.path.exists(str(name)):
         try:
-            os.unlink(temp_name)
+            os.unlink(str(name))
         except OSError:
             pass
 
 
-def _swap_under_custody(path, payload, fingerprint):
-    """Replace `path`, but only if it is still the file `fingerprint` describes.
+def _write_exclusive_file(target, payload):
+    """Create ``target`` (which must not exist) with ``payload`` as JSON, fsynced."""
+    fd = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with open(fd, "w", encoding="utf-8", closefd=True) as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        _discard(target)
+        raise
+    return str(target)
 
-    ``os.replace`` is atomic but UNCONDITIONAL: it will happily overwrite
-    a file that changed since the caller last looked. Checking first and
-    replacing second leaves a window in between, and an independent
-    review drove a generation-2500 write into exactly that window and
-    watched it get clobbered by a generation-2459 one.
 
-    So the durable file is first RENAMED out of the way, into a private
-    claim name. That rename is atomic and gives this writer sole custody
-    of one specific file. Verification then happens on the claim -- a
-    file nobody else can reach by name any more -- rather than on a path
-    a competitor is still free to write. If the claim is not what was
-    read, or something has since recreated the original path, the claim
-    is put back and the write is refused.
+def _write_temp(path, payload):
+    """Serialize a candidate beside the cursor under a unique, non-authoritative name."""
+    return _write_exclusive_file(_candidate_path_for(path, _new_txid()), payload)
 
-    What this does NOT claim: the instant between the last check and
-    ``os.replace`` is still not zero, and no user-space code can make it
-    zero without an OS-level conditional rename, which Windows does not
-    offer. What it does buy is that a competing writer has to land inside
-    a window bounded by two adjacent statements, instead of anywhere in a
-    read-verify-write sequence that also does JSON encoding and file I/O.
-    Cooperating writers -- every writer in this repo -- take the mutation
-    lock and cannot be in that window at all.
+
+def _publish_exclusively(source, path):
+    """Install ``source`` at ``path`` ONLY if ``path`` is absent. Never overwrites.
+
+    This is the publication primitive, and it is the reason the last
+    check and the install are no longer two statements with a gap
+    between them: the operation itself refuses an occupied destination.
+
+    * ``os.link`` is a no-overwrite operation on every platform this
+      runs on (NTFS included: ``ERROR_ALREADY_EXISTS`` when the name is
+      taken), and it is atomic.
+    * Where hard links are unavailable, Windows' native rename is itself
+      no-overwrite (``MoveFileEx`` without ``REPLACE_EXISTING``); on
+      POSIX, where rename silently replaces, the fallback is an exclusive
+      create, which still claims the NAME atomically.
+
+    On success the source name is released (best effort). On an occupied
+    destination :class:`FileExistsError` propagates and ``source`` is left
+    exactly where it was, so a claim used as the source is never lost.
     """
-    claim = path.with_name(f"{path.name}.claim-{os.getpid()}-{threading.get_ident():x}")
-    # Serialise the payload BEFORE taking custody. Everything slow -- JSON
-    # encoding, file creation, fsync -- has to happen outside the checked
-    # window, or it becomes part of it. What remains between the last
-    # verification and the swap is one statement.
+    try:
+        os.link(str(source), str(path))
+    except FileExistsError:
+        raise
+    except (AttributeError, NotImplementedError, OSError) as exc:
+        if isinstance(exc, OSError) and exc.errno == errno.EEXIST:
+            raise FileExistsError(errno.EEXIST, str(exc), str(path)) from exc
+        if os.name == "nt":
+            os.rename(str(source), str(path))
+            return
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            with open(fd, "wb", closefd=True) as handle:
+                handle.write(Path(source).read_bytes())
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            _discard(path)
+            raise
+    _discard(source)
+
+
+# --------------------------------------------------------------------------
+# Initialization state record
+#
+# "The cursor file is absent" and "the cursor has never existed" are not the
+# same fact, and treating them as one is how a deleted generation-2459 cursor
+# came back as generation 1 holding a single project. The cursor cannot
+# answer the question -- its own absence is the condition being diagnosed --
+# so the answer lives in a small VALIDATED record beside it.
+#
+# The record distinguishes an initialization that was PREPARED (intent
+# recorded, cursor not yet created) from one that was COMMITTED (a cursor
+# has existed here). An existence-only marker cannot: a crash between
+# writing it and creating the cursor would look exactly like a lost cursor
+# and wedge a clean first boot permanently.
+#
+# The record carries no generation, no project state and no rotation
+# authority: it is provenance, not a second cursor. Nothing removes it
+# automatically.
+# --------------------------------------------------------------------------
+
+
+def _read_init_state(path):
+    """None if no record exists, else INIT_PREPARED / INIT_COMMITTED. Anything else fails closed."""
+    record_path = _init_state_path_for(path)
+    try:
+        raw = record_path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise CursorReadError(f"{record_path}: cannot read the initialization-state record: {exc}") from exc
+    label = str(record_path)
+    if not raw.strip():
+        raise CursorInitStateError(f"{label}: initialization-state record is empty; refusing to guess")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise CursorInitStateError(f"{label}: initialization-state record is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise CursorInitStateError(f"{label}: initialization-state record must be an object")
+    if data.get("schema") != INIT_STATE_SCHEMA:
+        raise CursorInitStateError(
+            f"{label}: initialization-state schema {data.get('schema')!r} is not {INIT_STATE_SCHEMA}")
+    if data.get("cursor") != path.name:
+        raise CursorInitStateError(
+            f"{label}: initialization-state record is for cursor {data.get('cursor')!r}, not {path.name!r}")
+    state = data.get("state")
+    if state not in (INIT_PREPARED, INIT_COMMITTED):
+        raise CursorInitStateError(f"{label}: initialization state {state!r} is not a known state")
+    txid = data.get("txid")
+    if not isinstance(txid, str) or not txid:
+        raise CursorInitStateError(f"{label}: initialization-state record has no transaction id")
+    return state
+
+
+def _write_init_state(path, state, txid):
+    """Durably record the initialization state. Atomic replace of the record only."""
+    record_path = _init_state_path_for(path)
+    payload = {
+        "schema": INIT_STATE_SCHEMA,
+        "cursor": path.name,
+        "state": state,
+        "txid": txid,
+        "recorded_at": now_iso(),
+    }
+    temp_name = None
+    try:
+        temp_name = _write_exclusive_file(record_path.with_name(f"{record_path.name}.{txid}.tmp"), payload)
+        # The record is provenance, not the cursor; replacing it in place
+        # is fine and is what makes prepared -> committed a single step.
+        os.replace(temp_name, str(record_path))
+        temp_name = None
+    except OSError as exc:
+        raise CursorReadError(f"{record_path}: cannot record the initialization state: {exc}") from exc
+    finally:
+        _discard(temp_name)
+
+
+def _commit_init_state(path, txid):
+    """Record COMMITTED, idempotently. A cursor exists (or is about to be published)."""
+    if _read_init_state(path) != INIT_COMMITTED:
+        _write_init_state(path, INIT_COMMITTED, txid)
+
+
+# --------------------------------------------------------------------------
+# Recovery protocol
+#
+# Under the lock, before anything else, every claim beside the cursor is
+# adjudicated. The rule set is small and every branch is deterministic:
+#
+#   cursor absent, any claim(s)      -> recovery required (the claim IS the
+#                                       last durable copy; never touched)
+#   cursor present, claim strictly   -> the claim is a superseded copy from
+#     older (or a duplicate of the      a transaction that published but
+#     same copy)                        could not tidy up; retire it
+#   cursor present, claim not older  -> recovery required (a human decides
+#     or either side unreadable         which copy is authoritative)
+#
+# Then the initialization record:
+#
+#   record invalid                   -> fail closed (CursorInitStateError)
+#   cursor present, none/prepared    -> adopt: commit BEFORE any custody
+#   cursor present, committed        -> live
+#   cursor absent, none              -> genuine first boot
+#   cursor absent, prepared          -> resume first boot (intent recorded,
+#                                       cursor never created)
+#   cursor absent, committed         -> recovery required
+# --------------------------------------------------------------------------
+
+
+def _adjudicate_claims(path, claims):
+    """Retire superseded claims; fail closed on anything else. Never deletes a last copy."""
+    if not claims:
+        return
+    names = ", ".join(c.name for c in claims)
+    if not _exists_at(path):
+        if len(claims) == 1:
+            raise CursorRecoveryRequiredError(
+                f"{path}: no durable cursor exists, but custody claim {claims[0].name} holds the last "
+                "durable copy from an interrupted mutation. Refusing to mutate or reinitialize. "
+                f"To recover, rename {claims[0]} back to {path} by hand (only while {path.name} is "
+                "absent); nothing here will delete it."
+            )
+        raise CursorRecoveryRequiredError(
+            f"{path}: no durable cursor exists and {len(claims)} custody claims are present ({names}). "
+            "Refusing to choose between them automatically; a human must determine the authoritative "
+            "copy. Nothing here will delete any of them."
+        )
+    try:
+        current = _load_at(path, missing_ok=False)
+        current_fingerprint = _fingerprint(path)
+    except PhaseCursorError as exc:
+        raise CursorRecoveryRequiredError(
+            f"{path}: custody claims are present ({names}) and the durable cursor cannot be read to "
+            f"adjudicate them: {exc}. Refusing to mutate."
+        ) from exc
+    if current_fingerprint is None:
+        raise CursorRecoveryRequiredError(
+            f"{path}: custody claims are present ({names}) and the durable cursor vanished while being "
+            "read; refusing to mutate."
+        )
+    for claim in claims:
+        try:
+            held = _load_at(claim, missing_ok=False)
+            held_fingerprint = _fingerprint(claim)
+        except CursorMissingError:
+            continue  # raced away by the transaction that owned it
+        except CursorStateError as exc:
+            raise CursorRecoveryRequiredError(
+                f"{path}: custody claim {claim.name} cannot be read ({exc}); refusing to mutate until a "
+                "human has adjudicated it. Nothing here will delete it."
+            ) from exc
+        superseded = held["generation"] < current["generation"]
+        duplicate = (held["generation"] == current["generation"]
+                     and held_fingerprint is not None
+                     and held_fingerprint[0] == current_fingerprint[0])
+        if not (superseded or duplicate):
+            raise CursorRecoveryRequiredError(
+                f"{path}: custody claim {claim.name} holds generation {held['generation']} but the "
+                f"durable cursor is generation {current['generation']}; the claim is not a superseded "
+                "copy, so a human must decide which is authoritative. Nothing here will delete either."
+            )
+        try:
+            os.unlink(str(claim))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise CursorReadError(f"{claim}: cannot retire the superseded custody claim: {exc}") from exc
+
+
+def _sweep_candidates(path):
+    """Candidates are never truth. Under the lock, none can be in flight but ours."""
+    for candidate in _list_candidates(path):
+        _discard(candidate)
+
+
+def _swap_under_custody(path, payload, fingerprint):
+    """Publish ``payload`` in place of the durable file ``fingerprint`` describes.
+
+    The custody transaction, in order:
+
+    1. the candidate is serialized under a unique non-authoritative name
+       (already done by the caller, outside the checked window);
+    2. the durable file is renamed to a UNIQUE claim name -- an atomic
+       operation that gives this transaction sole custody of one file;
+    3. the claim is verified to be the exact bytes the CAS decision was
+       made on; if it is not, or it is gone, nothing is published;
+    4. the candidate is published with a NO-OVERWRITE primitive. If
+       anything -- anyone -- has installed a file at the canonical name
+       since custody vacated it, publication fails by construction, that
+       file survives, and the claim is preserved for adjudication.
+    5. only after a successful publish is the claim redundant.
+
+    There is no unconditional replace over the canonical name anywhere
+    in this sequence. A failure at any step leaves the last durable copy
+    on disk under either its own name or the claim name; the claim is
+    never deleted on a failure path.
+    """
+    txid = _new_txid()
+    claim = _claim_path_for(path, txid)
     temp_name = _write_temp(path, payload)
     claimed = False
     try:
@@ -478,50 +805,56 @@ def _swap_under_custody(path, payload, fingerprint):
             claimed = True
         except (FileNotFoundError, NotADirectoryError) as exc:
             raise StaleCursorError(
-                f"{path}: durable cursor disappeared before the swap; refusing to recreate it"
+                f"{path}: durable cursor disappeared before custody; refusing to recreate it"
             ) from exc
         except OSError as exc:
             raise CursorReadError(f"{path}: cannot take custody of durable cursor: {exc}") from exc
 
-        # Now that the file is ours alone, confirm it is the one we read.
-        if _fingerprint(claim) != fingerprint:
+        held = _fingerprint(claim)
+        if held is None:
             raise StaleCursorError(
-                f"{path}: durable cursor changed between the compare and the swap; "
+                f"{path}: the durable cursor vanished from custody ({claim.name}); refusing to publish "
+                "over a state that no longer exists"
+            )
+        if held != fingerprint:
+            raise StaleCursorError(
+                f"{path}: durable cursor changed between the compare and custody; "
                 "refusing to overwrite a newer writer's state"
             )
-        # And confirm nobody recreated the original name while it was vacant.
-        if os.path.exists(str(path)):
-            raise StaleCursorError(
-                f"{path}: a durable cursor reappeared during the swap; refusing to overwrite it"
-            )
 
-        os.replace(temp_name, str(path))
+        try:
+            _publish_exclusively(temp_name, path)
+        except FileExistsError as exc:
+            raise StaleCursorError(
+                f"{path}: another writer installed a durable cursor while this mutation held custody; "
+                f"that cursor is preserved and this write is refused. Custody claim {claim.name} is "
+                "kept for adjudication."
+            ) from exc
         temp_name = None
         # Only now is the claim redundant: the new file is in place, so
-        # the copy it holds is genuinely superseded.
-        _discard(str(claim))
-    except Exception:
+        # the copy it holds is genuinely superseded. If this unlink fails
+        # the claim stays; the next mutation retires it as superseded.
+        try:
+            os.unlink(str(claim))
+        except OSError:
+            pass
+    except BaseException:
         _discard(temp_name)
         if claimed and os.path.exists(str(claim)):
-            # Put the file back exactly as found. Aborting must leave the
-            # durable state untouched, not merely unwritten.
-            if os.path.exists(str(path)):
-                # Something newer already occupies the durable name, so
-                # the claim is a superseded copy and may go.
-                _discard(str(claim))
-            else:
-                try:
-                    os.replace(str(claim), str(path))
-                except OSError:
-                    # The restore failed too. The claim is now the ONLY
-                    # copy of the durable state, so it is deliberately
-                    # LEFT ON DISK. Deleting it here to keep the
-                    # directory tidy would destroy the very cursor this
-                    # module exists to protect -- and the initialization
-                    # marker guarantees the next tick fails closed rather
-                    # than starting over, so a human finds the claim
-                    # rather than a silently reset rotation.
-                    pass
+            # Put the durable file back under its own name -- but only if
+            # that name is still vacant. If someone else now occupies it,
+            # the claim stays where it is: it may be the older copy or it
+            # may be the authoritative one, and the recovery protocol
+            # decides that on the next mutation, deterministically, with
+            # both copies still on disk.
+            try:
+                _publish_exclusively(claim, path)
+            except (FileExistsError, OSError):
+                # The claim is now the ONLY copy of the durable state (or
+                # one of two copies that need adjudicating). It is
+                # deliberately LEFT ON DISK. Any existing claim means the
+                # next mutation fails closed rather than starting over.
+                pass
         raise
 
 
@@ -529,96 +862,15 @@ def _create_exclusively(path, payload):
     """Create a cursor that does not exist. Atomic against a racing creator."""
     temp_name = _write_temp(path, payload)
     try:
-        # O_CREAT|O_EXCL on a link target is the atomic "create if absent"
-        # primitive; os.replace would silently clobber a competitor.
-        try:
-            os.link(temp_name, str(path))
-        except (AttributeError, NotImplementedError, OSError) as exc:
-            if isinstance(exc, OSError) and exc.errno == errno.EEXIST:
-                raise StaleCursorError(
-                    f"{path}: CREATE_ONLY write refused, a durable cursor appeared during the write"
-                ) from exc
-            # Filesystems without hard links: fall back to an exclusive
-            # create, which is still atomic against another creator.
-            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            try:
-                with open(fd, "w", encoding="utf-8", closefd=True) as handle:
-                    handle.write(Path(temp_name).read_text(encoding="utf-8"))
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            except BaseException:
-                try:
-                    os.unlink(str(path))
-                except OSError:
-                    pass
-                raise
+        _publish_exclusively(temp_name, path)
     except FileExistsError as exc:
+        _discard(temp_name)
         raise StaleCursorError(
             f"{path}: CREATE_ONLY write refused, a durable cursor appeared during the write"
         ) from exc
-    finally:
+    except BaseException:
         _discard(temp_name)
-
-
-# --------------------------------------------------------------------------
-# Initialization provenance
-#
-# "The cursor file is absent" and "the cursor has never existed" are not the
-# same fact, and treating them as one is how a deleted generation-2459 cursor
-# came back as generation 1 holding a single project. The cursor file cannot
-# answer the question -- its own absence is the condition being diagnosed --
-# so the answer lives in a separate durable marker beside it.
-#
-# The marker's ONLY truth is "a Phase-1 cursor has been initialized here
-# before". It deliberately carries no generation, no project state and no
-# rotation authority: it is a fence, not a second cursor. Nothing removes it
-# automatically; clearing it is a human recovery decision, which is the point.
-# --------------------------------------------------------------------------
-
-#: Sibling of the cursor it fences, named after it. Deliberately derived
-#: from the cursor's FILE name rather than being a fixed name in its
-#: directory: two cursors can share a directory, and a marker keyed only
-#: on the directory would let one cursor's history fence another's.
-INIT_MARKER_SUFFIX = ".initialized"
-
-
-def _marker_path_for(path):
-    return path.with_name(path.name + INIT_MARKER_SUFFIX)
-
-
-def _marker_exists(marker):
-    try:
-        return marker.exists()
-    except OSError as exc:
-        raise CursorReadError(f"{marker}: cannot stat the initialization marker: {exc}") from exc
-
-
-def _establish_marker(marker):
-    """Idempotently record that a cursor has existed here. Never removes."""
-    if _marker_exists(marker):
-        return
-    payload = {"schema": 1, "initialized_at": now_iso()}
-    temp_name = None
-    try:
-        temp_name = _write_temp(marker, payload)
-        try:
-            os.link(temp_name, str(marker))
-        except (AttributeError, NotImplementedError, OSError):
-            # A loser of the creation race is fine: the marker is a fact,
-            # not a claim, so any winner records the same fact.
-            if not _marker_exists(marker):
-                os.replace(temp_name, str(marker))
-                temp_name = None
-    except OSError as exc:
-        raise CursorReadError(f"{marker}: cannot record the initialization marker: {exc}") from exc
-    finally:
-        _discard(temp_name)
-
-
-def phase1_cursor_initialized(manager_home=None, cursor_path=None):
-    """Whether a Phase-1 cursor has ever been initialized under this home."""
-    return _marker_exists(_marker_path_for(
-        _resolve_cursor_path(manager_home=manager_home, cursor_path=cursor_path)))
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -636,6 +888,52 @@ def phase1_cursor_exists(manager_home=None, cursor_path=None):
     corrupted one.
     """
     return _exists_at(_resolve_cursor_path(manager_home=manager_home, cursor_path=cursor_path))
+
+
+def phase1_cursor_init_state(manager_home=None, cursor_path=None):
+    """None (never initialized), 'prepared' or 'committed'. Invalid records fail closed."""
+    return _read_init_state(_resolve_cursor_path(manager_home=manager_home, cursor_path=cursor_path))
+
+
+def require_phase1_cursor_first_boot(manager_home=None, cursor_path=None):
+    """Prove that creating a generation-1 cursor here would be a genuine first boot.
+
+    Returns normally only when the durable artifacts say so: no cursor,
+    no custody claim, and an initialization record that is absent or
+    merely PREPARED. Every other combination raises:
+
+    * :class:`StaleCursorError` -- a cursor is present (amend it instead);
+    * :class:`CursorRecoveryRequiredError` -- a claim exists, or the
+      record says a cursor was COMMITTED here before;
+    * :class:`CursorInitStateError` -- the record is unreadable garbage.
+
+    Advisory in the same sense as :func:`phase1_cursor_exists`: the save
+    re-proves it under the lock.
+    """
+    path = _resolve_cursor_path(manager_home=manager_home, cursor_path=cursor_path)
+    _adjudicate_first_boot(path)
+    return True
+
+
+def _adjudicate_first_boot(path):
+    """Under-lock (or advisory) proof that a CREATE_ONLY write is a genuine first boot."""
+    claims = _list_claims(path)
+    if claims:
+        # With the cursor absent this is recovery-required; with it present
+        # it is either superseded debris or a conflict -- but a CREATE_ONLY
+        # caller with a present cursor is stale either way.
+        _adjudicate_claims(path, claims)
+    if _exists_at(path):
+        raise StaleCursorError(f"{path}: CREATE_ONLY write refused, a durable cursor already exists")
+    state = _read_init_state(path)
+    if state == INIT_COMMITTED:
+        raise CursorRecoveryRequiredError(
+            f"{path}: no durable cursor exists, but {_init_state_path_for(path).name} records that one "
+            "was committed here before. Refusing to silently reinitialize Phase-1 rotation from zero. "
+            "Investigate why the cursor vanished; to deliberately start over, remove "
+            f"{_init_state_path_for(path)} by hand."
+        )
+    return state
 
 
 def load_phase1_cursor(manager_home=None, cursor_path=None, missing_ok=True):
@@ -664,8 +962,9 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None,
 
     ``expected_generation`` is required and has exactly two meanings:
 
-    * :data:`CREATE_ONLY` -- create a cursor that does not exist yet.
-      Fails if one does. The created cursor is generation 1.
+    * :data:`CREATE_ONLY` -- create a cursor that does not exist yet, and
+      only when the durable artifacts prove this is a genuine first boot.
+      The created cursor is generation 1.
     * a non-negative ``int`` -- update an existing cursor whose durable
       generation is exactly that. Fails if the cursor is absent, or if
       the durable generation differs.
@@ -682,8 +981,10 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None,
     that project and preserves the rest.
 
     The path is resolved once, at the top, and the read, the compare, the
-    final re-verification and the replace all use that one bound path,
-    inside the per-cursor mutation lock.
+    custody rename and the publish all use that one bound path, inside
+    the per-cursor mutation lock. The full custody transaction and its
+    recovery semantics are described on :func:`_swap_under_custody` and
+    in the "Recovery protocol" comment above.
     """
     if expected_generation is _UNSET:
         raise CursorContractError(
@@ -707,36 +1008,33 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None,
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with _cursor_mutation_lock(path, timeout=lock_timeout):
-        # The compare half of the compare-and-swap. `missing_ok=False`, so an
-        # absent file raises instead of presenting generation 0 -- the whole
-        # point is that "there is nothing here" and "here is a generation-0
-        # cursor" must not be the same answer.
-        marker = _marker_path_for(path)
+        # Recovery first: an unresolved claim from an interrupted
+        # transaction blocks ordinary mutation until it is adjudicated,
+        # and candidates from interrupted transactions are just debris.
+        _sweep_candidates(path)
+        txid = _new_txid()
+
         if creating:
-            if _exists_at(path):
-                raise StaleCursorError(
-                    f"{path}: CREATE_ONLY write refused, a durable cursor already exists"
-                )
-            # The fence. Absent cursor + established marker means the
-            # cursor existed and is now gone -- deletion, a failed swap, a
-            # wiped runtime directory. Recreating it here is what turned a
-            # generation-2459 cursor covering 13 projects into a
-            # generation-1 one covering 1. A human has to decide what
-            # happened; this refuses rather than inventing a new history.
-            if _marker_exists(marker):
-                raise CursorRecoveryRequiredError(
-                    f"{path}: no durable cursor exists, but {marker.name} records that one was "
-                    "initialized here before. Refusing to silently reinitialize Phase-1 rotation "
-                    "from zero. Investigate why the cursor vanished; to deliberately start over, "
-                    f"remove {marker} by hand."
-                )
+            state = _adjudicate_first_boot(path)
             durable = None
             base_generation = 0
             fingerprint = None
         else:
+            _adjudicate_claims(path, _list_claims(path))
+            state = _read_init_state(path)
+            # The compare half of the compare-and-swap. `missing_ok=False`,
+            # so an absent file raises instead of presenting generation 0
+            # -- "there is nothing here" and "here is a generation-0
+            # cursor" must not be the same answer.
             try:
                 durable = _load_at(path, missing_ok=False)
             except CursorMissingError as exc:
+                if state == INIT_COMMITTED:
+                    raise CursorRecoveryRequiredError(
+                        f"{path}: write expected generation {expected_generation} but no durable cursor "
+                        f"exists, and {_init_state_path_for(path).name} records that one was committed "
+                        "here before. Refusing to mutate; investigate why the cursor vanished."
+                    ) from exc
                 raise StaleCursorError(
                     f"{path}: write expected generation {expected_generation} but no durable cursor exists; "
                     "pass CREATE_ONLY to create one"
@@ -746,7 +1044,7 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None,
                 raise StaleCursorError(
                     f"Cursor generation mismatch: expected {expected_generation}, found {base_generation}"
                 )
-            # Bind the exact bytes this decision was made on, for the swap.
+            # Bind the exact bytes this decision was made on, for custody.
             fingerprint = _fingerprint(path)
             if fingerprint is None:
                 raise StaleCursorError(
@@ -777,25 +1075,26 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None,
             "updated_at": now_iso(),
         }
 
-        # The swap. Both branches carry their verification INTO the write
-        # rather than performing it beforehand and hoping: an earlier
-        # version checked here and replaced afterwards, and a competing
-        # generation-2500 write landed in between and was clobbered.
         if creating:
-            # Marker first. If this process dies between the two writes,
-            # the next boot sees "initialized before, cursor absent" and
-            # fails closed -- the safe direction. The reverse order would
-            # leave a cursor no marker vouches for, and its later loss
-            # would once again look like a first boot.
-            _establish_marker(marker)
+            # First-boot transaction: PREPARE (intent, durable) -> create
+            # the cursor -> COMMIT. A crash after PREPARE leaves "prepared
+            # + no cursor", which the next attempt resumes; a crash after
+            # the create leaves a valid cursor that the next mutation
+            # adopts and commits. Neither wedges, and neither can be
+            # mistaken for a lost committed cursor.
+            if state != INIT_PREPARED:
+                _write_init_state(path, INIT_PREPARED, txid)
             _create_exclusively(path, payload)
+            _commit_init_state(path, txid)
         else:
+            # Upgrade / adopt fence, BEFORE custody: a valid cursor that
+            # predates the record (the one live in production), or one
+            # created by a first boot that crashed before its commit, is
+            # committed now. From this statement on there is no instant at
+            # which the historical cursor has left its name while no
+            # durable evidence says it ever existed.
+            if state != INIT_COMMITTED:
+                _commit_init_state(path, txid)
             _swap_under_custody(path, payload, fingerprint)
-            # An existing cursor proves initialization just as well as
-            # creating one does. Stamping it here is what closes the gap
-            # for the cursor already live in production, which predates
-            # the marker: its first successful tick after activation
-            # fences it, so a later disappearance fails closed.
-            _establish_marker(marker)
 
     return payload

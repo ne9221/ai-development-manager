@@ -2083,22 +2083,33 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
 
     from manager.phase1_cursor import (CREATE_ONLY, CursorLockError, CursorMissingError,
                                        CursorRecoveryRequiredError, CursorStateError,
-                                       StaleCursorError, default_phase1_cursor,
-                                       load_phase1_cursor, phase1_cursor_initialized,
-                                       save_phase1_cursor)
+                                       StaleCursorError, bind_phase1_cursor_path,
+                                       default_phase1_cursor, load_phase1_cursor,
+                                       require_phase1_cursor_first_boot, save_phase1_cursor)
 
-    # `cursor_cas_token` is this invocation's write permit, and the three
-    # branches below are the three states the durable cursor can be in.
+    # Bound ONCE for the whole tick. The load below and the save at the
+    # end of the tick both receive this same absolute path object, so a
+    # relative home or cursor path plus a cwd/environment change midway
+    # through the tick cannot make the tick read one file and advance a
+    # decoy. An unresolvable home raises ManagerHomeError here, exactly as
+    # the load used to, before any cursor state has been consulted.
+    phase1_cursor_path = bind_phase1_cursor_path(cursor_path=cursor_path)
+
+    # `cursor_cas_token` is this invocation's write permit, and the
+    # branches below are the states the durable cursor can be in.
     # Keeping them apart is the whole fix: the old loader collapsed all
-    # three into "generation 0", so a cursor that merely failed to read
+    # of them into "generation 0", so a cursor that merely failed to read
     # was indistinguishable from one that had never existed, and the next
     # save rebuilt it from zero.
     #
-    #   absent, never initialized -> CREATE_ONLY. Genuine first boot.
-    #   absent, but initialized before -> None. The cursor EXISTED and is
-    #                  gone. Recreating it from zero is the 2026-09-02
+    #   absent, proven first boot -> CREATE_ONLY. No cursor, no custody
+    #                  claim, and no record of a committed initialization.
+    #   absent, otherwise -> None. The cursor EXISTED and is gone, or a
+    #                  custody claim from an interrupted mutation holds
+    #                  the last copy, or the initialization record is
+    #                  garbage. Recreating from zero is the 2026-09-02
     #                  incident, so the tick refuses and leaves the
-    #                  reconstruction decision to a human.
+    #                  decision to a human.
     #   present     -> its durable generation. Normal CAS amendment.
     #   unreadable  -> None, meaning "do not persist at all". The tick
     #                  still serves commands, but it will not overwrite
@@ -2107,16 +2118,18 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
     #                  holding 5 projects instead of 13. The bad file is
     #                  left exactly as it is, as evidence for a human.
     try:
-        cursor = load_phase1_cursor(cursor_path=cursor_path, missing_ok=False)
+        cursor = load_phase1_cursor(cursor_path=phase1_cursor_path, missing_ok=False)
         cursor_cas_token = cursor["generation"]
     except CursorMissingError:
         cursor = default_phase1_cursor()
-        # Absence alone does not authorise creation; the initialization
-        # marker is what separates a first boot from a lost cursor.
-        if phase1_cursor_initialized(cursor_path=cursor_path):
-            print("PHASE1_CURSOR: durable cursor is MISSING but was initialized here before; "
+        # Absence alone does not authorise creation; the recovery protocol
+        # is what separates a first boot from a lost cursor.
+        try:
+            require_phase1_cursor_first_boot(cursor_path=phase1_cursor_path)
+        except (CursorRecoveryRequiredError, CursorStateError, StaleCursorError) as exc:
+            print("PHASE1_CURSOR: durable cursor is MISSING and this is not a provable first boot; "
                   "refusing to reinitialize Phase-1 rotation from zero. Not persisting this tick. "
-                  "This needs a human: find out why the cursor vanished.", file=sys.stderr)
+                  f"This needs a human: {exc}", file=sys.stderr)
             cursor_cas_token = None
         else:
             cursor_cas_token = CREATE_ONLY
@@ -2277,7 +2290,8 @@ def poll_once(store, service, allowlist=None, deadline=None, discovery_store=Non
             return
         cursor["per_project_attention_visits"] = attention_visits
         try:
-            save_phase1_cursor(cursor, cursor_path=cursor_path,
+            # The SAME bound path object the load used -- never re-resolved.
+            save_phase1_cursor(cursor, cursor_path=phase1_cursor_path,
                                expected_generation=cursor_cas_token)
         except (StaleCursorError, CursorStateError, CursorLockError,
                 CursorRecoveryRequiredError, OSError) as exc:
