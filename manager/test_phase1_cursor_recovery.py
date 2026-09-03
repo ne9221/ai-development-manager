@@ -775,6 +775,105 @@ class TestFirstBootTransaction(RecoveryTestCase):
         self.assertEqual(1, saved["generation"])
         self.assertEqual(INIT_COMMITTED, self.state())
 
+    def _fail_commit_after(self, tamper):
+        """Run a CREATE_ONLY save whose commit fails, tampering first."""
+        real = pc._write_init_state
+
+        def fail_the_commit(path, state, txid):
+            if state == INIT_COMMITTED:
+                if tamper is not None:
+                    tamper(Path(str(path)))
+                raise CursorReadError("injected: cannot record the commit")
+            return real(path, state, txid)
+
+        with patch.object(pc, "_write_init_state", side_effect=fail_the_commit):
+            with self.assertRaises(CursorReadError):
+                self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
+
+    def test_the_rollback_never_deletes_a_cursor_it_did_not_create(self):
+        """The rollback deletes by IDENTITY, never by name.
+
+        An independent review drove this exact shape: between
+        ``_create_exclusively`` returning and the commit failing, another
+        writer put a real cursor at the canonical name, and the rollback
+        deleted it -- a generation-2458 file with 13 projects, destroyed
+        by code whose comment reasons about the generation-1 file it had
+        created. The reasoning was sound; it just did not describe the
+        file being unlinked.
+
+        Both tampering shapes matter, and an identity check alone only
+        catches the first: a competitor that PUBLISHES gets a new inode,
+        while one that opens the name and rewrites it keeps the inode and
+        walks past ``samestat`` untouched.
+        """
+        def replaced(path):
+            other = path.with_name(path.name + ".other")
+            other.write_text(json.dumps({
+                "project_cursor": 0,
+                "per_project_record_cursor": dict(PROD_13_PROJECTS),
+                "per_project_attention_visits": {},
+                "generation": 2458, "updated_at": None}), encoding="utf-8")
+            os.replace(str(other), str(path))
+
+        def truncated_in_place(path):
+            path.write_text(json.dumps({
+                "project_cursor": 0,
+                "per_project_record_cursor": dict(PROD_13_PROJECTS),
+                "per_project_attention_visits": {},
+                "generation": 2458, "updated_at": None}), encoding="utf-8")
+
+        def appended_in_place(path):
+            with open(str(path), "a", encoding="utf-8") as handle:
+                handle.write("\n")
+
+        def replaced_with_identical_bytes(path):
+            """A DIFFERENT file that happens to hold the same bytes.
+
+            The content comparison alone cannot tell this from our own
+            file; only the identity half can. It is the competitor's
+            published cursor, so it is not ours to remove.
+            """
+            same = path.read_bytes()
+            other = path.with_name(path.name + ".other")
+            other.write_bytes(same)
+            os.replace(str(other), str(path))
+
+        for label, tamper, survives_as in [
+            ("competitor replaced the file (new inode)", replaced, 2458),
+            ("competitor truncated in place (same inode)", truncated_in_place, 2458),
+            ("competitor rewrote in place (same inode)", appended_in_place, 1),
+            ("competitor replaced with byte-identical content", replaced_with_identical_bytes, 1),
+        ]:
+            with self.subTest(shape=label):
+                self.setUp()
+                self._fail_commit_after(tamper)
+                self.assertTrue(self.cursor_path.exists(),
+                                f"{label}: the rollback destroyed a file it did not create")
+                self.assertEqual(survives_as, self.durable()["generation"], label)
+
+    def test_the_rollback_still_removes_the_file_it_did_create(self):
+        """The identity check must not turn the rollback off.
+
+        Leaving an uncommitted generation-1 cursor behind is the failure
+        the rollback exists to prevent: a later loss would read as
+        PREPARED + absent, indistinguishable from "never created", and
+        authorise a second first boot.
+        """
+        self._fail_commit_after(None)
+        self.assertFalse(self.cursor_path.exists(),
+                         "a cursor no durable record vouches for was left behind")
+        self.assertEqual(INIT_PREPARED, self.state())
+        saved = self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
+        self.assertEqual(1, saved["generation"])
+        self.assertEqual(INIT_COMMITTED, self.state())
+
+    def test_an_unestablished_creation_token_never_deletes(self):
+        """No token means no proof of ownership, so nothing is removed."""
+        self.seed(generation=2458)
+        pc._discard_if_same(self.cursor_path, None)
+        self.assertTrue(self.cursor_path.exists())
+        self.assertEqual(2458, self.durable()["generation"])
+
     def test_crash_after_create_before_commit_adopts_generation_1(self):
         self.write_state(INIT_PREPARED)
         self.seed(1, records={"only": 1})

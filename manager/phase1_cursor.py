@@ -565,6 +565,44 @@ def _discard(name):
             pass
 
 
+def _discard_if_same(path, created):
+    """Discard ``path`` ONLY while it is still exactly what this call created.
+
+    Rolling a creation back means deleting the file THIS transaction made,
+    not whatever currently answers to its name. Those are the same thing
+    right up until someone else puts a cursor at that name, and then
+    deleting by name destroys their file instead of ours -- the durable
+    loss this whole protocol exists to prevent.
+
+    ``created`` is the ``(stat, bytes)`` token :func:`_create_exclusively`
+    returns, and BOTH halves are required:
+
+    * ``samestat`` (``st_dev``/``st_ino``, populated and distinct on every
+      platform this runs on, NTFS included) catches a writer that
+      REPLACED the file -- which is what this module's own publication
+      does, so it is what a competing ADM writer looks like;
+    * the byte comparison catches a writer that TRUNCATED IN PLACE
+      (``open(path, "w")``, ``Path.write_text``), which keeps the inode
+      and would sail straight past an identity check on its own.
+
+    Anything unreadable, vanished, or changed proves the file is not ours
+    to delete, so it is left alone. Leaving a stray generation-1 cursor
+    behind is recoverable -- the next mutation adopts or refuses it --
+    while deleting someone else's is not.
+    """
+    if created is None:
+        return
+    identity, content = created
+    try:
+        if not os.path.samestat(os.stat(str(path)), identity):
+            return
+        if Path(str(path)).read_bytes() != content:
+            return
+    except OSError:
+        return
+    _discard(path)
+
+
 def _write_exclusive_file(target, payload):
     """Create ``target`` (which must not exist) with ``payload`` as JSON, fsynced."""
     fd = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -969,7 +1007,14 @@ def _swap_under_custody(path, expected_generation, build_payload, fingerprint):
 
 
 def _create_exclusively(path, payload):
-    """Create a cursor that does not exist. Atomic against a racing creator."""
+    """Create a cursor that does not exist. Atomic against a racing creator.
+
+    Returns a ``(stat, bytes)`` token for the file this call installed, so
+    a later rollback can prove the thing it is about to delete is still
+    that exact file and not a successor or an in-place rewrite. ``None``
+    means the token could not be established, which
+    :func:`_discard_if_same` treats as "do not delete".
+    """
     temp_name = _write_temp(path, payload)
     try:
         _publish_exclusively(temp_name, path)
@@ -981,6 +1026,10 @@ def _create_exclusively(path, payload):
     except BaseException:
         _discard(temp_name)
         raise
+    try:
+        return os.stat(str(path)), Path(str(path)).read_bytes()
+    except OSError:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -1201,7 +1250,7 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None,
             # mistaken for a lost committed cursor.
             if state != INIT_PREPARED:
                 _write_init_state(path, INIT_PREPARED, txid)
-            _create_exclusively(path, payload)
+            created = _create_exclusively(path, payload)
             try:
                 _commit_init_state(path, txid)
             except BaseException:
@@ -1213,7 +1262,16 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None,
                 # a later first boot will not recreate, so discarding it
                 # loses no rotation state, while leaving it opens a route
                 # to a false first boot.
-                _discard(path)
+                #
+                # By IDENTITY, never by name: the reasoning above holds for
+                # the generation-1 file this transaction created, and for
+                # nothing else. If another writer has installed a cursor at
+                # this name in the meantime, that file is theirs and may
+                # carry real rotation state -- deleting it here would be
+                # exactly the durable loss this whole protocol exists to
+                # prevent. The POSIX publication fallback already refuses to
+                # clean up a competitor for the same reason.
+                _discard_if_same(path, created)
                 raise
         else:
             # Upgrade / adopt fence, BEFORE custody: a valid cursor that
