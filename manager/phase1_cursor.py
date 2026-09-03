@@ -481,6 +481,12 @@ INIT_STATE_SUFFIX = ".init-state"
 #: Retained name from the previous round; the record it points at is now
 #: a validated state record rather than an existence-only marker.
 INIT_MARKER_SUFFIX = INIT_STATE_SUFFIX
+#: The previous round's existence-only marker, under its own name. Renaming
+#: the artifact must not amount to forgetting what it recorded: a deployment
+#: that ran the previous round and then lost its cursor would otherwise show
+#: "no record, no cursor" and be reinitialized from zero -- the exact reset
+#: route this module exists to close. Read, never written.
+LEGACY_INIT_MARKER_SUFFIX = ".initialized"
 CLAIM_INFIX = ".claim-"
 CANDIDATE_INFIX = ".candidate-"
 
@@ -619,12 +625,29 @@ def _publish_exclusively(source, path):
 # --------------------------------------------------------------------------
 
 
+def _legacy_marker_path_for(path):
+    return path.with_name(path.name + LEGACY_INIT_MARKER_SUFFIX)
+
+
 def _read_init_state(path):
     """None if no record exists, else INIT_PREPARED / INIT_COMMITTED. Anything else fails closed."""
     record_path = _init_state_path_for(path)
     try:
         raw = record_path.read_bytes()
     except FileNotFoundError:
+        # No record under the current name. Before concluding "never
+        # initialized", honour the previous round's existence-only marker
+        # if one is present: it carries exactly one fact -- a cursor was
+        # initialized here -- so it reads as COMMITTED. Its *contents*
+        # are deliberately not parsed, because that marker never had a
+        # trustworthy schema; only its presence is evidence.
+        legacy = _legacy_marker_path_for(path)
+        try:
+            if legacy.exists():
+                return INIT_COMMITTED
+        except OSError as exc:
+            raise CursorReadError(
+                f"{legacy}: cannot stat the legacy initialization marker: {exc}") from exc
         return None
     except OSError as exc:
         raise CursorReadError(f"{record_path}: cannot read the initialization-state record: {exc}") from exc

@@ -290,6 +290,78 @@ class TestFirstBootTransaction(RecoveryTestCase):
             require_phase1_cursor_first_boot(cursor_path=self.cursor_path)
 
 
+class TestLegacyMarkerMigration(RecoveryTestCase):
+    """Renaming the artifact must not amount to forgetting what it recorded.
+
+    Round 2 wrote an existence-only ``phase1-cursor.json.initialized``.
+    Round 3 renamed it. A deployment that ran round 2 and then lost its
+    cursor would show "no record, no cursor" under the new name and be
+    reinitialized from zero -- reintroducing the exact P0 both rounds
+    exist to close.
+    """
+
+    def legacy(self):
+        return self.runtime / ("phase1-cursor.json" + pc.LEGACY_INIT_MARKER_SUFFIX)
+
+    def write_legacy(self, body=None):
+        self.legacy().write_text(
+            json.dumps({"schema": 1, "initialized_at": "2026-09-03T00:00:00Z"} if body is None else body),
+            encoding="utf-8")
+
+    def test_legacy_marker_alone_reads_as_committed(self):
+        self.write_legacy()
+        self.assertEqual(INIT_COMMITTED, self.state())
+
+    def test_lost_cursor_with_only_a_legacy_marker_is_not_reinitialized(self):
+        self.write_legacy()
+        with self.assertRaises(CursorRecoveryRequiredError):
+            require_phase1_cursor_first_boot(cursor_path=self.cursor_path)
+        with self.assertRaises(CursorRecoveryRequiredError):
+            self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
+        self.assertFalse(self.cursor_path.exists(),
+                         "a lost cursor was rebuilt from zero because the marker had been renamed")
+
+    def test_watcher_tick_does_not_rebuild_behind_a_legacy_marker(self):
+        self.write_legacy()
+        watcher_tick(str(self.cursor_path))
+        watcher_tick(str(self.cursor_path))
+        self.assertFalse(self.cursor_path.exists())
+
+    def test_legacy_marker_contents_are_never_parsed(self):
+        """Only its presence is evidence; that marker had no trustworthy schema."""
+        for body in (b"", b"   ", b"not json at all", b"[]", b'{"schema": 99}'):
+            with self.subTest(body=body):
+                self.legacy().write_bytes(body)
+                self.assertEqual(INIT_COMMITTED, self.state())
+
+    def test_a_live_cursor_beside_a_legacy_marker_still_amends_normally(self):
+        self.write_legacy()
+        self.seed(2458)
+        saved = self.save({"project_cursor": 1}, expected_generation=2458)
+        self.assertEqual(2459, saved["generation"])
+        self.assertEqual(13, len(saved["per_project_record_cursor"]))
+        self.assertEqual(INIT_COMMITTED, self.state())
+
+    def test_the_new_record_wins_over_a_legacy_marker(self):
+        self.write_legacy()
+        self.write_state(INIT_PREPARED)
+        self.assertEqual(INIT_PREPARED, self.state())
+        self.assertTrue(require_phase1_cursor_first_boot(cursor_path=self.cursor_path))
+
+    def test_the_legacy_marker_is_never_written_or_removed(self):
+        self.write_legacy()
+        before = self.legacy().read_bytes()
+        self.seed(10)
+        self.save({"project_cursor": 1}, expected_generation=10)
+        self.assertTrue(self.legacy().exists())
+        self.assertEqual(before, self.legacy().read_bytes())
+        source = Path(pc.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("_write_init_state(_legacy", source)
+        writes = [line for line in source.splitlines()
+                  if "_legacy_marker_path_for" in line and ("unlink" in line or "write" in line)]
+        self.assertEqual([], writes, f"the legacy marker must be read-only: {writes}")
+
+
 class TestInitStateValidation(RecoveryTestCase):
 
     BAD = {
