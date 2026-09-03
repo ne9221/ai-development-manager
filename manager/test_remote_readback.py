@@ -102,3 +102,13 @@ def test_verify_remote_branch_matches_fails_closed_on_ambiguous_multiple_refs():
 
     with pytest.raises(TaskError, match="ambiguous"):
         verify_remote_branch_matches("/fake/dir", "main", "a" * 40, runner=fake_runner)
+
+
+def test_verify_remote_branch_matches_fails_closed_on_malformed_remote_sha():
+    def fake_runner(command, **kwargs):
+        if "get-url" in command:
+            return subprocess.CompletedProcess(command, 0, "https://example.com/repo.git\n", "")
+        return subprocess.CompletedProcess(command, 0, "not-a-sha\trefs/heads/main\n", "")
+
+    with pytest.raises(TaskError, match="unexpected ref value"):
+        verify_remote_branch_matches("/fake/dir", "main", "a" * 40, runner=fake_runner)
