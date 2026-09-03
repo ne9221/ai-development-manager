@@ -50,23 +50,49 @@ CALLER_5_PROJECTS = {f"proj-{i:02d}": 1 for i in range(5)}
 
 def fail_canonical_install(cursor_path, only_candidates=False):
     """Fault injection at the OS layer: installing ANY file at the canonical
-    cursor name fails, whichever primitive (link, rename, replace) the code
-    reaches for. Custody renames (destination is a claim) still work. With
-    ``only_candidates`` the restore of a claim still works too, modelling a
-    full disk rather than a filesystem that has stopped working."""
+    cursor name fails, whichever primitive the code reaches for. Custody
+    renames (destination is a claim) still work. With ``only_candidates``
+    the restore of a claim still works too, modelling a full disk rather
+    than a filesystem that has stopped working.
+
+    Every install primitive is blocked, not merely the convenient ones.
+    ``_publish_exclusively`` tries ``os.link``, then Windows' native
+    non-replacing rename, then an exclusive ``os.open`` create -- and an
+    injection that stops at rename lets the third route through. On
+    Windows the second route is reached and the reproduction happens to
+    hold; anywhere else the publication would quietly SUCCEED and the
+    double-failure scenario would be modelling a failure the code can
+    still route around. A fault-injection model that does not defeat
+    every fallback is a reproduction that lies."""
     import manager.phase1_cursor as pc
     canonical = os.path.normcase(str(cursor_path))
-    real = {"replace": os.replace, "rename": os.rename, "link": os.link}
+    real = {"replace": os.replace, "rename": os.rename, "link": os.link, "open": os.open}
+    # The source of the canonical install currently being attempted, so the
+    # exclusive-create fallback can honour ``only_candidates`` too: by the
+    # time it runs, the source is no longer one of the call's arguments.
+    attempting = []
+
+    def refused(src):
+        return not only_candidates or ".candidate-" in str(src)
 
     def guard(name):
         def wrapped(src, dst, *args, **kwargs):
-            if os.path.normcase(str(dst)) == canonical and (
-                    not only_candidates or ".candidate-" in str(src)):
-                raise OSError(f"injected: {name} to the canonical cursor name refused")
+            if os.path.normcase(str(dst)) == canonical:
+                del attempting[:]
+                attempting.append(src)
+                if refused(src):
+                    raise OSError(f"injected: {name} to the canonical cursor name refused")
             return real[name](src, dst, *args, **kwargs)
         return wrapped
 
-    return patch.multiple(pc.os, replace=guard("replace"), rename=guard("rename"), link=guard("link"))
+    def guarded_open(path, flags, *args, **kwargs):
+        if (os.path.normcase(str(path)) == canonical and (flags & os.O_CREAT)
+                and refused(attempting[0] if attempting else "")):
+            raise OSError("injected: exclusive create at the canonical cursor name refused")
+        return real["open"](path, flags, *args, **kwargs)
+
+    return patch.multiple(pc.os, replace=guard("replace"), rename=guard("rename"),
+                          link=guard("link"), open=guarded_open)
 
 
 class CursorTestCase(unittest.TestCase):

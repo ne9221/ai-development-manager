@@ -22,10 +22,12 @@ the reviewer used (the primitive, and the real ``poll_once`` tick):
 The numbers 2458 / 13 / 2500 are the reviewer's.
 """
 
+import ast
 import json
 import os
 import shutil
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -51,6 +53,221 @@ from manager.phase1_cursor import (
 from manager.test_phase1_cursor_integrity import fail_canonical_install
 
 PROD_13_PROJECTS = {f"proj-{i:02d}": 100 + i for i in range(13)}
+
+
+# ---------------------------------------------------------------------------
+# Static guard: nothing in the mutation module lands on the canonical
+# cursor name except by a primitive that refuses an occupied destination.
+#
+# This is the same lesson as Blocker 5, applied to the invariant Blocker 3
+# established. Its predecessor was a line-oriented check that read only
+# lines starting with ``os.replace(`` and accepted any that mentioned a
+# claim or the record, so a trailing ``# retires the claim`` comment
+# re-opened the hole; and it never looked at ``os.rename``, which is
+# non-replacing on Windows but replaces silently on POSIX, so an
+# unguarded one is a live lost-update defect anywhere else while the
+# check stays green. Both were demonstrated against the real module.
+#
+# The guard is scope- and alias-aware, so a comment, a line break, an
+# alias, a wrapper such as ``str()``, or a root-level script cannot hide
+# a violation. It also covers the truncating writes the writer audit
+# deliberately cannot see here -- ``manager/phase1_cursor.py`` is that
+# audit's sanctioned path, so this file is the only place a truncating
+# overwrite inside it would ever be caught.
+# ---------------------------------------------------------------------------
+
+#: Sinks that install over an occupied destination without complaint anywhere.
+ALWAYS_REPLACING_FUNCS = {("os", "replace"), ("shutil", "move"), ("shutil", "copyfile"),
+                          ("shutil", "copy"), ("shutil", "copy2")}
+#: Replacing on POSIX, non-replacing on Windows: permitted only under an
+#: explicit ``os.name == "nt"`` guard, which is what makes it safe.
+POSIX_REPLACING_FUNCS = {("os", "rename")}
+ALWAYS_REPLACING_METHODS = {"replace"}
+POSIX_REPLACING_METHODS = {"rename"}
+#: Writes that truncate whatever the destination already holds.
+TRUNCATING_METHODS = {"write_text", "write_bytes"}
+WRITE_MODE_CHARS = set("wax+")
+#: The module's name for the one bound canonical cursor path.
+CANONICAL_NAME = "path"
+#: Calls that wrap a path without naming a DIFFERENT file.
+PATH_WRAPPERS = {"str", "Path", "fspath"}
+#: Calls that hand back the canonical cursor path.
+PATH_SOURCES = {"_resolve_cursor_path", "bind_phase1_cursor_path"}
+
+
+def _names_canonical(node, aliases):
+    """Does this expression name the canonical cursor file itself?
+
+    Deliberately narrow: ``path.parent`` and ``path.with_name(...)`` name
+    other files, so only the bare name and transparent wrappers count.
+    """
+    if isinstance(node, ast.Name):
+        return node.id in aliases
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name in PATH_SOURCES:
+            return True
+        if name in PATH_WRAPPERS:
+            return any(_names_canonical(a, aliases) for a in node.args)
+    return False
+
+
+def _is_nt_guard(test):
+    for sub in ast.walk(test):
+        if (isinstance(sub, ast.Compare) and isinstance(sub.left, ast.Attribute)
+                and sub.left.attr == "name" and isinstance(sub.left.value, ast.Name)
+                and sub.left.value.id == "os"):
+            return any(isinstance(c, ast.Constant) and c.value == "nt" for c in sub.comparators)
+    return False
+
+
+def _replacing_sink(call):
+    """``(kind, destination, posix_only)`` for a replacing install, else None.
+
+    A rename is not the only way to land on top of the canonical name.
+    A truncating write gets there too, and inside this module the writer
+    audit cannot see it -- ``manager/phase1_cursor.py`` is the sanctioned
+    path there and is skipped by design. So the non-exclusive creates
+    belong here: ``open(cursor, "w")``, ``cursor.write_text(...)``, and
+    an ``os.open`` that omits ``O_EXCL``. The module's own POSIX
+    publication fallback opens the canonical name WITH ``O_EXCL``, which
+    is precisely what makes it a publication rather than an overwrite.
+    """
+    func = call.func
+    if isinstance(func, ast.Name) and func.id == "open" and call.args:
+        mode = call.args[1] if len(call.args) >= 2 else next(
+            (k.value for k in call.keywords if k.arg == "mode"), None)
+        text = mode.value if isinstance(mode, ast.Constant) else ""
+        if isinstance(text, str) and set(text) & WRITE_MODE_CHARS:
+            return ('open(%r)' % text, call.args[0], False)
+        return None
+    if isinstance(func, ast.Attribute):
+        if isinstance(func.value, ast.Name) and len(call.args) >= 2:
+            pair = (func.value.id, func.attr)
+            if pair in ALWAYS_REPLACING_FUNCS:
+                return ("%s.%s()" % pair, call.args[1], False)
+            if pair in POSIX_REPLACING_FUNCS:
+                return ("%s.%s()" % pair, call.args[1], True)
+            if pair == ("os", "open") and not _mentions_o_excl(call.args[1]):
+                return ("os.open() without O_EXCL", call.args[0], False)
+        if len(call.args) == 1 and not call.keywords:
+            # Method form: the RECEIVER is the source, the argument the
+            # destination. ``Path.replace``/``rename`` take exactly one
+            # argument, which is what separates them from the two-argument
+            # ``str.replace`` that shares the name.
+            if func.attr in ALWAYS_REPLACING_METHODS:
+                return (".%s()" % func.attr, call.args[0], False)
+            if func.attr in POSIX_REPLACING_METHODS:
+                return (".%s()" % func.attr, call.args[0], True)
+        if func.attr in TRUNCATING_METHODS:
+            # Method form again, but here the RECEIVER is the destination.
+            return (".%s()" % func.attr, func.value, False)
+    return None
+
+
+def _mentions_o_excl(flags):
+    return any(isinstance(sub, ast.Attribute) and sub.attr == "O_EXCL" for sub in ast.walk(flags))
+
+
+def _scan_scope(node, aliases, nt_guarded, out):
+    if isinstance(node, ast.If) and _is_nt_guard(node.test):
+        for stmt in node.body:
+            _scan_scope(stmt, aliases, True, out)
+        for stmt in node.orelse:
+            _scan_scope(stmt, aliases, nt_guarded, out)
+        return
+    if isinstance(node, ast.Call):
+        sink = _replacing_sink(node)
+        if sink is not None:
+            kind, destination, posix_only = sink
+            if _names_canonical(destination, aliases) and not (posix_only and nt_guarded):
+                out.append("%s over the canonical cursor at line %d" % (kind, node.lineno))
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue  # its own scope, walked separately
+        _scan_scope(child, aliases, nt_guarded, out)
+
+
+def replacing_installs_over_the_cursor(source):
+    """Every replacing install whose destination is the canonical cursor."""
+    tree = ast.parse(textwrap.dedent(source))
+    scopes = [tree] + [n for n in ast.walk(tree)
+                       if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    violations = []
+    for scope in scopes:
+        aliases = {CANONICAL_NAME}
+        for sub in ast.walk(scope):
+            if isinstance(sub, ast.Assign) and _names_canonical(sub.value, aliases):
+                aliases.update(t.id for t in sub.targets if isinstance(t, ast.Name))
+        for child in ast.iter_child_nodes(scope):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            _scan_scope(child, aliases, False, violations)
+    return sorted(set(violations))
+
+
+REPLACING_INSTALL_CONTROL = """
+def publish(path, temp_name, claim, record_path, source):
+    os.replace(str(path), str(claim))
+    os.replace(temp_name, str(record_path))
+    stamp = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    label = str(path).replace(str(path), "<cursor>")
+    if os.name == "nt":
+        os.rename(str(source), str(path))
+    return stamp, label
+"""
+
+REPLACING_INSTALL_MUTANTS = {
+    "trailing comment naming a claim": """
+def publish(path, temp_name):
+    os.replace(str(temp_name), str(path))  # retires the claim
+""",
+    "os.rename without the nt guard": """
+def publish(path, temp_name):
+    os.rename(str(temp_name), str(path))
+""",
+    "destination reached through an alias": """
+def publish(path, temp_name):
+    destination = path
+    os.replace(str(temp_name), str(destination))
+""",
+    "spelled over several lines": """
+def publish(path, temp_name):
+    os.replace(
+        str(temp_name),
+        str(path))
+""",
+    "Path.replace method form": """
+def publish(path, temp_name):
+    Path(temp_name).replace(path)
+""",
+    "shutil.move": """
+def publish(path, temp_name):
+    shutil.move(temp_name, str(path))
+""",
+    "destination from the bound-path resolver": """
+def publish(temp_name):
+    os.replace(temp_name, str(bind_phase1_cursor_path()))
+""",
+    "in a root-level script with no function at all": """
+cursor = _resolve_cursor_path()
+os.replace("staged.json", str(cursor))
+""",
+    "truncating open over the canonical name": """
+def publish(path, payload):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+""",
+    "Path.write_text over the canonical name": """
+def publish(path, payload):
+    path.write_text(payload, encoding="utf-8")
+""",
+    "os.open create without O_EXCL": """
+def publish(path):
+    return os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o600)
+""",
+}
 
 
 def _tasks(pid):
@@ -159,6 +376,34 @@ class TestUpgradeDoubleFailure(RecoveryTestCase):
         self.assertEqual(claims, self.claims(), "a tick touched the custody claim")
         self.assertEqual(2458, self.durable(claims[0])["generation"])
         self.assertEqual(13, len(self.durable(claims[0])["per_project_record_cursor"]))
+
+    def test_the_double_failure_reproduction_holds_on_every_platform(self):
+        """The injection must defeat EVERY install route, not the convenient ones.
+
+        ``_publish_exclusively`` tries a hard link, then Windows' native
+        non-replacing rename, then an exclusive create. An injection that
+        blocks only link/rename/replace is defeated by the third route:
+        on Windows the second is reached and the scenario happens to
+        reproduce, but anywhere else publication would quietly succeed
+        and this whole class would be asserting against a failure the
+        code can route around. Forcing each platform branch proves the
+        reproduction is real rather than incidental.
+        """
+        candidate = self.runtime / ("phase1-cursor.json" + ".candidate-probe")
+        for platform in ("nt", "posix"):
+            with self.subTest(os_name=platform):
+                candidate.write_text('{"generation": 2459}', encoding="utf-8")
+                # ``os.name`` is patched around the publication primitive
+                # only: pathlib dispatches its concrete class on it, so a
+                # wider patch would fail constructing paths rather than
+                # exercising the branch.
+                with self.fail_double(), patch.object(pc.os, "name", platform):
+                    with self.assertRaises(OSError):
+                        pc._publish_exclusively(candidate, self.cursor_path)
+                self.assertFalse(self.cursor_path.exists(),
+                                 f"the {platform} install route was NOT blocked by the injection")
+                self.assertTrue(candidate.exists(), "a refused publish consumed its source")
+                candidate.unlink()
 
     def test_leftover_claim_prevents_first_init_even_without_a_record(self):
         """ANY existing claim means NOT first boot -- with no record at all."""
@@ -511,13 +756,25 @@ class TestNoOverwritePublication(RecoveryTestCase):
         self.assertFalse(claim.exists())
 
     def test_no_unconditional_replace_over_the_canonical_name(self):
-        """Static: the only os.replace destinations are claims and the state record."""
-        source = Path(pc.__file__).read_text(encoding="utf-8")
-        for line in source.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("os.replace("):
-                self.assertTrue("claim" in stripped or "record_path" in stripped,
-                                f"unconditional replace found: {stripped}")
+        """Static: nothing installs over the canonical name with a replacing primitive."""
+        violations = replacing_installs_over_the_cursor(Path(pc.__file__).read_text(encoding="utf-8"))
+        self.assertEqual([], violations, f"replacing install over the canonical cursor: {violations}")
+
+    def test_the_static_guard_catches_every_shape_of_replacing_install(self):
+        """Non-vacuous: the guard is AST-level, so no spelling of the defect slips past.
+
+        Its predecessor was a line-oriented check -- the very weakness
+        Blocker 5 condemned in the writer audit. It read only lines
+        beginning ``os.replace(`` and accepted any that mentioned a claim,
+        so a trailing ``# retires the claim`` comment re-opened the hole;
+        ``os.rename``, which replaces silently on POSIX, was never
+        examined at all; and neither was a truncating write.
+        """
+        for label, body in REPLACING_INSTALL_MUTANTS.items():
+            with self.subTest(shape=label):
+                self.assertNotEqual([], replacing_installs_over_the_cursor(body),
+                                    f"{label} was not detected")
+        self.assertEqual([], replacing_installs_over_the_cursor(REPLACING_INSTALL_CONTROL))
 
     def test_publish_primitive_refuses_an_occupied_destination(self):
         source = self.runtime / "candidate"
@@ -680,6 +937,28 @@ class TestRecoveryMatrix(RecoveryTestCase):
         self.write_state(INIT_PREPARED)
         self.assertEqual(1, self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)["generation"])
         self.assertEqual(INIT_COMMITTED, self.state())
+
+    def test_cursor_corrupt_with_a_prior_init_record_fails_closed(self):
+        """Matrix row 9: corruption beside a record of a committed cursor never resolves itself.
+
+        Neither token may turn this into a write: an amendment cannot
+        read the generation it is amending, and CREATE_ONLY cannot claim
+        a first boot over a file that is sitting right there. The corrupt
+        file is left untouched as evidence.
+        """
+        self.cursor_path.write_text('{"generation": 24', encoding="utf-8")
+        before = self.cursor_path.read_bytes()
+        self.write_state(INIT_COMMITTED)
+        for token in (2458, 0, CREATE_ONLY):
+            with self.subTest(token=token):
+                with self.assertRaises((CursorStateError, StaleCursorError,
+                                        CursorRecoveryRequiredError)):
+                    self.save({"project_cursor": 1}, expected_generation=token)
+                self.assertEqual(before, self.cursor_path.read_bytes())
+                self.assertEqual([], self.claims())
+        watcher_tick(str(self.cursor_path))
+        self.assertEqual(before, self.cursor_path.read_bytes(),
+                         "a tick wrote over a corrupt cursor instead of leaving the evidence")
 
     def test_claim_destroyed_during_custody_aborts_without_recreating(self):
         self.seed(2458)
