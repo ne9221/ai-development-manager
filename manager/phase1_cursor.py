@@ -175,6 +175,20 @@ def now_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+class _BoundCursorPath(type(Path())):
+    """An absolute cursor path this module has already resolved.
+
+    A marker type, not new behaviour: it lets :func:`_resolve_cursor_path`
+    recognise its own output and hand it straight back, so a caller that
+    binds once and passes the result to several calls really does get one
+    resolution rather than one per call. Derived paths (``with_name`` for
+    the lock, the claims, the state record) intentionally come back as
+    this type too -- they are siblings of an already-bound path.
+    """
+
+    __slots__ = ()
+
+
 def _resolve_cursor_path(manager_home=None, cursor_path=None):
     """Locate the durable cursor, or raise ManagerHomeError -- never cwd.
 
@@ -203,9 +217,17 @@ def _resolve_cursor_path(manager_home=None, cursor_path=None):
     :func:`bind_phase1_cursor_path`) and hand the same bound path to
     every call it makes.
     """
+    if isinstance(cursor_path, _BoundCursorPath):
+        # Already bound by this module. Returning it untouched is what makes
+        # "resolved once per tick" literally true rather than merely usually
+        # true: a second ``resolve()`` re-walks the filesystem, so a symlink
+        # or reparse point installed at the bound path between a tick's load
+        # and its save would be followed on the way out and not on the way in.
+        return cursor_path
     if cursor_path is not None:
-        return Path(cursor_path).expanduser().resolve()
-    return (resolve_manager_home(manager_home) / "runtime" / "phase1-cursor.json").resolve()
+        return _BoundCursorPath(Path(cursor_path).expanduser().resolve())
+    return _BoundCursorPath(
+        (resolve_manager_home(manager_home) / "runtime" / "phase1-cursor.json").resolve())
 
 
 def bind_phase1_cursor_path(manager_home=None, cursor_path=None):
@@ -592,14 +614,25 @@ def _publish_exclusively(source, path):
         if os.name == "nt":
             os.rename(str(source), str(path))
             return
+        # Claims the NAME atomically, but the bytes arrive afterwards, so a
+        # reader can briefly see a partial file. Only reachable where hard
+        # links are unavailable and the platform is not Windows -- never on
+        # the production path. The identity check on the failure branch is
+        # what stops the cleanup from deleting a competitor that replaced
+        # this file while it was being written.
         fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
+            created = os.fstat(fd)
             with open(fd, "wb", closefd=True) as handle:
                 handle.write(Path(source).read_bytes())
                 handle.flush()
                 os.fsync(handle.fileno())
         except BaseException:
-            _discard(path)
+            try:
+                if os.path.samestat(os.stat(str(path)), created):
+                    _discard(path)
+            except (OSError, NameError):
+                pass
             raise
     _discard(source)
 
@@ -730,8 +763,40 @@ def _commit_init_state(path, txid):
 # --------------------------------------------------------------------------
 
 
+def _claim_is_redundant(held, held_fingerprint, current, current_fingerprint):
+    """Is every fact in ``held`` already carried by ``current``? (redundant, why-not).
+
+    A lower generation is NOT sufficient, and assuming it was is how an
+    independent review destroyed a 13-project generation-2458 claim
+    against a 1-project generation-2500 cursor that an external writer
+    had installed: the newer file was newer and poorer, and deleting the
+    claim erased the only copy of the missing twelve projects.
+
+    Retirement therefore requires proof of redundancy: identical bytes,
+    or a strictly older generation whose per-project coverage the
+    current cursor already contains at a value at least as advanced.
+    Anything else is a human's decision.
+    """
+    if held_fingerprint is not None and current_fingerprint is not None \
+            and held_fingerprint[0] == current_fingerprint[0]:
+        return True, ""
+    if held["generation"] >= current["generation"]:
+        return False, "the claim's generation is not older"
+    for field in ("per_project_record_cursor", "per_project_attention_visits"):
+        held_map, current_map = held[field], current[field]
+        missing = sorted(set(held_map) - set(current_map))
+        if missing:
+            return False, (f"the claim carries {field} entries the durable cursor has lost "
+                           f"({', '.join(missing[:5])}{'...' if len(missing) > 5 else ''})")
+        regressed = sorted(k for k, v in held_map.items() if current_map[k] < v)
+        if regressed:
+            return False, (f"the durable cursor's {field} went backwards for "
+                           f"{', '.join(regressed[:5])}{'...' if len(regressed) > 5 else ''}")
+    return True, ""
+
+
 def _adjudicate_claims(path, claims):
-    """Retire superseded claims; fail closed on anything else. Never deletes a last copy."""
+    """Retire provably redundant claims; fail closed on anything else. Never deletes a last copy."""
     if not claims:
         return
     names = ", ".join(c.name for c in claims)
@@ -772,15 +837,14 @@ def _adjudicate_claims(path, claims):
                 f"{path}: custody claim {claim.name} cannot be read ({exc}); refusing to mutate until a "
                 "human has adjudicated it. Nothing here will delete it."
             ) from exc
-        superseded = held["generation"] < current["generation"]
-        duplicate = (held["generation"] == current["generation"]
-                     and held_fingerprint is not None
-                     and held_fingerprint[0] == current_fingerprint[0])
-        if not (superseded or duplicate):
+        redundant, why = _claim_is_redundant(held, held_fingerprint, current, current_fingerprint)
+        if not redundant:
             raise CursorRecoveryRequiredError(
-                f"{path}: custody claim {claim.name} holds generation {held['generation']} but the "
-                f"durable cursor is generation {current['generation']}; the claim is not a superseded "
-                "copy, so a human must decide which is authoritative. Nothing here will delete either."
+                f"{path}: custody claim {claim.name} (generation {held['generation']}, "
+                f"{len(held['per_project_record_cursor'])} projects) is not a superseded copy of the "
+                f"durable cursor (generation {current['generation']}, "
+                f"{len(current['per_project_record_cursor'])} projects): {why}. A human must decide "
+                "which is authoritative. Nothing here will delete either."
             )
         try:
             os.unlink(str(claim))
@@ -796,22 +860,33 @@ def _sweep_candidates(path):
         _discard(candidate)
 
 
-def _swap_under_custody(path, payload, fingerprint):
-    """Publish ``payload`` in place of the durable file ``fingerprint`` describes.
+def _swap_under_custody(path, expected_generation, build_payload, fingerprint):
+    """Publish a successor to the durable file, deciding everything under custody.
 
     The custody transaction, in order:
 
-    1. the candidate is serialized under a unique non-authoritative name
-       (already done by the caller, outside the checked window);
-    2. the durable file is renamed to a UNIQUE claim name -- an atomic
+    1. the durable file is renamed to a UNIQUE claim name -- an atomic
        operation that gives this transaction sole custody of one file;
-    3. the claim is verified to be the exact bytes the CAS decision was
-       made on; if it is not, or it is gone, nothing is published;
-    4. the candidate is published with a NO-OVERWRITE primitive. If
+    2. the claim is verified to be the exact bytes the pre-custody
+       compare looked at; if it is not, or it is gone, nothing happens;
+    3. the claim is RE-PARSED, and that parse -- not the caller's
+       earlier read -- is the authoritative durable state. Its
+       generation must still equal ``expected_generation``;
+    4. the successor is built from that authoritative state and
+       serialized under a unique non-authoritative candidate name;
+    5. the candidate is published with a NO-OVERWRITE primitive. If
        anything -- anyone -- has installed a file at the canonical name
        since custody vacated it, publication fails by construction, that
-       file survives, and the claim is preserved for adjudication.
-    5. only after a successful publish is the claim redundant.
+       file survives, and the claim is preserved for adjudication;
+    6. only after a successful publish is the claim redundant.
+
+    Step 3 is not redundant with step 2. An independent review installed
+    generation 2500 in the window between the pre-custody *parse* and
+    the pre-custody *fingerprint*: the fingerprint then described the
+    2500 file, custody verified it against itself, and a payload
+    computed from the stale 2458 parse was published as 2459. Both the
+    generation check and the merge base therefore have to come from a
+    file this transaction already owns.
 
     There is no unconditional replace over the canonical name anywhere
     in this sequence. A failure at any step leaves the last durable copy
@@ -820,7 +895,7 @@ def _swap_under_custody(path, payload, fingerprint):
     """
     txid = _new_txid()
     claim = _claim_path_for(path, txid)
-    temp_name = _write_temp(path, payload)
+    temp_name = None
     claimed = False
     try:
         try:
@@ -845,6 +920,17 @@ def _swap_under_custody(path, payload, fingerprint):
                 "refusing to overwrite a newer writer's state"
             )
 
+        # Authoritative read: this file is private to this transaction now.
+        durable = _load_at(claim, missing_ok=False)
+        if durable["generation"] != expected_generation:
+            raise StaleCursorError(
+                f"Cursor generation mismatch under custody: expected {expected_generation}, "
+                f"found {durable['generation']}; refusing to publish a successor to state this "
+                "mutation never read"
+            )
+        payload = build_payload(durable)
+        temp_name = _write_temp(path, payload)
+
         try:
             _publish_exclusively(temp_name, path)
         except FileExistsError as exc:
@@ -861,6 +947,7 @@ def _swap_under_custody(path, payload, fingerprint):
             os.unlink(str(claim))
         except OSError:
             pass
+        return payload
     except BaseException:
         _discard(temp_name)
         if claimed and os.path.exists(str(claim)):
@@ -1074,31 +1161,38 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None,
                     f"{path}: durable cursor disappeared during the compare; refusing to recreate it"
                 )
 
-        # Authoritative: durable state + 1, never the caller's snapshot.
-        new_generation = base_generation + 1
-        project_cursor = int(cursor_data.get("project_cursor", 0))
-        if project_cursor < 0:
-            project_cursor = 0
+        def build_payload(durable_state):
+            """The successor to ``durable_state``. Called with authoritative state only.
 
-        # Merge, never replace: per-project state the durable cursor holds and
-        # this snapshot does not mention is carried forward. Nothing in the
-        # runtime deletes a project's cursor entry, so there is no deletion
-        # contract to preserve here; adding one would need its own explicit
-        # verb rather than an omission from a partial snapshot.
-        record_cursors = dict(durable["per_project_record_cursor"]) if durable else {}
-        record_cursors.update(_clean_counter_map(cursor_data.get("per_project_record_cursor", {})))
-        attention_visits = dict(durable["per_project_attention_visits"]) if durable else {}
-        attention_visits.update(_clean_counter_map(cursor_data.get("per_project_attention_visits", {})))
+            For an amendment that means the re-parse taken under custody,
+            never the caller's snapshot and never the pre-custody read --
+            both the next generation and the merge base have to come
+            from a file this mutation owns.
+            """
+            # Authoritative: durable state + 1, never the caller's snapshot.
+            project_cursor = int(cursor_data.get("project_cursor", 0))
+            if project_cursor < 0:
+                project_cursor = 0
 
-        payload = {
-            "project_cursor": project_cursor,
-            "per_project_record_cursor": record_cursors,
-            "per_project_attention_visits": attention_visits,
-            "generation": new_generation,
-            "updated_at": now_iso(),
-        }
+            # Merge, never replace: per-project state the durable cursor holds and
+            # this snapshot does not mention is carried forward. Nothing in the
+            # runtime deletes a project's cursor entry, so there is no deletion
+            # contract to preserve here; adding one would need its own explicit
+            # verb rather than an omission from a partial snapshot.
+            record_cursors = dict(durable_state["per_project_record_cursor"]) if durable_state else {}
+            record_cursors.update(_clean_counter_map(cursor_data.get("per_project_record_cursor", {})))
+            attention_visits = dict(durable_state["per_project_attention_visits"]) if durable_state else {}
+            attention_visits.update(_clean_counter_map(cursor_data.get("per_project_attention_visits", {})))
+            return {
+                "project_cursor": project_cursor,
+                "per_project_record_cursor": record_cursors,
+                "per_project_attention_visits": attention_visits,
+                "generation": (durable_state["generation"] if durable_state else 0) + 1,
+                "updated_at": now_iso(),
+            }
 
         if creating:
+            payload = build_payload(None)
             # First-boot transaction: PREPARE (intent, durable) -> create
             # the cursor -> COMMIT. A crash after PREPARE leaves "prepared
             # + no cursor", which the next attempt resumes; a crash after
@@ -1108,7 +1202,19 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None,
             if state != INIT_PREPARED:
                 _write_init_state(path, INIT_PREPARED, txid)
             _create_exclusively(path, payload)
-            _commit_init_state(path, txid)
+            try:
+                _commit_init_state(path, txid)
+            except BaseException:
+                # The cursor exists but nothing durable says so yet. If it
+                # were left, a later loss would show PREPARED + absent --
+                # indistinguishable from "never created" -- and authorise
+                # a second generation-1 creation. Roll the creation back
+                # instead: this cursor is generation 1 and carries nothing
+                # a later first boot will not recreate, so discarding it
+                # loses no rotation state, while leaving it opens a route
+                # to a false first boot.
+                _discard(path)
+                raise
         else:
             # Upgrade / adopt fence, BEFORE custody: a valid cursor that
             # predates the record (the one live in production), or one
@@ -1118,6 +1224,6 @@ def save_phase1_cursor(cursor_data, manager_home=None, cursor_path=None,
             # durable evidence says it ever existed.
             if state != INIT_COMMITTED:
                 _commit_init_state(path, txid)
-            _swap_under_custody(path, payload, fingerprint)
+            payload = _swap_under_custody(path, expected_generation, build_payload, fingerprint)
 
     return payload

@@ -38,6 +38,7 @@ from manager.phase1_cursor import (
     INIT_PREPARED,
     INIT_STATE_SUFFIX,
     CursorInitStateError,
+    CursorReadError,
     CursorRecoveryRequiredError,
     CursorStateError,
     StaleCursorError,
@@ -263,6 +264,35 @@ class TestFirstBootTransaction(RecoveryTestCase):
         watcher_tick(str(self.cursor_path))
         self.assertEqual(2, self.durable()["generation"])
 
+    def test_a_commit_failure_rolls_the_creation_back(self):
+        """PREPARED + absent must mean "never created", not "created and lost".
+
+        Without the rollback, a create that succeeded and a commit that
+        failed left a cursor whose later loss looked exactly like a
+        pre-create crash, authorising a second generation-1 creation.
+        """
+        real = pc._write_init_state
+        calls = []
+
+        def fail_the_commit(path, state, txid):
+            calls.append(state)
+            if state == INIT_COMMITTED:
+                raise CursorReadError("injected: cannot record the commit")
+            return real(path, state, txid)
+
+        with patch.object(pc, "_write_init_state", side_effect=fail_the_commit):
+            with self.assertRaises(CursorReadError):
+                self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
+        self.assertIn(INIT_PREPARED, calls)
+        self.assertIn(INIT_COMMITTED, calls)
+        self.assertFalse(self.cursor_path.exists(),
+                         "a cursor no durable record vouches for was left behind")
+        self.assertEqual(INIT_PREPARED, self.state())
+        # And the retry is a clean, single first boot.
+        saved = self.save({"project_cursor": 0}, expected_generation=CREATE_ONLY)
+        self.assertEqual(1, saved["generation"])
+        self.assertEqual(INIT_COMMITTED, self.state())
+
     def test_crash_after_create_before_commit_adopts_generation_1(self):
         self.write_state(INIT_PREPARED)
         self.seed(1, records={"only": 1})
@@ -446,15 +476,39 @@ class TestNoOverwritePublication(RecoveryTestCase):
         self.assertEqual(1, len(claims), "the claim must be kept for adjudication, not deleted")
         self.assertEqual(2458, self.durable(claims[0])["generation"])
 
-    def test_superseded_claim_is_retired_by_the_next_mutation(self):
+    def test_the_richer_claim_left_by_an_external_winner_is_never_retired(self):
+        """The aftermath of the race above must not become a second data loss.
+
+        An earlier version of this test asserted the opposite -- that the
+        next mutation deletes the claim because its generation is lower.
+        An independent review pointed out that this blesses the defect:
+        the claim held 2458 with 13 projects and the external winner held
+        2500 with one, so "older" and "poorer" coincided and retiring the
+        claim erased the only copy of the other twelve projects.
+        """
         self.seed(2458)
         ctx, _ = self.install_at_publish()
         with ctx:
             with self.assertRaises(StaleCursorError):
                 self.save({"project_cursor": 1}, expected_generation=2458)
-        saved = self.save({"project_cursor": 1}, expected_generation=2500)
-        self.assertEqual(2501, saved["generation"])
+        claims = self.claims()
+        self.assertEqual(1, len(claims))
+        with self.assertRaises(CursorRecoveryRequiredError):
+            self.save({"project_cursor": 1}, expected_generation=2500)
+        self.assertEqual(claims, self.claims(), "the richer claim was deleted")
+        self.assertEqual(13, len(self.durable(claims[0])["per_project_record_cursor"]))
+        self.assertEqual(2500, self.durable()["generation"], "the external winner was disturbed")
+
+    def test_a_provably_redundant_claim_is_retired(self):
+        """Retirement needs proof, and a claim our own successor covers has it."""
+        self.seed(2458)
+        self.save({"project_cursor": 1}, expected_generation=2458)
+        claim = self.runtime / ("phase1-cursor.json" + CLAIM_INFIX + "older")
+        self.seed(2458, path=claim)
+        saved = self.save({"project_cursor": 1}, expected_generation=2459)
+        self.assertEqual(2460, saved["generation"])
         self.assertEqual([], self.claims())
+        self.assertFalse(claim.exists())
 
     def test_no_unconditional_replace_over_the_canonical_name(self):
         """Static: the only os.replace destinations are claims and the state record."""
@@ -482,6 +536,71 @@ class TestNoOverwritePublication(RecoveryTestCase):
 # ---------------------------------------------------------------------------
 # Claim lifecycle / recovery matrix
 # ---------------------------------------------------------------------------
+
+
+class TestCompareToCustodyRace(RecoveryTestCase):
+    """The P0 an independent review found in the previous round.
+
+    The pre-custody compare parsed the file, and the fingerprint that
+    bound it read the file a second time. An external writer landing
+    between those two reads made the fingerprint describe ITS file:
+    custody then verified that file against itself and published a
+    successor computed from the stale parse. Generation 2500 became
+    2459. Both the generation check and the merge base now come from a
+    re-parse taken after custody, on a file no one else can reach.
+    """
+
+    def install_between_parse_and_fingerprint(self, generation=2500, records=None):
+        real = pc._fingerprint
+        fired = []
+
+        def hook(path):
+            if not fired and path == self.cursor_path:
+                fired.append(1)
+                self.seed(generation, records=records)
+            return real(path)
+
+        return patch.object(pc, "_fingerprint", side_effect=hook), fired
+
+    def test_external_write_between_the_parse_and_the_fingerprint_is_not_rolled_back(self):
+        self.seed(2458)
+        ctx, fired = self.install_between_parse_and_fingerprint(records={"external": 1})
+        with ctx:
+            with self.assertRaises(StaleCursorError):
+                self.save({"project_cursor": 1}, expected_generation=2458)
+        self.assertTrue(fired)
+        self.assertEqual(2500, self.durable()["generation"],
+                         "generation 2500 was rolled back to 2459")
+        self.assertEqual({"external": 1}, self.durable()["per_project_record_cursor"])
+
+    def test_a_same_generation_external_rewrite_does_not_lose_its_projects(self):
+        """Equal generations make the fingerprint check pass; the re-parse still saves us."""
+        self.seed(2458, records={"a": 1})
+        ctx, fired = self.install_between_parse_and_fingerprint(
+            generation=2458, records={"a": 1, "added-by-external": 5})
+        with ctx:
+            saved = self.save({"project_cursor": 1}, expected_generation=2458)
+        self.assertTrue(fired)
+        self.assertEqual(2459, saved["generation"])
+        self.assertIn("added-by-external", self.durable()["per_project_record_cursor"],
+                      "the merge base was the stale pre-custody read")
+
+    def test_the_merge_base_is_the_state_under_custody(self):
+        recorded = {}
+        real = pc._load_at
+
+        def watch(path, missing_ok):
+            state = real(path, missing_ok)
+            if CLAIM_INFIX in path.name:
+                recorded["claim_generation"] = state["generation"]
+            return state
+
+        self.seed(2458)
+        with patch.object(pc, "_load_at", side_effect=watch):
+            saved = self.save({"project_cursor": 1}, expected_generation=2458)
+        self.assertEqual(2458, recorded.get("claim_generation"),
+                         "the successor was not derived from a re-parse under custody")
+        self.assertEqual(2459, saved["generation"])
 
 
 class TestRecoveryMatrix(RecoveryTestCase):

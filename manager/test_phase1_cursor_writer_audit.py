@@ -340,6 +340,26 @@ def _os_open_is_writable(call):
     return not names <= {"O_RDONLY"}
 
 
+def _imported_sink_names(tree):
+    """{local name: reported kind} for sinks pulled in by ``from os import ...``.
+
+    ``from os import replace as swap`` puts a sink behind a name the
+    bare-Name rule below would not otherwise recognise, which is a
+    one-line bypass of the whole audit.
+    """
+    modules = {module for module, _ in SINK_FUNCS}
+    out = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or node.module not in modules:
+            continue
+        for alias in node.names:
+            if (node.module, alias.name) in SINK_FUNCS:
+                out[alias.asname or alias.name] = f"{node.module}.{alias.name}()"
+            elif node.module == "os" and alias.name == "open":
+                out[alias.asname or alias.name] = "os.open(write-flags)"
+    return out
+
+
 def audit_source(source, label, aliases_seed=()):
     """Return the sorted list of (label, lineno, kind) cursor-writer findings in one module."""
     tree = ast.parse(source, filename=label)
@@ -347,6 +367,7 @@ def audit_source(source, label, aliases_seed=()):
             isinstance(n, ast.Name) and n.id in PATH_SOURCE_FUNCS for n in ast.walk(tree)):
         return []
     aliases, bodies, ctx = _collect_aliases(tree, aliases_seed)
+    imported_sinks = _imported_sink_names(tree)
     findings = set()
     for scope, nodes in bodies.items():
         names = aliases[scope]
@@ -359,6 +380,9 @@ def audit_source(source, label, aliases_seed=()):
             if isinstance(func, ast.Name):
                 if func.id == "open" and touches and _is_write_mode(_open_mode(node)):
                     findings.add((label, node.lineno, "open(write-mode)"))
+                elif func.id in imported_sinks and touches:
+                    if imported_sinks[func.id] != "os.open(write-flags)" or _os_open_is_writable(node):
+                        findings.add((label, node.lineno, imported_sinks[func.id]))
                 elif func.id in {"rename", "replace", "remove", "unlink", "move", "truncate"} and touches:
                     findings.add((label, node.lineno, f"{func.id}()"))
             elif isinstance(func, ast.Attribute):
@@ -586,6 +610,23 @@ ROGUES = {
             os.write(fd, b'{"generation": 0}')
             os.close(fd)
     ''',
+    "nested/imported_sink_alias.py": '''
+        import tempfile
+        from os import replace as swap
+        from pathlib import Path
+
+        def rewrite(home):
+            cursor = Path(home) / "runtime" / "phase1-cursor.json"
+            tmp = tempfile.mkstemp()[1]
+            swap(tmp, str(cursor))
+    ''',
+    "nested/imported_sink_plain.py": '''
+        from shutil import move
+        from pathlib import Path
+
+        def restore(home, backup):
+            move(backup, str(Path(home) / "runtime" / "phase1-cursor.json"))
+    ''',
 }
 
 INNOCENT = {
@@ -676,6 +717,8 @@ class NegativeControlTests(unittest.TestCase):
             ("nested/container_indirection.py", ".write_text()"),
             ("nested/os_truncate.py", "os.truncate()"),
             ("nested/os_open_write.py", "os.open(write-flags)"),
+            ("nested/imported_sink_alias.py", "os.replace()"),
+            ("nested/imported_sink_plain.py", "shutil.move()"),
         ]:
             self.assertIn(expected, kinds)
 
