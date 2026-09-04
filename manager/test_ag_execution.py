@@ -214,7 +214,13 @@ class TestAgLaunchTaskPath(unittest.TestCase):
 
     def _make_runner(self):
         cli_runner = MockCliRunner()
-        launcher = AgRunner(cli_runner=cli_runner)
+        # An explicit dead IDE bridge: with the language-server bridge real,
+        # a bare AgRunner(cli_runner=...) would auto-discover the user's live
+        # IDE and dispatch a REAL model turn from a unit test (it did, three
+        # times, on 2026-09-05 -- see conftest.py's live-Antigravity fence).
+        dead_bridge = MockAgBridge()
+        dead_bridge.is_alive_val = False
+        launcher = AgRunner(ide_bridge=dead_bridge, cli_runner=cli_runner)
         launcher.last_fallback_reason = None
         return launcher, cli_runner
 

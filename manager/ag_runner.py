@@ -1,7 +1,8 @@
 """Antigravity direct dispatch execution facade and event models.
 
 This module provides normalized event translation, outcome dataclasses, and the AgRunner
-facade which automatically negotiates between Live IDE, Official CLI, and Headless execution.
+facade which automatically negotiates between the IDE bridge (language-server cascade RPCs,
+mode ``live_ide``), the official ``agentapi`` CLI (mode ``cli``), and Headless execution.
 It does not contain IDE-specific IPC or low-level subprocess transport implementations.
 """
 
@@ -173,14 +174,20 @@ class AgRunner:
 
     def _get_ide_bridge(self):
         if self._ide_bridge is None:
-            from manager.ag_ide_bridge import AgIdeBridge
-            self._ide_bridge = AgIdeBridge()
+            # The IDE bridge is the language-server-backed adapter driving the
+            # IDE's own cascade RPCs (transport=ide_bridge, mode live_ide);
+            # verified live 2026-09-05. manager.ag_ide_bridge.AgIdeBridge is
+            # the older fail-closed IPC stub and is no longer on this path.
+            from manager.ag_cli_runner import OfficialAgCliRunner
+            from manager.ag_language_server import TRANSPORT_IDE_BRIDGE
+            self._ide_bridge = OfficialAgCliRunner(transport=TRANSPORT_IDE_BRIDGE)
         return self._ide_bridge
 
     def _get_cli_runner(self):
         if self._cli_runner is None:
             from manager.ag_cli_runner import OfficialAgCliRunner
-            self._cli_runner = OfficialAgCliRunner()
+            from manager.ag_language_server import TRANSPORT_AGENTAPI
+            self._cli_runner = OfficialAgCliRunner(transport=TRANSPORT_AGENTAPI)
         return self._cli_runner
 
     def _get_headless_runner(self):

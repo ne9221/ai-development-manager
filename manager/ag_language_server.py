@@ -52,6 +52,24 @@ TRUSTED_EXECUTABLE_MARKERS = ("extensions/antigravity/bin", "extensions\\antigra
 _REDACT_KEY = re.compile(r"(token|secret|api_?key|credential|password|cookie|refresh_)", re.IGNORECASE)
 _CSRF_ARG = re.compile(r"--csrf_token(?:=|\s+)(\S+)")
 _APP_DATA_ARG = re.compile(r"--app_data_dir(?:=|\s+)(\S+)")
+_WORKSPACE_ID_ARG = re.compile(r"--workspace_id(?:=|\s+)(\S+)")
+# Execution transports. ``ide_bridge`` drives the IDE-hosted language server's
+# own cascade RPCs directly (AddTrackedWorkspace -> StartCascade ->
+# SendUserCascadeMessage), verified live 2026-09-05 on Antigravity IDE 1.107.0;
+# ``agentapi`` spawns the official CLI, which needs a projects store this
+# IDE-hosted server does not have. The transport actually used is recorded in
+# every run-state/evidence record -- never inferred afterwards.
+TRANSPORT_IDE_BRIDGE = "ide_bridge"
+TRANSPORT_AGENTAPI = "agentapi"
+TRANSPORTS = (TRANSPORT_IDE_BRIDGE, TRANSPORT_AGENTAPI)
+CASCADE_SOURCE_AGENT_API = "CORTEX_TRAJECTORY_SOURCE_AGENT_API"
+# The IDE starts two language servers per window: the app-level one (no
+# --workspace_id) hosts every cascade/conversation, the per-workspace one
+# (--enable_lsp --workspace_id ...) only serves LSP and answers the cascade
+# RPCs with an empty trajectory list. Verified live 2026-09-05.
+ROLE_CASCADE_HOST = "cascade_host"
+ROLE_WORKSPACE_LSP = "workspace_lsp"
+VERIFIED_IDE_VERSION = "1.107.0"
 _LISTEN_LINE = re.compile(r"^\s*TCP\s+(?:127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\[::\]):(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$", re.IGNORECASE)
 
 
@@ -99,6 +117,8 @@ class LanguageServerEndpoint:
     ls_version: str | None = None
     creation_identity: str | None = None
     parent_pid: int | None = None
+    role: str = ROLE_CASCADE_HOST
+    workspace_id: str | None = None
     csrf_token: str = field(default="", repr=False, compare=False)
 
     @property
@@ -124,7 +144,7 @@ class LanguageServerEndpoint:
             "pid": self.pid, "parent_pid": self.parent_pid, "creation_identity": self.creation_identity,
             "http_port": self.http_port, "https_port": self.https_port, "ls_version": self.ls_version,
             "app_data_dir": self.app_data_dir, "executable": os.path.basename(self.executable),
-            "source": self.source, "observed_at": self.observed_at,
+            "source": self.source, "observed_at": self.observed_at, "role": self.role, "workspace_id": self.workspace_id,
         }
 
 
@@ -203,10 +223,15 @@ def parse_command_line(command_line: str) -> dict[str, Any]:
     """Extract the launch facts ADM needs from the server's argv. The token stays in-memory only."""
     csrf = _CSRF_ARG.search(command_line or "")
     app_data = _APP_DATA_ARG.search(command_line or "")
+    workspace = _WORKSPACE_ID_ARG.search(command_line or "")
+    enable_lsp = "--enable_lsp" in (command_line or "")
     return {
         "csrf_token": csrf.group(1) if csrf else None,
         "app_data_dir": app_data.group(1) if app_data else DEFAULT_APP_DATA_DIR,
         "persistent_mode": "--persistent_mode" in (command_line or ""),
+        "workspace_id": workspace.group(1) if workspace else None,
+        "enable_lsp": enable_lsp,
+        "role": ROLE_WORKSPACE_LSP if (workspace or enable_lsp) else ROLE_CASCADE_HOST,
     }
 
 
@@ -276,8 +301,9 @@ def discover_language_server(*, app_data_dir: str = DEFAULT_APP_DATA_DIR, timeou
     Classifications: ``ide_not_running`` (no trusted server process),
     ``csrf_unavailable`` (process found but its argv carries no token),
     ``ls_unreachable`` (process found, no port answers), plus the enumeration
-    failures raised by the helpers. When several servers run (two IDE
-    windows), the most recently created one is used.
+    failures raised by the helpers. When several servers run, the app-level
+    cascade host (``ROLE_CASCADE_HOST``) is preferred over a per-workspace
+    LSP server, and among equals the most recently created one is used.
     """
     process_lister = process_lister or list_language_server_processes
     port_lister = port_lister or list_listening_ports
@@ -301,6 +327,7 @@ def discover_language_server(*, app_data_dir: str = DEFAULT_APP_DATA_DIR, timeou
             raise AgLsError("csrf_unavailable", "an Antigravity language server is running but exposes no --csrf_token")
         raise AgLsError("ide_not_running", "no trusted Antigravity language server process is running")
     candidates.sort(key=lambda item: str(item[0].get("creation_date") or ""), reverse=True)
+    candidates.sort(key=lambda item: item[1]["role"] != ROLE_CASCADE_HOST)  # stable: cascade host first
     last_error = None
     for proc, launch, executable in candidates:
         pid = proc["pid"]
@@ -322,7 +349,8 @@ def discover_language_server(*, app_data_dir: str = DEFAULT_APP_DATA_DIR, timeou
         return LanguageServerEndpoint(
             pid=pid, http_port=http_port, https_port=https_port, app_data_dir=launch["app_data_dir"],
             executable=executable, observed_at=observed_at, source="ide_process", ls_version=ls_version,
-            creation_identity=creation, parent_pid=proc.get("parent_pid"), csrf_token=launch["csrf_token"],
+            creation_identity=creation, parent_pid=proc.get("parent_pid"), role=launch["role"],
+            workspace_id=launch["workspace_id"], csrf_token=launch["csrf_token"],
         )
     raise last_error or AgLsError("ls_unreachable", "no reachable Antigravity language server")
 
@@ -396,6 +424,32 @@ class AgLanguageServerClient:
     def get_cascade_trajectory_executor_metadatas(self, cascade_id: str) -> dict[str, Any]:
         return self.call("GetCascadeTrajectoryExecutorMetadatas", {"cascadeId": cascade_id})
 
+    # -- IDE-bridge dispatch RPCs (shapes verified live 2026-09-05, IDE 1.107.0) --
+    def add_tracked_workspace(self, workspace_path: str) -> dict[str, Any]:
+        """Register an absolute folder path (no ``file://``) so the server may open a cascade in it."""
+        return self.call("AddTrackedWorkspace", {"workspace": str(workspace_path)})
+
+    def start_cascade(self, workspace_uris: list[str], *, source: str = CASCADE_SOURCE_AGENT_API) -> dict[str, Any]:
+        """Create a NEW, empty conversation bound to ``workspace_uris``; returns ``{"cascadeId": ...}``."""
+        return self.call("StartCascade", {"source": source, "workspaceUris": [str(uri) for uri in workspace_uris]})
+
+    def send_user_cascade_message(self, cascade_id: str, text: str, *, model_placeholder: str,
+                                  ide_version: str | None = None) -> dict[str, Any]:
+        """Deliver one user turn. The model goes in ``cascadeConfig.plannerConfig.requestedModel``
+        as the server's own ``MODEL_PLACEHOLDER_*`` enum; the server applies its default tool policy
+        (no auto-execution widening is requested here)."""
+        body = {
+            "cascadeId": cascade_id,
+            "items": [{"text": text}],
+            "metadata": {"ideName": "antigravity", "ideVersion": ide_version or VERIFIED_IDE_VERSION,
+                         "extensionName": "antigravity", "locale": "en"},
+            "cascadeConfig": {"plannerConfig": {
+                "conversational": {"plannerMode": "CONVERSATIONAL_PLANNER_MODE_DEFAULT", "agenticMode": True},
+                "requestedModel": {"model": model_placeholder},
+            }},
+        }
+        return self.call("SendUserCascadeMessage", body)
+
 
 # --------------------------------------------------------------------------- availability contract
 
@@ -464,37 +518,103 @@ def _account_records(user_status: dict[str, Any]) -> tuple[dict[str, Any] | None
     return account, models[:40]
 
 
-def probe_dispatch_route(client: AgLanguageServerClient) -> dict[str, Any]:
-    """Can this language server actually accept a NEW conversation from ADM?
+def probe_dispatch_route(client: AgLanguageServerClient, *, transport: str = TRANSPORT_IDE_BRIDGE) -> dict[str, Any]:
+    """Can this language server actually accept a NEW conversation from ADM over ``transport``?
 
     Quota readability and dispatchability are different facts and must not be
-    conflated. Verified live on Antigravity IDE 1.107.0 (2026-09-02): an
-    IDE-hosted language server answers every read-only status/quota RPC, but
-    its projects store is not initialized, so the official
-    ``agentapi new-conversation`` route fails closed with
-    ``projectsStore is nil, but projectEnvConfig was provided`` (or
-    ``project_id is required when providing project_env_config`` when no
-    project id is supplied) -- it always sends a project_env_config. This
-    probe is read-only (``ReadProject``) and consumes no model turn.
+    conflated. Both probes are read-only and consume no model turn.
 
-    Returns ``{"available": bool, "reason": str|None, "detail": str|None}``.
+    * ``ide_bridge`` -- the server's cascade subsystem must answer
+      ``GetAllCascadeTrajectories`` (the per-workspace LSP server answers it
+      too, with an empty map, so discovery -- not this probe -- is what picks
+      the cascade host). Whether a *specific* cascade can be created is only
+      ever proven by ``StartCascade`` itself at dispatch time.
+    * ``agentapi`` -- the official CLI always sends a ``project_env_config``,
+      which needs an initialized projects store. Verified live on Antigravity
+      IDE 1.107.0 (2026-09-02 and again 2026-09-05): an IDE-hosted server
+      answers ``ReadProject`` with ``projects store not initialized``, so that
+      route stays blocked (``projectsStore is nil, but projectEnvConfig was
+      provided`` / ``project_id is required when providing project_env_config``).
+
+    Returns ``{"available": bool, "transport": str, "reason": str|None, "detail": str|None}``.
     """
+    if transport == TRANSPORT_IDE_BRIDGE:
+        try:
+            summaries = client.get_all_cascade_trajectories()
+        except AgLsError as exc:
+            return {"available": False, "transport": transport, "reason": exc.classification, "detail": exc.detail}
+        if not isinstance(summaries, dict):
+            return {"available": False, "transport": transport, "reason": "malformed_response",
+                    "detail": "GetAllCascadeTrajectories did not answer with a JSON object"}
+        return {"available": True, "transport": transport, "reason": None, "detail": None}
+    if transport != TRANSPORT_AGENTAPI:
+        raise ValueError(f"unknown Antigravity transport {transport!r}; expected one of {TRANSPORTS}")
     try:
         client.call("ReadProject", {})
     except AgLsError as exc:
         detail = (exc.detail or "").lower()
         if "projects store not initialized" in detail or "projectsstore is nil" in detail:
-            return {"available": False, "reason": "projects_store_unavailable", "detail": exc.detail}
+            return {"available": False, "transport": transport, "reason": "projects_store_unavailable", "detail": exc.detail}
         if exc.classification in ("rpc_invalid_argument", "rpc_not_found"):
             # The store answered and merely rejected an empty request: it exists.
-            return {"available": True, "reason": None, "detail": None}
-        return {"available": False, "reason": exc.classification, "detail": exc.detail}
-    return {"available": True, "reason": None, "detail": None}
+            return {"available": True, "transport": transport, "reason": None, "detail": None}
+        return {"available": False, "transport": transport, "reason": exc.classification, "detail": exc.detail}
+    return {"available": True, "transport": transport, "reason": None, "detail": None}
+
+
+def _model_catalog(user_status: dict[str, Any]) -> list[dict[str, Any]]:
+    status = user_status.get("userStatus") if isinstance(user_status, dict) else None
+    configs = ((status or {}).get("cascadeModelConfigData") or {}).get("clientModelConfigs") if isinstance(status, dict) else None
+    catalog = []
+    for config in configs or []:
+        if not isinstance(config, dict):
+            continue
+        placeholder = (config.get("modelOrAlias") or {}).get("model") if isinstance(config.get("modelOrAlias"), dict) else None
+        quota = config.get("quotaInfo") if isinstance(config.get("quotaInfo"), dict) else {}
+        catalog.append({
+            "model_id": config.get("modelId"), "label": config.get("label"), "placeholder": placeholder,
+            "recommended": bool(config.get("isRecommended")),
+            # protobuf JSON omits zero-valued scalars: a present resetTime with
+            # no remainingFraction means exhausted (0), not unknown.
+            "remaining_fraction": float(quota.get("remainingFraction") or 0.0) if quota else None,
+            "reset_time": quota.get("resetTime"),
+        })
+    return catalog
+
+
+def resolve_model_placeholder(user_status: dict[str, Any], requested: str | None = None) -> dict[str, Any]:
+    """Map an ADM model name onto the server's own ``MODEL_PLACEHOLDER_*`` enum -- from the live
+    catalog ``GetUserStatus.cascadeModelConfigData.clientModelConfigs``, never from a table ADM
+    guessed. ``requested`` matches ``modelId``, ``label`` or the placeholder itself
+    (case-insensitive); ``None`` picks the cheapest recommended Gemini Flash model that still
+    has quota. Raises ``unknown_model`` / ``model_quota_exhausted`` / ``model_catalog_unavailable``.
+    """
+    catalog = [item for item in _model_catalog(user_status) if item["placeholder"] and item["model_id"]]
+    if not catalog:
+        raise AgLsError("model_catalog_unavailable", "GetUserStatus exposes no client model configs with a model placeholder")
+    if requested is not None and str(requested).strip():
+        wanted = str(requested).strip().lower()
+        for item in catalog:
+            if wanted in {str(item["model_id"]).lower(), str(item["label"] or "").lower(), str(item["placeholder"]).lower()}:
+                if item["remaining_fraction"] is not None and item["remaining_fraction"] <= 0.0:
+                    raise AgLsError("model_quota_exhausted", f"{item['model_id']} exhausted until {item['reset_time']}")
+                return item
+        raise AgLsError("unknown_model", f"model {requested!r} is not in the live catalog {[c['model_id'] for c in catalog]}")
+    usable = [item for item in catalog if item["remaining_fraction"] is None or item["remaining_fraction"] > 0.0]
+    if not usable:
+        raise AgLsError("model_quota_exhausted", "every catalog model is exhausted")
+
+    def rank(item: dict[str, Any]) -> tuple:
+        model_id = str(item["model_id"]).lower()
+        return (not ("gemini" in model_id and "flash" in model_id), not item["recommended"], "low" not in model_id, model_id)
+
+    return sorted(usable, key=rank)[0]
 
 
 def availability_snapshot(*, discover: Callable[..., LanguageServerEndpoint] | None = None,
                           client_factory: Callable[..., AgLanguageServerClient] | None = None,
-                          now: str | None = None, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
+                          now: str | None = None, timeout: float = DEFAULT_TIMEOUT_SECONDS,
+                          transport: str = TRANSPORT_IDE_BRIDGE) -> dict[str, Any]:
     """Structured AG availability -- status/source/observed_at/freshness/confidence/account/models/remaining/reset_at/reason.
 
     ``status`` is one of ``available`` / ``degraded`` (some bucket exhausted) /
@@ -510,6 +630,7 @@ def availability_snapshot(*, discover: Callable[..., LanguageServerEndpoint] | N
         "freshness": "fresh", "confidence": "unknown", "account": None, "models": [], "buckets": [],
         "remaining": None, "remaining_percent": None, "reset_at": None, "unavailable_until": None,
         "reason": None, "language_server": None, "dispatch_route": None, "can_accept_new_task": False,
+        "transport": transport,
     }
     try:
         endpoint = discover(timeout=timeout)
@@ -527,7 +648,7 @@ def availability_snapshot(*, discover: Callable[..., LanguageServerEndpoint] | N
         return snapshot
     account, models = _account_records(user_status)
     snapshot.update(account=account, models=models, buckets=buckets, confidence="official")
-    route = probe_dispatch_route(client)
+    route = probe_dispatch_route(client, transport=transport)
     snapshot["dispatch_route"] = route
     if account is None or not account.get("email"):
         snapshot.update(status="unverified", reason="account_identity_unavailable")

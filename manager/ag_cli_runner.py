@@ -9,6 +9,17 @@ soon as the conversation exists -- so this adapter observes, terminalizes and
 cancels through the server's trajectory RPCs, never through the CLI's exit
 code.
 
+Transports (``OfficialAgCliRunner(transport=...)``, recorded in every
+run-state/evidence record):
+
+* ``ide_bridge`` (default, mode ``live_ide``) -- verified live 2026-09-05 on
+  Antigravity IDE 1.107.0: ``AddTrackedWorkspace`` -> ``StartCascade``
+  (a NEW cascade bound to exactly the ADM working directory) -> workspace
+  readback -> ``SendUserCascadeMessage`` with the model as the server's own
+  ``MODEL_PLACEHOLDER_*`` enum. No CLI process, no projects store needed.
+* ``agentapi`` (mode ``cli``) -- the official CLI; blocked on an IDE-hosted
+  server without a projects store (fails closed in ``prepare``).
+
 Lifecycle (same prepare/start/wait/close contract as CodexLauncher /
 ClaudeLauncher, routed by manager/ag_runner.AgRunner):
 
@@ -46,6 +57,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from manager.ag_language_server import (
+    TRANSPORT_AGENTAPI,
+    TRANSPORT_IDE_BRIDGE,
+    TRANSPORTS,
     AgLanguageServerClient,
     AgLsError,
     LanguageServerEndpoint,
@@ -53,8 +67,9 @@ from manager.ag_language_server import (
     discover_language_server,
     probe_dispatch_route,
     redact,
+    resolve_model_placeholder,
 )
-from manager.ag_run_state import TERMINAL_STATUSES, read_run_state, update_run_state, write_run_state
+from manager.ag_run_state import TERMINAL_STATUSES, list_run_states, read_run_state, update_run_state, write_run_state
 from manager.ag_runner import (
     AgLaunchError,
     AgNormalizedEvent,
@@ -201,6 +216,23 @@ def map_agentapi_model(model: str | None) -> str | None:
     if "pro" in text:
         return "pro"
     raise AgLaunchError("unknown_model", f"model {model!r} does not map onto agentapi models {AGENTAPI_MODELS}")
+
+
+BINDING_INVARIANT = "ONE_EXECUTION_ONE_ACTIVE_AG_BINDING"
+
+
+def _classify_rpc_failure(exc: AgLsError) -> str:
+    """Normalize a dispatch-time language-server failure into ADM's failure vocabulary."""
+    detail = exc.detail or ""
+    if exc.classification == "rpc_unauthenticated" or AUTH_ERROR_PATTERN.search(detail):
+        return "auth_transient"
+    if QUOTA_ERROR_PATTERN.search(detail):
+        return "quota_exhausted"
+    if exc.classification == "malformed_response":
+        return "malformed_output"
+    if exc.classification == "ls_unreachable":
+        return "ls_unreachable"
+    return "dispatch_failed"
 
 
 def _kill_process_tree(process: Any) -> None:
@@ -430,6 +462,7 @@ class OfficialAgCliRunner:
 
     def __init__(self, executable_resolver: Callable[..., Any] | None = None,
                  auth_verifier: Callable[[], str] | None = None, default_mode: str = "cli", *,
+                 transport: str = TRANSPORT_IDE_BRIDGE,
                  discover: Callable[..., LanguageServerEndpoint] | None = None,
                  client_factory: Callable[..., AgLanguageServerClient] | None = None,
                  popen: Callable[..., Any] = subprocess.Popen,
@@ -437,6 +470,9 @@ class OfficialAgCliRunner:
                  permission_stall_seconds: float = 90.0, cancel_reconcile_seconds: float = 30.0,
                  manager_home: str | None = None, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep, kill_tree: Callable[[Any], None] = _kill_process_tree):
+        if transport not in TRANSPORTS:
+            raise ValueError(f"unknown Antigravity transport {transport!r}; expected one of {TRANSPORTS}")
+        self.transport = transport
         self._resolve_executable = executable_resolver
         self._verify_auth = auth_verifier
         self.default_mode = default_mode
@@ -483,6 +519,14 @@ class OfficialAgCliRunner:
             prepared._ls_client = client
         return client
 
+    def is_alive(self) -> bool:
+        """AgRunner facade protocol: a trusted language server is discoverable right now (no side effects)."""
+        try:
+            self._discover(timeout=10.0)
+        except Exception:
+            return False
+        return True
+
     # ------------------------------------------------------------------ READY handshake
     def ready_probe(self, client: AgLanguageServerClient, request: LaunchRequest) -> dict[str, Any]:
         """Raise AgLaunchError unless AG is provably ready for a new task; return readiness evidence."""
@@ -503,11 +547,27 @@ class OfficialAgCliRunner:
             buckets = _bucket_records(client.retrieve_user_quota_summary())
         except AgLsError as exc:
             raise AgLaunchError("quota_unverified", exc.detail) from exc
-        model = map_agentapi_model(request.model)
-        # agentapi models are Gemini models: gate on the Gemini group when it is
-        # identifiable, otherwise on every bucket.
         gemini = [b for b in buckets if "gemini" in (b["bucket_id"] + " " + b["group"]).lower()]
-        relevant = gemini or buckets
+        catalog_model = None
+        model = None
+        if self.transport == TRANSPORT_IDE_BRIDGE:
+            # The model is the server's own placeholder enum from its live
+            # catalog (never a table ADM guessed); an unknown or exhausted
+            # model refuses to launch. Gate on the quota group the chosen
+            # model actually draws from.
+            try:
+                catalog_model = resolve_model_placeholder(user_status, request.model)
+            except AgLsError as exc:
+                raise AgLaunchError(exc.classification, exc.detail) from exc
+            if "gemini" in str(catalog_model["model_id"]).lower():
+                relevant = gemini or buckets
+            else:
+                relevant = [b for b in buckets if b not in gemini] or buckets
+        else:
+            model = map_agentapi_model(request.model)
+            # agentapi models are Gemini models: gate on the Gemini group when it is
+            # identifiable, otherwise on every bucket.
+            relevant = gemini or buckets
         exhausted = [b for b in relevant if b["remaining_fraction"] <= 0.0]
         if exhausted and len(exhausted) == len(relevant):
             until = max((b["reset_time"] for b in exhausted if b.get("reset_time")), default=None)
@@ -518,7 +578,7 @@ class OfficialAgCliRunner:
         # new-conversation` needs (it always sends a project_env_config).
         # Refuse to launch rather than spawn a CLI that cannot create a
         # conversation -- read-only probe, no model turn.
-        route = probe_dispatch_route(client)
+        route = probe_dispatch_route(client, transport=self.transport)
         if not route["available"]:
             raise AgLaunchError("dispatch_route_unavailable", f"{route['reason']}: {route.get('detail') or ''}")
         configs = ((status or {}).get("cascadeModelConfigData") or {}).get("clientModelConfigs") if isinstance(status, dict) else None
@@ -526,6 +586,7 @@ class OfficialAgCliRunner:
         return {
             "ready": True, "account_email": email, "plan_name": ((status.get("planStatus") or {}).get("planInfo") or {}).get("planName"),
             "agentapi_model": model, "models_available": len(model_ids), "dispatch_route": route,
+            "transport": self.transport, "model": catalog_model,
             "quota_min_remaining_fraction": min(b["remaining_fraction"] for b in relevant),
             "quota_degraded": bool(exhausted), "observed_at": utc_now(),
         }
@@ -542,14 +603,21 @@ class OfficialAgCliRunner:
             raise AgLaunchError(exc.classification, exc.detail) from exc
         client = self._client_factory(endpoint, timeout=request.timeout_seconds)
         readiness = self.ready_probe(client, request)
-        argv = self._launcher_argv(endpoint)
-        if not Path(argv[0]).is_file():
-            raise AgLaunchError("route_unavailable", f"agentapi entrypoint not found: {argv[0]}")
-        mode = request.force_mode if request.force_mode in ("cli", "headless") else self.default_mode
-        thread_id = f"ag-{mode}-{uuid.uuid4().hex[:12]}"
+        argv = None
+        if self.transport == TRANSPORT_AGENTAPI:
+            argv = self._launcher_argv(endpoint)
+            if not Path(argv[0]).is_file():
+                raise AgLaunchError("route_unavailable", f"agentapi entrypoint not found: {argv[0]}")
+            mode = request.force_mode if request.force_mode in ("cli", "headless") else self.default_mode
+        else:
+            mode = "live_ide"
+        thread_id = f"ag-{'live' if mode == 'live_ide' else mode}-{uuid.uuid4().hex[:12]}"
         now = utc_now()
+        catalog_model = readiness.get("model") or {}
         state = {
             "thread_id": thread_id, "provider": "antigravity", "status": "prepared", "conversation_id": None,
+            "transport": self.transport, "provider_run_id": None, "binding": None,
+            "model_id": catalog_model.get("model_id"), "model_placeholder": catalog_model.get("placeholder"),
             "project_id": request.project_id, "working_directory": str(cwd), "model": request.model,
             "agentapi_model": readiness["agentapi_model"], "language_server": endpoint.evidence(),
             "readiness": readiness, "prepared_at": now, "started_at": None, "last_event": "provider_prepared",
@@ -584,6 +652,8 @@ class OfficialAgCliRunner:
             client.get_status()
         except AgLsError as exc:
             raise AgLaunchError("ls_unreachable", f"language server went away before dispatch: {exc.detail}") from exc
+        if self.transport == TRANSPORT_IDE_BRIDGE:
+            return self._start_ide_bridge(prepared, prompt)
 
         state = self._state(prepared)
         argv = [*prepared._argv, "new-conversation"]
@@ -627,6 +697,74 @@ class OfficialAgCliRunner:
         running._started_clock = self._clock()
         return running
 
+    def _start_ide_bridge(self, prepared: PreparedLaunch, prompt: str) -> RunningLaunch:
+        """transport=ide_bridge: AddTrackedWorkspace -> StartCascade -> claim binding -> verify workspace -> SendUserCascadeMessage.
+
+        The cascade is always NEW (never an adopted/foreground one), it is bound
+        to exactly the ADM working directory, and the workspace readback is
+        checked BEFORE the first model turn so a mismatch never runs anything.
+        """
+        request = prepared._request
+        endpoint: LanguageServerEndpoint = prepared._endpoint
+        client = self._client(prepared)
+        state = self._state(prepared)
+        workspace = Path(str(request.working_directory)).resolve()
+        try:
+            client.add_tracked_workspace(str(workspace))
+        except AgLsError as exc:
+            self._persist(prepared, status="failed", last_event="workspace_bind_failed", last_event_at=utc_now(),
+                          termination_reason="workspace_bind_failed")
+            raise AgLaunchError("workspace_bind_failed", f"AddTrackedWorkspace refused {workspace}: {exc.detail}") from exc
+        try:
+            response = client.start_cascade([workspace.as_uri()])
+        except AgLsError as exc:
+            classification = _classify_rpc_failure(exc)
+            self._persist(prepared, status="failed", last_event="dispatch_failed", last_event_at=utc_now(), termination_reason=classification)
+            raise AgLaunchError(classification, f"StartCascade failed: {exc.detail}") from exc
+        conversation_id = _find_conversation_id(response) if isinstance(response, dict) else None
+        if not conversation_id:
+            self._persist(prepared, status="failed", last_event="dispatch_failed", last_event_at=utc_now(), termination_reason="malformed_output")
+            raise AgLaunchError("malformed_output", f"StartCascade answered without a cascadeId: {json.dumps(redact(response))[:MAX_EVIDENCE_CHARS]}")
+        binding = self._claim_binding(prepared, conversation_id, endpoint)
+        transcript = str(_safe_home() / ".gemini" / "antigravity-ide" / "brain" / conversation_id / ".system_generated" / "logs" / "transcript.jsonl")
+        prepared.session_path = transcript
+        bound_at = utc_now()
+        self._persist(prepared, conversation_id=conversation_id, status="bound", binding=binding, transcript_path=transcript,
+                      last_event="cascade_bound", last_event_at=bound_at)
+        self._verify_workspace(prepared, conversation_id)
+        try:
+            client.send_user_cascade_message(conversation_id, prompt, model_placeholder=state["model_placeholder"],
+                                             ide_version=endpoint.ls_version)
+        except AgLsError as exc:
+            classification = _classify_rpc_failure(exc)
+            self.cancel(prepared, reason="dispatch_failed")
+            self._persist(prepared, status="failed", last_event="dispatch_failed", last_event_at=utc_now(), termination_reason=classification)
+            raise AgLaunchError(classification, f"SendUserCascadeMessage failed: {exc.detail}") from exc
+        started_at = utc_now()
+        self._persist(prepared, status="running", started_at=started_at, last_event="turn_started", last_event_at=started_at)
+        running = RunningLaunch(prepared=prepared, turn_id=f"turn-{uuid.uuid4().hex[:8]}", started_at=started_at)
+        running._started_clock = self._clock()
+        return running
+
+    def _claim_binding(self, prepared: PreparedLaunch, conversation_id: str, endpoint: LanguageServerEndpoint) -> dict[str, Any]:
+        """ONE_EXECUTION_ONE_ACTIVE_AG_BINDING: this execution owns exactly one, freshly created cascade.
+
+        A cascade id already claimed by another non-terminal run is never
+        adopted or touched (not even cancelled -- it is someone else's live
+        session); the launch fails ``binding_ambiguous`` instead.
+        """
+        try:
+            others = [item for item in list_run_states(self._manager_home, include_terminal=False)
+                      if item.get("conversation_id") == conversation_id and item.get("thread_id") != prepared.thread_id]
+        except Exception:
+            others = []
+        if others:
+            self._persist(prepared, status="failed", last_event="binding_ambiguous", last_event_at=utc_now(), termination_reason="binding_ambiguous")
+            raise AgLaunchError("binding_ambiguous", f"cascade {conversation_id} is already bound to {[o.get('thread_id') for o in others][:3]}")
+        return {"invariant": BINDING_INVARIANT, "conversation_id": conversation_id, "thread_id": prepared.thread_id,
+                "language_server_pid": endpoint.pid, "language_server_identity": endpoint.creation_identity,
+                "workspace": str(Path(str(prepared._request.working_directory)).resolve()), "claimed_at": utc_now()}
+
     def _verify_workspace(self, prepared: PreparedLaunch, conversation_id: str) -> None:
         """STOP (cancel + fail) when the provider's workspace provably differs from ADM's working directory."""
         request = prepared._request
@@ -638,7 +776,8 @@ class OfficialAgCliRunner:
             uris = [str(item) for item in raw if isinstance(item, str)]
             for item in metadata.get("workspaces") or []:
                 if isinstance(item, dict):
-                    for key in ("uri", "workspaceUri", "path"):
+                    # Live shape (IDE 1.107.0): workspaces[].workspaceFolderAbsoluteUri / gitRootAbsoluteUri.
+                    for key in ("workspaceFolderAbsoluteUri", "gitRootAbsoluteUri", "uri", "workspaceUri", "path"):
                         if isinstance(item.get(key), str):
                             uris.append(item[key])
         except AgLsError as exc:
@@ -712,6 +851,8 @@ class OfficialAgCliRunner:
                 "language_server_pid": state.get("language_server", {}).get("pid"), "steps_observed": max(last_step_count, 0),
                 "termination_reason": (verdict or {}).get("termination_reason"), "transcript_path": state.get("transcript_path"),
                 "workspace_check": state.get("workspace_check"), "cancel_evidence": cancel_evidence or state.get("cancel_evidence"),
+                "transport": state.get("transport"), "provider_run_id": state.get("provider_run_id"),
+                "model_id": state.get("model_id"), "binding": state.get("binding"),
             }
             if extra:
                 stats.update(extra)
@@ -755,6 +896,12 @@ class OfficialAgCliRunner:
                 elif running._heartbeat:
                     running._heartbeat("provider_heartbeat")
                 verdict = classify_run(summary, steps, metadatas, seconds_since_start=now - started)
+                latest_executor = max((m for m in (metadatas or []) if isinstance(m, dict)),
+                                      key=lambda m: int(m.get("lastStepIdx") or 0), default=None)
+                run_id = (latest_executor or {}).get("executionId")
+                if isinstance(run_id, str) and run_id and state.get("provider_run_id") != run_id:
+                    # AG's own executor run id: distinct from the cascade/conversation id and from ADM's ids.
+                    self._persist(prepared, provider_run_id=run_id)
             elif running._heartbeat:
                 running._heartbeat("provider_heartbeat")
             if verdict is not None:

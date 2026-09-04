@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 from manager.ag_cli_runner import (
+    BINDING_INVARIANT,
     AgCliProcess,
     OfficialAgCliRunner,
     classify_run,
@@ -22,8 +23,8 @@ from manager.ag_cli_runner import (
     parse_new_conversation_output,
     sanitize_ag_environment,
 )
-from manager.ag_language_server import AgLsError
-from manager.ag_run_state import list_run_states, read_run_state
+from manager.ag_language_server import CASCADE_SOURCE_AGENT_API, TRANSPORT_AGENTAPI, TRANSPORT_IDE_BRIDGE, AgLsError
+from manager.ag_run_state import list_run_states, read_run_state, write_run_state
 from manager.ag_runner import AgLaunchError, LaunchRequest
 from manager.test_ag_language_server import TOKEN, endpoint, quota_summary, user_status
 
@@ -104,6 +105,16 @@ class ScriptedClient:
     def get_cascade_trajectory_executor_metadatas(self, cascade_id):
         return self.call("GetCascadeTrajectoryExecutorMetadatas", {"cascadeId": cascade_id})
 
+    def add_tracked_workspace(self, workspace_path):
+        return self.call("AddTrackedWorkspace", {"workspace": workspace_path})
+
+    def start_cascade(self, workspace_uris, *, source=CASCADE_SOURCE_AGENT_API):
+        return self.call("StartCascade", {"source": source, "workspaceUris": list(workspace_uris)})
+
+    def send_user_cascade_message(self, cascade_id, text, *, model_placeholder, ide_version=None):
+        return self.call("SendUserCascadeMessage", {"cascadeId": cascade_id, "items": [{"text": text}],
+                                                    "model_placeholder": model_placeholder, "ide_version": ide_version})
+
 
 class FakeProcess:
     def __init__(self, stdout='{"response": {"conversationId": "%s"}}' % CID, stderr="", returncode=0, hang=False):
@@ -145,6 +156,9 @@ class RunnerHarness:
             self.popen_calls.append((list(argv), kwargs))
             return self.process
 
+        # The agentapi transport is the historical default of this harness; the
+        # IDE-bridge scenarios opt in with transport=TRANSPORT_IDE_BRIDGE.
+        runner_kwargs.setdefault("transport", TRANSPORT_AGENTAPI)
         self.runner = OfficialAgCliRunner(
             executable_resolver=lambda: (test.exe, ["agentapi"]),
             discover=lambda timeout: endpoint(executable=test.exe, creation_identity="windows-filetime:28164"),
@@ -164,6 +178,7 @@ class RunnerHarness:
                                           {"steps": [step("USER_INPUT", text="do it"), step("PLANNER_RESPONSE", text="ADM-SMOKE-OK")]}],
             "GetCascadeTrajectoryExecutorMetadatas": [{"executorMetadata": []}, executor()],
             "CancelCascadeInvocation": {}, "ForceStopCascadeTree": {},
+            "AddTrackedWorkspace": {}, "StartCascade": {"cascadeId": CID}, "SendUserCascadeMessage": {},
         }
         script.update(overrides)
         return script
@@ -538,6 +553,188 @@ class WaitTests(RunnerTestCase):
         self.assertEqual([], list_run_states(self.home, include_terminal=False))
         raw = Path(self.home, "runtime", "antigravity", "runs", f"{prepared.thread_id}.json").read_text(encoding="utf-8")
         self.assertNotIn(TOKEN, raw)
+
+
+class IdeBridgeTests(RunnerTestCase):
+    """transport=ide_bridge (verified live 2026-09-05): the language server's own cascade RPCs, no CLI process."""
+
+    def harness(self, script=None, **kwargs):
+        kwargs.setdefault("transport", TRANSPORT_IDE_BRIDGE)
+        return RunnerHarness(self, script=script, **kwargs)
+
+    def metadata_for(self, path):
+        return {"metadata": {"workspaces": [{"workspaceFolderAbsoluteUri": Path(path).resolve().as_uri(),
+                                              "gitRootAbsoluteUri": Path(path).resolve().as_uri(), "branchName": "master"}]}}
+
+    def test_success_path_binds_a_new_cascade_to_exactly_the_working_directory(self):
+        h = self.harness(RunnerHarness.default_script(GetConversationMetadata=self.metadata_for(self.workdir)))
+        prepared, running, outcome = h.run(prompt="reply PONG")
+        self.assertEqual(("live_ide", True), (prepared.mode, prepared.thread_id.startswith("ag-live-")))
+        self.assertEqual([], h.popen_calls, "the IDE bridge never spawns a CLI")
+        rpcs = [call[0] for call in h.client.calls]
+        order = [rpc for rpc in rpcs if rpc in ("AddTrackedWorkspace", "StartCascade", "GetConversationMetadata", "SendUserCascadeMessage")]
+        self.assertEqual(["AddTrackedWorkspace", "StartCascade", "GetConversationMetadata", "SendUserCascadeMessage"], order)
+        self.assertNotIn("ReadProject", rpcs, "the projects-store probe belongs to the agentapi route only")
+        bodies = {call[0]: call[1] for call in h.client.calls}
+        self.assertEqual({"workspace": str(Path(self.workdir).resolve())}, bodies["AddTrackedWorkspace"])
+        self.assertEqual({"source": CASCADE_SOURCE_AGENT_API, "workspaceUris": [Path(self.workdir).resolve().as_uri()]}, bodies["StartCascade"])
+        self.assertEqual(("reply PONG", "MODEL_PLACEHOLDER_M7"), (bodies["SendUserCascadeMessage"]["items"][0]["text"], bodies["SendUserCascadeMessage"]["model_placeholder"]))
+        self.assertEqual("completed", outcome.status)
+        self.assertEqual("ADM-SMOKE-OK", outcome.response_text)
+        self.assertEqual(("ide_bridge", "exec-1", "gemini-3-7-flash-medium"), (outcome.stats["transport"], outcome.stats["provider_run_id"], outcome.stats["model_id"]))
+        self.assertEqual(BINDING_INVARIANT, outcome.stats["binding"]["invariant"])
+        self.assertEqual(CID, outcome.stats["binding"]["conversation_id"])
+        state = read_run_state(prepared.thread_id, self.home)
+        self.assertEqual(("completed", CID, "ide_bridge", "exec-1", "MODEL_PLACEHOLDER_M7"),
+                         (state["status"], state["conversation_id"], state["transport"], state["provider_run_id"], state["model_placeholder"]))
+        self.assertEqual("verified", state["workspace_check"]["result"])
+        self.assertEqual({"pid", "creation_identity"} <= set(state["language_server"]), True)
+        self.assertNotIn(TOKEN, json.dumps(state))
+
+    def test_readiness_records_transport_and_the_catalog_model(self):
+        h = self.harness()
+        prepared = h.runner.prepare(h.request(model="Gemini 3.7 Flash (Medium)"))
+        readiness = read_run_state(prepared.thread_id, self.home)["readiness"]
+        self.assertEqual(("ide_bridge", None, "gemini-3-7-flash-medium", "MODEL_PLACEHOLDER_M7"),
+                         (readiness["transport"], readiness["agentapi_model"], readiness["model"]["model_id"], readiness["model"]["placeholder"]))
+        self.assertEqual({"available": True, "transport": "ide_bridge", "reason": None, "detail": None}, readiness["dispatch_route"])
+
+    def test_unknown_and_exhausted_models_refuse_to_launch(self):
+        h = self.harness()
+        with self.assertRaises(AgLaunchError) as ctx:
+            h.runner.prepare(h.request(model="gpt-9-ultra"))
+        self.assertEqual("unknown_model", ctx.exception.classification)
+        with self.assertRaises(AgLaunchError) as ctx:
+            h.runner.prepare(h.request(model="claude-opus-4-6-thinking"))
+        self.assertEqual("model_quota_exhausted", ctx.exception.classification)
+
+    def test_agentapi_projects_store_block_does_not_apply_to_the_bridge(self):
+        blocked = AgLsError("rpc_failed", "ReadProject: HTTP 500 unknown: projects store not initialized")
+        h = self.harness(RunnerHarness.default_script(ReadProject=blocked, GetConversationMetadata=self.metadata_for(self.workdir)))
+        _, _, outcome = h.run()
+        self.assertEqual("completed", outcome.status)
+
+    def test_bridge_route_unavailable_when_the_cascade_rpc_fails(self):
+        h = self.harness(RunnerHarness.default_script(GetAllCascadeTrajectories=AgLsError("rpc_failed", "cascade subsystem down")))
+        with self.assertRaises(AgLaunchError) as ctx:
+            h.runner.prepare(h.request())
+        self.assertEqual("dispatch_route_unavailable", ctx.exception.classification)
+
+    def test_workspace_mismatch_stops_before_any_model_turn(self):
+        elsewhere = self.metadata_for(Path(self.temp.name, "other"))
+        h = self.harness(RunnerHarness.default_script(GetConversationMetadata=elsewhere))
+        prepared = h.runner.prepare(h.request(sandbox=None))
+        with self.assertRaises(AgLaunchError) as ctx:
+            h.runner.start(prepared, "do it")
+        self.assertEqual("workspace_mismatch", ctx.exception.classification)
+        rpcs = [call[0] for call in h.client.calls]
+        self.assertNotIn("SendUserCascadeMessage", rpcs)
+        self.assertIn("CancelCascadeInvocation", rpcs)
+        state = read_run_state(prepared.thread_id, self.home)
+        self.assertEqual(("mismatch", "workspace_mismatch"), (state["workspace_check"]["result"], state["cancel_evidence"]["reason"]))
+        self.assertFalse(state["cancel_evidence"]["cli_process_killed"])
+
+    def test_unverifiable_workspace_refuses_a_write_task_before_the_turn(self):
+        h = self.harness(RunnerHarness.default_script(GetConversationMetadata={"metadata": {}}))
+        prepared = h.runner.prepare(h.request(sandbox=None))
+        with self.assertRaises(AgLaunchError) as ctx:
+            h.runner.start(prepared, "do it")
+        self.assertEqual("workspace_unverified", ctx.exception.classification)
+        self.assertNotIn("SendUserCascadeMessage", [call[0] for call in h.client.calls])
+
+    def test_add_tracked_workspace_failure_is_workspace_bind_failed(self):
+        h = self.harness(RunnerHarness.default_script(AddTrackedWorkspace=AgLsError("rpc_invalid_argument", "bad path")))
+        prepared = h.runner.prepare(h.request())
+        with self.assertRaises(AgLaunchError) as ctx:
+            h.runner.start(prepared, "do it")
+        self.assertEqual("workspace_bind_failed", ctx.exception.classification)
+        self.assertNotIn("StartCascade", [call[0] for call in h.client.calls])
+        self.assertEqual("failed", read_run_state(prepared.thread_id, self.home)["status"])
+
+    def test_start_cascade_failures_are_normalized(self):
+        cases = [
+            (AgLsError("rpc_failed", "StartCascade: HTTP 500 unknown: quota exceeded for this account"), "quota_exhausted"),
+            (AgLsError("rpc_unauthenticated", "StartCascade: Invalid CSRF token"), "auth_transient"),
+            (AgLsError("ls_unreachable", "StartCascade: ConnectionRefusedError"), "ls_unreachable"),
+            (AgLsError("malformed_response", "StartCascade: non-JSON response (HTTP 200)"), "malformed_output"),
+            (AgLsError("rpc_failed", "StartCascade: HTTP 500 unknown: something else"), "dispatch_failed"),
+        ]
+        for error, expected in cases:
+            with self.subTest(expected=expected):
+                h = self.harness(RunnerHarness.default_script(StartCascade=error))
+                prepared = h.runner.prepare(h.request())
+                with self.assertRaises(AgLaunchError) as ctx:
+                    h.runner.start(prepared, "do it")
+                self.assertEqual(expected, ctx.exception.classification)
+                state = read_run_state(prepared.thread_id, self.home)
+                self.assertEqual(("failed", expected, None), (state["status"], state["termination_reason"], state["conversation_id"]))
+
+    def test_start_cascade_without_an_id_is_malformed_output(self):
+        h = self.harness(RunnerHarness.default_script(StartCascade={"ok": True}))
+        prepared = h.runner.prepare(h.request())
+        with self.assertRaises(AgLaunchError) as ctx:
+            h.runner.start(prepared, "do it")
+        self.assertEqual("malformed_output", ctx.exception.classification)
+
+    def test_send_message_failure_cancels_the_fresh_cascade(self):
+        error = AgLsError("rpc_failed", "SendUserCascadeMessage: HTTP 500 unknown: rate limit exceeded")
+        h = self.harness(RunnerHarness.default_script(SendUserCascadeMessage=error, GetConversationMetadata=self.metadata_for(self.workdir)))
+        prepared = h.runner.prepare(h.request())
+        with self.assertRaises(AgLaunchError) as ctx:
+            h.runner.start(prepared, "do it")
+        self.assertEqual("quota_exhausted", ctx.exception.classification)
+        self.assertIn("CancelCascadeInvocation", [call[0] for call in h.client.calls])
+        state = read_run_state(prepared.thread_id, self.home)
+        self.assertEqual(("failed", "quota_exhausted", CID), (state["status"], state["termination_reason"], state["conversation_id"]))
+
+    def test_one_execution_one_active_binding_never_adopts_a_claimed_cascade(self):
+        write_run_state({"thread_id": "ag-live-other", "provider": "antigravity", "status": "running", "conversation_id": CID}, self.home)
+        h = self.harness(RunnerHarness.default_script(GetConversationMetadata=self.metadata_for(self.workdir)))
+        prepared = h.runner.prepare(h.request())
+        with self.assertRaises(AgLaunchError) as ctx:
+            h.runner.start(prepared, "do it")
+        self.assertEqual("binding_ambiguous", ctx.exception.classification)
+        rpcs = [call[0] for call in h.client.calls]
+        self.assertNotIn("SendUserCascadeMessage", rpcs)
+        self.assertNotIn("CancelCascadeInvocation", rpcs, "someone else's live cascade is never touched")
+        self.assertEqual("failed", read_run_state(prepared.thread_id, self.home)["status"])
+        # A terminal claim on the same id is not a conflict.
+        write_run_state({"thread_id": "ag-live-other", "provider": "antigravity", "status": "completed", "conversation_id": CID}, self.home)
+        h2 = self.harness(RunnerHarness.default_script(GetConversationMetadata=self.metadata_for(self.workdir)))
+        self.assertEqual("completed", h2.run()[2].status)
+
+    def test_cancel_and_timeout_leave_evidence_without_a_cli_process(self):
+        script = RunnerHarness.default_script(
+            GetConversationMetadata=self.metadata_for(self.workdir),
+            GetAllCascadeTrajectories=[summary("CASCADE_RUN_STATUS_RUNNING", 1), summary("CASCADE_RUN_STATUS_RUNNING", 1), summary("CASCADE_RUN_STATUS_IDLE", 1)],
+            GetCascadeTrajectorySteps={"steps": [step("USER_INPUT", text="do it")]},
+            GetCascadeTrajectoryExecutorMetadatas={"executorMetadata": []},
+        )
+        h = self.harness(script)
+        prepared = h.runner.prepare(h.request(turn_timeout_seconds=5))
+        running = h.runner.start(prepared, "do it")
+        outcome = h.runner.wait(running)
+        self.assertEqual(("failed", "turn_timeout"), (outcome.status, outcome.failure_classification))
+        evidence = outcome.stats["cancel_evidence"]
+        self.assertEqual(("turn_timeout", False, {"CancelCascadeInvocation": "ok", "ForceStopCascadeTree": "ok"}),
+                         (evidence["reason"], evidence["cli_process_killed"], evidence["rpc"]))
+        self.assertEqual("ide_bridge", outcome.stats["transport"])
+
+    def test_close_while_running_cancels_so_stop_is_provable(self):
+        h = self.harness(RunnerHarness.default_script(GetConversationMetadata=self.metadata_for(self.workdir)))
+        prepared = h.runner.prepare(h.request())
+        h.runner.start(prepared, "do it")
+        h.runner.close(prepared)
+        self.assertIn("CancelCascadeInvocation", [call[0] for call in h.client.calls])
+        self.assertEqual(0, prepared._process.poll())
+
+    def test_is_alive_follows_discovery_without_side_effects(self):
+        h = self.harness()
+        self.assertTrue(h.runner.is_alive())
+        dead = OfficialAgCliRunner(transport=TRANSPORT_IDE_BRIDGE, discover=lambda timeout: (_ for _ in ()).throw(AgLsError("ide_not_running", "no")))
+        self.assertFalse(dead.is_alive())
+        with self.assertRaises(ValueError):
+            OfficialAgCliRunner(transport="pty")
 
 
 class AgCliProcessTests(unittest.TestCase):

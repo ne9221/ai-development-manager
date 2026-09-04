@@ -2,8 +2,10 @@
 
 Everything below was established by probing the real installation on this
 machine (Antigravity IDE **1.107.0**, language server build
-`agy_ls_release_branch/2.7`, 2026-09-02). Nothing here is taken from vendor
-documentation or third-party articles.
+`agy_ls_release_branch/2.7`, 2026-09-02 and 2026-09-05). Request shapes were
+cross-checked against public language-server clients but only kept once they
+worked on this machine; nothing here is taken from vendor marketing or from an
+unprobed version number.
 
 ## 1. Automation surface
 
@@ -76,116 +78,117 @@ rules apply unchanged -- no second quota framework.
 Requires the IDE (or its language server, kept alive by the IDE setting
 `antigravity.persistentLanguageServer`, default off) to be running.
 
-## 3. Execution (implemented, gated OFF -- route blocked on this build)
+## 3. Execution: transport `ide_bridge` (working, live-verified 2026-09-05)
 
-`manager/ag_cli_runner.py` implements the full adapter against the same
-`prepare/start/wait/close` contract `CodexLauncher` and `ClaudeLauncher` use,
-routed by the existing `manager/ag_runner.AgRunner` facade. No second
+`manager/ag_cli_runner.OfficialAgCliRunner` implements the adapter against the
+same `prepare/start/wait/close` contract `CodexLauncher` and `ClaudeLauncher`
+use, routed by the existing `manager/ag_runner.AgRunner` facade. No second
 dispatcher, execution engine, session system or quota framework was created.
+The adapter has two transports; the one actually used is written into every
+run-state record and into the execution outcome `stats.transport`:
 
-* **READY handshake** -- never "process exists, send prompt". `prepare()`
-  requires: an existing absolute working directory; a discovered language
-  server; `GetStatus` answering; `GetUserStatus` carrying a signed-in account;
-  a non-exhausted quota group; the requested model mapping onto an `agentapi`
-  model; a resolvable `agentapi` entrypoint; and a usable **dispatch route**
-  (below). All read-only, no model turn.
-* **Terminal truth** -- exit code 0 is never success. The conversation runs
-  *inside* the language server (the CLI returns as soon as the conversation
-  exists), so `wait()` polls `GetAllCascadeTrajectories`,
-  `GetCascadeTrajectorySteps` and `GetCascadeTrajectoryExecutorMetadatas`.
-  Success requires run status `CASCADE_RUN_STATUS_IDLE` **and** an executor
-  record **and** a non-empty final `PLANNER_RESPONSE`. Distinct failure
-  classifications: `empty_response`, `prompt_not_started`, `permission_stall`,
-  `permission_required`, `quota_exhausted`, `token_budget_exceeded`,
-  `max_invocations`, `provider_error`, `auth_transient`, `turn_timeout`,
-  `malformed_provider_state`, `ls_unreachable`, `cancelled` -- never one
-  blanket `provider_failed`.
-* **Cancellation** -- `CancelCascadeInvocation` + `ForceStopCascadeTree`, plus
-  `taskkill /F /T` of the CLI process tree (never just the parent PID), then
-  reconciliation until the server reports IDLE. Cancellation evidence
-  (`reason`, per-RPC result, whether the process tree was killed, final run
-  status, confirmation time) is persisted and returned in the outcome stats.
-* **Identity separation** -- ADM Task / ADM Execution / ADM Session /
-  `thread_id` (the ADM-assigned provider_session_id) / AG `conversation_id` /
-  language-server process identity are all distinct fields. An AG conversation
-  can outlive one ADM execution.
-* **Recovery** -- `manager/ag_run_state.py` keeps one JSON file per thread id
-  under `AI_MANAGER_HOME/runtime/antigravity/runs/` (scratch state, never an
-  SSOT) with conversation id, process identity, timestamps, last event, step
-  cursor, transcript path, terminal state and cancellation evidence, so a
-  restarted ADM can read a run back. Durable provider-side readback also
-  exists: `~/.gemini/antigravity-ide/conversations/<id>.db` (SQLite) and
-  `brain/<id>/.system_generated/logs/transcript.jsonl` -- used for
-  reconciliation only, never as the control plane.
-* **Permissions** -- no blanket permission skipping. A run waiting on a
-  permission/question is classified `permission_required`, and after a bounded
-  stall it fails `permission_stall` and is cancelled, rather than being granted
-  everything to make headless work.
-* **Workspace isolation** -- after dispatch the adapter reads the
-  conversation's own workspace mapping. A provable mismatch with the ADM
-  working directory cancels the run and fails `workspace_mismatch`; an
-  unverifiable mapping refuses any non-read-only task (`workspace_unverified`).
+| transport | AgRunner mode | how a task reaches AG | status on this build |
+|---|---|---|---|
+| `ide_bridge` (default) | `live_ide` | the IDE-hosted language server's own cascade RPCs | **works** (live 2026-09-05) |
+| `agentapi` | `cli` | official `agentapi new-conversation` CLI | blocked: needs a projects store |
 
-### Why dispatch is gated off
-
-On this build the official `agentapi new-conversation` route **cannot create a
-conversation against an IDE-hosted language server**:
+### `ide_bridge` dispatch sequence (verified live on IDE 1.107.0)
 
 ```
-$ agentapi new-conversation --model=flash "<prompt>"          # ANTIGRAVITY_PROJECT_ID unset
-{"error": "failed to start conversation: rpc error: code = Unknown desc = project_id is required when providing project_env_config"}
-
-$ ANTIGRAVITY_PROJECT_ID=outside-of-project agentapi new-conversation ...
-{"error": "failed to start conversation: rpc error: code = Unknown desc = projectsStore is nil, but projectEnvConfig was provided"}
+discover_language_server()      -> the app-level cascade host (see below), CSRF nonce in memory only
+GetStatus / GetUserStatus /     -> READY handshake, account, quota, live model catalog
+RetrieveUserQuotaSummary
+GetAllCascadeTrajectories       -> dispatch-route probe (cascade subsystem answers)
+AddTrackedWorkspace {workspace: <abs path>}
+StartCascade {source: CORTEX_TRAJECTORY_SOURCE_AGENT_API, workspaceUris: [file:///...]}
+                                -> {cascadeId}  == AG conversation id (always NEW, never adopted)
+GetConversationMetadata         -> workspaces[].workspaceFolderAbsoluteUri must equal the ADM working directory,
+                                   checked BEFORE the first model turn (mismatch => cancel + workspace_mismatch)
+SendUserCascadeMessage {cascadeId, items: [{text}], metadata: {ideName, ideVersion, extensionName, locale},
+                        cascadeConfig.plannerConfig: {conversational: {plannerMode: DEFAULT, agenticMode: true},
+                                                      requestedModel: {model: MODEL_PLACEHOLDER_*}}}
+poll GetAllCascadeTrajectories / GetCascadeTrajectorySteps / GetCascadeTrajectoryExecutorMetadatas
+                                -> terminal truth (unchanged classifier)
 ```
 
-`agentapi` always sends a `project_env_config`, and this language server has no
-projects store: `ReadProject {}` -> `projects store not initialized`,
-`IsProjectsEnabledInternally` -> false. That is a platform state, not an ADM
-defect.
+Two things the earlier (2026-09-02) attempt got wrong and this build proves:
+the user turn goes in top-level `items: [{text}]`, not in a `step` object, and
+the model is the server's own `MODEL_PLACEHOLDER_*` enum read from
+`GetUserStatus.cascadeModelConfigData.clientModelConfigs[].modelOrAlias.model`
+(`manager/ag_language_server.resolve_model_placeholder`; an unknown or
+exhausted model refuses to launch -- nothing is guessed). No `apiKey` and no
+tool-policy widening are sent: the server applies its own defaults, which on
+this build auto-apply file edits (`toolConfig.code.applyEdits: true`) -- the
+live smoke created `pong.txt` in the disposable workspace with no permission
+prompt. Commands stay under the IDE's own permission policy.
 
-`manager/ag_language_server.probe_dispatch_route()` checks exactly that
-precondition (read-only `ReadProject`, no model turn). It feeds:
+**Which language server.** The IDE starts two per window: the app-level one
+(no `--workspace_id`) hosts every cascade, the per-workspace one
+(`--enable_lsp --workspace_id ...`) answers the cascade RPCs with an empty
+map. `parse_command_line` labels them `cascade_host` / `workspace_lsp` and
+discovery prefers the cascade host (then the newest). The role and workspace
+id are part of the endpoint evidence.
 
-* `OfficialAgCliRunner.prepare()` -> `AgLaunchError("dispatch_route_unavailable", ...)`
-  instead of spawning a CLI that cannot succeed;
-* `command_watcher.ag_availability_check()` -> **False**, so the Command
-  Watcher never routes a Task to Antigravity while the route is blocked;
-* `availability_snapshot()` -> `status: degraded`, `can_accept_new_task: false`,
-  `reason: projects_store_unavailable`, while quota stays truthfully fresh and
-  readable.
+**Identity separation and the binding invariant.** ADM Task / ADM Execution /
+ADM Session / `thread_id` (the ADM-assigned provider_session_id, `ag-live-*`)
+/ AG `conversation_id` (= `cascadeId`) / AG executor `provider_run_id`
+(`executorMetadata[].executionId`) / language-server process identity are all
+distinct fields in the run state. `ONE_EXECUTION_ONE_ACTIVE_AG_BINDING`: a
+launch always creates a fresh cascade and records a `binding` record; a
+cascade id already held by another non-terminal run state fails the launch
+`binding_ambiguous` without touching that cascade (it is somebody else's live
+session -- never cancelled, never adopted).
 
-Quota visibility and dispatchability are deliberately separate facts.
+**Everything else is unchanged from the CLI transport**: READY handshake
+before any side effect, exit-code-free terminal truth (IDLE + executor record
++ non-empty final `PLANNER_RESPONSE`), distinct failure classifications,
+`CancelCascadeInvocation` + `ForceStopCascadeTree` + reconciliation (no CLI
+process tree to kill on this transport -- `cancel_evidence.cli_process_killed`
+stays false), run-state readback under `AI_MANAGER_HOME/runtime/antigravity/runs/`,
+permission stalls failing closed instead of being auto-granted. Dispatch-time
+RPC failures are normalized by `_classify_rpc_failure`: `quota_exhausted`,
+`auth_transient`, `ls_unreachable`, `malformed_output`, `dispatch_failed`,
+plus `workspace_bind_failed` (AddTrackedWorkspace refused) and
+`binding_ambiguous`.
 
-### Direct-RPC route: investigated, rejected for now
+### `agentapi` transport: still blocked on this build
 
-The private `StartCascade` + `SendUserCascadeMessage` RPCs do create a
-conversation without the projects store
-(`StartCascade {"source": "CORTEX_TRAJECTORY_SOURCE_AGENT_API", "workspaceUris": [...]}`
-returns a `cascadeId`, and the workspace mapping comes back correctly in
-`GetConversationMetadata`). The model must be supplied as
-`SendUserCascadeMessage.cascadeConfig.plannerConfig.requestedModel.model` using
-the `MODEL_PLACEHOLDER_*` enum from `GetUserStatus`'s `clientModelConfigs`;
-without it the executor writes
-`failed to construct executor: neither PlanModel nor RequestedModel specified`.
-With it, the executor gets one step further and fails
-`agent executor error: earliest step index is out of bounds: 0 vs 0` -- the
-user-input step is not persisted by the shapes tried.
+Re-verified 2026-09-05 on both language servers: `ReadProject {}` ->
+`projects store not initialized`, `IsProjectsEnabledInternally` -> `{}`. The
+official CLI always sends a `project_env_config`, so
+`probe_dispatch_route(client, transport="agentapi")` keeps failing closed with
+`projects_store_unavailable` and `OfficialAgCliRunner(transport="agentapi")`
+refuses to spawn a CLI that cannot succeed. The CLI code path and its tests are
+kept for the day the projects store exists.
 
-This is an undocumented, uncommitted private schema. Rather than keep guessing
-message shapes, ADM does **not** ship this route: no schema guard could
-honestly claim stability, and the project rules forbid treating an unpromised
-private schema as a control plane. The finding is recorded here so a future
-task can resume from the exact blocking error.
+### Headless / PTY fallback: not available on this build
+
+The bundled `language_server_windows_x64.exe --help` (agy_ls_release_branch/2.7)
+exposes no `-cli`, `-print`, `-agent_mode` or `-dangerously-skip-permissions`
+flag; the public "agy" harnesses that use those target the separate
+Antigravity CLI binary, which is not installed here (`~/.gemini/antigravity-cli`
+absent, no `agy` on PATH). A `transport=agy_pty` therefore cannot be probed,
+let alone built, on this machine -- it is recorded as unavailable rather than
+stubbed.
 
 ## 4. Capability and routing
 
 Antigravity keeps its existing entry in `manager/assignment.py`'s capability
-registry (`mode: interactive`, browser-leaning traits) and its existing
-provider registration in `command_watcher.PROVIDER_RUNTIMES`. It has **not**
-been marked `repo_write_capable`: no isolated-worktree repo-write turn has been
-proven through it, and `files_changed` for AG would still have to come from git
-evidence, never from the agent's self-report.
+registry and its existing provider registration in
+`command_watcher.PROVIDER_RUNTIMES` (`launcher_factory: AgRunner`,
+`quota_check: ag_availability_check`). `ag_availability_check` requires fresh
+official SSOT quota **and** a discoverable language server **and**
+`probe_dispatch_route()` -- which now defaults to the `ide_bridge` route, so
+with the IDE running the Command Watcher may route a Task to Antigravity.
+`AgRunner`'s hybrid order is IDE bridge first, `agentapi` CLI as the fallback
+(only for `live_ide_not_found` / `live_ide_transport_unavailable`).
+`manager/ag_ide_bridge.AgIdeBridge` (the older fail-closed IPC stub) is no
+longer on the path.
+
+Antigravity has **not** been marked `repo_write_capable`: `files_changed` for AG
+comes from git evidence (`enforce_allowed_paths` / `capture_repo_write_evidence`
+in `execution_runner`), never from the agent's self-report, and the bounded
+repo-write admission for AG is a separate milestone (M4).
 
 ## 5. Testing layers
 
@@ -198,5 +201,10 @@ evidence, never from the agent's self-report.
   `python -m manager.ag_language_server` prints the redacted availability
   snapshot; `python -m collectors.antigravity` prints the status document.
 * **Layer 4** (live, real quota): deliberately **not** part of the default
-  suite. The live dispatch smoke is blocked by the route above; the live quota
-  smoke is the Layer-3 command against a running IDE.
+  suite, and the suite cannot reach it by accident: `conftest.py` fences the
+  real process/loopback entry points for every test that is not marked
+  `live_antigravity` (three ordinary unit tests dispatched three real model
+  turns on 2026-09-05 the moment the bridge became real -- that fence is the
+  postmortem). `python -m manager.ag_live_smoke` runs the minimal live
+  dispatch: disposable git repo, one small file-creating task, adapter
+  terminal state, then **independent** `git status`/diff verification.

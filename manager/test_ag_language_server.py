@@ -4,6 +4,11 @@ import json
 import unittest
 
 from manager.ag_language_server import (
+    CASCADE_SOURCE_AGENT_API,
+    ROLE_CASCADE_HOST,
+    ROLE_WORKSPACE_LSP,
+    TRANSPORT_AGENTAPI,
+    TRANSPORT_IDE_BRIDGE,
     AgLanguageServerClient,
     AgLsError,
     LanguageServerEndpoint,
@@ -15,11 +20,17 @@ from manager.ag_language_server import (
     parse_listening_ports,
     parse_process_listing,
     redact,
+    resolve_model_placeholder,
 )
 
 TOKEN = "11111111-2222-3333-4444-555555555555"
 EXE = r"C:\Users\EE\AppData\Local\Programs\Antigravity IDE\resources\app\extensions\antigravity\bin\language_server_windows_x64.exe"
 CMDLINE = f'"{EXE}" --csrf_token {TOKEN} --extension_server_port 54411 --extension_server_csrf_token other --app_data_dir antigravity-ide --subclient_type ide'
+# The per-workspace LSP server the IDE also starts (live argv shape, 2026-09-05): it answers the
+# cascade RPCs with an empty map and must never be picked as the dispatch target.
+LSP_CMDLINE = (f'"{EXE}" --enable_lsp --csrf_token {TOKEN} --extension_server_port 56641 --extension_server_csrf_token other '
+               f'--workspace_id 0765dc392543520fe50f641702eb0c58652f14df3ac9a9f2da84c7c2c5e31401 --subclient_type ide '
+               f'--app_data_dir antigravity-ide --parent_pipe_path \\\\.\\pipe\\server_3e7997d61807730f')
 NETSTAT = """
 Active Connections
 
@@ -67,9 +78,11 @@ def user_status(email="user@example.com"):
         "planInfo": {"planName": "Pro", "teamsTier": "TEAMS_TIER_PRO"},
         "availablePromptCredits": 500, "availableFlowCredits": 100},
         "cascadeModelConfigData": {"clientModelConfigs": [
-            {"label": "Gemini 3.7 Flash (Medium)", "modelId": "gemini-3-7-flash-medium",
+            {"label": "Gemini 3.7 Flash (Medium)", "modelId": "gemini-3-7-flash-medium", "isRecommended": True,
+             "modelOrAlias": {"model": "MODEL_PLACEHOLDER_M7"},
              "quotaInfo": {"remainingFraction": 1, "resetTime": "2026-09-02T17:11:44Z"}},
             {"label": "Claude Opus 4.6 (Thinking)", "modelId": "claude-opus-4-6-thinking",
+             "modelOrAlias": {"model": "MODEL_PLACEHOLDER_M9"},
              "quotaInfo": {"resetTime": "2026-09-02T17:11:44Z"}},
         ]}}}
 
@@ -109,9 +122,21 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(TOKEN, parsed["csrf_token"])
         self.assertEqual("antigravity-ide", parsed["app_data_dir"])
         self.assertFalse(parsed["persistent_mode"])
-        self.assertEqual({"csrf_token": None, "app_data_dir": "antigravity-ide", "persistent_mode": True},
-                         parse_command_line("ls.exe --persistent_mode"))
+        minimal = parse_command_line("ls.exe --persistent_mode")
+        self.assertEqual((None, "antigravity-ide", True), (minimal["csrf_token"], minimal["app_data_dir"], minimal["persistent_mode"]))
         self.assertEqual("custom", parse_command_line("x --csrf_token=t --app_data_dir=custom")["app_data_dir"])
+
+    def test_parse_command_line_tells_the_cascade_host_from_the_workspace_lsp_server(self):
+        host = parse_command_line(CMDLINE)
+        self.assertEqual((ROLE_CASCADE_HOST, None, False), (host["role"], host["workspace_id"], host["enable_lsp"]))
+        lsp = parse_command_line(LSP_CMDLINE)
+        self.assertEqual(ROLE_WORKSPACE_LSP, lsp["role"])
+        self.assertEqual("0765dc392543520fe50f641702eb0c58652f14df3ac9a9f2da84c7c2c5e31401", lsp["workspace_id"])
+        self.assertTrue(lsp["enable_lsp"])
+        self.assertEqual(TOKEN, lsp["csrf_token"])
+        # Either marker alone is enough to demote a server to the LSP role.
+        self.assertEqual(ROLE_WORKSPACE_LSP, parse_command_line("x --csrf_token t --enable_lsp")["role"])
+        self.assertEqual(ROLE_WORKSPACE_LSP, parse_command_line("x --csrf_token t --workspace_id abc")["role"])
 
     def test_executable_trust_requires_antigravity_install_location(self):
         self.assertTrue(executable_is_trusted(EXE))
@@ -125,6 +150,19 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual([8501], parse_listening_ports(NETSTAT, 999))
         self.assertEqual([], parse_listening_ports(NETSTAT, 42))
         self.assertEqual([], parse_listening_ports("", 28164))
+
+
+class SuiteFenceTests(unittest.TestCase):
+    """conftest.py fences the live IDE off for every unmarked test. Tripwire: if this fails while an
+    Antigravity IDE is running, ordinary regression could dispatch real model turns again."""
+
+    def test_ordinary_tests_never_see_a_live_language_server(self):
+        with self.assertRaises(AgLsError) as ctx:
+            discover_language_server()
+        self.assertEqual("ide_not_running", ctx.exception.classification)
+        self.assertIn("fenced off", ctx.exception.detail)
+        snap = availability_snapshot(now="2026-09-05T00:00:00Z")
+        self.assertEqual(("unavailable", "ide_not_running", False), (snap["status"], snap["reason"], snap["can_accept_new_task"]))
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -179,6 +217,18 @@ class DiscoveryTests(unittest.TestCase):
         newer = process(pid=200, created="2026-09-02T00:00:00Z")
         found = self.discover([older, newer])
         self.assertEqual(200, found.pid)
+
+    def test_cascade_host_beats_a_newer_workspace_lsp_server(self):
+        """Live 2026-09-05: pid 17044 (app-level, older) hosts every cascade; pid 28604
+        (--enable_lsp --workspace_id, newer) answers the cascade RPCs with nothing."""
+        host = process(pid=17044, created="2026-09-04T01:15:57Z")
+        lsp = process(pid=28604, cmdline=LSP_CMDLINE, created="2026-09-04T01:16:09Z")
+        found = self.discover([lsp, host])
+        self.assertEqual((17044, ROLE_CASCADE_HOST, None), (found.pid, found.role, found.workspace_id))
+        self.assertEqual(ROLE_CASCADE_HOST, found.evidence()["role"])
+        only_lsp = self.discover([lsp])
+        self.assertEqual((28604, ROLE_WORKSPACE_LSP), (only_lsp.pid, only_lsp.role))
+        self.assertEqual("0765dc392543520fe50f641702eb0c58652f14df3ac9a9f2da84c7c2c5e31401", only_lsp.evidence()["workspace_id"])
 
     def test_endpoint_never_leaks_token(self):
         found = self.discover([process()])
@@ -236,13 +286,15 @@ class ClientTests(unittest.TestCase):
 
 
 class DispatchRouteProbeTests(unittest.TestCase):
-    """Readable quota and dispatchability are separate facts (live 2026-09-02)."""
+    """Readable quota and dispatchability are separate facts (live 2026-09-02): the agentapi route."""
 
     def probe(self, response):
-        return probe_dispatch_route(AgLanguageServerClient(endpoint(), opener=FakeOpener({"ReadProject": response})))
+        client = AgLanguageServerClient(endpoint(), opener=FakeOpener({"ReadProject": response}))
+        return probe_dispatch_route(client, transport=TRANSPORT_AGENTAPI)
 
     def test_initialized_projects_store_is_available(self):
-        self.assertEqual({"available": True, "reason": None, "detail": None}, self.probe((200, {"project": {}})))
+        self.assertEqual({"available": True, "transport": "agentapi", "reason": None, "detail": None},
+                         self.probe((200, {"project": {}})))
 
     def test_uninitialized_projects_store_blocks_dispatch(self):
         result = self.probe((500, {"code": "unknown", "message": "projects store not initialized (error ID: abc)"}))
@@ -262,23 +314,118 @@ class DispatchRouteProbeTests(unittest.TestCase):
         self.assertEqual((False, "rpc_unauthenticated"), (result["available"], result["reason"]))
 
 
+class IdeBridgeRouteProbeTests(unittest.TestCase):
+    """The IDE-bridge route (default): the cascade subsystem must answer; no projects store involved."""
+
+    def probe(self, responses):
+        client = AgLanguageServerClient(endpoint(), opener=FakeOpener(responses))
+        return probe_dispatch_route(client)
+
+    def test_default_transport_is_the_ide_bridge_and_never_touches_read_project(self):
+        opener = FakeOpener({"GetAllCascadeTrajectories": (200, {"trajectorySummaries": {}})})
+        result = probe_dispatch_route(AgLanguageServerClient(endpoint(), opener=opener))
+        self.assertEqual({"available": True, "transport": "ide_bridge", "reason": None, "detail": None}, result)
+        self.assertEqual(["GetAllCascadeTrajectories"], [call[1] for call in opener.calls])
+
+    def test_empty_trajectory_map_is_still_available(self):
+        # A freshly started IDE (or the LSP-role server) answers {} -- the RPC works.
+        self.assertTrue(self.probe({"GetAllCascadeTrajectories": (200, {})})["available"])
+
+    def test_cascade_rpc_failure_blocks_with_its_own_reason(self):
+        result = self.probe({"GetAllCascadeTrajectories": (403, {"message": "Invalid CSRF token"})})
+        self.assertEqual((False, "ide_bridge", "rpc_unauthenticated"), (result["available"], result["transport"], result["reason"]))
+
+    def test_unknown_transport_is_a_programming_error(self):
+        with self.assertRaises(ValueError):
+            probe_dispatch_route(AgLanguageServerClient(endpoint(), opener=FakeOpener({})), transport="pty")
+
+
+class ModelPlaceholderTests(unittest.TestCase):
+    """The model sent to the server is its own placeholder enum from the live catalog -- never guessed."""
+
+    def test_requested_model_matches_id_label_or_placeholder(self):
+        for wanted in ("gemini-3-7-flash-medium", "Gemini 3.7 Flash (Medium)", "model_placeholder_m7"):
+            self.assertEqual("MODEL_PLACEHOLDER_M7", resolve_model_placeholder(user_status(), wanted)["placeholder"], wanted)
+
+    def test_default_is_the_cheapest_recommended_gemini_flash_with_quota(self):
+        chosen = resolve_model_placeholder(user_status(), None)
+        self.assertEqual(("gemini-3-7-flash-medium", "MODEL_PLACEHOLDER_M7", 1.0), (chosen["model_id"], chosen["placeholder"], chosen["remaining_fraction"]))
+
+    def test_unknown_model_fails_closed(self):
+        with self.assertRaises(AgLsError) as ctx:
+            resolve_model_placeholder(user_status(), "gpt-9-ultra")
+        self.assertEqual("unknown_model", ctx.exception.classification)
+
+    def test_exhausted_model_is_refused_with_its_reset(self):
+        # protobuf JSON omits the zero: resetTime present, remainingFraction absent == 0.
+        with self.assertRaises(AgLsError) as ctx:
+            resolve_model_placeholder(user_status(), "claude-opus-4-6-thinking")
+        self.assertEqual("model_quota_exhausted", ctx.exception.classification)
+        self.assertIn("2026-09-02T17:11:44Z", ctx.exception.detail)
+
+    def test_catalog_without_placeholders_is_unavailable_not_guessed(self):
+        status = user_status()
+        for config in status["userStatus"]["cascadeModelConfigData"]["clientModelConfigs"]:
+            config.pop("modelOrAlias")
+        with self.assertRaises(AgLsError) as ctx:
+            resolve_model_placeholder(status, None)
+        self.assertEqual("model_catalog_unavailable", ctx.exception.classification)
+
+
+class CascadeRpcShapeTests(unittest.TestCase):
+    """Request shapes verified live 2026-09-05 (IDE 1.107.0): a change here changes what the server sees."""
+
+    def test_add_tracked_workspace_start_cascade_and_send_message_bodies(self):
+        opener = FakeOpener({"StartCascade": (200, {"cascadeId": "cas-1"})})
+        client = AgLanguageServerClient(endpoint(), opener=opener)
+        client.add_tracked_workspace(r"C:\work\repo")
+        self.assertEqual("cas-1", client.start_cascade(["file:///C:/work/repo"])["cascadeId"])
+        client.send_user_cascade_message("cas-1", "do it", model_placeholder="MODEL_PLACEHOLDER_M7", ide_version="1.107.0")
+        bodies = {call[1]: call[2] for call in opener.calls}
+        self.assertEqual({"workspace": r"C:\work\repo"}, bodies["AddTrackedWorkspace"])
+        self.assertEqual({"source": CASCADE_SOURCE_AGENT_API, "workspaceUris": ["file:///C:/work/repo"]}, bodies["StartCascade"])
+        sent = bodies["SendUserCascadeMessage"]
+        self.assertEqual("cas-1", sent["cascadeId"])
+        self.assertEqual([{"text": "do it"}], sent["items"])
+        self.assertEqual({"model": "MODEL_PLACEHOLDER_M7"}, sent["cascadeConfig"]["plannerConfig"]["requestedModel"])
+        self.assertEqual({"plannerMode": "CONVERSATIONAL_PLANNER_MODE_DEFAULT", "agenticMode": True},
+                         sent["cascadeConfig"]["plannerConfig"]["conversational"])
+        self.assertEqual({"ideName": "antigravity", "ideVersion": "1.107.0", "extensionName": "antigravity", "locale": "en"}, sent["metadata"])
+        # No tool-policy widening is ever requested: the server applies its own defaults.
+        self.assertNotIn("toolConfig", sent["cascadeConfig"]["plannerConfig"])
+        self.assertTrue(all(call[3]["x-codeium-csrf-token"] == TOKEN for call in opener.calls))
+
+
 class AvailabilitySnapshotTests(unittest.TestCase):
-    def snapshot(self, responses=None, discover=None):
+    def snapshot(self, responses=None, discover=None, transport=None):
         base = {"GetUserStatus": (200, user_status()), "RetrieveUserQuotaSummary": (200, quota_summary()),
-                "ReadProject": (200, {"project": {}})}
+                "ReadProject": (200, {"project": {}}), "GetAllCascadeTrajectories": (200, {"trajectorySummaries": {}})}
         if responses is not None:
             base.update(responses)
         opener = FakeOpener(base)
+        kwargs = {"transport": transport} if transport else {}
         return availability_snapshot(discover=discover or (lambda timeout: endpoint()),
                                      client_factory=lambda ep, timeout: AgLanguageServerClient(ep, opener=opener),
-                                     now="2026-09-02T12:30:00Z")
+                                     now="2026-09-02T12:30:00Z", **kwargs)
 
     def test_blocked_dispatch_route_degrades_without_touching_quota_truth(self):
-        snap = self.snapshot({"ReadProject": (500, {"code": "unknown", "message": "projects store not initialized"})})
-        self.assertEqual(("degraded", "projects_store_unavailable", False),
-                         (snap["status"], snap["reason"], snap["can_accept_new_task"]))
+        snap = self.snapshot({"ReadProject": (500, {"code": "unknown", "message": "projects store not initialized"})},
+                             transport=TRANSPORT_AGENTAPI)
+        self.assertEqual(("degraded", "projects_store_unavailable", False, "agentapi"),
+                         (snap["status"], snap["reason"], snap["can_accept_new_task"], snap["transport"]))
         self.assertEqual((0.65, "official", "fresh"), (snap["remaining"], snap["confidence"], snap["freshness"]))
         self.assertFalse(snap["dispatch_route"]["available"])
+
+    def test_default_snapshot_uses_the_ide_bridge_route(self):
+        snap = self.snapshot({"ReadProject": (500, {"code": "unknown", "message": "projects store not initialized"})})
+        self.assertEqual(("available", None, True, "ide_bridge"),
+                         (snap["status"], snap["reason"], snap["can_accept_new_task"], snap["transport"]))
+        self.assertEqual({"available": True, "transport": "ide_bridge", "reason": None, "detail": None}, snap["dispatch_route"])
+
+    def test_ide_bridge_route_failure_degrades_but_keeps_quota(self):
+        snap = self.snapshot({"GetAllCascadeTrajectories": (500, {"code": "unknown", "message": "cascade subsystem down"})})
+        self.assertEqual(("degraded", "rpc_failed", False), (snap["status"], snap["reason"], snap["can_accept_new_task"]))
+        self.assertEqual(0.65, snap["remaining"])
 
     def test_available_with_account_models_and_buckets(self):
         snap = self.snapshot()

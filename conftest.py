@@ -44,6 +44,8 @@ import os
 import tempfile
 from pathlib import Path
 
+import pytest
+
 _ENV_VAR = "AI_MANAGER_HOME"
 CANONICAL_HOME_DIRNAME = ".ai-development-manager"
 
@@ -107,3 +109,43 @@ def _install_isolated_manager_home():
 
 
 ISOLATED_MANAGER_HOME = _install_isolated_manager_home()
+
+
+# ---------------------------------------------------------------------------
+# Live Antigravity fence (Layer 1/2 must never consume AG quota)
+#
+# The Antigravity adapter discovers the IDE's language server by enumerating
+# live processes and talks to it over loopback. Once that bridge became real
+# (2026-09-05) three ordinary unit tests that built an ``AgRunner`` without
+# injecting a dead IDE bridge dispatched three REAL model turns into the
+# user's IDE. This fixture makes that impossible again: every test sees an
+# "IDE not running" language server unless it explicitly opts into the live
+# layer with ``@pytest.mark.live_antigravity`` (Layer 3/4 smokes, never part
+# of the default regression run). Tests that inject their own discover/opener
+# doubles are unaffected -- only the real process/loopback entry points are
+# fenced.
+# ---------------------------------------------------------------------------
+
+LIVE_ANTIGRAVITY_MARKER = "live_antigravity"
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", f"{LIVE_ANTIGRAVITY_MARKER}: opt a test into the real Antigravity IDE (consumes AG quota; never in ordinary regression)")
+
+
+@pytest.fixture(autouse=True)
+def _fence_live_antigravity(request, monkeypatch):
+    if request.node.get_closest_marker(LIVE_ANTIGRAVITY_MARKER):
+        yield
+        return
+    from manager import ag_language_server
+
+    def refuse(*_args, **_kwargs):
+        raise ag_language_server.AgLsError(
+            "ide_not_running",
+            "live Antigravity access is fenced off in the test suite; mark the test live_antigravity to opt in")
+
+    monkeypatch.setattr(ag_language_server, "list_language_server_processes", refuse)
+    monkeypatch.setattr(ag_language_server, "_default_opener", refuse)
+    yield

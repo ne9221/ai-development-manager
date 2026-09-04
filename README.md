@@ -480,7 +480,10 @@ cannot be enumerated. The coarse repository lease remains the safety boundary.
 - Automatic review and CI-feedback loops are next-stage work.
 - A richer GUI, installer, scheduler UI, and tray application are not current
   core requirements; `manager/launch_task.ps1` remains the desktop entrypoint.
-- Antigravity remains a manual channel rather than an automatic runner.
+- Antigravity is an automatic runner over the IDE bridge (`transport=ide_bridge`,
+  live-verified 2026-09-05, see `docs/ANTIGRAVITY-PROVIDER.md`); it is not yet
+  `repo_write_capable`, and its Command Watcher gate still applies the shared
+  any-window-exhausted quota rule.
 - Runtime schema compatibility and migrations require ongoing governance as
   the Drive SSOT evolves.
 - Development remains real-use-first: dogfood should expose the next concrete
