@@ -1,15 +1,20 @@
 # KERNEL_V5 — Safety + Reachability Kernel
 
-version: 5.0.0-draft  
-status: **DRAFT_COMPLETE** — **INDEPENDENT_REVIEW = REQUIRED**  
-date: 2026-09-05  
-session: grokbuild-adm-verification-loop-v5-20260905  
+version: 5.0.0-draft+r1  
+status: **R1_REMEDIATED** — **INDEPENDENT_RE_REVIEW = REQUIRED**  
+date: 2026-09-05 (Remediation Round 1)  
+session: claude-adm-verification-loop-v5-r1-20260905  
+repair base: `c11685417bce7824fbfa380426d2471f714aff7d`  
 implementation: `docs/verification-loop/v5/` executable reference model  
 production runtime: **NOT modified, NOT activated**
 
-V5_IMPLEMENTATION_STATUS = DRAFT_COMPLETE  
-INDEPENDENT_REVIEW = REQUIRED  
+V5_IMPLEMENTATION_STATUS = R1_REMEDIATED  
+INDEPENDENT_REVIEW = REQUIRED (delta-only re-review of B1–B7 closure)  
+V5_READY = NO  
 V4_STATUS = **DO_NOT_ADOPT**
+
+Round 1 closed the seven blockers B1–B7 found by independent review, plus C7
+(oracle lineage reuse) and C10 (human-escalation DoS). See section 21.
 
 This file is the prose twin of `docs/verification-loop/v5/src/v5_kernel/kernel.py`.
 If they disagree, the executable model is the contract under test; this file must be
@@ -70,6 +75,12 @@ CONTROLLER_TRUST_ROOT = LAUNCHER_CAPTURED_CONTROLLER_AND_POLICY_DIGEST
 REVIEWER_OUTPUT_ROLE = CLAIM
 REVIEW_CONTEXT_BINDING = LAUNCHER_CAPTURED_MANIFEST_DIGEST
 INVALIDATION_POLICY = ASYMMETRIC
+EVENT_SOURCE_BINDING = TYPED_ENVELOPE_INJECTED_AT_THE_CONTROLLER_LAUNCHER_BOUNDARY
+REFERENCE_MODEL_TRUST_BOUNDARY = ENVELOPE_INJECTED_AT_CONTROLLER_LAUNCHER_API_BOUNDARY
+RUNTIME_ATTESTATION_BOUNDARY = NOT_IMPLEMENTED_IN_THIS_SLICE
+TRUST_ROOT_RUNTIME_PROVEN = NO
+ACCEPTED_LIFECYCLE = TERMINAL_FOR_ONE_VERIFICATION_CYCLE_BOUND_TO_ITS_OPEN_CLOSE_WINDOW
+ORACLE_LINEAGE_ARITY = 1:1
 ```
 
 Executor-done, missing-evidence, recoverable-failure, adjudication-required, and
@@ -87,21 +98,26 @@ Form: **state + event + guard → next_state + next_action**.
 |---|---|---|---|---|
 | OPEN | EXECUTOR_DONE | always (done is an event, never ACCEPTED) | VERIFYING | replay + bind |
 | OPEN | VERIFY_START | always | VERIFYING | replay + bind |
-| VERIFYING | MECHANICAL_REPLAY | attester ∈ {LAUNCHER, PINNED_CONTROLLER} ∧ result=PASS | VERIFYING | SATISFY mechanical.tests; decide |
-| VERIFYING | MECHANICAL_REPLAY | attester=CANDIDATE | VERIFYING | leave PENDING (MC-B) |
-| VERIFYING | REVIEW_CLAIM | files ⊆ allowed manifest | VERIFYING | store CLAIM; verdict is not DECISION |
-| VERIFYING | REVIEW_CLAIM | files include candidate CLAUDE.md/AGENTS.md | VERIFYING | ADVERSE review.claim (F02b) |
+| VERIFYING | MECHANICAL_REPLAY | **envelope** source ∈ {LAUNCHER, PINNED_CONTROLLER} ∧ result=PASS | VERIFYING | SATISFY mechanical.tests; decide |
+| VERIFYING | MECHANICAL_REPLAY | no envelope, unregistered capture id, or source=CANDIDATE | VERIFYING | leave PENDING (MC-B) |
+| VERIFYING | REVIEW_CLAIM | claim complete ∧ launcher capture corroborates ∧ captured files ⊆ allowed manifest | VERIFYING | store CLAIM; verdict is not DECISION |
+| VERIFYING | REVIEW_CLAIM | claim below minimum schema, or no launcher capture for the invocation | VERIFYING | leave PENDING (B4) |
+| VERIFYING | REVIEW_CLAIM | captured files include candidate CLAUDE.md/AGENTS.md, or claim ≠ capture | VERIFYING | ADVERSE review.claim (F02b) |
 | * | VERIFIER_UNAVAILABLE | kind ∈ recoverable ∧ budget remaining | WAITING_RECOVERABLE | retry identity + remaining |
 | WAITING_RECOVERABLE | RETRY | budget remaining | VERIFYING | re-enter verification |
 | WAITING_RECOVERABLE | RETRY | budget exhausted | HUMAN_REQUIRED | closed-set: automated_recovery_budget_exhausted |
 | * | STALE_BINDING | OPEN/CLOSE disagree | REQUIRES_RE_ADJUDICATION | REDERIVE (not human) |
-| REQUIRES_RE_ADJUDICATION | REDERIVE | OPEN PASS ∧ CLOSE PASS | VERIFYING | SATISFY interval; decide |
-| REQUIRES_RE_ADJUDICATION | REDERIVE | OPEN PASS ∧ CLOSE FAIL | REQUIRES_RE_ADJUDICATION | do not keep old PASS |
+| REQUIRES_RE_ADJUDICATION | REDERIVE | OPEN PASS ∧ CLOSE PASS **over the whole required predicate domain** | VERIFYING | SATISFY interval; decide |
+| REQUIRES_RE_ADJUDICATION | REDERIVE | any required predicate FAIL / MISSING / unbound at CLOSE | REQUIRES_RE_ADJUDICATION | do not keep old PASS (B3) |
 | REQUIRES_RE_ADJUDICATION | REDERIVE | OPEN ADVERSE ∧ CLOSE MISSING | REJECTED | not clean (asymmetric) |
 | * | ADVERSE_BLOCKER | real adverse | REJECTED | must not ACCEPTED |
 | * | HUMAN_GATE | reason ∈ closed set | HUMAN_REQUIRED | wait allowed-issuer record |
-| * | HUMAN_GATE | reason ∉ closed set | WAITING_RECOVERABLE | treat as recoverable |
-| HUMAN_REQUIRED | ADJUDICATE | issuer ∈ {HUMAN_OPERATOR, PINNED_CONTROLLER} | VERIFYING | apply freeze; decide |
+| * | HUMAN_GATE | reason ∉ closed set | WAITING_RECOVERABLE | treat as recoverable (consumes budget) |
+| * | HUMAN_GATE | reason = automated_recovery_budget_exhausted ∧ no exhausted controller budget | WAITING_RECOVERABLE | refuse the controller-owned reason (C10) |
+| HUMAN_REQUIRED | ADJUDICATE | envelope issuer = HUMAN_OPERATOR ∧ subject = this gate's subject ∧ scope=obligation ∧ resolution=SATISFIED ∧ unexpired | VERIFYING | apply freeze; decide |
+| HUMAN_REQUIRED | ADJUDICATE | issuer allowed but subject/scope/resolution/expiry mismatch | HUMAN_REQUIRED | ignore record; gate stays shut (B5) |
+| REQUIRES_RE_ADJUDICATION | ADJUDICATE | envelope issuer ∈ {HUMAN_OPERATOR, PINNED_CONTROLLER} ∧ exact match ∧ resolution=SATISFIED | VERIFYING | apply freeze; decide |
+| * | ADJUDICATE | resolution=ADVERSE | same | preserve the blocker; never discharge |
 | HUMAN_REQUIRED | other | sticky | HUMAN_REQUIRED | wait human (no loop) |
 | VERIFYING | CLOSE_WINDOW | close bound | VERIFYING | decide |
 | VERIFYING | (decide) | INV-1..4 ∧ no blockers | ACCEPTED | derived terminal |
@@ -109,6 +125,12 @@ Form: **state + event + guard → next_state + next_action**.
 
 `decide()` is the only producer of ACCEPTED. Executor `status=ACCEPTED` is ignored (MC-B)
 and is not a permanent taint (MC-D).
+
+**Trusted identity never comes from the payload.** Every event may carry a typed
+`EventEnvelope` injected by the controller/launcher API boundary. `payload["attester"]`
+and `record["issuer"]` are recorded and then ignored. An event with no envelope, or
+with a capture id the launcher never registered, resolves to CANDIDATE_EXECUTOR —
+omission fails closed rather than defaulting to LAUNCHER.
 
 ---
 
@@ -156,6 +178,15 @@ TrustRoot = {
 This is not a PKI platform. The launcher is the attester. The candidate cannot
 write the capture.
 
+**Honest boundary statement.** Inside this reference model the separation is the
+typed `EventEnvelope`: it is a distinct parameter of `apply()`, so a candidate
+payload cannot become one, and its `capture_id` must be one the launcher
+registered at OPEN. That is `REFERENCE_MODEL_TRUST_BOUNDARY`. It is **not** a
+runtime attestation that a real launcher process produced the event —
+`RUNTIME_ATTESTATION_BOUNDARY = NOT_IMPLEMENTED_IN_THIS_SLICE` and
+`TRUST_ROOT_RUNTIME_PROVEN = NO`. Do not report this slice as a production-grade
+trust root.
+
 ---
 
 ## 7. Obligation model
@@ -166,6 +197,13 @@ write the capture.
 - Missing required ids are floored as PENDING (existence ≠ satisfaction).
 - SATISFIED only via DERIVED (this `decide()`) or ATTESTATION/CLAIM from a non-candidate attester.
 - `discharged` is **not** a state (v4 undefined discharged is REJECTED).
+- **INV-1 acceptance predicate: EVERY required obligation must be SATISFIED.**
+  Not "present", not "not ADVERSE", not "not PENDING". PENDING,
+  UNAVAILABLE_RECOVERABLE, UNAVAILABLE_HUMAN, INVALIDATED and ADVERSE are all
+  non-accepting, and a floor row whose `source` is still `POLICY_FLOOR` is
+  existence rather than satisfaction.
+- An obligation SATISFIED by adjudication carries its backing record id, and
+  that record's subject/scope/expiry is re-checked at every `decide()`.
 
 ---
 
@@ -179,6 +217,13 @@ write the capture.
 - Semantic findings require a typed adjudication record from an allowed issuer.
 - Honest L2 still works: required `review.claim` must be **present and context-bound**;
   controller derivation, not reviewer verdict, produces ACCEPTED.
+- A CLAIM must meet a minimum schema: `invocation_id`, `context_manifest_digest`,
+  `launcher_capture_ref`, `reviewer_identity`, `completion_status`, a non-empty
+  `files_used`, and an explicitly present `findings` (absent ≠ empty).
+- A CLAIM alone is never truth. The **actual** files used and the **captured**
+  context digest come from the launcher's `ReviewCapture` for that invocation.
+  No capture ⇒ non-satisfying. Claim disagrees with capture ⇒ ADVERSE.
+  The allowlist check runs against the captured file set, not the claimed one.
 
 ---
 
@@ -195,17 +240,33 @@ Candidate-controlled `CLAUDE.md` / `AGENTS.md` / `prompt.override.md` cannot be
 silently included. Candidate prompt text cannot change review policy. Closes F02b
 without a surveillance platform.
 
+The OPEN manifest digest is **never back-filled from a claim**. A reviewer that
+supplies its own digest into an empty binding would be authenticating itself.
+
 ---
 
 ## 10. Writer / freeze ownership (closes F13)
 
-Every ACCEPTED-affecting override / freeze / re-adjudication record has:
+Every ACCEPTED-affecting override / freeze / re-adjudication record must match
+**exactly**, on every field. A single mismatch means the record is ignored:
 
-- allowed issuer ∈ {HUMAN_OPERATOR, PINNED_CONTROLLER}
-- scope, subject, expiry/lifetime, provenance
+- issuer comes from the **envelope**, not the record body, and must be in
+  {HUMAN_OPERATOR, PINNED_CONTROLLER}; a `human.*` obligation requires
+  HUMAN_OPERATOR specifically — a pinned controller cannot self-serve a human gate
+- `subject` must be an obligation of this task (or a declared virtual subject),
+  and to release an active human gate it must be **that gate's own subject**
+- `scope` must be exactly `obligation`
+- `resolution` ∈ {SATISFIED, ADVERSE}; **ADVERSE never discharges anything** —
+  it preserves the adverse finding
+- `issued_tick` ≤ now, `expires_tick` > now, non-empty lifetime
+- non-empty `provenance_digest`
 - **cannot** be minted by CANDIDATE_EXECUTOR (ignored, not applied)
 
-No IAM platform. Closed issuer predicate + expiry + subject is the minimum.
+Expiry is re-checked **at every `decide()`**, not only when the record is written:
+an approval that was valid when spent and has since expired reverts its obligation
+and re-raises the human gate.
+
+No IAM platform. Exact-match closed predicate is the minimum.
 
 ---
 
@@ -216,8 +277,12 @@ Identity = **oracle item id**, not path.
 - expected set frozen at OPEN
 - observed set at CLOSE
 - missing expected id → ADVERSE / non-accepting
-- rename only via authenticated lineage map (`old_id → new_id`)
+- rename only via authenticated lineage map (`old_id → new_id`), captured by the launcher
 - `git mv` / delete / relocate cannot shrink the domain by making the old id vanish
+- lineage arity is **1:1** (`ORACLE_LINEAGE_ARITY`). The map must be injective, and a
+  lineage target may not itself be an expected id — otherwise one observation would
+  satisfy two required identities. Matching consumes each observed id at most once.
+- 1:N lineage is deliberately **not** implemented in this slice; it is carried forward.
 
 ---
 
@@ -229,6 +294,13 @@ Identity = **oracle item id**, not path.
 - OPEN true / CLOSE false → cannot keep old PASS → REQUIRES_RE_ADJUDICATION
 - OPEN adverse / CLOSE disappeared → not clean
 - Recovery (MC-D): REDERIVE then honest CLOSE PASS can SATISFY and reach ACCEPTED (L4)
+
+**Every CLOSE_WINDOW, every REDERIVE, and every `decide()` recomputes the interval
+disposition from scratch over the whole required predicate domain**, and the result
+atomically replaces the previous one. It is never incremental and never OR-ed with an
+earlier PASS, so a partial rederive cannot leave a stale SATISFIED standing (B3).
+A required predicate that is absent, MISSING, FAIL or unbound at CLOSE invalidates
+the interval regardless of how the other predicates fared.
 
 ---
 
@@ -243,6 +315,11 @@ Allowed:
 - unresolved governance conflict
 - automated recovery budget exhausted
 - genuinely semantic decision with no objective verifier
+
+`automated_recovery_budget_exhausted` is **controller-owned**. It may only be
+produced by recovery state where `used >= maximum`. A candidate that asks for it
+in a payload is refused and routed to bounded recovery instead, so human
+escalation cannot be used as a denial-of-service lever (C10).
 
 **Not** human (first: WAITING_RECOVERABLE + bounded retry):
 
@@ -260,9 +337,21 @@ Allowed:
 Every recoverable state has retry count, retry identity, idempotency, next-attempt
 condition, exhaustion outcome.
 
+**One function owns every recoverable route** - named kinds and the unknown/default
+branch alike. Entering it always: (1) invalidates the affected obligation, (2)
+consumes budget under the canonical identity `recovery:<kind>:<obligation>`, (3) is
+idempotent per identity, (4) exhausts at a finite limit, and (5) leaves an obligation
+state `decide()` cannot accept over. There is no route that reaches
+WAITING_RECOVERABLE without spending budget (B6).
+
+`RETRY` must name an identity that is already bound. An unknown identity is ignored
+rather than allowed to borrow another obligation's budget.
+
 Budget exhausted ≠ ACCEPTED. Usually HUMAN_REQUIRED (closed-set
 `automated_recovery_budget_exhausted`) or REJECTED by failure type. HUMAN_REQUIRED
-is sticky; further RETRY does not loop.
+is sticky; further RETRY does not loop. Closing this must not create a permanent
+latch: after RETRY the invalidated obligations return to PENDING and an honest
+re-verification still reaches ACCEPTED (INV-4, L3, B6-R6).
 
 ---
 
@@ -330,21 +419,48 @@ Aggregation is forbidden unless `HARNESS_USABLE = YES`.
 
 Gate:
 
-- roster complete
+- **H1** the expected kernel digest is *computed* from the authoritative kernel
+  bytes; the caller supplies only an observed digest, and the two must be equal.
+  A non-empty string is not a digest check (a fabricated `deadbeef` used to pass).
+- **H2** roster and safety-attack set are *exact expected sets* - no missing, no
+  extra. `0/0` is never a PASS.
+- **H3** every safety effective row carries the full canonical schema:
+  `attack_id`, `original_attack_blocked`, `new_variant_found`, `status`, `usable`,
+  `kernel_digest`, `klass`, `evidence`. One missing field ⇒ NOT USABLE.
+- **H4** replicated rows for one logical attack must agree on
+  (`original_attack_blocked`, `new_variant_found`, `status`). A flip is divergence:
+  aggregation is forbidden, and the latest row never wins.
+- **H5** any *required* agent that is NOT_RUN, ERROR, unusable, sentinel-bearing or
+  without an effective result makes the harness unusable - safety or not.
+- **H6** a non-empty expected roster with nothing collected is unusable.
 - unresolved failures = 0
 - effective results have no error sentinel (`[object]`, usage-limit, …)
-- verdict / enums valid
-- prose-required agents usable
-- no placeholder input
-- authoritative kernel digest captured
-- no BLOCKED ∧ `block_is_degenerate=true`
-- original-vs-new-variant fields complete
+- verdict / enums valid; prose-required agents carry prose
+- no placeholder input; no BLOCKED ∧ `block_is_degenerate=true`
+
+The runner is gated the same way: an empty safety roster exits non-zero instead of
+printing `0/0` and returning success.
 
 Historical harness failures remain on record in
 `docs/verification-loop/v5/EVIDENCE_PRIOR_ROUNDS.md`. They are not rewritten as success.
 
 Non-vacuity mutants, all killed: H-M1 missing agent, H-M2 `[object]` sentinel,
-H-M3 placeholder kernel, H-M4 BLOCKED+degenerate.
+H-M3 placeholder kernel, H-M4 BLOCKED+degenerate. Round 1 adds the reviewer's own
+harness escapes as permanent regressions: **RH1** empty safety collection aggregated
+as a pass (gate *and* runner), **RH2** fabricated kernel digest accepted.
+
+---
+
+## 19b. ACCEPTED lifecycle
+
+```
+ACCEPTED_LIFECYCLE = TERMINAL_FOR_ONE_VERIFICATION_CYCLE_BOUND_TO_ITS_OPEN_CLOSE_WINDOW
+```
+
+ACCEPTED is terminal **for one verification cycle**, bound to the OPEN/CLOSE evidence
+window that produced it. Later external change does not reopen that cycle; it opens a
+**new** one. This kernel performs no monitoring inside an accepted state, and this
+slice does not add permanent post-acceptance surveillance.
 
 ---
 
@@ -355,6 +471,41 @@ H-M3 placeholder kernel, H-M4 BLOCKED+degenerate.
 - patching artifacts A–F
 - unifying risk lattices / gate_id / bundle schema
 - self-signing READY
+- runtime attestation of the launcher (`RUNTIME_ATTESTATION_BOUNDARY`)
+- 1:N oracle lineage (carried forward from C7)
+- permanent post-ACCEPTED monitoring (carried forward from C9)
 
 Next: independent read-only review by a different provider or independent session
 (Claude / Codex / AG). Reviewer MUST NOT modify v5.
+
+---
+
+## 21. Remediation Round 1 (2026-09-05)
+
+Independent review of `c116854` returned `V5_INDEPENDENT_REVIEW = REPAIR_REQUIRED`
+with seven concrete bypasses. All seven were **reproduced at the repair base before
+being repaired** (`tests/prefix_repro_r1.py`: 21/21 probes REPRODUCED at `c116854`,
+0/21 at this HEAD, same script both times).
+
+| ID | Bypass at `c116854` | Repair |
+|---|---|---|
+| B1 | omitting `attester` defaulted to LAUNCHER; a payload could self-declare the trusted label | typed `EventEnvelope` injected at the controller/launcher boundary; payload identity ignored; no envelope means CANDIDATE |
+| B2 | a required obligation left UNAVAILABLE_RECOVERABLE still reached ACCEPTED; an explicitly empty oracle domain was back-filled with `oracle.unit` | INV-1 predicate is *every required obligation SATISFIED*; declared-empty domains stay empty |
+| B3 | a partial CLOSE rederive kept an earlier interval SATISFIED | interval recomputed over the full required domain and atomically replaced, in every CLOSE/REDERIVE and in `decide()` |
+| B4 | a claim carrying only `context_digest` satisfied a MEDIUM review, and back-filled the binding it was checked against | minimum claim schema + mandatory launcher `ReviewCapture`; captured files are the allowlist input; no back-fill |
+| B5 | unrelated subject, wrong scope, `resolution=ADVERSE` and expired records all discharged a destructive approval | exact-match adjudication on issuer/subject/scope/resolution/provenance/lifetime; ADVERSE preserves; expiry re-checked every `decide()` |
+| B6 | the default recovery branch spent no budget; a wrong retry identity borrowed another budget | one `_enter_recoverable_failure` for every route; canonical retry identity; unknown identity ignored |
+| B7 | fabricated digest, missing row fields, PASS/FAIL replication flips, unusable required agents and an empty safety roster all reported HARNESS_USABLE=YES | H1-H6 above, plus a fail-closed runner |
+
+Also closed: **C7** (one observation satisfying two expected oracle ids through a
+lineage target that was itself expected) and **C10** (candidate self-declaring
+`automated_recovery_budget_exhausted` to force a human gate).
+
+Test-side non-vacuity repairs: **F01** now constructs a genuinely empty oracle domain
+(it previously resolved to a 1-item domain and never exercised MC-A); **F18** measures
+its own original attack instead of hard-coding `original_false_accept_blocked = True`.
+
+Negative controls: `tests/mutations_r1.py` reverts each repair in isolation -
+`R1_MUTATIONS = 7/7 KILLED`.
+
+`V5_READY = NO` until an independent delta-only re-review of B1-B7 closure.

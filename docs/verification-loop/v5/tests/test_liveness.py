@@ -8,15 +8,29 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from fixtures import close_ok, honest_open, mechanical_pass, review_ok
-from v5_kernel.kernel import Event, Issuer, State, apply, decide
+from fixtures import close_ok, honest_open, human_env, launcher_env, mechanical_pass, review_ok
+from v5_kernel.kernel import Event, State, apply, decide, retry_identity
+
+
+def human_record(world, subject, resolution="SATISFIED", lifetime=40):
+    return {
+        "record": {
+            "record_id": "human-%d" % world.tick,
+            "subject": subject,
+            "scope": "obligation",
+            "issued_tick": world.tick,
+            "expires_tick": world.tick + lifetime,
+            "provenance_digest": "human-signed-1",
+        },
+        "resolution": resolution,
+    }
 
 
 class LivenessTests(unittest.TestCase):
     def test_L1_low_risk_honest_reaches_accepted(self):
         w = honest_open("LOW")
         apply(w, Event.EXECUTOR_DONE, {})
-        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass())
+        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass(), launcher_env(w))
         apply(w, Event.CLOSE_WINDOW, close_ok())
         d = decide(w)
         self.assertEqual(d.derived_status, State.ACCEPTED, d.blockers)
@@ -26,7 +40,7 @@ class LivenessTests(unittest.TestCase):
     def test_L2_medium_risk_independent_review_reaches_accepted(self):
         w = honest_open("MEDIUM")
         apply(w, Event.EXECUTOR_DONE, {})
-        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass())
+        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass(), launcher_env(w))
         apply(w, Event.REVIEW_CLAIM, review_ok())
         apply(w, Event.CLOSE_WINDOW, close_ok())
         d = decide(w)
@@ -41,9 +55,9 @@ class LivenessTests(unittest.TestCase):
         self.assertNotEqual(w.state, State.ACCEPTED)
         self.assertNotEqual(w.state, State.HUMAN_REQUIRED)
         self.assertIn("retry", t.next_action)
-        apply(w, Event.RETRY, {"identity": "unavailable:transient_read_error:mechanical.tests"})
+        apply(w, Event.RETRY, {"identity": retry_identity("transient_read_error", "mechanical.tests")})
         self.assertEqual(w.state, State.VERIFYING)
-        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass())
+        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass(), launcher_env(w))
         apply(w, Event.CLOSE_WINDOW, close_ok())
         d = decide(w)
         self.assertEqual(d.derived_status, State.ACCEPTED, d.blockers)
@@ -51,7 +65,7 @@ class LivenessTests(unittest.TestCase):
     def test_L4_stale_observation_rederives_then_accepted(self):
         w = honest_open("LOW")
         apply(w, Event.EXECUTOR_DONE, {})
-        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass())
+        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass(), launcher_env(w))
         apply(w, Event.CLOSE_WINDOW, {
             "oracle_observed": ["oracle.unit", "oracle.lint"],
             "close_predicates": {"mechanical.tests": "FAIL", "oracle.set": "PASS"},
@@ -62,7 +76,7 @@ class LivenessTests(unittest.TestCase):
         self.assertNotEqual(d_mid.derived_status, State.ACCEPTED)
         self.assertNotEqual(w.state, State.HUMAN_REQUIRED)
         apply(w, Event.REDERIVE, {"close_predicates": {"mechanical.tests": "PASS", "oracle.set": "PASS"}})
-        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass())
+        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass(), launcher_env(w))
         apply(w, Event.CLOSE_WINDOW, close_ok())
         d = decide(w)
         self.assertEqual(d.derived_status, State.ACCEPTED, d.blockers)
@@ -70,7 +84,7 @@ class LivenessTests(unittest.TestCase):
     def test_L5_adverse_real_blocker_never_accepted(self):
         w = honest_open("LOW")
         apply(w, Event.EXECUTOR_DONE, {})
-        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass())
+        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass(), launcher_env(w))
         apply(w, Event.ADVERSE_BLOCKER, {"obligation": "mechanical.tests"})
         d = decide(w)
         self.assertEqual(w.state, State.REJECTED)
@@ -79,7 +93,7 @@ class LivenessTests(unittest.TestCase):
     def test_L6_genuine_human_required_destructive(self):
         w = honest_open("DESTRUCTIVE")
         apply(w, Event.EXECUTOR_DONE, {})
-        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass())
+        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass(), launcher_env(w))
         apply(w, Event.REVIEW_CLAIM, review_ok())
         apply(w, Event.CLOSE_WINDOW, close_ok())
         apply(w, Event.HUMAN_GATE, {"reason": "destructive_action_approval"})
@@ -87,21 +101,10 @@ class LivenessTests(unittest.TestCase):
         self.assertEqual(w.state, State.HUMAN_REQUIRED)
         self.assertEqual(d.derived_status, State.HUMAN_REQUIRED)
         self.assertEqual(w.human_reason, "destructive_action_approval")
-        # INV-4: after allowed human issuer record, honest path can continue.
-        apply(
-            w,
-            Event.ADJUDICATE,
-            {
-                "record": {
-                    "issuer": Issuer.HUMAN_OPERATOR.value,
-                    "subject": "human.destructive_approval",
-                    "expires_tick": w.tick + 20,
-                    "provenance_digest": "human-1",
-                },
-                "resolution": "SATISFIED",
-            },
-        )
-        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass())
+        # INV-4: after an allowed human issuer record, the honest path continues.
+        apply(w, Event.ADJUDICATE, human_record(w, "human.destructive_approval"), human_env(w))
+        self.assertEqual(w.state, State.VERIFYING)
+        apply(w, Event.MECHANICAL_REPLAY, mechanical_pass(), launcher_env(w))
         apply(w, Event.CLOSE_WINDOW, close_ok())
         d2 = decide(w)
         self.assertEqual(d2.derived_status, State.ACCEPTED, d2.blockers)
@@ -109,7 +112,7 @@ class LivenessTests(unittest.TestCase):
     def test_L7_retry_exhausted_terminates_without_loop(self):
         w = honest_open("LOW")
         apply(w, Event.EXECUTOR_DONE, {})
-        identity = "unavailable:transient_read_error:mechanical.tests"
+        identity = retry_identity("transient_read_error", "mechanical.tests")
         seen = []
         for _ in range(6):
             apply(w, Event.VERIFIER_UNAVAILABLE, {"kind": "transient_read_error"})

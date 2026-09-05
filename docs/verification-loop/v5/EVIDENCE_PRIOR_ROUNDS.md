@@ -39,6 +39,20 @@ recovery.
 
 Do not delete, rewrite-as-pass, or “clean the history” of these rows.
 
+## Round 1 harness escapes (independent review of `c116854`)
+
+| ID | What happened | Why it must stay |
+|---|---|---|
+| HF-R1-FABRICATED-DIGEST | `kernel_digest="deadbeef"` satisfied the gate, which only checked that a digest string was non-empty | gate: observed digest must equal the digest computed from authoritative kernel bytes |
+| HF-R1-EMPTY-SAFETY-ROSTER | an empty safety roster aggregated as 0 attacks / 0 blocked / HARNESS_USABLE=YES / exit 0 | gate: expected attack set must be non-empty and exactly collected; the runner exits non-zero |
+| HF-R1-ROW-SCHEMA | a safety row missing `New variant?` was aggregated | gate: every row carries the full canonical schema |
+| HF-R1-REPLICATION-FLIP | replicated rows for one attack disagreeing PASS/FAIL were aggregated, latest wins | gate: divergence forbids aggregation |
+| HF-R1-REQUIRED-AGENT-NOT-RUN | a required non-safety agent at NOT_RUN / unusable was aggregated | gate: every required agent must be usable and effective |
+
+These are recorded as failures of the **round-1 harness**, not as successes.
+The two vacuous safety tests found in the same review (F01's back-filled oracle
+domain and F18's hard-coded original result) are recorded in `RESULTS.md`.
+
 ## Artifacts A–F
 
 5 incompatible risk lattices, 3 gate_id schemes, 20+ bundle field mismatches,
