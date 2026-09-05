@@ -340,6 +340,67 @@ class TerminalBindTests(unittest.TestCase):
         with self.assertRaises(task_root.TerminalProposalConflict):
             task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a", session_id="codex:DIFFERENT"))
 
+    def test_recovery_metadata_enrichment_is_idempotent_without_rebinding(self):
+        interrupted = _execution("exec-a", status="interrupted", terminal_reason=None, completed_at=None)
+        bound, generation = task_root.commit_terminal_bind(
+            self.registry, "p1", "t1", interrupted,
+            expected_task_projection={"status": "interrupted"})
+        original = deepcopy(bound["terminal"])
+
+        recovered = deepcopy(interrupted)
+        recovered.update(terminal_reason="provider stopped during recovery",
+                         completed_at="2026-09-01T00:01:00Z")
+        recovered["cleanup_evidence"].update(
+            persistence="partial", persisted=["execution"], task_claim_release="retained")
+
+        replayed, replay_generation = task_root.commit_terminal_bind(
+            self.registry, "p1", "t1", recovered,
+            expected_task_projection={"status": "conflicting-projection"})
+        repeated, repeated_generation = task_root.commit_terminal_bind(
+            self.registry, "p1", "t1", recovered)
+
+        self.assertNotEqual(original["proposal_hash"],
+                            task_root.proposal_hash(task_root.terminal_proposal(recovered, 1)))
+        self.assertEqual(original, replayed["terminal"])
+        self.assertEqual(original, repeated["terminal"])
+        self.assertEqual(generation, replay_generation)
+        self.assertEqual(generation, repeated_generation)
+
+    def test_recovery_rejects_conflicting_truth_and_preserves_claim(self):
+        original_execution = _execution(
+            "exec-a", status="failed", session_id="codex:a", provider="codex",
+            terminal_reason="provider failed", completed_at="2026-09-01T00:00:00Z")
+        task_root.commit_terminal_bind(self.registry, "p1", "t1", original_execution)
+        original_root = deepcopy(self.registry.document)
+
+        conflicts = (
+            {"status": "completed"},
+            {"provider": "claude"},
+            {"session_id": "codex:other"},
+            {"terminal_reason": "different failure"},
+            {"completed_at": "2026-09-01T00:02:00Z"},
+            {"retry_count": 1},
+        )
+        for mutation in conflicts:
+            with self.subTest(mutation=mutation), self.assertRaises(TaskError):
+                task_root.commit_terminal_bind(
+                    self.registry, "p1", "t1", {**original_execution, **mutation})
+            self.assertEqual(original_root, self.registry.document)
+            self.assertTrue(self.registry.document["authority_active"])
+            self.assertEqual("retained", self.registry.document["cleanup"]["status"])
+
+    def test_terminal_bind_rejects_wrong_task_project_and_execution_identity(self):
+        original_root = deepcopy(self.registry.document)
+        wrong_identities = (
+            ("p1", "t1", _execution("exec-b"), task_root.TerminalProposalLost),
+            ("p1", "t1", {**_execution("exec-a"), "task_id": "wrong-task"}, TaskError),
+            ("p1", "t1", {**_execution("exec-a"), "project_id": "wrong-project"}, TaskError),
+        )
+        for project_id, task_id, execution, error in wrong_identities:
+            with self.subTest(execution=execution), self.assertRaises(error):
+                task_root.commit_terminal_bind(self.registry, project_id, task_id, execution)
+            self.assertEqual(original_root, self.registry.document)
+
     def test_L_loser_never_consumes_its_own_pregenerated_fixed_ids(self):
         task_root.commit_terminal_bind(self.registry, "p1", "t1", _execution("exec-a"))
         loser_calls = []
@@ -802,6 +863,31 @@ class R17RoundRoundAndFreshProcessRecoveryTests(unittest.TestCase):
         # test_digest_immutable_once_bound_even_if_new_payload_supplied.)
         for key in ("proposal_hash", "execution_id", "epoch", "terminal_fence_epoch", "terminal_committed_at", "canonical_proposal"):
             self.assertEqual(original_bind.get(key), fresh_registry.document["terminal"].get(key), f"field {key} changed across crash recovery")
+
+    def test_cleanup_recovery_converges_after_bound_metadata_advances(self):
+        self._seed_terminal_execution()
+        cmd = self._corrupt_to_r17_shape()
+        self._seed_legacy_claim_document()
+        recovered_execution = self.store.get("executions", "p1", self.execution_id)
+        pre_recovery_execution = deepcopy(recovered_execution)
+        pre_recovery_execution.update(terminal_reason=None, completed_at=None)
+
+        bound, generation = task_root.commit_terminal_bind(
+            self.registry, "p1", "t1", pre_recovery_execution)
+        original_bind = deepcopy(bound["terminal"])
+
+        with patch("manager.command_watcher.process_identity_state", return_value="stopped"):
+            outcome = process_command(self.store, None, cmd, claim_factory=lambda *_: self.registry)
+
+        self.assertEqual("completed", outcome["status"])
+        self.assertEqual(
+            "complete",
+            self.store.get("executions", "p1", self.execution_id)["cleanup_evidence"]["persistence"])
+        for key in ("proposal_hash", "canonical_proposal", "terminal_committed_at", "terminal_fence_epoch"):
+            self.assertEqual(original_bind[key], self.registry.document["terminal"][key])
+        self.assertGreaterEqual(self.registry.generation, generation)
+        self.assertFalse(self.registry.document["authority_active"])
+        self.assertEqual("released", self.registry.document["cleanup"]["status"])
 
     def test_L_winner_repair_deterministically_overwrites_stale_task_projection(self):
         """L: a stale/corrupted Task record (e.g. a straggling old writer's

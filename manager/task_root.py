@@ -138,6 +138,21 @@ def proposal_hash(proposal):
     return hashlib.sha256(_canonical_json(canonical).encode("utf-8")).hexdigest()
 
 
+def _is_recovery_metadata_enrichment(existing_bind, candidate):
+    """Accept null-fills that add metadata without changing terminal truth."""
+    existing = existing_bind.get("canonical_proposal")
+    if not isinstance(existing, dict) or proposal_hash(existing) != existing_bind.get("proposal_hash"):
+        return False
+    enrichment_fields = {"terminal_reason", "completed_at"}
+    for field in _PROPOSAL_FIELDS:
+        old, new = existing.get(field), candidate.get(field)
+        if old == new:
+            continue
+        if field not in enrichment_fields or old is not None or new is None:
+            return False
+    return True
+
+
 def projection_digest(payload):
     """Deterministic digest of a Drive projection payload (a Task or
     Handoff document, or the authoritative-fields subset of one). Callers
@@ -507,6 +522,8 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
     stale writer's projection carries a different epoch or hash and is
     rejected on that basis regardless of what a numeric fence would add."""
     execution_id = execution.get("execution_id")
+    if execution.get("project_id") != project_id or execution.get("task_id") != task_id:
+        raise TaskError("terminal execution identity does not match the task root key")
     fresh_task_drive_id = None
     fresh_handoff_drive_id = None
     for _ in range(attempts):
@@ -545,6 +562,8 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
             raise TerminalProposalLost(
                 f"task root's current epoch is owned by execution {document.get('execution_id')}, not {execution_id}",
                 winner=document.get("terminal"))
+        if document.get("provider") != execution.get("provider"):
+            raise TaskError("terminal execution provider does not match the task root owner")
 
         epoch = document["epoch"]
         proposal = terminal_proposal(execution, epoch)
@@ -583,7 +602,8 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
                 raise TerminalProposalLost(
                     "task root's current epoch is already bound to a different execution/epoch",
                     winner=existing_bind)
-            if existing_bind.get("proposal_hash") != proposal_h:
+            if (existing_bind.get("proposal_hash") != proposal_h
+                    and not _is_recovery_metadata_enrichment(existing_bind, proposal)):
                 raise TerminalProposalConflict(
                     "terminal proposal conflicts with the already-bound proposal for this epoch",
                     {"bound_proposal_hash": existing_bind.get("proposal_hash"), "candidate_proposal_hash": proposal_h})
