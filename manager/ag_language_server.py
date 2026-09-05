@@ -23,7 +23,14 @@ evidence dicts, excluded from ``repr``. The Google OAuth token itself lives in
 the IDE's own storage and is never read by this module; the language server
 performs every authenticated call on ADM's behalf.
 
-Read-only: nothing in this module starts, stops, or writes to Antigravity.
+Two clearly separated surfaces: the *read-only probes* (``GetStatus``,
+``GetUserStatus``, ``RetrieveUserQuotaSummary``, the trajectory reads,
+``probe_dispatch_route`` and ``availability_snapshot``) consume no model turn
+and write nothing; the *mutating dispatch RPCs* (``AddTrackedWorkspace``,
+``StartCascade``, ``SendUserCascadeMessage``) create conversations and model
+turns and are only ever issued by the execution adapter
+(``manager/ag_cli_runner.py``) during a dispatched task. Every real-world
+entry point is fenced off from test processes by ``manager/ag_live_fence.py``.
 """
 
 from __future__ import annotations
@@ -38,6 +45,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
+
+from manager import ag_live_fence
 
 LS_EXECUTABLE_NAMES = ("language_server_windows_x64.exe", "language_server_windows_x64", "language_server")
 LS_SERVICE = "exa.language_server_pb.LanguageServerService"
@@ -172,6 +181,7 @@ _PROCESS_QUERY = (
 
 def list_language_server_processes(timeout: float = DEFAULT_TIMEOUT_SECONDS) -> list[dict[str, Any]]:
     """Enumerate same-user language-server processes (Windows CIM). Never raises on an empty result."""
+    ag_live_fence.check("ag_language_server.list_language_server_processes")
     if os.name != "nt":
         return []
     try:
@@ -246,6 +256,7 @@ def executable_is_trusted(path: str) -> bool:
 
 def list_listening_ports(pid: int, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> list[int]:
     """Loopback TCP ports ``pid`` is listening on, via ``netstat -ano`` (no extra dependencies)."""
+    ag_live_fence.check("ag_language_server.list_listening_ports")
     if os.name != "nt":
         return []
     try:
@@ -267,6 +278,7 @@ def parse_listening_ports(netstat_output: str, pid: int) -> list[int]:
 
 
 def _default_opener(url: str, data: bytes, headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
+    ag_live_fence.check("ag_language_server._default_opener")
     request = urllib.request.Request(url, data=data, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:

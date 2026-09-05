@@ -3,6 +3,7 @@
 import json
 import unittest
 
+from manager import ag_live_fence
 from manager.ag_language_server import (
     CASCADE_SOURCE_AGENT_API,
     ROLE_CASCADE_HOST,
@@ -153,15 +154,17 @@ class ParsingTests(unittest.TestCase):
 
 
 class SuiteFenceTests(unittest.TestCase):
-    """conftest.py fences the live IDE off for every unmarked test. Tripwire: if this fails while an
-    Antigravity IDE is running, ordinary regression could dispatch real model turns again."""
+    """manager/ag_live_fence.py fences the live IDE off for every unmarked test, under every runner.
+    Tripwire: if this fails while an Antigravity IDE is running, ordinary regression could dispatch
+    real model turns again. The probe is deliberate, hence ``expecting_refusal()``."""
 
     def test_ordinary_tests_never_see_a_live_language_server(self):
-        with self.assertRaises(AgLsError) as ctx:
-            discover_language_server()
+        with ag_live_fence.expecting_refusal():
+            with self.assertRaises(AgLsError) as ctx:
+                discover_language_server()
+            snap = availability_snapshot(now="2026-09-05T00:00:00Z")
         self.assertEqual("ide_not_running", ctx.exception.classification)
         self.assertIn("fenced off", ctx.exception.detail)
-        snap = availability_snapshot(now="2026-09-05T00:00:00Z")
         self.assertEqual(("unavailable", "ide_not_running", False), (snap["status"], snap["reason"], snap["can_accept_new_task"]))
 
 

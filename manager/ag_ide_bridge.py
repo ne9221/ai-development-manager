@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Generator
 
+from manager import ag_live_fence
 from manager.ag_runner import (
     AgLaunchError,
     AgNormalizedEvent,
@@ -33,6 +34,8 @@ from manager.ag_runner import (
 
 def _detect_live_processes() -> list[dict[str, Any]]:
     """Detect running Antigravity processes safely via tasklist / ps."""
+    if ag_live_fence.fenced("ag_ide_bridge._detect_live_processes"):
+        return []
     results = []
     if os.name == "nt":
         try:

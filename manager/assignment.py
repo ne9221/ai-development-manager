@@ -30,6 +30,15 @@ CAPABILITIES = {
         "task_types": {"implementation": 1, "debugging": 1, "testing": 1, "research": 1, "architecture": 1},
         "traits": {"needs_repo_edit": 0, "needs_research": 0, "needs_browser": 1},
         "mode": "interactive",
+        # M1 Antigravity is read-only / analysis / explicitly controlled live
+        # smoke only. The IDE bridge CAN write files (the Layer-4 smoke proves
+        # it, deliberately, in a disposable repo), but the bounded repo-write
+        # admission contract (allowed paths, lease, scoped staging, git-derived
+        # files_changed) is a separate milestone (M4). Until then the shared
+        # `.get("repo_write_capable", True)` default must not admit it: this
+        # key is deliberately explicit so a missing entry can never widen
+        # routing again (independent review of f4cf5cb, P1-2).
+        "repo_write_capable": False,
     },
     "gemini_app": {
         "task_types": {"implementation": 1, "debugging": 1, "testing": 1, "research": 2, "architecture": 1},

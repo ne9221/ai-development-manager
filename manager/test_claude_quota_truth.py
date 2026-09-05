@@ -274,6 +274,9 @@ class ClaudeQuotaTruthTests(unittest.TestCase):
             runtime_path=self.base / "status.json",
             log_path=self.base / "refresh.log",
             lock_path=self.base / "refresh.lock",
+            # Claude/Codex contract only: never let refresh() reach the real Antigravity
+            # collector (live process discovery) from a unit test -- see manager/ag_live_fence.py.
+            antigravity_collector=False,
             claude_path=payload_a,
             claude_accounts={"account-a": payload_a, "account-b": payload_b},
             reader=lambda **_: deepcopy(doc),
@@ -364,6 +367,9 @@ class ClaudeOauthRefreshIntegrationTests(unittest.TestCase):
             runtime_path=self.base / "status.json",
             log_path=self.base / "refresh.log",
             lock_path=self.base / "refresh.lock",
+            # Claude/Codex contract only: never let refresh() reach the real Antigravity
+            # collector (live process discovery) from a unit test -- see manager/ag_live_fence.py.
+            antigravity_collector=False,
             claude_path=payload_fallback,
             claude_accounts={"account-a": payload_fallback, "account-b": payload_fallback},
             # Distinct config_dirs for both -- avoids colliding with the
@@ -405,6 +411,9 @@ class ClaudeOauthRefreshIntegrationTests(unittest.TestCase):
             runtime_path=self.base / "status.json",
             log_path=self.base / "refresh.log",
             lock_path=self.base / "refresh.lock",
+            # Claude/Codex contract only: never let refresh() reach the real Antigravity
+            # collector (live process discovery) from a unit test -- see manager/ag_live_fence.py.
+            antigravity_collector=False,
             claude_path=payload_fallback,
             claude_accounts={"account-a": payload_fallback, "account-b": payload_fallback},
             claude_config_dirs={"account-a": None, "account-b": str(self.base / ".claude-b")},
@@ -446,6 +455,9 @@ class ClaudeOauthRefreshIntegrationTests(unittest.TestCase):
             runtime_path=self.base / "status.json",
             log_path=self.base / "refresh.log",
             lock_path=self.base / "refresh.lock",
+            # Claude/Codex contract only: never let refresh() reach the real Antigravity
+            # collector (live process discovery) from a unit test -- see manager/ag_live_fence.py.
+            antigravity_collector=False,
             claude_path=payload_fallback,
             claude_accounts={"account-a": payload_fallback},
             claude_config_dirs={None: None, "account-a": None},
@@ -479,6 +491,9 @@ class ClaudeOauthRefreshIntegrationTests(unittest.TestCase):
             runtime_path=self.base / "status.json",
             log_path=self.base / "refresh.log",
             lock_path=self.base / "refresh.lock",
+            # Claude/Codex contract only: never let refresh() reach the real Antigravity
+            # collector (live process discovery) from a unit test -- see manager/ag_live_fence.py.
+            antigravity_collector=False,
             claude_path=payload_fallback,
             claude_accounts={"account-a": payload_fallback},
             claude_config_dirs={"account-a": None},
@@ -508,6 +523,9 @@ class ClaudeOauthRefreshIntegrationTests(unittest.TestCase):
             runtime_path=self.base / "status.json",
             log_path=self.base / "refresh.log",
             lock_path=self.base / "refresh.lock",
+            # Claude/Codex contract only: never let refresh() reach the real Antigravity
+            # collector (live process discovery) from a unit test -- see manager/ag_live_fence.py.
+            antigravity_collector=False,
             claude_path=payload_a,
             claude_accounts={"account-a": payload_a},
             claude_config_dirs={"account-a": None},
@@ -546,6 +564,9 @@ class ClaudeOauthRefreshIntegrationTests(unittest.TestCase):
             runtime_path=self.base / "status.json",
             log_path=self.base / "refresh.log",
             lock_path=self.base / "refresh.lock",
+            # Claude/Codex contract only: never let refresh() reach the real Antigravity
+            # collector (live process discovery) from a unit test -- see manager/ag_live_fence.py.
+            antigravity_collector=False,
             claude_path=missing_payload,
             claude_accounts={"account-a": missing_payload},
             claude_config_dirs={"account-a": None},
@@ -576,6 +597,9 @@ class ClaudeOauthRefreshIntegrationTests(unittest.TestCase):
             runtime_path=self.base / "status.json",
             log_path=self.base / "refresh.log",
             lock_path=self.base / "refresh.lock",
+            # Claude/Codex contract only: never let refresh() reach the real Antigravity
+            # collector (live process discovery) from a unit test -- see manager/ag_live_fence.py.
+            antigravity_collector=False,
             claude_path=self.base / "unused.json",
             reader=lambda **_: self._empty_doc(),
             codex_collector=lambda **_: ({}, {"providers": [codex_provider]}),

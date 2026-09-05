@@ -212,8 +212,8 @@ class TestAgLaunchTaskPath(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def _make_runner(self):
-        cli_runner = MockCliRunner()
+    def _make_runner(self, cli_runner=None):
+        cli_runner = cli_runner or MockCliRunner()
         # An explicit dead IDE bridge: with the language-server bridge real,
         # a bare AgRunner(cli_runner=...) would auto-discover the user's live
         # IDE and dispatch a REAL model turn from a unit test (it did, three
@@ -336,7 +336,7 @@ class TestAgLaunchTaskPath(unittest.TestCase):
             failure_classification="turn_timeout",
             failure_detail="Antigravity turn exceeded timeout",
         )
-        launcher = AgRunner(cli_runner=cli_runner)
+        launcher, _ = self._make_runner(cli_runner)
         claim_registry = MemoryClaimRegistry()
 
         with patch("manager.execution_lifecycle.validate_local_preflight"), \

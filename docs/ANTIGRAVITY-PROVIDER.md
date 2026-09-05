@@ -185,10 +185,19 @@ with the IDE running the Command Watcher may route a Task to Antigravity.
 `manager/ag_ide_bridge.AgIdeBridge` (the older fail-closed IPC stub) is no
 longer on the path.
 
-Antigravity has **not** been marked `repo_write_capable`: `files_changed` for AG
-comes from git evidence (`enforce_allowed_paths` / `capture_repo_write_evidence`
-in `execution_runner`), never from the agent's self-report, and the bounded
-repo-write admission for AG is a separate milestone (M4).
+Antigravity is registered with an **explicit** `repo_write_capable: False`
+(`manager/assignment.py`). The shared `.get("repo_write_capable", True)` default
+in `decide()` and `dispatch()` would otherwise admit it for repo-write Tasks the
+moment the bridge became real (independent review of f4cf5cb, P1-2). M1
+Antigravity is therefore read-only / analysis / explicitly controlled live smoke
+only; `manager/test_dispatcher.py::AntigravityRepoWriteAdmissionTests` locks the
+gate in for automatic ranking, explicit `preferred_provider` and Command Watcher
+replay alike. `files_changed` for AG comes from git evidence
+(`enforce_allowed_paths` / `capture_repo_write_evidence` in `execution_runner`),
+never from the agent's self-report, and the bounded repo-write admission for AG
+is a separate milestone (M4). The Layer-4 live smoke's controlled write bypasses
+the registry entirely (it drives `AgRunner` directly in a disposable repo) --
+keeping it green is never an argument for widening admission.
 
 ## 5. Testing layers
 
@@ -201,10 +210,19 @@ repo-write admission for AG is a separate milestone (M4).
   `python -m manager.ag_language_server` prints the redacted availability
   snapshot; `python -m collectors.antigravity` prints the status document.
 * **Layer 4** (live, real quota): deliberately **not** part of the default
-  suite, and the suite cannot reach it by accident: `conftest.py` fences the
-  real process/loopback entry points for every test that is not marked
-  `live_antigravity` (three ordinary unit tests dispatched three real model
-  turns on 2026-09-05 the moment the bridge became real -- that fence is the
-  postmortem). `python -m manager.ag_live_smoke` runs the minimal live
+  suite, and no test runner can reach it by accident: `manager/ag_live_fence.py`
+  is consulted by the four real process/loopback entry points at call time and
+  refuses whenever a test framework is loaded in the process -- under pytest,
+  `python -m unittest`, a directly executed test module or a subprocess alike
+  (three ordinary unit tests dispatched three real model turns on 2026-09-05 the
+  moment the bridge became real; the pytest-only `conftest.py` fence that followed
+  was shown to leak under `unittest` by the independent review of f4cf5cb). Opt-in
+  is explicit: `@pytest.mark.live_antigravity` under pytest, or
+  `ADM_ANTIGRAVITY_LIVE_OPT_IN=1` for any other runner (the suite refuses to start
+  with that variable set). `conftest.py` additionally FAILS any unmarked test that
+  reached a fenced entry point, and
+  `manager/test_ag_runner_construction_guard.py` statically rejects any
+  `AgRunner(...)` built in a test without an injected `ide_bridge`.
+  `python -m manager.ag_live_smoke` runs the minimal live
   dispatch: disposable git repo, one small file-creating task, adapter
   terminal state, then **independent** `git status`/diff verification.

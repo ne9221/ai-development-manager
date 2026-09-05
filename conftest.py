@@ -118,15 +118,38 @@ ISOLATED_MANAGER_HOME = _install_isolated_manager_home()
 # live processes and talks to it over loopback. Once that bridge became real
 # (2026-09-05) three ordinary unit tests that built an ``AgRunner`` without
 # injecting a dead IDE bridge dispatched three REAL model turns into the
-# user's IDE. This fixture makes that impossible again: every test sees an
-# "IDE not running" language server unless it explicitly opts into the live
-# layer with ``@pytest.mark.live_antigravity`` (Layer 3/4 smokes, never part
-# of the default regression run). Tests that inject their own discover/opener
-# doubles are unaffected -- only the real process/loopback entry points are
-# fenced.
+# user's IDE. The fence itself now lives in ``manager/ag_live_fence.py`` and
+# is consulted by the real process/loopback entry points at call time, so it
+# holds under ``python -m unittest``, a directly executed test module and a
+# subprocess -- none of which load this file (independent review of f4cf5cb
+# proved the pytest-only fence reached the live cascade host that way).
+#
+# This file adds the pytest-specific parts: the ``live_antigravity`` marker
+# (Layer 3/4 smokes, never part of the default regression run) suspends the
+# fence for exactly that test, and every unmarked test FAILS if it reached a
+# fenced entry point -- a test that leans on ambient live discovery must not
+# pass on a silent "IDE not running" fallback (that is how the last hole
+# stayed hidden). Tests that deliberately probe the fence wrap the probe in
+# ``ag_live_fence.expecting_refusal()``. The environment opt-in that other
+# runners use is refused outright here, mirroring the manager-home refusal
+# above: an inherited variable must never widen an ordinary suite run.
 # ---------------------------------------------------------------------------
 
 LIVE_ANTIGRAVITY_MARKER = "live_antigravity"
+
+
+def _refuse_ambient_live_opt_in():
+    from manager import ag_live_fence
+
+    if ag_live_fence.live_opt_in():
+        raise RuntimeError(
+            f"refusing to run the suite with {ag_live_fence.LIVE_OPT_IN_ENV}=1: that opts every test into the "
+            "live Antigravity IDE (real model turns, real quota). Unset it; a test that genuinely needs the "
+            f"live IDE opts in individually with @pytest.mark.{LIVE_ANTIGRAVITY_MARKER}."
+        )
+
+
+_refuse_ambient_live_opt_in()
 
 
 def pytest_configure(config):
@@ -135,17 +158,23 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
-def _fence_live_antigravity(request, monkeypatch):
+def _fence_live_antigravity(request):
+    from manager import ag_live_fence
+
     if request.node.get_closest_marker(LIVE_ANTIGRAVITY_MARKER):
-        yield
+        with ag_live_fence.suspended():
+            yield
         return
-    from manager import ag_language_server
-
-    def refuse(*_args, **_kwargs):
-        raise ag_language_server.AgLsError(
-            "ide_not_running",
-            "live Antigravity access is fenced off in the test suite; mark the test live_antigravity to opt in")
-
-    monkeypatch.setattr(ag_language_server, "list_language_server_processes", refuse)
-    monkeypatch.setattr(ag_language_server, "_default_opener", refuse)
+    assert ag_live_fence.is_armed(), "the live Antigravity fence must be armed for every unmarked test"
+    before = len(ag_live_fence.attempts)
     yield
+    reached = ag_live_fence.attempts[before:]
+    if reached:
+        entry_points = sorted({item["entry_point"] for item in reached})
+        pytest.fail(
+            f"test reached the live Antigravity entry point(s) {entry_points} and only the fence stopped it: "
+            "inject a dead IDE bridge / fake discover or opener (or wrap a deliberate probe in "
+            f"ag_live_fence.expecting_refusal(), or mark the test {LIVE_ANTIGRAVITY_MARKER}).\n"
+            + reached[0]["stack"],
+            pytrace=False,
+        )

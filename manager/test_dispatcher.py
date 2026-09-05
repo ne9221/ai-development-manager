@@ -4,7 +4,9 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
+from manager.assignment import CAPABILITIES, decide
 from manager.dispatcher import dispatch, request_ok
+from manager.quota_reader import summarize
 from manager.rules_manifest import mandatory_rules
 from manager.sessions import parse_identity_header
 from manager.tasks import TaskError, create_handoff, create_project, create_task
@@ -115,7 +117,11 @@ class DispatcherTests(unittest.TestCase):
     def test_claude_preferred_excluded_and_unknown(self):
         claude = self.dispatch_case(request(task_type="architecture", needs_repo_edit=False, needs_research=True), quota(50, 80))
         self.assertEqual("claude", claude["recommended_provider"])
-        preferred = self.dispatch_case(request(title="Manual review", preferred_provider="antigravity"))
+        # Read-only on purpose: Antigravity is explicitly not repo_write_capable, so a
+        # preferred antigravity repo-write request is now "waiting" (see
+        # AntigravityRepoWriteAdmissionTests); this case keeps its original intent --
+        # an explicit preferred provider with UNKNOWN quota is admitted with a warning.
+        preferred = self.dispatch_case(request(title="Manual review", needs_repo_edit=False, preferred_provider="antigravity"))
         self.assertEqual("antigravity", preferred["recommended_provider"]); self.assertTrue(any("unknown" in item for item in preferred["warnings"]))
         excluded = self.dispatch_case(request(title="No Codex", excluded_provider="codex"), quota(90, 80))
         self.assertNotEqual("codex", excluded["recommended_provider"])
@@ -924,6 +930,82 @@ class ProviderCapabilityRoutingTests(unittest.TestCase):
         # short-circuited by) the quota-usability check.
         result = self.dispatch_case(request(title="Capability precedes quota"), quota(codex=None, claude=90))
         self.assertIn("does not support repo-write tasks (capability mismatch)", "; ".join(result["warnings"]))
+
+
+def ag_quota(antigravity=95, codex=None, claude=None, updated=None):
+    """quota() with a FRESH, official, non-exhausted Antigravity record (collectors/antigravity.py's source)."""
+    document = quota(codex=codex, claude=claude, updated=updated)
+    for item in document["providers"]:
+        if item["provider"] == "antigravity" and antigravity is not None:
+            item.update(collection_mode="automatic", source="antigravity_language_server_quota_summary", source_type="official",
+                        confidence="official", status="ok",
+                        windows=[{"name": "gemini-5h", "remaining_percent": antigravity, "used_percent": 100 - antigravity, "resets_at": None}])
+    return document
+
+
+class AntigravityRepoWriteAdmissionTests(unittest.TestCase):
+    """Independent review of f4cf5cb (P1-2): the registry carried no ``repo_write_capable`` key for
+    Antigravity, so the shared ``.get("repo_write_capable", True)`` default admitted it as a repo-write
+    provider -- the opposite of the documented M1 contract (read-only / analysis / explicitly controlled
+    live smoke). The key is now explicit and False; these tests fail if it is dropped or flipped."""
+
+    def setUp(self): self.store = MemoryStore(); create_project(self.store, project())
+
+    def dispatch_case(self, req=None, q=None, records=None):
+        return dispatch(self.store, object(), req or request(), q or ag_quota(), [] if records is None else records)
+
+    def test_registry_marks_antigravity_not_repo_write_capable_explicitly(self):
+        self.assertIn("repo_write_capable", CAPABILITIES["antigravity"], "the key must be explicit, never the shared default")
+        self.assertIs(False, CAPABILITIES["antigravity"]["repo_write_capable"])
+        self.assertIs(False, CAPABILITIES["claude"]["repo_write_capable"])
+        self.assertTrue(CAPABILITIES["codex"].get("repo_write_capable", True))
+
+    def test_decide_excludes_antigravity_for_repo_write_even_with_the_best_quota(self):
+        summary = summarize(ag_quota(antigravity=99))
+        self.assertTrue(next(p for p in summary["providers"] if p["provider"] == "antigravity")["has_usable_quota"])
+        decision = decide({"task_type": "implementation", "needs_repo_edit": True}, summary)
+        self.assertIsNone(decision["recommended_provider"])
+        self.assertNotIn("antigravity", decision["quota_evidence"])
+        self.assertIn("antigravity does not support repo-write tasks (capability mismatch)", decision["warning"])
+
+    def test_decide_keeps_antigravity_eligible_for_read_only_work(self):
+        decision = decide({"task_type": "research", "needs_repo_edit": False}, summarize(ag_quota(antigravity=99)))
+        self.assertEqual("antigravity", decision["recommended_provider"])
+
+    def test_repo_write_task_excludes_antigravity_from_ranking_entirely(self):
+        result = self.dispatch_case(request(title="Repo-write excludes antigravity"), ag_quota(antigravity=99))
+        self.assertIsNone(result["recommended_provider"])
+        self.assertTrue(result["waiting_quota"])
+        self.assertNotIn("antigravity", result["alternatives"])
+        self.assertNotIn("antigravity", result["quota_evidence"])
+        self.assertIn("does not support repo-write tasks (capability mismatch)", "; ".join(result["warnings"]))
+
+    def test_explicit_preferred_antigravity_for_repo_write_is_waiting_not_launched(self):
+        result = self.dispatch_case(request(title="Explicit antigravity repo-write", preferred_provider="antigravity"), ag_quota(antigravity=99))
+        self.assertIsNone(result["recommended_provider"])
+        self.assertIsNone(result["provider"])
+        self.assertTrue(result["waiting_quota"])
+        self.assertIsNone(result["generated_prompt"])
+
+    def test_replayed_assigned_antigravity_does_not_exempt_the_capability_gate(self):
+        req = request(title="Replay antigravity repo-write", preferred_provider="antigravity", provider_is_assigned=True)
+        result = self.dispatch_case(req, ag_quota(antigravity=99))
+        self.assertIsNone(result["recommended_provider"])
+        self.assertTrue(result["waiting_quota"])
+
+    def test_read_only_task_can_still_be_dispatched_to_antigravity(self):
+        result = self.dispatch_case(request(title="Read-only analysis", task_type="research", needs_repo_edit=False), ag_quota(antigravity=99))
+        self.assertEqual("antigravity", result["recommended_provider"])
+        self.assertEqual("antigravity", result["provider"])
+
+    def test_codex_and_claude_repo_write_routing_is_unchanged(self):
+        result = self.dispatch_case(request(title="Codex still wins repo-write"), ag_quota(antigravity=99, codex=80, claude=99))
+        self.assertEqual("codex", result["recommended_provider"])
+        self.assertNotIn("claude", result["quota_evidence"])
+        self.assertNotIn("antigravity", result["quota_evidence"])
+        excluded = self.dispatch_case(request(title="No compatible provider"), ag_quota(antigravity=99, codex=None, claude=99))
+        self.assertIsNone(excluded["recommended_provider"])
+        self.assertTrue(excluded["waiting_quota"])
 
 
 if __name__ == "__main__": unittest.main()
