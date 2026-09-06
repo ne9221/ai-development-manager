@@ -76,7 +76,14 @@ def _admissibility_reason(
         return "CHECKER_IDENTITY_MISMATCH"
     if report.checker_version != expected_version:
         return "CHECKER_VERSION_MISMATCH"
-    if execution.executor_identity is not None and report.checker_identity == execution.executor_identity:
+    # B5: an unresolved executor identity must never be treated as "safe
+    # independence". None means "we don't know who executed this", not "no
+    # conflict" -- a report can only be admitted once we can actually check
+    # it against the executor. The full (provider, account, session) triple
+    # is Phase B-2; for B-1R, None alone is enough to fail closed.
+    if execution.executor_identity is None:
+        return "EXECUTOR_IDENTITY_UNRESOLVED"
+    if report.checker_identity == execution.executor_identity:
         return "EXECUTOR_EQUALS_CHECKER"
     expected_oracle_hash = bundle.frozen_oracle_hashes.get(report.gate_id)
     if expected_oracle_hash is not None and report.oracle_hash != expected_oracle_hash:
@@ -89,13 +96,23 @@ def _classify_observation(
     gate_id: str,
     bundle: AcceptanceBundleFixture,
 ) -> str:
-    if observation.category is not None:
-        return observation.category
+    # B1: category/proposed_class are proposals only -- an observation's own
+    # self-declared category is NEVER trusted directly. Only these
+    # deterministic, evidence-backed predicates may decide the admitted
+    # class: an allowlisted transient signature, or a signature the frozen
+    # contract already has a clause for.
     if observation.signature in bundle.transient_allowlist:
         return "ENVIRONMENT_TRANSIENT"
     clauses = bundle.gate_contract_clauses.get(gate_id, ())
     if observation.signature in clauses:
         return "REGRESSION" if observation.is_regression else "CONTRACT_VIOLATION"
+    if observation.category == "TEST_DEFECT":
+        # No TD-1/TD-2 predicate exists yet (Phase B-2) to independently
+        # verify a "this is just a flaky test" claim. Without one, a
+        # report-authored TEST_DEFECT claim must not be admitted, and must
+        # not be softened into the weaker ACCEPTANCE_CONTRACT_DEFECT default
+        # either -- fail closed to UNKNOWN/human judgement instead.
+        return "UNKNOWN"
     return "ACCEPTANCE_CONTRACT_DEFECT"
 
 
@@ -125,6 +142,99 @@ def _report_is_trustworthy(report: VerificationReportFixture, bundle: Acceptance
     if not _coverage_complete(report, bundle):
         return False
     return True
+
+
+def _gate_outcome(
+    gate_id: str,
+    report: VerificationReportFixture,
+    bundle: AcceptanceBundleFixture,
+) -> Tuple[bool, Set[str]]:
+    """(satisfied, contributed_classes) for one admissible latest-round
+    report on a gate. Pulled out so the same rules apply whether or not the
+    gate is required for the current risk tier (B3)."""
+    trustworthy = _report_is_trustworthy(report, bundle)
+    if report.result == "PASS":
+        if trustworthy:
+            return True, set()
+        # A claimed-complete gate whose evidence cannot be trusted is a live
+        # false-complete signal, not merely "not yet run" -- it must
+        # escalate, never silently fall back to CONTINUE_VERIFICATION.
+        return False, {"UNKNOWN"}
+    if report.result == "FAIL":
+        if not trustworthy or not report.failure_observations:
+            return False, {"UNKNOWN"}
+        return False, {_classify_observation(o, gate_id, bundle) for o in report.failure_observations}
+    return False, {"UNKNOWN"}  # explicit "UNKNOWN" result
+
+
+def _latest_admissible_by_gate(
+    admissible: Sequence[Tuple[str, VerificationReportFixture]],
+) -> Tuple[Dict[str, VerificationReportFixture], Set[str]]:
+    """B2: group admissible reports by gate and pick the highest-round one
+    per gate. If a gate's highest admissible round carries more than one
+    report, that gate's outcome cannot be decided without depending on
+    input list order -- such gates are returned separately as
+    "duplicate_gates" instead of silently picking one (last-wins)."""
+    by_gate: Dict[str, List[VerificationReportFixture]] = {}
+    for _, report in admissible:
+        by_gate.setdefault(report.gate_id, []).append(report)
+
+    latest_by_gate: Dict[str, VerificationReportFixture] = {}
+    duplicate_gates: Set[str] = set()
+    for gate_id, reports_for_gate in by_gate.items():
+        max_round = max(r.round for r in reports_for_gate)
+        at_max = [r for r in reports_for_gate if r.round == max_round]
+        if len(at_max) > 1:
+            duplicate_gates.add(gate_id)
+        else:
+            latest_by_gate[gate_id] = at_max[0]
+    return latest_by_gate, duplicate_gates
+
+
+def _derive_next_action(
+    admitted_classes: Set[str],
+    missing_required_gates: Sequence[str],
+    satisfied_gates: Sequence[str],
+    required_gates: Sequence[str],
+) -> str:
+    """B4 guard order, most severe first. Extracted (like _retry_eligible)
+    so the priority order itself is directly unit-testable independent of
+    whatever admission path a given admitted class arrived through:
+      1. GOVERNANCE_CONFLICT       -> ESCALATE_HUMAN
+      2. PRODUCTION_SCOPE_VIOLATION -> ROUTE_TO_PFP (never masked by a
+         co-occurring CONTRACT_VIOLATION/REGRESSION, never downgraded to
+         ESCALATE_HUMAN)
+      3. ACCEPTANCE_CONTRACT_DEFECT -> OPEN_BUNDLE_REVISION
+      4. UNKNOWN                    -> ESCALATE_HUMAN
+      5. REGRESSION/CONTRACT_VIOLATION/TEST_DEFECT -> REPAIR
+      6. exactly {ENVIRONMENT_TRANSIENT} -> RETRY_SAME_CANDIDATE
+      7. still missing required coverage -> CONTINUE_VERIFICATION
+      8. full required coverage, nothing admitted -> ACCEPTED
+    The fail-closed default (9) never invents an extra UNKNOWN on top of an
+    admitted class that already explains the outcome -- it only adds one
+    when admitted_classes was genuinely empty (no required gates declared
+    for this risk tier and nothing failed).
+    """
+    if "GOVERNANCE_CONFLICT" in admitted_classes:
+        return "ESCALATE_HUMAN"
+    if "PRODUCTION_SCOPE_VIOLATION" in admitted_classes:
+        return "ROUTE_TO_PFP"
+    if "ACCEPTANCE_CONTRACT_DEFECT" in admitted_classes:
+        return "OPEN_BUNDLE_REVISION"
+    if "UNKNOWN" in admitted_classes:
+        return "ESCALATE_HUMAN"
+    if admitted_classes & {"CONTRACT_VIOLATION", "REGRESSION", "TEST_DEFECT"}:
+        return "REPAIR"
+    if _retry_eligible(admitted_classes):
+        return "RETRY_SAME_CANDIDATE"
+    if missing_required_gates:
+        return "CONTINUE_VERIFICATION"
+    if required_gates and set(satisfied_gates) == set(required_gates) and not admitted_classes:
+        return "ACCEPTED"
+    if admitted_classes:
+        return "ESCALATE_HUMAN"
+    admitted_classes.add("UNKNOWN")
+    return "ESCALATE_HUMAN"
 
 
 def evaluate(
@@ -165,69 +275,44 @@ def evaluate(
 
     required_gates = tuple(bundle.gate_requirements_by_risk.get(effective_risk, ()))
 
-    # Latest (highest round) admissible report per gate is authoritative.
-    latest_by_gate: Dict[str, VerificationReportFixture] = {}
-    latest_round_by_gate: Dict[str, int] = {}
-    for _, report in admissible:
-        current = latest_round_by_gate.get(report.gate_id)
-        if current is None or report.round >= current:
-            latest_round_by_gate[report.gate_id] = report.round
-            latest_by_gate[report.gate_id] = report
+    # B2: latest (highest round) admissible report per gate is authoritative
+    # -- but a gate whose highest round has more than one admissible report
+    # is ambiguous and must never be resolved by input list order.
+    latest_by_gate, duplicate_gates = _latest_admissible_by_gate(admissible)
 
     missing_required_gates: List[str] = []
     satisfied_gates: List[str] = []
 
     for gate_id in required_gates:
+        if gate_id in duplicate_gates:
+            admitted_classes.add("UNKNOWN")
+            continue
         report = latest_by_gate.get(gate_id)
         if report is None:
             missing_required_gates.append(gate_id)
             continue
+        satisfied, classes = _gate_outcome(gate_id, report, bundle)
+        admitted_classes |= classes
+        if satisfied:
+            satisfied_gates.append(gate_id)
 
-        trustworthy = _report_is_trustworthy(report, bundle)
-
-        if report.result == "PASS":
-            if trustworthy:
-                satisfied_gates.append(gate_id)
-            else:
-                # A claimed-complete gate whose evidence cannot be trusted is
-                # a live false-complete signal, not merely "not yet run" --
-                # it must escalate, never silently fall back to
-                # CONTINUE_VERIFICATION (Phase B-1 Fixture 2 and 3).
-                admitted_classes.add("UNKNOWN")
-        elif report.result == "FAIL":
-            if not trustworthy and (
-                report.evidence_source not in TRUSTED_EVIDENCE_SOURCES
-                or report.identity_resolution != "resolved"
-            ):
-                admitted_classes.add("UNKNOWN")
-            elif not report.failure_observations:
-                admitted_classes.add("UNKNOWN")
-            else:
-                for observation in report.failure_observations:
-                    admitted_classes.add(_classify_observation(observation, gate_id, bundle))
-        else:  # explicit "UNKNOWN" result
+    # B3: required_gates only decides *coverage* (missing vs satisfied). Any
+    # other admissible gate report -- required for this risk tier or not --
+    # must still be able to contribute a failure class; it must never be
+    # silently discarded just because the risk tier didn't require it.
+    for gate_id in set(latest_by_gate) | duplicate_gates:
+        if gate_id in required_gates:
+            continue  # already processed above
+        if gate_id in duplicate_gates:
             admitted_classes.add("UNKNOWN")
+            continue
+        report = latest_by_gate[gate_id]
+        _satisfied, classes = _gate_outcome(gate_id, report, bundle)
+        admitted_classes |= classes
 
-    if missing_required_gates and not admitted_classes:
-        next_action = "CONTINUE_VERIFICATION"
-    elif "UNKNOWN" in admitted_classes or "GOVERNANCE_CONFLICT" in admitted_classes:
-        next_action = "ESCALATE_HUMAN"
-    elif "ACCEPTANCE_CONTRACT_DEFECT" in admitted_classes:
-        next_action = "OPEN_BUNDLE_REVISION"
-    elif admitted_classes & {"CONTRACT_VIOLATION", "REGRESSION", "TEST_DEFECT"}:
-        next_action = "REPAIR"
-    elif _retry_eligible(admitted_classes):
-        next_action = "RETRY_SAME_CANDIDATE"
-    elif missing_required_gates:
-        next_action = "CONTINUE_VERIFICATION"
-    elif required_gates and set(satisfied_gates) == set(required_gates) and not admitted_classes:
-        next_action = "ACCEPTED"
-    else:
-        # No required gates declared for this risk tier and nothing failed:
-        # fail closed to human judgement rather than silently accepting.
-        next_action = "ESCALATE_HUMAN"
-        admitted_classes.add("UNKNOWN")
-
+    next_action = _derive_next_action(
+        admitted_classes, tuple(missing_required_gates), tuple(satisfied_gates), required_gates
+    )
     acceptance_state = "ACCEPTED" if next_action == "ACCEPTED" else "NOT_ACCEPTED"
 
     return EvaluationResult(

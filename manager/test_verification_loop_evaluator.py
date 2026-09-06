@@ -10,7 +10,7 @@ attack-test section for the explicit negative controls.
 
 import unittest
 
-from manager.verification_loop.evaluator import _retry_eligible, evaluate
+from manager.verification_loop.evaluator import _derive_next_action, _retry_eligible, evaluate
 from manager.verification_loop.fixtures import (
     fx_adm_false_dispatch,
     fx_ledger_freeze_pane,
@@ -224,12 +224,23 @@ class AttackTests(unittest.TestCase):
         self.assertEqual(result.invalidated_report_reasons[0][1], "EXECUTOR_EQUALS_CHECKER")
 
     def test_05_mixed_sha_reports_cannot_be_accepted(self):
+        # B6: single-factor -- every other field on wrong_sha_v1 is exactly
+        # what a legitimate V1 report would look like (correct checker
+        # identity/version, correct bundle/base/execution ids, trusted
+        # evidence, resolved identity). candidate_sha is the ONLY thing
+        # wrong, so this test can only pass because of the SHA check --
+        # removing it (mutant N6) must flip this to ACCEPTED.
         bundle = _simple_bundle()
         good_v0 = _report(gate_id="V0")
-        wrong_sha_v1 = _report(gate_id="V1", candidate_sha="sha-candidate-OTHER")
+        wrong_sha_v1 = _report(
+            gate_id="V1",
+            checker_identity="integration_checker",
+            candidate_sha="sha-candidate-OTHER",
+        )
         result = evaluate(_simple_task(), _simple_execution(), bundle, [good_v0, wrong_sha_v1])
         self.assertNotEqual(result.acceptance_state, "ACCEPTED")
         self.assertIn("V1", result.missing_required_gates)
+        self.assertEqual(result.invalidated_report_reasons[0][1], "CANDIDATE_SHA_MISMATCH")
 
     def test_06_declared_low_risk_diff_high_escalates_effective_risk(self):
         bundle = _simple_bundle(risk_rules=(RiskRule("sensitive/", "high"),))
@@ -303,6 +314,166 @@ class AttackTests(unittest.TestCase):
         )
         self.assertEqual(result.next_action, "ACCEPTED")
         self.assertEqual(result.acceptance_state, "ACCEPTED")
+
+    # -- Phase B-1R additions -------------------------------------------
+
+    def test_13_category_environment_transient_without_allowlist_cannot_retry(self):
+        """B1: a report can no longer relabel an unclaused defect as
+        ENVIRONMENT_TRANSIENT via .category when the signature isn't on the
+        bundle's transient_allowlist and there is no checker transient_code
+        admission path -- it must fall through to the deterministic default,
+        never reach RETRY_SAME_CANDIDATE."""
+        bundle = _simple_bundle()  # no transient_allowlist entries at all
+        v0 = _report(
+            result="FAIL",
+            failure_observations=(
+                FailureObservation(signature="not_allowlisted", category="ENVIRONMENT_TRANSIENT"),
+            ),
+        )
+        v1 = _report(gate_id="V1", checker_identity="integration_checker")
+        result = evaluate(_simple_task(), _simple_execution(), bundle, [v0, v1])
+        self.assertNotIn("ENVIRONMENT_TRANSIENT", result.admitted_failure_classes)
+        self.assertNotEqual(result.next_action, "RETRY_SAME_CANDIDATE")
+        self.assertNotEqual(result.acceptance_state, "ACCEPTED")
+
+    def test_14_test_defect_category_without_predicate_forces_unknown(self):
+        """B1: TD-1/TD-2 are not implemented in Phase B-1R, so a
+        report-authored TEST_DEFECT claim must not be admitted into
+        TEST_DEFECT, and must not be quietly downgraded into
+        ACCEPTANCE_CONTRACT_DEFECT either -- it must escalate as UNKNOWN."""
+        bundle = _simple_bundle()
+        v0 = _report(
+            result="FAIL",
+            failure_observations=(FailureObservation(signature="flaky_maybe", category="TEST_DEFECT"),),
+        )
+        v1 = _report(gate_id="V1", checker_identity="integration_checker")
+        result = evaluate(_simple_task(), _simple_execution(), bundle, [v0, v1])
+        self.assertIn("UNKNOWN", result.admitted_failure_classes)
+        self.assertNotIn("TEST_DEFECT", result.admitted_failure_classes)
+        self.assertNotIn("ACCEPTANCE_CONTRACT_DEFECT", result.admitted_failure_classes)
+        self.assertEqual(result.next_action, "ESCALATE_HUMAN")
+        self.assertNotEqual(result.acceptance_state, "ACCEPTED")
+
+    def test_15_admissible_fail_on_non_required_gate_blocks_acceptance(self):
+        """B3: medium risk only requires V0/V1, but an admissible FAIL on an
+        extra gate (V3, not required at this risk tier) must still block
+        acceptance -- required_gates governs coverage, not which admissible
+        failures may be ignored."""
+        bundle = _simple_bundle(
+            checker_identities={
+                "V0": ("unit_checker", "1.0"),
+                "V1": ("integration_checker", "1.0"),
+                "V3": ("extra_checker", "1.0"),
+            }
+        )
+        v3_fail = _report(
+            gate_id="V3",
+            checker_identity="extra_checker",
+            result="FAIL",
+            failure_observations=(FailureObservation(signature="unexpected_defect"),),
+        )
+        reports = [
+            _report(gate_id="V0"),
+            _report(gate_id="V1", checker_identity="integration_checker"),
+            v3_fail,
+        ]
+        result = evaluate(_simple_task(), _simple_execution(), bundle, reports)
+        self.assertNotEqual(result.acceptance_state, "ACCEPTED")
+        self.assertIn("ACCEPTANCE_CONTRACT_DEFECT", result.admitted_failure_classes)
+
+    def test_16_executor_identity_none_is_inadmissible_not_fail_open(self):
+        """B5: execution.executor_identity=None must never be treated as "no
+        conflict" -- every report tied to that execution becomes
+        inadmissible (EXECUTOR_IDENTITY_UNRESOLVED), never silently ACCEPTED."""
+        bundle = _simple_bundle()
+        execution = _simple_execution(executor_identity=None)
+        reports = [_report(gate_id="V0"), _report(gate_id="V1", checker_identity="integration_checker")]
+        result = evaluate(_simple_task(), execution, bundle, reports)
+        self.assertNotEqual(result.acceptance_state, "ACCEPTED")
+        self.assertEqual(result.admissible_report_keys, ())
+        reasons = {reason for _, reason in result.invalidated_report_reasons}
+        self.assertEqual(reasons, {"EXECUTOR_IDENTITY_UNRESOLVED"})
+
+
+# ---------------------------------------------------------------------------
+# B2: duplicate (gate_id, round) reports must be permutation-invariant
+# ---------------------------------------------------------------------------
+
+class DuplicateReportOrderInvarianceTests(unittest.TestCase):
+    def test_duplicate_same_gate_round_is_permutation_invariant_and_never_accepted(self):
+        bundle = _simple_bundle()
+        v0 = _report(gate_id="V0")
+        pass_v1 = _report(gate_id="V1", checker_identity="integration_checker", result="PASS")
+        fail_v1 = _report(
+            gate_id="V1",
+            checker_identity="integration_checker",
+            result="FAIL",
+            failure_observations=(FailureObservation(signature="whatever"),),
+        )
+
+        order_fail_then_pass = evaluate(_simple_task(), _simple_execution(), bundle, [v0, fail_v1, pass_v1])
+        order_pass_then_fail = evaluate(_simple_task(), _simple_execution(), bundle, [v0, pass_v1, fail_v1])
+
+        self.assertEqual(order_fail_then_pass.next_action, order_pass_then_fail.next_action)
+        self.assertEqual(order_fail_then_pass.acceptance_state, order_pass_then_fail.acceptance_state)
+        self.assertEqual(
+            order_fail_then_pass.admitted_failure_classes, order_pass_then_fail.admitted_failure_classes
+        )
+        self.assertEqual(
+            order_fail_then_pass.missing_required_gates, order_pass_then_fail.missing_required_gates
+        )
+        self.assertNotEqual(order_fail_then_pass.acceptance_state, "ACCEPTED")
+        self.assertNotEqual(order_pass_then_fail.acceptance_state, "ACCEPTED")
+
+
+# ---------------------------------------------------------------------------
+# B4: next_action guard order, tested directly against the extracted
+# predicate so the priority order is provable independent of how a given
+# admitted class actually got admitted.
+# ---------------------------------------------------------------------------
+
+class NextActionGuardOrderTests(unittest.TestCase):
+    def test_production_scope_violation_alone_routes_to_pfp(self):
+        self.assertEqual(
+            _derive_next_action(
+                {"PRODUCTION_SCOPE_VIOLATION"}, missing_required_gates=(), satisfied_gates=(), required_gates=("V0",)
+            ),
+            "ROUTE_TO_PFP",
+        )
+
+    def test_production_scope_violation_with_contract_violation_still_routes_to_pfp(self):
+        self.assertEqual(
+            _derive_next_action(
+                {"PRODUCTION_SCOPE_VIOLATION", "CONTRACT_VIOLATION"},
+                missing_required_gates=(),
+                satisfied_gates=(),
+                required_gates=("V0",),
+            ),
+            "ROUTE_TO_PFP",
+        )
+
+    def test_governance_conflict_outranks_production_scope_violation(self):
+        self.assertEqual(
+            _derive_next_action(
+                {"GOVERNANCE_CONFLICT", "PRODUCTION_SCOPE_VIOLATION"},
+                missing_required_gates=(),
+                satisfied_gates=(),
+                required_gates=("V0",),
+            ),
+            "ESCALATE_HUMAN",
+        )
+
+    def test_fallback_with_no_admitted_class_and_no_required_gates_escalates_and_records_unknown(self):
+        admitted = set()
+        result = _derive_next_action(admitted, missing_required_gates=(), satisfied_gates=(), required_gates=())
+        self.assertEqual(result, "ESCALATE_HUMAN")
+        self.assertEqual(admitted, {"UNKNOWN"})
+
+    def test_fallback_never_adds_a_second_unknown_on_top_of_an_admitted_class(self):
+        admitted = {"UNKNOWN"}
+        result = _derive_next_action(admitted, missing_required_gates=(), satisfied_gates=(), required_gates=())
+        self.assertEqual(result, "ESCALATE_HUMAN")
+        self.assertEqual(admitted, {"UNKNOWN"})
 
 
 # ---------------------------------------------------------------------------
