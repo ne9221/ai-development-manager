@@ -24,6 +24,27 @@ closes it.
 | B-2 independent review | [PHASE-B2-INDEPENDENT-REVIEW-CHANGES-REQUIRED.md](PHASE-B2-INDEPENDENT-REVIEW-CHANGES-REQUIRED.md) | `CHANGES_REQUIRED` |
 | B-2R repair | this branch | pending focused independent re-review |
 
+## Reproducers
+
+`repro/B2R-ADVERSARIAL-AUDIT.py` is the Phase B-2R self-adversarial audit: 11
+attacks and 2 live controls, runnable at either SHA from a scratch clone with a
+temporary `AI_MANAGER_HOME`:
+
+```
+PYTHONPATH=. python docs/verification-loop/repro/B2R-ADVERSARIAL-AUDIT.py <scratch-dir>
+```
+
+It is committed rather than left in a scratch directory so the next reviewer can
+re-measure the claim instead of taking it. Measured: **7 of 11 bypass at
+`794db70`, 0 of 11 at the B-2R HEAD, with both controls still accepting.** The
+four that fail to bypass at base do so through guards Phase B-2 already had, and
+the script says so rather than counting them as wins.
+
+The script is deliberately layout-agnostic: it finds ticket records by reading
+the `ticket_id` inside them rather than by any filename convention. An earlier
+version assumed the layout, silently matched nothing after the ledger changed
+shape, and scored four attacks as bypasses that had never touched a byte.
+
 ## Provenance
 
 `PHASE-A-V3-ARCHITECTURE.md` is the **verbatim, unedited** final assistant

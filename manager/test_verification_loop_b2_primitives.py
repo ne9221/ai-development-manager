@@ -520,10 +520,15 @@ class StoreCreateOnlyTests(unittest.TestCase):
             self.assertEqual((), tuple(store.list_ids()))
 
     def test_a_traversal_shaped_ticket_id_cannot_escape_the_store(self):
+        # Ticket ids stopped being path components when records became
+        # content-addressed, so this is now defence in depth rather than the
+        # only barrier -- which is worth keeping and worth saying.
         with tempfile.TemporaryDirectory() as root:
             store = stores.FileTicketStore(root)
             with self.assertRaises(stores.VerificationStoreError):
-                store._dir("../../escape")
+                store._records("../../escape")
+            with self.assertRaises(stores.VerificationStoreError):
+                stores.validate_ticket_id("../../escape")
 
     def test_reports_are_content_addressed_so_a_verdict_cannot_be_overwritten(self):
         with tempfile.TemporaryDirectory() as root:

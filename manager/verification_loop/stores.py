@@ -186,43 +186,67 @@ def _verify_record(path: Path, cls, expected_digest: str, kind: str):
     return record
 
 
+def validate_ticket_id(ticket_id: str) -> str:
+    """Refuse a path-shaped ticket id.
+
+    Ticket ids are not path components in this layout -- records are named by
+    their own content digest -- so this is defence in depth rather than the one
+    thing standing between an id and the filesystem. It is kept because a
+    future layout change could make it load-bearing again, and because an id
+    shaped like a traversal is evidence of something regardless.
+    """
+    if (
+        not ticket_id
+        or "/" in ticket_id
+        or "\\" in ticket_id
+        or ticket_id.startswith(".")
+    ):
+        raise VerificationStoreError(f"UNSAFE_TICKET_ID: {ticket_id!r}")
+    return ticket_id
+
+
 class FileTicketStore:
     """Append-only ticket ledger under ``<root>/verification/tickets``.
 
-    One directory per ``ticket_id``, holding one content-addressed record per
-    state transition: the issue record, and -- once a report answers it -- the
-    consumption record naming the digest that answered it (Phase A v3 predicate
-    11). The directory name is the CAS key for the round; the file names are
-    the content addresses of what the ticket said at each step.
+    Every record -- the issue record, and the consumption record naming the
+    report digest that answered it (Phase A v3 predicate 11) -- is one file
+    named by its own content digest, exactly like a report. A ticket is the set
+    of records carrying its ``ticket_id``, which lives inside the records
+    rather than in a path component.
 
-    Splitting the two is what closes the review's second vector.
-    ``ticket_id`` hashes only (execution, candidate, bundle, gate, round), so
-    the identities, the task, the base SHA, the lease and the status all sit
-    outside it and were previously free to edit. They are inside the record
-    digest, which the reader recomputes.
+    That is what closes the review's second vector. ``ticket_id`` hashes only
+    (execution, candidate, bundle, gate, round), so the identities, the task,
+    the base SHA, the lease and the status all sit outside it and were
+    previously free to edit. They are inside the record digest, which is the
+    file name, which the reader recomputes.
+
+    Filing records flat rather than in a directory per ticket is not merely
+    tidiness. A nested layout adds the full 67-character ticket id to every
+    record path, and this repository is checked out and tested at path lengths
+    where that crosses the Windows limit -- the same path-length sensitivity
+    the installer tests already have. A ledger that fails to write on a deep
+    checkout is a ledger with a silent availability cliff.
     """
 
     def __init__(self, root) -> None:
         self.root = assert_non_production_root(root)
         self.directory = self.root / "verification" / "tickets"
 
-    def _dir(self, ticket_id: str) -> Path:
-        if not ticket_id or "/" in ticket_id or "\\" in ticket_id or ticket_id.startswith("."):
-            raise VerificationStoreError(f"UNSAFE_TICKET_ID: {ticket_id!r}")
-        return self.directory / ticket_id
+    def _all_records(self) -> List[VerificationTicket]:
+        if not self.directory.exists():
+            return []
+        return [
+            _verify_record(path, VerificationTicket, path.stem, "TICKET")
+            for path in sorted(self.directory.glob("*.json"))
+        ]
 
     def _records(self, ticket_id: str) -> List[VerificationTicket]:
-        directory = self._dir(ticket_id)
-        if not directory.exists():
-            return []
-        records = []
-        for path in sorted(directory.glob("*.json")):
-            records.append(_verify_record(path, VerificationTicket, path.stem, "TICKET"))
-        return records
+        validate_ticket_id(ticket_id)
+        return [record for record in self._all_records() if record.ticket_id == ticket_id]
 
     def _append(self, ticket: VerificationTicket) -> VerificationTicket:
         payload = canonical_json(ticket)
-        path = self._dir(ticket.ticket_id) / (record_digest(ticket) + ".json")
+        path = self.directory / (record_digest(ticket) + ".json")
         if not _write_create_only(path, payload) and _read_exact(path) != payload:
             # Only reachable on a sha256 collision, but silently trusting the
             # stored copy would make the digest a claim rather than a proof.
@@ -239,6 +263,7 @@ class FileTicketStore:
         reason = ticket_self_consistency_reason(ticket)
         if reason is not None:
             raise VerificationStoreError(f"TICKET_REJECTED: {reason}")
+        validate_ticket_id(ticket.ticket_id)
         if ticket.status != "issued" or ticket.ticket_seq != ISSUE_SEQ:
             raise VerificationStoreError(
                 "TICKET_NOT_ISSUABLE: a ticket enters the ledger as issued; a consumed "
@@ -260,14 +285,14 @@ class FileTicketStore:
         """Append the record that this ticket was answered by that report.
 
         Returns None when no ticket holds ``ticket_id``: a report nobody
-        authorised must not conjure the authorisation it lacks, so the report
-        is simply stored and rejected later as ``NO_MATCHING_TICKET``.
+        authorised must not conjure the authorisation it lacks, so it is simply
+        stored and rejected later as ``NO_MATCHING_TICKET``.
 
         Answering twice with the same digest is a no-op, which is what makes a
         retried submission idempotent even though the wall-clock time differs.
-        Answering with a *different* digest appends a second, conflicting
-        claim rather than overwriting the first -- the contest becomes durable
-        evidence, and the fold below refuses the ticket to both of them.
+        Answering with a *different* digest appends a second, conflicting claim
+        rather than overwriting the first -- the contest becomes durable
+        evidence, and the fold below then refuses the ticket to both claimants.
         """
         issued = None
         consumptions = []
@@ -293,36 +318,39 @@ class FileTicketStore:
         )
 
     def get(self, ticket_id: str) -> Optional[VerificationTicket]:
-        """The ticket's current state, folded from its verified records.
-
-        A ledger missing its issue record, or holding two of them, or holding
-        two conflicting consumptions, does not resolve to "no constraint" -- the
-        first two raise, and the third yields an invalidated ticket that admits
-        nothing. Partial state is the shape a deletion attack leaves behind.
-        """
+        """The ticket's current state, folded from its verified records."""
         records = self._records(ticket_id)
         if not records:
             return None
-
-        issued = [record for record in records if record.ticket_seq == ISSUE_SEQ]
-        consumed = [record for record in records if record.ticket_seq == CONSUME_SEQ]
-        unknown = [record for record in records if record.ticket_seq not in (ISSUE_SEQ, CONSUME_SEQ)]
-
-        if len(issued) != 1 or unknown:
-            raise EvidenceIntegrityError(
-                f"TICKET_LEDGER_INCOHERENT: {ticket_id!r} holds {len(issued)} issue records "
-                f"and {len(unknown)} records at an unknown sequence; a ticket has exactly one"
-            )
-        if len(consumed) > 1:
-            # Two reports claimed one ticket. Neither is trusted, and the
-            # choice is not left to whichever was written first.
-            return replace(issued[0], status="invalidated")
-        return consumed[0] if consumed else issued[0]
+        return _fold_ticket(ticket_id, records)
 
     def list_ids(self) -> Sequence[str]:
-        if not self.directory.exists():
-            return ()
-        return tuple(sorted(path.name for path in self.directory.iterdir() if path.is_dir()))
+        return tuple(sorted({record.ticket_id for record in self._all_records()}))
+
+
+def _fold_ticket(ticket_id: str, records: Sequence[VerificationTicket]) -> VerificationTicket:
+    """One ticket's current state, from every record that claims its id.
+
+    A ledger missing its issue record, or holding two of them, does not resolve
+    to "no constraint" -- it raises, because partial state is the shape a
+    deletion attack leaves behind. Two conflicting consumptions leave the
+    ticket invalidated for both claimants, which is the only order-independent
+    answer available.
+    """
+    issued = [record for record in records if record.ticket_seq == ISSUE_SEQ]
+    consumed = [record for record in records if record.ticket_seq == CONSUME_SEQ]
+    unknown = [
+        record for record in records if record.ticket_seq not in (ISSUE_SEQ, CONSUME_SEQ)
+    ]
+
+    if len(issued) != 1 or unknown:
+        raise EvidenceIntegrityError(
+            f"TICKET_LEDGER_INCOHERENT: {ticket_id!r} holds {len(issued)} issue records "
+            f"and {len(unknown)} records at an unknown sequence; a ticket has exactly one"
+        )
+    if len(consumed) > 1:
+        return replace(issued[0], status="invalidated")
+    return consumed[0] if consumed else issued[0]
 
 
 class FileReportStore:

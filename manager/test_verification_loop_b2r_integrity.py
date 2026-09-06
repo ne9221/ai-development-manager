@@ -131,19 +131,33 @@ class LedgerTestCase(unittest.TestCase):
     def report_path(self, digest):
         return self.home / "verification" / "reports" / (digest + ".json")
 
-    def ticket_dir(self, gate_id, round_=1):
-        ticket_id = derive_ticket_id(
+    def ticket_id_for(self, gate_id, round_=1):
+        return derive_ticket_id(
             self.scenario.execution.execution_id,
             self.scenario.execution.candidate_sha,
             self.scenario.bundle.bundle_hash,
             gate_id,
             round_,
         )
-        return self.home / "verification" / "tickets" / ticket_id
+
+    def ticket_records(self, gate_id, round_=1):
+        """Every persisted record claiming this ticket's id.
+
+        Records are named by their own content digest, not by ticket id, so
+        they are selected by reading them -- which is also how the store finds
+        them, and means these tests cannot accidentally depend on a filename
+        convention the store does not actually rely on.
+        """
+        wanted = self.ticket_id_for(gate_id, round_)
+        found = []
+        for path in sorted((self.home / "verification" / "tickets").glob("*.json")):
+            if json.loads(path.read_text(encoding="utf-8"))["ticket_id"] == wanted:
+                found.append(path)
+        return found
 
     def record_at_seq(self, gate_id, seq, round_=1):
         """The ticket record at ``seq``. Chosen by content, never by filename."""
-        for path in sorted(self.ticket_dir(gate_id, round_).glob("*.json")):
+        for path in self.ticket_records(gate_id, round_):
             if json.loads(path.read_text(encoding="utf-8"))["ticket_seq"] == seq:
                 return path
         raise AssertionError(f"no ticket record at seq {seq} for {gate_id}")
@@ -285,7 +299,7 @@ class TicketLedgerIntegrityTests(LedgerTestCase):
     """``ticket_id`` binds five fields; the ledger has to bind the rest."""
 
     def issued_record(self, gate_id="V3"):
-        records = sorted(self.ticket_dir(gate_id).glob("*.json"))
+        records = self.ticket_records(gate_id)
         self.assertEqual(1, len(records), "a freshly issued ticket has exactly one record")
         return records[0]
 
@@ -360,7 +374,7 @@ class TicketLedgerIntegrityTests(LedgerTestCase):
         self.issue()
         doc = json.loads(self.issued_record("V3").read_text(encoding="utf-8"))
         doc["expected_checker_identity"] = ROGUE_JSON
-        (self.ticket_dir("V3") / ("0" * 64 + ".json")).write_text(
+        (self.home / "verification" / "tickets" / ("0" * 64 + ".json")).write_text(
             json.dumps(doc, sort_keys=True, separators=(",", ":")), encoding="utf-8", newline=""
         )
         with self.assertRaises(stores.VerificationStoreError):
@@ -403,7 +417,7 @@ class TicketConsumptionTests(LedgerTestCase):
         first = self.controller.submit(report)
         second = self.controller.submit(report)
         self.assertEqual(first, second)
-        self.assertEqual(2, len(list(self.ticket_dir("V0").glob("*.json"))))
+        self.assertEqual(2, len(self.ticket_records("V0")))
         self.assertEqual("consumed", self.stored_by_gate()["V0"].status)
 
     def test_csm_4_a_second_different_report_cannot_take_a_consumed_ticket(self):
@@ -475,11 +489,7 @@ class TicketConsumptionTests(LedgerTestCase):
         # Deleting the issue record must not degrade to "no ticket, therefore
         # no constraint".
         self.honest_round()
-        for record in sorted(self.ticket_dir("V3").glob("*.json")):
-            doc = json.loads(record.read_text(encoding="utf-8"))
-            if doc["ticket_seq"] == 0:
-                record.unlink()
-                break
+        self.record_at_seq("V3", 0).unlink()
         with self.assertRaises(stores.VerificationStoreError):
             self.derive()
 
