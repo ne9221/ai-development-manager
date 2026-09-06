@@ -62,6 +62,16 @@ guards the suite did not actually depend on, masked by a guard one layer
 away, and the fix was a test that isolates them rather than a change to the
 production code.
 
+`repro/P11-CRASH-WINDOW.py` reproduces the Codex review finding that Phase B-2R's
+first cut of predicate 11 left open. The controller persists a report and appends
+the ticket's consumption record as two filesystem steps; a crash between them left
+the report durable and the ticket still `issued`, and admission only compared the
+consumed digest once a ticket said `consumed`. Measured before the fix:
+`persisted_reports=4`, all four tickets `issued`, derivation **ACCEPTED** with
+`invalidated_report_reasons=()`. After: **TICKET_NOT_CONSUMED**, and appending the
+missing consumption record afterwards accepts again — the window is recoverable,
+not terminal, which is what separates an interrupted round from a forged one.
+
 ## Provenance
 
 `PHASE-A-V3-ARCHITECTURE.md` is the **verbatim, unedited** final assistant

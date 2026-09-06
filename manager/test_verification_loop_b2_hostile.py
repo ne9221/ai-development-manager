@@ -22,6 +22,7 @@ from manager.verification_loop.bundle import finalize_bundle
 from manager.verification_loop.evaluator import evaluate
 from manager.verification_loop.fixtures import (
     BASE_SHA,
+    consumed_against,
     CANDIDATE_SHA,
     GOVERNANCE_DIGEST,
     fx_adm_false_dispatch,
@@ -67,8 +68,11 @@ def run(scenario, reports, tickets=None, **kwargs):
         scenario.bundle,
         reports,
         preflight=scenario.preflight,
-        tickets=tickets if tickets is not None else scenario.tickets_for(
-            *[(r.gate_id, r.round) for r in reports]
+        tickets=consumed_against(
+            tickets if tickets is not None else scenario.tickets_for(
+                *[(r.gate_id, r.round) for r in reports]
+            ),
+            reports,
         ),
         **kwargs,
     )

@@ -40,6 +40,7 @@ from manager.verification_loop.controller import VerificationController, rehydra
 from manager.verification_loop.evaluator import evaluate
 from manager.verification_loop.fixtures import (
     WORKTREE_GENERATION,
+    consumed_against,
     WORKTREE_LOCK_ID,
     fx_ledger_freeze_pane,
 )
@@ -555,6 +556,114 @@ class TicketConsumptionTests(LedgerTestCase):
             {reason for _key, reason in result.invalidated_report_reasons},
         )
 
+    # -- crash consistency between the store's two writes ----------------
+    #
+    # submit() persists the report and appends the ticket's consumption record
+    # as two separate filesystem steps. A crash between them leaves durable
+    # evidence that no ticket ever authorised, and reading "issued" as "not yet
+    # spent, therefore fine" let that state derive ACCEPTED with no invalidation
+    # reasons at all. reports.put() below is exactly the first of those two
+    # writes, so these tests reproduce the window rather than simulate it.
+
+    def crash_window(self, gates=LEDGER_GATES):
+        """Reports durable, consumption records never appended."""
+        self.issue()
+        for gate in gates:
+            self.controller.reports.put(self.scenario.report(gate))
+
+    def test_csm_11_a_persisted_report_whose_ticket_was_never_consumed_is_refused(self):
+        self.crash_window()
+        self.assertEqual(
+            len(LEDGER_GATES), len(self.controller.stored_reports(
+                self.scenario.execution.execution_id))
+        )
+        self.assertEqual(
+            {"issued"}, {t.status for t in self.controller.stored_tickets()}
+        )
+        result = self.derive()
+        self.assertNotEqual("ACCEPTED", result.acceptance_state)
+        self.assertEqual(
+            {"TICKET_NOT_CONSUMED"},
+            {reason for _key, reason in result.invalidated_report_reasons},
+        )
+
+    def test_csm_12_an_interrupted_round_recovers_when_consumption_is_appended(self):
+        # The window is recoverable, not terminal: replaying the missing append
+        # makes the same reports admissible. That is what separates an
+        # interrupted round from a forged one, and it is why this fails closed
+        # rather than invalidating the round outright.
+        self.crash_window()
+        self.assertNotEqual("ACCEPTED", self.derive().acceptance_state)
+
+        for gate in LEDGER_GATES:
+            report = self.scenario.report(gate)
+            self.controller.tickets.consume(
+                report.ticket_id, report_digest(report), "2026-09-06T00:00:05Z"
+            )
+        recovered = self.derive()
+        self.assertEqual(
+            "ACCEPTED", recovered.acceptance_state, recovered.invalidated_report_reasons
+        )
+        self.assertEqual((), recovered.invalidated_report_reasons)
+
+    def test_csm_13_a_partial_crash_refuses_only_the_unconsumed_gate(self):
+        # One gate left in the window, the rest answered properly. The run must
+        # not accept, and the reason must name the crash rather than something
+        # generic -- otherwise a real interruption is indistinguishable from a
+        # gate nobody ever ran.
+        self.issue()
+        for gate in ("V0", "V1", "V2"):
+            self.controller.submit(self.scenario.report(gate))
+        self.controller.reports.put(self.scenario.report("V3"))
+        result = self.derive()
+        self.assertNotEqual("ACCEPTED", result.acceptance_state)
+        self.assertEqual(
+            {"TICKET_NOT_CONSUMED"},
+            {reason for _key, reason in result.invalidated_report_reasons},
+        )
+
+    def test_csm_14_the_crash_guard_does_not_replace_the_digest_comparison(self):
+        # Both halves of predicate 11 have to hold independently. A ticket that
+        # is consumed but records the wrong digest must still be refused, and
+        # for the digest reason -- if the new status guard were doing this work
+        # the mismatch protection could rot away unnoticed.
+        scenario = self.scenario
+        reports = [scenario.report(gate) for gate in LEDGER_GATES]
+        wrong = tuple(
+            scenario.ticket(
+                report.gate_id,
+                status="consumed",
+                consumed_report_digest="0" * 64,
+                consumed_at="2026-09-06T00:00:01Z",
+                ticket_seq=1,
+            )
+            for report in reports
+        )
+        result = evaluate(
+            scenario.task, scenario.execution, scenario.bundle, reports,
+            preflight=scenario.preflight, tickets=wrong,
+        )
+        self.assertNotEqual("ACCEPTED", result.acceptance_state)
+        self.assertEqual(
+            {"REPORT_DIGEST_NOT_TICKET_CONSUMED"},
+            {reason for _key, reason in result.invalidated_report_reasons},
+        )
+
+    def test_csm_15_a_correctly_consumed_round_still_accepts(self):
+        # The control for all four above. A guard that also refused honest
+        # rounds would close the window by closing the loop.
+        scenario = self.scenario
+        reports = [scenario.report(gate) for gate in LEDGER_GATES]
+        result = evaluate(
+            scenario.task, scenario.execution, scenario.bundle, reports,
+            preflight=scenario.preflight,
+            tickets=consumed_against(
+                scenario.tickets_for(*[(r.gate_id, r.round) for r in reports]), reports
+            ),
+        )
+        self.assertEqual("ACCEPTED", result.acceptance_state)
+        self.assertEqual((), result.invalidated_report_reasons)
+
     def test_csm_10_two_conflicting_consumptions_invalidate_the_ticket(self):
         # csm_4 proves the outcome but not this mechanism: with both reports on
         # disk the duplicate-ticket guard rejects them first, so the fold could
@@ -610,7 +719,9 @@ class BaselineAttestationPrecedenceTests(unittest.TestCase):
         return evaluate(
             scenario.task, scenario.execution, scenario.bundle, reports,
             preflight=scenario.preflight,
-            tickets=scenario.tickets_for(*[(r.gate_id, r.round) for r in reports]),
+            tickets=consumed_against(
+                scenario.tickets_for(*[(r.gate_id, r.round) for r in reports]), reports
+            ),
         )
 
     def attesting(self, *signatures):
@@ -796,7 +907,9 @@ class CrossTaskEvidenceReuseTests(unittest.TestCase):
         # Tickets carry Task A's id, matching the reports exactly, so every
         # ticket-level check passes and only the report/execution comparison
         # is left standing.
-        tickets = self.a.tickets_for(*[(r.gate_id, r.round) for r in reports])
+        tickets = consumed_against(
+            self.a.tickets_for(*[(r.gate_id, r.round) for r in reports]), reports
+        )
         result = evaluate(
             self.b.task, self.b.execution, self.b.bundle, reports,
             preflight=self.b.preflight, tickets=tickets,
@@ -812,7 +925,9 @@ class CrossTaskEvidenceReuseTests(unittest.TestCase):
         result = evaluate(
             self.b.task, self.b.execution, self.b.bundle, reports,
             preflight=self.b.preflight,
-            tickets=self.b.tickets_for(*[(r.gate_id, r.round) for r in reports]),
+            tickets=consumed_against(
+                self.b.tickets_for(*[(r.gate_id, r.round) for r in reports]), reports
+            ),
         )
         self.assertEqual("ACCEPTED", result.acceptance_state)
 
@@ -891,7 +1006,9 @@ class ReportSelfContradictionTests(unittest.TestCase):
         return evaluate(
             self.scenario.task, self.scenario.execution, self.scenario.bundle, reports,
             preflight=self.scenario.preflight,
-            tickets=self.scenario.tickets_for(*[(r.gate_id, r.round) for r in reports]),
+            tickets=consumed_against(
+                self.scenario.tickets_for(*[(r.gate_id, r.round) for r in reports]), reports
+            ),
         )
 
     def test_sc_1_a_pass_carrying_failures_is_inadmissible(self):

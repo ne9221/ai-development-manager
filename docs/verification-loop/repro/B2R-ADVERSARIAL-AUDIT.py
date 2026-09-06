@@ -8,6 +8,11 @@ attacks themselves.
     export AI_MANAGER_HOME=/some/ephemeral/home
     PYTHONPATH=. python ADVERSARIAL_B2R.py <scratch-store-dir>
 
+Attacks that call ``evaluate()`` directly bind their tickets to their reports
+with ``consumed_against``. Predicate 11 requires a consumed ticket, so an
+unbound ticket makes every report inadmissible and the attack scores itself
+blocked without ever reaching the guard it claims to test.
+
 Every attack prints BLOCKED (fail-closed) or BYPASSED (the attack worked).
 Controls print ACCEPTS or BROKEN; a control that stops accepting means the
 loop was sealed shut rather than secured, which is a failure too.
@@ -24,7 +29,7 @@ from manager.verification_loop.bundle import finalize_bundle, report_digest
 from manager.verification_loop.classification import base_evidence
 from manager.verification_loop.controller import VerificationController
 from manager.verification_loop.evaluator import evaluate
-from manager.verification_loop.fixtures import fx_ledger_freeze_pane
+from manager.verification_loop.fixtures import consumed_against, fx_ledger_freeze_pane
 from manager.verification_loop.identity import Identity, ResolvedIdentity
 from manager.verification_loop.models import FailureObservation
 
@@ -300,7 +305,9 @@ def a8():
     outcome = evaluate(
         scenario.task, scenario.execution, scenario.bundle, reports,
         preflight=scenario.preflight,
-        tickets=scenario.tickets_for(*[(r.gate_id, r.round) for r in reports]),
+        tickets=consumed_against(
+            scenario.tickets_for(*[(r.gate_id, r.round) for r in reports]), reports
+        ),
     )
     evidence, reason = base_evidence(
         observation, scenario.execution, scenario.bundle, reports[3]
@@ -321,7 +328,9 @@ def a9():
     reports = [SC.report(gate) for gate in GATES]
     outcome = evaluate(
         other.task, other.execution, other.bundle, reports, preflight=other.preflight,
-        tickets=SC.tickets_for(*[(r.gate_id, r.round) for r in reports]),
+        tickets=consumed_against(
+            SC.tickets_for(*[(r.gate_id, r.round) for r in reports]), reports
+        ),
     )
     return outcome.acceptance_state
 
@@ -347,7 +356,9 @@ def a11():
     )
     outcome = evaluate(
         SC.task, SC.execution, SC.bundle, reports, preflight=SC.preflight,
-        tickets=SC.tickets_for(*[(r.gate_id, r.round) for r in reports]),
+        tickets=consumed_against(
+            SC.tickets_for(*[(r.gate_id, r.round) for r in reports]), reports
+        ),
     )
     return outcome.acceptance_state
 

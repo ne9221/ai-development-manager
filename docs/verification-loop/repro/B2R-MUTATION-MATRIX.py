@@ -63,10 +63,10 @@ MUTANTS = [
     ),
     (
         "M44", V + "admission.py",
-        '''        if ticket.consumed_report_digest != report_digest(report):
-            return "REPORT_DIGEST_NOT_TICKET_CONSUMED"''',
-        '''        if False:
-            return "REPORT_DIGEST_NOT_TICKET_CONSUMED"''',
+        '''    if ticket.consumed_report_digest != report_digest(report):
+        return "REPORT_DIGEST_NOT_TICKET_CONSUMED"''',
+        '''    if False:
+        return "REPORT_DIGEST_NOT_TICKET_CONSUMED"''',
         "test_csm_8_predicate_11_is_enforced_in_the_pure_evaluator_too",
         "predicate 11: the consumed digest is no longer compared",
     ),
@@ -145,6 +145,14 @@ MUTANTS = [
         "a ticket may claim consumption while naming no report",
     ),
     (
+        "M54", V + "admission.py",
+        '''    if ticket.status == "issued":''',
+        '''    if False and ticket.status == "issued":''',
+        "test_csm_11_a_persisted_report_whose_ticket_was_never_consumed_is_refused",
+        "predicate 11 as a positive requirement: the crash window between the "
+        "store's two writes stops failing closed",
+    ),
+    (
         "M53", V + "admission.py",
         '''        return "WORKTREE_LEASE_NOT_REPORTED"''',
         '''        pass''',
@@ -156,6 +164,25 @@ MUTANTS = [
 
 def sha(path):
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+
+def read_source(path):
+    """Newline-normalised source for matching, plus the exact bytes for restore.
+
+    Reading with ``read_text`` and writing back with ``newline=""`` silently
+    rewrites CRLF into LF. On a Windows checkout -- which is how this repository
+    is normally cloned -- that made every restore fail the sha256 assertion
+    below even though the content was identical, and rewrote the line endings of
+    files the run never meant to touch.
+
+    Both halves are needed and they are not the same string. Mutations are
+    written against LF source, so matching has to happen on normalised text or
+    every mutant silently reports NOT_APPLIED on a CRLF checkout; the restore
+    has to happen from the original bytes, or the file comes back subtly
+    different from the one that was read.
+    """
+    raw = pathlib.Path(path).read_bytes()
+    return raw.decode("utf-8").replace("\r\n", "\n"), raw
 
 
 def run_suite():
@@ -182,17 +209,21 @@ print("")
 summary = []
 for mid, relpath, find, repl, target, what in MUTANTS:
     path = ROOT / relpath
-    original = path.read_text(encoding="utf-8")
+    original, original_bytes = read_source(path)
+    crlf = b"\r\n" in original_bytes
     before = sha(path)
     if find not in original:
         summary.append((mid, "NOT_APPLIED", what, ""))
         print("%-5s NOT_APPLIED  %s" % (mid, what))
         continue
-    path.write_text(original.replace(find, repl, 1), encoding="utf-8", newline="")
+    mutated = original.replace(find, repl, 1)
+    if crlf:
+        mutated = mutated.replace("\r\n", "\n").replace("\n", "\r\n")
+    path.write_bytes(mutated.encode("utf-8"))
     try:
         code, failures, out = run_suite()
     finally:
-        path.write_text(original, encoding="utf-8", newline="")
+        path.write_bytes(original_bytes)
         assert sha(path) == before, "%s: %s not restored byte-for-byte" % (mid, relpath)
 
     hit = any(target in name for name in failures)

@@ -22,6 +22,7 @@ from manager.verification_loop.evaluator import (
     evaluate,
 )
 from manager.verification_loop.fixtures import (
+    consumed_against,
     fx_adm_false_dispatch,
     fx_ledger_freeze_pane,
     fx_ob_mobile_overflow,
@@ -40,9 +41,12 @@ def run(scenario, reports, tickets=None, **kwargs):
         scenario.bundle,
         reports,
         preflight=scenario.preflight,
-        tickets=tickets
-        if tickets is not None
-        else scenario.tickets_for(*[(r.gate_id, r.round) for r in reports]),
+        tickets=consumed_against(
+            tickets
+            if tickets is not None
+            else scenario.tickets_for(*[(r.gate_id, r.round) for r in reports]),
+            reports,
+        ),
         **kwargs,
     )
 

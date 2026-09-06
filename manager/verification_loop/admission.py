@@ -88,18 +88,31 @@ def admissibility_reason(
     # --- Ticket: was this round authorised before it was answered? ----------
     if ticket is None:
         return "NO_MATCHING_TICKET"
-    if ticket.status == "consumed":
-        # Phase A v3 predicate 11: a consumed ticket admits exactly the report
-        # whose digest it recorded at the moment it was answered, and no other.
-        # Comparing against the recorded digest rather than re-deciding "which
-        # report matches this ticket" is the whole point -- the second question
-        # has more than one answer once an attacker can add files.
-        if ticket.consumed_report_digest != report_digest(report):
-            return "REPORT_DIGEST_NOT_TICKET_CONSUMED"
-    elif ticket.status != "issued":
+    if ticket.status == "issued":
+        # Phase A v3 predicate 11 is a positive requirement, not a check that
+        # only runs once a ticket admits to having been answered. An issued
+        # ticket beside a persisted report is precisely the crash window: the
+        # controller writes the report and appends the consumption record as
+        # two filesystem steps, and a crash between them leaves durable
+        # evidence that no ticket ever authorised. Reading "issued" as "not yet
+        # spent, therefore fine" made that window derive ACCEPTED with no
+        # invalidation reasons at all.
+        #
+        # This is recoverable rather than terminal: appending the missing
+        # consumption record afterwards makes the same reports admissible,
+        # which is what distinguishes an interrupted round from a forged one.
+        return "TICKET_NOT_CONSUMED"
+    if ticket.status != "consumed":
         # "invalidated" is what two conflicting consumptions leave behind: one
         # ticket, two claimants, no trustworthy answer for either.
         return "TICKET_NOT_OPEN"
+    # A consumed ticket admits exactly the report whose digest it recorded at
+    # the moment it was answered, and no other. Comparing against the recorded
+    # digest rather than re-deciding "which report matches this ticket" is the
+    # whole point -- the second question has more than one answer once an
+    # attacker can add files.
+    if ticket.consumed_report_digest != report_digest(report):
+        return "REPORT_DIGEST_NOT_TICKET_CONSUMED"
     if ticket.execution_id != report.execution_id:
         return "TICKET_EXECUTION_MISMATCH"
     if ticket.candidate_sha != report.candidate_sha:

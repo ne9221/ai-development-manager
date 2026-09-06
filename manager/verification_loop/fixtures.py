@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Optional, Tuple
 
-from .bundle import finalize_bundle, oracle_digest
+from .bundle import finalize_bundle, oracle_digest, report_digest
 from .identity import Identity, ResolvedIdentity
 from .models import (
     AcceptanceBundleFixture,
@@ -189,6 +189,7 @@ class Scenario:
         return report
 
     def tickets_for(self, *pairs: Tuple[str, int]) -> Tuple[VerificationTicket, ...]:
+        """Issued tickets: a round that has been authorised but not answered."""
         return tuple(self.ticket(gate_id, round_) for gate_id, round_ in pairs)
 
 
@@ -214,6 +215,51 @@ def _baseline(**overrides: Any) -> BaselineAttestation:
         attested_by_report_digest="baseline-report-digest-1",
     )
     return replace(baseline, **overrides) if overrides else baseline
+
+
+def consumed_against(
+    tickets: Tuple[VerificationTicket, ...],
+    reports: Any,
+    consumed_at: str = "2026-09-06T00:00:01Z",
+) -> Tuple[VerificationTicket, ...]:
+    """Mark each issued ticket consumed by the report that claims it.
+
+    Admission requires a consumed ticket carrying the answering report's digest
+    (Phase A v3 predicate 11). A test handing ``evaluate()`` an issued ticket
+    beside a persisted report is therefore modelling the crash window -- a real
+    fail-closed state -- rather than an ordinary answered round, and every such
+    test would reject on ``TICKET_NOT_CONSUMED`` before reaching whatever it
+    meant to prove.
+
+    Binding is by ``ticket_id``, so a report forged to point somewhere else
+    still finds no ticket, and a ticket forged in any field keeps that field and
+    merely becomes answered. That is what preserves single-factor discipline:
+    the forged field stays the only difference between the test and its control.
+
+    Tickets already consumed or invalidated are left exactly as they are, so a
+    test that deliberately constructs a wrong ``consumed_report_digest`` still
+    gets to make its point.
+    """
+    by_ticket_id = {}
+    for report in reports:
+        by_ticket_id.setdefault(report.ticket_id, report)
+
+    bound = []
+    for ticket in tickets:
+        report = by_ticket_id.get(ticket.ticket_id)
+        if ticket.status != "issued" or report is None:
+            bound.append(ticket)
+            continue
+        bound.append(
+            replace(
+                ticket,
+                status="consumed",
+                consumed_report_digest=report_digest(report),
+                consumed_at=consumed_at,
+                ticket_seq=1,
+            )
+        )
+    return tuple(bound)
 
 
 # ---------------------------------------------------------------------------
