@@ -45,6 +45,23 @@ the `ticket_id` inside them rather than by any filename convention. An earlier
 version assumed the layout, silently matched nothing after the ledger changed
 shape, and scored four attacks as bypasses that had never touched a byte.
 
+`repro/B2R-MUTATION-MATRIX.py` is the Phase B-2R mutation matrix: thirteen
+mutants, each neutralising exactly one guard the repair added, each with a
+**named target test** that must be among the failures. A mutant killed by some
+unrelated test elsewhere says nothing about whether the guard is under test,
+which is the vacuity trap both earlier reviews found; this harness scores that
+case as `KILLED_WRONG_REASON`, not as a kill. It also reports `NOT_APPLIED`
+when a mutation's search text is absent, counts a crash as a kill, and
+sha256-verifies every mutated file is restored byte-for-byte before the next
+mutant runs.
+
+Measured at the B-2R HEAD: **13/13 killed by their named target, 0 survived,
+0 not applied, 0 killed for the wrong reason.** Two of the thirteen survived
+the first run and are worth reading about in the commit history: both were
+guards the suite did not actually depend on, masked by a guard one layer
+away, and the fix was a test that isolates them rather than a change to the
+production code.
+
 ## Provenance
 
 `PHASE-A-V3-ARCHITECTURE.md` is the **verbatim, unedited** final assistant

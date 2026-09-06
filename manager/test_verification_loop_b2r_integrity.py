@@ -45,7 +45,10 @@ from manager.verification_loop.fixtures import (
 )
 from manager.verification_loop.identity import Identity, ResolvedIdentity
 from manager.verification_loop.models import FailureObservation, VerificationReportFixture
-from manager.verification_loop.tickets import derive_ticket_id
+from manager.verification_loop.tickets import (
+    derive_ticket_id,
+    ticket_self_consistency_reason,
+)
 
 LEDGER_GATES = ("V0", "V1", "V2", "V3")
 
@@ -526,17 +529,60 @@ class TicketConsumptionTests(LedgerTestCase):
         )
 
     def test_csm_9_a_ticket_claiming_consumption_without_a_digest_is_self_refuting(self):
+        # The reason matters, not only the refusal. A self-refuting ticket is
+        # dropped by index_tickets and stops existing, so its reports report
+        # NO_MATCHING_TICKET; without that guard the ticket would survive and
+        # be refused one layer later by predicate 11. Both fail closed, so
+        # asserting only "not ACCEPTED" left the guard untested -- mutation
+        # M52 survived the first matrix run for exactly that reason.
         scenario = self.scenario
         reports = [scenario.report(gate) for gate in LEDGER_GATES]
         tickets = tuple(
             scenario.ticket(report.gate_id, status="consumed", ticket_seq=1)
             for report in reports
         )
+        self.assertEqual(
+            "TICKET_CONSUMED_WITHOUT_DIGEST",
+            ticket_self_consistency_reason(tickets[0]),
+        )
         result = evaluate(
             scenario.task, scenario.execution, scenario.bundle, reports,
             preflight=scenario.preflight, tickets=tickets,
         )
         self.assertNotEqual("ACCEPTED", result.acceptance_state)
+        self.assertEqual(
+            {"NO_MATCHING_TICKET"},
+            {reason for _key, reason in result.invalidated_report_reasons},
+        )
+
+    def test_csm_10_two_conflicting_consumptions_invalidate_the_ticket(self):
+        # csm_4 proves the outcome but not this mechanism: with both reports on
+        # disk the duplicate-ticket guard rejects them first, so the fold could
+        # pick a winner and nothing would notice (mutation M45 survived on
+        # exactly that masking). Here the losing report is deleted, which is
+        # what an attacker would do, leaving the ticket ledger as the only
+        # remaining evidence that two answers were given.
+        self.issue()
+        for gate in ("V0", "V1", "V2"):
+            self.controller.submit(self.scenario.report(gate))
+        passing = self.scenario.report("V3")
+        failing = self.scenario.report(
+            "V3", result="FAIL", failure_observations=(self.fx["freeze_pane_failure"],)
+        )
+        self.controller.submit(passing)
+        failing_digest = self.controller.submit(failing)
+        self.report_path(failing_digest).unlink()
+
+        ticket = {t.gate_id: t for t in self.controller.stored_tickets()}["V3"]
+        self.assertEqual("invalidated", ticket.status)
+        self.assertIsNone(ticket.consumed_report_digest)
+
+        result = self.derive()
+        self.assertNotEqual("ACCEPTED", result.acceptance_state)
+        self.assertIn(
+            "TICKET_NOT_OPEN",
+            {reason for _key, reason in result.invalidated_report_reasons},
+        )
 
 
 # ---------------------------------------------------------------------------
