@@ -20,7 +20,9 @@ closes it.
 | B-1 independent review | [PHASE-B1-INDEPENDENT-REVIEW-CHANGES-REQUIRED.md](PHASE-B1-INDEPENDENT-REVIEW-CHANGES-REQUIRED.md) | `CHANGES_REQUIRED` |
 | B-1R repair | commit `62b403b` | — |
 | B-1R independent re-review | [PHASE-B1R-INDEPENDENT-REVIEW-ACCEPTED.md](PHASE-B1R-INDEPENDENT-REVIEW-ACCEPTED.md) | `PHASE_B1_ACCEPTED` |
-| B-2 implementation | this branch | pending independent review |
+| B-2 implementation | commit `794db70` | — |
+| B-2 independent review | [PHASE-B2-INDEPENDENT-REVIEW-CHANGES-REQUIRED.md](PHASE-B2-INDEPENDENT-REVIEW-CHANGES-REQUIRED.md) | `CHANGES_REQUIRED` |
+| B-2R repair | this branch | pending focused independent re-review |
 
 ## Provenance
 
@@ -32,8 +34,13 @@ message index 93. It was extracted programmatically and **not** rewritten,
 summarised, corrected or re-scoped. Where Phase B-1/B-1R deviate from it, the
 deviation is recorded in the review documents, never by editing this file.
 
-The two review files are likewise the verbatim final verdict messages of their
-respective review sessions (`f22f728a-…` index 250, `3baee210-…` index 389).
+The three review files are likewise the verbatim final verdict messages of
+their respective review sessions (`f22f728a-…` index 250, `3baee210-…` index
+389, `b73955eb-3926-4931-bbfc-3c9c9dfd7a62` index 474). Verbatim means
+verbatim: the B-2 file's closing line is the reviewer's conversational offer
+to publish, kept rather than trimmed, because an implementer editing a
+reviewer's verdict — even to tidy it — is the thing this directory exists to
+make impossible.
 
 Recorded digests (sha256 of the file bytes as committed):
 
@@ -42,6 +49,7 @@ Recorded digests (sha256 of the file bytes as committed):
 | `PHASE-A-V3-ARCHITECTURE.md` | 46055 | `2c5dc883a7039de60433f73f187a063babad8db8071cf875b778bce81df7903c` |
 | `PHASE-B1-INDEPENDENT-REVIEW-CHANGES-REQUIRED.md` | 9327 | `8462d21a7d8523ad02e7ffa224b2553045c79a780e9232f92a699ae242cb950a` |
 | `PHASE-B1R-INDEPENDENT-REVIEW-ACCEPTED.md` | 5028 | `adbf856eeba391386266bce1516c27b2d1c5cde71dac7d552d73b69cfa9ed7c0` |
+| `PHASE-B2-INDEPENDENT-REVIEW-CHANGES-REQUIRED.md` | 11300 | `59f9b6607b479dda8c1ea29894a8a491f6bc8d5406778bbd7a250596908a8a02` |
 
 ## Governance sources these documents are bound to
 
