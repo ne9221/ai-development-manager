@@ -1079,6 +1079,35 @@ class ProductionBoundaryTests(unittest.TestCase):
         self.assertEqual("ROUTE_TO_PFP", result.next_action)
         self.assertEqual("DEFERRED_TO_PFP", result.acceptance_state)
 
+    def test_37e_a_production_write_gate_this_tier_did_not_require_still_routes(self):
+        # Found in self-review: the production-write check originally looked
+        # only at the required set, so a production-write gate the current tier
+        # happened not to require could be reported on without tripping the
+        # boundary. Its PASS could not fill a required slot -- so this was not a
+        # false-complete -- but a report about a production write is itself the
+        # signal that this loop must not be the one deciding.
+        scenario = rebundle(
+            self.fx["ordinary"],
+            gate_requirements_by_risk={"low": ("V0",), "medium": ("V0",)},
+            checkers={
+                "V0": self.fx["ordinary"].bundle.checkers["V0"],
+                "V1": replace(
+                    self.fx["ordinary"].bundle.checkers["V1"],
+                    production_write=True,
+                    environment="production",
+                ),
+            },
+        )
+        result = run(scenario, [scenario.report(g) for g in ADM_GATES])
+        self.assertEqual(("V0",), result.required_gates)
+        self.assertEqual("ROUTE_TO_PFP", result.next_action)
+        self.assertEqual("DEFERRED_TO_PFP", result.acceptance_state)
+
+    def test_37f_an_ordinary_gate_set_is_unaffected_by_that_widening(self):
+        # Control for 37e: widening the check must not route every run to PFP.
+        result = run(self.fx["ordinary"], [self.fx["ordinary"].report(g) for g in ADM_GATES])
+        self.assertEqual("ACCEPTED", result.acceptance_state)
+
     def test_37d_a_checker_reporting_deferred_to_pfp_is_never_a_pass(self):
         scenario = self.fx["ordinary"]
         reports = [scenario.report("V0"), scenario.report("V1", result="DEFERRED_TO_PFP")]

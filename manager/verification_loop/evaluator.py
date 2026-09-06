@@ -338,8 +338,6 @@ def evaluate(
         admitted.add("UNKNOWN")
 
     required = required_gates(bundle, risk)
-    if risk == "production" or production_write_gates(bundle, required):
-        admitted.add("PRODUCTION_SCOPE_VIOLATION")
 
     tickets_by_id, _rejected_tickets = index_tickets(tickets)
     admissible, invalidated, round_invalidated = _partition_reports(
@@ -347,6 +345,16 @@ def evaluate(
     )
 
     latest_by_gate, duplicate_gates = _latest_admissible_by_gate(admissible)
+
+    # Phase A v3 I5. Checked across every gate that was *answered*, not only
+    # the ones this tier requires: a production-write gate the current tier
+    # happens not to require would otherwise be reportable without ever
+    # tripping the boundary. Its PASS could not fill a required slot, so it
+    # was not a false-complete -- but a report about a production write is
+    # itself the signal that this loop must not be the one deciding.
+    answered_gates = set(required) | set(latest_by_gate) | duplicate_gates
+    if risk == "production" or production_write_gates(bundle, sorted(answered_gates)):
+        admitted.add("PRODUCTION_SCOPE_VIOLATION")
 
     missing_required: List[str] = []
     satisfied: List[str] = []
