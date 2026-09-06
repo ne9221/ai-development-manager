@@ -1,283 +1,413 @@
-"""The three required false-complete fixtures (Phase B-1 spec section F).
-
-Each builder returns a dict of named scenario ingredients rather than a
-single case, so a test can combine them into the "before" and "after"
-moments the spec calls out (e.g. V3 missing vs. V3 failing vs. the contract
-having no clause for the defect yet).
+"""The three required false-complete fixtures, plus single-factor builders.
 
 Nothing here talks to a real provider, Excel, Drive, GitHub, screenshot or
-Session Center -- every one of those surfaces is represented purely as
-fixture data (evidence_source, identity_resolution, coverage_dimensions).
+Session Center. Every one of those surfaces is fixture data, which is the point:
+the admission and classification logic has to be provable before any real
+checker exists to be trusted or distrusted.
+
+``Scenario.report()`` and ``Scenario.ticket()`` produce a *fully valid* record
+by default and apply overrides on top. That is a test-integrity property, not a
+convenience. The Phase B-1 review found attack test 05 (mixed SHA) was vacuous
+because its report differed from the execution in two ways at once -- so the
+test still passed when the SHA check was mutated away, since the identity check
+was catching it instead. Builders that are valid by construction make a
+one-field override genuinely single-factor, so a test that claims to prove the
+SHA binding actually depends on it.
+
+The B-1R re-review left one such wart open as a residual: FX-ADM-FALSE-DISPATCH's
+production execution used a different ``execution_id`` from its reports, so
+every report was rejected on lineage before the production routing was reached.
+That is fixed here -- the production variant now shares the execution's id, so
+the routing is proven by production risk alone.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
+from typing import Any, Optional, Tuple
+
+from .bundle import finalize_bundle, oracle_digest
+from .identity import Identity, ResolvedIdentity
 from .models import (
     AcceptanceBundleFixture,
+    BaselineAttestation,
+    Budget,
+    CheckerSpec,
+    ComponentRule,
+    EnvironmentFingerprint,
     ExecutionFixture,
     FailureObservation,
+    FrozenOracle,
+    ImpactRule,
+    PreflightFacts,
     RiskRule,
     TaskFixture,
     VerificationReportFixture,
+    VerificationTicket,
+)
+from .risk import COMPONENT_PRODUCTION_CHECKOUT, COMPONENT_PRODUCTION_HOME
+from .tickets import derive_ticket_id
+
+GOVERNANCE_URI = "gdrive://1vSX5BiBgqLcgZQP1OKy_31yCZMlBS9Bdb_MpuSmSYrU"
+GOVERNANCE_VERSION = "0.5.0"
+GOVERNANCE_DIGEST = "gov-digest-v0-5-0"
+
+ENV = EnvironmentFingerprint(
+    os="win32", python="3.14.7", checkout_path_length=128, ai_manager_home_class="ephemeral"
 )
 
+# Three distinct actors. The executor and the checker differ in all three
+# fields, so "executor is not the checker" is a property of the data rather
+# than something a test has to force.
+EXECUTOR = ResolvedIdentity(
+    Identity("codex", "acct-executor", "sess-exec-1"), "classified", "high", "deterministic_signal"
+)
+CHECKER = ResolvedIdentity(
+    Identity("claude", "acct-checker", "sess-check-1"), "classified", "high", "deterministic_signal"
+)
+CONTROLLER = ResolvedIdentity(
+    Identity("adm", "acct-controller", "sess-ctl-1"), "classified", "high", "deterministic_signal"
+)
 
-def _pass_report(execution_id, gate_id, bundle, round_=1, dimensions=()):
-    identity, version = bundle.checker_identities[gate_id]
-    return VerificationReportFixture(
-        execution_id=execution_id,
-        gate_id=gate_id,
-        round=round_,
-        candidate_sha="sha-candidate-1",
-        base_sha="sha-base-1",
-        bundle_hash=bundle.bundle_hash,
-        checker_identity=identity,
-        checker_version=version,
-        evidence_source="independent_check",
-        identity_resolution="resolved",
-        result="PASS",
-        coverage_dimensions=dimensions,
+CANDIDATE_SHA = "a" * 40
+BASE_SHA = "b" * 40
+
+
+def checker_spec(gate_id: str, **overrides: Any) -> CheckerSpec:
+    spec = CheckerSpec(
+        checker_id=gate_id.lower() + "_checker",
+        checker_version="1.0.0",
+        checker_impl_digest="impl-" + gate_id.lower() + "-1",
     )
+    return replace(spec, **overrides) if overrides else spec
+
+
+@dataclass(frozen=True)
+class Scenario:
+    """One coherent (task, execution, bundle, preflight) world plus builders."""
+
+    task: TaskFixture
+    execution: ExecutionFixture
+    bundle: AcceptanceBundleFixture
+    preflight: PreflightFacts
+    executor: ResolvedIdentity = EXECUTOR
+    checker: ResolvedIdentity = CHECKER
+    controller: ResolvedIdentity = CONTROLLER
+
+    def ticket(self, gate_id: str, round_: int = 1, **overrides: Any) -> VerificationTicket:
+        ticket = VerificationTicket(
+            ticket_id="",
+            task_id=self.task.task_id,
+            execution_id=self.execution.execution_id,
+            candidate_sha=self.execution.candidate_sha,
+            base_sha=self.execution.base_sha,
+            bundle_hash=self.bundle.bundle_hash,
+            gate_id=gate_id,
+            round=round_,
+            issued_by=self.controller,
+            expected_checker_identity=self.checker,
+            forbidden_identity=self.executor,
+            candidate_head_at_issue=self.execution.candidate_sha,
+            worktree_lock_id="repo-" + self.execution.execution_id,
+            worktree_generation=1,
+            issued_at="2026-09-06T00:00:00Z",
+        )
+        explicit_id = overrides.pop("ticket_id", None)
+        if overrides:
+            ticket = replace(ticket, **overrides)
+        # Derived last, from the final field values, so an override of (say)
+        # the round produces a coherent ticket rather than a self-inconsistent
+        # one -- unless the test is deliberately forging the id.
+        ticket = replace(
+            ticket,
+            ticket_id=explicit_id
+            if explicit_id is not None
+            else derive_ticket_id(
+                ticket.execution_id,
+                ticket.candidate_sha,
+                ticket.bundle_hash,
+                ticket.gate_id,
+                ticket.round,
+            ),
+        )
+        return ticket
+
+    def report(
+        self,
+        gate_id: str,
+        round_: int = 1,
+        result: str = "PASS",
+        **overrides: Any,
+    ) -> VerificationReportFixture:
+        spec = self.bundle.checkers.get(gate_id) or checker_spec(gate_id)
+        report = VerificationReportFixture(
+            execution_id=self.execution.execution_id,
+            task_id=self.task.task_id,
+            ticket_id="",
+            gate_id=gate_id,
+            round=round_,
+            candidate_sha=self.execution.candidate_sha,
+            base_sha=self.execution.base_sha,
+            bundle_hash=self.bundle.bundle_hash,
+            deliverable_sha=self.task.deliverable_sha,
+            checker_id=spec.checker_id,
+            checker_version=spec.checker_version,
+            checker_impl_digest=spec.checker_impl_digest,
+            producer_identity=self.checker,
+            evidence_source="checker_produced_replayable",
+            result=result,
+            environment_fingerprint=self.preflight.environment_fingerprint,
+            worktree_head_before=self.execution.candidate_sha,
+            worktree_head_after=self.execution.candidate_sha,
+            governance_digest=self.bundle.governance_digest,
+            # Declared in full by default, so a coverage-gap test has to
+            # narrow it deliberately rather than benefit from an omission.
+            coverage_dimensions=tuple(self.bundle.gate_required_dimensions.get(gate_id, ())),
+            oracle_set_digest=oracle_digest(self.bundle, gate_id),
+        )
+        explicit_id = overrides.pop("ticket_id", None)
+        if overrides:
+            report = replace(report, **overrides)
+        report = replace(
+            report,
+            ticket_id=explicit_id
+            if explicit_id is not None
+            else derive_ticket_id(
+                report.execution_id,
+                report.candidate_sha,
+                report.bundle_hash,
+                report.gate_id,
+                report.round,
+            ),
+        )
+        return report
+
+    def tickets_for(self, *pairs: Tuple[str, int]) -> Tuple[VerificationTicket, ...]:
+        return tuple(self.ticket(gate_id, round_) for gate_id, round_ in pairs)
+
+
+def _preflight(**overrides: Any) -> PreflightFacts:
+    facts = PreflightFacts(
+        worktree_path="/scratch/isolated-worktree",
+        worktree_head=CANDIDATE_SHA,
+        ai_manager_home="/scratch/ephemeral-home",
+        ai_manager_home_class="ephemeral",
+        governance_digest_measured=GOVERNANCE_DIGEST,
+        environment_fingerprint=ENV,
+    )
+    return replace(facts, **overrides) if overrides else facts
+
+
+def _baseline(**overrides: Any) -> BaselineAttestation:
+    baseline = BaselineAttestation(
+        base_sha=BASE_SHA,
+        environment_fingerprint=ENV,
+        known_baseline_failures=(),
+        attested_by_report_digest="baseline-report-digest-1",
+    )
+    return replace(baseline, **overrides) if overrides else baseline
 
 
 # ---------------------------------------------------------------------------
 # Fixture 1: FX-LEDGER-FREEZE-PANE
+# The suite is green because it never asserted the frozen panes at all.
 # ---------------------------------------------------------------------------
 
+
 def fx_ledger_freeze_pane():
-    task = TaskFixture(
-        task_id="ledger-freeze-pane",
-        declared_risk="medium",
-        deliverable_sha="sha-candidate-1",
-        acceptance_bundle_ref="bundle-freeze-pane",
+    golden = FrozenOracle(
+        oracle_id="ORA-ART-STRUCT",
+        role="golden",
+        members=(("tests/golden/workbook-descriptor.json", "sha-golden-1"),),
     )
-    execution = ExecutionFixture(
-        execution_id="exec-freeze-pane-1",
-        task_id=task.task_id,
-        base_sha="sha-base-1",
-        candidate_sha="sha-candidate-1",
-        diff_paths=("tools/xlsx_template_render.py",),
-        status="completed",
-        executor_identity="codex-impl",
-    )
-    checker_identities = {
-        "V0": ("unit_checker", "1.0"),
-        "V1": ("lint_checker", "1.0"),
-        "V2": ("integration_checker", "1.0"),
-        "V3": ("excel_visual_checker", "1.0"),
-    }
     common = dict(
-        governance_digest="gov-digest-1",
+        bundle_id="ab-ledger",
+        bundle_version="1.4.0",
+        governance_source_uri=GOVERNANCE_URI,
+        governance_version=GOVERNANCE_VERSION,
+        governance_digest=GOVERNANCE_DIGEST,
         gate_requirements_by_risk={
             "low": ("V0",),
             "medium": ("V0", "V1"),
             "high": ("V0", "V1", "V2"),
             "artifact_sensitive": ("V0", "V1", "V2", "V3"),
         },
-        checker_identities=checker_identities,
-        risk_rules=(RiskRule("tools/xlsx_template_render.py", "artifact_sensitive"),),
+        checkers={
+            "V0": checker_spec("V0"),
+            "V1": checker_spec("V1"),
+            "V2": checker_spec("V2"),
+            "V3": checker_spec("V3"),
+        },
+        frozen_oracles=(golden,),
+        gate_oracle_refs={"V3": "ORA-ART-STRUCT"},
+        risk_rules=(RiskRule("manager/artifact", "artifact_sensitive"),),
+        component_escalation_rules=(
+            ComponentRule(COMPONENT_PRODUCTION_CHECKOUT, "production"),
+            ComponentRule(COMPONENT_PRODUCTION_HOME, "production"),
+        ),
+        impact_rules=(ImpactRule("manager/artifact", ("V1", "V2", "V3")),),
+        impact_always_rerun=("V0",),
+        baseline=_baseline(),
+        budget=Budget(),
     )
-    # Distinct hashes: a Frozen Acceptance Bundle is content-addressed, so a
-    # different contract-clause set (the whole point of OPEN_BUNDLE_REVISION)
-    # is a different bundle, never the same hash with silently different
-    # contents.
-    bundle_without_clause = AcceptanceBundleFixture(
-        bundle_hash="bundle-freeze-pane-hash-rev1-no-clause", gate_contract_clauses={}, **common
-    )
-    bundle_with_clause = AcceptanceBundleFixture(
-        bundle_hash="bundle-freeze-pane-hash-rev2-with-clause",
+    # Two distinct bundles, not one bundle mutated: a different clause set is a
+    # different contract, and a content-addressed bundle makes that structural
+    # rather than a matter of discipline.
+    bundle_without_clause = finalize_bundle(gate_contract_clauses={}, **common)
+    bundle_with_clause = finalize_bundle(
         gate_contract_clauses={"V3": ("freeze_pane_mismatch",)}, **common
     )
 
-    def reports_v0_v1_v2_pass(bundle):
-        return [
-            _pass_report(execution.execution_id, "V0", bundle),
-            _pass_report(execution.execution_id, "V1", bundle),
-            _pass_report(execution.execution_id, "V2", bundle),
-        ]
-
-    def v3_fail_report(bundle):
-        identity, version = bundle.checker_identities["V3"]
-        return VerificationReportFixture(
-            execution_id=execution.execution_id,
-            gate_id="V3",
-            round=1,
-            candidate_sha="sha-candidate-1",
-            base_sha="sha-base-1",
-            bundle_hash=bundle.bundle_hash,
-            checker_identity=identity,
-            checker_version=version,
-            evidence_source="independent_render",
-            identity_resolution="resolved",
-            result="FAIL",
-            failure_observations=(FailureObservation(signature="freeze_pane_mismatch"),),
+    def scenario(bundle: AcceptanceBundleFixture) -> Scenario:
+        task = TaskFixture(
+            task_id="T-LED-01",
+            declared_risk="medium",
+            deliverable_sha=CANDIDATE_SHA,
+            acceptance_bundle_ref=bundle.bundle_id,
         )
+        execution = ExecutionFixture(
+            execution_id="E-LED-01",
+            task_id=task.task_id,
+            base_sha=BASE_SHA,
+            candidate_sha=CANDIDATE_SHA,
+            diff_paths=("manager/artifact/workbook_writer.py",),
+            status="completed",
+            acceptance_bundle_ref=bundle.bundle_id,
+            executor_identity=EXECUTOR,
+        )
+        return Scenario(task=task, execution=execution, bundle=bundle, preflight=_preflight())
 
     return {
-        "task": task,
-        "execution": execution,
         "bundle_without_clause": bundle_without_clause,
         "bundle_with_clause": bundle_with_clause,
-        "reports_v0_v1_v2_pass": reports_v0_v1_v2_pass,
-        "v3_fail_report": v3_fail_report,
+        "scenario": scenario,
+        "freeze_pane_failure": FailureObservation(
+            signature="freeze_pane_mismatch",
+            base_result="PASS",
+        ),
     }
 
 
 # ---------------------------------------------------------------------------
 # Fixture 2: FX-OB-MOBILE-OVERFLOW
+# Desktop DOM is green; the mobile viewport was never measured.
 # ---------------------------------------------------------------------------
 
+
 def fx_ob_mobile_overflow():
-    task = TaskFixture(
-        task_id="ob-mobile-overflow",
-        declared_risk="high",
-        deliverable_sha="sha-candidate-1",
-        acceptance_bundle_ref="bundle-mobile-overflow",
-    )
-    execution = ExecutionFixture(
-        execution_id="exec-mobile-overflow-1",
-        task_id=task.task_id,
-        base_sha="sha-base-1",
-        candidate_sha="sha-candidate-1",
-        diff_paths=("Dashboard/dashboard.css",),
-        status="completed",
-        executor_identity="codex-impl",
-    )
-    checker_identities = {
-        "V0": ("unit_checker", "1.0"),
-        "V1": ("lint_checker", "1.0"),
-        "V2": ("responsive_visual_checker", "1.0"),
-    }
-    bundle = AcceptanceBundleFixture(
-        bundle_hash="bundle-mobile-overflow-hash-1",
-        governance_digest="gov-digest-1",
+    bundle = finalize_bundle(
+        bundle_id="ab-obsidian",
+        bundle_version="1.0.0",
+        governance_source_uri=GOVERNANCE_URI,
+        governance_version=GOVERNANCE_VERSION,
+        governance_digest=GOVERNANCE_DIGEST,
         gate_requirements_by_risk={
             "low": ("V0",),
             "medium": ("V0", "V1"),
             "high": ("V0", "V1", "V2"),
         },
-        checker_identities=checker_identities,
-        gate_required_dimensions={"V2": ("desktop", "mobile")},
+        checkers={"V0": checker_spec("V0"), "V1": checker_spec("V1"), "V2": checker_spec("V2")},
+        gate_required_dimensions={
+            "V2": ("viewport:desktop-1440", "viewport:tablet-768", "viewport:mobile-375")
+        },
         gate_contract_clauses={"V2": ("mobile_overflow",)},
+        component_escalation_rules=(
+            ComponentRule(COMPONENT_PRODUCTION_CHECKOUT, "production"),
+            ComponentRule(COMPONENT_PRODUCTION_HOME, "production"),
+        ),
+        baseline=_baseline(),
+        budget=Budget(),
     )
-
-    reports_v0_v1_pass = [
-        _pass_report(execution.execution_id, "V0", bundle),
-        _pass_report(execution.execution_id, "V1", bundle),
-    ]
-
-    v2_pass_desktop_only = VerificationReportFixture(
-        execution_id=execution.execution_id,
-        gate_id="V2",
-        round=1,
-        candidate_sha="sha-candidate-1",
-        base_sha="sha-base-1",
-        bundle_hash=bundle.bundle_hash,
-        checker_identity="responsive_visual_checker",
-        checker_version="1.0",
-        evidence_source="independent_render",
-        identity_resolution="resolved",
-        result="PASS",
-        coverage_dimensions=("desktop",),
+    task = TaskFixture(
+        task_id="T-OB-01",
+        declared_risk="high",
+        deliverable_sha=CANDIDATE_SHA,
+        acceptance_bundle_ref=bundle.bundle_id,
     )
-
-    def v2_report_full_coverage(result, failure_observations=()):
-        return VerificationReportFixture(
-            execution_id=execution.execution_id,
-            gate_id="V2",
-            round=2,
-            candidate_sha="sha-candidate-1",
-            base_sha="sha-base-1",
-            bundle_hash=bundle.bundle_hash,
-            checker_identity="responsive_visual_checker",
-            checker_version="1.0",
-            evidence_source="independent_render",
-            identity_resolution="resolved",
-            result=result,
-            coverage_dimensions=("desktop", "mobile"),
-            failure_observations=failure_observations,
-        )
-
+    execution = ExecutionFixture(
+        execution_id="E-OB-01",
+        task_id=task.task_id,
+        base_sha=BASE_SHA,
+        candidate_sha=CANDIDATE_SHA,
+        diff_paths=("dashboard/home.css",),
+        status="completed",
+        acceptance_bundle_ref=bundle.bundle_id,
+        executor_identity=EXECUTOR,
+    )
+    scenario = Scenario(task=task, execution=execution, bundle=bundle, preflight=_preflight())
     return {
-        "task": task,
-        "execution": execution,
-        "bundle": bundle,
-        "reports_v0_v1_pass": reports_v0_v1_pass,
-        "v2_pass_desktop_only": v2_pass_desktop_only,
-        "v2_report_full_coverage": v2_report_full_coverage,
+        "scenario": scenario,
+        "overflow_failure": FailureObservation(
+            signature="mobile_overflow",
+            base_result="PASS",
+        ),
     }
 
 
 # ---------------------------------------------------------------------------
 # Fixture 3: FX-ADM-FALSE-DISPATCH
+# HTTP 200, a listening port, a generated prompt file and the executor's own
+# tests_status -- none of which is evidence that a provider actually started.
 # ---------------------------------------------------------------------------
 
+
 def fx_adm_false_dispatch():
-    task = TaskFixture(
-        task_id="adm-false-dispatch",
-        declared_risk="medium",
-        deliverable_sha="sha-candidate-1",
-        acceptance_bundle_ref="bundle-false-dispatch",
-    )
-    execution_non_production = ExecutionFixture(
-        execution_id="exec-false-dispatch-1",
-        task_id=task.task_id,
-        base_sha="sha-base-1",
-        candidate_sha="sha-candidate-1",
-        diff_paths=("manager/dispatch_helpers.py",),
-        status="completed",
-        executor_identity="codex-impl",
-    )
-    execution_production = ExecutionFixture(
-        execution_id="exec-false-dispatch-2",
-        task_id=task.task_id,
-        base_sha="sha-base-1",
-        candidate_sha="sha-candidate-1",
-        diff_paths=("manager/execution_runner.py",),
-        status="completed",
-        executor_identity="codex-impl",
-    )
-    checker_identities = {
-        "V0": ("unit_checker", "1.0"),
-        "V1": ("session_center_checker", "1.0"),
-    }
-    bundle = AcceptanceBundleFixture(
-        bundle_hash="bundle-false-dispatch-hash-1",
-        governance_digest="gov-digest-1",
-        gate_requirements_by_risk={
-            "low": ("V0",),
-            "medium": ("V0", "V1"),
+    common = dict(
+        bundle_id="ab-adm",
+        bundle_version="1.0.0",
+        governance_source_uri=GOVERNANCE_URI,
+        governance_version=GOVERNANCE_VERSION,
+        governance_digest=GOVERNANCE_DIGEST,
+        gate_requirements_by_risk={"low": ("V0",), "medium": ("V0", "V1")},
+        checkers={
+            "V0": checker_spec("V0"),
+            "V1": checker_spec("V1", retryable=True, transient_code_allowlist=("IO_TIMEOUT",)),
         },
-        checker_identities=checker_identities,
         risk_rules=(RiskRule("manager/execution_runner.py", "production"),),
+        component_escalation_rules=(
+            ComponentRule(COMPONENT_PRODUCTION_CHECKOUT, "production"),
+            ComponentRule(COMPONENT_PRODUCTION_HOME, "production"),
+        ),
+        baseline=_baseline(),
+        budget=Budget(),
     )
+    bundle = finalize_bundle(**common)
 
-    report_v0_pass = _pass_report(execution_non_production.execution_id, "V0", bundle)
+    def _scenario(execution_id: str, diff_paths, preflight: Optional[PreflightFacts] = None):
+        task = TaskFixture(
+            task_id="T-ADM-01",
+            declared_risk="medium",
+            deliverable_sha=CANDIDATE_SHA,
+            acceptance_bundle_ref=bundle.bundle_id,
+        )
+        execution = ExecutionFixture(
+            execution_id=execution_id,
+            task_id=task.task_id,
+            base_sha=BASE_SHA,
+            candidate_sha=CANDIDATE_SHA,
+            diff_paths=diff_paths,
+            status="completed",
+            acceptance_bundle_ref=bundle.bundle_id,
+            executor_identity=EXECUTOR,
+        )
+        return Scenario(
+            task=task,
+            execution=execution,
+            bundle=bundle,
+            preflight=preflight or _preflight(),
+        )
 
-    # The executor's own signals (HTTP 200, "port is listening", "prompt was
-    # generated", its own Handoff.tests_status=passed) are folded into a
-    # single self-reported claim: evidence_source is NOT one of
-    # TRUSTED_EVIDENCE_SOURCES, and Session Center correlation could not
-    # resolve identity (needs_review), so none of it counts as evidence.
-    report_v1_false_pass = VerificationReportFixture(
-        execution_id=execution_non_production.execution_id,
-        gate_id="V1",
-        round=1,
-        candidate_sha="sha-candidate-1",
-        base_sha="sha-base-1",
-        bundle_hash=bundle.bundle_hash,
-        checker_identity="session_center_checker",
-        checker_version="1.0",
-        evidence_source="executor_claim",
-        identity_resolution="needs_review",
-        result="PASS",
-    )
+    ordinary = _scenario("E-ADM-01", ("manager/dispatch_helpers.py",))
+    # The production variant keeps the SAME execution_id as its reports (the
+    # B-1R residual): every report is admissible, so ROUTE_TO_PFP is proven by
+    # production risk alone and not by an incidental lineage rejection.
+    production = _scenario("E-ADM-01", ("manager/execution_runner.py",))
 
     return {
-        "task": task,
-        "execution_non_production": execution_non_production,
-        "execution_production": execution_production,
         "bundle": bundle,
-        "report_v0_pass": report_v0_pass,
-        "report_v1_false_pass": report_v1_false_pass,
+        "ordinary": ordinary,
+        "production": production,
+        # Everything the executor submitted about itself, folded into one
+        # untrusted evidence source.
+        "self_reported_evidence_source": "executor_claim",
     }
