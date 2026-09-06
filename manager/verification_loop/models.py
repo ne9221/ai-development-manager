@@ -20,8 +20,10 @@ LoopRun, no second Task/Execution/Session registry, and no persisted verdict.
 
 from __future__ import annotations
 
+import dataclasses
+import typing
 from dataclasses import dataclass, field
-from typing import Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 from .identity import Identity, ResolvedIdentity  # noqa: F401  (re-exported)
 
@@ -522,3 +524,58 @@ class TaskCloseDecision:
     close_eligible: bool
     blocking_reasons: Tuple[str, ...]
     accepted_execution_id: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Rehydration
+# ---------------------------------------------------------------------------
+#
+# Lives here rather than on the controller because the stores need it too: a
+# ledger that verifies a record's content address has to rebuild the record
+# first, and importing the controller from the store would invert the
+# dependency. It touches no filesystem and no clock, so it does not widen the
+# set of modules allowed to.
+
+
+def rehydrate(cls, data: Any):
+    """Rebuild a dataclass from the plain JSON a store holds.
+
+    Only the shapes tickets and reports actually use are handled -- nested
+    dataclasses, Optional, and homogeneous tuples. Anything else raises rather
+    than guessing, because a silently mis-typed field would change a
+    derivation without changing anything visible.
+    """
+    if data is None:
+        return None
+    if not dataclasses.is_dataclass(cls):
+        raise TypeError(f"not a dataclass: {cls!r}")
+    hints = typing.get_type_hints(cls)
+    kwargs = {}
+    for field_ in dataclasses.fields(cls):
+        kwargs[field_.name] = _coerce(hints[field_.name], data.get(field_.name))
+    return cls(**kwargs)
+
+
+def _coerce(annotation, value):
+    origin = typing.get_origin(annotation)
+
+    if origin is typing.Union:
+        args = [a for a in typing.get_args(annotation) if a is not type(None)]
+        if value is None:
+            return None
+        if len(args) == 1:
+            return _coerce(args[0], value)
+        return value
+
+    if origin is tuple:
+        args = typing.get_args(annotation)
+        if not args or value is None:
+            return tuple(value or ())
+        if len(args) == 2 and args[1] is Ellipsis:
+            return tuple(_coerce(args[0], item) for item in value)
+        return tuple(_coerce(arg, item) for arg, item in zip(args, value))
+
+    if dataclasses.is_dataclass(annotation):
+        return rehydrate(annotation, value)
+
+    return value

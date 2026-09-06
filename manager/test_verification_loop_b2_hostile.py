@@ -368,15 +368,32 @@ class ImmutableRoundTests(HostileTestCase):
 # ---------------------------------------------------------------------------
 
 
+def attesting(scenario, *signatures):
+    """The same scenario, with the frozen baseline attesting these failures.
+
+    Phase B-2R made the attestation outrank a report's self-declared
+    ``base_result``, so a test that wants "this also failed at base" has to say
+    so in the frozen contract. Claiming it in the report is now a
+    contradiction, which is the point of the repair -- and a test that left the
+    claim unattested would still pass here while proving nothing, because
+    UNKNOWN also fails to admit a TEST_DEFECT.
+    """
+    return rebundle(
+        scenario,
+        baseline=replace(scenario.bundle.baseline, known_baseline_failures=signatures),
+    )
+
+
 class BaselineRegressionTests(HostileTestCase):
-    def _v3_failure(self, **kw):
-        reports = self.control_reports()
-        reports[3] = self.scenario.report(
+    def _v3_failure(self, scenario=None, **kw):
+        scenario = scenario or self.scenario
+        reports = self.control_reports(scenario)
+        reports[3] = scenario.report(
             "V3",
             result="FAIL",
             failure_observations=(FailureObservation(signature="freeze_pane_mismatch", **kw),),
         )
-        return run(self.scenario, reports)
+        return run(scenario, reports)
 
     def test_13_base_pass_candidate_fail_is_a_regression(self):
         result = self._v3_failure(base_result="PASS")
@@ -385,7 +402,11 @@ class BaselineRegressionTests(HostileTestCase):
         self.assertEqual("REPAIR", result.next_action)
 
     def test_14_base_fail_candidate_fail_is_not_a_regression(self):
-        result = self._v3_failure(base_result="FAIL", base_signature="freeze_pane_mismatch")
+        result = self._v3_failure(
+            scenario=attesting(self.scenario, "freeze_pane_mismatch"),
+            base_result="FAIL",
+            base_signature="freeze_pane_mismatch",
+        )
         self.assertNotIn("REGRESSION", result.admitted_failure_classes)
         self.assertIn("CONTRACT_VIOLATION", result.admitted_failure_classes)
         self.assertIn(("freeze_pane_mismatch", "NOT_REGRESSION"), result.regression_determinations)
@@ -443,8 +464,12 @@ class BaselineRegressionTests(HostileTestCase):
     def test_15c_a_report_cannot_declare_itself_a_regression(self):
         # The field no longer exists; this pins that it cannot come back by
         # way of proposed_class either.
-        result = self._v3_failure(base_result="FAIL", base_signature="freeze_pane_mismatch",
-                                  proposed_class="REGRESSION")
+        result = self._v3_failure(
+            scenario=attesting(self.scenario, "freeze_pane_mismatch"),
+            base_result="FAIL",
+            base_signature="freeze_pane_mismatch",
+            proposed_class="REGRESSION",
+        )
         self.assertNotIn("REGRESSION", result.admitted_failure_classes)
 
 
@@ -454,6 +479,17 @@ class BaselineRegressionTests(HostileTestCase):
 
 
 class TestDefectAdmissionTests(HostileTestCase):
+    def attested_fail(self, observation):
+        """TD-1 with the frozen contract attesting the base failure.
+
+        After B-2R, "this test already failed at base" is a fact the contract
+        attests; a report asserting it is only a witness. Applied per test
+        rather than in setUp, because test_16's whole subject is a claim with
+        nothing attesting it -- attesting it there would turn the bare claim
+        into a genuine TD-1 and invert what the test proves.
+        """
+        return self._fail(observation, scenario=attesting(self.scenario, "flaky_thing"))
+
     def _fail(self, observation, scenario=None):
         scenario = scenario or self.scenario
         reports = [scenario.report(g) for g in self.gates]
@@ -470,7 +506,7 @@ class TestDefectAdmissionTests(HostileTestCase):
         self.assertNotEqual("REPAIR_TEST_ONLY", result.next_action)
 
     def test_17_td1_base_also_fails_with_the_same_signature(self):
-        result = self._fail(
+        result = self.attested_fail(
             FailureObservation(
                 signature="flaky_thing", base_result="FAIL", base_signature="flaky_thing"
             )
@@ -479,7 +515,7 @@ class TestDefectAdmissionTests(HostileTestCase):
         self.assertEqual("REPAIR_TEST_ONLY", result.next_action)
 
     def test_17b_td1_needs_the_same_signature_not_merely_a_base_failure(self):
-        result = self._fail(
+        result = self.attested_fail(
             FailureObservation(
                 signature="flaky_thing", base_result="FAIL", base_signature="something_else"
             )
@@ -526,7 +562,7 @@ class TestDefectAdmissionTests(HostileTestCase):
         self.assertNotIn("TEST_DEFECT", result.admitted_failure_classes)
 
     def test_19_a_repair_touching_a_frozen_oracle_is_forcibly_reclassified(self):
-        result = self._fail(
+        result = self.attested_fail(
             FailureObservation(
                 signature="flaky_thing",
                 base_result="FAIL",
@@ -539,7 +575,7 @@ class TestDefectAdmissionTests(HostileTestCase):
         self.assertEqual("OPEN_BUNDLE_REVISION", result.next_action)
 
     def test_19b_frozen_oracle_paths_cannot_be_dodged_by_respelling(self):
-        result = self._fail(
+        result = self.attested_fail(
             FailureObservation(
                 signature="flaky_thing",
                 base_result="FAIL",
@@ -550,7 +586,7 @@ class TestDefectAdmissionTests(HostileTestCase):
         self.assertNotIn("TEST_DEFECT", result.admitted_failure_classes)
 
     def test_19c_an_unreadable_repair_path_cannot_be_proven_safe(self):
-        result = self._fail(
+        result = self.attested_fail(
             FailureObservation(
                 signature="flaky_thing",
                 base_result="FAIL",

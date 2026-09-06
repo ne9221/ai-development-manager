@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .bundle import oracle_digest
+from .bundle import oracle_digest, report_digest
 from .identity import resolution_failure, same_actor
 from .models import (
     TRUSTED_EVIDENCE_SOURCES,
@@ -44,6 +44,13 @@ ROUND_INVALIDATING_REASONS = (
     "WORKTREE_HEAD_MOVED_DURING_ROUND",
     "WORKTREE_HEAD_NOT_CANDIDATE",
     "TICKET_ISSUED_AGAINST_DIFFERENT_HEAD",
+    # A lease change is the same class of event as a head move: the worktree
+    # the round was authorised against is not the worktree that answered it.
+    # Two verifications can share a HEAD and still be different worktrees, so
+    # head equality alone leaves this invisible -- which is what made the
+    # ticket's lease fields write-only in Phase B-2.
+    "WORKTREE_LOCK_ID_CHANGED_DURING_ROUND",
+    "WORKTREE_GENERATION_CHANGED_DURING_ROUND",
 )
 
 
@@ -81,9 +88,17 @@ def admissibility_reason(
     # --- Ticket: was this round authorised before it was answered? ----------
     if ticket is None:
         return "NO_MATCHING_TICKET"
-    if ticket.status != "issued":
-        # "consumed" means some other report already answered this ticket;
-        # answering it twice is the duplicate case, handled by the caller.
+    if ticket.status == "consumed":
+        # Phase A v3 predicate 11: a consumed ticket admits exactly the report
+        # whose digest it recorded at the moment it was answered, and no other.
+        # Comparing against the recorded digest rather than re-deciding "which
+        # report matches this ticket" is the whole point -- the second question
+        # has more than one answer once an attacker can add files.
+        if ticket.consumed_report_digest != report_digest(report):
+            return "REPORT_DIGEST_NOT_TICKET_CONSUMED"
+    elif ticket.status != "issued":
+        # "invalidated" is what two conflicting consumptions leave behind: one
+        # ticket, two claimants, no trustworthy answer for either.
         return "TICKET_NOT_OPEN"
     if ticket.execution_id != report.execution_id:
         return "TICKET_EXECUTION_MISMATCH"
@@ -161,7 +176,24 @@ def admissibility_reason(
     if report.environment_fingerprint != preflight.environment_fingerprint:
         return "ENVIRONMENT_FINGERPRINT_MISMATCH"
 
-    # --- Immutable candidate round (Phase A v3 I6) -------------------------
+    # --- Self-consistency of the report itself -----------------------------
+    if report.result == "PASS" and report.failure_observations:
+        # A gate cannot both pass and have failed. Phase B-2 discarded the
+        # observations and honoured the PASS, which grants a compromised
+        # checker nothing it did not already have but lets a merely confused
+        # one satisfy a gate it just reported failures for.
+        return "REPORT_SELF_CONTRADICTION"
+
+    # --- Immutable candidate round and worktree lease (Phase A v3 I6) ------
+    if preflight.worktree_lock_id is None or preflight.worktree_generation is None:
+        # The ticket always names the lease it was issued under, so an
+        # unreported current lease is "we could not check", which PreflightFacts
+        # already says must never read as "it was fine".
+        return "WORKTREE_LEASE_NOT_REPORTED"
+    if ticket.worktree_lock_id != preflight.worktree_lock_id:
+        return "WORKTREE_LOCK_ID_CHANGED_DURING_ROUND"
+    if ticket.worktree_generation != preflight.worktree_generation:
+        return "WORKTREE_GENERATION_CHANGED_DURING_ROUND"
     if ticket.candidate_head_at_issue != execution.candidate_sha:
         return "TICKET_ISSUED_AGAINST_DIFFERENT_HEAD"
     if report.worktree_head_before != report.worktree_head_after:

@@ -187,11 +187,22 @@ def _monotonicity_reasons(bundle: AcceptanceBundleFixture) -> Sequence[str]:
     return reasons
 
 
+def record_digest(record: Any) -> str:
+    """Content digest of any append-only ledger record.
+
+    One function for reports and tickets alike, because both ledgers make the
+    same promise: the name a record is filed under is the hash of what it
+    says. A second hashing scheme would be a second promise to keep in sync.
+    """
+    return _sha256(canonical_json(record))
+
+
 def report_digest(report: Any) -> str:
     """Content digest of a verification report.
 
-    Used as the report's identity in ``derivation_key`` and as the create-only
-    key in the report store, so two byte-different reports can never occupy one
-    slot and an unchanged report re-submitted is genuinely idempotent.
+    Used as the report's identity in ``derivation_key``, as the create-only key
+    in the report store, and as the value a ticket records when it is consumed
+    (Phase A v3 predicate 11) -- so two byte-different reports can never occupy
+    one slot and an unchanged report re-submitted is genuinely idempotent.
     """
-    return _sha256(canonical_json(report))
+    return record_digest(report)

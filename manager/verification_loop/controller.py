@@ -15,9 +15,8 @@ caught, instead of being invisible until a real checker existed to trip over it.
 
 from __future__ import annotations
 
-import dataclasses
-import typing
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import Mapping, Optional, Sequence, Tuple
 
 from .evaluator import evaluate
 from .models import (
@@ -29,53 +28,10 @@ from .models import (
     TaskFixture,
     VerificationReportFixture,
     VerificationTicket,
+    rehydrate,  # noqa: F401  (re-exported: the public name lived here first)
 )
 from .stores import FileReportStore, FileTicketStore
 from .tickets import derive_ticket_id
-
-
-def rehydrate(cls, data: Any):
-    """Rebuild a dataclass from the plain JSON the stores hold.
-
-    Only the shapes tickets and reports actually use are handled -- nested
-    dataclasses, Optional, and homogeneous tuples. Anything else raises rather
-    than guessing, because a silently mis-typed field would change a
-    derivation without changing anything visible.
-    """
-    if data is None:
-        return None
-    if not dataclasses.is_dataclass(cls):
-        raise TypeError(f"not a dataclass: {cls!r}")
-    hints = typing.get_type_hints(cls)
-    kwargs = {}
-    for field in dataclasses.fields(cls):
-        kwargs[field.name] = _coerce(hints[field.name], data.get(field.name))
-    return cls(**kwargs)
-
-
-def _coerce(annotation, value):
-    origin = typing.get_origin(annotation)
-
-    if origin is typing.Union:
-        args = [a for a in typing.get_args(annotation) if a is not type(None)]
-        if value is None:
-            return None
-        if len(args) == 1:
-            return _coerce(args[0], value)
-        return value
-
-    if origin is tuple:
-        args = typing.get_args(annotation)
-        if not args or value is None:
-            return tuple(value or ())
-        if len(args) == 2 and args[1] is Ellipsis:
-            return tuple(_coerce(args[0], item) for item in value)
-        return tuple(_coerce(arg, item) for arg, item in zip(args, value))
-
-    if dataclasses.is_dataclass(annotation):
-        return rehydrate(annotation, value)
-
-    return value
 
 
 class VerificationController:
@@ -133,20 +89,51 @@ class VerificationController:
             issued.append(self.tickets.issue(ticket))
         return tuple(issued)
 
-    def submit(self, report: VerificationReportFixture) -> str:
-        return self.reports.put(report)
+    def submit(self, report: VerificationReportFixture, consumed_at: Optional[str] = None) -> str:
+        """Store ``report`` and record that it consumed its ticket.
+
+        Storing and consuming are one operation because they are one fact:
+        Phase A v3 predicate 11 asks whether a report's digest is the digest
+        the ticket recorded when it was answered, and nothing can answer that
+        unless the answering is written down at the time. A report whose
+        ticket was never issued is still stored -- it is rejected later as
+        ``NO_MATCHING_TICKET``, which is a truer description than losing it.
+
+        ``consumed_at`` is a parameter so a caller can supply the time it
+        actually observed; the default reads the clock here, in one of the two
+        modules allowed to.
+        """
+        digest = self.reports.put(report)
+        self.tickets.consume(
+            derive_ticket_id(
+                report.execution_id,
+                report.candidate_sha,
+                report.bundle_hash,
+                report.gate_id,
+                report.round,
+            ),
+            digest,
+            consumed_at or datetime.now(timezone.utc).isoformat(),
+        )
+        return digest
 
     def stored_tickets(self) -> Tuple[VerificationTicket, ...]:
+        # Both stores verify each record against the name it is filed under
+        # and raise if it does not match, so a tampered ledger stops the
+        # derivation rather than feeding it.
         return tuple(
-            rehydrate(VerificationTicket, self.tickets.get(ticket_id))
-            for ticket_id in self.tickets.list_ids()
+            ticket
+            for ticket in (
+                self.tickets.get(ticket_id) for ticket_id in self.tickets.list_ids()
+            )
+            if ticket is not None
         )
 
     def stored_reports(self, execution_id: str) -> Tuple[VerificationReportFixture, ...]:
         loaded = []
         for digest in self.reports.list_digests():
-            report = rehydrate(VerificationReportFixture, self.reports.get(digest))
-            if report.execution_id == execution_id:
+            report = self.reports.get(digest)
+            if report is not None and report.execution_id == execution_id:
                 loaded.append(report)
         return tuple(loaded)
 

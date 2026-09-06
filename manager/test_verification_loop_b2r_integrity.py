@@ -141,6 +141,13 @@ class LedgerTestCase(unittest.TestCase):
         )
         return self.home / "verification" / "tickets" / ticket_id
 
+    def record_at_seq(self, gate_id, seq, round_=1):
+        """The ticket record at ``seq``. Chosen by content, never by filename."""
+        for path in sorted(self.ticket_dir(gate_id, round_).glob("*.json")):
+            if json.loads(path.read_text(encoding="utf-8"))["ticket_seq"] == seq:
+                return path
+        raise AssertionError(f"no ticket record at seq {seq} for {gate_id}")
+
     def rewrite(self, path, mutate):
         """Edit a stored record in place, exactly as a shell would."""
         doc = json.loads(path.read_text(encoding="utf-8"))
@@ -290,10 +297,15 @@ class TicketLedgerIntegrityTests(LedgerTestCase):
             self.issued_record("V3"),
             lambda doc: doc.__setitem__("expected_checker_identity", ROGUE_JSON),
         )
-        self.controller.submit(self.scenario.report("V3", producer_identity=ROGUE))
+        # The tamper is caught the moment anything reads the ledger, and
+        # submitting a report reads it: consuming a ticket means loading it.
         with self.assertRaises(stores.VerificationStoreError) as caught:
-            self.derive()
+            self.controller.submit(self.scenario.report("V3", producer_identity=ROGUE))
         self.assertIn("TICKET_CONTENT_DIGEST_MISMATCH", str(caught.exception))
+        # And it stays caught on the derivation path, which is the one that
+        # would otherwise have produced the ACCEPTED.
+        with self.assertRaises(stores.VerificationStoreError):
+            self.derive()
 
     def test_tkt_2_rewriting_the_ticket_task_id_is_refused(self):
         self.issue()
@@ -314,8 +326,12 @@ class TicketLedgerIntegrityTests(LedgerTestCase):
             self.derive()
 
     def test_tkt_4_rewriting_a_consumed_ticket_back_to_issued_is_refused(self):
+        # Reopening a spent ticket is how a second report would be let in, so
+        # the consumption record is selected by its sequence rather than by
+        # sort order -- editing the issue record to say "issued" changes
+        # nothing and would make this test pass without proving anything.
         self.honest_round()
-        record = sorted(self.ticket_dir("V3").glob("*.json"))[-1]
+        record = self.record_at_seq("V3", 1)
         self.rewrite(record, lambda doc: doc.__setitem__("status", "issued"))
         with self.assertRaises(stores.VerificationStoreError):
             self.derive()
@@ -428,6 +444,16 @@ class TicketConsumptionTests(LedgerTestCase):
                 "V3", result="FAIL", failure_observations=(self.fx["freeze_pane_failure"],)
             )
         )
+        # Replace the answer wholesale rather than adding a second one: with
+        # both on disk the duplicate-ticket guard fires first and predicate 11
+        # never gets to speak, which would make this test pass for the wrong
+        # reason. Removing the honest report is also the stronger attack.
+        honest_digest = report_digest(
+            self.scenario.report(
+                "V3", result="FAIL", failure_observations=(self.fx["freeze_pane_failure"],)
+            )
+        )
+        self.report_path(honest_digest).unlink()
         forged = self.scenario.report("V3")
         self.report_path(report_digest(forged)).write_text(
             canonical_json(forged), encoding="utf-8", newline=""

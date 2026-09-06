@@ -523,7 +523,7 @@ class StoreCreateOnlyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             store = stores.FileTicketStore(root)
             with self.assertRaises(stores.VerificationStoreError):
-                store._path("../../escape")
+                store._dir("../../escape")
 
     def test_reports_are_content_addressed_so_a_verdict_cannot_be_overwritten(self):
         with tempfile.TemporaryDirectory() as root:

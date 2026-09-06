@@ -55,6 +55,13 @@ def base_evidence(
     exact base_sha, and the environment fingerprints must match. The path
     length lives in that fingerprint because differing path lengths have
     genuinely manufactured phantom failures in this repo's installer tests.
+
+    **The frozen attestation is the evidence; the report is a witness.** A
+    report may agree with the attestation, and agreeing changes nothing. A
+    report that contradicts it does not win, and does not lose either -- the
+    answer becomes UNKNOWN, because two sources disagreeing is precisely the
+    state in which nobody knows. A report with nothing frozen to corroborate it
+    is likewise UNKNOWN: an unattested claim about the past is an assertion.
     """
     baseline = bundle.baseline
     if baseline is None:
@@ -64,20 +71,37 @@ def base_evidence(
     if report.environment_fingerprint != baseline.environment_fingerprint:
         return UNKNOWN, "ENVIRONMENT_NOT_EQUIVALENT"
 
-    # A base run performed in this very round is the strongest evidence.
-    if observation.base_result in ("PASS", "FAIL"):
-        return observation.base_result, "MEASURED_THIS_ROUND"
-
+    # What the frozen contract attests about this signature, on its own.
     if observation.signature in baseline.known_baseline_failures:
-        return "FAIL", "ATTESTED_KNOWN_BASELINE_FAILURE"
-
-    if baseline.attested_by_report_digest:
+        attested, reason = "FAIL", "ATTESTED_KNOWN_BASELINE_FAILURE"
+    elif baseline.attested_by_report_digest:
         # The attestation covers a whole run at this base_sha, so absence from
         # its failure list means the test passed there. Without an attesting
         # report, absence proves nothing -- it could simply never have run.
-        return "PASS", "ATTESTED_ABSENT_FROM_BASELINE_FAILURES"
+        attested, reason = "PASS", "ATTESTED_ABSENT_FROM_BASELINE_FAILURES"
+    else:
+        attested, reason = UNKNOWN, "BASELINE_NOT_ATTESTED"
 
-    return UNKNOWN, "BASELINE_NOT_ATTESTED"
+    claimed = observation.base_result if observation.base_result in ("PASS", "FAIL") else None
+    if claimed is None:
+        return attested, reason
+
+    # From here on the report is claiming to have measured base itself. That
+    # claim is corroboration, never evidence: the frozen, human-approved
+    # attestation outranks it. Phase B-2 read the claim first, so a report
+    # asserting "this also failed at base" against an attestation saying it
+    # passed converted a human-gated contract revision into an automated
+    # licence to edit the test -- the exact self-declared-field class that
+    # deleting `category` and `is_regression` was meant to end.
+    if observation.base_signature is not None and observation.base_signature != observation.signature:
+        # TD-1 is about *this* test failing at base. A claim describing some
+        # other failure there is not evidence about this one.
+        return UNKNOWN, "BASE_SIGNATURE_MISMATCH"
+    if attested == UNKNOWN:
+        return UNKNOWN, "BASE_RESULT_UNATTESTED"
+    if claimed != attested:
+        return UNKNOWN, "BASE_EVIDENCE_CONTRADICTION"
+    return attested, reason
 
 
 def _touches_frozen_oracle(

@@ -73,6 +73,20 @@ def ticket_self_consistency_reason(ticket: VerificationTicket) -> Optional[str]:
         return "TICKET_ID_NOT_DERIVED_FROM_CONTENT"
     if ticket.status not in ("issued", "consumed", "invalidated"):
         return "TICKET_STATUS_UNKNOWN"
+    # Consumption state has to be internally coherent for the same reason the
+    # id does: a ticket claiming it was answered while naming no answer, or
+    # naming an answer it never took, is refuted by its own contents before any
+    # store is consulted.
+    if ticket.status == "consumed":
+        digest = ticket.consumed_report_digest
+        if not isinstance(digest, str) or not digest.strip():
+            return "TICKET_CONSUMED_WITHOUT_DIGEST"
+        if ticket.ticket_seq < 1:
+            return "TICKET_CONSUMED_AT_ISSUE_SEQ"
+    elif ticket.consumed_report_digest is not None:
+        return "TICKET_UNCONSUMED_WITH_DIGEST"
+    if ticket.ticket_seq < 0:
+        return "TICKET_SEQ_NEGATIVE"
     return None
 
 
