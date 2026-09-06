@@ -1,0 +1,3 @@
+# Verbatim archived transcripts: never EOL-translate, or the recorded
+# sha256 digests in README.md stop matching a Windows checkout.
+*.md -text
