@@ -467,10 +467,22 @@ residual was repaired. Phase B-3 was not started.
 | B-2R repair | `8ba1aaa` | — |
 | Predicate 11 repair | `b38ceb2` | — |
 | Predicate 11 focused re-review | Drive `16u8d73U7Y5QZQ_aI9f0OQReZPfiF1FEwz_f7A3MtXJ0` | `PREDICATE11_FIX_ACCEPTED` |
-| **B-2 final independent re-review** | **this document** | **`PHASE_B2_ACCEPTED`** |
+| **B-2 final independent re-review** | **this document** (Drive `1ddfjjme7a9zL429S0ga_EFlar-ajAOQXjlBgCDydK6U`) | **`PHASE_B2_ACCEPTED`** |
 
-Drive counterpart of this document: see the Drive cross-link section appended
-below.
+**Drive counterpart of this document** (AI-DEVELOPMENT-RULES rule 25/26,
+PROJECT-RULES ADM 29):
+
+| Field | Value |
+|---|---|
+| Drive document | `ADM REVIEW - Verification Loop Phase B-2 Final Independent Re-review (PHASE_B2_ACCEPTED) - 2026-09-07` |
+| Drive document ID | `1ddfjjme7a9zL429S0ga_EFlar-ajAOQXjlBgCDydK6U` |
+| Drive folder | ADM project folder `16MO98FfbnwXsin-m6F1rgdmk-o6ZslVC` |
+| GitHub archival branch | `review/verification-loop-phase-b2-final-acceptance-20260907` |
+| GitHub archival commit | `8612a2ad2ee8cd0ac5c545939567de08da2ee440` |
+| GitHub artifact path | `docs/verification-loop/PHASE-B2-FINAL-INDEPENDENT-REREVIEW-ACCEPTED.md` |
+
+Either side names the other, so a future reader arriving at one can reach the
+other without reconstructing this session.
 
 ## Closing
 
