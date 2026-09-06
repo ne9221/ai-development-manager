@@ -23,6 +23,8 @@ closes it.
 | B-2 implementation | commit `794db70` | — |
 | B-2 independent review | [PHASE-B2-INDEPENDENT-REVIEW-CHANGES-REQUIRED.md](PHASE-B2-INDEPENDENT-REVIEW-CHANGES-REQUIRED.md) | `CHANGES_REQUIRED` |
 | B-2R repair | this branch | pending focused independent re-review |
+| B-2R predicate 11 crash-consistency fix | commit `b38ceb2` | — |
+| ↳ focused independent re-review | [PHASE-B2R-PREDICATE11-CRASH-CONSISTENCY-REREVIEW-ACCEPTED.md](PHASE-B2R-PREDICATE11-CRASH-CONSISTENCY-REREVIEW-ACCEPTED.md) | `PREDICATE11_FIX_ACCEPTED` (scoped to `8ba1aaa`→`b38ceb2`; **not** `PHASE_B2_ACCEPTED`) |
 
 ## Reproducers
 
