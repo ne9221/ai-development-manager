@@ -72,6 +72,12 @@ CONTROLLER = ResolvedIdentity(
 CANDIDATE_SHA = "a" * 40
 BASE_SHA = "b" * 40
 
+# One worktree lease, shared by the tickets and the preflight facts, so a
+# lease mismatch in a test is something the test asked for rather than an
+# artefact of two fixtures having been written independently.
+WORKTREE_LOCK_ID = "repo-lease-1"
+WORKTREE_GENERATION = 1
+
 
 def checker_spec(gate_id: str, **overrides: Any) -> CheckerSpec:
     spec = CheckerSpec(
@@ -108,8 +114,8 @@ class Scenario:
             expected_checker_identity=self.checker,
             forbidden_identity=self.executor,
             candidate_head_at_issue=self.execution.candidate_sha,
-            worktree_lock_id="repo-" + self.execution.execution_id,
-            worktree_generation=1,
+            worktree_lock_id=WORKTREE_LOCK_ID,
+            worktree_generation=WORKTREE_GENERATION,
             issued_at="2026-09-06T00:00:00Z",
         )
         explicit_id = overrides.pop("ticket_id", None)
@@ -194,6 +200,8 @@ def _preflight(**overrides: Any) -> PreflightFacts:
         ai_manager_home_class="ephemeral",
         governance_digest_measured=GOVERNANCE_DIGEST,
         environment_fingerprint=ENV,
+        worktree_lock_id=WORKTREE_LOCK_ID,
+        worktree_generation=WORKTREE_GENERATION,
     )
     return replace(facts, **overrides) if overrides else facts
 

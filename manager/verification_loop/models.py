@@ -335,6 +335,13 @@ class PreflightFacts:
     # walks ancestors -- so a subdirectory of a marked checkout cannot slip
     # past by resolving deeper.
     worktree_is_marked_production: bool = False
+    # The lease actually held *now*, to compare against the one the ticket was
+    # issued under. Two verifications can share a HEAD and still be different
+    # worktrees, so head equality is not worktree identity. Optional in the
+    # dataclass only because a caller can omit it; omitting it is not the same
+    # as matching, and admission treats it as unverifiable, not as fine.
+    worktree_lock_id: Optional[str] = None
+    worktree_generation: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +424,14 @@ class VerificationTicket:
     worktree_generation: int
     issued_at: str
     status: str = "issued"  # issued | consumed | invalidated
+    # Phase A v3 C.3 predicate 11. A ticket is consumed by exactly one report,
+    # and which one is recorded at the moment of consumption rather than
+    # inferred later -- "the report that matches" is a question with more than
+    # one answer once an attacker can add files.
+    consumed_report_digest: Optional[str] = None
+    consumed_at: Optional[str] = None
+    # Monotone within one ticket: 0 is the issue record, 1 the consumption.
+    ticket_seq: int = 0
 
 
 @dataclass(frozen=True)

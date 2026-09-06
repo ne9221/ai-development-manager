@@ -21,7 +21,12 @@ from unittest import mock
 from manager.verification_loop import stores
 from manager.verification_loop.bundle import canonical_json
 from manager.verification_loop.controller import VerificationController, rehydrate
-from manager.verification_loop.fixtures import fx_adm_false_dispatch, fx_ledger_freeze_pane
+from manager.verification_loop.fixtures import (
+    WORKTREE_GENERATION,
+    WORKTREE_LOCK_ID,
+    fx_adm_false_dispatch,
+    fx_ledger_freeze_pane,
+)
 from manager.verification_loop.models import (
     FailureObservation,
     VerificationReportFixture,
@@ -92,8 +97,8 @@ class ControllerIntegrationTests(unittest.TestCase):
             issued_by=self.scenario.controller,
             expected_checker_identity=self.scenario.checker,
             candidate_head_at_issue=self.scenario.execution.candidate_sha,
-            worktree_lock_id="repo-abc",
-            worktree_generation=1,
+            worktree_lock_id=WORKTREE_LOCK_ID,
+            worktree_generation=WORKTREE_GENERATION,
             issued_at="2026-09-06T00:00:00Z",
         )
 
@@ -180,8 +185,8 @@ class ControllerIntegrationTests(unittest.TestCase):
                 issued_by=self.scenario.controller,
                 expected_checker_identity=self.scenario.controller,  # different checker
                 candidate_head_at_issue=self.scenario.execution.candidate_sha,
-                worktree_lock_id="repo-abc",
-                worktree_generation=1,
+                worktree_lock_id=WORKTREE_LOCK_ID,
+                worktree_generation=WORKTREE_GENERATION,
                 issued_at="2026-09-06T00:00:00Z",
             )
 
@@ -246,8 +251,8 @@ class ProductionBoundaryIntegrationTests(unittest.TestCase):
                 issued_by=scenario.controller,
                 expected_checker_identity=scenario.checker,
                 candidate_head_at_issue=scenario.execution.candidate_sha,
-                worktree_lock_id="repo-abc",
-                worktree_generation=1,
+                worktree_lock_id=WORKTREE_LOCK_ID,
+                worktree_generation=WORKTREE_GENERATION,
                 issued_at="2026-09-06T00:00:00Z",
             )
             for gate in ("V0", "V1"):
