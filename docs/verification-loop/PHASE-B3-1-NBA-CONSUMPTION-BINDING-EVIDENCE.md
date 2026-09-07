@@ -239,5 +239,5 @@ stale, not current. No model change was made on quota grounds.
 
 ## Cross-link
 
-- Implementation commit: `IMPL_COMMIT_SHA`
-- Drive evidence document: `DRIVE_DOC_ID`
+- Implementation commit: `c296710ac999951eebea9ae6f9a8c25f7717bda1` on branch `fix/verification-loop-b3-1-nba-consumption-binding-20260907` (pushed; remote == local)
+- Drive evidence document: `1vugFHNgSZupxflnPl_T3iQCHXhbauxrPyIkAUjarv1I` — "ADM EVIDENCE — Verification Loop Phase B3-1 Predicate 10 / NB-A Closure — 2026-09-07", in ADM project folder `16MO98FfbnwXsin-m6F1rgdmk-o6ZslVC`. The Drive document names the implementation commit; this file names the Drive document. The cross-link itself is a docs-only follow-up commit on the same branch.
