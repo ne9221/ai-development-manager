@@ -25,8 +25,40 @@ closes it.
 | B-2R repair | commit `8ba1aaa` | — |
 | Predicate 11 repair | commit `b38ceb2` | `PREDICATE11_FIX_ACCEPTED` (focused re-review) |
 | B-2 final independent re-review | [PHASE-B2-FINAL-INDEPENDENT-REREVIEW-ACCEPTED.md](PHASE-B2-FINAL-INDEPENDENT-REREVIEW-ACCEPTED.md) | `PHASE_B2_ACCEPTED` |
+| B3-1 NB-A consumption binding | [PHASE-B3-1-NBA-CONSUMPTION-BINDING-EVIDENCE.md](PHASE-B3-1-NBA-CONSUMPTION-BINDING-EVIDENCE.md) | `B3-1 IMPLEMENTATION COMPLETE — INDEPENDENT REVIEW PENDING` |
 
 ## Reproducers
+
+`repro/B31-NBA-FORGED-CONSUMPTION.py` is the Phase B3-1 reproducer for the
+B-2 final review's residual NB-A. It uses only API present at both `b38ceb2`
+and the B3-1 head, so the two runs are one experiment measured twice:
+
+```
+PYTHONPATH=. python docs/verification-loop/repro/B31-NBA-FORGED-CONSUMPTION.py <short-scratch-dir>
+```
+
+Measured at `b38ceb2`: **5 of 16 forged-consumption shapes derive ACCEPTED**
+(the rogue-expected-checker vector A1, the erased forbidden identity, the
+rewritten issuer and issue time, and forged consumption plus forged PASS);
+the other 11 are stopped only by a sibling admission guard, which the script
+reports as such rather than counting as a defence. At the B3-1 head all 16 are
+refused by the target guard, `TICKET_CONSUMPTION_DIVERGES_FROM_ISSUE`, and the
+six controls (honest ACCEPTED, honest FAIL → REPAIR, crash window → PENDING,
+recovery → ACCEPTED, identical replay idempotent, conflicting consumption
+invalidated in both orders) are identical at both commits. Use a short scratch
+directory: the ledger files records flat precisely because this repository is
+tested near the Windows path-length cliff.
+
+`repro/B31-MUTATION-MATRIX.py` is the B3-1 mutation matrix: three mutants,
+each neutralising exactly the binding B3-1 added (the pure comparison, the
+fold's use of it, and the mutable-field allowlist), each with a named target
+test that must be among the failures, and each re-running the NB-A attack so
+the matrix shows the attack *reopening* rather than merely a test going red.
+Its `ROOT` is `parents[3]` — the repository root — and it verifies every
+mutated file is restored byte-for-byte and that the working tree is exactly
+as it found it. Measured at the B3-1 head: **3/3 killed by their named
+target, 0 survived, 0 not applied, 0 killed for the wrong reason**; under the
+first two mutants A1 re-derives ACCEPTED.
 
 `repro/B2R-ADVERSARIAL-AUDIT.py` is the Phase B-2R self-adversarial audit: 11
 attacks and 2 live controls, runnable at either SHA from a scratch clone with a

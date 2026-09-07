@@ -50,7 +50,7 @@ from typing import List, Optional, Sequence
 from .. import manager_home, production_guard
 from .bundle import canonical_json, record_digest, report_digest
 from .models import VerificationReportFixture, VerificationTicket, rehydrate
-from .tickets import ticket_self_consistency_reason
+from .tickets import consumption_divergence_field, ticket_self_consistency_reason
 
 # The two record kinds a ticket directory may hold, by ``ticket_seq``.
 ISSUE_SEQ = 0
@@ -336,6 +336,18 @@ def _fold_ticket(ticket_id: str, records: Sequence[VerificationTicket]) -> Verif
     deletion attack leaves behind. Two conflicting consumptions leave the
     ticket invalidated for both claimants, which is the only order-independent
     answer available.
+
+    The issue record is the authority on what the ticket authorised. A
+    consumption record may say *that* the ticket was answered and *by which
+    report*; it may not restate who was expected to answer, which lease the
+    round ran under, or anything else the controller froze at issue time.
+    Phase B-2 final review residual NB-A found that returning the consumption
+    record wholesale let a new, correctly named record beside an untouched
+    issue record rename the expected checker -- and because nothing existing
+    was edited, the digest-on-read guard could not fire by construction. A
+    consumption record that diverges from its issue record on any frozen field
+    is not a weaker claim; it is a record this store never wrote, so it is
+    refused as ledger tampering rather than folded.
     """
     issued = [record for record in records if record.ticket_seq == ISSUE_SEQ]
     consumed = [record for record in records if record.ticket_seq == CONSUME_SEQ]
@@ -348,6 +360,14 @@ def _fold_ticket(ticket_id: str, records: Sequence[VerificationTicket]) -> Verif
             f"TICKET_LEDGER_INCOHERENT: {ticket_id!r} holds {len(issued)} issue records "
             f"and {len(unknown)} records at an unknown sequence; a ticket has exactly one"
         )
+    for record in consumed:
+        divergent = consumption_divergence_field(issued[0], record)
+        if divergent is not None:
+            raise EvidenceIntegrityError(
+                f"TICKET_CONSUMPTION_DIVERGES_FROM_ISSUE: {ticket_id!r} holds a consumption "
+                f"record that rewrites {divergent!r}; a consumption record may change only "
+                "how a ticket was answered, never what the issue record authorised"
+            )
     if len(consumed) > 1:
         return replace(issued[0], status="invalidated")
     return consumed[0] if consumed else issued[0]

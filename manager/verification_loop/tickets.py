@@ -27,12 +27,52 @@ makes the encoding unambiguous.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 from typing import Optional, Sequence
 
 from .models import VerificationTicket
 
 TICKET_ID_PREFIX = "vt-"
+
+# The only fields a consumption record may differ from its issue record on.
+# Everything else a ticket carries was frozen when the controller issued it,
+# and a consumption record is a *state transition* of that ticket, not a
+# restatement of it. Enumerated by exclusion on purpose: a field added to
+# VerificationTicket later is bound the moment it exists, so nobody can widen
+# the ticket with something a consumption record could quietly rewrite.
+CONSUMPTION_MUTABLE_FIELDS = frozenset(
+    {"status", "consumed_report_digest", "consumed_at", "ticket_seq"}
+)
+
+
+def issue_frozen_fields() -> tuple:
+    """Every VerificationTicket field a consumption record may not change."""
+    return tuple(
+        field_.name
+        for field_ in dataclasses.fields(VerificationTicket)
+        if field_.name not in CONSUMPTION_MUTABLE_FIELDS
+    )
+
+
+def consumption_divergence_field(
+    issued: VerificationTicket, consumption: VerificationTicket
+) -> Optional[str]:
+    """The first issue-frozen field ``consumption`` rewrites, or None.
+
+    Phase B-2 final review residual NB-A: ``ticket_id`` hashes only
+    (execution, candidate, bundle, gate, round), so ``expected_checker_identity``
+    and every other field the issue record froze sat outside it, and a new,
+    correctly named consumption record could restate them. The store's own
+    ``consume()`` builds a consumption record by ``replace()`` on the issue
+    record, so an honest one never differs here; any difference is a record
+    the store did not write. Kept as a pure function so the binding can be
+    tested and mutated directly, independent of the ledger around it.
+    """
+    for name in issue_frozen_fields():
+        if getattr(issued, name) != getattr(consumption, name):
+            return name
+    return None
 
 
 def _encode(*parts: object) -> str:
