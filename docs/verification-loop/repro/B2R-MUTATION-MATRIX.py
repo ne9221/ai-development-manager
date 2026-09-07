@@ -1,4 +1,13 @@
-"""Phase B-2R mutation matrix M41-M51.
+"""Phase B-2R mutation matrix: fourteen mutants, M41-M54.
+
+    PYTHONPATH=. python docs/verification-loop/repro/B2R-MUTATION-MATRIX.py
+
+Run from a scratch clone with a temporary AI_MANAGER_HOME. ROOT is the
+repository root -- this file lives three directories below it -- and the
+script refuses to run if that directory does not carry the repository markers
+it mutates (Phase B3-2, residual NB-C: the first cut resolved ROOT to this
+``repro/`` directory, so pytest found nothing and the matrix exited 2 with
+"BASELINE NOT GREEN" -- fail-closed, but never measuring anything).
 
 Each mutant neutralises exactly one guard the repair added, then the whole
 verification-loop suite runs. A mutant is KILLED only if it fails, and only if
@@ -13,7 +22,10 @@ this repository before:
   SURVIVED;
 * a crash counts as KILLED, not as an error to be retried;
 * every mutated file is sha256-verified restored afterwards, and a mismatch
-  aborts the run rather than letting later mutants measure a dirty tree.
+  aborts the run rather than letting later mutants measure a dirty tree;
+* ``git status`` of the mutated package is compared before and after the whole
+  run, so the matrix leaves the tree exactly as it found it (it may run on an
+  uncommitted fix, so it demands "unchanged", not "clean").
 """
 
 import hashlib
@@ -21,7 +33,32 @@ import pathlib
 import subprocess
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent
+# Paths that must exist under ROOT for this script to be pointing at a
+# repository checkout: the package it mutates and the directory it lives in.
+ROOT_MARKERS = ("manager/verification_loop/stores.py", "docs/verification-loop/repro")
+
+
+def resolve_root(script=None):
+    """The repository root for this script, verified against ROOT_MARKERS.
+
+    The script lives at ``docs/verification-loop/repro/``, three directories
+    below the root, so ``parents[3]`` is the candidate. A moved script (or a
+    copy run from somewhere else) makes the candidate miss a marker, and the
+    run stops with a message naming the wrong directory instead of a baseline
+    that is "not green" because pytest was handed no tests.
+    """
+    here = pathlib.Path(script or __file__).resolve()
+    candidate = here.parents[3] if len(here.parents) > 3 else here.parent
+    missing = [marker for marker in ROOT_MARKERS if not (candidate / marker).exists()]
+    if missing:
+        raise SystemExit(
+            "ROOT %s is not the repository root (missing %s); this script must live at "
+            "docs/verification-loop/repro/ inside a checkout" % (candidate, ", ".join(missing))
+        )
+    return candidate
+
+
+ROOT = resolve_root()
 SUITES = [
     "manager/test_verification_loop_evaluator.py",
     "manager/test_verification_loop_b2_hostile.py",
@@ -185,10 +222,44 @@ def read_source(path):
     return raw.decode("utf-8").replace("\r\n", "\n"), raw
 
 
-def run_suite():
+def apply_mutation(path, find, repl):
+    """Write the mutant over ``path``; return the original bytes for restore.
+
+    Returns None without touching the file when the search text is absent, so
+    the caller reports NOT_APPLIED instead of a silent SURVIVED. Line endings
+    of the file are preserved: matching is done on LF-normalised text, and a
+    CRLF file gets its mutant written back as CRLF.
+    """
+    original, original_bytes = read_source(path)
+    if find not in original:
+        return None
+    mutated = original.replace(find, repl, 1)
+    if b"\r\n" in original_bytes:
+        mutated = mutated.replace("\n", "\r\n")
+    pathlib.Path(path).write_bytes(mutated.encode("utf-8"))
+    return original_bytes
+
+
+def restore(path, original_bytes):
+    """Put the original bytes back and prove it, or abort the whole run."""
+    pathlib.Path(path).write_bytes(original_bytes)
+    expected = hashlib.sha256(original_bytes).hexdigest()
+    if sha(path) != expected:
+        raise AssertionError("%s not restored byte-for-byte" % path)
+
+
+def tree_status(root):
+    proc = subprocess.run(
+        ["git", "status", "--porcelain", "--", "manager/verification_loop"],
+        capture_output=True, text=True, cwd=str(root),
+    )
+    return proc.stdout.strip()
+
+
+def run_suite(root):
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "--no-header", "-p", "no:randomly", *SUITES],
-        capture_output=True, text=True, cwd=str(ROOT),
+        capture_output=True, text=True, cwd=str(root),
     )
     failures = set()
     for line in proc.stdout.splitlines():
@@ -197,53 +268,60 @@ def run_suite():
     return proc.returncode, failures, proc.stdout
 
 
-print("Baseline: the unmutated tree must be green, or nothing below means anything.")
-code, failures, out = run_suite()
-if code != 0:
-    print("BASELINE NOT GREEN -- aborting")
-    print(out[-3000:])
-    sys.exit(2)
-print("  baseline green:", out.strip().splitlines()[-1])
-print("")
+def main(root=ROOT):
+    print("ROOT: %s" % root)
+    status_before = tree_status(root)
+    print("git status before (manager/verification_loop): %s" % (status_before or "clean"))
+    print("Baseline: the unmutated tree must be green, or nothing below means anything.")
+    code, failures, out = run_suite(root)
+    if code != 0:
+        print("BASELINE NOT GREEN -- aborting")
+        print(out[-3000:])
+        return 2
+    print("  baseline green:", out.strip().splitlines()[-1])
+    print("")
 
-summary = []
-for mid, relpath, find, repl, target, what in MUTANTS:
-    path = ROOT / relpath
-    original, original_bytes = read_source(path)
-    crlf = b"\r\n" in original_bytes
-    before = sha(path)
-    if find not in original:
-        summary.append((mid, "NOT_APPLIED", what, ""))
-        print("%-5s NOT_APPLIED  %s" % (mid, what))
-        continue
-    mutated = original.replace(find, repl, 1)
-    if crlf:
-        mutated = mutated.replace("\r\n", "\n").replace("\n", "\r\n")
-    path.write_bytes(mutated.encode("utf-8"))
-    try:
-        code, failures, out = run_suite()
-    finally:
-        path.write_bytes(original_bytes)
-        assert sha(path) == before, "%s: %s not restored byte-for-byte" % (mid, relpath)
+    summary = []
+    for mid, relpath, find, repl, target, what in MUTANTS:
+        path = root / relpath
+        before = sha(path)
+        original_bytes = apply_mutation(path, find, repl)
+        if original_bytes is None:
+            summary.append((mid, "NOT_APPLIED", what, ""))
+            print("%-5s NOT_APPLIED  %s" % (mid, what))
+            continue
+        try:
+            code, failures, out = run_suite(root)
+        finally:
+            restore(path, original_bytes)
+            assert sha(path) == before, "%s: %s not restored byte-for-byte" % (mid, relpath)
 
-    hit = any(target in name for name in failures)
-    if code == 0:
-        verdict = "SURVIVED"
-    elif hit:
-        verdict = "KILLED"
-    else:
-        verdict = "KILLED_WRONG_REASON"
-    detail = "%d failing; target %s" % (len(failures), "HIT" if hit else "MISSED")
-    summary.append((mid, verdict, what, detail))
-    print("%-5s %-19s %-62s %s" % (mid, verdict, what, detail))
+        hit = any(target in name for name in failures)
+        if code == 0:
+            verdict = "SURVIVED"
+        elif hit:
+            verdict = "KILLED"
+        else:
+            verdict = "KILLED_WRONG_REASON"
+        detail = "%d failing; target %s" % (len(failures), "HIT" if hit else "MISSED")
+        summary.append((mid, verdict, what, detail))
+        print("%-5s %-19s %-62s %s" % (mid, verdict, what, detail))
 
-print("")
-killed = sum(1 for _m, v, _w, _d in summary if v == "KILLED")
-print("=" * 100)
-print("%d/%d KILLED by their named target test; %d survived, %d not applied, %d killed for the wrong reason"
-      % (killed, len(summary),
-         sum(1 for _m, v, _w, _d in summary if v == "SURVIVED"),
-         sum(1 for _m, v, _w, _d in summary if v == "NOT_APPLIED"),
-         sum(1 for _m, v, _w, _d in summary if v == "KILLED_WRONG_REASON")))
-print("=" * 100)
-sys.exit(0 if killed == len(summary) else 1)
+    print("")
+    killed = sum(1 for _m, v, _w, _d in summary if v == "KILLED")
+    print("=" * 100)
+    print("%d/%d KILLED by their named target test; %d survived, %d not applied, %d killed for the wrong reason"
+          % (killed, len(summary),
+             sum(1 for _m, v, _w, _d in summary if v == "SURVIVED"),
+             sum(1 for _m, v, _w, _d in summary if v == "NOT_APPLIED"),
+             sum(1 for _m, v, _w, _d in summary if v == "KILLED_WRONG_REASON")))
+    status_after = tree_status(root)
+    print("git status after  (manager/verification_loop): %s" % (status_after or "clean"))
+    unchanged = status_after == status_before
+    print("tree unchanged by matrix: %s" % unchanged)
+    print("=" * 100)
+    return 0 if killed == len(summary) and unchanged else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

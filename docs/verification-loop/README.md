@@ -26,6 +26,7 @@ closes it.
 | Predicate 11 repair | commit `b38ceb2` | `PREDICATE11_FIX_ACCEPTED` (focused re-review) |
 | B-2 final independent re-review | [PHASE-B2-FINAL-INDEPENDENT-REREVIEW-ACCEPTED.md](PHASE-B2-FINAL-INDEPENDENT-REREVIEW-ACCEPTED.md) | `PHASE_B2_ACCEPTED` |
 | B3-1 NB-A consumption binding | [PHASE-B3-1-NBA-CONSUMPTION-BINDING-EVIDENCE.md](PHASE-B3-1-NBA-CONSUMPTION-BINDING-EVIDENCE.md) | `B3-1 IMPLEMENTATION COMPLETE — INDEPENDENT REVIEW PENDING` |
+| B3-2 NB-B/NB-C/NB-D reproducibility cleanup | [PHASE-B3-2-REPRO-CLEANUP-EVIDENCE.md](PHASE-B3-2-REPRO-CLEANUP-EVIDENCE.md) | `B3-2 IMPLEMENTATION COMPLETE — INDEPENDENT REVIEW PENDING` |
 
 ## Reproducers
 
@@ -61,40 +62,87 @@ target, 0 survived, 0 not applied, 0 killed for the wrong reason**; under the
 first two mutants A1 re-derives ACCEPTED.
 
 `repro/B2R-ADVERSARIAL-AUDIT.py` is the Phase B-2R self-adversarial audit: 11
-attacks and 2 live controls, runnable at either SHA from a scratch clone with a
-temporary `AI_MANAGER_HOME`:
+attacks and 3 live controls. It runs **unmodified** at the Phase B-2 base
+`794db70` and at every later head, from a scratch clone with a temporary
+`AI_MANAGER_HOME` and a short scratch directory:
 
 ```
-PYTHONPATH=. python docs/verification-loop/repro/B2R-ADVERSARIAL-AUDIT.py <scratch-dir>
+PYTHONPATH=. python docs/verification-loop/repro/B2R-ADVERSARIAL-AUDIT.py <short-scratch-dir>
 ```
 
 It is committed rather than left in a scratch directory so the next reviewer can
-re-measure the claim instead of taking it. Measured: **7 of 11 bypass at
-`794db70`, 0 of 11 at the B-2R HEAD, with both controls still accepting.** The
-four that fail to bypass at base do so through guards Phase B-2 already had, and
-the script says so rather than counting them as wins.
+re-measure the claim instead of taking it. The B-2 final review found (residual
+NB-B) that the first committed version imported the head-only fixture helper
+`consumed_against` and so died with `ImportError` at `794db70` — the headline
+below had been measured with a scratch harness, not with the committed script.
+Phase B3-2 replaced that import with a version adapter, `bound()`: it detects
+from the ticket dataclass which admission contract is present (a consumed ticket
+naming the report digest at the repair HEAD; an *issued* ticket at base, where
+no digest exists), uses the production fixture helper where it exists and the
+issued ticket where it does not, and exits rather than guessing at any other
+combination. It copies no production code. Control **C3** runs the honest round
+through the pure evaluator with exactly that binding, so a wrong adapter shows
+as `BROKEN` at the version where it is wrong instead of scoring attacks as
+blocked on a refusal they never reached.
+
+Measured at `794db70`: **7 bypassed, 3 blocked, 1 not applicable (A6)**, exit
+status 1. Bypassed: A1 stored FAIL edited into PASS → ACCEPTED; A2 stored PASS
+edited into FAIL moves the derivation (ACCEPTED → BLOCKED_HUMAN); A3 rogue
+expected checker → ACCEPTED; A5 consumed ticket reopened as issued is honoured;
+A8 base-FAIL claim against a PASS attestation buys `REPAIR_TEST_ONLY`; A10 a
+moved worktree lease is invisible because base `PreflightFacts` carries no
+lease; A11 PASS with hidden failure observations → ACCEPTED. Blocked by guards
+Phase B-2 already had: A4 (`IN_VERIFICATION`), A7 (`IN_VERIFICATION`), A9
+(`PENDING`, the cross-Task barrier). Not applicable: A6 repoints
+`consumed_report_digest`, a field base tickets do not have, so the tamper would
+edit nothing the loop reads and the script reports `N/A` rather than a block
+it did not earn. Measured at the B3-1/B3-2 head: **11/11 blocked, 0 bypassed,
+0 not applicable**, exit status 0. **3/3 controls** healthy at both.
+
+Both measurements are locked by
+`manager/test_verification_loop_b3_2_repro_harness.py`, which runs the
+committed script at this head from a foreign cwd and at `794db70` from a
+`git archive` extraction (skipping, and saying so, only if that commit is not
+in the local object store) and pins the verdict sets above.
 
 The script is deliberately layout-agnostic: it finds ticket records by reading
 the `ticket_id` inside them rather than by any filename convention. An earlier
 version assumed the layout, silently matched nothing after the ledger changed
 shape, and scored four attacks as bypasses that had never touched a byte.
 
-`repro/B2R-MUTATION-MATRIX.py` is the Phase B-2R mutation matrix: thirteen
-mutants, each neutralising exactly one guard the repair added, each with a
+`repro/B2R-MUTATION-MATRIX.py` is the Phase B-2R mutation matrix: 14 mutants (M41–M54),
+each neutralising exactly one guard the repair added, each with a
 **named target test** that must be among the failures. A mutant killed by some
 unrelated test elsewhere says nothing about whether the guard is under test,
 which is the vacuity trap both earlier reviews found; this harness scores that
 case as `KILLED_WRONG_REASON`, not as a kill. It also reports `NOT_APPLIED`
-when a mutation's search text is absent, counts a crash as a kill, and
+when a mutation's search text is absent, counts a crash as a kill,
 sha256-verifies every mutated file is restored byte-for-byte before the next
-mutant runs.
+mutant runs, and compares `git status` of the mutated package before and after
+the whole run.
 
-Measured at the B-2R HEAD: **13/13 killed by their named target, 0 survived,
-0 not applied, 0 killed for the wrong reason.** Two of the thirteen survived
-the first run and are worth reading about in the commit history: both were
-guards the suite did not actually depend on, masked by a guard one layer
-away, and the fix was a test that isolates them rather than a change to the
-production code.
+```
+PYTHONPATH=. python docs/verification-loop/repro/B2R-MUTATION-MATRIX.py
+```
+
+Its `ROOT` is `parents[3]` of the script — the repository root — verified
+against repository markers before anything runs. The B-2 final review found
+(residual NB-C) that the first committed version resolved `ROOT` to this
+`repro/` directory, handed pytest no tests and exited 2 with `BASELINE NOT
+GREEN` on every checkout: fail-closed, but never measuring anything; the review
+also found (NB-D) that this paragraph said "thirteen" for a matrix that defines
+fourteen. Both were repaired in Phase B3-2, and
+`manager/test_verification_loop_b3_2_repro_harness.py` now pins the root
+resolution (from any cwd, refusing a moved copy), the mutant count against this
+paragraph, every mutant's search text and named target, and byte-exact restore
+on LF and CRLF files.
+
+Measured at the B3-2 head with the committed script: **14/14 killed by their named target, 0 survived,
+0 not applied, 0 killed for the wrong reason**, tree unchanged by the matrix.
+Two of the fourteen survived the first B-2R run and are worth reading about in
+the commit history: both were guards the suite did not actually depend on,
+masked by a guard one layer away, and the fix was a test that isolates them
+rather than a change to the production code.
 
 `repro/P11-CRASH-WINDOW.py` reproduces the Codex review finding that Phase B-2R's
 first cut of predicate 11 left open. The controller persists a report and appends
