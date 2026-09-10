@@ -18,7 +18,11 @@ MIN_SAMPLE_INTERVAL_SECONDS = 60
 DEFAULT_MAX_AGE_MINUTES = 60
 RELIABLE_SOURCES = {
     "codex": {"codex_app_server", "official_app_server"},
-    "claude": {"claude_code_statusline_rate_limits", "official_statusline"},
+    # claude_oauth_usage is collectors/claude_oauth.py querying Anthropic's own
+    # https://api.anthropic.com/api/oauth/usage with that account's OAuth token.
+    # It is the source ADM's own launches actually produce -- the statusline hook
+    # never fires under `claude -p` -- and was omitted here when it landed.
+    "claude": {"claude_code_statusline_rate_limits", "official_statusline", "claude_oauth_usage"},
 }
 
 

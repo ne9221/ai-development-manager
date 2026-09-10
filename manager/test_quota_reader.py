@@ -1,7 +1,7 @@
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from manager.quota_reader import QuotaReaderError, read_local_status, summarize
@@ -358,3 +358,53 @@ class LegacyAggregateNeverRescuesNamedAccounts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClaudeOAuthSourceVerification(unittest.TestCase):
+    """`claude_oauth_usage` is the live first-party Claude quota source
+    (collectors/claude_oauth.py against https://api.anthropic.com/api/oauth/usage)
+    and must be recognised by the tier-2 source-verification allowlist.
+
+    Both directions are pinned so these cannot pass vacuously: a registered
+    source verifies, an unregistered one does not even when it claims official
+    provenance.  Note that tier 1 (`source_reliable`, which gates
+    `has_reliable_quota` and therefore routing) and tier 2 (`source_verified`,
+    which gates the bounded external contract) are deliberately distinct and are
+    NOT asserted to imply one another.
+    """
+
+    def one(self, item):
+        return summarize({"providers": [item]}, max_age_minutes=60, now=NOW)
+
+    def test_oauth_source_is_verified(self):
+        account = self.one(claude_item("account-a", source="claude_oauth_usage"))["accounts"][0]
+        self.assertTrue(account["source_reliable"])
+        self.assertTrue(account["source_verified"])
+        self.assertTrue(account["has_reliable_quota"])
+
+    def test_unregistered_claude_source_is_not_verified(self):
+        account = self.one(claude_item("account-a", source="some_unregistered_collector"))["accounts"][0]
+        # Tier 1 still passes: the record claims official provenance.
+        self.assertTrue(account["source_reliable"])
+        # Tier 2 must reject a source ADM does not recognise by name.
+        self.assertFalse(account["source_verified"])
+
+    def test_stale_oauth_payload_is_not_usable(self):
+        item = claude_item("account-a", source="claude_oauth_usage", updated=NOW - timedelta(hours=6))
+        account = self.one(item)["accounts"][0]
+        self.assertTrue(account["stale"])
+        self.assertFalse(account["has_reliable_quota"])
+        self.assertFalse(account["has_usable_quota"])
+
+    def test_windowless_oauth_payload_is_not_usable(self):
+        item = claude_item("account-a", remaining=None, source="claude_oauth_usage",
+                           confidence="unknown", status="unknown")
+        account = self.one(item)["accounts"][0]
+        self.assertFalse(account["has_reliable_quota"])
+        self.assertFalse(account["has_usable_quota"])
+
+    def test_codex_verified_source_not_regressed(self):
+        provider = self.one(codex_item())["providers"][0]
+        self.assertTrue(provider["source_verified"])
+        self.assertTrue(provider["has_reliable_quota"])
+

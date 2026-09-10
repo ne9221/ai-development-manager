@@ -14,7 +14,7 @@ from collectors.publish_drive import build_service
 from manager.dispatcher import clean, dispatch
 from manager.executions import list_executions
 from manager.governance import RULES_PATH, rendered_rules
-from manager.quota_reader import QuotaReaderError, parse_time, read_drive_status, summarize
+from manager.quota_reader import RELIABLE_SOURCES, QuotaReaderError, parse_time, read_drive_status, summarize
 from manager.scheduler import schedule
 from manager.tasks import DriveRecords, MIME_FOLDER, ROOT_FOLDER_ID, ROOT_FOLDERS, TaskError, validate
 
@@ -27,7 +27,6 @@ RUNTIME_STATUS_CONTRACT_VERSION = "1.0"
 RUNTIME_STATUS_MAX_WINDOWS = 8
 RUNTIME_STATUS_MAX_INPUT_WINDOWS = 16
 RUNTIME_STATUS_MAX_PROVIDERS = 32
-RUNTIME_STATUS_SOURCES = {"codex": "codex_app_server", "claude": "claude_statusline"}
 RUNTIME_STATUS_WINDOW_NAMES = {
     "codex": {"primary", "secondary"},
     "claude": {"five_hour", "seven_day"},
@@ -179,7 +178,11 @@ def project_provider(provider_id, provider, max_age_minutes, now):
     return {
         "status": status,
         "windows": windows,
-        "source": RUNTIME_STATUS_SOURCES[provider_id] if item["source_verified"] else "unknown",
+        # Report the source that was actually verified rather than a hardcoded
+        # per-provider name: source_verified is true only for a source already on
+        # the RELIABLE_SOURCES allowlist, so echoing it can never publish a name
+        # ADM does not recognise, and a future source migration cannot drift.
+        "source": item["source"] if item["source_verified"] else "unknown",
         "last_updated": iso_time(item["last_updated"]),
         "freshness": item["freshness"],
     }
@@ -193,10 +196,11 @@ def validate_runtime_status_contract(document):
     iso_time(document["generated_at"])
     if set(document["providers"]) != set(RUNTIME_STATUS_PROVIDERS):
         raise RuntimeError("runtime status provider mismatch")
-    for provider in document["providers"].values():
+    for provider_id, provider in document["providers"].items():
         if set(provider) != {"status", "windows", "source", "last_updated", "freshness"}:
             raise RuntimeError("runtime status provider key mismatch")
-        if provider["status"] not in {"known", "unknown", "stale", "unavailable"} or provider["source"] not in {*RUNTIME_STATUS_SOURCES.values(), "unknown"}:
+        allowed_sources = {*RELIABLE_SOURCES.get(provider_id, set()), "unknown"}
+        if provider["status"] not in {"known", "unknown", "stale", "unavailable"} or provider["source"] not in allowed_sources:
             raise RuntimeError("runtime status provider value mismatch")
         if not isinstance(provider["windows"], list) or len(provider["windows"]) > RUNTIME_STATUS_MAX_WINDOWS:
             raise RuntimeError("runtime status window bound mismatch")

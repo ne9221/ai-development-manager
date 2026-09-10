@@ -148,6 +148,21 @@ class RuntimeStatusContractTests(unittest.TestCase):
         self.assertEqual("known", result["providers"]["claude"]["status"])
         self.assertEqual(60, result["providers"]["claude"]["windows"][0]["remaining_percent"])
 
+    def test_oauth_sourced_claude_is_published_under_its_own_source(self):
+        claude = self.contract(claude={"source": "claude_oauth_usage"})["providers"]["claude"]
+        self.assertEqual("known", claude["status"])
+        self.assertEqual(60, claude["windows"][0]["remaining_percent"])
+        self.assertEqual("claude_oauth_usage", claude["source"])
+
+    def test_unregistered_source_is_still_withheld(self):
+        claude = self.contract(claude={"source": "some_unregistered_collector"})["providers"]["claude"]
+        self.assertEqual("unknown", claude["status"])
+        self.assertEqual([], claude["windows"])
+        self.assertEqual("unknown", claude["source"])
+
+    def test_codex_source_name_not_regressed(self):
+        self.assertEqual("codex_app_server", self.contract()["providers"]["codex"]["source"])
+
     def test_unknown_and_stale_are_not_zero(self):
         unknown = self.contract(claude={"status": "unknown", "windows": []})
         self.assertEqual("unknown", unknown["providers"]["claude"]["status"])
