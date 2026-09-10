@@ -16,8 +16,9 @@ record is governed by `schema/session.schema.json` and it has a real
 operator path: its CLI subcommands `import-claude` / `import-codex` write
 that schema-governed metadata to the Drive SSOT, and the Dashboard renders
 the Drive session records. `manager/context_pack.py` imports
-`manager.sessions`; `manager/session_center.py` does NOT -- it reaches
-session state through its own JSONL scan. `manager/sessions.py` predates
+`manager.sessions`; `manager/session_center.py` does NOT -- it resolves
+Codex through its own JSONL scan and Claude through `claude agents --json`.
+`manager/sessions.py` predates
 this file by five days (2026-08-10 vs 2026-08-15) and continued to be
 developed after it, so this
 adapter was a duplicate implementation from the moment it was written, not
