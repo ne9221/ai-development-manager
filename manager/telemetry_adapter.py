@@ -10,7 +10,8 @@ can easily give the opposite impression -- it does not describe a live path.
 
 Superseded by `manager/sessions.py`. That module does the same job for the
 same three providers (scan local JSONL, emit provider-neutral session
-metadata that never contains transcript content), but its `CanonicalSession`
+metadata that excludes full transcripts, though it does persist a bounded
+`first_user_prompt` excerpt -- see below), but its `CanonicalSession`
 record is governed by `schema/session.schema.json` and it has a real
 operator path: its CLI subcommands `import-claude` / `import-codex` write
 that schema-governed metadata to the Drive SSOT, and the Dashboard renders
