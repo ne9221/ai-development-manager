@@ -45,18 +45,26 @@ success.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from manager.manager_home import ENV_VAR as MANAGER_HOME_ENV_VAR, resolve_manager_home
 from manager.remote_readback import verify_remote_branch_matches
 from manager.tasks import TaskError, now_iso
 from manager.trusted_ingress import REQUIRED_REPO_WRITE_TASK_POLICIES
 from manager.worktree_materializer import OWNER_MARKER_FILENAME
 
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+
+# Prefix for the throwaway, execution-specific manager home each validation
+# subprocess runs against -- see _isolated_validation_manager_home below.
+VALIDATION_MANAGER_HOME_PREFIX = "adm-validation-home-"
 
 
 class AllowedPathsViolationError(TaskError):
@@ -339,6 +347,100 @@ def _resolve_validation_command(command: str) -> tuple[str, Optional[str]]:
     return f'{leading_ws}"{sys.executable}"{rest}', sys.executable
 
 
+# Validation runtime home isolation (P0 HANDS_OFF_VALIDATION_TRUTH,
+# 2026-09-10). Until this fix, _run_validation_command launched the
+# validation subprocess with no `env` at all, so the child silently
+# inherited the Command Watcher's OWN environment -- including
+# AI_MANAGER_HOME=~/.ai-development-manager, the live production manager
+# home. For any pytest validation_command in this repo that is an
+# immediate, total failure: the root conftest.py refuses to run the suite
+# against the production home (it writes durable runtime state -- the
+# Phase-1 rotation cursor among others), so pytest exits 4 during
+# collection. That is exactly what killed Rule44 fresh E2E-A on
+# 2026-09-03 (command-dispatch-rule44-fresh-a-20260903-1239z): Codex had
+# really edited the worktree, really committed 49fa1e7, really pushed, and
+# the remote read-back really matched -- and then host-side validation
+# failed for a reason that had nothing to do with the code under test.
+#
+# The conftest refusal is CORRECT and is deliberately left alone; so is
+# manager.manager_home's fail-closed resolver. The defect is that ADM
+# never told the child which manager home to use, so the child fell back
+# to whatever the parent happened to carry. The fix supplies one
+# explicitly, always -- never by deleting AI_MANAGER_HOME from the child's
+# environment, which would merely move the problem: an unset variable
+# makes manager.manager_home.resolve_manager_home fall back to the real
+# ~/.ai-development-manager for any non-pytest validation command, which
+# is the very production home this exists to keep out of reach.
+#
+# The home is a fresh throwaway directory per validation run, so two
+# concurrent executions can never share one, and it is passed through
+# resolve_manager_home() -- the single canonical resolver this codebase
+# already has -- rather than a second, parallel notion of what a valid
+# manager home is. That reuse is what enforces "absolute" and "not inside
+# any git work tree" here, so a temp directory that ever did land inside a
+# checkout fails closed instead of quietly reintroducing the 2026-09-02
+# contamination outage. Everything else in the parent environment (PATH,
+# PYTHONPATH -- which is how the Watcher's pinned interpreter finds its
+# dependencies -- USERPROFILE, and so on) is passed through unchanged, so
+# this narrows exactly one variable and changes nothing else about how a
+# project's own validation command runs.
+
+
+def _isolated_validation_manager_home() -> tuple:
+    """Create and validate a throwaway manager home for one validation run.
+
+    Returns ``(created_directory, resolved_home)``. Both are returned on
+    purpose: cleanup must act on the directory this function literally
+    created, never on the resolved value -- see
+    _remove_validation_manager_home. Raises ManagerHomeError (via
+    resolve_manager_home) if the created directory is not a safe manager
+    home -- inside a git work tree, most importantly -- so the caller
+    fails the validation closed rather than running it against an unsafe
+    home.
+    """
+    created = tempfile.mkdtemp(prefix=VALIDATION_MANAGER_HOME_PREFIX)
+    try:
+        return created, str(resolve_manager_home(created))
+    except BaseException:
+        _remove_validation_manager_home(created)
+        raise
+
+
+def _remove_validation_manager_home(created: str) -> None:
+    """Delete only a directory this module itself created via mkdtemp.
+
+    Deliberately guarded, and deliberately keyed on the literal mkdtemp
+    result rather than on any derived or resolved path. An earlier
+    revision of this fix removed whatever path the home helper returned;
+    a mutation test that made that helper return the worktree under
+    validation promptly deleted the entire checkout. Cleanup of a
+    convenience temp directory must never be able to destroy anything
+    else, so the removal happens only for a path that both carries this
+    module's own prefix and sits directly in the OS temp directory. A
+    directory that fails the guard is left on disk -- an orphaned temp
+    directory is a trivial cost next to the alternative.
+    """
+    try:
+        target = os.path.abspath(created)
+        if (os.path.basename(target).startswith(VALIDATION_MANAGER_HOME_PREFIX)
+                and os.path.dirname(target) == os.path.abspath(tempfile.gettempdir())):
+            shutil.rmtree(target, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _validation_environment(manager_home: str) -> Dict[str, str]:
+    """The parent environment with AI_MANAGER_HOME explicitly overridden.
+
+    A copy is taken so the ADM host process's own environment is never
+    mutated -- this runs inside the long-lived Command Watcher, whose own
+    AI_MANAGER_HOME must keep pointing at the real production home.
+    """
+    env = dict(os.environ)
+    env[MANAGER_HOME_ENV_VAR] = manager_home
+    return env
+
+
 def _run_validation_command(working_directory, command: str, runner=subprocess.run,
                             timeout_seconds: int = DEFAULT_VALIDATION_TIMEOUT_SECONDS) -> Dict[str, Any]:
     """Independently run a Task's own declared validation_command in the
@@ -366,32 +468,56 @@ def _run_validation_command(working_directory, command: str, runner=subprocess.r
     exit_code=None and reported to the caller exactly like a failed run
     (never re-raised): a validation_command that could not be proven to have
     passed must never be silently read downstream as "no evidence" and
-    fall through to a completed status by omission."""
+    fall through to a completed status by omission.
+
+    The subprocess runs against a fresh, execution-specific throwaway
+    manager home supplied explicitly via `env` -- never the Command
+    Watcher's own inherited production AI_MANAGER_HOME (see the comment
+    above this function). The recorded `manager_home` is read back out of
+    the very environment mapping handed to the runner, so the evidence is
+    what the child actually got rather than a separately-computed guess;
+    it is None only when no subprocess was ever launched."""
     started_at = now_iso()
     resolved_command, executable = _resolve_validation_command(command)
+
+    def _evidence(exit_code, output_summary, timed_out, manager_home) -> Dict[str, Any]:
+        return {
+            "command": command, "executable": executable, "exit_code": exit_code,
+            "manager_home": manager_home,
+            "output_summary": output_summary, "started_at": started_at,
+            "completed_at": now_iso(), "timed_out": timed_out,
+        }
+
+    # A manager home that cannot be established safely fails the validation
+    # closed, exactly like any other failure to launch the command at all.
     try:
-        result = runner(resolved_command, cwd=str(working_directory), shell=True, text=True,
-                        encoding="utf-8", errors="replace", capture_output=True, timeout=timeout_seconds)
-    except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + (exc.stderr or "") if isinstance(exc.stdout, str) or isinstance(exc.stderr, str) else ""
-        return {
-            "command": command, "executable": executable, "exit_code": None,
-            "output_summary": (output[-MAX_VALIDATION_OUTPUT_CHARS:] if output
-                               else f"validation_command timed out after {timeout_seconds}s"),
-            "started_at": started_at, "completed_at": now_iso(), "timed_out": True,
-        }
+        created_home, manager_home = _isolated_validation_manager_home()
     except Exception as exc:
-        return {
-            "command": command, "executable": executable, "exit_code": None,
-            "output_summary": f"validation_command could not be run: {exc}"[-MAX_VALIDATION_OUTPUT_CHARS:],
-            "started_at": started_at, "completed_at": now_iso(), "timed_out": False,
-        }
-    output = (result.stdout or "") + (result.stderr or "")
-    return {
-        "command": command, "executable": executable, "exit_code": result.returncode,
-        "output_summary": output[-MAX_VALIDATION_OUTPUT_CHARS:],
-        "started_at": started_at, "completed_at": now_iso(), "timed_out": False,
-    }
+        return _evidence(None, f"validation_command could not be run: no isolated manager home "
+                               f"could be established: {exc}"[-MAX_VALIDATION_OUTPUT_CHARS:], False, None)
+
+    env = _validation_environment(manager_home)
+    manager_home_used = env[MANAGER_HOME_ENV_VAR]
+    try:
+        try:
+            result = runner(resolved_command, cwd=str(working_directory), shell=True, text=True,
+                            encoding="utf-8", errors="replace", capture_output=True, env=env,
+                            timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            output = (exc.stdout or "") + (exc.stderr or "") if isinstance(exc.stdout, str) or isinstance(exc.stderr, str) else ""
+            return _evidence(None, (output[-MAX_VALIDATION_OUTPUT_CHARS:] if output
+                                    else f"validation_command timed out after {timeout_seconds}s"),
+                             True, manager_home_used)
+        except Exception as exc:
+            return _evidence(None, f"validation_command could not be run: {exc}"[-MAX_VALIDATION_OUTPUT_CHARS:],
+                             False, manager_home_used)
+        output = (result.stdout or "") + (result.stderr or "")
+        return _evidence(result.returncode, output[-MAX_VALIDATION_OUTPUT_CHARS:], False, manager_home_used)
+    finally:
+        # Bounded lifetime: one validation run, one home. Never allowed to
+        # turn a passing validation into a failure, and never allowed to
+        # remove anything but the directory created for this run.
+        _remove_validation_manager_home(created_home)
 
 
 def capture_no_change_evidence(working_directory, branch: Optional[str], validation_command: str,

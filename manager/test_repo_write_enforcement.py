@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 """Tests for runtime allowed_paths enforcement against real git state (Slice D)."""
 
+import json
+import os
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from manager.manager_home import ManagerHomeError
 from manager.repo_write_enforcement import (
     AllowedPathsViolationError,
+    MANAGER_HOME_ENV_VAR,
     OWNER_MARKER_FILENAME,
+    VALIDATION_MANAGER_HOME_PREFIX,
+    _remove_validation_manager_home,
     _resolve_validation_command,
+    _run_validation_command,
     capture_repo_write_evidence,
     collect_changed_paths,
     collect_commit_shas,
@@ -673,3 +682,276 @@ def test_commit_and_push_fails_closed_on_git_push_failure(repo):
 
     with pytest.raises(TaskError):
         commit_and_push_repo_write_changes(repo["path"], "refs/heads/main", ["manager/foo.py"], "message")
+
+
+# --- Validation runtime home isolation (P0 HANDS_OFF_VALIDATION_TRUTH) ------
+#
+# Rule44 fresh E2E-A (2026-09-03) failed after a real edit, a real commit
+# 49fa1e7, a real push and a matching remote read-back, because the host's
+# own validation step inherited the Command Watcher's production
+# AI_MANAGER_HOME and the root conftest.py correctly refused to run the
+# suite there (pytest exit 4). These tests pin the invariant that closes
+# it: every validation subprocess is handed an explicit, execution-specific,
+# disposable manager home, and never inherits the parent's.
+
+
+def _normalized(path):
+    """Windows-correct path comparison (the production home and an
+    inherited value can differ only by case)."""
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def _capture_validation_env(working_directory, command='python -c "pass"', exit_code=0):
+    """Run _run_validation_command against a fake runner that records the
+    exact keyword arguments it was handed, so a test can assert on the
+    environment the child process would really have received."""
+    captured = {}
+
+    def fake_runner(cmd, **kwargs):
+        captured["command"] = cmd
+        captured["kwargs"] = kwargs
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(cmd, exit_code, "", "")
+
+    evidence = _run_validation_command(working_directory, command, runner=fake_runner)
+    return evidence, captured
+
+
+# A. Production inheritance attack -------------------------------------------
+
+def test_validation_subprocess_never_inherits_a_production_manager_home(tmp_path, monkeypatch):
+    """The exact Rule44-A shape: the parent (the Command Watcher) carries
+    AI_MANAGER_HOME pointing at the live production manager home. The child
+    must not receive it."""
+    production = tmp_path / "profile" / ".ai-development-manager"
+    monkeypatch.setenv(MANAGER_HOME_ENV_VAR, str(production))
+
+    evidence, captured = _capture_validation_env(tmp_path)
+
+    assert captured["env"] is not None, "no env supplied; the child inherits the parent environment"
+    child_home = captured["env"][MANAGER_HOME_ENV_VAR]
+    assert _normalized(child_home) != _normalized(production)
+    assert os.path.isabs(child_home)
+    assert VALIDATION_MANAGER_HOME_PREFIX in child_home
+    assert evidence["manager_home"] == child_home
+
+
+def test_validation_subprocess_manager_home_is_never_inside_a_git_work_tree(tmp_path, monkeypatch):
+    """manager.manager_home's own invariant, enforced here too: durable
+    runtime state must never be written into a checkout."""
+    monkeypatch.setenv(MANAGER_HOME_ENV_VAR, str(tmp_path / ".ai-development-manager"))
+    _, captured = _capture_validation_env(tmp_path)
+    home = Path(captured["env"][MANAGER_HOME_ENV_VAR])
+    for directory in (home, *home.parents):
+        assert not (directory / ".git").exists(), f"manager home {home} is inside checkout {directory}"
+
+
+def test_validation_subprocess_manager_home_is_not_the_worktree_or_cwd(tmp_path):
+    """Never the repo/worktree under validation, and never a cwd-relative
+    fallback -- both are the 2026-09-02 contamination outage's shape."""
+    _, captured = _capture_validation_env(tmp_path)
+    home = captured["env"][MANAGER_HOME_ENV_VAR]
+    assert _normalized(home) != _normalized(tmp_path)
+    assert _normalized(home) != _normalized(os.getcwd())
+    assert not _normalized(home).startswith(_normalized(tmp_path) + os.sep)
+
+
+# B. Missing parent env -------------------------------------------------------
+
+def test_validation_subprocess_gets_explicit_home_when_parent_has_none(tmp_path, monkeypatch):
+    """With AI_MANAGER_HOME unset the child must still be handed an
+    explicit isolated home -- never left to resolve_manager_home's
+    canonical ~/.ai-development-manager fallback, which is production."""
+    monkeypatch.delenv(MANAGER_HOME_ENV_VAR, raising=False)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "profile"))
+    monkeypatch.setenv("HOME", str(tmp_path / "profile"))
+
+    _, captured = _capture_validation_env(tmp_path)
+
+    child_home = captured["env"][MANAGER_HOME_ENV_VAR]
+    assert child_home and child_home.strip()
+    assert os.path.isabs(child_home)
+    canonical = tmp_path / "profile" / ".ai-development-manager"
+    assert _normalized(child_home) != _normalized(canonical)
+
+
+# C. Blank / whitespace parent env -------------------------------------------
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_validation_subprocess_ignores_a_blank_parent_manager_home(tmp_path, monkeypatch, blank):
+    """A blank AI_MANAGER_HOME is treated as unset by resolve_manager_home,
+    which then falls back to the real canonical home. The child must get a
+    real isolated path instead of inheriting the blank value."""
+    monkeypatch.setenv(MANAGER_HOME_ENV_VAR, blank)
+    _, captured = _capture_validation_env(tmp_path)
+    child_home = captured["env"][MANAGER_HOME_ENV_VAR]
+    assert child_home.strip(), "blank manager home leaked to the child"
+    assert os.path.isabs(child_home)
+    assert VALIDATION_MANAGER_HOME_PREFIX in child_home
+
+
+# D. The rest of the parent environment is preserved --------------------------
+
+def test_validation_environment_preserves_the_rest_of_the_parent_environment(tmp_path, monkeypatch):
+    """Only AI_MANAGER_HOME is narrowed. PYTHONPATH in particular is how
+    the Watcher's pinned interpreter finds its dependencies."""
+    monkeypatch.setenv("PYTHONPATH", "C:\\adm-deps")
+    monkeypatch.setenv("ADM_UNRELATED_MARKER", "preserved")
+    _, captured = _capture_validation_env(tmp_path)
+    env = captured["env"]
+    assert env["PYTHONPATH"] == "C:\\adm-deps"
+    assert env["ADM_UNRELATED_MARKER"] == "preserved"
+
+
+def test_validation_never_mutates_the_hosts_own_environment(tmp_path, monkeypatch):
+    """This runs inside the long-lived Command Watcher, whose own
+    AI_MANAGER_HOME must keep pointing at the real production home."""
+    host_home = str(tmp_path / "host-home")
+    monkeypatch.setenv(MANAGER_HOME_ENV_VAR, host_home)
+    _capture_validation_env(tmp_path)
+    assert os.environ[MANAGER_HOME_ENV_VAR] == host_home
+
+
+# E. Execution isolation ------------------------------------------------------
+
+def test_two_validation_runs_never_share_one_disposable_manager_home(tmp_path):
+    """Two independent executions validating concurrently must not write
+    durable runtime state into the same home."""
+    first, _ = _capture_validation_env(tmp_path)
+    second, _ = _capture_validation_env(tmp_path)
+    assert first["manager_home"] and second["manager_home"]
+    assert first["manager_home"] != second["manager_home"]
+
+
+def test_disposable_manager_home_is_cleaned_up_after_the_run(tmp_path):
+    """Bounded lifetime: one validation run, one home. The Watcher runs
+    this repeatedly and must not leak a directory per execution."""
+    evidence, _ = _capture_validation_env(tmp_path)
+    assert not Path(evidence["manager_home"]).exists()
+
+
+# F. Evidence truth -----------------------------------------------------------
+
+def test_recorded_manager_home_is_what_the_real_child_process_actually_saw(tmp_path):
+    """End-to-end against a REAL subprocess (no fake runner): the recorded
+    manager_home must be the value the child genuinely received, not a
+    separately-computed guess. Also proves the real Windows path behaviour
+    of handing an absolute temp path through cmd.exe."""
+    probe = tmp_path / "probe.py"
+    probe.write_text("import os\nprint(os.environ['AI_MANAGER_HOME'])\n", encoding="utf-8")
+
+    evidence = _run_validation_command(tmp_path, f'python "{probe}"')
+
+    assert evidence["exit_code"] == 0, evidence["output_summary"]
+    child_reported = evidence["output_summary"].strip().splitlines()[-1].strip()
+    assert _normalized(child_reported) == _normalized(evidence["manager_home"])
+
+
+def test_real_child_process_does_not_receive_the_parents_production_home(tmp_path, monkeypatch):
+    """The baseline reproduction, inverted: a fake USERPROFILE makes
+    <profile>/.ai-development-manager the canonical production home for
+    this process; at base the child inherited exactly that string and
+    pytest exited 4. It must now receive an isolated home instead."""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    production = profile / ".ai-development-manager"
+    monkeypatch.setenv("USERPROFILE", str(profile))
+    monkeypatch.setenv("HOME", str(profile))
+    monkeypatch.setenv(MANAGER_HOME_ENV_VAR, str(production))
+
+    probe = tmp_path / "probe.py"
+    probe.write_text("import os\nprint(os.environ['AI_MANAGER_HOME'])\n", encoding="utf-8")
+    evidence = _run_validation_command(tmp_path, f'python "{probe}"')
+
+    assert evidence["exit_code"] == 0, evidence["output_summary"]
+    child_reported = evidence["output_summary"].strip().splitlines()[-1].strip()
+    assert _normalized(child_reported) != _normalized(production)
+    assert _normalized(child_reported) == _normalized(evidence["manager_home"])
+
+
+def test_validation_fails_closed_when_no_isolated_manager_home_can_be_established(tmp_path):
+    """A manager home that cannot be established safely must fail the
+    validation closed -- never fall through to a completed status, and
+    never silently run against whatever the parent carried."""
+    def exploding_home():
+        raise ManagerHomeError("MANAGER_HOME_IN_CHECKOUT: simulated")
+
+    def fake_runner(cmd, **kwargs):  # pragma: no cover - must never be reached
+        raise AssertionError("validation ran without a safe isolated manager home")
+
+    with patch("manager.repo_write_enforcement._isolated_validation_manager_home", exploding_home):
+        evidence = _run_validation_command(tmp_path, 'python -c "pass"', runner=fake_runner)
+
+    assert evidence["exit_code"] is None
+    assert evidence["timed_out"] is False
+    assert evidence["manager_home"] is None
+    assert "isolated manager home" in evidence["output_summary"]
+
+
+def test_manager_home_is_recorded_in_persisted_repo_write_evidence(repo_with_origin):
+    """The evidence a Task actually persists carries the manager home the
+    validation really ran against."""
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "commit", "-am", "edit foo")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    evidence = capture_repo_write_evidence(
+        repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+        validation_command='python -c "print(123)"',
+    )
+
+    assert evidence["tests_status"] == "passed"
+    recorded = evidence["tests"][0]["manager_home"]
+    assert recorded and os.path.isabs(recorded)
+    assert VALIDATION_MANAGER_HOME_PREFIX in recorded
+
+
+def test_execution_schema_accepts_evidence_with_and_without_manager_home():
+    """The new field is optional: records persisted before this fix (no
+    manager_home) must still validate against the schema."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema_path = Path(__file__).resolve().parents[1] / "schema" / "execution.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    tests_schema = schema["properties"]["repo_write_evidence"]["oneOf"][2]["properties"]["tests"]
+
+    legacy = [{"command": "pytest", "exit_code": 0, "output_summary": "ok",
+               "started_at": "2026-09-03T12:39:00Z", "completed_at": "2026-09-03T12:40:00Z"}]
+    current = [dict(legacy[0], manager_home="C:\\Temp\\adm-validation-home-xyz")]
+
+    jsonschema.validate(legacy, tests_schema)
+    jsonschema.validate(current, tests_schema)
+
+
+def test_cleanup_never_deletes_anything_it_did_not_create(tmp_path):
+    """Regression for a real defect found by mutation testing on
+    2026-09-10: the first revision of this fix removed whatever path the
+    home helper returned, so a helper that returned the worktree under
+    validation deleted the entire checkout. Cleanup is now keyed on the
+    literal mkdtemp result and guarded by prefix + parent directory."""
+    precious = tmp_path / "checkout"
+    (precious / "manager").mkdir(parents=True)
+    (precious / "manager" / "keep.py").write_text("do not delete me\n", encoding="utf-8")
+
+    def bad_home():
+        return str(precious), str(precious)
+
+    def fake_runner(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with patch("manager.repo_write_enforcement._isolated_validation_manager_home", bad_home):
+        _run_validation_command(tmp_path, 'python -c "pass"', runner=fake_runner)
+
+    assert precious.exists(), "cleanup deleted a directory it did not create"
+    assert (precious / "manager" / "keep.py").read_text(encoding="utf-8") == "do not delete me\n"
+
+
+def test_cleanup_removes_only_prefixed_directories_in_the_temp_root(tmp_path):
+    """The guard itself, exercised directly in both directions."""
+    outside = tmp_path / (VALIDATION_MANAGER_HOME_PREFIX + "decoy")
+    outside.mkdir()
+    _remove_validation_manager_home(str(outside))
+    assert outside.exists(), "removed a prefixed directory outside the temp root"
+
+    real = tempfile.mkdtemp(prefix=VALIDATION_MANAGER_HOME_PREFIX)
+    _remove_validation_manager_home(real)
+    assert not Path(real).exists(), "failed to remove its own temp directory"
