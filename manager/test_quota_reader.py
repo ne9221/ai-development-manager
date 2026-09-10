@@ -407,5 +407,21 @@ class ClaudeOAuthSourceVerification(unittest.TestCase):
         self.assertTrue(provider["has_reliable_quota"])
 
 
+class ReliableSourceRegistriesStayInSync(unittest.TestCase):
+    """The trusted-source allowlist is currently defined twice: quota_reader
+    projects the bounded external contract through its copy, quota_forecast
+    uses its own for forecasting.  A source approved in one but not the other
+    is a split brain -- the external contract would publish quota that
+    forecasting does not trust, or the reverse.  This pins them equal until
+    they are converged into a single definition.
+    """
+
+    def test_quota_reader_and_forecast_registries_are_identical(self):
+        from manager.quota_forecast import RELIABLE_SOURCES as forecast_sources
+        from manager.quota_reader import RELIABLE_SOURCES as reader_sources
+
+        self.assertEqual(reader_sources, forecast_sources)
+
+
 if __name__ == "__main__":
     unittest.main()
