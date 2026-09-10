@@ -48,11 +48,16 @@ projected through is `manager.quota_reader.RELIABLE_SOURCES`. Read the
 membership from the code rather than from this document, so the contract
 cannot go stale when a source is added or retired.
 
-Note that the allowlist is currently duplicated: `manager.quota_forecast`
-defines its own `RELIABLE_SOURCES` used by forecasting. The two are held
-equal by a test, and a new provider source must be approved in BOTH before
-it is trusted anywhere. Converging them into one definition is tracked as a
-follow-up. Each window always contains a sanitized
+The allowlist governs this contract's `source` label and its
+`known`/`unknown` classification. It is not what makes quota usable for
+ADM's internal routing and forecasting, which turn on fresh official
+provenance and valid windows: an official but unlisted source can be usable
+internally while this contract still reports it as `unknown`.
+`manager.quota_forecast` keeps a second copy of the allowlist, used to
+compute its own `source_verified` field; a test pins the two copies equal,
+and converging them into one definition is tracked as a follow-up.
+
+Each window always contains a sanitized
 `name`; `duration_minutes`, `used_percent`, `remaining_percent`, and
 `resets_at` are optional. Duplicate normalized names keep the first window and
 at most eight windows are returned.
