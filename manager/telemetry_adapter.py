@@ -30,19 +30,23 @@ requirement currently requires them.
 
 Future execution attribution belongs on `CanonicalSession.usage_ref`
 (`manager/sessions.py`, `schema/session.schema.json`), which is already
-reserved for it and is currently `None` at every construction site. It is a
-reference, not an inline blob, which keeps prompts, responses, tool content
-and raw API bodies out of the session record by construction. A consumer
-must be approved before any producer is written.
+reserved for it and is currently `None` at every construction site. Being a
+reference rather than an inline blob, it keeps an execution-attribution blob
+from being embedded directly in `CanonicalSession`. That is the whole of the
+guarantee -- it does NOT make the session record transcript-free: the
+current schema still requires `first_user_prompt`, which persists up to 1000
+characters of user prompt text. A consumer must be approved before any
+producer is written.
 
-Quota truth is a separate capability and is unchanged: it flows
-`collectors/claude_oauth.py` -> `manager/refresh_status.py` ->
-`runtime/status.json` -> `manager/quota_reader.py`. Provider-reported quota
-remains authoritative through that existing pipeline; confidence is
-`official` only when the active source satisfies the existing
-reliable-source gate. It remains the only authority for routing and
-forecasting, and locally derived execution telemetry must never be fed into
-that judgement (AI-DEVELOPMENT-RULES rule 11; PROJECT-RULES -- ADM rule 9).
+This module is not part of ADM's quota authority or routing path. Quota
+collection, persistence, verification and consumption are handled by the
+existing quota modules and SSOT paths -- see `collectors/claude_oauth.py`,
+`manager/refresh_status.py`, `manager/quota_reader.py` and
+`manager/quota_forecast.py` for navigation. This deprecated adapter must not
+be wired into any of them, and locally derived execution telemetry must
+never be fed into a quota judgement (AI-DEVELOPMENT-RULES rule 11;
+PROJECT-RULES -- ADM rule 9). The precise reliability semantics of those
+modules are deliberately not restated here; they are under separate audit.
 
 Decision record: Drive doc 1S9dvb2argvpE2yEiYlHeJC91RorwG1d45YVtqdfGVVo
 (ADM DECISION -- manager/telemetry_adapter.py: DEPRECATE_ADAPTER). Removal
