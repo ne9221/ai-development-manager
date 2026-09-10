@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from manager.quota_reader import QuotaReaderError
 from manager import runtime_bridge as runtime_bridge_module
-from manager.runtime_bridge import human_summary, main, read_runtime_status, resolve_project, runtime_bridge, runtime_status_contract
+from manager.runtime_bridge import human_summary, main, read_runtime_status, resolve_project, runtime_bridge, runtime_status_contract, validate_runtime_status_contract
 from manager.tasks import TaskError, create_handoff, create_project, create_task
 
 
@@ -162,6 +162,22 @@ class RuntimeStatusContractTests(unittest.TestCase):
 
     def test_codex_source_name_not_regressed(self):
         self.assertEqual("codex_app_server", self.contract()["providers"]["codex"]["source"])
+
+    def test_contract_validator_accepts_the_published_oauth_source(self):
+        # docs/CHATGPT-INTEGRATION.md documents `source` as an allowlisted
+        # verified-source name.  Pin that the bounded contract validator really
+        # does accept the OAuth source the projection can now emit -- a stale
+        # documented enum is how an external consumer silently rejects valid
+        # quota.
+        contract = self.contract(claude={"source": "claude_oauth_usage"})
+        self.assertEqual("claude_oauth_usage", contract["providers"]["claude"]["source"])
+        validate_runtime_status_contract(contract)
+
+    def test_contract_validator_rejects_an_off_allowlist_source(self):
+        contract = self.contract()
+        contract["providers"]["claude"]["source"] = "some_unregistered_collector"
+        with self.assertRaises(RuntimeError):
+            validate_runtime_status_contract(contract)
 
     def test_unknown_and_stale_are_not_zero(self):
         unknown = self.contract(claude={"status": "unknown", "windows": []})

@@ -36,12 +36,19 @@ The derived status is `known`, `unknown`, `stale`, or `unavailable`. A stale
 snapshot remains stale, a missing/malformed Drive status is unavailable, and
 an unknown value is never converted to zero. Provider metadata and raw
 responses are not returned. `known` specifically means a fresh numeric quota
-from the verified Codex app-server or Claude statusline source; manual,
+from a source on that provider's verified-source allowlist; manual,
 synthetic, inferred, and local-estimate values remain `unknown`. Future
 timestamps beyond five minutes of clock skew are unavailable.
 
-`source` is a fixed safe label (`codex_app_server`, `claude_statusline`, or
-`unknown`), never upstream free text. Each window always contains a sanitized
+`source` is the name of the verified source the quota actually came from, or
+`unknown`. It is still never upstream free text: a source name is only ever
+reported when it is already on that provider's verified-source allowlist
+(`manager.quota_reader.RELIABLE_SOURCES`), and `unknown` is reported
+otherwise. The allowlist is the single place a new provider source is
+approved, so the label set moves with it rather than drifting -- as of
+2026-09-10 it admits `codex_app_server` and `official_app_server` for Codex,
+and `claude_code_statusline_rate_limits`, `official_statusline` and
+`claude_oauth_usage` for Claude. Each window always contains a sanitized
 `name`; `duration_minutes`, `used_percent`, `remaining_percent`, and
 `resets_at` are optional. Duplicate normalized names keep the first window and
 at most eight windows are returned.
