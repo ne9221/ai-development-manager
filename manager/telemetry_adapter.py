@@ -1,5 +1,47 @@
 #!/usr/bin/env python3
-"""Local read-only telemetry adapter for Codex, Claude, and Antigravity."""
+"""DEPRECATED -- Local read-only telemetry adapter for Codex, Claude, and Antigravity.
+
+DEPRECATED 2026-09-10. This module has never had a production consumer: its
+only importer, at every commit since it was created, is its own test file
+`manager/test_telemetry_adapter.py`. Nothing in `manager/`, `collectors/`,
+`dashboard.py`, any `.ps1` installer or any scheduled task calls
+`collect_local_telemetry()` or its per-provider helpers. Reading this module
+can easily give the opposite impression -- it does not describe a live path.
+
+Superseded by `manager/sessions.py`. That module does the same job for the
+same three providers (scan local JSONL, emit provider-neutral session
+metadata that never contains transcript content), but its `CanonicalSession`
+record is governed by `schema/session.schema.json` and it is actually wired
+into `manager/session_center.py`, `manager/context_pack.py` and the
+Dashboard. `manager/sessions.py` predates this file by five days
+(2026-08-10 vs 2026-08-15) and continued to be developed after it, so this
+adapter was a duplicate implementation from the moment it was written, not
+an unfinished feature and not a reserved future hook.
+
+Do not wire this adapter into any pipeline, and do not enrich it with new
+fields (cache token split, attributionSkill, attributionPlugin,
+attributionMcpServer, attributionMcpTool, isSidechain) on the assumption
+that something will read them. Nothing will.
+
+Future execution attribution belongs on `CanonicalSession.usage_ref`
+(`manager/sessions.py`, `schema/session.schema.json`), which is already
+reserved for it and is currently `None` at every construction site. It is a
+reference, not an inline blob, which keeps prompts, responses, tool content
+and raw API bodies out of the session record by construction. A consumer
+must be approved before any producer is written.
+
+Quota truth is a separate capability and is unchanged: it flows
+`collectors/claude_oauth.py` -> `manager/refresh_status.py` ->
+`runtime/status.json` -> `manager/quota_reader.py`, is provider-reported
+with confidence `official`, and remains the only authority for routing and
+forecasting. Locally derived execution telemetry must never be fed into
+that judgement (AI-DEVELOPMENT-RULES rule 11; PROJECT-RULES -- ADM rule 9).
+
+Decision record: Drive doc 1S9dvb2argvpE2yEiYlHeJC91RorwG1d45YVtqdfGVVo
+(ADM DECISION -- manager/telemetry_adapter.py: DEPRECATE_ADAPTER). Removal
+of this file is deliberately NOT decided there; the notice stands first so
+any hidden consumer can surface.
+"""
 
 import os
 import re
