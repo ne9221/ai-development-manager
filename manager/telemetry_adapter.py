@@ -11,17 +11,22 @@ can easily give the opposite impression -- it does not describe a live path.
 Superseded by `manager/sessions.py`. That module does the same job for the
 same three providers (scan local JSONL, emit provider-neutral session
 metadata that never contains transcript content), but its `CanonicalSession`
-record is governed by `schema/session.schema.json` and it is actually wired
-into `manager/session_center.py`, `manager/context_pack.py` and the
-Dashboard. `manager/sessions.py` predates this file by five days
-(2026-08-10 vs 2026-08-15) and continued to be developed after it, so this
+record is governed by `schema/session.schema.json` and it has a real
+operator path: its CLI subcommands `import-claude` / `import-codex` write
+that schema-governed metadata to the Drive SSOT, and the Dashboard renders
+the Drive session records. `manager/context_pack.py` imports
+`manager.sessions`; `manager/session_center.py` does NOT -- it reaches
+session state through its own JSONL scan. `manager/sessions.py` predates
+this file by five days (2026-08-10 vs 2026-08-15) and continued to be
+developed after it, so this
 adapter was a duplicate implementation from the moment it was written, not
 an unfinished feature and not a reserved future hook.
 
 Do not wire this adapter into any pipeline, and do not enrich it with new
 fields (cache token split, attributionSkill, attributionPlugin,
 attributionMcpServer, attributionMcpTool, isSidechain) on the assumption
-that something will read them. Nothing will.
+that something will read them. Nothing reads them today, and no approved
+requirement currently requires them.
 
 Future execution attribution belongs on `CanonicalSession.usage_ref`
 (`manager/sessions.py`, `schema/session.schema.json`), which is already
@@ -32,9 +37,11 @@ must be approved before any producer is written.
 
 Quota truth is a separate capability and is unchanged: it flows
 `collectors/claude_oauth.py` -> `manager/refresh_status.py` ->
-`runtime/status.json` -> `manager/quota_reader.py`, is provider-reported
-with confidence `official`, and remains the only authority for routing and
-forecasting. Locally derived execution telemetry must never be fed into
+`runtime/status.json` -> `manager/quota_reader.py`. Provider-reported quota
+remains authoritative through that existing pipeline; confidence is
+`official` only when the active source satisfies the existing
+reliable-source gate. It remains the only authority for routing and
+forecasting, and locally derived execution telemetry must never be fed into
 that judgement (AI-DEVELOPMENT-RULES rule 11; PROJECT-RULES -- ADM rule 9).
 
 Decision record: Drive doc 1S9dvb2argvpE2yEiYlHeJC91RorwG1d45YVtqdfGVVo
