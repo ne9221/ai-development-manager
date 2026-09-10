@@ -955,3 +955,78 @@ def test_cleanup_removes_only_prefixed_directories_in_the_temp_root(tmp_path):
     real = tempfile.mkdtemp(prefix=VALIDATION_MANAGER_HOME_PREFIX)
     _remove_validation_manager_home(real)
     assert not Path(real).exists(), "failed to remove its own temp directory"
+
+
+# --- Adversarial-review finding, 2026-09-10 --------------------------------
+#
+# Codex's independent review of the first revision of this fix found that
+# supplying `env` only fixes the environment the SHELL starts with. Under
+# shell=True a validation_command could reassign AI_MANAGER_HOME before
+# launching the real validator, handing it the production home while the
+# persisted evidence still named the disposable directory. Reproduced
+# against that revision before being closed.
+
+_HIJACK_COMMANDS = [
+    'set "AI_MANAGER_HOME=C:\\hijacked" && python -c "pass"',
+    "set AI_MANAGER_HOME=C:\\hijacked&&pytest -q",
+    "export AI_MANAGER_HOME=/tmp/hijacked && pytest -q",
+    "AI_MANAGER_HOME=/tmp/hijacked pytest -q",
+    'powershell -c "$env:AI_MANAGER_HOME=\'C:\\hijacked\'; pytest -q"',
+    'setx ai_manager_home "C:\\hijacked" && pytest -q',
+]
+
+
+@pytest.mark.parametrize("command", _HIJACK_COMMANDS)
+def test_validation_command_that_reassigns_the_manager_home_is_refused(tmp_path, command):
+    """Fail closed, and never launch the command at all."""
+    def fake_runner(cmd, **kwargs):  # pragma: no cover - must never be reached
+        raise AssertionError("a manager-home-reassigning validation_command was executed")
+
+    evidence = _run_validation_command(tmp_path, command, runner=fake_runner)
+
+    assert evidence["exit_code"] is None
+    assert evidence["timed_out"] is False
+    assert evidence["manager_home"] is None
+    assert "refused" in evidence["output_summary"]
+    assert MANAGER_HOME_ENV_VAR in evidence["output_summary"]
+
+
+def test_the_reviewed_hijack_command_can_no_longer_diverge_from_its_evidence(tmp_path):
+    """The exact shape from the review, end to end against a real shell:
+    either the child genuinely runs against the recorded home, or the
+    command is refused outright. What must never happen again is a run
+    whose evidence names one home while the child used another."""
+    probe = tmp_path / "probe.py"
+    probe.write_text("import os\nprint(os.environ['AI_MANAGER_HOME'])\n", encoding="utf-8")
+    hijack = tmp_path / "hijacked-home"
+
+    evidence = _run_validation_command(
+        tmp_path, f'set "AI_MANAGER_HOME={hijack}" && python "{probe}"')
+
+    assert evidence["exit_code"] is None, "the hijacking command was actually executed"
+    assert evidence["manager_home"] is None
+    assert _normalized(hijack) not in _normalized(evidence["output_summary"])
+
+
+def test_an_ordinary_validation_command_is_still_accepted(tmp_path):
+    """The guard must not block normal, ecosystem-agnostic commands."""
+    for command in ('python -c "print(1)"', "npm test", "node --test", "pytest -q tests/"):
+        _, captured = _capture_validation_env(tmp_path, command=command)
+        assert captured["env"] is not None, f"{command!r} was wrongly refused"
+
+
+def test_refused_command_downgrades_persisted_evidence_to_failed(repo_with_origin):
+    """A refusal must read as a failed validation downstream -- never as
+    'no evidence' that falls through to completed."""
+    (repo_with_origin["path"] / "manager" / "foo.py").write_text("changed\n", encoding="utf-8")
+    _git(repo_with_origin["path"], "commit", "-am", "edit foo")
+    _git(repo_with_origin["path"], "push", "origin", "main")
+
+    evidence = capture_repo_write_evidence(
+        repo_with_origin["path"], repo_with_origin["baseline"], "refs/heads/main", ["manager/foo.py"],
+        validation_command='set "AI_MANAGER_HOME=C:\\hijacked" && python -c "print(1)"',
+    )
+
+    assert evidence["tests_status"] == "failed"
+    assert evidence["tests"][0]["exit_code"] is None
+    assert "refused" in evidence["tests"][0]["output_summary"]

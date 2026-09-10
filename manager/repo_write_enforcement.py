@@ -66,6 +66,10 @@ SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 # subprocess runs against -- see _isolated_validation_manager_home below.
 VALIDATION_MANAGER_HOME_PREFIX = "adm-validation-home-"
 
+# Any mention of the manager-home variable in a validation_command -- see
+# the refusal in _run_validation_command for why a mere mention is enough.
+_MANAGER_HOME_MENTION_RE = re.compile(re.escape(MANAGER_HOME_ENV_VAR), re.IGNORECASE)
+
 
 class AllowedPathsViolationError(TaskError):
     """Raised with every offending path -- never just the first one found --
@@ -473,10 +477,13 @@ def _run_validation_command(working_directory, command: str, runner=subprocess.r
     The subprocess runs against a fresh, execution-specific throwaway
     manager home supplied explicitly via `env` -- never the Command
     Watcher's own inherited production AI_MANAGER_HOME (see the comment
-    above this function). The recorded `manager_home` is read back out of
-    the very environment mapping handed to the runner, so the evidence is
-    what the child actually got rather than a separately-computed guess;
-    it is None only when no subprocess was ever launched."""
+    above this function). The recorded `manager_home` is the home ADM
+    supplied, read back out of the very environment mapping handed to the
+    runner rather than separately recomputed; it is None only when no
+    subprocess was ever launched. Because these commands run under
+    `shell=True`, a command that reassigns AI_MANAGER_HOME itself would
+    make that record untrue -- which is exactly why such a command is
+    refused outright below rather than run."""
     started_at = now_iso()
     resolved_command, executable = _resolve_validation_command(command)
 
@@ -487,6 +494,38 @@ def _run_validation_command(working_directory, command: str, runner=subprocess.r
             "output_summary": output_summary, "started_at": started_at,
             "completed_at": now_iso(), "timed_out": timed_out,
         }
+
+    # Supplying `env` fixes the environment the SHELL starts with, not the
+    # one the eventual validator ends up in: these commands run under
+    # shell=True, so `set "AI_MANAGER_HOME=%USERPROFILE%\.ai-development-
+    # manager" && pytest -q` (or an `export`/inline-assignment equivalent)
+    # would hand the real production home straight back to pytest while
+    # the recorded manager_home still named the disposable directory --
+    # reintroducing this very P0 *and* making the persisted evidence lie
+    # about it. Found by adversarial review of the first revision of this
+    # fix (2026-09-10) and reproduced before being closed.
+    #
+    # So a validation_command that so much as names this variable is
+    # refused, fail-closed and loudly, instead of being run. Deliberately
+    # a whole-name match rather than an assignment-shaped pattern: a
+    # regex over shell syntax would have gaps (quoting, `setx`, PowerShell
+    # `$env:`, POSIX prefix assignment), and a project's validation
+    # command has no legitimate reason to name the manager home variable
+    # at all -- ADM supplies it. This is a guard against a Task author
+    # accidentally reintroducing the defect (the 2026-09-04 author reached
+    # for os.environ.pop on this same variable), and it is honestly not a
+    # sandbox: validation_command is admitted, trusted input that already
+    # runs arbitrary code, so a command that computed the assignment
+    # dynamically could still evade a static check.
+    if _MANAGER_HOME_MENTION_RE.search(command):
+        return _evidence(
+            None,
+            f"validation_command was refused: it references {MANAGER_HOME_ENV_VAR}, which ADM "
+            "supplies itself as an isolated, execution-specific throwaway directory. A command "
+            "that sets this variable would run the real validation against a different manager "
+            "home than the one recorded as evidence -- and could point it back at the live "
+            "production home. Remove it from the command."[-MAX_VALIDATION_OUTPUT_CHARS:],
+            False, None)
 
     # A manager home that cannot be established safely fails the validation
     # closed, exactly like any other failure to launch the command at all.
