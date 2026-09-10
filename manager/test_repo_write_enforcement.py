@@ -906,20 +906,56 @@ def test_manager_home_is_recorded_in_persisted_repo_write_evidence(repo_with_ori
     assert VALIDATION_MANAGER_HOME_PREFIX in recorded
 
 
-def test_execution_schema_accepts_evidence_with_and_without_manager_home():
-    """The new field is optional: records persisted before this fix (no
-    manager_home) must still validate against the schema."""
+def _tests_evidence_item_schemas():
+    """Every `tests` item schema in the repo that describes this module's
+    validation evidence, found structurally rather than by a hardcoded
+    list.
+
+    This is deliberately a search, not two named files. The first revision
+    of this fix patched only execution.schema.json and left
+    handoff.schema.json rejecting the new key with
+    additionalProperties:false, which broke five real execution-runner
+    integration tests -- a targeted test that named one schema could not
+    have caught it, and would not catch a third schema appearing later.
+    """
+    found = []
+    schema_dir = Path(__file__).resolve().parents[1] / "schema"
+    for path in sorted(schema_dir.glob("*.schema.json")):
+        document = json.loads(path.read_text(encoding="utf-8"))
+        stack = [document]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                item = (node.get("items") or {}) if isinstance(node.get("items"), dict) else {}
+                properties = item.get("properties") or {}
+                if "command" in properties and "output_summary" in properties:
+                    found.append((path.name, node))
+                stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+            elif isinstance(node, list):
+                stack.extend(node)
+    return found
+
+
+def test_every_schema_carrying_validation_evidence_accepts_manager_home():
+    """The new field is optional everywhere it can appear: records
+    persisted before this fix (no manager_home) must still validate, and
+    records written after it must validate too -- in every schema that
+    describes this evidence, not just the execution one."""
     jsonschema = pytest.importorskip("jsonschema")
-    schema_path = Path(__file__).resolve().parents[1] / "schema" / "execution.schema.json"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    tests_schema = schema["properties"]["repo_write_evidence"]["oneOf"][2]["properties"]["tests"]
+    schemas = _tests_evidence_item_schemas()
+    names = {name for name, _ in schemas}
+    assert {"execution.schema.json", "handoff.schema.json"} <= names, names
 
     legacy = [{"command": "pytest", "exit_code": 0, "output_summary": "ok",
                "started_at": "2026-09-03T12:39:00Z", "completed_at": "2026-09-03T12:40:00Z"}]
     current = [dict(legacy[0], manager_home="C:\\Temp\\adm-validation-home-xyz")]
 
-    jsonschema.validate(legacy, tests_schema)
-    jsonschema.validate(current, tests_schema)
+    for name, tests_schema in schemas:
+        for label, record in (("a pre-fix record", legacy), ("a manager_home record", current)):
+            try:
+                jsonschema.validate(record, tests_schema)
+            except jsonschema.ValidationError as exc:
+                pytest.fail(f"{name} rejected {label}: {exc.message}")
 
 
 def test_cleanup_never_deletes_anything_it_did_not_create(tmp_path):
