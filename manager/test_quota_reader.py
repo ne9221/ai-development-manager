@@ -356,8 +356,6 @@ class LegacyAggregateNeverRescuesNamedAccounts(unittest.TestCase):
         self.assertEqual({"scope": "eligible_named_account", "eligible_account_ids": []}, claude["availability"])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ClaudeOAuthSourceVerification(unittest.TestCase):
@@ -408,3 +406,6 @@ class ClaudeOAuthSourceVerification(unittest.TestCase):
         self.assertTrue(provider["source_verified"])
         self.assertTrue(provider["has_reliable_quota"])
 
+
+if __name__ == "__main__":
+    unittest.main()
