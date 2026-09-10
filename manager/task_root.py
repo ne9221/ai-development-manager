@@ -43,6 +43,7 @@ new epoch open, and archives whatever is there when one does.
 
 import hashlib
 import json
+from copy import deepcopy
 
 from manager.gcs_lock_registry import RegistryConflict
 from manager.tasks import TaskError, now_iso
@@ -442,6 +443,38 @@ def read_task_root_or_legacy_claim(registry, project_id, task_id):
             return None
         return {**document, "generation": generation}
     return check_task_execution_claim(registry, project_id, task_id)
+
+
+def read_terminal_bind(registry, project_id, task_id):
+    """Read-only: this task's current epoch terminal bind, or None.
+
+    Deliberately NOT expressible through read_task_root_or_legacy_claim():
+    that function answers "is this task still claimed?" and therefore
+    returns None the moment authority_active goes false -- which is exactly
+    when a released-but-bound epoch still holds the durable terminal truth
+    every projection must be repaired against. This one answers the
+    orthogonal question "what terminal outcome is already frozen for this
+    epoch?" and stays truthful across the claim's whole lifetime.
+
+    Writes nothing, CASes nothing, migrates nothing: a legacy-shaped
+    document has no bind by construction and reads as None rather than
+    being migrated behind a caller's back (migration stays
+    commit_terminal_bind's own single-CAS-decision responsibility). A
+    document whose identity does not match the key it was read under is a
+    genuine corruption and still fails closed."""
+    try:
+        existing = registry.read_if_exists()
+    except Exception as exc:
+        raise TaskError("task root backend unavailable") from exc
+    if existing is None:
+        return None
+    document, _generation, _server_time = existing
+    if document.get("project_id") != project_id or document.get("task_id") != task_id:
+        raise TaskError("malformed task root record: identity does not match the claim key")
+    if not _is_strengthened(document):
+        return None
+    bind = document.get("terminal")
+    return deepcopy(bind) if isinstance(bind, dict) else None
 
 
 def validate_task_root_running_authority(claim, project_id, task_id, execution_id, provider):

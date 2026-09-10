@@ -116,6 +116,136 @@ def merge_cleanup_evidence(existing, updates):
     return merged
 
 
+class TerminalBindAlreadyBound(TaskError):
+    """This epoch's terminal outcome is already frozen on the GCS Task Root.
+
+    Raised BEFORE any Drive write, by the one guard that makes I11
+    ("a Drive projection never outranks the Root bind") enforceable rather
+    than merely intended. Until this existed, terminalize_execution()
+    persisted the new terminal Execution record FIRST and only then asked
+    commit_terminal_bind() whether that outcome was allowed -- so a losing
+    recovery proposal had already overwritten the winning projection by the
+    time it was rejected (live, 2026-09-04: a bound `failed` execution was
+    overwritten with `interrupted`, whereupon the bind conflict aborted
+    cleanup and stranded the task claim and writer lease forever).
+
+    The correct response to this error is never to retry the proposal: it is
+    to repair the projection FROM the bind (see
+    repair_terminal_projection_from_bind) and then continue cleanup, which
+    is decoupled from whether any proposal was ever accepted."""
+
+    def __init__(self, message, bind, candidate):
+        super().__init__(message)
+        self.bind = bind
+        self.candidate = candidate
+
+
+def terminal_conflict_note(bind, candidate_status, candidate_reason, candidate_hash):
+    """PRESERVE_CONFLICT_EVIDENCE: the single canonical rendering of one
+    rejected terminal observation, carrying everything a later forensic
+    reader needs to reconstruct the disagreement -- both proposal hashes and
+    the candidate's own status/reason -- without ever implying the candidate
+    won. Appended to Execution.cleanup_evidence.errors, which merges
+    append-only with dedup, so recording the same conflict on every
+    subsequent tick stays idempotent."""
+    return ("terminal proposal conflicts with the bound truth: "
+            f"bound_status={(bind or {}).get('terminal_status')!r} "
+            f"bound_hash={(bind or {}).get('proposal_hash')} "
+            f"candidate_status={candidate_status!r} "
+            f"candidate_reason={(candidate_reason or '')[:160]!r} "
+            f"candidate_hash={candidate_hash}")[:600]
+
+
+def _candidate_proposal_hash(execution, bind, status, reason, timestamp):
+    candidate = {**execution, "status": status,
+                 "terminal_reason": (reason if reason is not None else status)[:300],
+                 "completed_at": execution.get("completed_at") or timestamp}
+    return task_root.proposal_hash(task_root.terminal_proposal(candidate, (bind or {}).get("epoch")))
+
+
+def repair_terminal_projection_from_bind(store, project_id, task_id, execution_id, bind, note=None):
+    """PROJECT_FROM_BIND: force one Drive Execution projection's terminal
+    facts back to the Task Root's immutable bind, never the other way round.
+
+    Returns True once the projection agrees with the bind (including the
+    no-op case where it already did), False when it could not be repaired on
+    this pass -- the caller stays in its existing attention/refusal path and
+    a later tick tries again.
+
+    Deliberately refuses to write when the record read here is NOT terminal.
+    A bind can only exist after the winner's own persist_terminal() already
+    landed a terminal Execution record, so a non-terminal read of a bound
+    epoch is a stale projection (Drive's documented read-after-write window),
+    never a live one -- writing that snapshot back would resurrect `running`
+    over the terminal truth and violate I2 while claiming to repair it.
+
+    `cleanup_evidence.provider_outcome` is assigned directly rather than
+    merged: merge_cleanup_evidence treats it as write-once and fails closed
+    on two different non-empty values, which is exactly right for two
+    independent observations but wrong here, where the bind is by
+    construction the authority that settles which of them was real. Every
+    other cleanup_evidence field keeps its merged value, and `errors` stays
+    append-only."""
+    if not isinstance(bind, dict) or bind.get("execution_id") != execution_id:
+        return False
+    try:
+        current = store.get("executions", project_id, execution_id)
+    except Exception:
+        return False
+    identity = {"project_id": project_id, "task_id": task_id, "execution_id": execution_id}
+    if any(current.get(key) != value for key, value in identity.items()):
+        return False
+    if current.get("status") not in ("completed", "failed", "interrupted"):
+        return False
+    bound_outcome = bind.get("provider_outcome") or bind.get("terminal_status")
+    evidence = dict(current.get("cleanup_evidence") or {})
+    already_agrees = (current.get("status") == bind.get("terminal_status")
+                      and current.get("terminal_reason") == bind.get("terminal_reason")
+                      and current.get("completed_at") == bind.get("completed_at")
+                      and evidence.get("provider_outcome") in (None, bound_outcome))
+    if already_agrees:
+        return True
+    # Re-read immediately before writing and fold onto THAT, never onto the
+    # snapshot this function opened with. DriveRecords.put is an
+    # unconditional files.update with no CAS, so a concurrent reconciler's
+    # freshly-written writer_release / task_claim_release / persistence
+    # progress would otherwise be silently rolled back by a repair that
+    # started earlier. This narrows the window to the read-back check below;
+    # it does not close it -- a conditional Execution write is a
+    # DriveRecords-level change and is deliberately out of this phase's
+    # scope. Convergence does not depend on winning the race: every field
+    # that could be lost is re-derived from Root/registry truth on the next
+    # tick, which is what the idempotency and crash-boundary tests assert.
+    try:
+        current = store.get("executions", project_id, execution_id)
+    except Exception:
+        return False
+    if (current.get("status") not in ("completed", "failed", "interrupted")
+            or any(current.get(key) != value for key, value in identity.items())):
+        return False
+    evidence = merge_cleanup_evidence(current.get("cleanup_evidence"),
+                                      {"errors": [note]} if note else {})
+    # provider_outcome is the one field the lattice cannot settle (write-once,
+    # fail-closed on two different values) and the bind is the authority that
+    # can -- assigned directly, after the merge, so nothing else is bypassed.
+    evidence["provider_outcome"] = bound_outcome
+    repaired = {**current,
+                "status": bind["terminal_status"],
+                "terminal_reason": bind.get("terminal_reason"),
+                "completed_at": bind.get("completed_at"),
+                "finished_at": bind.get("completed_at") or current.get("finished_at"),
+                "cleanup_evidence": evidence}
+    try:
+        validate("execution", repaired)
+        store.put("executions", project_id, execution_id, repaired)
+    except Exception:
+        return False
+    try:
+        return store.get("executions", project_id, execution_id) == repaired
+    except Exception:
+        return False
+
+
 def _claimed_task(task, execution_id):
     context = dict(task.get("source_context") or {})
     active = context.get("active_execution_id")
@@ -563,14 +693,27 @@ def _terminal_state(execution, task, handoff, status, summary, timestamp):
     return expected_handoff, expected_task, handoff == expected_handoff and task == expected_task
 
 
-def _retain_terminal_authority(store, execution, status, persisted, error):
+def _retain_terminal_authority(store, execution, status, persisted, error, writer_authority_released=False):
+    """I12: this audit records what is TRUE about the writer authority, not
+    what is convenient. `writer_authority_released` is first-hand proof from
+    the caller that the lease generation was already CAS-released (and
+    re-verified) before terminalization was attempted -- the recovery path
+    in command_watcher._reconcile_active passes exactly that. Ignoring it
+    here (the pre-2026-09-11 behaviour) wrote `writer_release: retained`
+    over a genuinely released lease, and recover_task_claim then refused to
+    release the task claim forever on the strength of that false copy."""
     try:
         current = store.get("executions", execution["project_id"], execution["execution_id"])
         existing_evidence = current.get("cleanup_evidence")
     except Exception:
         current = None
         existing_evidence = execution.get("cleanup_evidence")
-    writer_release = "released" if (existing_evidence or {}).get("writer_release") == "released" else ("retained" if execution.get("access") == "production_write" else "not_required")
+    if (existing_evidence or {}).get("writer_release") in _WRITER_RELEASE_STICKY:
+        writer_release = (existing_evidence or {})["writer_release"]
+    elif writer_authority_released:
+        writer_release = "released"
+    else:
+        writer_release = "retained" if execution.get("access") == "production_write" else "not_required"
     updates = {
         "provider_outcome": status, "persistence": "incomplete" if not persisted else "partial",
         "persisted": persisted,
@@ -683,12 +826,52 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
     execution = store.get("executions", project_id, execution_id)
     if execution.get("status") not in ("completed", "failed", "interrupted"):
         return False
+
+    # PROJECT_FROM_BIND, before anything reads this record's own terminal
+    # facts as if they were authoritative. A projection that disagrees with
+    # the bind is repaired here rather than re-proposed: deriving the
+    # proposal from a projection a losing writer already overwrote is what
+    # made the 2026-09-04 shape permanent, because every subsequent pass
+    # recomputed the loser's hash and lost the same CAS again forever.
+    repaired_from_bind = None
+    if claim_registry is not None:
+        try:
+            repaired_from_bind = task_root.read_terminal_bind(claim_registry, project_id, task_id)
+        except TaskError:
+            # Fail closed, not open: an unreadable Root leaves this pass with
+            # no way to know whether the projection it is about to re-derive
+            # agrees with the bound truth. Return False (the caller's existing
+            # attention path) and retry on a later tick.
+            return False
+        if repaired_from_bind is not None and repaired_from_bind.get("execution_id") == execution_id:
+            candidate_hash = _candidate_proposal_hash(
+                execution, repaired_from_bind, execution["status"],
+                execution.get("terminal_reason"), execution.get("completed_at"))
+            if candidate_hash != repaired_from_bind.get("proposal_hash"):
+                note = terminal_conflict_note(repaired_from_bind, execution["status"],
+                                              execution.get("terminal_reason"), candidate_hash)
+                if not repair_terminal_projection_from_bind(store, project_id, task_id, execution_id,
+                                                            repaired_from_bind, note=note):
+                    return False
+                execution = store.get("executions", project_id, execution_id)
+            else:
+                repaired_from_bind = None
+        else:
+            repaired_from_bind = None
+
     evidence = execution.get("cleanup_evidence") or {}
     if evidence.get("persistence") == "complete" and evidence.get("persisted") == ["execution", "handoff", "task"]:
         return True
     status = execution["status"]
     timestamp = execution.get("completed_at") or now_iso()
-    summary = execution["notes"][-1] if execution.get("notes") else f"Execution {execution_id} {status}"
+    # A repaired projection's own `notes` still end with the LOSING
+    # observation's text (persist_terminal appended it before the conflict
+    # was detected). The Handoff and Task records below are pure functions of
+    # this summary, so on a repaired record it has to come from the bind too
+    # -- otherwise the re-derived Handoff conflicts byte-for-byte with the
+    # one the winner already wrote and materialization fails closed forever.
+    summary = (repaired_from_bind.get("terminal_reason") if repaired_from_bind
+               else (execution["notes"][-1] if execution.get("notes") else f"Execution {execution_id} {status}"))
 
     handoff_drive_file_id = None
     bound_projection = None
@@ -819,6 +1002,43 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
     timestamp = execution.get("completed_at") or completed_at or now_iso()
     summary = (execution["notes"][-1] if execution.get("status") == status and execution.get("notes")
                else summary or f"Execution {execution_id} {status}")
+
+    # I11 fail-closed gate, deliberately BEFORE persist_terminal's Drive
+    # write rather than after it. Two independent refusals, both of which
+    # were reachable live on 2026-09-04:
+    #
+    #   (a) a bind exists and this store read still says `running`. A bind
+    #       can only exist after the winner's own persist_terminal() already
+    #       landed a terminal record, so `running` here is a stale read, and
+    #       writing this proposal would overwrite the winner's projection
+    #       with a loser's outcome. Refuse; the caller repairs from the bind.
+    #   (b) a bind exists and disagrees with the outcome being proposed. A
+    #       terminal outcome is immutable within its epoch: recovery may
+    #       observe, project and clean up, never re-decide.
+    #
+    # An idempotent re-run of the SAME bound outcome on an already-terminal
+    # record still falls through exactly as before -- that is the normal
+    # retry path, not a conflict.
+    if claim_registry is not None:
+        # An unreadable Task Root is NOT evidence that no bind exists, and is
+        # never swallowed into `bound = None` here: "we could not ask" and
+        # "the answer is no" are different facts, and only one of them
+        # licenses a Drive write. (_verify_terminal_authority above already
+        # raises on the same backend failure, so this is defence in depth
+        # rather than the only fence -- which is exactly why it must not be
+        # written as if it were optional.)
+        bound = task_root.read_terminal_bind(claim_registry, project_id, task_id)
+        if bound is not None and bound.get("execution_id") == execution_id:
+            stale_running = execution.get("status") == "running"
+            different_outcome = bound.get("terminal_status") != status
+            if stale_running or different_outcome:
+                candidate_hash = _candidate_proposal_hash(execution, bound, status, summary, timestamp)
+                note = terminal_conflict_note(bound, status, summary, candidate_hash)
+                repair_terminal_projection_from_bind(store, project_id, task_id, execution_id, bound, note=note)
+                raise TerminalBindAlreadyBound(
+                    "task root already bound this epoch's terminal outcome; the Drive projection "
+                    "must be repaired from the bind, never re-proposed", bound,
+                    {"terminal_status": status, "terminal_reason": summary, "proposal_hash": candidate_hash})
     terminal = execution
     persisted = []
     try:
@@ -875,7 +1095,8 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
             task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "task", "pending")
             task_root.advance_materialization_view(claim_registry, project_id, task_id, execution_id, "task", "verified")
     except Exception as exc:
-        _retain_terminal_authority(store, execution, status, persisted, exc)
+        _retain_terminal_authority(store, execution, status, persisted, exc,
+                                   writer_authority_released=writer_authority_released)
         raise
 
     terminal = store.get("executions", project_id, execution_id)

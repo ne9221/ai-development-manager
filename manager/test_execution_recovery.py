@@ -34,6 +34,7 @@ class RecoveryTests(unittest.TestCase):
         # different physical shape; clear the slate first.
         claim.document = None
         claim.generation = 0
+        self.writer = writer
         return store, claim_task_execution(claim, "p1", "t1", "exec-a", "codex", "2026-08-13T01:00:00Z"), claim
 
     def test_terminal_execution_stale_claim_releases_and_repeats_safely(self):
@@ -55,13 +56,30 @@ class RecoveryTests(unittest.TestCase):
                 self.assertIsNotNone(claim.document)
 
     def test_production_terminal_requires_released_writer(self):
+        """Phase 2 (2026-09-11) moved the writer-release question from the
+        Execution's own cleanup_evidence copy to the lock registry itself --
+        the two provably diverged in production on 2026-09-04, and only one
+        of them is the writer authority. So an execution that names a
+        specific lock generation is answered by the registry and nowhere
+        else: the registry's `released` outranks a stale `retained` copy, and
+        an unreadable/absent registry refuses rather than believing the copy.
+        """
         store, _, claim = self.terminal_claim(read_only=False)
-        self.assertEqual("released", recover_task_claim(store, claim, "p1", "t1")["status"])
+        self.assertEqual("released", recover_task_claim(store, claim, "p1", "t1",
+                                                        writer_registry=self.writer)["status"])
+
         store, _, claim = self.terminal_claim(read_only=False)
         execution = store.get("executions", "p1", "exec-a")
         execution["cleanup_evidence"]["writer_release"] = "retained"
         store.put("executions", "p1", "exec-a", execution)
-        self.assertEqual("writer_authority_not_confirmed_released", recover_task_claim(store, claim, "p1", "t1")["reason"])
+        self.assertEqual("released", recover_task_claim(store, claim, "p1", "t1",
+                                                        writer_registry=self.writer)["status"],
+                         "the registry's released truth outranks a stale evidence copy")
+
+        store, _, claim = self.terminal_claim(read_only=False)
+        self.assertEqual("writer_authority_not_confirmed_released",
+                         recover_task_claim(store, claim, "p1", "t1")["reason"],
+                         "a verifiable lease identity may not be cleared without a registry read")
         self.assertIsNotNone(claim.document)
 
     def test_generation_change_refuses_without_deleting_new_claim(self):

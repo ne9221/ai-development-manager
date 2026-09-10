@@ -17,7 +17,8 @@ from manager.ag_runner import AgRunner
 from manager.claude_launcher import ClaudeLauncher
 from manager.codex_launcher import CodexLauncher, process_creation_identity, process_identity_state
 from manager.detached_process import popen_detached
-from manager.execution_lifecycle import merge_cleanup_evidence, retry_incomplete_terminal_persistence, terminalize_execution
+from manager.execution_lifecycle import (merge_cleanup_evidence, repair_terminal_projection_from_bind,
+                                         retry_incomplete_terminal_persistence, terminalize_execution)
 from manager.execution_runner import launch_task
 from manager.open_existing_adm_ui import focus_existing_adm_ui
 from manager.executions import cancel_reserved_execution, execution_health, prepare_task_retry
@@ -28,7 +29,7 @@ from manager.quota_reader import read_drive_status, summarize
 from manager.runtime_bridge import all_projects
 from manager.runtime_supervisor import try_check_and_recover
 from manager.task_claims import task_claim_registry, TaskClaimConflict
-from manager.task_root import read_task_root_or_legacy_claim, release_runtime_claim
+from manager.task_root import read_task_root_or_legacy_claim, read_terminal_bind, release_runtime_claim
 from manager.tasks import DriveRecords, TaskError, now_iso, validate
 from manager.trusted_ingress import (
     ADMISSION_VERSION_V1, REQUIRED_TASK_POLICIES, TRUSTED_INGRESS_ORIGIN, task_policy_satisfied,
@@ -677,6 +678,119 @@ def _release_orphan_pre_execution_claim(store, command, claim_registry):
     return {"status": "queued", "reconciled": True, "orphan_claim_released": True}
 
 
+def _bound_terminal_truth(claim_registry, command):
+    """The immutable terminal bind this Command's execution owns, or None.
+
+    Read-only, and it never converts an unreadable Task Root into "no bind":
+    that TaskError propagates so the caller can decide, per branch, whether
+    not knowing is safe. A bind owned by a DIFFERENT execution IS None here
+    -- it is not this command's truth, and the existing claim-mismatch paths
+    already handle that shape."""
+    bind = read_terminal_bind(claim_registry, command["project_id"], command["task_id"])
+    if isinstance(bind, dict) and bind.get("execution_id") == command["execution_id"]:
+        return bind
+    return None
+
+
+def _attention_unless_bound(store, claim_registry, command, execution, reason):
+    """Re-check the Task Root bind one statement before `_attention()` writes.
+
+    `_attention()` re-reads the Execution and, when that read is
+    non-terminal, stamps stale_at/recovery_reason onto it. Under Drive's
+    read-after-write staleness that read can return `running` for a record
+    that is already terminal -- harmless while the epoch is genuinely
+    unbound, but a projection regression the moment another reconciler
+    binds it.
+
+    This cannot be made atomic here, and does not pretend to be: Drive
+    Executions have no conditional write (DriveRecords.put is an
+    unconditional files.update), so a bind committed between this read and
+    the write below is still physically possible. Two things bound the
+    consequence, and both are asserted by the tests:
+      * the bind itself is immutable and is never what gets overwritten --
+        only its projection can transiently diverge;
+      * the next tick's bind gate at the top of _reconcile_active repairs
+        that projection FROM the bind, so divergence is bounded, not
+        durable.
+    Closing the window properly needs a CAS-capable Execution projection,
+    which is a DriveRecords/executions.py change and deliberately outside
+    this phase's scope."""
+    try:
+        bind = _bound_terminal_truth(claim_registry, command)
+    except TaskError:
+        return {"status": command["status"], "skipped": True, "reason": "task_root_bind_unknown"}
+    if bind is not None:
+        return {"status": command["status"], "skipped": True, "reason": "terminal_bind_projection_stale"}
+    return _attention(store, command, execution, reason)
+
+
+def _converge_terminal_writer_lease(store, command, execution, bind):
+    """Release (or re-verify) a bound terminal execution's writer lease, and
+    make the Execution's evidence copy match the registry's own truth.
+
+    The missing half of terminal cleanup. `terminalize_execution`'s
+    `cleanup_execution()` releases the lease on the happy path, but the
+    watcher's terminal branch -- the only path a partially-persisted or
+    conflict-aborted execution ever reaches again -- had no route to the
+    lease at all. So `recover_task_claim` kept refusing with
+    `writer_authority_not_confirmed_released` on every tick, forever, for
+    two different live shapes: a genuinely still-active lease nobody
+    released (the non-stale deadlock), and a genuinely released one whose
+    Execution copy still said "retained" (2026-09-04).
+
+    Cleanup is DECOUPLED from whether any terminal proposal was accepted
+    (I4): the preconditions are exactly the bound terminal outcome plus
+    first-hand proof the provider process is gone -- never the state of the
+    Drive projection, which may still be mid-repair. A provider that is
+    live, or whose state cannot be determined, is never released."""
+    if execution.get("access") != "production_write":
+        return False
+    if execution.get("status") not in ("completed", "failed", "interrupted"):
+        return False
+    if bind.get("terminal_status") not in ("completed", "failed", "interrupted"):
+        return False
+    lease = execution.get("lease_evidence") or {}
+    lock_id, generation = lease.get("lock_id"), lease.get("generation")
+    if not lock_id or not isinstance(generation, int):
+        return False
+    if _provider_state(execution) not in ("stopped", "replaced"):
+        return False
+    from manager.execution_recovery import writer_lease_release_truth
+
+    try:
+        writer_registry = GCSLockRegistry.from_environment()
+    except Exception:  # noqa: BLE001 -- registry unavailable is a transient; retry next tick
+        return False
+    released = writer_lease_release_truth(writer_registry, execution)
+    if released is False:
+        try:
+            reconcile_stopped_provider_terminal_lease(
+                writer_registry, lock_id, command["project_id"], command["task_id"],
+                execution["execution_id"], execution["provider"], generation,
+                execution.get("session_id"), True,
+            )
+        except TaskError:
+            return False
+        released = writer_lease_release_truth(writer_registry, execution)
+    if released is not True:
+        return False
+    try:
+        current = store.get("executions", command["project_id"], command["execution_id"])
+        if current.get("status") not in ("completed", "failed", "interrupted"):
+            # A non-terminal read of a bound epoch is stale; writing it back
+            # to stamp the evidence would resurrect `running` (I2).
+            return False
+        if (current.get("cleanup_evidence") or {}).get("writer_release") == "released":
+            return True
+        current["cleanup_evidence"] = merge_cleanup_evidence(current.get("cleanup_evidence"),
+                                                             {"writer_release": "released"})
+        validate("execution", current)
+        store.put("executions", command["project_id"], command["execution_id"], current)
+    except (TaskError, KeyError):
+        return False
+    return True
+
+
 def _reconcile_active(store, service, command, claim_factory, launch_failure_observed=False):
     """Reconcile a claimed/running/attention Command against its Execution.
 
@@ -710,8 +824,50 @@ def _reconcile_active(store, service, command, claim_factory, launch_failure_obs
         claim_registry = _claim_registry(command, claim_factory)
     except TaskError:
         return _attention(store, command, execution, "task_claim_backend_unavailable")
+
+    # I11 / first-bind-wins, ahead of EVERY branch below that would treat
+    # this Drive read as authoritative. Once the Task Root has bound this
+    # epoch's terminal outcome, a non-terminal Execution projection is
+    # stale by construction (the winner's own persist_terminal() landed a
+    # terminal record before the bind was ever written), so the running
+    # branch's recovery path -- reconcile the writer lease, then propose
+    # `interrupted` -- must not run at all: on 2026-09-04 it overwrote a
+    # bound `failed` projection with the losing outcome, then aborted
+    # cleanup on the resulting bind conflict and stranded the claim and the
+    # lease forever. Nothing is written on this pass; the staleness window
+    # is transient and a later tick converges through the terminal branch.
+    try:
+        terminal_bind = _bound_terminal_truth(claim_registry, command)
+    except TaskError:
+        if execution.get("status") not in ("completed", "failed", "interrupted"):
+            # Not knowing whether this epoch is already bound is not the same
+            # as knowing it is not, and every non-terminal branch below can
+            # write. Proven live: with the Root unreadable and the Execution
+            # read stale, the running branch fell through to _attention(),
+            # which re-read (stale again) and wrote that `running` snapshot
+            # back over a bound `failed` record -- an I1/I2 violation with no
+            # terminal proposal involved at all. Return without writing
+            # anything, rather than flapping the Command to attention, and
+            # let a later tick converge.
+            return {"status": command["status"], "skipped": True, "reason": "task_root_bind_unknown"}
+        # A terminal Execution cannot be re-proposed by anything below; the
+        # bind is only needed for lease convergence, which safely no-ops.
+        terminal_bind = None
+    if (terminal_bind is not None
+            and execution.get("status") not in ("completed", "failed", "interrupted")):
+        if repair_terminal_projection_from_bind(store, command["project_id"], command["task_id"],
+                                                command["execution_id"], terminal_bind):
+            execution = store.get("executions", command["project_id"], command["execution_id"])
+        else:
+            return {"status": command["status"], "skipped": True,
+                    "reason": "terminal_bind_projection_stale"}
+
     if execution["status"] in ("completed", "failed", "interrupted"):
         evidence = execution.get("cleanup_evidence") or {}
+        if terminal_bind is not None:
+            _converge_terminal_writer_lease(store, command, execution, terminal_bind)
+            execution = store.get("executions", command["project_id"], command["execution_id"])
+            evidence = execution.get("cleanup_evidence") or {}
         if evidence.get("persistence") != "complete":
             drive_file_id_factory = getattr(store, "generate_record_file_id", None)
             if retry_incomplete_terminal_persistence(store, command["project_id"], command["task_id"], command["execution_id"],
@@ -722,7 +878,12 @@ def _reconcile_active(store, service, command, claim_factory, launch_failure_obs
             claim = read_task_root_or_legacy_claim(claim_registry, command["project_id"], command["task_id"])
             if claim is not None:
                 from manager.execution_recovery import recover_task_claim
-                recovered = recover_task_claim(store, claim_registry, command["project_id"], command["task_id"])
+                try:
+                    writer_registry = GCSLockRegistry.from_environment()
+                except Exception:  # noqa: BLE001 -- fall back to the evidence copy, exactly as before
+                    writer_registry = None
+                recovered = recover_task_claim(store, claim_registry, command["project_id"], command["task_id"],
+                                               writer_registry=writer_registry)
                 if recovered.get("status") not in ("clean", "released"):
                     return _attention(store, command, execution, "terminal_cleanup_not_confirmed")
                 if recovered.get("status") == "released":
@@ -847,10 +1008,24 @@ def _reconcile_active(store, service, command, claim_factory, launch_failure_obs
 
     if provider == "stopped" and health["state"] == "healthy":
         health = {**health, "state": "attention", "reason": "provider_process_stopped"}
+    # Second Task Root read, same fence as the first. Two distinct races end
+    # here, and both used to fall through to _attention(), which re-reads the
+    # Execution and -- if that read is also stale -- writes a `running`
+    # snapshot back over a terminal projection (I1/I2):
+    #   * this read fails, and "backend unavailable" becomes `claim = None`;
+    #   * this read succeeds but ANOTHER reconciler bound the epoch's terminal
+    #     outcome between the early bind read above and now, so `execution`
+    #     is stale by construction and every branch below is reasoning about
+    #     a state that no longer exists.
+    # Neither licenses a write. Return without touching Drive and converge on
+    # a later tick through the terminal branch.
     try:
         claim = read_task_root_or_legacy_claim(claim_registry, command["project_id"], command["task_id"])
+        terminal_bind = _bound_terminal_truth(claim_registry, command)
     except TaskError:
-        claim = None
+        return {"status": command["status"], "skipped": True, "reason": "task_root_bind_unknown"}
+    if terminal_bind is not None:
+        return {"status": command["status"], "skipped": True, "reason": "terminal_bind_projection_stale"}
     exact_claim = claim and claim.get("execution_id") == execution["execution_id"]
     if provider == "stopped" and exact_claim and execution.get("access") == "read_only":
         terminalize_execution(
@@ -891,7 +1066,7 @@ def _reconcile_active(store, service, command, claim_factory, launch_failure_obs
         reason = "provider_process_identity_replaced"
     elif provider != "stopped":
         reason = f"{reason}_provider_{provider}"
-    return _attention(store, command, execution, reason)
+    return _attention_unless_bound(store, claim_registry, command, execution, reason)
 
 
 def _claim_expired(command, now=None):
