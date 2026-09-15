@@ -12,14 +12,12 @@ from collectors.publish_drive import build_service
 from manager.assignment import CAPABILITIES, decide
 from manager.estimator import estimate
 from manager.executions import list_executions, list_executions_bounded
-from manager.governance import MANDATORY_STATUS_FIELDS, STATUS_FIELD_LABELS, rendered_rules, validate_task_enforcement
+from manager.governance import MANDATORY_STATUS_FIELDS, STATUS_FIELD_LABELS, rendered_rules, validate_prompt_injection, validate_task_enforcement
 from manager.project_registry import resolve_authoritative_working_directory
 from manager.quota_reader import EXPECTED_PROVIDERS, read_drive_status, summarize, unknown_account_summary
-from manager.rules_manifest import injection_lines, mandatory_rules, validate_prompt_injection, validate_research_gate
+from manager.rules_manifest import validate_research_gate
 from manager.tasks import DriveRecords, TaskError, create_task, safe_id, validate
 
-
-MANDATORY_RULES = mandatory_rules("dispatch")
 
 ADAPTATION = {
     "codex": "Work directly in the named repo and scope. Run required tests and git status. Commit/push only when explicitly requested.",
@@ -115,8 +113,6 @@ def prompt_for(project, task, handoff, provider, estimate_result, quota_summary,
         *[f"- Mandatory ADM governance: {item}" for item in mandatory_rules],
         *[f"- AI Development Manager scope / protection: {item}" for item in additional_shared_rules],
         *[f"- AI Development Manager scope / protection: {item}" for item in task.get("constraints", [])],
-        "Mandatory ADM rules (auto-injected; do not remove, paraphrase, or omit):",
-        *injection_lines(MANDATORY_RULES),
         "Allowed scope:", *[f"- {item}" for item in task.get("scope", [])],
         "Forbidden scope / do not touch:", *[f"- {item}" for item in dict.fromkeys(forbidden)],
         "Acceptance criteria:", *[f"- {item}" for item in task.get("acceptance_criteria", [])],
@@ -452,7 +448,7 @@ def dispatch(store, service, request, quota_document=None, executions=None, hist
     validate_task_enforcement(task)
     summary = quota_line(selected_quota)
     generated = prompt_for(project, task, handoff, selected, selected_estimate, summary, warnings, request.get("shared_rules"), request.get("ponytail_available"))
-    validate_prompt_injection(generated, MANDATORY_RULES)
+    validate_prompt_injection(generated)
     return {
         "recommended_provider": selected, "provider": selected,
         "account_id": selected_quota.get("account_id"),

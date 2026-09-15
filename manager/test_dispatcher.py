@@ -5,7 +5,8 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from manager.dispatcher import dispatch, request_ok
-from manager.rules_manifest import mandatory_rules
+from manager import governance
+from manager.rules_manifest import injection_lines, mandatory_rules
 from manager.sessions import parse_identity_header
 from manager.tasks import TaskError, create_handoff, create_project, create_task
 
@@ -449,12 +450,27 @@ class DispatcherTests(unittest.TestCase):
         task = self.store.get("tasks", "p1", "t1")
         self.assertEqual("C:/already/resolved", task["working_directory"])
 
-    def test_mandatory_rules_are_injected_into_generated_task(self):
-        """The caller passed no shared_rules at all: injection must still happen automatically."""
+    def test_canonical_rules_are_injected_exactly_once_into_generated_task(self):
+        """The caller passed no shared_rules at all: injection must still happen
+        automatically, from governance-rules.json (C) and from nowhere else, so
+        each mandatory instruction reaches the provider exactly once."""
         result = self.dispatch_case(request(title="No manual rules passed"))
         prompt = result["generated_prompt"]
-        for rule in mandatory_rules("dispatch"):
-            self.assertIn(rule["instruction"], prompt, f"mandatory rule {rule['rule_id']} was not auto-injected")
+        rules = governance.RULES["mandatory_rules"]
+        self.assertEqual(8, len(rules))
+        for rule in rules:
+            with self.subTest(rule=rule["id"]):
+                self.assertEqual(1, prompt.count(rule["instruction"]),
+                                 f"mandatory rule {rule['id']} must appear exactly once")
+
+    def test_manifest_injection_is_absent_from_the_live_prompt(self):
+        """Wave 1: the manifest helper still exists for other callers, but its
+        second prompt-injection path must no longer reach a live prompt."""
+        prompt = self.dispatch_case(request(title="Single injection path"))["generated_prompt"]
+        self.assertNotIn("Mandatory ADM rules (auto-injected", prompt)
+        for line in injection_lines(mandatory_rules("dispatch")):
+            with self.subTest(line=line):
+                self.assertNotIn(line, prompt)
 
     def test_dispatch_rejected_when_mandatory_rule_injection_missing(self):
         """Any generated prompt lacking a mandatory rule (bug, drift, bypass) must block dispatch, not warn."""
@@ -462,6 +478,33 @@ class DispatcherTests(unittest.TestCase):
             with self.assertRaises(TaskError) as ctx:
                 self.dispatch_case(request(title="Bypassed injection"))
         self.assertIn("mandatory rule injection missing", str(ctx.exception))
+
+    def test_dropping_any_single_canonical_rule_fails_closed_and_names_it(self):
+        """Fail-closed must be per-rule, not merely 'some governance text present'."""
+        full = self.dispatch_case(request(title="Full prompt"))["generated_prompt"]
+        for rule in governance.RULES["mandatory_rules"]:
+            with self.subTest(rule=rule["id"]):
+                damaged = full.replace(rule["instruction"], "REDACTED")
+                self.assertNotEqual(full, damaged)
+                with mock.patch("manager.dispatcher.prompt_for", return_value=damaged):
+                    with self.assertRaises(TaskError) as ctx:
+                        self.dispatch_case(request(title="Dropped rule"))
+                self.assertIn(rule["id"], str(ctx.exception))
+
+    def test_validator_is_bound_to_canonical_rules_not_the_manifest(self):
+        """A prompt carrying only the manifest instructions must still be rejected:
+        the validator's source of truth is C, not the manifest."""
+        manifest_only = "AI: Codex\nProject: p1\nTask: t1\n\n" + "\n".join(
+            injection_lines(mandatory_rules("dispatch")))
+        with mock.patch("manager.dispatcher.prompt_for", return_value=manifest_only):
+            with self.assertRaises(TaskError) as ctx:
+                self.dispatch_case(request(title="Manifest only"))
+        self.assertIn("mandatory rule injection missing", str(ctx.exception))
+
+    def test_canonical_governance_digest_unchanged_by_wave_1(self):
+        """C itself is untouched, so no stamp migration is required."""
+        self.assertEqual("dc046cbac80101355c4fce000e044bb66d555d145423524bf64b42e019c4f23c",
+                         governance.RULES_DIGEST)
 
     def test_research_before_build_requires_poc_or_rejection_evidence(self):
         with self.assertRaises(TaskError) as ctx:
