@@ -60,6 +60,19 @@ def rendered_rules():
     return [f"{rule['id']}: {rule['instruction']}" for rule in RULES["mandatory_rules"]]
 
 
+def validate_prompt_injection(prompt):
+    """Reject a generated prompt missing any canonical mandatory rule instruction.
+
+    The canonical source is governance-rules.json (C). Dispatch must fail closed
+    rather than hand a provider a prompt whose governance was dropped by a bug,
+    a refactor, or a caller-supplied override.
+    """
+    missing = [rule["id"] for rule in RULES["mandatory_rules"] if rule["instruction"] not in prompt]
+    if missing:
+        raise TaskError(f"mandatory rule injection missing from generated task: {', '.join(missing)}")
+    return True
+
+
 def validate_completion_report(report, task, store=None, provider=None, session=None):
     if not isinstance(report, dict):
         raise TaskError("completion report must be an object")
