@@ -1,0 +1,1569 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ADM normalized AI result",
+  "description": "ADM's canonical view of one agent result event. Every fact carries an evidence level bound to its source (see manager/nextplan/result.py). Generated from FIELD_KINDS.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "event_id",
+    "task_id",
+    "role",
+    "extraction",
+    "facts",
+    "evidence",
+    "blockers",
+    "warnings",
+    "findings"
+  ],
+  "properties": {
+    "contract": {
+      "const": "adm-normalized-result/1"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "role": {
+      "enum": [
+        "worker",
+        "reviewer"
+      ]
+    },
+    "extraction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tier",
+        "signals",
+        "raw_sha256",
+        "warnings"
+      ],
+      "properties": {
+        "tier": {
+          "enum": [
+            "native",
+            "fenced",
+            "deterministic",
+            "heuristic",
+            "none"
+          ]
+        },
+        "signals": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "raw_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "facts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "session_id",
+        "agent",
+        "model",
+        "mode",
+        "status",
+        "progress_percent",
+        "repo",
+        "worktree",
+        "branch",
+        "base_sha",
+        "head_sha",
+        "files_changed",
+        "files_created",
+        "files_deleted",
+        "tests_run",
+        "tests_passed",
+        "tests_failed",
+        "tests_skipped",
+        "commit_sha",
+        "commits",
+        "push_status",
+        "remote_sha",
+        "git_status",
+        "dirty_paths",
+        "ssot_sync_github",
+        "ssot_sync_drive",
+        "review_required",
+        "review_status",
+        "review_verdict",
+        "reviewed_sha",
+        "terminal_state",
+        "recommended_next_action"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "session_id": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "agent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "mode": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "status": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "enum": [
+                    "PASS",
+                    "FAIL",
+                    "PARTIAL",
+                    "BLOCKED",
+                    "IN_PROGRESS",
+                    "ERROR"
+                  ]
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "progress_percent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 100
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "repo": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "worktree": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "branch": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "base_sha": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{7,40}$"
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "head_sha": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{7,40}$"
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "files_changed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "files_created": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "files_deleted": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "tests_run": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "tests_passed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "tests_failed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "tests_skipped": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "commit_sha": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{7,40}$"
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "commits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{7,40}$"
+                  }
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "push_status": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "enum": [
+                    "pushed",
+                    "not_pushed",
+                    "failed",
+                    "not_applicable"
+                  ]
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "remote_sha": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{7,40}$"
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "git_status": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "enum": [
+                    "clean",
+                    "dirty"
+                  ]
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "dirty_paths": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "ssot_sync_github": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "enum": [
+                    "synced",
+                    "failed",
+                    "not_required"
+                  ]
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "ssot_sync_drive": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "enum": [
+                    "synced",
+                    "failed",
+                    "not_required"
+                  ]
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "review_required": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "boolean"
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "review_status": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "enum": [
+                    "not_requested",
+                    "pending",
+                    "pass",
+                    "fail",
+                    "not_applicable"
+                  ]
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "review_verdict": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "enum": [
+                    "PASS",
+                    "FAIL"
+                  ]
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "reviewed_sha": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{7,40}$"
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "terminal_state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "enum": [
+                    "terminal",
+                    "non_terminal"
+                  ]
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "recommended_next_action": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "value",
+            "level",
+            "source",
+            "detail"
+          ],
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1
+                }
+              ]
+            },
+            "level": {
+              "enum": [
+                "VERIFIED",
+                "REPORTED",
+                "DERIVED",
+                "CONTRADICTED",
+                "UNKNOWN"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(agent:(native|fenced|deterministic|heuristic)|derived:[a-z_]+|probe:[a-z_]+|absent)$"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
