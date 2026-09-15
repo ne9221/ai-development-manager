@@ -1,0 +1,196 @@
+{
+  "inventory_version": "1.0.0",
+  "measured_at": "2026-09-16T02:15:00+08:00",
+  "measured_against": {
+    "repo": "github:ne9221/ai-development-manager",
+    "ref": "origin/main",
+    "sha": "2a004d4a54079d457e8e037bdc0872d41a01981f"
+  },
+  "method": "Read-only inspection of origin/main source, schemas and tests. A stage is IMPLEMENTED only when live code, a caller, a test module and a persistence location were all found in main. Unmerged branches are listed under unmerged_candidates and never count toward a main status.",
+  "status_vocabulary": ["IMPLEMENTED", "PARTIAL", "DOC-ONLY", "TEST-ONLY", "MISSING", "UNKNOWN"],
+  "stages": [
+    {
+      "stage": "request",
+      "status": "IMPLEMENTED",
+      "live_implementation": ["manager/dispatch_requests.py", "manager/drive_dispatch_ingress.py", "manager/github_dispatch_ingress.py", "manager/github_issue_dispatch_ingress.py", "cloud/dispatch_ingress.py::handle_dispatch"],
+      "callers": ["manager/drive_dispatch_watcher.py", "manager/github_dispatch_watcher.py", "cloud/app.py"],
+      "tests": ["manager/test_dispatch_requests.py", "manager/test_drive_dispatch_ingress.py", "manager/test_github_dispatch_ingress.py", "manager/test_github_issue_dispatch_ingress.py", "cloud/test_dispatch_ingress.py"],
+      "persistence": ["Drive DISPATCH-REQUESTS folder", "schema/dispatch_request.schema.json"],
+      "evidence": "Direct Dispatch deployment docs + closed acceptance records (memory: project_direct_dispatch_ingress, 3of3 acceptance).",
+      "gaps": []
+    },
+    {
+      "stage": "normalize",
+      "status": "IMPLEMENTED",
+      "live_implementation": ["manager/trusted_ingress.py", "manager/tasks.py::validate/create_task", "manager/project_registry.py"],
+      "callers": ["manager/dispatcher.py::dispatch", "cloud/dispatch_ingress.py"],
+      "tests": ["manager/test_tasks.py", "manager/test_project_registry.py", "manager/test_home_handsoff_ingress_contract.py"],
+      "persistence": ["Drive tasks/<project>/", "schema/task.schema.json", "project-registry.json"],
+      "evidence": "Task schema validation on every put (manager/tasks.py::update_task calls validate('task')).",
+      "gaps": ["Normalization covers the request/task, not the agent's result."]
+    },
+    {
+      "stage": "preflight",
+      "status": "IMPLEMENTED",
+      "live_implementation": ["manager/governance.py::validate_task_enforcement/validate_prompt_injection", "manager/production_guard.py", "manager/execution_lifecycle.py::enter_running_gate", "manager/task_claims.py", "manager/worktree_locks.py", "manager/execution_runner.py (launch working_directory must equal reserved snapshot)"],
+      "callers": ["manager/dispatcher.py::dispatch", "manager/execution_runner.py::run_reserved_execution"],
+      "tests": ["manager/test_governance.py", "manager/test_production_guard.py", "manager/test_task_claims.py", "manager/test_worktree_locks.py", "manager/test_execution_lifecycle.py"],
+      "persistence": ["Task.governance{rules_version,rules_digest}", "worktree lock registry (GCS)", "task claim registry"],
+      "evidence": "Rule 44-A adjudication and Phase 1 validation-runtime isolation records on Drive (2026-09-10).",
+      "gaps": []
+    },
+    {
+      "stage": "dispatch",
+      "status": "IMPLEMENTED",
+      "live_implementation": ["manager/dispatcher.py::dispatch", "manager/execution_runner.py::launch_task", "manager/command_watcher.py", "manager/scheduler.py"],
+      "callers": ["manager/command_watcher.py", "manager/scheduler.py", "cloud/dispatch_ingress.py", "manager/mcp_adapter.py (via cloud.dispatch_ingress.handle_dispatch)"],
+      "tests": ["manager/test_dispatcher.py", "manager/test_execution_runner.py", "manager/test_command_watcher.py", "manager/test_scheduler.py"],
+      "persistence": ["Drive commands/ and executions/ (schema/command.schema.json, schema/execution.schema.json)"],
+      "evidence": "Hands-off Rule44 readiness record (Drive 1eHGUgj2...); Global Hands-off still NOT complete per 2026-09-10 adjudication.",
+      "gaps": ["Retry dispatch exists only as an explicit caller request (cloud/dispatch_ingress.py::_handle_retry_dispatch); nothing decides a retry automatically."]
+    },
+    {
+      "stage": "agent_execution",
+      "status": "IMPLEMENTED",
+      "live_implementation": ["manager/claude_launcher.py", "manager/codex_launcher.py", "manager/ag_cli_runner.py", "manager/execution_runner.py::run_reserved_execution (heartbeats, provider_evidence)"],
+      "callers": ["manager/execution_runner.py"],
+      "tests": ["manager/test_claude_launcher.py", "manager/test_codex_launcher.py", "manager/test_ag_cli_runner.py", "manager/test_execution_runner.py"],
+      "persistence": ["Execution.provider_evidence / heartbeat_at / progress_updated_at"],
+      "evidence": "claude_launcher module docstring notes the stream-json shapes were never verified against a real invocation in that round -- treat Claude result parsing as lower confidence.",
+      "gaps": []
+    },
+    {
+      "stage": "result_ingest",
+      "status": "PARTIAL",
+      "live_implementation": ["manager/claude_launcher.py (last well-formed type=result ndjson event; is_error)", "manager/codex_launcher.py (JSON-RPC result/error)", "manager/ag_cli_runner.py (stream-json result/error events)", "manager/execution_runner.py:546-559 (outcome.status + failure_classification string)"],
+      "callers": ["manager/execution_runner.py::run_reserved_execution"],
+      "tests": ["manager/test_claude_launcher.py", "manager/test_codex_launcher.py", "manager/test_ag_cli_runner.py"],
+      "persistence": ["Execution.status / terminal_reason (<=300 chars) / notes"],
+      "evidence": "Only process-level outcome is ingested. What the agent CLAIMS it did (tests, commits, blockers, next action) is never parsed; manager/governance.py::execution_completion_report builds a generic report ('Execution completed') instead of reading the agent's own report.",
+      "gaps": ["No canonical AI result contract.", "No extraction of agent claims from native/fenced/free-text output.", "No REPORTED/VERIFIED distinction for agent claims."]
+    },
+    {
+      "stage": "validate",
+      "status": "PARTIAL",
+      "live_implementation": ["manager/repo_write_enforcement.py::enforce_allowed_paths / capture_repo_write_evidence / capture_no_change_evidence", "manager/remote_readback.py::verify_remote_branch_matches (git ls-remote)", "manager/governance.py::validate_completion_report (identity + running-claim evidence only)"],
+      "callers": ["manager/execution_runner.py:616-676", "manager/tasks.py::create_handoff/complete_task"],
+      "tests": ["manager/test_repo_write_enforcement.py", "manager/test_remote_readback.py", "manager/test_governance.py"],
+      "persistence": ["Execution.repo_write_evidence (push_status 'verified' only after ls-remote readback; tests run by ADM itself)"],
+      "evidence": "Strong for bounded repo-write executions: ADM commits, pushes, reads back the remote SHA and runs validation_command itself. Read-only and legacy executions get no verification at all.",
+      "gaps": ["No verification of agent-reported facts on non-repo-write paths.", "No Drive read-back verification of evidence sync.", "Verification results are not expressed per-claim (VERIFIED/CONTRADICTED/UNKNOWN)."]
+    },
+    {
+      "stage": "classify",
+      "status": "PARTIAL",
+      "live_implementation": ["launcher failure_classification strings (e.g. claude_launcher 'malformed_output', 'spawn_failed', 'protocol_error'; CodexLaunchError classification)", "manager/quota_reader.py / quota_forecast.py (quota exhaustion)", "manager/acceptance_gate.py (controlled provider-unavailable reroute simulation only)"],
+      "callers": ["manager/execution_runner.py", "manager/dispatcher.py"],
+      "tests": ["manager/test_claude_launcher.py", "manager/test_codex_launcher.py", "manager/test_acceptance_gate.py"],
+      "persistence": ["free-text Execution.terminal_reason"],
+      "evidence": "Failure kinds are ad-hoc strings local to each launcher; there is no canonical failure taxonomy, no per-class retry/reroute/human-gate policy, and no machine-readable atlas.",
+      "gaps": ["Failure Atlas MISSING in main."]
+    },
+    {
+      "stage": "next_plan",
+      "status": "MISSING",
+      "live_implementation": [],
+      "callers": [],
+      "tests": [],
+      "persistence": [],
+      "evidence": "manager/executions.py::finish_execution:463-464 hard-codes every non-completed outcome to Task.status=blocked with next_action='Review failure and decide whether to resume' -- i.e. every failure is a human decision.",
+      "gaps": ["No deterministic planner over (task state, result, verification, failure class, retry history)."]
+    },
+    {
+      "stage": "review",
+      "status": "MISSING",
+      "live_implementation": [],
+      "callers": [],
+      "tests": [],
+      "persistence": [],
+      "evidence": "No reviewer dispatch in main (grep for reviewer in dispatcher/tasks/command_watcher/execution_* found nothing). The worker->reviewer->repair->fresh reviewer loop was proven only by the external DeepCode supervisor PoC (C:/Users/EE/Documents/ChatGPT/AI/deepcode-loop-mvp-20260915/supervisor.py, outside the ADM repo, PARTIAL PASS).",
+      "gaps": ["Reviewer role, freshness rule and verdict ingestion are not in ADM."]
+    },
+    {
+      "stage": "repair",
+      "status": "MISSING",
+      "live_implementation": [],
+      "callers": [],
+      "tests": [],
+      "persistence": [],
+      "evidence": "No repair_of_execution_id in schema/execution.schema.json on main (it exists only in the unmerged Verification Loop design).",
+      "gaps": []
+    },
+    {
+      "stage": "retry",
+      "status": "PARTIAL",
+      "live_implementation": ["manager/executions.py::prepare_task_retry (MAX_RETRY_COUNT=2, retry_count must increment exactly once)", "cloud/dispatch_ingress.py::_handle_retry_dispatch"],
+      "callers": ["cloud/dispatch_ingress.py::handle_dispatch"],
+      "tests": ["manager/test_executions.py", "cloud/test_dispatch_ingress.py"],
+      "persistence": ["Execution.retry_count / retry_of_execution_id"],
+      "evidence": "The mechanism is bounded and idempotent, but who decides to retry is always an external caller.",
+      "gaps": ["No per-failure-class retry policy; retry is not distinguished from repair."]
+    },
+    {
+      "stage": "reroute",
+      "status": "PARTIAL",
+      "live_implementation": ["manager/dispatcher.py provider eligibility / preferred_provider", "manager/command_watcher.py waiting_quota retry sweep"],
+      "callers": ["manager/command_watcher.py"],
+      "tests": ["manager/test_waiting_quota_acceleration.py", "manager/test_acceptance_gate.py"],
+      "persistence": ["Command status 'attention'/waiting_quota fields"],
+      "evidence": "Reroute exists at dispatch time for quota only; a failed execution is never rerouted.",
+      "gaps": []
+    },
+    {
+      "stage": "stop",
+      "status": "IMPLEMENTED",
+      "live_implementation": ["manager/execution_lifecycle.py::terminalize_execution", "manager/executions.py::finish_execution (blocked)", "manager/execution_recovery.py"],
+      "callers": ["manager/execution_runner.py"],
+      "tests": ["manager/test_execution_terminal.py", "manager/test_execution_recovery.py"],
+      "persistence": ["Execution.status terminal set {completed, failed, interrupted}; Task.status blocked"],
+      "evidence": "Phase 2 terminal convergence (e75381d) is on an unmerged branch; main carries the earlier terminal path.",
+      "gaps": []
+    },
+    {
+      "stage": "evidence",
+      "status": "IMPLEMENTED",
+      "live_implementation": ["manager/tasks.py::create_handoff", "manager/execution_lifecycle.py (handoff with push_status/remote_sha/tests_status)", "manager/provenance.py", "manager/health_evidence.py"],
+      "callers": ["manager/execution_lifecycle.py", "manager/executions.py"],
+      "tests": ["manager/test_execution_lifecycle.py", "manager/test_provenance.py", "manager/test_health_evidence.py"],
+      "persistence": ["Drive handoffs/ (schema/handoff.schema.json)", "provenance/*.json"],
+      "evidence": "Handoff carries ADM-verified repo-write facts; the agent's own narrative is not structured.",
+      "gaps": []
+    },
+    {
+      "stage": "terminal_state",
+      "status": "IMPLEMENTED",
+      "live_implementation": ["manager/execution_lifecycle.py::terminalize_execution", "manager/execution_recovery.py::TERMINAL"],
+      "callers": ["manager/execution_runner.py"],
+      "tests": ["manager/test_execution_terminal.py", "manager/test_terminal_monotonicity_cleanup_convergence.py"],
+      "persistence": ["Execution record (Drive)"],
+      "evidence": "Execution terminal truth is strong; Task-level terminal truth (COMPLETE only when evidence is verified and review passed) does not exist.",
+      "gaps": ["No task-level completion proof."]
+    }
+  ],
+  "unmerged_candidates": [
+    {
+      "name": "Verification Loop / Acceptance Layer (Phase A v3 -> B-2 accepted, B3-1/B3-2 review pending)",
+      "branch": "origin/fix/verification-loop-b3-2-repro-cleanup-20260907",
+      "package": "manager/verification_loop/",
+      "relationship": "Acceptance of a candidate SHA from checker VerificationReports (admission, failure admission classes, single next action, derived ACCEPTED). It does not parse agent output, does not cover infra/SSOT/orchestration failures, and is not merged. NextPlan consumes its acceptance state as an optional input when merged; it must not duplicate it.",
+      "status_in_main": "MISSING"
+    },
+    {
+      "name": "Phase 2 Terminal Convergence / Recovery Truth",
+      "branch": "origin/fix/terminal-convergence-recovery-truth-20260911",
+      "relationship": "Execution terminal authority. Orthogonal; not touched.",
+      "status_in_main": "MISSING"
+    }
+  ],
+  "external_pocs": [
+    {
+      "name": "DeepCode Loop MVP supervisor",
+      "path": "C:/Users/EE/Documents/ChatGPT/AI/deepcode-loop-mvp-20260915/supervisor.py",
+      "status": "PARTIAL PASS (reviewer FAIL -> repair -> fresh reviewer PASS chain never completed); not in the ADM repo; DeepCode is not the main line.",
+      "record": "https://docs.google.com/document/d/1BWmMFcJnkEjnolJgMCSllDWASEoaQnMY92N2-SlFMZ4"
+    }
+  ]
+}
