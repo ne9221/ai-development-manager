@@ -1,0 +1,30 @@
+{
+  "description": "Reports PASS but the tree is dirty.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "Status: PASS\ngit status: dirty (2 uncommitted files)\ncommit: 3f2a9c1\n",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "deterministic",
+    "signals": [],
+    "facts": {
+      "status": [
+        "PASS",
+        "REPORTED"
+      ],
+      "git_status": [
+        "dirty",
+        "REPORTED"
+      ],
+      "commit_sha": [
+        "3f2a9c1",
+        "REPORTED"
+      ]
+    },
+    "unknown": []
+  }
+}

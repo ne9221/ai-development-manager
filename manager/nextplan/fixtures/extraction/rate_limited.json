@@ -1,0 +1,22 @@
+{
+  "description": "Transient throttling.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "Error: 429 Too Many Requests — retry after 60s\n",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "heuristic",
+    "signals": [
+      "extract.no_parseable_payload",
+      "result.rate_limited"
+    ],
+    "facts": {},
+    "unknown": [
+      "status"
+    ]
+  }
+}

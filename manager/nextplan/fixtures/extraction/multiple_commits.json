@@ -1,0 +1,29 @@
+{
+  "description": "Two commits; the final one is the candidate.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "Two commits: first the parser, then the tests.\n```adm-result\n{\n  \"schema_version\": \"adm-ai-result/1\",\n  \"task_id\": \"t-100\",\n  \"session_id\": \"s-w1\",\n  \"agent\": \"claude\",\n  \"model\": \"claude-opus-5\",\n  \"mode\": \"high\",\n  \"status\": \"PASS\",\n  \"progress_percent\": 100,\n  \"repo\": \"github:ne9221/ai-development-manager\",\n  \"worktree\": \"/scratch/adm\",\n  \"branch\": \"feat/x\",\n  \"base_sha\": \"0a1b2c3d4e5f60718293a4b5c6d7e8f901234567\",\n  \"head_sha\": \"3f2a9c1d0b8e7f6a5c4d3e2f1a0b9c8d7e6f5a4b\",\n  \"files_changed\": [\n    \"manager/a.py\"\n  ],\n  \"files_created\": [],\n  \"files_deleted\": [],\n  \"tests_run\": 12,\n  \"tests_passed\": 12,\n  \"tests_failed\": 0,\n  \"tests_skipped\": 0,\n  \"commit_sha\": \"3f2a9c1d0b8e7f6a5c4d3e2f1a0b9c8d7e6f5a4b\",\n  \"push_status\": \"pushed\",\n  \"remote_sha\": \"3f2a9c1d0b8e7f6a5c4d3e2f1a0b9c8d7e6f5a4b\",\n  \"git_status\": \"clean\",\n  \"ssot_sync_status\": {\n    \"github\": \"synced\",\n    \"drive\": \"not_required\"\n  },\n  \"review_required\": true,\n  \"review_status\": \"pending\",\n  \"evidence\": [\n    {\n      \"kind\": \"test_log\",\n      \"ref\": \"pytest-output.txt\"\n    }\n  ],\n  \"blockers\": [],\n  \"warnings\": [],\n  \"recommended_next_action\": \"send to independent review\",\n  \"terminal_state\": \"terminal\",\n  \"commits\": [\n    \"9e8d7c6b5a4938271605f4e3d2c1b0a998877665\",\n    \"3f2a9c1d0b8e7f6a5c4d3e2f1a0b9c8d7e6f5a4b\"\n  ]\n}\n```",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "fenced",
+    "signals": [],
+    "facts": {
+      "commits": [
+        [
+          "9e8d7c6b5a4938271605f4e3d2c1b0a998877665",
+          "3f2a9c1d0b8e7f6a5c4d3e2f1a0b9c8d7e6f5a4b"
+        ],
+        "REPORTED"
+      ],
+      "commit_sha": [
+        "3f2a9c1d0b8e7f6a5c4d3e2f1a0b9c8d7e6f5a4b",
+        "REPORTED"
+      ]
+    },
+    "unknown": []
+  }
+}

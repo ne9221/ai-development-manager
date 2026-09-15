@@ -1,0 +1,22 @@
+{
+  "description": "A daily free-tier quota surfaced as HTTP 429 is quota, not a rate limit.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "HTTP 429 rate limit exceeded: free-models-per-day. Add credits to continue.\n",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "heuristic",
+    "signals": [
+      "extract.no_parseable_payload",
+      "result.quota_exhausted"
+    ],
+    "facts": {},
+    "unknown": [
+      "status"
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "description": "Two status lines disagree.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "Status: PASS\n...\nStatus: FAIL\n",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "none",
+    "signals": [
+      "extract.conflicting_statements",
+      "extract.no_parseable_payload"
+    ],
+    "facts": {},
+    "unknown": [
+      "status"
+    ]
+  }
+}

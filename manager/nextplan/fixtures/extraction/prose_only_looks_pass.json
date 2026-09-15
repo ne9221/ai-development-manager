@@ -1,0 +1,24 @@
+{
+  "description": "Only prose that sounds like success.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "Everything looks good — all tests pass! Ready to merge.\n",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "heuristic",
+    "signals": [
+      "extract.no_parseable_payload"
+    ],
+    "facts": {
+      "status": [
+        "PASS",
+        "DERIVED"
+      ]
+    },
+    "unknown": []
+  }
+}

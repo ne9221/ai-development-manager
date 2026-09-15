@@ -1,0 +1,24 @@
+{
+  "description": "Stream ended without a result event.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "stream-json",
+    "content": "{\"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"All done\"}]}}",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "none",
+    "signals": [
+      "extract.no_parseable_payload"
+    ],
+    "facts": {},
+    "unknown": [
+      "status"
+    ],
+    "warnings_contain": [
+      "no result event"
+    ]
+  }
+}

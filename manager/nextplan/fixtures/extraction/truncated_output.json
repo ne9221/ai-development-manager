@@ -1,0 +1,23 @@
+{
+  "description": "Output cut off inside the payload.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "Finishing up.\n```adm-result\n{\"schema_version\": \"adm-ai-result/1\", \"task_id\": \"t-100\", \"status\": \"PA",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "none",
+    "signals": [
+      "extract.no_parseable_payload",
+      "extract.payload_truncated"
+    ],
+    "facts": {},
+    "unknown": [
+      "status",
+      "task_id"
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "description": "Nothing at all.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "none",
+    "signals": [
+      "extract.no_parseable_payload"
+    ],
+    "facts": {},
+    "unknown": [
+      "status"
+    ]
+  }
+}

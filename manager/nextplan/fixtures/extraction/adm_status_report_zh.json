@@ -1,0 +1,43 @@
+{
+  "description": "ADM mandatory status format in Traditional Chinese.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "AI：Claude A\n目前進度：80%\ncommit：3f2a9c1\ngit status：clean\nGitHub sync：pushed, remote == local\nDrive sync：失敗（Drive 403）\nBlockers：Drive unavailable\n",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "deterministic",
+    "signals": [],
+    "facts": {
+      "progress_percent": [
+        80,
+        "REPORTED"
+      ],
+      "commit_sha": [
+        "3f2a9c1",
+        "REPORTED"
+      ],
+      "git_status": [
+        "clean",
+        "REPORTED"
+      ],
+      "push_status": [
+        "pushed",
+        "REPORTED"
+      ],
+      "ssot_sync_drive": [
+        "failed",
+        "REPORTED"
+      ]
+    },
+    "unknown": [
+      "status"
+    ],
+    "blockers": [
+      "Drive unavailable"
+    ]
+  }
+}

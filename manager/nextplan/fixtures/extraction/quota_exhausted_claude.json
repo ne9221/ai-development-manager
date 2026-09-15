@@ -1,0 +1,22 @@
+{
+  "description": "Provider usage limit message, no report.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "Claude AI usage limit reached|1757991600\n",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "heuristic",
+    "signals": [
+      "extract.no_parseable_payload",
+      "result.quota_exhausted"
+    ],
+    "facts": {},
+    "unknown": [
+      "status"
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "description": "pytest reports failures; the closing prose says done.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "Ran the tests.\n============ 2 failed, 10 passed in 3.21s ============\nAll done — 完成！\n",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "deterministic",
+    "signals": [],
+    "facts": {
+      "tests_failed": [
+        2,
+        "REPORTED"
+      ],
+      "tests_passed": [
+        10,
+        "REPORTED"
+      ],
+      "tests_run": [
+        12,
+        "DERIVED"
+      ],
+      "status": [
+        "PASS",
+        "DERIVED"
+      ]
+    },
+    "unknown": []
+  }
+}

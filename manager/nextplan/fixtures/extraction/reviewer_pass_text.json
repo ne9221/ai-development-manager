@@ -1,0 +1,28 @@
+{
+  "description": "Reviewer approves in plain text.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "reviewer",
+    "format": "text",
+    "content": "Verdict: APPROVE\nReviewed SHA: 3f2a9c1d0b8e7f6a5c4d3e2f1a0b9c8d7e6f5a4b\nNo blocking findings.\n",
+    "session_id": "s-r1"
+  },
+  "expected": {
+    "tier": "deterministic",
+    "signals": [],
+    "facts": {
+      "review_verdict": [
+        "PASS",
+        "REPORTED"
+      ],
+      "reviewed_sha": [
+        "3f2a9c1d0b8e7f6a5c4d3e2f1a0b9c8d7e6f5a4b",
+        "REPORTED"
+      ]
+    },
+    "unknown": [
+      "status"
+    ]
+  }
+}

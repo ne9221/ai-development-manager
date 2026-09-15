@@ -1,0 +1,22 @@
+{
+  "description": "Payload attempted, invalid JSON; prose says done.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "Done!\n```adm-result\n{\"schema_version\": \"adm-ai-result/1\", \"status\": \"PASS\",, }\n```\n",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "none",
+    "signals": [
+      "extract.no_parseable_payload",
+      "extract.payload_invalid_json"
+    ],
+    "facts": {},
+    "unknown": [
+      "status"
+    ]
+  }
+}

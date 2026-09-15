@@ -1,0 +1,42 @@
+{
+  "description": "Says it pushed, gives no commit or remote SHA.",
+  "input": {
+    "event_id": "evt-1",
+    "task_id": "t-100",
+    "role": "worker",
+    "format": "text",
+    "content": "工作完成。\n- 狀態：PASS\n- GitHub sync：已 push\n- 測試：8 passed, 0 failed\n",
+    "session_id": "s-w1"
+  },
+  "expected": {
+    "tier": "deterministic",
+    "signals": [],
+    "facts": {
+      "status": [
+        "PASS",
+        "REPORTED"
+      ],
+      "push_status": [
+        "pushed",
+        "REPORTED"
+      ],
+      "tests_passed": [
+        8,
+        "REPORTED"
+      ],
+      "tests_failed": [
+        0,
+        "REPORTED"
+      ],
+      "tests_run": [
+        8,
+        "DERIVED"
+      ]
+    },
+    "unknown": [
+      "remote_sha",
+      "commit_sha",
+      "head_sha"
+    ]
+  }
+}
