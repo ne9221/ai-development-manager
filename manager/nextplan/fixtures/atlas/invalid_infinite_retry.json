@@ -1,0 +1,36 @@
+{
+  "expect_problem": "must be retryable with max_attempts >= 1",
+  "atlas": {
+    "atlas_version": "0.0.1",
+    "entries": [
+      {
+        "failure_code": "push_failed",
+        "category": "repo_git",
+        "severity": "medium",
+        "description": "The push of the task branch failed, or local HEAD is ahead of the remote branch.",
+        "detection_signal": [
+          "result.push_failed",
+          "verify.push.local_ahead_of_remote"
+        ],
+        "required_evidence": [
+          "local HEAD",
+          "remote branch SHA or push error"
+        ],
+        "safe_default": "RETRY_SAME_AGENT",
+        "fallback_action": null,
+        "role_overrides": {},
+        "retryable": true,
+        "max_retry_policy": {
+          "max_attempts": 0,
+          "backoff_seconds": 0,
+          "budget": "per_code"
+        },
+        "reroute_allowed": true,
+        "human_gate_required": false,
+        "terminal_if_unresolved": "MARK_BLOCKED",
+        "next_state": "UNCHANGED",
+        "notes": "Never COMPLETE on an unpushed candidate. Never force-push."
+      }
+    ]
+  }
+}

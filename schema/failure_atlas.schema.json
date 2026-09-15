@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ADM Failure Atlas",
+  "description": "Canonical failure taxonomy consumed by manager.nextplan. Structural rules live here; cross-field rules (next_state consistency, finite budgets, human-gate integrity) live in manager.nextplan.atlas.semantic_problems.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["atlas_version", "entries"],
+  "properties": {
+    "atlas_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "failure_code", "category", "severity", "description", "detection_signal",
+          "required_evidence", "safe_default", "fallback_action", "role_overrides",
+          "retryable", "max_retry_policy", "reroute_allowed", "human_gate_required",
+          "terminal_if_unresolved", "next_state", "notes"
+        ],
+        "properties": {
+          "failure_code": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+          "category": {"enum": ["repo_git", "agent_execution", "test_review", "ssot_sync", "orchestration"]},
+          "severity": {"enum": ["critical", "high", "medium", "low"]},
+          "description": {"type": "string", "minLength": 1},
+          "detection_signal": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z_]+(\\.[a-z0-9_]+)+$"}},
+          "required_evidence": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+          "safe_default": {"$ref": "#/$defs/action"},
+          "fallback_action": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/action"}]},
+          "role_overrides": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"worker": {"$ref": "#/$defs/action"}, "reviewer": {"$ref": "#/$defs/action"}}
+          },
+          "retryable": {"type": "boolean"},
+          "max_retry_policy": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["max_attempts", "backoff_seconds", "budget"],
+            "properties": {
+              "max_attempts": {"type": "integer", "minimum": 0, "maximum": 12},
+              "backoff_seconds": {"type": "integer", "minimum": 0, "maximum": 86400},
+              "budget": {"enum": ["per_code", "repair", "review"]}
+            }
+          },
+          "reroute_allowed": {"type": "boolean"},
+          "human_gate_required": {"type": "boolean"},
+          "terminal_if_unresolved": {"enum": ["HUMAN_GATE", "MARK_BLOCKED", "MARK_FAILED", "NO_OP"]},
+          "next_state": {"enum": ["WORKING", "AWAITING_REVIEW", "REPAIRING", "WAITING", "BLOCKED", "HUMAN_GATE", "FAILED", "COMPLETE", "UNCHANGED"]},
+          "notes": {"type": "string"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "action": {"enum": ["CONTINUE_WORKER", "SEND_TO_REVIEW", "RETURN_TO_WORKER", "RETRY_SAME_AGENT", "REROUTE_AGENT", "WAIT_DEPENDENCY", "HUMAN_GATE", "MARK_BLOCKED", "MARK_FAILED", "MARK_COMPLETE", "NO_OP"]}
+  }
+}

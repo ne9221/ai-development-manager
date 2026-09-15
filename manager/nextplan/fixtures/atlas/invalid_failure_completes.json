@@ -1,0 +1,38 @@
+{
+  "expect_problem": "can never route to MARK_COMPLETE",
+  "atlas": {
+    "atlas_version": "0.0.1",
+    "entries": [
+      {
+        "failure_code": "reviewer_fail",
+        "category": "test_review",
+        "severity": "medium",
+        "description": "An admissible, fresh reviewer returned FAIL on the candidate.",
+        "detection_signal": [
+          "result.review_verdict_fail"
+        ],
+        "required_evidence": [
+          "review verdict",
+          "findings",
+          "reviewed SHA"
+        ],
+        "safe_default": "RETURN_TO_WORKER",
+        "fallback_action": null,
+        "role_overrides": {
+          "reviewer": "MARK_COMPLETE"
+        },
+        "retryable": true,
+        "max_retry_policy": {
+          "max_attempts": 2,
+          "backoff_seconds": 0,
+          "budget": "repair"
+        },
+        "reroute_allowed": false,
+        "human_gate_required": false,
+        "terminal_if_unresolved": "HUMAN_GATE",
+        "next_state": "REPAIRING",
+        "notes": "Findings go back to the ORIGINAL worker session; the reviewer never becomes the implementer (AI-DEVELOPMENT-RULES 32)."
+      }
+    ]
+  }
+}

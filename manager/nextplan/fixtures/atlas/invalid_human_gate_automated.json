@@ -1,0 +1,38 @@
+{
+  "expect_problem": "human-gated failure routes to automated",
+  "atlas": {
+    "atlas_version": "0.0.1",
+    "entries": [
+      {
+        "failure_code": "wrong_repo",
+        "category": "repo_git",
+        "severity": "critical",
+        "description": "The execution worked in, or reported results for, a repository other than the task's declared repo.",
+        "detection_signal": [
+          "verify.repo.identity_mismatch",
+          "result.repo_mismatch"
+        ],
+        "required_evidence": [
+          "task repo identity",
+          "observed origin URL or reported repo"
+        ],
+        "safe_default": "HUMAN_GATE",
+        "fallback_action": null,
+        "role_overrides": {
+          "worker": "CONTINUE_WORKER"
+        },
+        "retryable": false,
+        "max_retry_policy": {
+          "max_attempts": 0,
+          "backoff_seconds": 0,
+          "budget": "per_code"
+        },
+        "reroute_allowed": false,
+        "human_gate_required": true,
+        "terminal_if_unresolved": "MARK_BLOCKED",
+        "next_state": "HUMAN_GATE",
+        "notes": "Hard stop for this execution (PROJECT-RULES ADM rule 12). Writes may have landed in another project; only a person can judge the blast radius."
+      }
+    ]
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "expect_problem": "'notes' is a required property",
+  "atlas": {
+    "atlas_version": "0.0.1",
+    "entries": [
+      {
+        "failure_code": "agent_crash",
+        "category": "agent_execution",
+        "severity": "medium",
+        "description": "The agent process exited abnormally without a result.",
+        "detection_signal": [
+          "execution.crashed",
+          "execution.nonzero_exit_without_result"
+        ],
+        "required_evidence": [
+          "exit code",
+          "absence of a result event"
+        ],
+        "safe_default": "RETRY_SAME_AGENT",
+        "fallback_action": null,
+        "role_overrides": {},
+        "retryable": true,
+        "max_retry_policy": {
+          "max_attempts": 2,
+          "backoff_seconds": 30,
+          "budget": "per_code"
+        },
+        "reroute_allowed": true,
+        "human_gate_required": false,
+        "terminal_if_unresolved": "HUMAN_GATE",
+        "next_state": "UNCHANGED"
+      }
+    ]
+  }
+}

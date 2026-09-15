@@ -1,0 +1,38 @@
+{
+  "expect_problem": "reroute_allowed is false",
+  "atlas": {
+    "atlas_version": "0.0.1",
+    "entries": [
+      {
+        "failure_code": "test_failed",
+        "category": "test_review",
+        "severity": "medium",
+        "description": "Required tests ran and failed.",
+        "detection_signal": [
+          "verify.tests.failed",
+          "result.tests_failed_nonzero"
+        ],
+        "required_evidence": [
+          "test command",
+          "exit code or failing test ids"
+        ],
+        "safe_default": "CONTINUE_WORKER",
+        "fallback_action": "REROUTE_AGENT",
+        "role_overrides": {
+          "reviewer": "RETURN_TO_WORKER"
+        },
+        "retryable": true,
+        "max_retry_policy": {
+          "max_attempts": 2,
+          "backoff_seconds": 0,
+          "budget": "per_code"
+        },
+        "reroute_allowed": false,
+        "human_gate_required": false,
+        "terminal_if_unresolved": "HUMAN_GATE",
+        "next_state": "WORKING",
+        "notes": "Known-baseline failures are not this task's defect only when a base run at the same base_sha proves it (see regression_unknown)."
+      }
+    ]
+  }
+}
