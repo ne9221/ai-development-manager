@@ -100,10 +100,19 @@ def in_scope(path, allowed_paths):
     return False
 
 
+# What the world can actually distinguish. git sees whether the remote has the
+# commit; it cannot tell a push that failed from a push that never happened, so
+# claiming "failed" while the world says "not_pushed" is agreement, not a lie.
+EQUIVALENT_VALUES = {"push_status": ({"not_pushed", "failed"},)}
+
+
 def equivalent(field, claimed, observed):
     kind = r.FIELD_KINDS[field]
     if claimed is None or observed is None:
         return claimed is observed
+    for group in EQUIVALENT_VALUES.get(field, ()):
+        if claimed in group and observed in group:
+            return True
     if kind == "sha":
         claimed, observed = claimed.lower(), observed.lower()
         return claimed.startswith(observed) or observed.startswith(claimed)
