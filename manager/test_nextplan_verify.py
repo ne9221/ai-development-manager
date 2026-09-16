@@ -7,6 +7,7 @@ from pathlib import Path
 
 from manager.nextplan import result as r
 from manager.nextplan import vocabulary as v
+from manager.nextplan.classify import completion_proof
 from manager.nextplan.verify import (
     DispatchRecordProbe, DriveReadbackProbe, ExecutionRecordProbe, GitProbe, ProbeUnavailable, TestEvidenceProbe,
     normalize_repo, observation, adm_test_evidence, verify,
@@ -251,6 +252,10 @@ class ExecutionRecordProbeTests(unittest.TestCase):
         self.assertEqual("adm_run", evidence["source"])
         verified, _ = verify(claims(tests_failed=0), {"test_evidence": evidence}, [TestEvidenceProbe()])
         self.assertEqual((0, v.VERIFIED), (r.value(verified, "tests_failed"), r.level(verified, "tests_failed")))
+        # ...and the follow-up question the 2026-09-16 review had to ask for us:
+        # an exit code with no counts says nothing about whether tests ran.
+        self.assertEqual(v.UNKNOWN, r.level(verified, "tests_run"))
+        self.assertFalse(all(item["ok"] for item in completion_proof(verified, {})))
 
     def test_no_evidence_means_unavailable_not_failed(self):
         self.assertIsNone(adm_test_evidence({"repo_write_evidence": None}))

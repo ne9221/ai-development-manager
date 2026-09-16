@@ -27,7 +27,10 @@ from manager.nextplan.extract import extract
 from manager.nextplan.planner import apply, new_task_state, plan
 
 SEEDS = (1, 7, 13, 42, 99, 2026)
-PROOF_FIELDS = ("status", "head_sha", "commit_sha", "remote_sha", "push_status", "git_status", "tests_failed")
+# tests_run belongs here: leaving it out was how the suite mirrored the
+# production blind spot the 2026-09-16 review found.
+PROOF_FIELDS = ("status", "head_sha", "commit_sha", "remote_sha", "push_status", "git_status",
+                "tests_failed", "tests_run")
 
 
 def working(**changes):

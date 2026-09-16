@@ -302,10 +302,27 @@ class ExecutionRecordProbe:
 
 
 def adm_test_evidence(execution):
-    """Adapt ADM's own validation runs (never the provider's claims) to test evidence."""
+    """Adapt ADM's own validation runs (never the provider's claims) to test evidence.
+
+    The recorded ``output_summary`` is parsed for real counts with the same
+    parser the extractor uses. Without counts an exit code alone cannot show
+    that any test ran (``true`` exits 0), so a run that yields none leaves
+    tests_run UNKNOWN and the completion proof fails rather than passing on an
+    empty validation.
+    """
+    from manager.nextplan.extract import test_counts
+
     evidence = (execution or {}).get("repo_write_evidence") or {}
-    runs = [{"command": t["command"], "exit_code": t.get("exit_code"), "timed_out": bool(t.get("timed_out"))}
-            for t in evidence.get("tests", [])]
+    runs = []
+    for test in evidence.get("tests", []):
+        run = {"command": test["command"], "exit_code": test.get("exit_code"),
+               "timed_out": bool(test.get("timed_out"))}
+        counts = test_counts(test.get("output_summary") or "")
+        if counts:
+            run["passed"] = counts.get("tests_passed", 0)
+            run["failed"] = counts.get("tests_failed", 0)
+            run["skipped"] = counts.get("tests_skipped", 0)
+        runs.append(run)
     return {"source": "adm_run", "runs": runs} if runs else None
 
 

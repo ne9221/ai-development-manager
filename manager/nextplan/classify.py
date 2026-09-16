@@ -81,8 +81,14 @@ def completion_proof(result, requirements):
     if req["requires_tests"]:
         items.append(_item("required tests passed", "tests_failed", result,
                            level("tests_failed") == v.VERIFIED and value("tests_failed") == 0, "0 (VERIFIED)"))
-        if level("tests_run") == v.VERIFIED:
-            items.append(_item("tests actually ran", "tests_run", result, value("tests_run") > 0, "> 0 (VERIFIED)"))
+        # This item is unconditional on purpose. It used to be appended only
+        # when tests_run was already VERIFIED, so when nothing could say how
+        # many tests ran the requirement vanished from the proof instead of
+        # failing it -- and a validation command that ran zero tests (`true`,
+        # exit 0) completed the task. An absent proof item is not a satisfied
+        # one.
+        items.append(_item("tests actually ran", "tests_run", result,
+                           level("tests_run") == v.VERIFIED and (value("tests_run") or 0) > 0, "> 0 (VERIFIED)"))
     if req["requires_drive_sync"]:
         items.append(_item("Drive evidence read back", "ssot_sync_drive", result,
                            level("ssot_sync_drive") == v.VERIFIED and value("ssot_sync_drive") == "synced",

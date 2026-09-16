@@ -96,6 +96,11 @@ _RATE = re.compile(r"\b429\b|rate[- ]?limit(?:ed)?", re.I)
 _BLOCKED_PROSE = re.compile(r"\bblocked\b|\bcannot proceed\b|無法繼續|阻塞", re.I)
 _DONE_PROSE = re.compile(r"\ball (?:tests )?pass(?:ed|ing)?\b|\b(?:done|completed|finished)\b|已完成|完成", re.I)
 _FAIL_PROSE = re.compile(r"\bfail(?:ed|ing|ure)?\b|失敗", re.I)
+# An explicit contrary judgement in the agent's own prose. Only ever used to
+# withdraw a positive claim, never to create one.
+_CONTRARY_VERDICT = re.compile(
+    r"changes[ _-]required|should not (?:ship|merge|land)|do not merge|\breject(?:ed|s)?\b|"
+    r"\bnot ready\b|needs? (?:more )?work|不應(?:該)?合併|需要(?:再)?修改|尚未完成", re.I)
 
 
 def _sha256(text):
@@ -225,6 +230,15 @@ def _payload_facts(payload, tier, signals, warnings, role):
 
 # -- source 3: deterministic lines ---------------------------------------------------------------
 
+def test_counts(text):
+    """Public: parse "N passed, N failed, N skipped" style counts out of text.
+
+    Shared with manager.nextplan.verify so a test summary recorded by ADM is
+    read by exactly the same parser as one an agent quotes.
+    """
+    return _counts(text)
+
+
 def _counts(text):
     found = {}
     for number, word in _COUNT.findall(text):
@@ -242,10 +256,15 @@ def _counts(text):
 def _map_value(field, raw, role):
     token = raw.strip().strip("*`").strip()
     upper = token.upper().replace(" ", "_")
+    # Exact matches only. A prefix fallback used to collapse a hedge into a
+    # clean verdict -- "PASS_WITH_CAVEATS" became PASS and
+    # "APPROVED_WITH_COMMENTS" became a passing review. A qualified answer is
+    # not the unqualified one; unmapped words fall through to a warning and
+    # stay UNKNOWN.
     if field == "status":
-        return _STATUS_WORDS.get(upper) or _STATUS_WORDS.get(upper.split("_")[0] if upper else upper)
+        return _STATUS_WORDS.get(upper)
     if field == "review_verdict":
-        return _VERDICT_WORDS.get(upper) or _VERDICT_WORDS.get(upper.split("_")[0] if upper else upper)
+        return _VERDICT_WORDS.get(upper)
     if field in ("commit_sha", "head_sha", "remote_sha", "base_sha", "reviewed_sha"):
         match = _HEX.search(token.lower())
         return match.group(0) if match else None
@@ -436,11 +455,24 @@ def extract(output):
         if r.level(result, "tests_passed") == v.REPORTED and r.level(result, "tests_failed") == v.REPORTED:
             result["facts"]["tests_run"] = r.fact(passed + failed, v.DERIVED, "derived:test_count_sum")
 
+    # Prose the agent wrote outside any payload or parsed line.
+    prose = "\n".join(line for index, line in enumerate(lines) if index not in consumed)
+
+    # A positive claim is withdrawn when the same message states the opposite
+    # in prose: a payload saying review_verdict PASS next to "CHANGES REQUIRED"
+    # is a contradiction, not an approval. This can only ever remove a claim,
+    # which is why a heuristic is allowed to do it.
+    if _CONTRARY_VERDICT.search(prose):
+        for field in ("status", "review_verdict"):
+            if r.value(result, field) == "PASS" and r.level(result, field) in (v.REPORTED, v.DERIVED):
+                result["facts"][field] = r.unknown(
+                    f"claimed PASS, but the same message states the opposite in prose"[:300])
+                signals.add("extract.conflicting_statements")
+
     # Negative heuristics read only what the agent said about its own run:
     # prose outside payloads, plus declared blockers. Payload findings or code
     # that merely *mention* rate limiting must not trip them.
-    prose = "\n".join(line for index, line in enumerate(lines) if index not in consumed) if payload is None else ""
-    heuristic_text = "\n".join([prose, *lists["blockers"]])
+    heuristic_text = "\n".join([prose if payload is None else "", *lists["blockers"]])
     if _QUOTA.search(heuristic_text):
         signals.add("result.quota_exhausted")
     elif _RATE.search(heuristic_text):
