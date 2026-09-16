@@ -145,6 +145,25 @@ class FindingTwoQuotedPayloadBecomesTheVerdict(unittest.TestCase):
         decision = plan(reviewing(), h.event(got, role=v.REVIEWER, session_id=h.REVIEWER_SESSION, generation=1))
         self.assertEqual(v.MARK_COMPLETE, decision["action"])
 
+    def test_research_rejection_evidence_is_not_a_contrary_verdict(self):
+        """Rule 10 reports say "rejected the library"; that is not a verdict."""
+        payload = {"schema_version": r.REPORT_SCHEMA_VERSION, "task_id": "t-1", "status": "PASS"}
+        for prose in ("I evaluated three libraries and rejected all of them: none handles Windows paths.",
+                      "Rejected the wrapper approach after a PoC; built it directly instead.",
+                      "The parser rejects malformed payloads, as required."):
+            with self.subTest(prose):
+                content = prose + "\n\n```adm-result\n" + json.dumps(payload) + "\n```\n"
+                got = extract({"event_id": "e", "task_id": "t-1", "role": v.WORKER, "format": "text",
+                               "content": content})
+                self.assertEqual(("PASS", v.REPORTED), (r.value(got, "status"), r.level(got, "status")))
+                self.assertNotIn("extract.conflicting_statements", got["extraction"]["signals"])
+
+    def test_a_verdict_shaped_reject_still_withdraws_the_claim(self):
+        payload = {"schema_version": r.REPORT_SCHEMA_VERSION, "task_id": "t-1", "status": "PASS"}
+        content = "REJECT - the migration loses rows.\n\n```adm-result\n" + json.dumps(payload) + "\n```\n"
+        got = extract({"event_id": "e", "task_id": "t-1", "role": v.WORKER, "format": "text", "content": content})
+        self.assertEqual(v.UNKNOWN, r.level(got, "status"))
+
     def test_a_worker_saying_the_opposite_of_its_own_payload_is_caught_too(self):
         payload = {"schema_version": r.REPORT_SCHEMA_VERSION, "task_id": "t-1", "status": "PASS"}
         content = ("This is not ready - needs more work on the parser.\n\n```adm-result\n"

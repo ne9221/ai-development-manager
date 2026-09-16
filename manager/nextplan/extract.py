@@ -98,9 +98,15 @@ _DONE_PROSE = re.compile(r"\ball (?:tests )?pass(?:ed|ing)?\b|\b(?:done|complete
 _FAIL_PROSE = re.compile(r"\bfail(?:ed|ing|ure)?\b|失敗", re.I)
 # An explicit contrary judgement in the agent's own prose. Only ever used to
 # withdraw a positive claim, never to create one.
+#
+# Deliberately narrow. A bare "rejected" is NOT here: ADM reports routinely say
+# "rejected the library after evaluating it" as research-before-build evidence
+# (common governance rule 10), and that must not withdraw an honest PASS. A
+# verdict-shaped REJECT is matched case-sensitively instead.
 _CONTRARY_VERDICT = re.compile(
-    r"changes[ _-]required|should not (?:ship|merge|land)|do not merge|\breject(?:ed|s)?\b|"
-    r"\bnot ready\b|needs? (?:more )?work|不應(?:該)?合併|需要(?:再)?修改|尚未完成", re.I)
+    r"changes[ _-]required|should not (?:ship|merge|land)|do not merge|\bnot ready\b|"
+    r"needs? (?:more|further) work|不應(?:該)?合併|尚未完成|還沒(?:有)?完成", re.I)
+_CONTRARY_TOKEN = re.compile(r"\bREJECT(?:ED)?\b|\bCHANGES[ _]REQUIRED\b|\bDO NOT MERGE\b")
 
 
 def _sha256(text):
@@ -462,7 +468,7 @@ def extract(output):
     # in prose: a payload saying review_verdict PASS next to "CHANGES REQUIRED"
     # is a contradiction, not an approval. This can only ever remove a claim,
     # which is why a heuristic is allowed to do it.
-    if _CONTRARY_VERDICT.search(prose):
+    if _CONTRARY_VERDICT.search(prose) or _CONTRARY_TOKEN.search(prose):
         for field in ("status", "review_verdict"):
             if r.value(result, field) == "PASS" and r.level(result, field) in (v.REPORTED, v.DERIVED):
                 result["facts"][field] = r.unknown(
