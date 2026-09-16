@@ -120,7 +120,12 @@ def _fresh_review_constraints(state, event):
 def _failure_decision(decide, state, event, findings, atlas):
     codes = [finding["code"] for finding in findings]
     signals = [signal for finding in findings for signal in finding["signals"]]
-    code = codes[0]
+    # A human gate is not a severity contest: if any active failure needs a
+    # person, that failure governs even when a more severe automated one is
+    # present. Otherwise a critical false_pass would quietly decide a task that
+    # also has, say, a parallel writer collision.
+    gated = [code for code in codes if atlas.entry(code)["human_gate_required"]]
+    code = gated[0] if gated else codes[0]
     entry = atlas.entry(code)
     role = event.get("role") or state["phase_owner"]["role"]
     if entry["human_gate_required"]:
