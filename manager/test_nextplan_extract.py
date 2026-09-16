@@ -95,5 +95,62 @@ class ExtractionInvariantTests(unittest.TestCase):
         self.assertEqual(v.UNKNOWN, r.level(got, "review_verdict"))
 
 
+class DeterministicDetailTests(unittest.TestCase):
+    """The value mappings the corpus does not happen to exercise."""
+
+    def extract_text(self, content, role=v.WORKER):
+        return extract({"event_id": "e", "task_id": "t-1", "role": role, "format": "text", "content": content})
+
+    def test_push_words_map_to_the_right_state(self):
+        for text, expected in (("GitHub sync: 未 push", "not_pushed"), ("push: 失敗 (rejected)", "failed"),
+                               ("push: not pushed yet", "not_pushed"), ("push: 已推送", "pushed")):
+            with self.subTest(text):
+                self.assertEqual(expected, r.value(self.extract_text(text), "push_status"))
+
+    def test_skipped_tests_are_counted_separately(self):
+        got = self.extract_text("==== 8 passed, 2 skipped in 1.10s ====")
+        self.assertEqual((8, 2, 0), (r.value(got, "tests_passed"), r.value(got, "tests_skipped"),
+                                     r.value(got, "tests_failed")))
+
+    def test_errors_count_as_failures(self):
+        got = self.extract_text("==== 1 failed, 2 errors, 5 passed in 3.00s ====")
+        self.assertEqual(3, r.value(got, "tests_failed"))
+
+    def test_unittest_summary_is_understood(self):
+        got = self.extract_text("Ran 12 tests in 0.40s\nFAILED (failures=2, errors=1)")
+        self.assertEqual((12, 3), (r.value(got, "tests_run"), r.value(got, "tests_failed")))
+
+    def test_branch_line_keeps_only_the_branch_name(self):
+        got = self.extract_text("branch: feat/nextplan-x (tracking origin/feat/nextplan-x)")
+        self.assertEqual("feat/nextplan-x", r.value(got, "branch"))
+
+    def test_a_short_sha_agreeing_with_the_payload_keeps_the_full_one(self):
+        full = "3f2a9c1d0b8e7f6a5c4d3e2f1a0b9c8d7e6f5a4b"
+        payload = {"schema_version": r.REPORT_SCHEMA_VERSION, "task_id": "t-1", "status": "PASS", "commit_sha": full}
+        content = "```adm-result\n" + json.dumps(payload) + "\n```\n\ncommit: " + full[:8] + "\n"
+        got = self.extract_text(content)
+        self.assertEqual((full, v.REPORTED), (r.value(got, "commit_sha"), r.level(got, "commit_sha")))
+
+    def test_a_short_sha_disagreeing_with_the_payload_is_a_conflict(self):
+        full = "3f2a9c1d0b8e7f6a5c4d3e2f1a0b9c8d7e6f5a4b"
+        payload = {"schema_version": r.REPORT_SCHEMA_VERSION, "task_id": "t-1", "status": "PASS", "commit_sha": full}
+        content = "```adm-result\n" + json.dumps(payload) + "\n```\n\ncommit: 9999999\n"
+        got = self.extract_text(content)
+        self.assertEqual(v.UNKNOWN, r.level(got, "commit_sha"))
+        self.assertIn("extract.conflicting_statements", got["extraction"]["signals"])
+
+    def test_an_unmapped_status_word_is_a_warning_not_a_guess(self):
+        got = self.extract_text("Status: SORT-OF-OK")
+        self.assertEqual(v.UNKNOWN, r.level(got, "status"))
+        self.assertTrue(any("unmapped" in w for w in got["extraction"]["warnings"]))
+
+    def test_tests_not_run_is_recorded_as_zero(self):
+        self.assertEqual(0, r.value(self.extract_text("測試：未執行"), "tests_run"))
+
+    def test_blockers_none_is_not_a_blocker(self):
+        self.assertEqual([], self.extract_text("Blockers: none").get("blockers"))
+        self.assertEqual(["Drive 403"], self.extract_text("Blockers: Drive 403").get("blockers"))
+
+
 if __name__ == "__main__":
     unittest.main()
