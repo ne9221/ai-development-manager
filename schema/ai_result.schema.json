@@ -14,7 +14,8 @@
     "evidence",
     "blockers",
     "warnings",
-    "findings"
+    "findings",
+    "decisions"
   ],
   "properties": {
     "contract": {
@@ -1563,6 +1564,12 @@
       "type": "array",
       "items": {
         "type": "string"
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object"
       }
     }
   }

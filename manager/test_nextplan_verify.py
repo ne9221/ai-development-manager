@@ -265,7 +265,12 @@ class ExecutionRecordProbeTests(unittest.TestCase):
 
 class TestEvidenceProbeTests(unittest.TestCase):
     def test_count_mismatch_is_a_hallucinated_result(self):
-        evidence = {"source": "artifact", "runs": [{"command": "pytest", "exit_code": 0, "passed": 9, "failed": 0}]}
+        # Round 5: counts are admissible only from a process-bound run, so the
+        # fixture now carries the execution identity a runner adapter records.
+        # The assertion below is unchanged -- 9 observed against 12 claimed is
+        # still a hallucinated result.
+        evidence = {"source": "artifact", "runs": [{"execution_id": "exec-1", "argv": ["pytest"],
+                                                    "exit_code": 0, "passed": 9, "failed": 0}]}
         verified, report = verify(claims(tests_passed=12, tests_failed=0), {"test_evidence": evidence}, [TestEvidenceProbe()])
         self.assertEqual(v.CONTRADICTED, r.level(verified, "tests_passed"))
         self.assertIn("verify.tests.count_mismatch", report["signals"])

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ADM validation execution (adm-validation-result/v1)",
+  "description": "The record of ONE test execution ADM spawned, and the only source of VERIFIED test counts. Produced by a runner adapter (manager/nextplan/runner.py), never by parsing a command's stdout: the adapter spawns an argv list with shell=False and reads the counts from the structured report the runner itself wrote. Codex demonstrated why, by running `echo documentation; pytest & echo ===== 12 passed in 3.10s =====` through ADM's validation path and obtaining VERIFIED tests_run=12 and a completed task. Legacy shell-string records still carry an exit code but can never carry counts.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema", "execution_id", "argv", "runner", "started", "exit_code"],
+  "properties": {
+    "schema": {
+      "const": "adm-validation-result/v1"
+    },
+    "execution_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$",
+      "description": "Identity of this one spawned process. Counts are attributed to it and cannot be reattached to another run."
+    },
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string"},
+      "description": "The argument vector actually spawned. Never a shell string: a shell string is the shape in which a printed argument and an executed program are indistinguishable."
+    },
+    "runner": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The adapter that produced this record. The adapter checks argv actually invokes that program."
+    },
+    "started": {
+      "const": true,
+      "description": "False (or absent) means the process never started, which proves nothing and is rejected as evidence."
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "The spawned process's exit status."
+    },
+    "timed_out": {"type": "boolean"},
+    "tests": {
+      "description": "Counts read from the runner's own structured report. null is the honest value when no report was produced -- the run is recorded, the numbers are not invented, and the completion proof fails for want of evidence rather than passing by omission.",
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["passed", "failed", "skipped"],
+          "properties": {
+            "passed": {"type": "integer", "minimum": 0},
+            "failed": {"type": "integer", "minimum": 0},
+            "skipped": {"type": "integer", "minimum": 0}
+          }
+        }
+      ]
+    },
+    "output_summary": {
+      "type": "string",
+      "description": "Bounded stdout+stderr, for humans reading the audit trail. Deliberately NOT a source of counts."
+    }
+  }
+}

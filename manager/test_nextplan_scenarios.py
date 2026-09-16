@@ -53,18 +53,40 @@ def payload(**changes):
     return report
 
 
-def envelope(report=None, text=None, role=v.WORKER, session_id=None, generation=0, event_id="evt-1"):
+def envelope(report=None, text=None, role=v.WORKER, session_id=None, generation=0, event_id="evt-1",
+             decision=None, reviewer_run_id=h.REVIEWER_RUN):
     report = report if report is not None else payload()
-    # Round 4: a payload carries the verdict's value but cannot authorize it.
-    # A compliant reviewer states its decision in its own words, so that is
-    # what the scenario reviewer now sends.
+    # Round 5: the prose lead is kept exactly as Round 4 wrote it, and is now
+    # pure annotation -- it can no longer authorize anything. A compliant
+    # reviewer additionally returns an adm-review-result/v1 block, and that
+    # block is the only thing the completion gate reads.
     lead = (f"Verdict: {report['review_verdict']}"
             if role == v.REVIEWER and report.get("review_verdict") else "Work finished.")
+    blocks = ""
+    if role == v.REVIEWER and report.get("review_verdict") and decision is not False:
+        block = decision if decision else h.review_decision(
+            verdict="PASS" if report["review_verdict"] == "PASS" else "REJECT",
+            target=report.get("reviewed_sha") or h.HEAD, reviewer_run_id=reviewer_run_id)
+        blocks = "\n```adm-review-result\n" + json.dumps(block, indent=2) + "\n```\n"
     content = text if text is not None else (
-        lead + "\n\n```adm-result\n" + json.dumps(report, indent=2) + "\n```\n")
+        lead + "\n\n```adm-result\n" + json.dumps(report, indent=2) + "\n```\n" + blocks)
     return {"event_id": event_id, "task_id": "t-1", "role": role, "agent": "claude", "generation": generation,
             "format": "text", "content": content,
             "session_id": session_id or (h.WORKER_SESSION if role == v.WORKER else h.REVIEWER_SESSION)}
+
+
+def dispatched(state, **changes):
+    """The state after the orchestrator records the reviewer run it launched.
+
+    SEND_TO_REVIEW deliberately clears any previous run identity, so a scenario
+    that carries on into a review phase has to record the new one -- exactly as
+    ADM does when it dispatches. Without this step nothing can authorize, which
+    is the intended fail-closed default and is asserted directly in
+    test_nextplan_round5_findings.py.
+    """
+    state = dict(state)
+    state["review_dispatch"] = h.review_dispatch(**changes)
+    return state
 
 
 def review_payload(verdict="PASS", reviewed=h.HEAD, evidence=True, **changes):
@@ -89,7 +111,9 @@ def working(**changes):
 def reviewing(**changes):
     candidate = {"head_sha": h.HEAD, "proof": completion_proof(h.worker_result(), {}), "worker_session": h.WORKER_SESSION}
     base = task(state=v.AWAITING_REVIEW, phase_owner={"role": v.REVIEWER, "session_id": None},
-                worker_session=h.WORKER_SESSION, worker_sessions=[h.WORKER_SESSION], candidate=candidate, generation=1)
+                worker_session=h.WORKER_SESSION, worker_sessions=[h.WORKER_SESSION], candidate=candidate,
+                # Round 5: the reviewer run ADM dispatched; decisions bind to it.
+                review_dispatch=h.review_dispatch(), generation=1)
     base.update(changes)
     return base
 
@@ -275,7 +299,10 @@ class ScenarioMatrixTests(unittest.TestCase):
     def test_s20_a_verified_candidate_approved_by_a_fresh_reviewer_completes(self):
         worker = self.decide(working(), envelope(), probes=honest_world())
         self.assertEqual(v.SEND_TO_REVIEW, worker["decision"]["action"])
-        state = worker["state_after"]
+        # Round 5: SEND_TO_REVIEW clears any previous reviewer run identity, so
+        # the orchestrator records the run it has just dispatched. Everything
+        # the scenario asserted before this line is unchanged.
+        state = dispatched(worker["state_after"])
         review = self.decide(state, envelope(review_payload(), role=v.REVIEWER, generation=state["generation"],
                                              event_id="evt-r1"))
         self.assertEqual(v.MARK_COMPLETE, review["decision"]["action"])

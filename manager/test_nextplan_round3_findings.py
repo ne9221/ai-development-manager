@@ -121,11 +121,24 @@ GENUINE_PASS_PROSE = (
 
 
 def execution_with(output_summary, command="pytest", exit_code=0):
+    """A LEGACY record: a shell command string plus whatever it printed.
+
+    Round 5 made this shape incapable of yielding counts at all.
+    """
     return {"repo_write_evidence": {
         "files_changed": ["pkg/a.py"], "commits": [h.HEAD], "final_commit_sha": h.HEAD, "branch": "feat/x",
         "worktree_path": "/w", "push_status": "verified", "remote_sha": h.HEAD, "tests_status": "passed",
         "tests": [{"command": command, "exit_code": exit_code, "output_summary": output_summary,
                    "started_at": "2026-09-16T00:00:00Z", "completed_at": "2026-09-16T00:00:01Z"}]}}
+
+
+def validated(passed=12, failed=0, skipped=0, exit_code=0):
+    """The same run as a runner adapter records it: one argv, one process, its own report."""
+    return {"repo_write_evidence": {
+        "files_changed": ["pkg/a.py"], "commits": [h.HEAD], "final_commit_sha": h.HEAD, "branch": "feat/x",
+        "worktree_path": "/w", "push_status": "verified", "remote_sha": h.HEAD, "tests_status": "passed",
+        "validation_results": [h.validation_result(passed=passed, failed=failed, skipped=skipped,
+                                                   exit_code=exit_code)]}}
 
 
 def working(**changes):
@@ -140,6 +153,9 @@ def reviewing(**changes):
                  "worker_session": h.WORKER_SESSION}
     state = working(state=v.AWAITING_REVIEW, phase_owner={"role": v.REVIEWER, "session_id": None},
                     worker_session=h.WORKER_SESSION, worker_sessions=[h.WORKER_SESSION], candidate=candidate,
+                    # Round 5: ADM's own record of the reviewer run it dispatched. A
+                    # decision authorizes only when it binds back to this.
+                    review_dispatch=h.review_dispatch(),
                     generation=1)
     state.update(changes)
     return state
@@ -149,7 +165,7 @@ def worker_text(content):
     return extract({"event_id": "e", "task_id": "t-1", "role": v.WORKER, "format": "text", "content": content})
 
 
-def review_text(prose, verdict="PASS", anchor=True):
+def review_text(prose, verdict="PASS", anchor=True, decision=True):
     """Reviewer prose beside a structured payload that claims a clean PASS.
 
     Round 4: a payload alone no longer authorizes a PASS (Codex finding R3-1),
@@ -157,12 +173,21 @@ def review_text(prose, verdict="PASS", anchor=True):
     states. Without it every rejection case below would pass for the wrong
     reason -- blocked by the new gate rather than by the prose -- and would
     stop testing what it was written to test.
+
+    Round 5: for exactly the same reason, they now also carry a bound
+    adm-review-result/v1 decision. The prose anchor is no longer authority, so
+    without the block these cases would once again be blocked by the gate rather
+    than by the wording they exist to exercise. Every rejection case here is
+    therefore a live test of the one thing prose may still do: **withdraw** an
+    otherwise valid structured PASS.
     """
     if anchor:
         prose = f"Verdict: {verdict}\n" + prose
     payload = {"schema_version": r.REPORT_SCHEMA_VERSION, "task_id": "t-1", "status": "PASS",
                "review_verdict": verdict, "reviewed_sha": h.HEAD}
-    content = prose + "\n\n```adm-result\n" + json.dumps(payload) + "\n```\n"
+    block = ("\n```adm-review-result\n" + json.dumps(h.review_decision(verdict=verdict)) + "\n```\n"
+             if decision else "")
+    content = prose + "\n\n```adm-result\n" + json.dumps(payload) + "\n```\n" + block
     got = extract({"event_id": "evt-r1", "task_id": "t-1", "role": v.REVIEWER, "format": "text",
                    "session_id": h.REVIEWER_SESSION, "content": content})
     got["evidence"] = [{"kind": "review_notes", "ref": "review.md"}]
@@ -214,11 +239,22 @@ class GroupATestEvidenceProvenance(unittest.TestCase):
         self.assertEqual({"tests_passed": 2, "tests_failed": 1, "tests_skipped": 0}, parse_counts(content))
 
     def test_zero_tests_never_proves_that_tests_ran(self):
+        # The parser is unchanged and still reads the summary exactly as before.
         counts = parse_counts("===== 0 passed in 0.01s =====")
         self.assertEqual({"tests_passed": 0, "tests_failed": 0}, counts)
-        evidence = adm_test_evidence(execution_with("===== 0 passed in 0.01s ====="))
         bare = h.worker_result(verified=False, drop=("tests_run", "tests_passed", "tests_failed"))
-        verified, _ = verify(bare, {"test_evidence": evidence}, [TestEvidenceProbe()])
+
+        # Round 5: the legacy record cannot say how many tests ran at all, so the
+        # requirement fails for want of evidence rather than on the number.
+        legacy, _ = verify(bare, {"test_evidence": adm_test_evidence(execution_with("===== 0 passed in 0.01s ====="))},
+                           [TestEvidenceProbe()])
+        self.assertEqual(v.UNKNOWN, r.level(legacy, "tests_run"))
+        self.assertFalse(next(i for i in completion_proof(legacy, {}) if "actually ran" in i["requirement"])["ok"])
+
+        # And the original claim, on the channel that can now carry counts: a run
+        # that genuinely executed zero tests is VERIFIED at zero, and zero still
+        # does not prove that tests ran.
+        verified, _ = verify(bare, {"test_evidence": adm_test_evidence(validated(passed=0))}, [TestEvidenceProbe()])
         self.assertEqual((0, v.VERIFIED), (r.value(verified, "tests_run"), r.level(verified, "tests_run")))
         proof = completion_proof(verified, {})
         ran = next(item for item in proof if "actually ran" in item["requirement"])

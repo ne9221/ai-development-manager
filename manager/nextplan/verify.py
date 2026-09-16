@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 
+from manager.nextplan import contracts
 from manager.nextplan import result as r
 from manager.nextplan import vocabulary as v
 
@@ -319,11 +320,25 @@ _INTERPRETER = re.compile(r"^(?:python[\d.]*|py|pypy[\d.]*|node|deno|bunx?|npx|p
 
 
 def is_test_command(command):
-    """Is this Task-declared command recognisably a test-runner invocation?
+    """Does this shell string *look like* a test-runner invocation? Diagnostic only.
 
-    Deliberately conservative and structural: it reads the *program* of each
-    shell segment, not any substring of the line, so `echo "===== 999 passed ====="`
-    is not a test run however convincing its output looks.
+    DEMOTED in Round 5. This used to decide whether a recorded run's output
+    could become VERIFIED test counts, and Codex broke it with a real
+    subprocess::
+
+        echo documentation; pytest & echo ===== 12 passed in 3.10s =====
+
+    _SEGMENT split on ``;`` but not on ``&``, so the printed word ``pytest`` was
+    read as an executed program. Adding ``&`` would close that instance and
+    leave the shape untouched: the designation is decided for the *command
+    string* while the counts are taken from the *whole output*, so nothing ties
+    a number to a process. ``pytest && echo "===== 999 passed ====="`` defeats
+    any lexical repair of this function.
+
+    It survives as an annotation -- useful for explaining a legacy record to a
+    human -- and no longer gates anything. Counts now come only from
+    manager.nextplan.runner, which spawns an argv list and reads the runner's
+    own structured report.
     """
     if not command or not isinstance(command, str):
         return False
@@ -354,11 +369,9 @@ def is_test_command(command):
 
 
 def is_test_step(test):
-    """Is this recorded validation step designated as a test run?
+    """Was this recorded validation step designated a test run? Diagnostic only.
 
-    An explicit ``kind`` decides, so once the execution runner labels its steps
-    this stops guessing entirely. Until then the Task-declared command is the
-    only provenance there is, and anything unrecognised is NOT a test run.
+    Demoted with is_test_command: a designation is not evidence that tests ran.
     """
     kind = (test or {}).get("kind")
     if kind is not None:
@@ -367,34 +380,48 @@ def is_test_step(test):
 
 
 def adm_test_evidence(execution):
-    """Adapt ADM's own validation runs (never the provider's claims) to test evidence.
+    """Adapt ADM's own recorded validation runs to test evidence.
 
-    Counts are read only from a step that is *designated* a test run. Parsing the
-    output alone cannot tell a test runner's stdout from a script that printed a
-    documentation transcript and exited 0 -- Codex reproduced exactly that,
-    escalating a documented "8 passed" into VERIFIED tests_run=8 and a completed
-    task. A step that is not a test run still records its exit code, so a failure
-    is not lost; it simply cannot say how many tests ran.
+    Two kinds of record can appear, and only one of them can produce counts.
 
-    Without counts an exit code alone cannot show that any test ran (``true``
-    exits 0), so such a run leaves tests_run UNKNOWN and the completion proof
-    fails rather than passing on an empty validation.
+    ``validation_results`` holds ``adm-validation-result/v1`` objects, each
+    written by a runner adapter that spawned an argv list and read the runner's
+    own structured report (manager.nextplan.runner). Its counts belong to that
+    ``execution_id``, so they are admissible.
+
+    ``tests`` holds the legacy shell-string records: a command line, an exit
+    code, and whatever the command printed. **These can never yield counts.**
+    Not because the parser is weak, but because the record itself cannot
+    distinguish output a test runner produced from output a command echoed --
+    the evidence needed to tell those apart was never captured. The exit code is
+    still carried, so a failing run is not lost; it simply cannot say how many
+    tests ran, and ``tests_run`` stays UNKNOWN.
+
+    An unproven run therefore fails the completion proof instead of satisfying
+    it. That is the point: ``true`` exits 0, and so does ``echo``.
     """
-    from manager.nextplan.extract import test_counts
-
     evidence = (execution or {}).get("repo_write_evidence") or {}
     runs = []
-    for test in evidence.get("tests", []):
-        run = {"command": test["command"], "exit_code": test.get("exit_code"),
-               "timed_out": bool(test.get("timed_out")), "test_step": is_test_step(test)}
-        counts = test_counts(test.get("output_summary") or "") if run["test_step"] else {}
+    for block in evidence.get("validation_results", []):
+        problems = contracts.validation_problems(block)
+        run = {"execution_id": block.get("execution_id") if isinstance(block, dict) else None,
+               "argv": block.get("argv") if isinstance(block, dict) else None,
+               "runner": block.get("runner") if isinstance(block, dict) else None,
+               "exit_code": block.get("exit_code") if isinstance(block, dict) else None,
+               "timed_out": bool(block.get("timed_out")) if isinstance(block, dict) else True,
+               "structured": not problems, "problems": problems}
+        counts = contracts.validation_counts(block) if not problems else None
         if counts:
-            run["passed"] = counts.get("tests_passed", 0)
-            run["failed"] = counts.get("tests_failed", 0)
-            run["skipped"] = counts.get("tests_skipped", 0)
+            run.update(passed=counts["passed"], failed=counts["failed"], skipped=counts["skipped"])
         runs.append(run)
+    for test in evidence.get("tests", []):
+        # Legacy record: exit status only, by construction. `test_step` is kept
+        # for human explanation and is deliberately not consulted for counts.
+        runs.append({"command": test.get("command"), "exit_code": test.get("exit_code"),
+                     "timed_out": bool(test.get("timed_out")), "test_step": is_test_step(test),
+                     "structured": False,
+                     "problems": ["legacy shell-string record: output cannot be bound to a test process"]})
     return {"source": "adm_run", "runs": runs} if runs else None
-
 
 
 class TestEvidenceProbe:
@@ -411,7 +438,16 @@ class TestEvidenceProbe:
         failed_run = any(run.get("timed_out") or run.get("exit_code") != 0 for run in runs)
         obs, signals = [], set()
         add = lambda *a, **k: obs.append(observation(*a, probe=self.name, **k))  # noqa: E731
-        counted = all(isinstance(run.get("passed"), int) and isinstance(run.get("failed"), int) for run in runs)
+        # Every run must carry counts AND the identity of the process they came
+        # from: an execution_id and the argv that was spawned. Those two fields
+        # are what a legacy shell-string record structurally cannot supply, and
+        # they are what ties a number to a run rather than to a string that
+        # happened to be printed. One unbound record in the set withholds all
+        # counts -- a total assembled partly from unbound output is not a
+        # measurement of anything.
+        counted = all(run.get("execution_id") and run.get("argv")
+                      and isinstance(run.get("passed"), int) and isinstance(run.get("failed"), int)
+                      for run in runs)
         if counted:
             observed = {
                 "tests_passed": sum(run["passed"] for run in runs),

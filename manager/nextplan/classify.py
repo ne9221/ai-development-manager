@@ -14,6 +14,7 @@ claim anyone made).
 
 from __future__ import annotations
 
+from manager.nextplan import contracts
 from manager.nextplan import result as r
 from manager.nextplan import vocabulary as v
 from manager.nextplan.atlas import default_atlas
@@ -96,16 +97,43 @@ def completion_proof(result, requirements):
     return items
 
 
+def review_expectation(review_context):
+    """What ADM itself knows a valid reviewer decision must match.
+
+    Every field comes from ADM's own records -- the candidate it is holding and
+    the reviewer run it dispatched -- and none of it from the agent's output.
+    That is what a forged block cannot satisfy and a sentence cannot even
+    address.
+    """
+    context = review_context or {}
+    dispatch = context.get("review_dispatch") or {}
+    return {"target_sha": context.get("candidate_sha"),
+            "reviewer_run_id": dispatch.get("reviewer_run_id"),
+            "provider": dispatch.get("provider"),
+            "job_id": dispatch.get("job_id")}
+
+
 def review_proof(result, review_context):
-    """Items a reviewer result must satisfy before it may approve the candidate."""
+    """Items a reviewer result must satisfy before it may approve the candidate.
+
+    The first item replaced two prose-derived ones in Round 5: a ``review_verdict``
+    fact read out of the message, and a ``reviewed_sha`` compared against the
+    candidate. Both were extracted from natural language, and both were shown to
+    be forgeable -- a heading, a quoted history line or a paragraph break was
+    enough to make a decision line look authoritative, while eight of nine
+    genuine phrasings were refused. A structured decision settles target and
+    authority together, so neither question is answered by reading prose any
+    more.
+
+    The remaining items are unchanged: they are facts about ADM's own dispatch
+    (who this session is, what it has already done), never claims in the output.
+    """
     context = review_context or {}
     session = context.get("reviewer_session")
-    candidate = context.get("candidate_sha")
+    authority = contracts.review_authority(result.get("decisions") or (), review_expectation(context))
     return [
-        {"requirement": "verdict PASS", "ok": r.value(result, "review_verdict") == "PASS"
-         and r.level(result, "review_verdict") in _CLAIMED},
-        {"requirement": "reviewed the current candidate", "ok": bool(candidate) and _known(result, "reviewed_sha")
-         and equivalent("reviewed_sha", r.value(result, "reviewed_sha"), candidate)},
+        {"requirement": "a bound reviewer decision authorizes this candidate",
+         "ok": authority["authorized"], "reason": authority["reason"], "problems": authority["problems"]},
         {"requirement": "reviewer is not the implementer",
          "ok": bool(session) and session not in set(context.get("worker_sessions") or ())},
         {"requirement": "reviewer session is fresh",
@@ -173,19 +201,29 @@ def signals_for(result, verification_report, requirements, execution=None, revie
             signals.add("review.reviewer_is_implementer")
         if session and session in set(context.get("prior_reviewer_sessions") or ()):
             signals.add("review.session_reused")
-        verdict = r.value(result, "review_verdict") if r.level(result, "review_verdict") in _CLAIMED else None
-        if verdict is None:
-            if result["extraction"]["tier"] != "none":
-                signals.add("result.required_field_missing")
-        else:
-            candidate = context.get("candidate_sha")
-            if _known(result, "reviewed_sha") and candidate and not equivalent(
-                    "reviewed_sha", r.value(result, "reviewed_sha"), candidate):
-                signals.add("review.reviewed_sha_not_candidate")
-            if verdict == "PASS" and (not _known(result, "reviewed_sha") or not result["evidence"]):
-                signals.add("review.pass_without_evidence")
-            if verdict == "FAIL":
-                signals.add("result.review_verdict_fail")
+        # Authority is read from the structured decision, never from the prose.
+        # The prose verdict survives only as annotation: extract still records
+        # it, and a written rejection beside a structured PASS still raises
+        # extract.conflicting_statements, which is merged in above. Withdrawal
+        # widens, authorization narrows -- unchanged from Round 3, but now the
+        # narrow side is a contract rather than a vocabulary.
+        authority = contracts.review_authority(result.get("decisions") or (), review_expectation(context))
+        reason = authority["reason"]
+        if reason == contracts.REJECTED:
+            signals.add("result.review_verdict_fail")
+        elif reason in (contracts.CONFLICT, contracts.INVALID):
+            # An unreadable or self-contradictory decision is not a rejection
+            # and emphatically not silence; it is an unresolved statement, and
+            # the task waits on a person rather than on a wording.
+            signals.add("extract.conflicting_statements")
+        elif reason == contracts.ABSENT and (result["extraction"]["tier"] != "none" or result.get("decisions")):
+            signals.add("result.required_field_missing")
+        if authority["authorized"] and not result["evidence"]:
+            signals.add("review.pass_without_evidence")
+        candidate = context.get("candidate_sha")
+        if _known(result, "reviewed_sha") and candidate and not equivalent(
+                "reviewed_sha", r.value(result, "reviewed_sha"), candidate):
+            signals.add("review.reviewed_sha_not_candidate")
     return signals
 
 

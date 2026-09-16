@@ -44,6 +44,7 @@ import re
 
 from jsonschema import Draft202012Validator
 
+from manager.nextplan import contracts
 from manager.nextplan import result as r
 from manager.nextplan import vocabulary as v
 
@@ -55,6 +56,10 @@ REVIEW_AUTHORITY_FIELDS = frozenset({"review_verdict", "reviewed_sha"})
 
 _FENCE_LINE = re.compile(r"^(?P<indent>[ \t]*)(?P<marker>`{3,}|~{3,})[ \t]*(?P<info>[^\n]*?)[ \t]*$")
 _PAYLOAD_LANGS = frozenset({"adm-result", "json"})
+# A reviewer's decision travels in its own fenced block, separate from the
+# result report: the report is the reviewer's *claims*, the decision is the
+# reviewer's *authority*, and mixing the two is what let a claim authorize.
+_DECISION_LANG = "adm-review-result"
 _HEX = re.compile(r"\b[0-9a-f]{7,40}\b")
 
 # -- evidence provenance --------------------------------------------------------
@@ -329,6 +334,17 @@ _REJECTION_RULES = tuple((re.compile(pattern, re.I), guarded) for pattern, guard
     (r"changes[ _-]required|do not merge|needs? (?:more|further) work|"
      r"不應(?:該)?合併|尚未完成|還沒(?:有)?完成", False),
 ))
+# Contrastive conjunctions. A resolution after one of these is about the
+# other side of the contrast, never about the thing just asserted. This is
+# a grammatical role, not a vocabulary of rejections: it constrains where a
+# cancellation may be read from, and cannot create one.
+_CONTRAST = re.compile(
+    r"\b(?:although|though|even\s+though|even\s+if|but|whereas|while|however|nevertheless|"
+    r"nonetheless|despite|in\s+spite\s+of|notwithstanding|yet|aside\s+from|other\s+than|"
+    r"apart\s+from|besides)\b",
+    re.I
+)
+
 _CONTRARY_TOKEN = re.compile(r"\bREJECT(?:ED)?\b|\bCHANGES[ _]REQUIRED\b|\bDO NOT MERGE\b")
 
 
@@ -358,9 +374,25 @@ def _resolved_after(clause, match):
     "The issue that blocked merge is now fixed" names a blocker and clears it in
     the same breath. An ordered fix is not a resolution, so "a blocker remains
     and must be fixed" still counts as a rejection.
+
+    A resolution introduced by a *contrastive* conjunction is about something
+    else -- that is what contrast is for. "A blocker remains although the
+    timeout is fixed" resolves the timeout, not the blocker, and Codex found
+    that this construction cancelled a live blocker and completed the task. The
+    tail is therefore cut at the first contrast word before looking for a
+    resolution.
+
+    This is the withdrawal net, not the gate. It can only ever *remove* a claim,
+    so a miss here costs a round rather than a task, and the contract's own
+    answer to "a blocker remains" is a blocking entry in the decision's
+    ``findings`` -- which needs no reading of prose at all.
     """
-    for found in re.finditer(r"\b%s\b" % _RESOLVED, clause[match.end():], re.I):
-        head = clause[match.end():][:found.start()]
+    tail = clause[match.end():]
+    contrast = _CONTRAST.search(tail)
+    if contrast:
+        tail = tail[:contrast.start()]
+    for found in re.finditer(r"\b%s\b" % _RESOLVED, tail, re.I):
+        head = tail[:found.start()]
         if not re.search(r"\b%s\b[\w\s]{0,20}$" % _ORDERED, head, re.I):
             return True
     return False
@@ -478,6 +510,40 @@ def _fenced_payload(lines, signals, fenced_lines):
         signals.add("extract.conflicting_statements")
         return None, attempted
     return (payloads[-1] if payloads else None), attempted
+
+
+def _fenced_decisions(lines, fenced_lines, warnings):
+    """Every structured reviewer decision in the message, exactly as written.
+
+    Nothing is judged here: a block is collected whether or not it is valid,
+    bound, or even parseable. Dropping an unreadable decision at extraction
+    would recreate the Round-4 defect one layer down -- an unparseable decision
+    would silently become no decision, and a PASS elsewhere would stand. The
+    invalid block is carried forward so contracts.review_authority can block on
+    it explicitly.
+    """
+    decisions = []
+    for lang, body, closed, indexes in _fence_regions(lines):
+        if lang != _DECISION_LANG and contracts.REVIEW_SCHEMA not in body:
+            continue
+        fenced_lines.update(indexes)
+        if not closed:
+            decisions.append({"schema": contracts.REVIEW_SCHEMA, "unreadable": "the decision block was truncated"})
+            warnings.append("review decision: the block was never closed")
+            continue
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError as exc:
+            decisions.append({"schema": contracts.REVIEW_SCHEMA, "unreadable": f"invalid JSON: {exc}"})
+            warnings.append("review decision: the block is not valid JSON")
+            continue
+        for block in (parsed if isinstance(parsed, list) else [parsed]):
+            if isinstance(block, dict):
+                decisions.append(block)
+            else:
+                decisions.append({"schema": contracts.REVIEW_SCHEMA,
+                                  "unreadable": f"decision is a {type(block).__name__}, not an object"})
+    return decisions
 
 
 def _payload_facts(payload, tier, signals, warnings, role):
@@ -794,6 +860,20 @@ def extract(output):
 
     lines = text.split("\n") if text else []
     fenced_lines = set()
+    # Collected before the payload so a decision block's lines are never also
+    # read as prose or as a result report.
+    decisions = _fenced_decisions(lines, fenced_lines, warnings)
+    if native is not None and native.get("schema") == contracts.REVIEW_SCHEMA:
+        decisions.append(native)
+        native = None
+    if decisions and role != v.REVIEWER:
+        # Only a reviewer holds review authority. A worker message carrying a
+        # decision block is dropped here, exactly as a worker payload carrying
+        # review_verdict is, so authority never depends on which channel a claim
+        # arrived through.
+        warnings.append(f"review decision: ignored, {role} may not assert one")
+        signals.add("result.required_field_missing")
+        decisions = []
     payload, attempted = (native, True) if native is not None else _fenced_payload(lines, signals, fenced_lines)
     if native is None and fmt == "json" and "extract.payload_invalid_json" in signals:
         attempted = True
@@ -917,4 +997,5 @@ def extract(output):
     result["extraction"].update(tier=tier, signals=sorted(signals), warnings=warnings)
     for key, items in lists.items():
         result[key] = items
+    result["decisions"] = decisions
     return r.validate_result(result)

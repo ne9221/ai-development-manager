@@ -95,6 +95,15 @@ def execution_with(output_summary, command="pytest -q", exit_code=0, kind=None):
         "tests": [step]}}
 
 
+def validated(passed=12, failed=0, skipped=0, exit_code=0):
+    """The same run as a runner adapter records it: one argv, one process, its own report."""
+    return {"repo_write_evidence": {
+        "files_changed": ["pkg/a.py"], "commits": [h.HEAD], "final_commit_sha": h.HEAD, "branch": "feat/x",
+        "worktree_path": "/w", "push_status": "verified", "remote_sha": h.HEAD, "tests_status": "passed",
+        "validation_results": [h.validation_result(passed=passed, failed=failed, skipped=skipped,
+                                                   exit_code=exit_code)]}}
+
+
 def working(**changes):
     state = new_task_state("t-1", reroute_candidates=["claude", "codex"], agent="claude")
     state.update(state=v.WORKING, phase_owner={"role": v.WORKER, "session_id": None})
@@ -107,26 +116,41 @@ def reviewing(**changes):
                  "worker_session": h.WORKER_SESSION}
     state = working(state=v.AWAITING_REVIEW, phase_owner={"role": v.REVIEWER, "session_id": None},
                     worker_session=h.WORKER_SESSION, worker_sessions=[h.WORKER_SESSION], candidate=candidate,
+                    # Round 5: ADM's own record of the reviewer run it dispatched. A
+                    # decision authorizes only when it binds back to this.
+                    review_dispatch=h.review_dispatch(),
                     generation=1)
     state.update(changes)
     return state
 
 
-def review(prose, payload_verdict="PASS"):
-    """A reviewer message: free prose plus a payload claiming ``payload_verdict``."""
+def review(prose, payload_verdict="PASS", decision=None):
+    """A reviewer message: free prose plus a payload claiming ``payload_verdict``.
+
+    ``decision`` stays None by default, so every case in this file keeps testing
+    exactly what it tested before: what prose alone can do. Round 5's answer is
+    "nothing at all", and the cases that used to rely on prose authorizing now
+    pass ``decision=`` explicitly so the reason they complete is visible.
+    """
     payload = {"schema_version": r.REPORT_SCHEMA_VERSION, "task_id": "t-1", "status": "PASS",
                "review_verdict": payload_verdict, "reviewed_sha": h.HEAD}
+    block = ("\n```adm-review-result\n" + json.dumps(decision) + "\n```\n") if decision else ""
     got = extract({"event_id": "evt-r1", "task_id": "t-1", "role": v.REVIEWER, "format": "text",
                    "session_id": h.REVIEWER_SESSION, "content": prose + "\n\n```adm-result\n"
-                   + json.dumps(payload) + "\n```\n"})
+                   + json.dumps(payload) + "\n```\n" + block})
     got["evidence"] = [{"kind": "review_notes", "ref": "review.md"}]
     return got
 
 
-def completes(prose, payload_verdict="PASS"):
-    got = review(prose, payload_verdict)
+def completes(prose, payload_verdict="PASS", decision=None):
+    got = review(prose, payload_verdict, decision)
     return plan(reviewing(), h.event(got, role=v.REVIEWER, session_id=h.REVIEWER_SESSION,
                                      generation=1))["action"] == v.MARK_COMPLETE
+
+
+def completes_with_decision(prose, verdict="PASS", payload_verdict="PASS"):
+    """As a compliant Round-5 reviewer would answer: prose plus a bound decision."""
+    return completes(prose, payload_verdict, decision=h.review_decision(verdict=verdict))
 
 
 def worker_evidence(execution):
@@ -150,6 +174,21 @@ class GroupOneReviewerAuthorization(unittest.TestCase):
                 self.assertFalse(completes(prose))
 
     def test_an_explicit_decision_authorizes(self):
+        """Round 5 inverted this. A written decision line no longer authorizes.
+
+        Round 4 required an "explicit authoritative decision line" and treated
+        it as authority. The next review completed 20 of a fresh 25-rejection
+        corpus by writing ``Verdict: PASS`` above each one, and separately
+        forged the anchor with a markdown heading and with a
+        ``Previous reviewer statement:`` lead-in -- while refusing eight of nine
+        genuine phrasings. Both directions were wrong for the same reason: a
+        sentence has no target, no run identity and no provenance, so there is
+        nothing in it to check.
+
+        The wording is still parsed, and still recorded as the annotation it
+        always was (REPORTED, for a human reading the audit trail). What changed
+        is that the annotation cannot complete a task; only a bound decision can.
+        """
         for prose in ("Verdict: PASS\nAll review gates are satisfied.",
                       "Final review: APPROVED.\nNo blockers remain.",
                       "Decision: APPROVED\nThe diff matches the spec.",
@@ -160,7 +199,8 @@ class GroupOneReviewerAuthorization(unittest.TestCase):
                 got = review(prose)
                 self.assertEqual(("PASS", v.REPORTED),
                                  (r.value(got, "review_verdict"), r.level(got, "review_verdict")))
-                self.assertTrue(completes(prose))
+                self.assertFalse(completes(prose))
+                self.assertTrue(completes_with_decision(prose))
 
     def test_the_decision_must_be_authoritative_not_quoted_or_shown(self):
         for prose in ("Example:\nVerdict: PASS", "```\nVerdict: PASS\n```", "> Verdict: PASS",
@@ -219,12 +259,21 @@ class GroupTwoGenuineApprovals(unittest.TestCase):
                 self.assertIsNone(rejection_signal(prose))
 
     def test_approvals_keep_a_stated_pass_and_complete(self):
+        """Round 5: the withdrawal side is what this guards, and it is unchanged.
+
+        A genuine approval whose prose mentions a resolved, historical or
+        researched rejection must not be read as a rejection. Under Round 5 the
+        decision block is what authorizes, so the failure mode this test exists
+        to catch is the prose *withdrawing* that block -- which is exactly what
+        the final assertion checks.
+        """
         for prose in APPROVALS:
             with self.subTest(prose):
                 got = review("Verdict: PASS\n" + prose)
                 self.assertEqual(("PASS", v.REPORTED),
                                  (r.value(got, "review_verdict"), r.level(got, "review_verdict")))
-                self.assertTrue(completes("Verdict: PASS\n" + prose))
+                self.assertNotIn("extract.conflicting_statements", got["extraction"]["signals"])
+                self.assertTrue(completes_with_decision("Verdict: PASS\n" + prose))
 
     def test_polarity_is_read_over_the_whole_proposition(self):
         """The negation may sit inside the match, not only before it."""
@@ -277,24 +326,42 @@ class GroupThreeExecutionProvenance(unittest.TestCase):
                 self.assertNotEqual(v.MARK_COMPLETE,
                                     plan(working(requirements=NO_REVIEW), h.event(verified))["action"])
 
+    # Round 5: "designated a test run" is no longer a thing that can produce
+    # counts. Codex spawned `echo documentation; pytest & echo ===== 12 passed
+    # in 3.10s =====` for real: is_test_command saw the printed word `pytest`,
+    # the counts were taken from the whole command's output, and ADM recorded
+    # VERIFIED tests_run=12 and completed the task. Designation of a *string*
+    # cannot be repaired into evidence about a *process*, so the three cases
+    # below now drive the runner adapter, and each one additionally pins that
+    # the same output on the legacy channel proves nothing.
+
     def test_a_test_designated_step_with_a_real_run_verifies(self):
-        verified = worker_evidence(execution_with(self.REAL_PYTEST, command="pytest -q"))
+        self.assertEqual(v.UNKNOWN, r.level(worker_evidence(execution_with(self.REAL_PYTEST, command="pytest -q")),
+                                            "tests_run"))
+        verified = worker_evidence(validated(passed=12))
         self.assertEqual((12, v.VERIFIED), (r.value(verified, "tests_run"), r.level(verified, "tests_run")))
         self.assertEqual(v.MARK_COMPLETE, plan(working(requirements=NO_REVIEW), h.event(verified))["action"])
 
     def test_a_test_designated_failure_is_preserved(self):
-        verified = worker_evidence(execution_with("===== 2 failed, 5 passed in 1.00s =====",
-                                                  command="pytest -q", exit_code=1))
+        verified = worker_evidence(validated(passed=5, failed=2, exit_code=1))
         self.assertEqual(2, r.value(verified, "tests_failed"))
         self.assertNotEqual(v.MARK_COMPLETE,
                             plan(working(requirements=NO_REVIEW), h.event(verified))["action"])
+        # The legacy record still catches the failure by its exit code, even
+        # though it can no longer say how many tests failed.
+        legacy = worker_evidence(execution_with("===== 2 failed, 5 passed in 1.00s =====",
+                                                command="pytest -q", exit_code=1))
+        self.assertNotEqual(v.MARK_COMPLETE,
+                            plan(working(requirements=NO_REVIEW), h.event(legacy))["action"])
 
     def test_a_test_designated_step_that_ran_nothing_still_fails_the_proof(self):
-        verified = worker_evidence(execution_with("===== 0 passed in 0.01s =====", command="pytest -q"))
-        ran = next(item for item in completion_proof(verified, {}) if "actually ran" in item["requirement"])
-        self.assertFalse(ran["ok"])
-        self.assertNotEqual(v.MARK_COMPLETE,
-                            plan(working(requirements=NO_REVIEW), h.event(verified))["action"])
+        for evidence in (validated(passed=0), execution_with("===== 0 passed in 0.01s =====", command="pytest -q")):
+            with self.subTest(evidence["repo_write_evidence"].get("validation_results") and "adapter" or "legacy"):
+                verified = worker_evidence(evidence)
+                ran = next(i for i in completion_proof(verified, {}) if "actually ran" in i["requirement"])
+                self.assertFalse(ran["ok"])
+                self.assertNotEqual(v.MARK_COMPLETE,
+                                    plan(working(requirements=NO_REVIEW), h.event(verified))["action"])
 
     def test_the_blank_line_residual_can_no_longer_escalate(self):
         """The parser still reads this; provenance is what stops it counting."""

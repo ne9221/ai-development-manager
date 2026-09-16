@@ -54,6 +54,11 @@ def new_task_state(task_id, requirements=None, dependencies=(), reroute_candidat
         "phase_owner": {"role": v.WORKER, "session_id": None},
         "worker_session": None, "worker_sessions": [], "reviewer_sessions": [],
         "candidate": None, "requirements": requirements_with_defaults(requirements),
+        # The reviewer run ADM itself dispatched: {reviewer_run_id, provider,
+        # job_id}. Only the orchestrator writes it, and only a decision bound to
+        # it can authorize completion. None means no review was dispatched, so
+        # nothing is authorizable -- absence of a record is not permission.
+        "review_dispatch": None,
         "retry_history": [], "dependencies": [dict(d) for d in dependencies],
         "reroute_candidates": list(reroute_candidates), "agent": agent, "last_decision": None,
     }
@@ -102,6 +107,7 @@ def _worker_target(state, event):
 
 def _review_context(state, event):
     return {
+        "review_dispatch": state.get("review_dispatch"),
         "reviewer_session": event.get("session_id"),
         "worker_sessions": list(state["worker_sessions"]) + ([state["worker_session"]] if state["worker_session"] else []),
         "prior_reviewer_sessions": list(state["reviewer_sessions"]),
@@ -314,6 +320,11 @@ def apply(state, event, decision):
         new["phase_owner"] = {"role": v.WORKER, "session_id": new["worker_session"]}
     elif action == v.SEND_TO_REVIEW:
         new["phase_owner"] = {"role": v.REVIEWER, "session_id": None}
+        # The previous reviewer run's identity dies with its phase. The
+        # orchestrator records the new one when it dispatches; until it does,
+        # no decision can bind, so a superseded approval cannot be replayed
+        # against a later candidate.
+        new["review_dispatch"] = None
     elif action in (v.RETRY_SAME_AGENT, v.REROUTE_AGENT):
         new["phase_owner"] = {"role": current_role, "session_id": None}
         if current_role == v.WORKER:

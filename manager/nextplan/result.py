@@ -163,7 +163,7 @@ def normalized_schema():
         "type": "object",
         "additionalProperties": False,
         "required": ["contract", "event_id", "task_id", "role", "extraction", "facts", "evidence", "blockers",
-                     "warnings", "findings"],
+                     "warnings", "findings", "decisions"],
         "properties": {
             "contract": {"const": CONTRACT},
             "event_id": {"type": "string", "minLength": 1},
@@ -185,6 +185,12 @@ def normalized_schema():
             "blockers": {"type": "array", "items": {"type": "string"}},
             "warnings": {"type": "array", "items": {"type": "string"}},
             "findings": {"type": "array", "items": {"type": "string"}},
+            # Structured reviewer decisions exactly as returned, before any
+            # binding check. Deliberately NOT a fact: a fact carries an evidence
+            # level, and levels are for claims ADM reasons over. Authority is not
+            # a claim -- manager.nextplan.contracts.review_authority decides it
+            # against ADM's own dispatch record, and only there.
+            "decisions": {"type": "array", "items": {"type": "object"}},
         },
     }
 
@@ -214,7 +220,7 @@ def blank_result(event_id, task_id, role, tier="none", raw_sha256="0" * 64):
         "contract": CONTRACT, "event_id": event_id, "task_id": task_id, "role": role,
         "extraction": {"tier": tier, "signals": [], "raw_sha256": raw_sha256, "warnings": []},
         "facts": {field: unknown() for field in FACT_FIELDS},
-        "evidence": [], "blockers": [], "warnings": [], "findings": [],
+        "evidence": [], "blockers": [], "warnings": [], "findings": [], "decisions": [],
     }
 
 

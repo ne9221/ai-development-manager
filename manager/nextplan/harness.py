@@ -9,6 +9,7 @@ shapes.
 
 from __future__ import annotations
 
+from manager.nextplan import contracts
 from manager.nextplan import result as r
 from manager.nextplan import vocabulary as v
 
@@ -17,6 +18,38 @@ HEAD = "3f2a9c1d0b8e7f6a5c4d3e2f1a0b9c8d7e6f5a4b"
 REPAIRED = "7c6b5a49382716059e8d4f3e2d1c0b9a88776655"
 WORKER_SESSION = "s-worker-1"
 REVIEWER_SESSION = "s-reviewer-1"
+
+# The reviewer run ADM itself dispatched. A decision authorizes only when it
+# carries these exact values back, so a fixture that forgets them is refused --
+# which is the behaviour under test, not an inconvenience.
+REVIEWER_RUN = "run-review-1"
+PROVIDER = "codex"
+JOB_ID = "job-review-1"
+
+
+def review_dispatch(reviewer_run_id=REVIEWER_RUN, provider=PROVIDER, job_id=JOB_ID):
+    """ADM's own record of the review it dispatched."""
+    return {"reviewer_run_id": reviewer_run_id, "provider": provider, "job_id": job_id}
+
+
+def review_decision(verdict="PASS", target=HEAD, reviewer_run_id=REVIEWER_RUN, findings=(),
+                    provider=PROVIDER, job_id=JOB_ID, mode="read_only"):
+    """One ``adm-review-result/v1`` object."""
+    return {"schema": contracts.REVIEW_SCHEMA, "target_sha": target, "reviewer_run_id": reviewer_run_id,
+            "verdict": verdict, "findings": [dict(f) for f in findings],
+            "provenance": {"provider": provider, "job_id": job_id, "mode": mode}}
+
+
+def validation_result(passed=12, failed=0, skipped=0, exit_code=0, execution_id="exec-1",
+                      argv=("python", "-m", "pytest", "-q"), runner="pytest", counts=True, timed_out=False):
+    """One ``adm-validation-result/v1`` as a runner adapter would return it.
+
+    ``counts=False`` is the honest shape for a run whose structured report never
+    arrived: the process is recorded, the numbers are not invented.
+    """
+    return {"schema": contracts.VALIDATION_SCHEMA, "execution_id": execution_id, "argv": list(argv),
+            "runner": runner, "started": True, "exit_code": exit_code, "timed_out": timed_out,
+            "tests": {"passed": passed, "failed": failed, "skipped": skipped} if counts else None}
 
 
 def _git_facts(head, verified):
@@ -54,8 +87,21 @@ def worker_result(status="PASS", verified=True, head=HEAD, event_id="evt-w1", ta
 
 
 def reviewer_result(verdict="PASS", reviewed=HEAD, event_id="evt-r1", task_id="t-1",
-                    evidence=(("review_notes", "review.md"),), findings=(), facts=None, tier="fenced", signals=()):
+                    evidence=(("review_notes", "review.md"),), findings=(), facts=None, tier="fenced", signals=(),
+                    decisions=None):
+    """A reviewer result.
+
+    ``decisions`` defaults to one bound ``adm-review-result/v1`` matching
+    ``verdict`` and ``reviewed``, because that is now the only thing that can
+    authorize anything. Pass ``decisions=[]`` for a reviewer that wrote only
+    prose, or an explicit list to test a malformed, unbound or conflicting one.
+    The ``review_verdict`` fact below is kept as the annotation it now is.
+    """
     result = r.blank_result(event_id, task_id, v.REVIEWER, tier=tier)
+    if decisions is None:
+        decisions = ([review_decision(verdict="PASS" if verdict == "PASS" else "REJECT", target=reviewed or HEAD)]
+                     if verdict is not None else [])
+    result["decisions"] = [dict(d) for d in decisions]
     result["extraction"]["signals"] = sorted(signals)
     result = r.with_fact(result, "status", r.fact("PASS", v.REPORTED, "agent:fenced"))
     if verdict is not None:

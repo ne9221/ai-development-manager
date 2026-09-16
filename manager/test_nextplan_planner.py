@@ -143,6 +143,7 @@ class BudgetTests(unittest.TestCase):
 
     def test_returning_to_an_unknown_original_worker_falls_back(self):
         before = state(state=v.AWAITING_REVIEW, phase_owner={"role": v.REVIEWER, "session_id": None},
+                       review_dispatch=h.review_dispatch(),
                        candidate={"head_sha": h.HEAD, "proof": completion_proof(h.worker_result(), {}),
                                   "worker_session": None})
         decision = plan(before, h.event(h.reviewer_result(verdict="FAIL"), role=v.REVIEWER))
