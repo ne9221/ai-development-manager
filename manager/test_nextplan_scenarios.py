@@ -54,8 +54,14 @@ def payload(**changes):
 
 
 def envelope(report=None, text=None, role=v.WORKER, session_id=None, generation=0, event_id="evt-1"):
+    report = report if report is not None else payload()
+    # Round 4: a payload carries the verdict's value but cannot authorize it.
+    # A compliant reviewer states its decision in its own words, so that is
+    # what the scenario reviewer now sends.
+    lead = (f"Verdict: {report['review_verdict']}"
+            if role == v.REVIEWER and report.get("review_verdict") else "Work finished.")
     content = text if text is not None else (
-        "Work finished.\n\n```adm-result\n" + json.dumps(report if report is not None else payload(), indent=2) + "\n```\n")
+        lead + "\n\n```adm-result\n" + json.dumps(report, indent=2) + "\n```\n")
     return {"event_id": event_id, "task_id": "t-1", "role": role, "agent": "claude", "generation": generation,
             "format": "text", "content": content,
             "session_id": session_id or (h.WORKER_SESSION if role == v.WORKER else h.REVIEWER_SESSION)}

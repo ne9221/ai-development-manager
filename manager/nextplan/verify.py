@@ -301,14 +301,84 @@ class ExecutionRecordProbe:
         return obs, set()
 
 
+# Commands ADM may treat as an actual test run. The string comes from the Task's
+# own declared `validation_command`, which repo_write_enforcement re-runs itself
+# in the isolated worktree -- it is not agent free text. Even so it is only ever
+# a fallback: an explicit `kind` on the step always wins.
+_TEST_RUNNERS = (
+    "pytest", "py.test", "unittest", "tox", "nox", "trial", "green",
+    "jest", "vitest", "mocha", "ava", "karma",
+    "rspec", "minitest", "phpunit", "pester", "invoke-pester",
+)
+_TEST_SUBCOMMANDS = {"go": {"test"}, "cargo": {"test"}, "dotnet": {"test"}, "mvn": {"test"},
+                     "gradle": {"test"}, "npm": {"test"}, "yarn": {"test"}, "pnpm": {"test"},
+                     "bun": {"test"}, "swift": {"test"}, "make": {"test", "check"}}
+_SEGMENT = re.compile(r"&&|\|\||;|\||\n")
+_INTERPRETER = re.compile(r"^(?:python[\d.]*|py|pypy[\d.]*|node|deno|bunx?|npx|pnpx|uv|uvx|poetry|pipenv|"
+                          r"hatch|rye|pdm|conda|micromamba|powershell|pwsh|cmd|sh|bash|zsh|env)$")
+
+
+def is_test_command(command):
+    """Is this Task-declared command recognisably a test-runner invocation?
+
+    Deliberately conservative and structural: it reads the *program* of each
+    shell segment, not any substring of the line, so `echo "===== 999 passed ====="`
+    is not a test run however convincing its output looks.
+    """
+    if not command or not isinstance(command, str):
+        return False
+    for segment in _SEGMENT.split(command):
+        words = [w for w in re.split(r"\s+", segment.strip()) if w and "=" not in w.split("/")[-1][:1]]
+        index = 0
+        while index < len(words):
+            program = os.path.basename(words[index].strip("'\"")).lower()
+            program = re.sub(r"\.(exe|cmd|bat|ps1)$", "", program)
+            if program in _TEST_RUNNERS:
+                return True
+            following = [w.lower() for w in words[index + 1:] if not w.startswith("-")]
+            if program in _TEST_SUBCOMMANDS and following and following[0] in _TEST_SUBCOMMANDS[program]:
+                return True
+            if _INTERPRETER.match(program):
+                index += 1
+                while index < len(words):
+                    token = words[index].lower()
+                    if token == "-c":  # inline code is not a runner invocation
+                        return False
+                    if token in ("-m", "-X", "run", "exec", "--") or token.startswith("-"):
+                        index += 1
+                        continue
+                    break
+                continue
+            break
+    return False
+
+
+def is_test_step(test):
+    """Is this recorded validation step designated as a test run?
+
+    An explicit ``kind`` decides, so once the execution runner labels its steps
+    this stops guessing entirely. Until then the Task-declared command is the
+    only provenance there is, and anything unrecognised is NOT a test run.
+    """
+    kind = (test or {}).get("kind")
+    if kind is not None:
+        return str(kind).lower() in ("test", "tests")
+    return is_test_command((test or {}).get("command"))
+
+
 def adm_test_evidence(execution):
     """Adapt ADM's own validation runs (never the provider's claims) to test evidence.
 
-    The recorded ``output_summary`` is parsed for real counts with the same
-    parser the extractor uses. Without counts an exit code alone cannot show
-    that any test ran (``true`` exits 0), so a run that yields none leaves
-    tests_run UNKNOWN and the completion proof fails rather than passing on an
-    empty validation.
+    Counts are read only from a step that is *designated* a test run. Parsing the
+    output alone cannot tell a test runner's stdout from a script that printed a
+    documentation transcript and exited 0 -- Codex reproduced exactly that,
+    escalating a documented "8 passed" into VERIFIED tests_run=8 and a completed
+    task. A step that is not a test run still records its exit code, so a failure
+    is not lost; it simply cannot say how many tests ran.
+
+    Without counts an exit code alone cannot show that any test ran (``true``
+    exits 0), so such a run leaves tests_run UNKNOWN and the completion proof
+    fails rather than passing on an empty validation.
     """
     from manager.nextplan.extract import test_counts
 
@@ -316,14 +386,15 @@ def adm_test_evidence(execution):
     runs = []
     for test in evidence.get("tests", []):
         run = {"command": test["command"], "exit_code": test.get("exit_code"),
-               "timed_out": bool(test.get("timed_out"))}
-        counts = test_counts(test.get("output_summary") or "")
+               "timed_out": bool(test.get("timed_out")), "test_step": is_test_step(test)}
+        counts = test_counts(test.get("output_summary") or "") if run["test_step"] else {}
         if counts:
             run["passed"] = counts.get("tests_passed", 0)
             run["failed"] = counts.get("tests_failed", 0)
             run["skipped"] = counts.get("tests_skipped", 0)
         runs.append(run)
     return {"source": "adm_run", "runs": runs} if runs else None
+
 
 
 class TestEvidenceProbe:

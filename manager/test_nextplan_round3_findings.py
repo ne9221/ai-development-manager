@@ -149,8 +149,17 @@ def worker_text(content):
     return extract({"event_id": "e", "task_id": "t-1", "role": v.WORKER, "format": "text", "content": content})
 
 
-def review_text(prose, verdict="PASS"):
-    """Reviewer prose next to a structured payload that claims a clean PASS."""
+def review_text(prose, verdict="PASS", anchor=True):
+    """Reviewer prose beside a structured payload that claims a clean PASS.
+
+    Round 4: a payload alone no longer authorizes a PASS (Codex finding R3-1),
+    so these cases now also carry the explicit verdict a compliant reviewer
+    states. Without it every rejection case below would pass for the wrong
+    reason -- blocked by the new gate rather than by the prose -- and would
+    stop testing what it was written to test.
+    """
+    if anchor:
+        prose = f"Verdict: {verdict}\n" + prose
     payload = {"schema_version": r.REPORT_SCHEMA_VERSION, "task_id": "t-1", "status": "PASS",
                "review_verdict": verdict, "reviewed_sha": h.HEAD}
     content = prose + "\n\n```adm-result\n" + json.dumps(payload) + "\n```\n"

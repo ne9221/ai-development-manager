@@ -105,7 +105,15 @@ class ExtractionInvariantTests(unittest.TestCase):
         self.assertTrue(any("only a reviewer" in w for w in worker["extraction"]["warnings"]))
         reviewer = extract({"event_id": "e", "task_id": "t-100", "role": v.REVIEWER, "format": "text",
                             "content": content})
-        self.assertEqual(v.REPORTED, r.level(reviewer, "review_verdict"))
+        # Round 4 (Codex finding R3-1): this line used to assert REPORTED -- a
+        # reviewer's payload PASS authorized a review on its own. That was the
+        # fail-open the review broke: 26/30 reworded rejections completed
+        # because nothing matched them. A payload may carry the value; only an
+        # explicit verdict the reviewer wrote can authorize it.
+        self.assertEqual(v.UNKNOWN, r.level(reviewer, "review_verdict"))
+        anchored = extract({"event_id": "e", "task_id": "t-100", "role": v.REVIEWER,
+                            "format": "text", "content": "Verdict: PASS\n\n" + content})
+        self.assertEqual(v.REPORTED, r.level(anchored, "review_verdict"))
 
 
 class DeterministicDetailTests(unittest.TestCase):

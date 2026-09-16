@@ -14,6 +14,15 @@ produce:
 
 Nothing here can produce VERIFIED; only manager.nextplan.verify can.
 
+The trust model these tiers implement is written down in
+docs/nextplan/TRUST-MODEL.md: what may establish a reviewer PASS, what may
+establish VERIFIED test counts, which payloads are authoritative, and what
+happens on ambiguity. One rule underlies all four -- silence is not consent,
+and an unreadable statement is not silence. In particular a reviewer's PASS
+needs an explicit decision the reviewer wrote; a payload may carry the value
+but may not authorize it, because treating "no rejection matched" as approval
+made every wording the matcher missed into an approval.
+
 Two rules keep this from being permissive:
 
 - **Disagreement is never resolved optimistically.** When the payload and a
@@ -44,7 +53,7 @@ _TIER_ORDER = {tier: index for index, tier in enumerate(r.TIERS)}
 # Facts only a reviewer has the authority to assert, whatever tier they arrive in.
 REVIEW_AUTHORITY_FIELDS = frozenset({"review_verdict", "reviewed_sha"})
 
-_FENCE_LINE = re.compile(r"^\s*(?P<marker>`{3,}|~{3,})[ \t]*(?P<info>\S*)[ \t]*$")
+_FENCE_LINE = re.compile(r"^(?P<indent>[ \t]*)(?P<marker>`{3,}|~{3,})[ \t]*(?P<info>[^\n]*?)[ \t]*$")
 _PAYLOAD_LANGS = frozenset({"adm-result", "json"})
 _HEX = re.compile(r"\b[0-9a-f]{7,40}\b")
 
@@ -64,10 +73,14 @@ _HEX = re.compile(r"\b[0-9a-f]{7,40}\b")
 # rule that can only remove a claim is safe to run everywhere -- narrowing it
 # would just open a new bypass ("put the REJECT inside a fence").
 _QUOTE_LINE = re.compile(r"^\s{0,3}>")
+# A markdown indented code block (4 spaces or a tab). Codex found that an
+# indented transcript was still read as this run's output.
+_INDENTED_LINE = re.compile(r"^(?: {4,}|\t)\S")
 _LEAD_IN = re.compile(r"[:：]\s*$")
 _EXAMPLE_WORDS = re.compile(
     r"\b(?:examples?|samples?|e\.g\.|for instance|illustrat\w*|hypothetical|mock|dummy|"
-    r"template|schema|format|looks like|reference|docs?|documentation|pseudo\w*)\b|"
+    r"template|schema|format|looks like|reference|docs?|documentation|pseudo\w*|"
+    r"transcripts?|sessions?|snippets?|excerpts?|expected(?:\s+\w+)?\s+output|console)\b|"
     r"範例|示例|例如|格式|參考",
     re.I
 )
@@ -78,23 +91,35 @@ _EXAMPLE_MAX_LINES = 40
 
 
 def _fence_regions(lines):
-    """[(info, body, closed, indexes)] for every fenced block, whatever its language."""
+    """[(lang, body, closed, indexes)] for every fenced block, whatever its language.
+
+    A closing fence must use the same character as its opener and be at least as
+    long, and must carry no info string. Comparing only the character let a
+    three-backtick line close a ````text block, and the body leaked out as if it
+    were the agent's own output.
+    """
     regions, index = [], 0
     while index < len(lines):
         opened = _FENCE_LINE.match(lines[index])
         if not opened:
             index += 1
             continue
-        char, start = opened.group("marker")[0], index
+        marker, start = opened.group("marker"), index
+        info = opened.group("info").strip()
         body, index = [], index + 1
         while index < len(lines):
             closing = _FENCE_LINE.match(lines[index])
-            if closing and closing.group("marker")[0] == char and not closing.group("info"):
+            if (closing and not closing.group("info")
+                    and closing.group("marker")[0] == marker[0]
+                    and len(closing.group("marker")) >= len(marker)):
                 break
             body.append(lines[index])
             index += 1
         closed = index < len(lines)
-        regions.append((opened.group("info"), "\n".join(body), closed, range(start, min(index + 1, len(lines)))))
+        # Only the first token of the info string is the language: a fence may
+        # carry attributes (```console title="example").
+        lang = info.split()[0] if info else ""
+        regions.append((lang, "\n".join(body), closed, range(start, min(index + 1, len(lines)))))
         index += 1
     return regions
 
@@ -105,7 +130,7 @@ def non_evidence_lines(lines):
     for _info, _body, _closed, indexes in _fence_regions(lines):
         skip.update(indexes)
     for index, line in enumerate(lines):
-        if _QUOTE_LINE.match(line):
+        if _QUOTE_LINE.match(line) or _INDENTED_LINE.match(line):
             skip.add(index)
     for index, line in enumerate(lines):
         if index in skip or not _LEAD_IN.search(line) or not _EXAMPLE_WORDS.search(line):
@@ -126,6 +151,10 @@ _KEY_ALIASES = {
     "status": "status", "狀態": "status", "result": "status", "結果": "status", "final status": "status",
     "最終狀態": "status", "verdict": "review_verdict", "review verdict": "review_verdict",
     "reviewer verdict": "review_verdict", "審查結果": "review_verdict",
+    "decision": "review_verdict", "review decision": "review_verdict",
+    "final decision": "review_verdict", "final review": "review_verdict",
+    "final verdict": "review_verdict", "review result": "review_verdict",
+    "審查結論": "review_verdict", "結論": "review_verdict",
     "commit": "commit_sha", "commit sha": "commit_sha", "commit_sha": "commit_sha",
     "head": "head_sha", "head sha": "head_sha", "head_sha": "head_sha", "local head": "head_sha",
     "remote sha": "remote_sha", "remote_sha": "remote_sha", "remote head": "remote_sha",
@@ -215,6 +244,8 @@ _CLAUSE_SPLIT = re.compile(r"[.;!?\n。；！？]+|,\s")
 _WORD = re.compile(r"[\w'’-]+")
 _NEGATOR = re.compile(r"^(?:no|not|n't|never|zero|none|nothing|without|neither|nor|non|0)$", re.I)
 _NEG_WINDOW = 4
+# A short match leaves its predicate outside the span; read a little of it.
+_PREDICATE_WINDOW = 2
 
 # Explicit negation carriers. Bare "no" is deliberately absent: it is the
 # quantifier in "no blocking issues", which F2 already handles, and admitting it
@@ -223,12 +254,22 @@ _NOT = (r"(?:not|cannot|can\s*not|can't|won't|will\s+not|would\s+not|shall\s+not
         r"must\s+not|may\s+not|do\s+not|does\s+not|don't|doesn't|is\s+not|isn't|are\s+not|aren't|"
         r"has\s+not|have\s+not|hasn't|haven't|was\s+not|were\s+not|never|unable\s+to|"
         r"refus\w+\s+to|declin\w+\s+to|fail\w*\s+to)")
-_FILLER = r"(?:be|been|being|get|got|yet|now|ever|fully|formally|hereby|explicitly|currently|safely|cleanly)"
+_FILLER = r"(?:be|been|being|get|got|yet|now|ever|fully|formally|hereby|explicitly|currently|\w+ly)"
 _APPROVE = (r"(?:approv\w*|accept\w*|sign[-\s]?off|signed[-\s]?off|merg\w*|land(?:ed|ing|s)?|"
             r"ship(?:ped|ping|s)?|releas\w*|grant\w*|endors\w*)")
 _APPROVAL_NOUN = r"(?:approval|sign[-\s]?off|acceptance|go[-\s]?ahead)"
-_NEGATIVE_PREDICATE = (r"(?:not|never|withheld|withhold\w*|denied|deny|refused|refus\w*|pending|"
-                       r"conditional|contingent|depends|depend|blocked|revoked|premature)")
+# Predicates that describe the *state* of an approval. Split from bare negation
+# because "Approval is not conditional" negates the state and is an approval,
+# while "Approval is conditional" is not.
+_APPROVAL_STATE = (r"(?:withheld|withhold\w*|denied|deny|refused|refus\w*|pending|conditional|contingent|"
+                   r"depend\w*|blocked|revoked|premature|deferred|postponed|suspended|on\s+hold)")
+_APPROVAL_ABSENT = r"(?:not|never|no)"
+_RESOLVED = (r"(?:resolved|fixed|closed|cleared|addressed|gone|eliminated|removed|corrected|repaired|"
+             r"remediated|done|complete|completed|landed|merged|passing)")
+_ORDERED = r"(?:must|should|needs?\s+to|has\s+to|have\s+to|will\s+need\s+to|shall|to\s+be|please)"
+# A judgement attributed to an earlier review is a record, not this reviewer's
+# decision: "The previous review rejected this; that issue is fixed" is an approval.
+_HISTORICAL = (r"(?:previous|prior|earlier|last|first|original|former|round\s*\d+)\s+(?:reviews?|reviewers?|rounds?|passes|pass|attempts?|iterations?)")
 _DEFECT = r"(?:issues?|bugs?|defects?|findings?|problems?|concerns?)"
 # A blocker withdraws a PASS only when the sentence asserts one *exists*: either
 # a persistence predicate or a counting quantifier. "The blocker was the missing
@@ -252,7 +293,7 @@ _UNDER_REVIEW = r"(?:this|it|(?:this|that|the|your)\s+(?:\w+\s+){0,1}?%s)" % _WO
 _REJECTION_RULES = tuple((re.compile(pattern, re.I), guarded) for pattern, guarded in (
     # F1 -- approval negated, withheld or conditional
     (r"\b%s\s+(?:%s\s+){0,2}%s\b" % (_NOT, _FILLER, _APPROVE), False),
-    (r"\b%s\b[^,;.!?]{0,60}?\b%s\b" % (_APPROVAL_NOUN, _NEGATIVE_PREDICATE), False),
+    # (the approval-noun family moved to _approval_rejected: its polarity needs code)
     (r"\bwithhold\w*\s+(?:my\s+|our\s+|the\s+)?%s\b" % _APPROVAL_NOUN, False),
     (r"\bunacceptable\b|\bnot\s+acceptable\b|\bnot\s+ready\b", False),
     # F2 -- a blocker asserted to exist
@@ -261,22 +302,27 @@ _REJECTION_RULES = tuple((re.compile(pattern, re.I), guarded) for pattern, guard
     (r"\b%s\s+(?:\w+\s+){0,2}?%s\b" % (_QUANT, _BLOCKER), True),
     (r"\b%s\s+(?:that\s+)?block(?:s|ed|ing)?\s+(?:the\s+)?"
      r"(?:merge|merging|landing|release|approval|this|it)\b" % _DEFECT, True),
-    (r"\b(?:merg\w+|landing|release|approval|this|it)\s+(?:is|are|remains?|stays?)\s+blocked\b", True),
-    # F3 -- a fix ordered before landing
-    (r"\b%s\b[^,;.!?]{0,40}?\bbefore\b[^,;.!?]{0,40}?\b%s\b" % (_FIXVERB, _LAND), True),
-    (r"\b(?:must|needs?\s+to|has\s+to|have\s+to|should)\s+be\s+%s\s+(?:first|before)\b" % _FIXVERB, True),
+    (r"\b(?:merg\w+|landing|release|approval|this|it)\s+(?:is|are|remains?|stays?)\s+(?:\w+\s+){0,2}?blocked\b", True),
+    # F3 -- a fix ORDERED before landing. Past tense without a modal reports
+    #       work already done: "We fixed the bug before merging; I approve" is an
+    #       approval, and Round 3 withdrew it.
+    (r"\b(?:please\s+)?(?:fix|resolve|address|correct|repair|remediate|close)\b"
+     r"[^,;.!?]{0,40}?\bbefore\b[^,;.!?]{0,40}?\b%s\b" % _LAND, True),
+    (r"\b%s\s+(?:be\s+)?(?:fix\w*|resolv\w*|address\w*|correct\w*|repair\w*|remediat\w*)\b"
+     r"[^,;.!?]{0,40}?\b(?:first|before)\b" % _ORDERED, True),
+    (r"\b(?:needs?|requires?|awaits?|awaiting|pending)\s+(?:\w+\s+){0,2}?(?:revisions?|rework|changes|fixes|corrections?)\b", True),
     # F4 -- another round, or the work handed back to its author
     (r"\b(?:another|a\s+further|an\s+additional|one\s+more|a\s+second|further)\s+"
      r"(?:review\s+)?(?:rounds?|revisions?|passes|pass|iterations?|reviews?|attempts?|cycles?)\b", True),
     (r"\b%s\s+%s\s+back\b" % (_HANDBACK, _UNDER_REVIEW), False),
     (r"\b%s\s+%s\s+(?:back\s+)?to\s+(?:the\s+)?%s\b" % (_HANDBACK, _UNDER_REVIEW, _AUTHOR), False),
-    (r"\breturn(?:ed|ing|s)?\s+(?:this\s+|it\s+)?for\s+(?:rework|revisions?|changes|fixes)\b", False),
+    (r"\breturn\w*\s+(?:%s\s+)?for\s+(?:rework|revisions?|changes|fixes|another)\b" % _UNDER_REVIEW, False),
     (r"\bback\s+to\s+(?:the\s+)?(?:%s|drawing\s+board)\b" % _AUTHOR, False),
     # F5 -- a rejection whose object is the work under review
     (r"\breject(?:s|ed|ing)?\s+(?:(?:this|that|the|your|its|their|my|our)\s+)?(?:\w+\s+){0,2}?%s\b" % _WORK, False),
     (r"\b(?:this|that|the|your)\s+(?:\w+\s+){0,2}?%s\s+"
      r"(?:is|was|are|were|has\s+been|have\s+been|had\s+been)\s+rejected\b" % _WORK, False),
-    (r"\breject(?:s|ed|ing)?\s+(?:this|it)\s*(?:[,;]|$)", False),
+    (r"\breject(?:s|ed|ing)?\s+(?:this|it)\s*(?:[,;.!?]|$|\b(?:because|since|due|owing|given)\b)", True),
     (r"\b(?:the\s+)?reviewer\s+rejects?\b", False),
     (r"\bverdict\b\W{0,8}reject(?:ed)?\b", False),
     # Fixed governance tokens, which are identifiers rather than prose guesses
@@ -287,14 +333,61 @@ _CONTRARY_TOKEN = re.compile(r"\bREJECT(?:ED)?\b|\bCHANGES[ _]REQUIRED\b|\bDO NO
 
 
 def _negated(clause, match):
-    """Is this match negated -- just before it, or by its own leading quantifier?
+    """Is this match cancelled -- by negation, by resolution, or by attribution?
 
-    The second half matters because a counting rule swallows the count: "0
-    blocking issues" starts at the "0", so there is nothing before it to look at.
+    Round 3 looked only at the words *before* the match and at the match's first
+    word. That missed negation inside the matched proposition ("The blocker no
+    longer exists" matched blocker->exists and withdrew a genuine approval), and
+    it missed negation in the predicate just after a short match ("A blocker no
+    longer exists", where the rule matches only "A blocker"). Polarity is read
+    over the window before, the whole matched span, and the first words after it.
     """
-    words = _WORD.findall(clause[:match.start()])[-_NEG_WINDOW:]
-    first = _WORD.findall(match.group(0))[:1]
-    return any(_NEGATOR.match(word) for word in words + first)
+    before = _WORD.findall(clause[:match.start()])[-_NEG_WINDOW:]
+    inside = _WORD.findall(match.group(0))
+    after = _WORD.findall(clause[match.end():])[:_PREDICATE_WINDOW]
+    if any(_NEGATOR.match(word) for word in before + inside + after):
+        return True
+    if re.search(r"\b%s\b" % _HISTORICAL, clause[:match.start()], re.I):
+        return True
+    return _resolved_after(clause, match)
+
+
+def _resolved_after(clause, match):
+    """Does the clause say this condition has since been dealt with?
+
+    "The issue that blocked merge is now fixed" names a blocker and clears it in
+    the same breath. An ordered fix is not a resolution, so "a blocker remains
+    and must be fixed" still counts as a rejection.
+    """
+    for found in re.finditer(r"\b%s\b" % _RESOLVED, clause[match.end():], re.I):
+        head = clause[match.end():][:found.start()]
+        if not re.search(r"\b%s\b[\w\s]{0,20}$" % _ORDERED, head, re.I):
+            return True
+    return False
+
+
+def _approval_rejected(clause):
+    """An approval noun whose state is negative -- with the state's own polarity.
+
+    A single regex could not do this: "Approval is not conditional" contains both
+    an approval and a negative-sounding predicate, yet it is an approval. The
+    state is what carries the meaning, and the state can itself be negated.
+    """
+    noun = re.search(r"\b%s\b" % _APPROVAL_NOUN, clause, re.I)
+    if not noun:
+        return None
+    tail = clause[noun.end():]
+    for state in re.finditer(r"\b%s\b" % _APPROVAL_STATE, tail, re.I):
+        if re.search(r"\b(?:not|never|no\s+longer|nor)\s+(?:\w+\s+){0,2}$", tail[:state.start()], re.I):
+            continue  # "not conditional", "no longer blocked" -- the state is denied
+        return clause[noun.start():noun.end() + state.end()].strip()[:120]
+    for absent in re.finditer(r"\b%s\b" % _APPROVAL_ABSENT, tail, re.I):
+        after = tail[absent.end():]
+        if re.match(r"\s*(?:\w+\s+){0,2}?%s\b" % _APPROVAL_STATE, after, re.I):
+            continue  # "not conditional", "never blocked" -- the state is denied
+        return clause[noun.start():noun.end() + absent.end()].strip()[:120]
+    return None
+
 
 
 def rejection_signal(text):
@@ -303,6 +396,9 @@ def rejection_signal(text):
         clause = clause.strip()
         if not clause:
             continue
+        approval = _approval_rejected(clause)
+        if approval:
+            return approval
         for pattern, guarded in _REJECTION_RULES:
             for match in pattern.finditer(clause):
                 if not guarded or not _negated(clause, match):
@@ -515,17 +611,25 @@ _NORMALIZE_CAP = 8
 
 
 def _normalize_token(raw):
+    """``(token, exhausted)``. ``exhausted`` means the cap was hit before the
+    token stopped changing, so what came back is NOT a settled reading of it."""
     token = raw.strip()
     for _ in range(_NORMALIZE_CAP):
-        stripped = token.strip().strip(_WRAPPERS).strip().rstrip(_TRAILING).strip()
+        stripped = token.strip().strip(_WRAPPERS).strip(_TRAILING).strip()
         if stripped == token:
-            break
+            return token, False
         token = stripped
-    return token
+    return token, True
+
 
 
 def _map_value(field, raw, role):
-    token = _normalize_token(raw)
+    token, exhausted = _normalize_token(raw)
+    if exhausted:
+        # Wrapping deep enough to outlast the cap leaves the value unread.
+        # Returning the truncated token would let an unreadable verdict pass
+        # for silence, which is how a contradictory payload PASS survived.
+        return None
     upper = token.upper().replace(" ", "_").replace("-", "_")
     # Exact matches only. A prefix fallback used to collapse a hedge into a
     # clean verdict -- "PASS_WITH_CAVEATS" became PASS and
@@ -573,9 +677,10 @@ def _map_value(field, raw, role):
     return None
 
 
-def _deterministic(lines, role, warnings, skip):
+def _deterministic(lines, role, warnings, skip, signals=None):
     """({field: [values]}, set of consumed line indexes, blockers). Lines in ``skip`` are payload."""
     seen, consumed, blockers = {}, set(skip), []
+    signals = signals if signals is not None else set()
 
     def add(field, value, index):
         if value is None:
@@ -630,6 +735,12 @@ def _deterministic(lines, role, warnings, skip):
         mapped = _map_value(field, raw, role)
         if mapped is None:
             warnings.append(f"deterministic: unmapped {field} value {raw.strip()[:60]!r}")
+            if field in REVIEW_AUTHORITY_FIELDS:
+                # The reviewer stated a verdict and it could not be read. That
+                # is an unresolved decision, not the absence of one, so it must
+                # not leave a payload PASS standing unopposed.
+                signals.add("extract.conflicting_statements")
+                consumed.add(index)
             continue
         add(field, mapped, index)
     return seen, consumed, blockers
@@ -693,7 +804,8 @@ def extract(output):
     sources = {field: f"agent:{tier}" for field in facts}
     # Evidence narrows: a fenced, quoted or documented line may not prove anything.
     non_evidence = non_evidence_lines(lines)
-    deterministic, consumed, blockers = _deterministic(lines, role, warnings, fenced_lines | non_evidence)
+    deterministic, consumed, blockers = _deterministic(
+        lines, role, warnings, fenced_lines | non_evidence, signals)
     for field, values in deterministic.items():
         candidate = values[0]
         if len(values) > 1:
@@ -729,6 +841,29 @@ def extract(output):
         passed, failed = r.value(result, "tests_passed"), r.value(result, "tests_failed")
         if r.level(result, "tests_passed") == v.REPORTED and r.level(result, "tests_failed") == v.REPORTED:
             result["facts"]["tests_run"] = r.fact(passed + failed, v.DERIVED, "derived:test_count_sum")
+
+    # A reviewer's PASS must be something the reviewer actually said.
+    #
+    # Round 3 let a fenced payload carry review_verdict PASS on its own, and then
+    # tried to take it back whenever the prose looked like a rejection. That is
+    # fail-open by construction: it treats "no rejection matched" as "the reviewer
+    # approved", so every wording the matcher missed became an approval. Codex
+    # completed 26 of 30 held-out rejections that way -- and a payload with no
+    # prose at all completed too.
+    #
+    # The direction is now reversed. A PASS needs an explicit authoritative
+    # decision line ("Verdict: PASS", "Final review: APPROVED") that survived
+    # region filtering, mapped exactly onto the enum, and did not conflict. A
+    # payload may still carry the value, but it cannot authorize it alone. FAIL
+    # is deliberately NOT gated: a payload asserting failure only ever routes
+    # away from completion, so it needs no anchor.
+    if role == v.REVIEWER and r.value(result, "review_verdict") == "PASS":
+        stated = deterministic.get("review_verdict") or []
+        if stated != ["PASS"]:
+            result["facts"]["review_verdict"] = r.unknown(
+                "payload claimed PASS but the reviewer stated no explicit verdict of its own")
+            warnings.append("review_verdict: a payload PASS alone cannot authorize a review")
+
 
     # Prose the agent wrote outside any payload or parsed line.
     prose = "\n".join(line for index, line in enumerate(lines) if index not in consumed)

@@ -140,7 +140,10 @@ class FindingTwoQuotedPayloadBecomesTheVerdict(unittest.TestCase):
         self.assertEqual(v.UNKNOWN, r.level(got, "review_verdict"))
 
     def test_a_genuine_approval_is_still_accepted(self):
-        got = self.extract_review(self.review_text(prose="I reviewed the diff and the tests. No blocking findings."))
+        # Round 4: the approval must now be stated, not inferred from the
+        # absence of a rejection (Codex finding R3-1).
+        got = self.extract_review(self.review_text(
+            prose="Verdict: PASS\nI reviewed the diff and the tests. No blocking findings."))
         self.assertEqual(("PASS", v.REPORTED), (r.value(got, "review_verdict"), r.level(got, "review_verdict")))
         decision = plan(reviewing(), h.event(got, role=v.REVIEWER, session_id=h.REVIEWER_SESSION, generation=1))
         self.assertEqual(v.MARK_COMPLETE, decision["action"])
@@ -332,7 +335,11 @@ class FindingBReviewerRejectionProseAndNormalization(unittest.TestCase):
         ]
         for prose in research_prose_cases:
             with self.subTest(prose):
-                content = self.review_text(prose=f"Analysis: {prose}.\nI reviewed the implementation and all tests pass.")
+                # Round 4: a genuine PASS is now stated, not left to be inferred
+                # from the absence of a rejection (Codex finding R3-1). What this
+                # test guards is unchanged: research-rejection prose must not
+                # withdraw the approval the reviewer did state.
+                content = self.review_text(prose=f"Verdict: PASS\nAnalysis: {prose}.\nI reviewed the implementation and all tests pass.")
                 got = self.extract_review(content)
                 self.assertEqual(("PASS", v.REPORTED), (r.value(got, "review_verdict"), r.level(got, "review_verdict")))
                 self.assertNotIn("extract.conflicting_statements", got["extraction"]["signals"])
