@@ -41,6 +41,9 @@ from manager.nextplan import vocabulary as v
 _FIELD_VALIDATORS = {field: Draft202012Validator(r._value_schema(kind)) for field, kind in r.FIELD_KINDS.items()}
 _TIER_ORDER = {tier: index for index, tier in enumerate(r.TIERS)}
 
+# Facts only a reviewer has the authority to assert, whatever tier they arrive in.
+REVIEW_AUTHORITY_FIELDS = frozenset({"review_verdict", "reviewed_sha"})
+
 _FENCE_OPEN = re.compile(r"^\s*```[ \t]*(adm-result|json)[ \t]*$")
 _FENCE_CLOSE = re.compile(r"^\s*```\s*$")
 _HEX = re.compile(r"\b[0-9a-f]{7,40}\b")
@@ -183,11 +186,18 @@ def _fenced_payload(lines, signals, fenced_lines):
     return (payloads[-1] if payloads else None), attempted
 
 
-def _payload_facts(payload, tier, signals, warnings):
+def _payload_facts(payload, tier, signals, warnings, role):
     facts, lists = {}, {"evidence": [], "blockers": [], "warnings": [], "findings": []}
     for problem in r.report_problems(payload):
         warnings.append(problem)
     for field in r.FACT_FIELDS:
+        if field in REVIEW_AUTHORITY_FIELDS and role != v.REVIEWER:
+            # Only a reviewer can assert a verdict. A worker payload carrying
+            # one is dropped here as well as in the deterministic tier, so the
+            # rule does not depend on which tier the claim arrived through.
+            if payload.get(field) is not None:
+                warnings.append(f"{field}: ignored, only a reviewer may assert it")
+            continue
         if field.startswith("ssot_sync_"):
             sync = payload.get("ssot_sync_status")
             raw = sync.get(field[len("ssot_sync_"):]) if isinstance(sync, dict) else None
@@ -386,7 +396,7 @@ def extract(output):
         attempted = True
     if payload is not None:
         tier = "native" if native is not None else "fenced"
-        facts, lists = _payload_facts(payload, tier, signals, warnings)
+        facts, lists = _payload_facts(payload, tier, signals, warnings, role)
 
     sources = {field: f"agent:{tier}" for field in facts}
     deterministic, consumed, blockers = _deterministic(lines, role, warnings, fenced_lines)
