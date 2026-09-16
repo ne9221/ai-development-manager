@@ -5,11 +5,13 @@ Session: Claude A / Claude Code, model Claude Opus 5, autonomous implementation
 `feat/nextplan-failure-atlas-foundation-20260916`, based on `origin/main` @
 `2a004d4`. **Not merged. Not released. Not activated.**
 
-Final status of this round: **PARTIALLY_READY**. The implementation and its own
-checks are complete, but the required independent adversarial review (common
-governance rule 32) did **not** run — see "Independent review" below. Nothing
-here is a milestone acceptance; every PASS below is an AI self-report of a test
-run, not human verification (rules 23/34).
+Final status of this round: **PARTIALLY_READY**. The independent adversarial
+review ran, returned **REJECT** with two CRITICAL false-pass findings, and both
+were reproduced and fixed here — but **the remediation itself has not been
+reviewed by anyone independent**, and the implementer of the fixes is the author
+of the code (common governance rule 32 is therefore still not satisfied).
+Nothing here is a milestone acceptance; every PASS below is an AI self-report of
+a test run, not human verification (rules 23/34).
 
 ## What this round built
 
@@ -53,10 +55,12 @@ Measured against `main` @ `2a004d4`, from code rather than documentation:
 
 | Run | Result |
 |---|---|
-| NextPlan suites (9 modules) | 161 tests, 0 failures; 653 property subtests included |
-| Whole-repo regression (`manager` + `cloud`) | **5 failed, 2890 passed** in 12m21s |
+| NextPlan suites, before remediation | 161 tests, 0 failures |
+| NextPlan suites, after remediation | **187 tests, 0 failures; 954 subtests** |
+| Whole-repo regression, before remediation | **5 failed, 2890 passed** in 12m21s |
+| Whole-repo regression, after remediation (@`fa847e3`) | **5 failed, 2925 passed** in 8m04s |
 | Baseline comparison at `origin/main` @ `2a004d4` | the **same 5** tests fail: 5 failed, 37 passed |
-| Measured statement coverage of `manager/nextplan` | **95.0%** overall |
+| Measured statement coverage of `manager/nextplan` | **96.6%** overall (187 tests) |
 
 The 5 regression failures are therefore **pre-existing on main**, not caused by
 this branch: `test_command_watcher_ag.py::test_gate_pass_reaches_launch_task`,
@@ -68,8 +72,8 @@ collected at all in this environment because of third-party package versions
 untouched by this branch and were excluded from the run.
 
 Coverage by module: `pipeline` 100%, `vocabulary` 100%, `atlas` 99.0%,
-`crosscheck` 98.6%, `result` 98.3%, `planner` 96.9%, `classify` 96.4%,
-`verify` 95.3%, `extract` 88.2%. Measured with a stdlib tracer
+`crosscheck` 98.6%, `result` 98.3%, `planner` 97.4%, `classify` 97.6%,
+`verify` 95.4%, `extract` 94.0%. Measured with a stdlib tracer
 (`ast` + `sys.settrace`), because coverage.py is not installed here.
 
 ## Defects found and fixed inside this round
@@ -126,14 +130,72 @@ dispatch prompts, the planner will choose the safe route (ask again), every
 time. That injection is the next minimal task and is deliberately **not** in
 this branch.
 
-## Independent review — NOT DONE
+## Independent review — REJECT, remediated, re-review still owed
 
-Two attempts to run a fresh-context read-only adversarial review were made. The
-first terminated on the account session limit (HTTP 429, "resets 1pm"); a
-second was launched with a different model late in the session. **No
-independent review verdict is recorded in this document.** Per rule 32 the
-reviewer must not be the implementer, so nothing in this round may be treated
-as reviewed: the author's own checks are implementer reasoning, not review.
+A fresh-context read-only review ran (a first attempt died on the account
+session limit, HTTP 429 "resets 1pm"; a second completed). **Verdict: REJECT**,
+with two CRITICAL findings. Both were **reproduced here against the real code
+before being fixed** — the reviewer's claims were not taken on trust:
+
+### CRITICAL 1 — a task could complete with no evidence any test ran
+
+`classify.completion_proof` appended its "tests actually ran" item *only when
+tests_run was already VERIFIED*. When nothing could say how many tests ran, the
+requirement did not fail — it **vanished from the proof list**, and
+`all(item["ok"] ...)` was then trivially true. Reachable through the package's
+own ADM adapter: `adm_test_evidence` never supplied counts, so
+`TestEvidenceProbe` verified `tests_failed = 0` from a bare exit code. A
+validation command of `true` (exit 0, zero tests) reached **MARK_COMPLETE**.
+
+Reproduced: proof list contained no "tests actually ran" item and the planner
+returned `MARK_COMPLETE` with `tests_run` UNKNOWN.
+
+Fixed (`fa847e3`): the item is unconditional and requires `tests_run` VERIFIED
+and greater than zero; `adm_test_evidence` parses real counts out of the
+recorded `output_summary` with the same parser the extractor uses, so a genuine
+pytest run still completes and an empty validation does not.
+
+### CRITICAL 2 — a review could be forged from the reviewer's own message
+
+Two compounding defects:
+
+- **Hedge collapsing**: the parser fell back to the prefix before the first
+  underscore, so `PASS_WITH_CAVEATS` became `PASS` and
+  `APPROVED_WITH_COMMENTS` became a passing review, silently. Reproduced
+  exactly. Fixed (`fa847e3`): exact matches only; a qualified word stays
+  UNKNOWN with a warning.
+- **A quoted example payload became the verdict**: a reviewer whose prose said
+  "CHANGES REQUIRED — this should not ship" but which also contained a
+  formatting example claiming `review_verdict: PASS` produced **MARK_COMPLETE**.
+  Reproduced. Fixed (`fa847e3`): a positive claim contradicted by the same
+  message's prose is withdrawn to UNKNOWN and signalled as
+  `extract.conflicting_statements`, which classifies as `contradictory_result`.
+  (A blockquoted payload was already ignored; the plain "example block" form was
+  the reachable one.)
+
+A follow-up fix (`096284d`) narrows that prose rule after self-review: a bare
+"rejected" matched ADM's own research-before-build evidence ("rejected the
+library after evaluating it"), which would have withdrawn honest PASS reports.
+
+### Findings accepted without a code change
+
+- **MEDIUM, `ExecutionRecordProbe` does no independent verification of its own**
+  — correct, and by design: it reuses what `manager.repo_write_enforcement`
+  already verified (ADM commits, pushes and reads the remote back itself). The
+  reviewer correctly notes the real guarantee then lives in code outside this
+  package. Recorded as a trust boundary, not fixed here.
+- **LOW, `ssot_sync_github` is never in the completion proof** — true; GitHub
+  landing is already proven by the `push landed` and `remote equals HEAD`
+  items, so adding a second switch would add surface without adding proof.
+
+### Tests the reviewer showed were vacuous — both repaired
+
+- `test_adm_validation_runs_become_test_evidence` stopped exactly where the
+  risk began; it now also asserts `tests_run` stays UNKNOWN and that the
+  completion proof fails.
+- The property suite's `PROOF_FIELDS` omitted `tests_run`, mirroring the
+  production blind spot precisely. `tests_run` is now in it — with that entry,
+  the random-omission property would have caught CRITICAL 1 immediately.
 
 ## Coverage, stated honestly
 
