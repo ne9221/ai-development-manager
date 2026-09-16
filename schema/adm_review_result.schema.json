@@ -1,10 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ADM reviewer decision (adm-review-result/v1)",
-  "description": "The only thing that can authorize completing a reviewed candidate. A reviewer returns this as a ```adm-review-result fenced block (or as native structured output). Shape alone never authorizes: manager/nextplan/contracts.py review_authority additionally binds target_sha to the candidate ADM is holding and reviewer_run_id/provenance to the reviewer run ADM itself dispatched, and with no dispatch record on file nothing can authorize. Prose in the same message is explanation and may withdraw a PASS it contradicts, but can never grant one.",
+  "description": "The only thing that can authorize completing a reviewed candidate. A reviewer returns this as a ```adm-review-result fenced block (or as native structured output). Shape alone never authorizes: manager/nextplan/contracts.py review_authority additionally binds target_sha to the candidate ADM is holding and reviewer_run_id/provenance to the reviewer run ADM itself dispatched, and with no dispatch record on file nothing can authorize. Prose in the same message is explanation and may withdraw a PASS it contradicts, but can never grant one. Round 6: the object is CLOSED. It was additionalProperties:true, and a PASS carrying blocking:true, required_action:\"repair\", status:\"needs_changes\" or can_merge:false validated and completed the task, because an unknown key was silently dropped. Dropping a key is only safe when the key cannot have been decision-bearing, which is exactly what an unknown key does not establish. An additive extension is therefore a reviewed change to this contract, not a new field name an agent can invent. Prose in the same message may also now CONFLICT with the object: a second explicit decision statement (\"Current decision: reject\", \"I reject this\"), or a decision field whose value ADM cannot read, makes the pair a conflict and blocks.",
   "type": "object",
-  "additionalProperties": true,
-  "required": ["schema", "target_sha", "reviewer_run_id", "verdict", "findings", "provenance"],
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "target_sha",
+    "reviewer_run_id",
+    "verdict",
+    "findings",
+    "provenance"
+  ],
   "properties": {
     "schema": {
       "const": "adm-review-result/v1"
@@ -20,7 +27,10 @@
       "description": "The run identity ADM issued when it dispatched this review. This is the field a forger cannot supply."
     },
     "verdict": {
-      "enum": ["PASS", "REJECT"],
+      "enum": [
+        "PASS",
+        "REJECT"
+      ],
       "description": "Absent, empty and unrecognised values are all INVALID and block. They are never read as silence."
     },
     "findings": {
@@ -28,26 +38,51 @@
       "description": "Required. An empty list is the positive statement that there are none. A PASS carrying any blocking finding is a contradiction and blocks.",
       "items": {
         "type": "object",
-        "additionalProperties": true,
-        "required": ["summary"],
+        "additionalProperties": false,
+        "required": [
+          "summary"
+        ],
         "properties": {
-          "summary": {"type": "string", "minLength": 1},
+          "summary": {
+            "type": "string",
+            "minLength": 1
+          },
           "severity": {
-            "enum": ["blocking", "high", "medium", "low", "info"],
+            "enum": [
+              "blocking",
+              "high",
+              "medium",
+              "low",
+              "info"
+            ],
             "description": "Omitted means blocking: an unreadable severity is not a harmless one."
           },
-          "file": {"type": "string"},
-          "line": {"type": "integer"}
+          "file": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          }
         }
       }
     },
     "provenance": {
       "type": "object",
-      "additionalProperties": true,
-      "required": ["provider", "job_id", "mode"],
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "job_id",
+        "mode"
+      ],
       "properties": {
-        "provider": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"},
-        "job_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"},
+        "provider": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+        },
+        "job_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+        },
         "mode": {
           "const": "read_only",
           "description": "A reviewer that could write is not an independent reviewer (AI-DEVELOPMENT-RULES 32)."

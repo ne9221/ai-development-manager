@@ -40,7 +40,7 @@ from manager.nextplan import result as r
 from manager.nextplan import runner as run_mod
 from manager.nextplan import vocabulary as v
 from manager.nextplan.classify import completion_proof, review_proof
-from manager.nextplan.extract import extract
+from manager.nextplan.extract import decision_statements, extract
 from manager.nextplan.extract import test_counts as parse_counts
 from manager.nextplan.planner import new_task_state, plan
 from manager.nextplan.verify import TestEvidenceProbe, adm_test_evidence, verify
@@ -176,7 +176,12 @@ def legacy_step(output_summary, command="pytest -q", exit_code=0):
 def worker_evidence(execution):
     """Worker facts verified by ADM's own recorded run, with no test claims of its own."""
     bare = h.worker_result(verified=True, drop=("tests_run", "tests_passed", "tests_failed"))
-    verified, _ = verify(bare, {"test_evidence": adm_test_evidence(execution)}, [TestEvidenceProbe()])
+    # Round 6: counts come from ADM's execution registry, so a fixture standing
+    # for a genuine run has to supply the entry ADM would hold for it. A fixture
+    # standing for a forgery simply does not (see the registry groups below).
+    evidence = adm_test_evidence(execution, registry=h.registry_for(execution),
+                                 task_id=h.TASK_ID, run_id=h.RUN_ID)
+    verified, _ = verify(bare, {"test_evidence": evidence}, [TestEvidenceProbe()])
     return verified
 
 
@@ -673,44 +678,63 @@ class GroupSevenFreshCorpora(unittest.TestCase):
         completed = [prose for prose in REJECTIONS if completes("Verdict: PASS\n" + prose)]
         self.assertEqual([], completed)
 
-    # The measured residual of the prose withdrawal net, stated as a number
-    # rather than claimed away. Reaching any of these needs a reviewer that
-    # returns a correctly bound structured PASS with an EMPTY findings list and
-    # then contradicts it in prose. The gate believes the decision; the prose net
-    # is a backstop over a reviewer disagreeing with itself, and a backstop built
-    # on wording has wording coverage. Widening the vocabulary is the move that
-    # failed in Rounds 2, 3 and 4, so it is not attempted here.
+    # ROUND 6, per the independent review.
     #
-    # Pinned exactly so it cannot drift in either direction: a wider net makes
-    # this test fail and the entry moves out; a broken net makes it fail and the
-    # regression is visible.
-    RESIDUAL = {
+    # This set used to be called RESIDUAL and was asserted with assertEqual, so
+    # these eight sentences were *required to keep completing*. Round 5 wrote
+    # that deliberately, as an honest measurement of a known gap. The Round-6
+    # independent reviewer ruled it a contract violation rather than a
+    # measurement: a test that pins false-completes as correct behaviour makes
+    # them green, and green is what everyone reads. Four of the eight were
+    # decision-shaped and now fail closed (see GroupOne in
+    # test_nextplan_round6_findings.py). They were removed from this set rather
+    # than silently left in it.
+    #
+    # What is left is four sentences that are not decisions at all: three state
+    # a finding and one is an imperative. None announces a verdict, so the
+    # decision-shape parser correctly does not read one, and the round's standing
+    # instruction is not to chase them with more rejection vocabulary -- that is
+    # the move that failed in Rounds 2, 3 and 4. They are recorded here as
+    # out-of-contract commentary, with the invariant that actually holds
+    # asserted, and nothing below requires any of them to complete.
+    OUT_OF_CONTRACT_COMMENTARY = {
         "Changes are required before I can sign off.",
         "There remain unresolved concerns about locking.",
         "Two defects block acceptance.",
-        "This fails my review.",
         "Hold the merge until CI is green.",
-        "I am not able to approve the patch.",
-        "Current decision: reject",
-        "My assessment is negative.",
     }
 
-    def test_the_prose_net_residual_is_exactly_what_is_documented(self):
-        """The harder direction: a bound PASS decision AND rejecting prose.
+    def test_the_commentary_residual_is_not_decision_shaped(self):
+        """The property that justifies leaving these open, stated as a test.
 
-        Compare with Round 4, where the equivalent measurement was 20 of 25
-        completing on a *written anchor alone* -- an ordinary honest rejection
-        from a reviewer who never claimed to approve. That case is now 0 of 30
-        (the test above). What is left is only the self-contradicting reviewer.
+        Each of these is a *finding* or an instruction, written beside a bound
+        PASS whose ``findings`` list is empty. The contract already has a place
+        for a finding, and the reviewer did not use it. What is asserted here is
+        that none of them is a decision the parser should have read -- so this
+        set can only ever shrink by the contract getting stricter, never by a
+        decision quietly slipping through it.
         """
-        completed = {prose for prose in REJECTIONS
-                     if completes("Verdict: PASS\n" + prose, decision=h.review_decision())}
-        self.assertEqual(self.RESIDUAL, completed)
+        for prose in sorted(self.OUT_OF_CONTRACT_COMMENTARY):
+            with self.subTest(prose):
+                self.assertEqual([], decision_statements(prose))
 
-    def test_the_residual_never_applies_when_the_decision_states_the_blocker(self):
-        """And it closes entirely the moment the reviewer uses the contract."""
+    def test_nothing_decision_shaped_survives_a_bound_pass(self):
+        """The contract A3 asks for: no sentence that announces a decision completes.
+
+        Round 4's equivalent measurement was 20 of 25 completing on a written
+        anchor alone. Round 5 brought that to 0 of 30 for prose-only rejections
+        but left 8 completing when the reviewer also returned a bound PASS.
+        Round 6 closes every one of those that states a decision.
+        """
+        leaked = [prose for prose in REJECTIONS
+                  if decision_statements(prose)
+                  and completes("Verdict: PASS\n" + prose, decision=h.review_decision())]
+        self.assertEqual([], leaked)
+
+    def test_the_commentary_closes_the_moment_the_reviewer_uses_the_contract(self):
+        """And the remedy is the contract, not a wider vocabulary."""
         blocking = h.review_decision(findings=[{"summary": "stated in findings", "severity": "blocking"}])
-        for prose in sorted(self.RESIDUAL):
+        for prose in sorted(self.OUT_OF_CONTRACT_COMMENTARY):
             with self.subTest(prose):
                 self.assertFalse(completes("Verdict: PASS\n" + prose, decision=blocking))
                 self.assertFalse(completes("Verdict: PASS\n" + prose,

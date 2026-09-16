@@ -1,8 +1,15 @@
 # NextPlan trust model
 
-Status: Remediation Round 5 (2026-09-17), pending independent review.
+Status: Remediation Round 6 (2026-09-17), pending independent review.
 Applies to `manager/nextplan/contracts.py`, `runner.py`, `extract.py`,
 `verify.py`, `classify.py` and `planner.py`.
+
+> **Round 6 amends this document.** Round 5's design below is unchanged and
+> still correct; Round 6 fixes the places where it was written down but not
+> implemented, and the place where it was applied too far. Read
+> [`REMEDIATION-ROUND-6-20260917.md`](REMEDIATION-ROUND-6-20260917.md) with it.
+> In one line: **a bound decision is necessary, and Round 5 treated it as
+> sufficient.** Section 6 below states the amended contract.
 
 Rounds 2, 3 and 4 each failed the same way, one layer further in:
 
@@ -198,3 +205,125 @@ are separate reviewed changes — this round deliberately did not start the
 **5.4 The runner adapter covers pytest only.** Other ecosystems
 (`npm test`, `go test`, …) have no adapter yet, so they cannot produce counts.
 Fail-closed, and additive to fix.
+
+## 6. Round 6 amendment — necessary is not sufficient
+
+Grok 4.6's independent review rejected `405c90c4` with four findings. They are
+not a new failure mode; they are the *correction* to Rounds 2–4 applied one step
+too far, plus two places where this document described behaviour the code did
+not have.
+
+### 6.1 A bound PASS may now be contradicted (F1, HIGH)
+
+Section 1 said prose "may still *withdraw* a decision it contradicts". It did
+not. The withdrawal ran over the `review_verdict` **fact**, and a bound decision
+never travels through a fact — so a reviewer could return a correctly bound
+`PASS` with `findings: []`, write `Current decision: reject` beside it, and the
+task completed. Measured at `405c90c4`: **12 of 30** fresh decision-shaped
+contradictions completed, including the two the review named.
+
+The rule now lives in `contracts.review_authority`, where authority is decided,
+and it reads **decision shape**, not rejection vocabulary:
+
+| in the reviewer's output | effect |
+|---|---|
+| bound `PASS`, no contradicting statement | **AUTHORIZED** |
+| bound `PASS` + an explicit contradicting decision | **CONFLICT**, blocks |
+| bound `PASS` + a decision field ADM cannot read | **CONFLICT**, blocks |
+| a decision statement with no bound object | nothing — cannot grant, and deliberately cannot block either |
+
+A *decision statement* is a decision **field** on a line (`Verdict:`,
+`Decision:`, `Current decision:`, `Review outcome:`, `Approval:`, …), the same
+field written with a copula (`My decision is to reject`), a first-person
+decision verb whose object is the work (`I reject this patch`, `I cannot approve
+this change`), or the review's outcome predicated of the work (`This fails my
+review`). The value is mapped against a closed vocabulary; **an unmappable value
+in an unambiguous decision field is a conflict, not silence** — the same rule
+Round 4 got right about unreadable verdicts, now applied to the statement.
+
+Two label tiers, because fail-closed has a cost on the other side. A *decisive*
+label is announcing a decision, so an unreadable value there conflicts. A
+*reporting* label (`Result:`, `Conclusion:`, `Assessment:`) is ordinary review
+prose that may carry a decision, so it counts only when its value is itself an
+unambiguous rejection — otherwise `Conclusion: the fix is correct` would
+withdraw a genuine approval. Measured after the fix: **0 of 30** contradictions
+complete, **0 of 24** Round-5 genuine approvals are refused.
+
+This is deliberately **not** another row in the rejection vocabulary. Widening
+that vocabulary is what lost Rounds 2, 3 and 4.
+
+### 6.2 Test counts come from ADM's registry, not from the record (F2, HIGH)
+
+Round 5 built a producer that could not be fooled and a consumer that never
+checked whether the producer had run. The consumer validated the record's
+*shape*, saw an `execution_id` and an `argv`, and believed the counts. Grok
+typed a block naming `exec-forged` by hand and obtained `VERIFIED
+tests_run=999` and `MARK_COMPLETE` with nothing spawned. Shape had been made to
+stand in for provenance — the Round-2 defect in a JSON costume.
+
+`runner.ExecutionRegistry` now mints the `execution_id` **before** the spawn,
+binds it to the task and run that asked for it, and records what the adapter
+observed: the argv digest, the artifact path, and the digest of the artifact
+bytes it read. A returned `adm-validation-result/v1` is only a **reference**:
+
+> **The counts are read from the registry entry, never from the record.**
+
+So a fabricated number is not disbelieved — it is never consulted. A fabricated
+`execution_id` finds no entry, which yields *no* counts rather than any. The
+consumer additionally refuses an entry belonging to another task or run, an
+argv that does not digest to the one ADM spawned, a record naming an artifact
+digest other than the one ADM read, and an entry whose process never started.
+An unbound record also no longer proves `tests_failed = 0` on the strength of
+its own `exit_code`; a *legacy* record still can, because ADM spawned that
+command itself, so its exit status genuinely is an observation.
+
+### 6.3 The decision object is closed (F3, MEDIUM)
+
+`additionalProperties: true` meant `verdict: PASS` beside `blocking: true`,
+`required_action: "repair"`, `status: "needs_changes"` or `can_merge: false`
+validated and completed — **6 of 6** at `405c90c4`. Dropping an unknown key is
+only safe when the key cannot have been decision-bearing, which is exactly what
+an unknown key does not establish. The object, its `findings` items and its
+`provenance` are now closed in both `contracts.review_problems` and
+`schema/adm_review_result.schema.json`; an unknown field is INVALID, and INVALID
+blocks. An additive extension is a reviewed change to the contract, not a field
+name an agent invents.
+
+### 6.4 One authoritative channel (F4, LOW)
+
+Any fence whose body contained the schema string was collected as authority, so
+` ```json `, ` ```yaml `, ` ```text `, ` ```markdown `, ` ```example ` and a bare
+fence all worked — **6 of 6** — and a fence is exactly where a quoted example or
+a pasted transcript lives. Only ` ```adm-review-result ` (or a native structured
+output whose whole body is the object) is authoritative now. A decision in the
+wrong fence is **reported back as ignored** rather than silently dropped, and is
+**not** treated as a blocking decision — blocking on it would let anyone stall a
+task by quoting JSON.
+
+### 6.5 Residual after Round 6
+
+**6.5.1 The Round-5 `RESIDUAL` set is gone as a contract.** It asserted with
+`assertEqual` that eight sentences must keep completing, which made
+false-completes green. Four of the eight were decision-shaped and now fail
+closed. The remaining four state a *finding* or an instruction rather than a
+decision, are recorded in `GroupSevenFreshCorpora.OUT_OF_CONTRACT_COMMENTARY` as
+out-of-contract commentary, and **nothing requires them to complete**. Reaching
+one still needs a reviewer that returns a bound `PASS` with an empty `findings`
+list and then contradicts it; putting the blocker in `findings` closes all four.
+
+**6.5.2 One pre-existing over-refusal, recorded rather than chased.** `A blocker
+was present last time; it is resolved.` is split at the semicolon by the Round-5
+clause splitter, so the resolution sits in a different clause from the blocker.
+Reproduced at `405c90c4` before any Round-6 edit, so it is neither a regression
+nor one of Grok's findings; closing it means widening rejection vocabulary. It
+fails closed — it costs a round, never a completion.
+
+**6.5.3 The registry is per-task state, not a service.** It is a plain dict so
+ADM can keep it in the task/run state it already persists. The security property
+is *who writes it*, not where it lives. A registry that outlived its task would
+only widen the window in which a stale `execution_id` is honoured.
+
+**6.5.4 Still not activated.** Residual 5.3 stands unchanged: nothing in
+production emits either contract, and `run_validation` is not wired into
+`repo_write_enforcement.py`. The `adm-result` milestone was deliberately not
+started.

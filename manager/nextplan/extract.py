@@ -255,10 +255,16 @@ _PREDICATE_WINDOW = 2
 # Explicit negation carriers. Bare "no" is deliberately absent: it is the
 # quantifier in "no blocking issues", which F2 already handles, and admitting it
 # here would read "No issues block merge" as a refusal to merge.
+# "am not" and "not able to" close two gaps in a *closed grammatical class*,
+# not in a vocabulary of rejections: every other copula negation (is not, are
+# not, was not, were not) was already here, and "unable to" was already here
+# without its analytic form. Round 6's residual contained "I am not able to
+# approve the patch", which is first-person decision shape that only escaped
+# because English's first-person copula was missing from this list.
 _NOT = (r"(?:not|cannot|can\s*not|can't|won't|will\s+not|would\s+not|shall\s+not|should\s+not|"
         r"must\s+not|may\s+not|do\s+not|does\s+not|don't|doesn't|is\s+not|isn't|are\s+not|aren't|"
-        r"has\s+not|have\s+not|hasn't|haven't|was\s+not|were\s+not|never|unable\s+to|"
-        r"refus\w+\s+to|declin\w+\s+to|fail\w*\s+to)")
+        r"am\s+not|ain't|has\s+not|have\s+not|hasn't|haven't|was\s+not|were\s+not|never|"
+        r"unable\s+to|not\s+able\s+to|refus\w+\s+to|declin\w+\s+to|fail\w*\s+to)")
 _FILLER = r"(?:be|been|being|get|got|yet|now|ever|fully|formally|hereby|explicitly|currently|\w+ly)"
 _APPROVE = (r"(?:approv\w*|accept\w*|sign[-\s]?off|signed[-\s]?off|merg\w*|land(?:ed|ing|s)?|"
             r"ship(?:ped|ping|s)?|releas\w*|grant\w*|endors\w*)")
@@ -346,6 +352,179 @@ _CONTRAST = re.compile(
 )
 
 _CONTRARY_TOKEN = re.compile(r"\bREJECT(?:ED)?\b|\bCHANGES[ _]REQUIRED\b|\bDO NOT MERGE\b")
+
+
+# -- decision shape -------------------------------------------------------------
+#
+# Everything above this line is *vocabulary*: which English sentences mean
+# "no". Round 6's independent review showed that a correctly bound PASS plus
+# ``Current decision: reject`` still completed, and the response is deliberately
+# not another row in _REJECTION_RULES. Widening the vocabulary is the move that
+# failed in Rounds 2, 3 and 4, and it fails for a structural reason: the set of
+# sentences meaning "no" has no edge, so coverage can always be measured and
+# will always be short.
+#
+# What does have an edge is the *shape a decision is written in*. A reviewer
+# announcing a decision writes a decision field ("Verdict:", "Current
+# decision:") or a first-person decision verb ("I reject this"). That is a small
+# closed form, and the value in it is read against a small closed vocabulary --
+# so this asks "did you state a decision, and can I read it?", never "does this
+# sentence sound negative?".
+#
+# Unreadable is not silence. A decision field ADM cannot map is a conflict, for
+# the same reason an unknown verdict in the object is INVALID rather than
+# absent: the one thing an unreadable decision does not establish is that the
+# reviewer agreed.
+#
+# Two label tiers, because fail-closed has a cost on the other side. A DECISIVE
+# label is unambiguously announcing a decision, so an unreadable value there is
+# a conflict. A REPORTING label ("Result:", "Conclusion:") is ordinary review
+# prose that *may* carry a decision, so it counts only when its value is itself
+# an unambiguous rejection -- otherwise "Conclusion: the fix is correct" would
+# withdraw a genuine approval, and a gate nothing can pass is just a wall.
+_DECISIVE_LABELS = (
+    "verdict", "decision", "review decision", "reviewer decision", "review verdict",
+    "current decision", "final decision", "final verdict", "final call", "final review",
+    "outcome", "review outcome", "approval", "sign off", "signoff", "disposition",
+    "recommendation", "overall decision", "overall verdict", "my decision", "my verdict",
+    "review result", "决定", "決定", "裁決", "裁决", "審查結論", "审查结论",
+)
+_REPORTING_LABELS = (
+    "result", "status", "conclusion", "review conclusion", "assessment", "review status",
+    "final status", "judgement", "judgment", "call", "overall", "summary verdict", "結論", "结论",
+)
+_LABEL_LINE = re.compile(
+    # A leading ">" is admitted for the same reason the withdrawal region is
+    # widened rather than narrowed: a decision line stays a decision line when
+    # it is quoted, and excluding quotes would make "> Verdict: reject" a
+    # one-character bypass. Reading it can only cost a round.
+    r"^\s{0,3}(?:>\s?)*\s{0,3}(?:[-*•]\s*)?(?:#{1,6}\s*)?(?:\*\*|__|\*|`)?\s*"
+    r"(?P<label>[A-Za-z][A-Za-z \-]{0,24}|[一-鿿]{2,6})"
+    r"\s*(?:\*\*|__|\*|`)?\s*[:：]\s*(?P<value>.*?)\s*$"
+)
+# The same decision field written as a sentence. "My decision is to reject" is
+# the label form with a copula instead of a colon, and "My review verdict is
+# PASS" -- a genuine approval from the Round-5 corpus -- is the same shape, which
+# is what makes it a shape rather than a rejection pattern.
+_COPULA_DECISION = re.compile(
+    r"\b(?:my|our|the|its|their)\s+(?P<label>(?:review|final|overall|current)\s+)?"
+    r"(?P<noun>decision|verdict|recommendation|disposition|outcome|call|assessment|conclusion|judgement|judgment)\s+"
+    r"(?:is|was|are|were|remains?|stands?\s+as|will\s+be)\s+(?:to\s+)?(?P<value>[^.;!?\n]{1,40})",
+    re.I
+)
+# Nouns whose sentence form is unambiguously announcing a decision; the rest get
+# the reporting tier's treatment, exactly as their label form does.
+_DECISIVE_NOUNS = frozenset({"decision", "verdict", "recommendation", "disposition", "outcome"})
+
+# First person, because "I reject this" carries no colon and is exactly as
+# explicit as "Decision: reject". The object has to be the work under review;
+# without that, "I cannot approve the budget for another reviewer" would count.
+_FIRST_PERSON = re.compile(
+    r"\b(?:i|we)\s+(?P<neg>%s\s+(?:\w+\s+){0,2})?(?P<verb>approv\w*|accept\w*|sign\s*-?\s*off|reject\w*|"
+    r"declin\w*|withhold\w*|am\s+rejecting|am\s+not\s+approving)\b"
+    r"(?P<tail>[^.;!?\n]{0,40})" % _NOT,
+    re.I
+)
+# The review's own outcome predicated of the work under review: "This fails my
+# review", "the patch did not pass review". Still shape rather than sentiment --
+# the subject must be the work, the predicate must be pass/fail, and the object
+# must be the review itself -- which is why "the tests fail" does not match it.
+_REVIEW_OUTCOME = re.compile(
+    r"\b(?:this|it|that|(?:this|that|the|your)\s+(?:\w+\s+){0,1}?%s)\s+"
+    r"(?P<neg>%s\s+)?(?P<verb>fail\w*|pass\w*|clear\w*|did\s+not\s+pass|does\s+not\s+pass)\s+"
+    r"(?:my|our|the|this)\s+(?:\w+\s+){0,1}?(?:review|verdict|approval|assessment)\b" % (_WORK, _NOT),
+    re.I
+)
+
+_APPROVE_VALUES = frozenset({
+    "pass", "passed", "passes", "passing", "approve", "approved", "approval", "accept",
+    "accepted", "acceptable", "ok", "okay", "lgtm", "yes", "green", "clean", "complete",
+    "completed", "done", "granted", "sign off", "signed off", "signoff", "go", "ship",
+    "ship it", "merge", "no objections", "no findings", "none", "satisfied", "positive",
+    "通過", "通过", "同意", "核准",
+})
+_REJECT_VALUES = frozenset({
+    "reject", "rejected", "rejects", "rejecting", "fail", "failed", "fails", "failing",
+    "failure", "no", "nack", "block", "blocked", "blocking", "withheld", "withhold",
+    "denied", "deny", "refused", "negative", "rework", "revise", "revision required",
+    "revisions required", "changes required", "changes requested", "changes needed",
+    "needs changes", "needs work", "needs revision", "needs rework", "not approved",
+    "not approve", "do not approve", "do not merge", "do not complete", "do not ship",
+    "not ready", "not acceptable", "unacceptable", "no go", "nogo", "incomplete",
+    "more work required", "another round", "changes", "駁回", "驳回", "拒絕", "拒绝",
+    "不通過", "不通过", "退回",
+})
+_VALUE_TRIM = re.compile(r"^[\s\-–—*_`\"'“”‘’()\[\]{}]+|[\s\-–—*_`\"'“”‘’()\[\]{}.,;:!?。，；：！？]+$")
+
+
+def _decision_value(raw):
+    """``reject`` / ``approve`` / ``unreadable`` for the value of a decision field."""
+    token = _VALUE_TRIM.sub("", raw or "")
+    token = re.sub(r"\s+", " ", token).strip().lower().replace("_", " ").replace("-", " ")
+    token = re.sub(r"\s+", " ", token)
+    if not token:
+        return contracts.STATEMENT_UNREADABLE  # "Decision:" with nothing after it
+    if token in _REJECT_VALUES:
+        return contracts.STATEMENT_REJECT
+    if token in _APPROVE_VALUES:
+        return contracts.STATEMENT_APPROVE
+    return contracts.STATEMENT_UNREADABLE
+
+
+def decision_statements(text):
+    """Every decision the reviewer announced in prose: ``[{raw, polarity}]``.
+
+    Shape, not sentiment. Only a decision field or a first-person decision verb
+    is read, and the value is mapped against a closed vocabulary -- an
+    unmappable value in a decisive field is ``unreadable``, which
+    ``contracts.review_authority`` treats as a conflict rather than as silence.
+    """
+    statements = []
+    for line in (text or "").split("\n"):
+        match = _LABEL_LINE.match(line)
+        if not match:
+            continue
+        label = re.sub(r"\s+", " ", match.group("label")).strip().lower().replace("-", " ")
+        polarity = _decision_value(match.group("value"))
+        if label in _DECISIVE_LABELS:
+            statements.append({"raw": line.strip()[:120], "polarity": polarity})
+        elif label in _REPORTING_LABELS and polarity == contracts.STATEMENT_REJECT:
+            # A reporting label counts only on an unambiguous rejection; its
+            # unreadable values are ordinary prose, not a withheld decision.
+            statements.append({"raw": line.strip()[:120], "polarity": polarity})
+    for match in _COPULA_DECISION.finditer(text or ""):
+        polarity = _decision_value(match.group("value"))
+        decisive = match.group("noun").lower() in _DECISIVE_NOUNS
+        if decisive or polarity == contracts.STATEMENT_REJECT:
+            statements.append({"raw": match.group(0).strip()[:120], "polarity": polarity})
+    for match in _REVIEW_OUTCOME.finditer(text or ""):
+        failing = bool(re.match(r"fail|did\s+not\s+pass|does\s+not\s+pass", match.group("verb"), re.I))
+        if bool(match.group("neg")) != failing:      # "fails" / "does not pass" -> reject
+            polarity = contracts.STATEMENT_REJECT    # "passes" / "did not fail"  -> approve
+        else:
+            polarity = contracts.STATEMENT_APPROVE
+        statements.append({"raw": match.group(0).strip()[:120], "polarity": polarity})
+    for clause in _CLAUSE_SPLIT.split(text or ""):
+        for match in _FIRST_PERSON.finditer(clause):
+            verb = match.group("verb").lower()
+            tail = match.group("tail") or ""
+            negated = bool(match.group("neg"))
+            positive = bool(re.match(r"approv|accept|sign", verb))
+            if positive and not negated:
+                polarity = contracts.STATEMENT_APPROVE
+            elif positive:
+                polarity = contracts.STATEMENT_REJECT  # "I do not approve ..."
+            elif negated:
+                continue  # "I do not reject this" is not a decision shape worth reading
+            else:
+                polarity = contracts.STATEMENT_REJECT
+            # The decision has to be about the work under review, not about
+            # something else the reviewer happens to reject.
+            if not re.match(r"\s*(?:$|[,;.!?]|(?:of|on|for|upon)?\s*(?:this|it|that|the\s+%s|your\s+%s|"
+                            r"(?:this|the|your)\s+\w+\s+%s)\b)" % (_WORK, _WORK, _WORK), tail, re.I):
+                continue
+            statements.append({"raw": match.group(0).strip()[:120], "polarity": polarity})
+    return statements
 
 
 def _negated(clause, match):
@@ -521,10 +700,24 @@ def _fenced_decisions(lines, fenced_lines, warnings):
     would silently become no decision, and a PASS elsewhere would stand. The
     invalid block is carried forward so contracts.review_authority can block on
     it explicitly.
+
+    The *channel* is narrow, and Round 6 narrowed it: only a ```adm-review-result
+    fence is authoritative. Round 5 also collected any fence whose body merely
+    contained the schema string, so ```json, ```yaml, ```text, ```markdown and
+    even a bare ``` fence all carried authority -- and a fence is exactly the
+    place a quoted example, a documentation snippet or a pasted transcript
+    lives. A decision in the wrong fence is not collected and not blocked; it is
+    reported back as ignored, because silently dropping it would leave a
+    compliant-looking reviewer wondering why nothing happened, while *blocking*
+    on it would hand anyone a way to stall a task by quoting JSON.
     """
     decisions = []
     for lang, body, closed, indexes in _fence_regions(lines):
-        if lang != _DECISION_LANG and contracts.REVIEW_SCHEMA not in body:
+        if lang != _DECISION_LANG:
+            if contracts.REVIEW_SCHEMA in body:
+                warnings.append(
+                    f"review decision: ignored, a decision must be in a ```{_DECISION_LANG} fence, "
+                    f"not ```{lang or '(none)'}")
             continue
         fenced_lines.update(indexes)
         if not closed:
@@ -964,6 +1157,14 @@ def extract(output):
     # its own words: a payload saying review_verdict PASS beside a written
     # rejection is a contradiction, not an approval. This can only ever remove a
     # claim, which is why a heuristic is allowed to do it.
+    # Decisions the reviewer announced in prose. Carried on the result rather
+    # than folded into a fact, because they are not a claim ADM reasons over:
+    # contracts.review_authority consults them, and only to withdraw. They are
+    # read from the same widened region as the withdrawal rules below -- a
+    # reviewer does not get to hide its own decision inside a fence.
+    if role == v.REVIEWER:
+        result["decision_statements"] = decision_statements(written)
+
     token = _CONTRARY_TOKEN.search(written)
     contrary = rejection_signal(written) or (token.group(0) if token else None)
     if contrary:

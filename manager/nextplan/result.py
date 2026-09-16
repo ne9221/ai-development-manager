@@ -163,7 +163,7 @@ def normalized_schema():
         "type": "object",
         "additionalProperties": False,
         "required": ["contract", "event_id", "task_id", "role", "extraction", "facts", "evidence", "blockers",
-                     "warnings", "findings", "decisions"],
+                     "warnings", "findings", "decisions", "decision_statements"],
         "properties": {
             "contract": {"const": CONTRACT},
             "event_id": {"type": "string", "minLength": 1},
@@ -191,6 +191,17 @@ def normalized_schema():
             # a claim -- manager.nextplan.contracts.review_authority decides it
             # against ADM's own dispatch record, and only there.
             "decisions": {"type": "array", "items": {"type": "object"}},
+            # Decisions the reviewer announced in prose (extract.decision_statements).
+            # Also not a fact, and for the opposite reason to `decisions`: these
+            # carry no authority at all. review_authority reads them only to turn
+            # an otherwise-authorizing PASS into a CONFLICT, never to grant one.
+            "decision_statements": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": False,
+                          "required": ["raw", "polarity"],
+                          "properties": {"raw": {"type": "string"},
+                                         "polarity": {"enum": ["reject", "approve", "unreadable"]}}},
+            },
         },
     }
 
@@ -221,6 +232,7 @@ def blank_result(event_id, task_id, role, tier="none", raw_sha256="0" * 64):
         "extraction": {"tier": tier, "signals": [], "raw_sha256": raw_sha256, "warnings": []},
         "facts": {field: unknown() for field in FACT_FIELDS},
         "evidence": [], "blockers": [], "warnings": [], "findings": [], "decisions": [],
+        "decision_statements": [],
     }
 
 

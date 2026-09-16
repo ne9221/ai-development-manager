@@ -35,6 +35,25 @@ harder to type than a forged sentence. What a forger cannot supply is the
 binding: a ``reviewer_run_id`` ADM handed out, for the exact SHA ADM is holding.
 ``review_authority`` checks the object against ADM's own dispatch record, and
 with no such record on file **nothing can authorize**.
+
+Round 6 closes two ways a *correctly bound* PASS still decided on its own.
+
+The first is the asymmetry above being stated but not implemented. Round 5's
+withdrawal ran over the ``review_verdict`` **fact**, which a bound decision does
+not go through, so a reviewer could return a bound ``PASS`` with empty
+``findings`` and write ``Current decision: reject`` beside it and still complete.
+The rule now lives here, where authority is decided, and it reads *decision
+shape* rather than rejection vocabulary: a second explicit decision statement
+that contradicts the object makes the pair a CONFLICT. Extending the vocabulary
+is the move that failed in Rounds 2, 3 and 4 and is not attempted; an
+unmappable value in an unambiguous decision field is a conflict too, because
+"we could not read your decision" is not "you did not decide".
+
+The second is ``additionalProperties: true``. A schema-valid PASS could carry
+``blocking: true`` or ``required_action: "repair"`` and be waved through,
+because the validator only ever looked at the keys it knew. The object is now
+closed: an unknown key in a decision is INVALID, since the one thing ADM cannot
+do with a field it does not understand is be sure it was not the decision.
 """
 
 from __future__ import annotations
@@ -64,6 +83,24 @@ _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _SEVERITIES = ("blocking", "high", "medium", "low", "info")
 _NON_BLOCKING = frozenset({"low", "info"})
 
+# The decision object is closed. Round 5 left it open on a forward-compatibility
+# argument, and the independent review answered it: ``verdict: PASS`` plus
+# ``blocking: true`` (or ``required_action: "repair"``, or ``can_merge: false``)
+# validated and completed, because an unknown key was silently dropped. Dropping
+# a key is only safe when the key cannot have been decision-bearing, and nothing
+# about an unknown key says that. An additive extension therefore has to be
+# added here -- which is the point: extending the contract is a reviewed change,
+# not something an agent does by typing a new field name.
+_REVIEW_KEYS = frozenset({"schema", "verdict", "target_sha", "reviewer_run_id", "findings",
+                          "provenance", "summary"})
+_PROVENANCE_KEYS = frozenset({"provider", "job_id", "mode"})
+_FINDING_KEYS = frozenset({"summary", "severity", "file", "line"})
+
+# How a decision statement in the same message relates to the object.
+STATEMENT_REJECT = "reject"
+STATEMENT_APPROVE = "approve"
+STATEMENT_UNREADABLE = "unreadable"
+
 
 def _text(value):
     return value if isinstance(value, str) else None
@@ -89,6 +126,13 @@ def review_problems(block):
     problems = []
     if block.get("schema") != REVIEW_SCHEMA:
         problems.append(f"schema is {block.get('schema')!r}, not {REVIEW_SCHEMA!r}")
+
+    # Unknown keys are refused rather than ignored. ``blocking: true`` beside a
+    # PASS is not a harmless annotation; it is a second decision in a field ADM
+    # has no rule for, and the only honest reading of a field with no rule is
+    # that the decision cannot be settled.
+    for key in sorted(set(block) - _REVIEW_KEYS):
+        problems.append(f"unknown field {key!r}: a decision may not carry fields this contract does not define")
 
     # An absent verdict, an empty one and an unrecognised one are all *invalid*,
     # and deliberately not silence. Round 4 let "Current decision: reject" and a
@@ -123,6 +167,8 @@ def review_problems(block):
             severity = finding.get("severity")
             if severity is not None and severity not in _SEVERITIES:
                 problems.append(f"findings[{index}] severity {severity!r} is unknown")
+            for key in sorted(set(finding) - _FINDING_KEYS):
+                problems.append(f"findings[{index}] has unknown field {key!r}")
 
     provenance = block.get("provenance")
     if not isinstance(provenance, dict):
@@ -133,6 +179,8 @@ def review_problems(block):
                 problems.append(f"provenance.{field} {provenance.get(field)!r} is not an identifier")
         if provenance.get("mode") not in REVIEW_MODES:
             problems.append(f"provenance.mode {provenance.get('mode')!r} is not one of {list(REVIEW_MODES)}")
+        for key in sorted(set(provenance) - _PROVENANCE_KEYS):
+            problems.append(f"provenance has unknown field {key!r}")
     return problems
 
 
@@ -180,7 +228,7 @@ def _binding_problems(block, expectation):
     return problems, True
 
 
-def review_authority(decisions, expectation):
+def review_authority(decisions, expectation, statements=()):
     """Does this reviewer output authorize completing ``expectation``'s target?
 
     Returns ``{authorized, blocked, verdict, problems, considered}``.
@@ -198,6 +246,15 @@ def review_authority(decisions, expectation):
       any task;
     * a decision for another SHA is irrelevant: it neither authorizes nor blocks;
     * no decision at all never authorizes.
+
+    ``statements`` (Round 6) are the *decision-shaped* things the same reviewer
+    wrote in prose, as ``extract.decision_statements`` read them. They obey the
+    same asymmetry as every other prose rule here, and it is enforced rather
+    than merely documented: a contradicting or unreadable statement turns an
+    otherwise-authorizing PASS into a CONFLICT, and nothing in the list can
+    create, upgrade or unblock authority. A reviewer that returns ``PASS`` and
+    then writes ``Current decision: reject`` has not approved anything; it has
+    told ADM two different things, and two different things are not consent.
     """
     problems, verdicts, considered, invalid = [], set(), 0, False
     for index, block in enumerate(decisions or ()):
@@ -225,6 +282,20 @@ def review_authority(decisions, expectation):
         return {"authorized": False, "blocked": True, "verdict": None, "reason": INVALID,
                 "problems": problems or ["an invalid reviewer decision was returned"], "considered": considered}
     if verdicts == {"PASS"}:
+        # The object says PASS. Before that is authority, the reviewer must not
+        # also have said something else -- and only here, where a PASS already
+        # exists, do statements get consulted at all. A statement beside no
+        # object is still nothing: it cannot grant, and it is not allowed to
+        # block either, or a forged "Decision: reject" would stall any task.
+        contradictions = [s for s in (statements or ())
+                          if s.get("polarity") in (STATEMENT_REJECT, STATEMENT_UNREADABLE)]
+        if contradictions:
+            return {"authorized": False, "blocked": True, "verdict": None, "reason": CONFLICT,
+                    "problems": problems + [
+                        f"decision PASS, but the same reviewer also stated {s['raw']!r}"
+                        f"{'' if s['polarity'] == STATEMENT_REJECT else ' (a decision field ADM cannot read)'}"
+                        for s in contradictions],
+                    "considered": considered}
         return {"authorized": True, "blocked": False, "verdict": "PASS", "reason": AUTHORIZED,
                 "problems": problems, "considered": considered}
     if "REJECT" in verdicts:

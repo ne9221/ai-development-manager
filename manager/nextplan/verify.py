@@ -32,6 +32,7 @@ import subprocess
 
 from manager.nextplan import contracts
 from manager.nextplan import result as r
+from manager.nextplan import runner as runner_mod
 from manager.nextplan import vocabulary as v
 
 # Facts whose contradiction means the agent claimed success that is not true.
@@ -379,15 +380,56 @@ def is_test_step(test):
     return is_test_command((test or {}).get("command"))
 
 
-def adm_test_evidence(execution):
+def _registry_problems(block, record, expected_task, expected_run):
+    """Why this record is not ADM's own execution. Empty means it is."""
+    if record is None:
+        return [f"execution_id {block.get('execution_id')!r} is not in ADM's execution registry; "
+                "no such run was ever issued"]
+    problems = []
+    if not record.get("issued_by_adm"):
+        problems.append("registry entry was not issued by ADM")
+    if expected_task is not None and record.get("task_id") != expected_task:
+        problems.append(f"execution belongs to task {record.get('task_id')!r}, not {expected_task!r}")
+    if expected_run is not None and record.get("run_id") != expected_run:
+        problems.append(f"execution belongs to run {record.get('run_id')!r}, not {expected_run!r}")
+    if record.get("started") is not True:
+        problems.append("the registered process never started")
+    argv = block.get("argv")
+    if isinstance(argv, list) and record.get("argv_sha256") != runner_mod.argv_digest(argv):
+        problems.append("the reported argv is not the argv ADM spawned for this execution")
+    # The record may carry its own copy of the artifact digest. It is never the
+    # source -- the registry's is -- but a copy that disagrees means the record
+    # is describing a different artifact, and a disagreement is not resolved in
+    # the record's favour.
+    claimed_artifact = block.get("artifact_sha256")
+    if claimed_artifact is not None and claimed_artifact != record.get("artifact_sha256"):
+        problems.append("the reported artifact digest is not the artifact ADM read")
+    if record.get("artifact_sha256") is None:
+        problems.append("no validation artifact was produced by this execution")
+    return problems
+
+
+def adm_test_evidence(execution, registry=None, task_id=None, run_id=None):
     """Adapt ADM's own recorded validation runs to test evidence.
 
     Two kinds of record can appear, and only one of them can produce counts.
 
     ``validation_results`` holds ``adm-validation-result/v1`` objects, each
     written by a runner adapter that spawned an argv list and read the runner's
-    own structured report (manager.nextplan.runner). Its counts belong to that
-    ``execution_id``, so they are admissible.
+    own structured report (manager.nextplan.runner).
+
+    A well-shaped object is still only a *reference*. ``registry`` is ADM's
+    :class:`~manager.nextplan.runner.ExecutionRegistry`, and the counts are
+    taken from the entry it holds for that ``execution_id`` -- never from the
+    object, whose ``tests`` field is not read at all. Round 5 read it, and Grok's
+    independent review obtained ``VERIFIED tests_run=999`` from a hand-written
+    block naming ``exec-forged``. Fabricated numbers are now inert because they
+    are not consulted, and a fabricated ``execution_id`` finds no entry, which
+    yields no counts rather than any.
+
+    Passing no registry means ADM cannot show it started anything, so nothing
+    here produces counts. That is the fail-closed reading and the correct one:
+    the absence of a record is not evidence of a run.
 
     ``tests`` holds the legacy shell-string records: a command line, an exit
     code, and whatever the command printed. **These can never yield counts.**
@@ -404,22 +446,38 @@ def adm_test_evidence(execution):
     runs = []
     for block in evidence.get("validation_results", []):
         problems = contracts.validation_problems(block)
+        record = registry.lookup(block.get("execution_id")) if (registry and isinstance(block, dict)) else None
+        if registry is None:
+            problems = problems + ["ADM holds no execution registry for this task; nothing can be bound to a run"]
+        elif isinstance(block, dict):
+            problems = problems + _registry_problems(block, record, task_id, run_id)
+        bound = record if not problems else None
         run = {"execution_id": block.get("execution_id") if isinstance(block, dict) else None,
                "argv": block.get("argv") if isinstance(block, dict) else None,
                "runner": block.get("runner") if isinstance(block, dict) else None,
-               "exit_code": block.get("exit_code") if isinstance(block, dict) else None,
-               "timed_out": bool(block.get("timed_out")) if isinstance(block, dict) else True,
-               "structured": not problems, "problems": problems}
-        counts = contracts.validation_counts(block) if not problems else None
-        if counts:
-            run.update(passed=counts["passed"], failed=counts["failed"], skipped=counts["skipped"])
+               # Exit status, like the counts, is read from ADM's own entry once
+               # there is one: a record may not report a green exit for a run
+               # the registry saw fail.
+               "exit_code": (bound or block if isinstance(block, dict) else {}).get("exit_code"),
+               "timed_out": bool((bound or block if isinstance(block, dict) else {}).get("timed_out", True)),
+               "structured": not problems, "bound": not problems,
+               # An unbound block's exit code is the agent's word, not ADM's.
+               "exit_observed": not problems, "problems": problems}
+        counts = bound.get("counts") if bound else None
+        if isinstance(counts, dict):
+            run.update(passed=counts.get("passed"), failed=counts.get("failed"), skipped=counts.get("skipped"))
         runs.append(run)
     for test in evidence.get("tests", []):
         # Legacy record: exit status only, by construction. `test_step` is kept
         # for human explanation and is deliberately not consulted for counts.
         runs.append({"command": test.get("command"), "exit_code": test.get("exit_code"),
                      "timed_out": bool(test.get("timed_out")), "test_step": is_test_step(test),
-                     "structured": False,
+                     "structured": False, "bound": False,
+                     # ADM spawned this command itself, so the exit status IS an
+                     # observation. It is only the *counts* this record cannot
+                     # carry. Round 6 tightened the binding required for counts;
+                     # it did not take away the one fact a legacy record proves.
+                     "exit_observed": True,
                      "problems": ["legacy shell-string record: output cannot be bound to a test process"]})
     return {"source": "adm_run", "runs": runs} if runs else None
 
@@ -445,9 +503,15 @@ class TestEvidenceProbe:
         # happened to be printed. One unbound record in the set withholds all
         # counts -- a total assembled partly from unbound output is not a
         # measurement of anything.
-        counted = all(run.get("execution_id") and run.get("argv")
+        counted = all(run.get("bound") and run.get("execution_id") and run.get("argv")
                       and isinstance(run.get("passed"), int) and isinstance(run.get("failed"), int)
                       for run in runs)
+        # A run whose exit status ADM did not observe cannot stand in for counts
+        # either. Round 6: a forged validation block claiming exit 0 previously
+        # still produced "tests_failed VERIFIED 0" on the strength of its own
+        # say-so. A legacy record is different -- ADM spawned that command, so
+        # the exit code is genuinely an observation.
+        unbound = any(not run.get("exit_observed") for run in runs)
         if counted:
             observed = {
                 "tests_passed": sum(run["passed"] for run in runs),
@@ -460,9 +524,11 @@ class TestEvidenceProbe:
                 claimed = r.get(result, field)
                 if claimed["source"].startswith("agent:") and claimed["value"] is not None and claimed["value"] != value:
                     signals.add("verify.tests.count_mismatch")
-        elif not failed_run:
+        elif not failed_run and not unbound:
             add("tests_failed", v.VERIFIED, 0, detail="every recorded run exited 0")
-        elif r.value(result, "tests_failed") == 0:
+        elif failed_run and r.value(result, "tests_failed") == 0:
+            # Only an *observed* failure contradicts a zero. "We could not bind
+            # this run" is not "this run failed".
             add("tests_failed", v.CONTRADICTED, None, detail="a recorded run failed")
         if failed_run:
             signals.add("verify.tests.failed")

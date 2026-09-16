@@ -66,7 +66,12 @@ def validated(passed=12, failed=0, skipped=0, exit_code=0):
 def worker_evidence(execution):
     """Worker facts verified by ADM's recorded run, with no test claims of its own."""
     bare = h.worker_result(verified=True, drop=("tests_run", "tests_passed", "tests_failed"))
-    verified, _ = verify(bare, {"test_evidence": adm_test_evidence(execution)}, [TestEvidenceProbe()])
+    # Round 6: counts come from ADM's execution registry, so a fixture standing
+    # for a genuine run has to supply the entry ADM would hold for it. A fixture
+    # standing for a forgery simply does not (see the registry groups below).
+    evidence = adm_test_evidence(execution, registry=h.registry_for(execution),
+                                 task_id=h.TASK_ID, run_id=h.RUN_ID)
+    verified, _ = verify(bare, {"test_evidence": evidence}, [TestEvidenceProbe()])
     return verified
 
 

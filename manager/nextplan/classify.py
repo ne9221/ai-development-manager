@@ -130,7 +130,8 @@ def review_proof(result, review_context):
     """
     context = review_context or {}
     session = context.get("reviewer_session")
-    authority = contracts.review_authority(result.get("decisions") or (), review_expectation(context))
+    authority = contracts.review_authority(result.get("decisions") or (), review_expectation(context),
+                                           result.get("decision_statements") or ())
     return [
         {"requirement": "a bound reviewer decision authorizes this candidate",
          "ok": authority["authorized"], "reason": authority["reason"], "problems": authority["problems"]},

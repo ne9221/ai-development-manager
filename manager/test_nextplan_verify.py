@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from manager.nextplan import harness as h
 from manager.nextplan import result as r
 from manager.nextplan import vocabulary as v
 from manager.nextplan.classify import completion_proof
@@ -248,7 +249,8 @@ class ExecutionRecordProbeTests(unittest.TestCase):
             self.assertEqual(v.VERIFIED, r.level(verified, field), field)
 
     def test_adm_validation_runs_become_test_evidence(self):
-        evidence = adm_test_evidence(self.EXECUTION)
+        evidence = adm_test_evidence(self.EXECUTION, registry=h.registry_for(self.EXECUTION),
+                                     task_id=h.TASK_ID, run_id=h.RUN_ID)
         self.assertEqual("adm_run", evidence["source"])
         verified, _ = verify(claims(tests_failed=0), {"test_evidence": evidence}, [TestEvidenceProbe()])
         self.assertEqual((0, v.VERIFIED), (r.value(verified, "tests_failed"), r.level(verified, "tests_failed")))
@@ -269,8 +271,13 @@ class TestEvidenceProbeTests(unittest.TestCase):
         # fixture now carries the execution identity a runner adapter records.
         # The assertion below is unchanged -- 9 observed against 12 claimed is
         # still a hallucinated result.
+        # `bound`/`exit_observed` are what adm_test_evidence sets once a record
+        # matched ADM's execution registry (Round 6). Stating them here is this
+        # fixture saying "assume the provenance check passed"; the assertion
+        # under test is about counts disagreeing, not about provenance.
         evidence = {"source": "artifact", "runs": [{"execution_id": "exec-1", "argv": ["pytest"],
-                                                    "exit_code": 0, "passed": 9, "failed": 0}]}
+                                                    "exit_code": 0, "passed": 9, "failed": 0,
+                                                    "bound": True, "exit_observed": True}]}
         verified, report = verify(claims(tests_passed=12, tests_failed=0), {"test_evidence": evidence}, [TestEvidenceProbe()])
         self.assertEqual(v.CONTRADICTED, r.level(verified, "tests_passed"))
         self.assertIn("verify.tests.count_mismatch", report["signals"])

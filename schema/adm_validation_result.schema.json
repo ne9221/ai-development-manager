@@ -1,10 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ADM validation execution (adm-validation-result/v1)",
-  "description": "The record of ONE test execution ADM spawned, and the only source of VERIFIED test counts. Produced by a runner adapter (manager/nextplan/runner.py), never by parsing a command's stdout: the adapter spawns an argv list with shell=False and reads the counts from the structured report the runner itself wrote. Codex demonstrated why, by running `echo documentation; pytest & echo ===== 12 passed in 3.10s =====` through ADM's validation path and obtaining VERIFIED tests_run=12 and a completed task. Legacy shell-string records still carry an exit code but can never carry counts.",
+  "description": "The record of ONE test execution ADM spawned, and the only source of VERIFIED test counts. Produced by a runner adapter (manager/nextplan/runner.py), never by parsing a command's stdout: the adapter spawns an argv list with shell=False and reads the counts from the structured report the runner itself wrote. Codex demonstrated why, by running `echo documentation; pytest & echo ===== 12 passed in 3.10s =====` through ADM's validation path and obtaining VERIFIED tests_run=12 and a completed task. Legacy shell-string records still carry an exit code but can never carry counts. Round 6: this object is only a REFERENCE to an execution. Counts are read from ADM's own ExecutionRegistry entry for execution_id -- the `tests` field below is not consulted by the consumer at all -- because Grok obtained VERIFIED tests_run=999 from a hand-written block naming exec-forged, with nothing spawned. An execution_id ADM never issued has no entry, and therefore no counts.",
   "type": "object",
   "additionalProperties": true,
-  "required": ["schema", "execution_id", "argv", "runner", "started", "exit_code"],
+  "required": [
+    "schema",
+    "execution_id",
+    "argv",
+    "runner",
+    "started",
+    "exit_code"
+  ],
   "properties": {
     "schema": {
       "const": "adm-validation-result/v1"
@@ -17,7 +24,9 @@
     "argv": {
       "type": "array",
       "minItems": 1,
-      "items": {"type": "string"},
+      "items": {
+        "type": "string"
+      },
       "description": "The argument vector actually spawned. Never a shell string: a shell string is the shape in which a printed argument and an executed program are indistinguishable."
     },
     "runner": {
@@ -33,19 +42,36 @@
       "type": "integer",
       "description": "The spawned process's exit status."
     },
-    "timed_out": {"type": "boolean"},
+    "timed_out": {
+      "type": "boolean"
+    },
     "tests": {
-      "description": "Counts read from the runner's own structured report. null is the honest value when no report was produced -- the run is recorded, the numbers are not invented, and the completion proof fails for want of evidence rather than passing by omission.",
+      "description": "Counts read from the runner's own structured report. null is the honest value when no report was produced -- the run is recorded, the numbers are not invented, and the completion proof fails for want of evidence rather than passing by omission. Since Round 6 this is the adapter's own copy for the audit trail; the consumer reads the registry, so a fabricated number here is inert rather than disbelieved.",
       "oneOf": [
-        {"type": "null"},
+        {
+          "type": "null"
+        },
         {
           "type": "object",
           "additionalProperties": true,
-          "required": ["passed", "failed", "skipped"],
+          "required": [
+            "passed",
+            "failed",
+            "skipped"
+          ],
           "properties": {
-            "passed": {"type": "integer", "minimum": 0},
-            "failed": {"type": "integer", "minimum": 0},
-            "skipped": {"type": "integer", "minimum": 0}
+            "passed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "failed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "skipped": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         }
       ]
@@ -53,6 +79,11 @@
     "output_summary": {
       "type": "string",
       "description": "Bounded stdout+stderr, for humans reading the audit trail. Deliberately NOT a source of counts."
+    },
+    "artifact_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Optional. The digest of the runner's structured report. Never the source -- the registry's own digest is -- but a copy that disagrees means the record describes a different artifact, and the disagreement is not resolved in the record's favour."
     }
   }
 }

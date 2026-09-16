@@ -40,16 +40,61 @@ def review_decision(verdict="PASS", target=HEAD, reviewer_run_id=REVIEWER_RUN, f
             "provenance": {"provider": provider, "job_id": job_id, "mode": mode}}
 
 
+TASK_ID = "t-1"
+RUN_ID = "run-1"
+
+
 def validation_result(passed=12, failed=0, skipped=0, exit_code=0, execution_id="exec-1",
                       argv=("python", "-m", "pytest", "-q"), runner="pytest", counts=True, timed_out=False):
     """One ``adm-validation-result/v1`` as a runner adapter would return it.
 
     ``counts=False`` is the honest shape for a run whose structured report never
     arrived: the process is recorded, the numbers are not invented.
+
+    On its own this is only a *reference* to an execution, and since Round 6 a
+    reference with no matching registry entry proves nothing. Pair it with
+    :func:`execution_registry` for a fixture that stands for a run ADM really
+    started; leave the registry out for one that stands for a forgery.
     """
     return {"schema": contracts.VALIDATION_SCHEMA, "execution_id": execution_id, "argv": list(argv),
             "runner": runner, "started": True, "exit_code": exit_code, "timed_out": timed_out,
             "tests": {"passed": passed, "failed": failed, "skipped": skipped} if counts else None}
+
+
+def execution_registry(blocks=(), task_id=TASK_ID, run_id=RUN_ID):
+    """ADM's registry, as it would look having itself spawned ``blocks``.
+
+    This plays ADM's side, not the agent's: it records, for each block, what a
+    runner adapter would have observed. The counts a consumer later reads come
+    from here -- so a fixture that wants a forgery simply omits its block from
+    the registry, or registers different numbers, rather than editing the block.
+    """
+    from manager.nextplan import runner as runner_mod
+
+    registry = runner_mod.ExecutionRegistry(task_id=task_id, run_id=run_id)
+    for block in blocks:
+        entry = registry.issue(block["argv"], task_id=task_id, run_id=run_id)
+        # The adapter mints the id; a fixture states it, so adopt the stated one.
+        registry.records.pop(entry["execution_id"])
+        entry["execution_id"] = block["execution_id"]
+        registry.records[block["execution_id"]] = entry
+        registry.complete(block["execution_id"], started=bool(block.get("started")),
+                          exit_code=block.get("exit_code"), timed_out=bool(block.get("timed_out")),
+                          artifact_path="/adm/validation/report.xml",
+                          artifact_sha256=None if block.get("tests") is None else "0" * 64,
+                          counts=block.get("tests"))
+    return registry
+
+
+def registry_for(execution, task_id=TASK_ID, run_id=RUN_ID):
+    """The registry ADM would hold, had it spawned everything ``execution`` records.
+
+    The convenience form of :func:`execution_registry` for fixtures that already
+    have an execution record in hand.
+    """
+    blocks = ((execution or {}).get("repo_write_evidence") or {}).get("validation_results") or ()
+    return execution_registry([b for b in blocks if isinstance(b, dict) and b.get("argv")],
+                              task_id=task_id, run_id=run_id)
 
 
 def _git_facts(head, verified):

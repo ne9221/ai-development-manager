@@ -254,7 +254,9 @@ class GroupATestEvidenceProvenance(unittest.TestCase):
         # And the original claim, on the channel that can now carry counts: a run
         # that genuinely executed zero tests is VERIFIED at zero, and zero still
         # does not prove that tests ran.
-        verified, _ = verify(bare, {"test_evidence": adm_test_evidence(validated(passed=0))}, [TestEvidenceProbe()])
+        zero = validated(passed=0)
+        verified, _ = verify(bare, {"test_evidence": adm_test_evidence(
+            zero, registry=h.registry_for(zero), task_id=h.TASK_ID, run_id=h.RUN_ID)}, [TestEvidenceProbe()])
         self.assertEqual((0, v.VERIFIED), (r.value(verified, "tests_run"), r.level(verified, "tests_run")))
         proof = completion_proof(verified, {})
         ran = next(item for item in proof if "actually ran" in item["requirement"])

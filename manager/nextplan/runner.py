@@ -30,13 +30,37 @@ help page, or any amount of convincing text. The counts exist only if a test
 runner produced them, and they are stamped with the ``execution_id`` of the run
 that produced them, so they cannot later be attributed to a different execution.
 
+Round 6 closes what that left open. Round 5 built a *producer* that could not be
+fooled and a *consumer* that never checked whether the producer had run: the
+consumer validated the record's shape, saw an ``execution_id`` and an ``argv``,
+and believed the counts. Grok's independent review typed this by hand::
+
+    {"schema": "adm-validation-result/v1", "execution_id": "exec-forged",
+     "argv": ["python", "-m", "pytest"], "started": true, "exit_code": 0,
+     "tests": {"passed": 999, "failed": 0, "skipped": 0}}
+
+and obtained ``VERIFIED tests_run=999`` and MARK_COMPLETE, without anything
+being spawned. Shape had been made to stand in for provenance, which is the
+Round-2 defect in a JSON costume.
+
+So an execution now has to be one ADM itself issued. ``ExecutionRegistry`` mints
+the ``execution_id`` *before* the spawn, binds it to the task and run that asked
+for it, and records what the adapter observed: the argv digest, the artifact
+path and the digest of the artifact bytes the adapter read. A returned record is
+only a *reference* to one of those entries -- **the counts are read from the
+registry, never from the record** -- so fabricating numbers achieves nothing:
+they are not consulted. Fabricating an ``execution_id`` achieves nothing either,
+because ADM never issued it, and with no entry on file there are no counts at
+all.
+
 This is deliberately *not* wired into ``manager/repo_write_enforcement.py``.
-Round 5 builds the evidence path and the gate that consumes it; activating it in
-the live write path is a separate, reviewed change.
+Rounds 5 and 6 build the evidence path and the gate that consumes it; activating
+it in the live write path is a separate, reviewed change.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
@@ -60,6 +84,66 @@ _INTERPRETERS = re.compile(r"^(?:python[\d.]*|py|pypy[\d.]*)$")
 
 class ValidationRunError(ValueError):
     """The caller asked for something that cannot produce bound evidence."""
+
+
+def argv_digest(argv):
+    """A stable digest of one argument vector."""
+    return hashlib.sha256("\x00".join(str(token) for token in argv).encode("utf-8")).hexdigest()
+
+
+def _file_digest(path):
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+class ExecutionRegistry:
+    """ADM's own record of the validation runs it started.
+
+    This is the thing a worker cannot write into. Every entry is minted by
+    :meth:`issue` *before* a process exists, so an ``execution_id`` is a
+    capability ADM handed out rather than a string an agent chose; and every
+    entry is completed by the adapter that did the spawning, from what it
+    observed rather than from what anyone reported.
+
+    Deliberately small, and deliberately not a service. It is a plain dict of
+    records, so ADM can keep it inside the task/run state it already persists --
+    the security property comes from *who writes it*, not from where it lives.
+    A registry that outlived its task would only widen the window in which a
+    stale ``execution_id`` is still honoured.
+    """
+
+    def __init__(self, task_id=None, run_id=None, records=None):
+        self.task_id = task_id
+        self.run_id = run_id
+        self.records = dict(records or {})
+
+    def issue(self, argv, task_id=None, run_id=None):
+        """Mint an execution identity for ``argv``, before anything is spawned."""
+        execution_id = f"exec-{uuid.uuid4().hex}"
+        self.records[execution_id] = {
+            "execution_id": execution_id,
+            "task_id": task_id if task_id is not None else self.task_id,
+            "run_id": run_id if run_id is not None else self.run_id,
+            "argv_sha256": argv_digest(argv),
+            "nonce": uuid.uuid4().hex,
+            "issued_by_adm": True,
+            "started": False, "exit_code": None, "timed_out": False,
+            "artifact_path": None, "artifact_sha256": None, "counts": None,
+        }
+        return self.records[execution_id]
+
+    def complete(self, execution_id, **observed):
+        """Record what the adapter observed. Only known fields are writable."""
+        record = self.records[execution_id]
+        for field in ("started", "exit_code", "timed_out", "artifact_path", "artifact_sha256", "counts"):
+            if field in observed:
+                record[field] = observed[field]
+        return record
+
+    def lookup(self, execution_id):
+        return self.records.get(execution_id) if isinstance(execution_id, str) else None
 
 
 def _program_of(argv):
@@ -115,12 +199,20 @@ def parse_junit_xml(path):
     return {"passed": passed, "failed": failures + errors, "skipped": skipped}
 
 
-def run_validation(argv, cwd, runner="pytest", timeout_seconds=DEFAULT_TIMEOUT_SECONDS, spawn=subprocess.run):
+def run_validation(argv, cwd, runner="pytest", timeout_seconds=DEFAULT_TIMEOUT_SECONDS, spawn=subprocess.run,
+                   registry=None, task_id=None, run_id=None):
     """Spawn ``argv`` and return one ``adm-validation-result/v1``.
 
     ``argv`` must be a list. Passing a shell string raises rather than quietly
     degrading: a string is the shape that cannot carry provenance, and accepting
     one "just this once" is how the old path stayed exploitable.
+
+    ``registry`` is ADM's :class:`ExecutionRegistry`. When one is given the
+    execution identity is minted from it *before* the spawn and completed from
+    what this function observed, and that entry -- not the returned record -- is
+    what any consumer is allowed to read counts from. Calling without a registry
+    still runs the process honestly; the result simply has nothing to bind to
+    and can never become VERIFIED evidence.
     """
     if isinstance(argv, str) or not isinstance(argv, (list, tuple)) or not argv:
         raise ValidationRunError("argv must be a non-empty list; a shell command string cannot be bound to a process")
@@ -132,33 +224,48 @@ def run_validation(argv, cwd, runner="pytest", timeout_seconds=DEFAULT_TIMEOUT_S
     if program not in accepted:
         raise ValidationRunError(f"argv runs {program!r}, which is not {runner!r}")
 
-    execution_id = f"exec-{uuid.uuid4().hex}"
     with tempfile.TemporaryDirectory(prefix="adm-validation-") as workspace:
-        report = Path(workspace) / "report.xml"
+        # A nonce in the filename, in a directory this call created: the report
+        # ADM reads cannot be a file that was lying there beforehand, and the
+        # pre-existence check below is cheap enough to keep as a hard assertion
+        # rather than an assumption about tempfile.
+        report = Path(workspace) / f"report-{uuid.uuid4().hex}.xml"
+        if report.exists():
+            raise ValidationRunError("the validation report path already exists; refusing to read a pre-existing artifact")
         # -p no:cacheprovider keeps the run from writing into the checkout.
         full_argv = [*argv, f"--junitxml={report}", "-p", "no:cacheprovider"]
+        entry = (registry.issue(full_argv, task_id=task_id, run_id=run_id) if registry is not None
+                 else {"execution_id": f"exec-{uuid.uuid4().hex}"})
+        execution_id = entry["execution_id"]
         record = {
             "schema": VALIDATION_SCHEMA, "execution_id": execution_id, "argv": full_argv,
             "runner": runner, "started": False, "exit_code": None,
             "tests": None, "timed_out": False, "output_summary": "",
         }
+
+        def finish(**observed):
+            record.update({k: x for k, x in observed.items() if k in record})
+            if registry is not None:
+                registry.complete(execution_id, started=record["started"], exit_code=record["exit_code"],
+                                  timed_out=record["timed_out"], artifact_path=str(report),
+                                  artifact_sha256=observed.get("artifact_sha256"),
+                                  counts=record["tests"])
+            return record
+
         try:
             completed = spawn(full_argv, cwd=str(cwd), shell=False, text=True, encoding="utf-8",
                               errors="replace", capture_output=True, timeout=timeout_seconds)
         except subprocess.TimeoutExpired as exc:
             output = (exc.stdout or "") + (exc.stderr or "") if isinstance(exc.stdout, str) else ""
-            record.update(started=True, timed_out=True, output_summary=output[-MAX_OUTPUT_CHARS:])
-            return record
+            return finish(started=True, timed_out=True, output_summary=output[-MAX_OUTPUT_CHARS:])
         except (OSError, ValueError) as exc:
             # The process never started. `started: False` makes the record
             # invalid for evidence, which is the correct reading: nothing ran.
-            record.update(output_summary=f"validation runner could not be started: {exc}"[-MAX_OUTPUT_CHARS:])
-            return record
+            return finish(output_summary=f"validation runner could not be started: {exc}"[-MAX_OUTPUT_CHARS:])
         output = (completed.stdout or "") + (completed.stderr or "")
-        record.update(started=True, exit_code=completed.returncode,
+        return finish(started=True, exit_code=completed.returncode,
                       output_summary=output[-MAX_OUTPUT_CHARS:],
-                      tests=parse_junit_xml(report))
-        return record
+                      tests=parse_junit_xml(report), artifact_sha256=_file_digest(report))
 
 
 def pytest_argv(targets=(), extra=(), executable=None):

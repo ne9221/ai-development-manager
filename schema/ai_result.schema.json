@@ -15,7 +15,8 @@
     "blockers",
     "warnings",
     "findings",
-    "decisions"
+    "decisions",
+    "decision_statements"
   ],
   "properties": {
     "contract": {
@@ -1570,6 +1571,29 @@
       "type": "array",
       "items": {
         "type": "object"
+      }
+    },
+    "decision_statements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "raw",
+          "polarity"
+        ],
+        "properties": {
+          "raw": {
+            "type": "string"
+          },
+          "polarity": {
+            "enum": [
+              "reject",
+              "approve",
+              "unreadable"
+            ]
+          }
+        }
       }
     }
   }
