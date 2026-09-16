@@ -80,6 +80,13 @@ def semantic_problems(document, required_codes=REQUIRED_CODES):
         seen.add(code)
     for code in sorted(set(required_codes) - seen):
         problems.append(f"required failure_code missing: {code}")
+    owners = {}
+    for entry in document["entries"]:
+        for signal in entry["detection_signal"]:
+            if signal in owners and owners[signal] != entry["failure_code"]:
+                problems.append(f"detection signal {signal!r} belongs to both {owners[signal]} and "
+                                f"{entry['failure_code']}; a signal must classify to exactly one failure")
+            owners.setdefault(signal, entry["failure_code"])
 
     for entry in document["entries"]:
         code = entry["failure_code"]
