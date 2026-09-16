@@ -84,9 +84,29 @@ _VERDICT_WORDS = {"PASS": "PASS", "APPROVE": "PASS", "APPROVED": "PASS", "ACCEPT
 _NONE_WORDS = re.compile(r"^(none|n/?a|無|沒有|-|—)\.?$", re.I)
 
 _COUNT = re.compile(r"(\d+)\s+(passed|failed|skipped|errors?|xfailed|xpassed)\b")
-_PYTEST_SUMMARY = re.compile(r"^=+\s.*\b(?:passed|failed|errors?)\b.*\bin\s+[\d.]+s.*=+\s*$")
+
+_PYTEST_EQUAL_LINE = re.compile(
+    r"^=+\s*(?:short test summary info\s*=+\s*\n\s*)?(?P<counts>(?:\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected)(?:,\s*)?)+)(?:\s+in\s+[\d.]+s.*?)?\s*=+$",
+    re.I
+)
+_PYTEST_TIMED_LINE = re.compile(
+    r"^(?P<counts>\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected)(?:,\s*\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected))*)\s+in\s+[\d.]+s.*$",
+    re.I
+)
+_PYTEST_COMMA_LINE = re.compile(
+    r"^(?P<counts>\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected)(?:,\s*\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected))+)\s*$",
+    re.I
+)
+_PYTEST_SUMMARY = re.compile(
+    r"^=+\s*(?:short test summary info\s*=+\s*\n\s*)?(?:\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected)(?:,\s*)?)+(?:\s+in\s+[\d.]+s.*?)?\s*=+$",
+    re.I
+)
 _UNITTEST_RAN = re.compile(r"^Ran (\d+) tests? in [\d.]+s\s*$")
 _UNITTEST_FAILED = re.compile(r"^FAILED \((.*)\)\s*$")
+_UNITTEST_BLOCK = re.compile(
+    r"^Ran\s+(\d+)\s+tests?\s+in\s+[\d.]+s\s*\n+(OK(?:\s*\(.*?\))?|FAILED\s*\((.*?)\))\s*$",
+    re.MULTILINE
+)
 
 # -- heuristic vocabulary (constrained) ---------------------------------------------
 
@@ -104,8 +124,21 @@ _FAIL_PROSE = re.compile(r"\bfail(?:ed|ing|ure)?\b|失敗", re.I)
 # (common governance rule 10), and that must not withdraw an honest PASS. A
 # verdict-shaped REJECT is matched case-sensitively instead.
 _CONTRARY_VERDICT = re.compile(
-    r"changes[ _-]required|should not (?:ship|merge|land)|do not merge|\bnot ready\b|"
-    r"needs? (?:more|further) work|不應(?:該)?合併|尚未完成|還沒(?:有)?完成", re.I)
+    r"changes[ _-]required|"
+    r"should not (?:ship|merge|land)|"
+    r"do not merge|"
+    r"\bnot ready\b|"
+    r"needs? (?:more|further) work|"
+    r"\b(?:cannot|can't|do not|does not)\s+approve\b|"
+    r"\bwithhold(?:ing)?\s+approval\b|"
+    r"(?<!\bno\s)(?<!\bzero\s)(?<!\bwithout\s)\bblocking\s+(?:issues?|bugs?|findings?)\b|"
+    r"must be fixed (?:first|before\s+(?:it can|we can)?\s*(?:land|merge|ship))|"
+    r"(?:the\s+)?reviewer\s+rejects?\b|"
+    r"\breject(?:s|ed|ing)?\s+(?:this|the)\s+(?:implementation|PR|pull request|change|patch|commit|submission|work)\b|"
+    r"\bverdict\s*:\s*reject(?:ed)?\b|"
+    r"不應(?:該)?合併|尚未完成|還沒(?:有)?完成",
+    re.I
+)
 _CONTRARY_TOKEN = re.compile(r"\bREJECT(?:ED)?\b|\bCHANGES[ _]REQUIRED\b|\bDO NOT MERGE\b")
 
 
@@ -240,28 +273,63 @@ def test_counts(text):
     """Public: parse "N passed, N failed, N skipped" style counts out of text.
 
     Shared with manager.nextplan.verify so a test summary recorded by ADM is
-    read by exactly the same parser as one an agent quotes.
+    read by exactly the same parser as one an agent quotes. Requires runner-specific
+    anchored structure (pytest summary or unittest block) to reject non-test prose.
     """
     return _counts(text)
 
 
 def _counts(text):
-    found = {}
-    for number, word in _COUNT.findall(text):
-        word = "errors" if word.startswith("error") else word
-        found[word] = found.get(word, 0) + int(number)
-    if not found:
+    if not text or not isinstance(text, str):
         return {}
-    failed = found.get("failed", 0) + found.get("errors", 0)
-    counts = {"tests_passed": found.get("passed", 0), "tests_failed": failed}
-    if "skipped" in found:
-        counts["tests_skipped"] = found["skipped"]
-    return counts
+
+    # 1. Complete unittest block (Ran N tests in X.XXs followed by OK or FAILED)
+    m_unit = _UNITTEST_BLOCK.search(text)
+    if m_unit:
+        total = int(m_unit.group(1))
+        status_part = m_unit.group(2)
+        if status_part.startswith("OK"):
+            skipped = 0
+            m_skip = re.search(r"skipped=(\d+)", status_part)
+            if m_skip:
+                skipped = int(m_skip.group(1))
+            return {"tests_passed": total - skipped, "tests_failed": 0, "tests_skipped": skipped}
+        else:
+            nums = [int(n) for n in re.findall(r"(?:failures|errors)=(\d+)", status_part)]
+            failed = sum(nums)
+            skipped = 0
+            m_skip = re.search(r"skipped=(\d+)", status_part)
+            if m_skip:
+                skipped = int(m_skip.group(1))
+            return {"tests_passed": max(0, total - failed - skipped), "tests_failed": failed, "tests_skipped": skipped}
+
+    # 2. Pytest summary line (search bottom-up for runner-anchored structure)
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        m = (_PYTEST_EQUAL_LINE.match(stripped) or
+             _PYTEST_TIMED_LINE.match(stripped) or
+             _PYTEST_COMMA_LINE.match(stripped))
+        if m:
+            counts_str = m.group("counts")
+            found = {}
+            for number, word in _COUNT.findall(counts_str):
+                word = "errors" if word.startswith("error") else word
+                found[word] = found.get(word, 0) + int(number)
+            if not found:
+                continue
+            failed = found.get("failed", 0) + found.get("errors", 0)
+            counts = {"tests_passed": found.get("passed", 0), "tests_failed": failed}
+            if "skipped" in found:
+                counts["tests_skipped"] = found["skipped"]
+            return counts
+
+    return {}
 
 
 def _map_value(field, raw, role):
-    token = raw.strip().strip("*`").strip()
-    upper = token.upper().replace(" ", "_")
+    token = raw.strip().strip("*`_~\"'“”‘’").strip()
+    token = token.rstrip(".:;,!?。：；，！").strip()
+    upper = token.upper().replace(" ", "_").replace("-", "_")
     # Exact matches only. A prefix fallback used to collapse a hedge into a
     # clean verdict -- "PASS_WITH_CAVEATS" became PASS and
     # "APPROVED_WITH_COMMENTS" became a passing review. A qualified answer is
@@ -324,7 +392,9 @@ def _deterministic(lines, role, warnings, skip):
         if index in skip:
             continue
         stripped = line.strip()
-        if _PYTEST_SUMMARY.match(stripped):
+        if (_PYTEST_EQUAL_LINE.match(stripped) or
+                _PYTEST_TIMED_LINE.match(stripped) or
+                _PYTEST_COMMA_LINE.match(stripped)):
             for field, value in _counts(stripped).items():
                 add(field, value, index)
             continue

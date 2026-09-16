@@ -12,7 +12,7 @@ from manager.nextplan import harness as h
 from manager.nextplan import result as r
 from manager.nextplan import vocabulary as v
 from manager.nextplan.classify import completion_proof
-from manager.nextplan.extract import extract
+from manager.nextplan.extract import _map_value, extract
 from manager.nextplan.planner import new_task_state, plan
 from manager.nextplan.verify import TestEvidenceProbe, adm_test_evidence, verify
 
@@ -171,6 +171,173 @@ class FindingTwoQuotedPayloadBecomesTheVerdict(unittest.TestCase):
         got = extract({"event_id": "e", "task_id": "t-1", "role": v.WORKER, "format": "text", "content": content})
         self.assertEqual(v.UNKNOWN, r.level(got, "status"))
         self.assertIn("extract.conflicting_statements", got["extraction"]["signals"])
+
+
+class FindingARunnerAnchoredTestEvidence(unittest.TestCase):
+    """Remediation Round 2 Finding A: only recognized runner outputs yield verified test counts."""
+
+    def test_gate_passed_prose_cannot_produce_verified_test_counts(self):
+        evidence = adm_test_evidence(execution_with("Gate 3 passed. Environment looks sane.", command="bash scripts/verify_env.sh"))
+        self.assertNotIn("passed", evidence["runs"][0])
+        verified, _ = verify(h.worker_result(drop=("tests_run", "tests_passed", "tests_failed")),
+                             {"test_evidence": evidence}, [TestEvidenceProbe()])
+        self.assertEqual(v.UNKNOWN, r.level(verified, "tests_run"))
+        decision = plan(working(requirements=NO_REVIEW), h.event(verified))
+        self.assertNotEqual(v.MARK_COMPLETE, decision["action"])
+
+    def test_see_section_prose_cannot_produce_verified_test_counts(self):
+        evidence = adm_test_evidence(execution_with("See section 12 passed to the parser for details.", command="cat docs/USAGE.md"))
+        self.assertNotIn("passed", evidence["runs"][0])
+        verified, _ = verify(h.worker_result(drop=("tests_run", "tests_passed", "tests_failed")),
+                             {"test_evidence": evidence}, [TestEvidenceProbe()])
+        self.assertEqual(v.UNKNOWN, r.level(verified, "tests_run"))
+        decision = plan(working(requirements=NO_REVIEW), h.event(verified))
+        self.assertNotEqual(v.MARK_COMPLETE, decision["action"])
+
+    def test_example_summary_line_cannot_produce_verified_test_counts(self):
+        evidence = adm_test_evidence(execution_with("Example summary line: = 99 passed in 1.00s =", command="echo"))
+        self.assertNotIn("passed", evidence["runs"][0])
+        verified, _ = verify(h.worker_result(drop=("tests_run", "tests_passed", "tests_failed")),
+                             {"test_evidence": evidence}, [TestEvidenceProbe()])
+        self.assertEqual(v.UNKNOWN, r.level(verified, "tests_run"))
+        decision = plan(working(requirements=NO_REVIEW), h.event(verified))
+        self.assertNotEqual(v.MARK_COMPLETE, decision["action"])
+
+    def test_exit_zero_with_no_recognizable_runner_output_is_unknown(self):
+        for out in ("The migration passed validation.", "Step 5 failed to upload but retry succeeded.", "validation ok"):
+            with self.subTest(out):
+                evidence = adm_test_evidence(execution_with(out, command="bash run.sh", exit_code=0))
+                self.assertNotIn("passed", evidence["runs"][0])
+                verified, _ = verify(h.worker_result(drop=("tests_run", "tests_passed", "tests_failed")),
+                                     {"test_evidence": evidence}, [TestEvidenceProbe()])
+                self.assertEqual(v.UNKNOWN, r.level(verified, "tests_run"))
+                self.assertNotEqual(v.MARK_COMPLETE, plan(working(requirements=NO_REVIEW), h.event(verified))["action"])
+
+    def test_genuine_pytest_equals_summary_produces_verified_and_completes(self):
+        evidence = adm_test_evidence(execution_with("===== 12 passed in 3.10s ====="))
+        self.assertEqual(12, evidence["runs"][0]["passed"])
+        self.assertEqual(0, evidence["runs"][0]["failed"])
+        verified, _ = verify(h.worker_result(drop=("tests_run", "tests_passed", "tests_failed")),
+                             {"test_evidence": evidence}, [TestEvidenceProbe()])
+        self.assertEqual((12, v.VERIFIED), (r.value(verified, "tests_run"), r.level(verified, "tests_run")))
+        self.assertEqual(v.MARK_COMPLETE, plan(working(requirements=NO_REVIEW), h.event(verified))["action"])
+
+    def test_genuine_pytest_comma_summary_produces_verified(self):
+        evidence = adm_test_evidence(execution_with("5 failed, 2927 passed"))
+        self.assertEqual(2927, evidence["runs"][0]["passed"])
+        self.assertEqual(5, evidence["runs"][0]["failed"])
+        verified, _ = verify(h.worker_result(drop=("tests_run", "tests_passed", "tests_failed")),
+                             {"test_evidence": evidence}, [TestEvidenceProbe()])
+        self.assertEqual((2932, v.VERIFIED), (r.value(verified, "tests_run"), r.level(verified, "tests_run")))
+
+    def test_genuine_pytest_timed_comma_summary_produces_verified(self):
+        evidence = adm_test_evidence(execution_with("12 passed, 3 skipped in 1.21s"))
+        self.assertEqual(12, evidence["runs"][0]["passed"])
+        self.assertEqual(0, evidence["runs"][0]["failed"])
+        self.assertEqual(3, evidence["runs"][0]["skipped"])
+        verified, _ = verify(h.worker_result(drop=("tests_run", "tests_passed", "tests_failed")),
+                             {"test_evidence": evidence}, [TestEvidenceProbe()])
+        self.assertEqual((12, v.VERIFIED), (r.value(verified, "tests_run"), r.level(verified, "tests_run")))
+        self.assertEqual(v.MARK_COMPLETE, plan(working(requirements=NO_REVIEW), h.event(verified))["action"])
+
+    def test_mixed_output_extracts_only_genuine_summary(self):
+        mixed = (
+            "Running validation...\n"
+            "Gate 3 passed. Environment looks sane.\n"
+            "See section 12 passed to the parser for details.\n"
+            "===== 12 passed in 3.10s =====\n"
+            "Finished.\n"
+        )
+        evidence = adm_test_evidence(execution_with(mixed))
+        self.assertEqual(12, evidence["runs"][0]["passed"])
+        self.assertEqual(0, evidence["runs"][0]["failed"])
+        verified, _ = verify(h.worker_result(drop=("tests_run", "tests_passed", "tests_failed")),
+                             {"test_evidence": evidence}, [TestEvidenceProbe()])
+        self.assertEqual((12, v.VERIFIED), (r.value(verified, "tests_run"), r.level(verified, "tests_run")))
+        self.assertEqual(v.MARK_COMPLETE, plan(working(requirements=NO_REVIEW), h.event(verified))["action"])
+
+    def test_unittest_complete_block_produces_verified_and_completes(self):
+        unittest_output = "Ran 12 tests in 0.500s\n\nOK"
+        evidence = adm_test_evidence(execution_with(unittest_output, command="python -m unittest"))
+        self.assertEqual(12, evidence["runs"][0]["passed"])
+        self.assertEqual(0, evidence["runs"][0]["failed"])
+        verified, _ = verify(h.worker_result(drop=("tests_run", "tests_passed", "tests_failed")),
+                             {"test_evidence": evidence}, [TestEvidenceProbe()])
+        self.assertEqual((12, v.VERIFIED), (r.value(verified, "tests_run"), r.level(verified, "tests_run")))
+        self.assertEqual(v.MARK_COMPLETE, plan(working(requirements=NO_REVIEW), h.event(verified))["action"])
+
+    def test_unittest_ran_alone_without_outcome_is_unknown(self):
+        """Trust model: 'Ran 12 tests' without OK/FAILED cannot prove tests passed."""
+        evidence = adm_test_evidence(execution_with("Ran 12 tests in 0.500s", command="python -m unittest"))
+        self.assertNotIn("passed", evidence["runs"][0])
+        verified, _ = verify(h.worker_result(drop=("tests_run", "tests_passed", "tests_failed")),
+                             {"test_evidence": evidence}, [TestEvidenceProbe()])
+        self.assertEqual(v.UNKNOWN, r.level(verified, "tests_run"))
+        self.assertNotEqual(v.MARK_COMPLETE, plan(working(requirements=NO_REVIEW), h.event(verified))["action"])
+
+
+class FindingBReviewerRejectionProseAndNormalization(unittest.TestCase):
+    """Remediation Round 2 Finding B: reviewer rejection prose & normalization withdraw payload PASS."""
+
+    def review_text(self, prose, verdict="PASS"):
+        payload = {"schema_version": r.REPORT_SCHEMA_VERSION, "task_id": "t-1", "status": "PASS",
+                   "review_verdict": verdict, "reviewed_sha": h.HEAD}
+        return prose + "\n\nFor reference here is the payload format:\n\n```adm-result\n" + json.dumps(payload) + "\n```\n"
+
+    def extract_review(self, content):
+        got = extract({"event_id": "evt-r2", "task_id": "t-1", "role": v.REVIEWER, "format": "text",
+                       "session_id": h.REVIEWER_SESSION, "content": content})
+        got["evidence"] = [{"kind": "review_notes", "ref": "review.md"}]
+        return got
+
+    def test_map_value_normalization(self):
+        self.assertEqual("FAIL", _map_value("review_verdict", "rejected", v.REVIEWER))
+        self.assertEqual("FAIL", _map_value("review_verdict", "rejected.", v.REVIEWER))
+        self.assertEqual("FAIL", _map_value("review_verdict", "REJECTED", v.REVIEWER))
+        self.assertEqual("FAIL", _map_value("review_verdict", "REJECTED:", v.REVIEWER))
+        self.assertEqual("FAIL", _map_value("review_verdict", "rejected!", v.REVIEWER))
+        self.assertEqual("FAIL", _map_value("review_verdict", "reject.", v.REVIEWER))
+        self.assertIsNone(_map_value("review_verdict", "rejected library X", v.REVIEWER))
+        self.assertIsNone(_map_value("review_verdict", "PASS_WITH_CAVEATS", v.REVIEWER))
+        self.assertIsNone(_map_value("review_verdict", "APPROVED_WITH_COMMENTS", v.REVIEWER))
+
+    def test_reviewer_contrary_prose_rejections_withdraw_payload_pass(self):
+        rejection_cases = [
+            "The reviewer rejects this implementation.",
+            "I cannot approve this as it stands.",
+            "I found two blocking issues that must be fixed first.",
+            "This must be fixed before it can land.",
+            "Verdict: rejected.",
+            "I am withholding approval until the race is closed.",
+        ]
+        for prose in rejection_cases:
+            with self.subTest(prose):
+                content = self.review_text(prose=prose, verdict="PASS")
+                got = self.extract_review(content)
+                self.assertEqual(v.UNKNOWN, r.level(got, "review_verdict"))
+                self.assertNotEqual("PASS", r.value(got, "review_verdict"))
+                decision = plan(reviewing(), h.event(got, role=v.REVIEWER, session_id=h.REVIEWER_SESSION, generation=1))
+                self.assertNotEqual(v.MARK_COMPLETE, decision["action"])
+
+    def test_false_positive_guardrails_preserve_legitimate_pass(self):
+        research_prose_cases = [
+            "rejected library X after evaluation",
+            "rejected approach A and selected approach B",
+            "rejected stale fixture",
+            "rejected invalid input",
+            "server rejected the push",
+            "the parser rejected malformed input",
+            "we rejected candidate A",
+            "the API rejected the request",
+        ]
+        for prose in research_prose_cases:
+            with self.subTest(prose):
+                content = self.review_text(prose=f"Analysis: {prose}.\nI reviewed the implementation and all tests pass.")
+                got = self.extract_review(content)
+                self.assertEqual(("PASS", v.REPORTED), (r.value(got, "review_verdict"), r.level(got, "review_verdict")))
+                self.assertNotIn("extract.conflicting_statements", got["extraction"]["signals"])
+                decision = plan(reviewing(), h.event(got, role=v.REVIEWER, session_id=h.REVIEWER_SESSION, generation=1))
+                self.assertEqual(v.MARK_COMPLETE, decision["action"])
 
 
 if __name__ == "__main__":
