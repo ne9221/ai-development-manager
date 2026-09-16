@@ -59,6 +59,7 @@ Measured against `main` @ `2a004d4`, from code rather than documentation:
 | NextPlan suites, after remediation | **187 tests, 0 failures; 954 subtests** |
 | Whole-repo regression, before remediation | **5 failed, 2890 passed** in 12m21s |
 | Whole-repo regression, after remediation (@`fa847e3`) | **5 failed, 2925 passed** in 8m04s |
+| Whole-repo regression, final clean run (@`096284d`) | **5 failed, 2927 passed**, 1400 subtests, in 7m40s |
 | Baseline comparison at `origin/main` @ `2a004d4` | the **same 5** tests fail: 5 failed, 37 passed |
 | Measured statement coverage of `manager/nextplan` | **96.6%** overall (187 tests) |
 
