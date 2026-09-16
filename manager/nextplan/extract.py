@@ -854,6 +854,11 @@ def extract(output):
             signals.add("extract.payload_invalid_json")
         if isinstance(parsed, dict) and parsed.get("schema_version", "").startswith("adm-ai-result"):
             native, text = parsed, ""
+        elif isinstance(parsed, dict) and parsed.get("schema") == contracts.REVIEW_SCHEMA:
+            # A reviewer whose whole output is the decision object. Without this
+            # the block fell into the branch below and was discarded, which is
+            # fail-closed but makes a compliant reviewer look silent.
+            native, text = parsed, ""
         elif parsed is not None:
             warnings.append("json output is not an adm-ai-result report")
             text = ""

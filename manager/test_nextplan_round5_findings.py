@@ -380,6 +380,43 @@ class GroupTwoForgedAnchors(unittest.TestCase):
         got = review("Verdict: PASS", decision=h.review_decision(), role=v.WORKER)
         self.assertEqual([], got["decisions"])
 
+    def _native(self, fmt, obj):
+        content = (json.dumps(obj) if fmt == "json"
+                   else json.dumps({"type": "result", "result": "", "structured_output": obj}))
+        got = extract({"event_id": "evt-r1", "task_id": "t-1", "role": v.REVIEWER, "format": fmt,
+                       "session_id": h.REVIEWER_SESSION, "content": content})
+        got["evidence"] = [{"kind": "review_notes", "ref": "review.md"}]
+        return got
+
+    def test_every_channel_is_gated_identically(self):
+        """A decision is collected and bound the same way however it arrives.
+
+        Otherwise the gate is only as strong as its weakest channel. Note a
+        decision-only message still cannot complete: it carries no result
+        report, so extraction raises `extract.no_parseable_payload` and the task
+        is sent back. That is fail-closed and deliberate -- the point here is
+        that the *binding* is identical, not that a bare decision is enough.
+        """
+        expectation = {"target_sha": h.HEAD, "reviewer_run_id": h.REVIEWER_RUN,
+                       "provider": h.PROVIDER, "job_id": h.JOB_ID}
+        for fmt in ("json", "stream-json"):
+            with self.subTest(fmt):
+                bound = self._native(fmt, h.review_decision())
+                self.assertEqual(1, len(bound["decisions"]))
+                self.assertTrue(contracts.review_authority(bound["decisions"], expectation)["authorized"])
+                self.assertNotEqual(v.MARK_COMPLETE,
+                                    plan(reviewing(), h.event(bound, role=v.REVIEWER,
+                                                              session_id=h.REVIEWER_SESSION,
+                                                              generation=1))["action"])
+
+                unbound = self._native(fmt, h.review_decision(reviewer_run_id="run-from-elsewhere"))
+                self.assertEqual(1, len(unbound["decisions"]))
+                self.assertFalse(contracts.review_authority(unbound["decisions"], expectation)["authorized"])
+                self.assertNotEqual(v.MARK_COMPLETE,
+                                    plan(reviewing(), h.event(unbound, role=v.REVIEWER,
+                                                              session_id=h.REVIEWER_SESSION,
+                                                              generation=1))["action"])
+
 
 # -- Group 3: a live blocker is not cancelled by nearby resolution words --------
 
