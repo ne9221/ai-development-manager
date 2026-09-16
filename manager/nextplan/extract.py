@@ -44,9 +44,81 @@ _TIER_ORDER = {tier: index for index, tier in enumerate(r.TIERS)}
 # Facts only a reviewer has the authority to assert, whatever tier they arrive in.
 REVIEW_AUTHORITY_FIELDS = frozenset({"review_verdict", "reviewed_sha"})
 
-_FENCE_OPEN = re.compile(r"^\s*```[ \t]*(adm-result|json)[ \t]*$")
-_FENCE_CLOSE = re.compile(r"^\s*```\s*$")
+_FENCE_LINE = re.compile(r"^\s*(?P<marker>`{3,}|~{3,})[ \t]*(?P<info>\S*)[ \t]*$")
+_PAYLOAD_LANGS = frozenset({"adm-result", "json"})
 _HEX = re.compile(r"\b[0-9a-f]{7,40}\b")
+
+# -- evidence provenance --------------------------------------------------------
+#
+# Execution evidence must come from output the agent presents as its own run, so
+# three regions are never read as evidence:
+#
+#   * anything inside a code fence, whatever its language;
+#   * markdown quote lines (the agent is citing, not reporting);
+#   * a block introduced by a documentation lead-in ("Example:", "Sample
+#     output:", "the format looks like this:").
+#
+# The split is asymmetric on purpose. *Evidence narrows* to authoritative
+# regions, because a documented example must not be able to prove anything.
+# *Withdrawal widens* to everything outside the agent's own payload, because a
+# rule that can only remove a claim is safe to run everywhere -- narrowing it
+# would just open a new bypass ("put the REJECT inside a fence").
+_QUOTE_LINE = re.compile(r"^\s{0,3}>")
+_LEAD_IN = re.compile(r"[:：]\s*$")
+_EXAMPLE_WORDS = re.compile(
+    r"\b(?:examples?|samples?|e\.g\.|for instance|illustrat\w*|hypothetical|mock|dummy|"
+    r"template|schema|format|looks like|reference|docs?|documentation|pseudo\w*)\b|"
+    r"範例|示例|例如|格式|參考",
+    re.I
+)
+# A documentation block runs to the next blank line, and never further than this
+# many lines: a lead-in with no blank line after it must not swallow a whole
+# report. Losing evidence only ever costs a completion, it never grants one.
+_EXAMPLE_MAX_LINES = 40
+
+
+def _fence_regions(lines):
+    """[(info, body, closed, indexes)] for every fenced block, whatever its language."""
+    regions, index = [], 0
+    while index < len(lines):
+        opened = _FENCE_LINE.match(lines[index])
+        if not opened:
+            index += 1
+            continue
+        char, start = opened.group("marker")[0], index
+        body, index = [], index + 1
+        while index < len(lines):
+            closing = _FENCE_LINE.match(lines[index])
+            if closing and closing.group("marker")[0] == char and not closing.group("info"):
+                break
+            body.append(lines[index])
+            index += 1
+        closed = index < len(lines)
+        regions.append((opened.group("info"), "\n".join(body), closed, range(start, min(index + 1, len(lines)))))
+        index += 1
+    return regions
+
+
+def non_evidence_lines(lines):
+    """Line indexes that must never be read as *this* run's execution evidence."""
+    skip = set()
+    for _info, _body, _closed, indexes in _fence_regions(lines):
+        skip.update(indexes)
+    for index, line in enumerate(lines):
+        if _QUOTE_LINE.match(line):
+            skip.add(index)
+    for index, line in enumerate(lines):
+        if index in skip or not _LEAD_IN.search(line) or not _EXAMPLE_WORDS.search(line):
+            continue
+        skip.add(index)
+        cursor = index + 1
+        while cursor < len(lines) and not lines[cursor].strip():  # "Example:" then a blank line
+            cursor += 1
+        limit = cursor + _EXAMPLE_MAX_LINES
+        while cursor < len(lines) and cursor < limit and lines[cursor].strip():
+            skip.add(cursor)
+            cursor += 1
+    return skip
 
 # -- deterministic vocabulary ---------------------------------------------------
 
@@ -84,29 +156,29 @@ _VERDICT_WORDS = {"PASS": "PASS", "APPROVE": "PASS", "APPROVED": "PASS", "ACCEPT
 _NONE_WORDS = re.compile(r"^(none|n/?a|無|沒有|-|—)\.?$", re.I)
 
 _COUNT = re.compile(r"(\d+)\s+(passed|failed|skipped|errors?|xfailed|xpassed)\b")
+# "subtests" is real pytest-subtests output ("187 passed, 954 subtests passed in
+# 23.22s"). It is recognised here so the line parses at all, but it is
+# deliberately absent from _COUNT: the primary population is 187, and the 954
+# must not be added to it nor read as a second run.
+_COUNT_WORD = (r"(?:sub(?:test|tests)\s+(?:passed|failed|skipped)|passed|failed|skipped|errors?|"
+               r"xfailed|xpassed|warnings?|deselected)")
 
 _PYTEST_EQUAL_LINE = re.compile(
-    r"^=+\s*(?:short test summary info\s*=+\s*\n\s*)?(?P<counts>(?:\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected)(?:,\s*)?)+)(?:\s+in\s+[\d.]+s.*?)?\s*=+$",
+    r"^=+\s*(?:short test summary info\s*=+\s*\n\s*)?(?P<counts>(?:\d+\s+%s(?:,\s*)?)+)"
+    r"(?:\s+in\s+[\d.]+s.*?)?\s*=+$" % _COUNT_WORD,
     re.I
 )
 _PYTEST_TIMED_LINE = re.compile(
-    r"^(?P<counts>\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected)(?:,\s*\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected))*)\s+in\s+[\d.]+s.*$",
+    r"^(?P<counts>\d+\s+%s(?:,\s*\d+\s+%s)*)\s+in\s+[\d.]+s.*$" % (_COUNT_WORD, _COUNT_WORD),
     re.I
 )
 _PYTEST_COMMA_LINE = re.compile(
-    r"^(?P<counts>\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected)(?:,\s*\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected))+)\s*$",
-    re.I
-)
-_PYTEST_SUMMARY = re.compile(
-    r"^=+\s*(?:short test summary info\s*=+\s*\n\s*)?(?:\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected)(?:,\s*)?)+(?:\s+in\s+[\d.]+s.*?)?\s*=+$",
+    r"^(?P<counts>\d+\s+%s(?:,\s*\d+\s+%s)+)\s*$" % (_COUNT_WORD, _COUNT_WORD),
     re.I
 )
 _UNITTEST_RAN = re.compile(r"^Ran (\d+) tests? in [\d.]+s\s*$")
 _UNITTEST_FAILED = re.compile(r"^FAILED \((.*)\)\s*$")
-_UNITTEST_BLOCK = re.compile(
-    r"^Ran\s+(\d+)\s+tests?\s+in\s+[\d.]+s\s*\n+(OK(?:\s*\(.*?\))?|FAILED\s*\((.*?)\))\s*$",
-    re.MULTILINE
-)
+_UNITTEST_STATUS = re.compile(r"^(?:OK(?:\s*\((?P<ok>.*?)\))?|FAILED\s*\((?P<bad>.*?)\))$")
 
 # -- heuristic vocabulary (constrained) ---------------------------------------------
 
@@ -116,30 +188,126 @@ _RATE = re.compile(r"\b429\b|rate[- ]?limit(?:ed)?", re.I)
 _BLOCKED_PROSE = re.compile(r"\bblocked\b|\bcannot proceed\b|無法繼續|阻塞", re.I)
 _DONE_PROSE = re.compile(r"\ball (?:tests )?pass(?:ed|ing)?\b|\b(?:done|completed|finished)\b|已完成|完成", re.I)
 _FAIL_PROSE = re.compile(r"\bfail(?:ed|ing|ure)?\b|失敗", re.I)
-# An explicit contrary judgement in the agent's own prose. Only ever used to
-# withdraw a positive claim, never to create one.
+# -- structural rejection detection (withdraw-only) ---------------------------
 #
-# Deliberately narrow. A bare "rejected" is NOT here: ADM reports routinely say
-# "rejected the library after evaluating it" as research-before-build evidence
-# (common governance rule 10), and that must not withdraw an honest PASS. A
-# verdict-shaped REJECT is matched case-sensitively instead.
-_CONTRARY_VERDICT = re.compile(
-    r"changes[ _-]required|"
-    r"should not (?:ship|merge|land)|"
-    r"do not merge|"
-    r"\bnot ready\b|"
-    r"needs? (?:more|further) work|"
-    r"\b(?:cannot|can't|do not|does not)\s+approve\b|"
-    r"\bwithhold(?:ing)?\s+approval\b|"
-    r"(?<!\bno\s)(?<!\bzero\s)(?<!\bwithout\s)\bblocking\s+(?:issues?|bugs?|findings?)\b|"
-    r"must be fixed (?:first|before\s+(?:it can|we can)?\s*(?:land|merge|ship))|"
-    r"(?:the\s+)?reviewer\s+rejects?\b|"
-    r"\breject(?:s|ed|ing)?\s+(?:this|the)\s+(?:implementation|PR|pull request|change|patch|commit|submission|work)\b|"
-    r"\bverdict\s*:\s*reject(?:ed)?\b|"
-    r"不應(?:該)?合併|尚未完成|還沒(?:有)?完成",
-    re.I
-)
+# An earlier round matched whole sentences, so every reworded rejection was a
+# new false pass and every fix was another literal bolted on. This reads
+# *structure* instead: a small set of composed families, each a (polarity,
+# target) pair, evaluated per clause with negation resolved inside the clause.
+#
+#   F1  an approval term that is negated, withheld or made conditional
+#   F2  a blocker asserted to exist (guarded: "no blocking issues" is not one)
+#   F3  a fix ordered before landing (guarded: "nothing must be fixed first")
+#   F4  another round, or the work sent back to its author
+#   F5  a rejection whose object is the work under review -- never a library,
+#       an approach, a fixture, a push or malformed input, which is how ADM
+#       reports record research-before-build and ordinary failures
+#
+# Guarded families consult _negated, a clause-local window, rather than
+# a lookbehind: "there are no remaining blocking issues" defeated the fixed
+# lookbehind simply by putting a word between "no" and "blocking".
+#
+# This is withdraw-only. It can turn a PASS into UNKNOWN; nothing here can ever
+# assert one, so a false negative costs a re-ask and a false positive costs a
+# round -- and the guards exist because a false positive on honest prose is
+# itself a defect.
+_CLAUSE_SPLIT = re.compile(r"[.;!?\n。；！？]+|,\s")
+_WORD = re.compile(r"[\w'’-]+")
+_NEGATOR = re.compile(r"^(?:no|not|n't|never|zero|none|nothing|without|neither|nor|non|0)$", re.I)
+_NEG_WINDOW = 4
+
+# Explicit negation carriers. Bare "no" is deliberately absent: it is the
+# quantifier in "no blocking issues", which F2 already handles, and admitting it
+# here would read "No issues block merge" as a refusal to merge.
+_NOT = (r"(?:not|cannot|can\s*not|can't|won't|will\s+not|would\s+not|shall\s+not|should\s+not|"
+        r"must\s+not|may\s+not|do\s+not|does\s+not|don't|doesn't|is\s+not|isn't|are\s+not|aren't|"
+        r"has\s+not|have\s+not|hasn't|haven't|was\s+not|were\s+not|never|unable\s+to|"
+        r"refus\w+\s+to|declin\w+\s+to|fail\w*\s+to)")
+_FILLER = r"(?:be|been|being|get|got|yet|now|ever|fully|formally|hereby|explicitly|currently|safely|cleanly)"
+_APPROVE = (r"(?:approv\w*|accept\w*|sign[-\s]?off|signed[-\s]?off|merg\w*|land(?:ed|ing|s)?|"
+            r"ship(?:ped|ping|s)?|releas\w*|grant\w*|endors\w*)")
+_APPROVAL_NOUN = r"(?:approval|sign[-\s]?off|acceptance|go[-\s]?ahead)"
+_NEGATIVE_PREDICATE = (r"(?:not|never|withheld|withhold\w*|denied|deny|refused|refus\w*|pending|"
+                       r"conditional|contingent|depends|depend|blocked|revoked|premature)")
+_DEFECT = r"(?:issues?|bugs?|defects?|findings?|problems?|concerns?)"
+# A blocker withdraws a PASS only when the sentence asserts one *exists*: either
+# a persistence predicate or a counting quantifier. "The blocker was the missing
+# token; resolved" names a blocker that is gone, and must not cost a round.
+_PERSIST = r"(?:remain\w*|persist\w*|outstanding|unresolved|open|present|exists?|still|pending|left)"
+_QUANT = r"(?:\d+|one|two|three|four|five|several|multiple|some|a|an|another|numerous|many)"
+_BLOCKER = r"(?:blockers?|blocking\s+(?:\w+\s+){0,1}?%s)" % _DEFECT
+_WORK = (r"(?:implementation|patch|pull\s+request|pr|changes?|changeset|commits?|submission|"
+         r"branch|diff|revision|merge|work|deliverable)")
+_FIXVERB = r"(?:fix\w*|resolv\w*|address\w*|correct\w*|repair\w*|remediat\w*)"
+_LAND = r"(?:merg\w*|land\w*|ship\w*|releas\w*|approv\w*|accept\w*|sign[-\s]?off)"
+# Handing the work back to whoever wrote it is a rejection whatever verb carries
+# it, so the family is the verb's morphology rather than a set of sentences.
+_HANDBACK = (r"(?:send|sent|sending|sends|hand(?:ed|ing|s)?|pass(?:ed|ing|es)?|kick(?:ed|ing|s)?|"
+             r"bounc(?:e|ed|ing|es)|return(?:ed|ing|s)?|giv(?:e|en|ing)|gave|throw(?:n|ing|s)?|threw)")
+_AUTHOR = r"(?:implementer|author|worker|developer|submitter|contributor)"
+# What is handed back has to be the work under review: without this, "handed the
+# token back to the caller" read as a rejection.
+_UNDER_REVIEW = r"(?:this|it|(?:this|that|the|your)\s+(?:\w+\s+){0,1}?%s)" % _WORK
+
+_REJECTION_RULES = tuple((re.compile(pattern, re.I), guarded) for pattern, guarded in (
+    # F1 -- approval negated, withheld or conditional
+    (r"\b%s\s+(?:%s\s+){0,2}%s\b" % (_NOT, _FILLER, _APPROVE), False),
+    (r"\b%s\b[^,;.!?]{0,60}?\b%s\b" % (_APPROVAL_NOUN, _NEGATIVE_PREDICATE), False),
+    (r"\bwithhold\w*\s+(?:my\s+|our\s+|the\s+)?%s\b" % _APPROVAL_NOUN, False),
+    (r"\bunacceptable\b|\bnot\s+acceptable\b|\bnot\s+ready\b", False),
+    # F2 -- a blocker asserted to exist
+    (r"\b%s\b[^,;.!?]{0,30}?\b%s\b" % (_BLOCKER, _PERSIST), True),
+    (r"\b%s\s+(?:\w+\s+){0,2}?%s\b" % (_PERSIST, _BLOCKER), True),
+    (r"\b%s\s+(?:\w+\s+){0,2}?%s\b" % (_QUANT, _BLOCKER), True),
+    (r"\b%s\s+(?:that\s+)?block(?:s|ed|ing)?\s+(?:the\s+)?"
+     r"(?:merge|merging|landing|release|approval|this|it)\b" % _DEFECT, True),
+    (r"\b(?:merg\w+|landing|release|approval|this|it)\s+(?:is|are|remains?|stays?)\s+blocked\b", True),
+    # F3 -- a fix ordered before landing
+    (r"\b%s\b[^,;.!?]{0,40}?\bbefore\b[^,;.!?]{0,40}?\b%s\b" % (_FIXVERB, _LAND), True),
+    (r"\b(?:must|needs?\s+to|has\s+to|have\s+to|should)\s+be\s+%s\s+(?:first|before)\b" % _FIXVERB, True),
+    # F4 -- another round, or the work handed back to its author
+    (r"\b(?:another|a\s+further|an\s+additional|one\s+more|a\s+second|further)\s+"
+     r"(?:review\s+)?(?:rounds?|revisions?|passes|pass|iterations?|reviews?|attempts?|cycles?)\b", True),
+    (r"\b%s\s+%s\s+back\b" % (_HANDBACK, _UNDER_REVIEW), False),
+    (r"\b%s\s+%s\s+(?:back\s+)?to\s+(?:the\s+)?%s\b" % (_HANDBACK, _UNDER_REVIEW, _AUTHOR), False),
+    (r"\breturn(?:ed|ing|s)?\s+(?:this\s+|it\s+)?for\s+(?:rework|revisions?|changes|fixes)\b", False),
+    (r"\bback\s+to\s+(?:the\s+)?(?:%s|drawing\s+board)\b" % _AUTHOR, False),
+    # F5 -- a rejection whose object is the work under review
+    (r"\breject(?:s|ed|ing)?\s+(?:(?:this|that|the|your|its|their|my|our)\s+)?(?:\w+\s+){0,2}?%s\b" % _WORK, False),
+    (r"\b(?:this|that|the|your)\s+(?:\w+\s+){0,2}?%s\s+"
+     r"(?:is|was|are|were|has\s+been|have\s+been|had\s+been)\s+rejected\b" % _WORK, False),
+    (r"\breject(?:s|ed|ing)?\s+(?:this|it)\s*(?:[,;]|$)", False),
+    (r"\b(?:the\s+)?reviewer\s+rejects?\b", False),
+    (r"\bverdict\b\W{0,8}reject(?:ed)?\b", False),
+    # Fixed governance tokens, which are identifiers rather than prose guesses
+    (r"changes[ _-]required|do not merge|needs? (?:more|further) work|"
+     r"不應(?:該)?合併|尚未完成|還沒(?:有)?完成", False),
+))
 _CONTRARY_TOKEN = re.compile(r"\bREJECT(?:ED)?\b|\bCHANGES[ _]REQUIRED\b|\bDO NOT MERGE\b")
+
+
+def _negated(clause, match):
+    """Is this match negated -- just before it, or by its own leading quantifier?
+
+    The second half matters because a counting rule swallows the count: "0
+    blocking issues" starts at the "0", so there is nothing before it to look at.
+    """
+    words = _WORD.findall(clause[:match.start()])[-_NEG_WINDOW:]
+    first = _WORD.findall(match.group(0))[:1]
+    return any(_NEGATOR.match(word) for word in words + first)
+
+
+def rejection_signal(text):
+    """The structural rejection a message states in its own prose, or None."""
+    for clause in _CLAUSE_SPLIT.split(text or ""):
+        clause = clause.strip()
+        if not clause:
+            continue
+        for pattern, guarded in _REJECTION_RULES:
+            for match in pattern.finditer(clause):
+                if not guarded or not _negated(clause, match):
+                    return match.group(0).strip()[:120]
+    return None
 
 
 def _sha256(text):
@@ -181,21 +349,7 @@ def _stream_json(content):
 
 def _fenced_blocks(lines):
     """[(lang, body, closed, line_indexes)] for every ```adm-result / ```json block."""
-    blocks, index = [], 0
-    while index < len(lines):
-        opened = _FENCE_OPEN.match(lines[index])
-        if not opened:
-            index += 1
-            continue
-        start = index
-        body, index = [], index + 1
-        while index < len(lines) and not _FENCE_CLOSE.match(lines[index]):
-            body.append(lines[index])
-            index += 1
-        closed = index < len(lines)
-        blocks.append((opened.group(1), "\n".join(body), closed, range(start, min(index + 1, len(lines)))))
-        index += 1
-    return blocks
+    return [region for region in _fence_regions(lines) if region[0] in _PAYLOAD_LANGS]
 
 
 def _fenced_payload(lines, signals, fenced_lines):
@@ -274,61 +428,104 @@ def test_counts(text):
 
     Shared with manager.nextplan.verify so a test summary recorded by ADM is
     read by exactly the same parser as one an agent quotes. Requires runner-specific
-    anchored structure (pytest summary or unittest block) to reject non-test prose.
+    anchored structure (pytest summary or unittest block) to reject non-test prose,
+    and ignores fenced / quoted / documentation regions (see non_evidence_lines).
     """
     return _counts(text)
 
 
-def _counts(text):
-    if not text or not isinstance(text, str):
-        return {}
+def _unittest_counts(lines, index):
+    """Counts for a unittest block whose OK/FAILED line is ``lines[index]``."""
+    status = _UNITTEST_STATUS.match(lines[index].strip())
+    if not status:
+        return None
+    cursor = index - 1
+    while cursor >= 0 and not lines[cursor].strip():
+        cursor -= 1
+    ran = _UNITTEST_RAN.match(lines[cursor].strip()) if cursor >= 0 else None
+    if not ran:
+        return None
+    total, detail = int(ran.group(1)), status.group("bad")
+    skipped = 0
+    m_skip = re.search(r"skipped=(\d+)", status.group("ok") or detail or "")
+    if m_skip:
+        skipped = int(m_skip.group(1))
+    if detail is None:
+        return {"tests_passed": total - skipped, "tests_failed": 0, "tests_skipped": skipped}
+    failed = sum(int(n) for n in re.findall(r"(?:failures|errors)=(\d+)", detail))
+    return {"tests_passed": max(0, total - failed - skipped), "tests_failed": failed, "tests_skipped": skipped}
 
-    # 1. Complete unittest block (Ran N tests in X.XXs followed by OK or FAILED)
-    m_unit = _UNITTEST_BLOCK.search(text)
-    if m_unit:
-        total = int(m_unit.group(1))
-        status_part = m_unit.group(2)
-        if status_part.startswith("OK"):
-            skipped = 0
-            m_skip = re.search(r"skipped=(\d+)", status_part)
-            if m_skip:
-                skipped = int(m_skip.group(1))
-            return {"tests_passed": total - skipped, "tests_failed": 0, "tests_skipped": skipped}
-        else:
-            nums = [int(n) for n in re.findall(r"(?:failures|errors)=(\d+)", status_part)]
-            failed = sum(nums)
-            skipped = 0
-            m_skip = re.search(r"skipped=(\d+)", status_part)
-            if m_skip:
-                skipped = int(m_skip.group(1))
-            return {"tests_passed": max(0, total - failed - skipped), "tests_failed": failed, "tests_skipped": skipped}
 
-    # 2. Pytest summary line (search bottom-up for runner-anchored structure)
-    for line in reversed(text.splitlines()):
-        stripped = line.strip()
-        m = (_PYTEST_EQUAL_LINE.match(stripped) or
+def _pytest_counts(stripped):
+    """Counts for one pytest summary line, or None if the line is not one."""
+    match = (_PYTEST_EQUAL_LINE.match(stripped) or
              _PYTEST_TIMED_LINE.match(stripped) or
              _PYTEST_COMMA_LINE.match(stripped))
-        if m:
-            counts_str = m.group("counts")
-            found = {}
-            for number, word in _COUNT.findall(counts_str):
-                word = "errors" if word.startswith("error") else word
-                found[word] = found.get(word, 0) + int(number)
-            if not found:
-                continue
-            failed = found.get("failed", 0) + found.get("errors", 0)
-            counts = {"tests_passed": found.get("passed", 0), "tests_failed": failed}
-            if "skipped" in found:
-                counts["tests_skipped"] = found["skipped"]
-            return counts
+    if not match:
+        return None
+    found = {}
+    for number, word in _COUNT.findall(match.group("counts")):
+        word = "errors" if word.startswith("error") else word
+        found[word] = found.get(word, 0) + int(number)
+    if not found:
+        return None
+    counts = {"tests_passed": found.get("passed", 0),
+              "tests_failed": found.get("failed", 0) + found.get("errors", 0)}
+    if "skipped" in found:
+        counts["tests_skipped"] = found["skipped"]
+    return counts
 
+
+def _counts(text, regions=True):
+    """The counts of the *last* runner summary in ``text``, or {}.
+
+    Two rules, both of which an earlier round got wrong:
+
+    - documentation is not evidence: fenced, quoted and example lines are
+      dropped before anything is parsed;
+    - the last valid summary wins, for unittest exactly as for pytest. The
+      unittest block used to be searched top-down across the whole text and
+      returned first, so a quoted "Ran 99 tests ... OK" shadowed the real
+      "0 passed" -- and a real *failure* -- printed below it.
+    """
+    if not text or not isinstance(text, str):
+        return {}
+    source = text.replace("\r\n", "\n").split("\n")
+    skip = non_evidence_lines(source) if regions else set()
+    kept = [line for index, line in enumerate(source) if index not in skip]
+    for index in range(len(kept) - 1, -1, -1):
+        counts = _pytest_counts(kept[index].strip())
+        if counts is None:
+            counts = _unittest_counts(kept, index)
+        if counts is not None:
+            return counts
     return {}
 
 
+# Formatting an agent wraps a value in, and the punctuation it ends a sentence
+# with, are not part of the value. Stripping them once was not enough:
+# "**rejected**." lost its leading stars, kept the trailing ones behind the
+# period, and missed the enum -- so the verdict stayed UNKNOWN and a payload
+# PASS survived next to a written rejection. Strip to a fixpoint instead, with
+# a cap so no input can loop, and keep the mapping itself exact: the loop makes
+# the *token* robust, it never widens what counts as a verdict.
+_WRAPPERS = "*`_~\"'“”‘’「」『』()[]{}<>【】"
+_TRAILING = ".:;,!?。：；，！？、… \t"
+_NORMALIZE_CAP = 8
+
+
+def _normalize_token(raw):
+    token = raw.strip()
+    for _ in range(_NORMALIZE_CAP):
+        stripped = token.strip().strip(_WRAPPERS).strip().rstrip(_TRAILING).strip()
+        if stripped == token:
+            break
+        token = stripped
+    return token
+
+
 def _map_value(field, raw, role):
-    token = raw.strip().strip("*`_~\"'“”‘’").strip()
-    token = token.rstrip(".:;,!?。：；，！").strip()
+    token = _normalize_token(raw)
     upper = token.upper().replace(" ", "_").replace("-", "_")
     # Exact matches only. A prefix fallback used to collapse a hedge into a
     # clean verdict -- "PASS_WITH_CAVEATS" became PASS and
@@ -494,7 +691,9 @@ def extract(output):
         facts, lists = _payload_facts(payload, tier, signals, warnings, role)
 
     sources = {field: f"agent:{tier}" for field in facts}
-    deterministic, consumed, blockers = _deterministic(lines, role, warnings, fenced_lines)
+    # Evidence narrows: a fenced, quoted or documented line may not prove anything.
+    non_evidence = non_evidence_lines(lines)
+    deterministic, consumed, blockers = _deterministic(lines, role, warnings, fenced_lines | non_evidence)
     for field, values in deterministic.items():
         candidate = values[0]
         if len(values) > 1:
@@ -533,22 +732,31 @@ def extract(output):
 
     # Prose the agent wrote outside any payload or parsed line.
     prose = "\n".join(line for index, line in enumerate(lines) if index not in consumed)
+    # Withdrawal widens: everything outside the agent's own payload counts,
+    # including the regions evidence may not be read from. A rule that can only
+    # remove a claim is safe everywhere, and narrowing it to authoritative prose
+    # would hand anyone a bypass -- write the rejection inside a fence.
+    claimed_lines = consumed - fenced_lines - non_evidence
+    written = "\n".join(line for index, line in enumerate(lines)
+                        if index not in fenced_lines and index not in claimed_lines)
 
-    # A positive claim is withdrawn when the same message states the opposite
-    # in prose: a payload saying review_verdict PASS next to "CHANGES REQUIRED"
-    # is a contradiction, not an approval. This can only ever remove a claim,
-    # which is why a heuristic is allowed to do it.
-    if _CONTRARY_VERDICT.search(prose) or _CONTRARY_TOKEN.search(prose):
+    # A positive claim is withdrawn when the same message states the opposite in
+    # its own words: a payload saying review_verdict PASS beside a written
+    # rejection is a contradiction, not an approval. This can only ever remove a
+    # claim, which is why a heuristic is allowed to do it.
+    token = _CONTRARY_TOKEN.search(written)
+    contrary = rejection_signal(written) or (token.group(0) if token else None)
+    if contrary:
         for field in ("status", "review_verdict"):
             if r.value(result, field) == "PASS" and r.level(result, field) in (v.REPORTED, v.DERIVED):
                 result["facts"][field] = r.unknown(
-                    f"claimed PASS, but the same message states the opposite in prose"[:300])
+                    f"claimed PASS, but the same message states the opposite in prose: {contrary!r}"[:300])
                 signals.add("extract.conflicting_statements")
 
     # Negative heuristics read only what the agent said about its own run:
     # prose outside payloads, plus declared blockers. Payload findings or code
     # that merely *mention* rate limiting must not trip them.
-    heuristic_text = "\n".join([prose if payload is None else "", *lists["blockers"]])
+    heuristic_text = "\n".join([written if payload is None else "", *lists["blockers"]])
     if _QUOTA.search(heuristic_text):
         signals.add("result.quota_exhausted")
     elif _RATE.search(heuristic_text):
