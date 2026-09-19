@@ -1,9 +1,16 @@
 # NextPlan trust model
 
-Status: Remediation Round 6 (2026-09-17), pending independent review.
+Status: Remediation Round 7 (2026-09-20), pending independent review.
 Applies to `manager/nextplan/contracts.py`, `runner.py`, `extract.py`,
 `verify.py`, `classify.py` and `planner.py`.
 
+> **Round 7 amends this document** (section 7), after Grok 4.6 rejected
+> `899d383e`. Round 6's design is unchanged and still correct; Round 7 closes
+> the places where the same contract was written down twice and the two copies
+> disagreed. In one line: **a list is not a grammar, and a quotation is not a
+> voice.** Section 7 states the amended contract, and it supersedes one Round-3
+> rule explicitly (7.3).
+>
 > **Round 6 amends this document.** Round 5's design below is unchanged and
 > still correct; Round 6 fixes the places where it was written down but not
 > implemented, and the place where it was applied too far. Read
@@ -327,3 +334,147 @@ only widen the window in which a stale `execution_id` is honoured.
 production emits either contract, and `run_validation` is not wired into
 `repo_write_enforcement.py`. The `adm-result` milestone was deliberately not
 started.
+
+## 7. Round 7 amendment — a list is not a grammar, and a quotation is not a voice
+
+Grok 4.6's fresh independent review rejected `899d383e` with four findings. All
+four are the same shape as each other, and none of them is a new failure mode:
+**one contract was written down twice, and the two copies disagreed.**
+
+Round 6 replaced rejection *vocabulary* with decision *shape*, which was right
+and stands. But it wrote that shape down in two forms and built only one of them
+as a grammar. Read
+[`REMEDIATION-ROUND-7-20260920.md`](REMEDIATION-ROUND-7-20260920.md) with this
+section.
+
+### 7.1 The decisive label is a grammar (R6-IR-1, HIGH)
+
+Section 6.1 described "a decision **field** on a line (`Verdict:`, `Decision:`,
+`Current decision:`, …)". The `…` was doing work the code did not do. The copula
+form (`My current decision is to reject`) was a small grammar — an owner, an
+optional modifier, a decision noun. The label form was a tuple of twenty-six
+literal strings, so the *same decision written with a colon instead of a verb*
+was invisible:
+
+| the reviewer wrote | Round 6 read it |
+|---|---|
+| `My decision is to reject` | a decision |
+| `My decision: reject` | a decision |
+| `My current decision: reject` | **nothing** |
+| `The current decision: reject` | **nothing** |
+| `Our final recommendation: reject` | **nothing** |
+
+Measured at `899d383e`: **9 of 12** decision fields beside a bound `PASS`
+reached `MARK_COMPLETE`, including all six the review named.
+
+The fix is the grammar the other form already had, not six more strings:
+
+> A decisive label is **`(owner)? (modifier)* (decision-noun)`**, where every
+> part is a closed set.
+>
+> * owner — `my`, `our`, `the`, `its`, `their`
+> * modifier — `current`, `final`, `overall`, `review`, `reviewer`, `official`,
+>   `formal`, `considered`
+> * decision noun — `decision`, `verdict`, `recommendation`, `disposition`,
+>   `outcome`
+
+Both forms are now built from the same two sets, so they cannot drift apart
+again. The explicit tables are still consulted first, so every Round-5 and
+Round-6 label keeps the tier it had — including the decisive ones the grammar
+would not generate (`final call`, `approval`, `sign off`, the Chinese labels)
+and the reporting ones it must not (`final status`, `summary verdict`).
+
+Two things this deliberately does **not** do. It does not promote reporting
+nouns: `Final result: 3 passed` is a count, and reading it as an unreadable
+decision would stall an honest review. And it adds nothing to `_REJECT_VALUES` —
+`Final outcome: send back for revision` is read as a decision whose value ADM
+cannot map, which conflicts under the existing 6.1 rule and blocks for that
+reason. **The rejection vocabulary is byte-for-byte unchanged.**
+
+### 7.2 A summary may withdraw the PASS it sits inside (R6-IR-2, MEDIUM)
+
+`summary` was documented as optional human prose and never read, so this
+validated, authorized and completed — 3 of 3 at `899d383e`:
+
+```json
+{"schema": "adm-review-result/v1", "verdict": "PASS", "findings": [],
+ "summary": "Current decision: reject"}
+```
+
+A summary still authorizes nothing; that asymmetry is unchanged. But it is the
+same reviewer's own voice, so it is now read by **`extract.decision_statements`
+— the same parser as the prose rule, deliberately not a second rejection
+scanner** — and a decision-shaped contradiction in it turns that object's `PASS`
+into a `CONFLICT`.
+
+Because it is shape and not sentiment, an ordinary summary is read as no
+decision at all: *"The previous blocker was fixed."*, *"This review rejects the
+old approach, but the submitted patch now satisfies the contract."*, *"No
+blocking issues remain."* all still complete.
+
+Summaries are collected **per bound block only**. An unbound or off-target
+decision cannot block, so its summary must not do what the object it sits in
+cannot.
+
+### 7.3 A wrong-channel fence is quotation in both directions (R6-IR-3, MEDIUM)
+
+Section 6.4 says a decision in the wrong fence "is **not** treated as a blocking
+decision — blocking on it would let anyone stall a task by quoting JSON". Only
+the first half was implemented. The fence was kept out of *structured authority*
+while its body stayed in the withdrawal prose region, so a bound `PASS` beside
+an ordinary ` ```json ` fence quoting `"verdict": "REJECT"` read as a
+contradiction. Measured: **5 of 5** fence languages stalled — `SEND_TO_REVIEW`
+or `HUMAN_GATE`.
+
+A non-authoritative fence body is now non-authoritative **quotation**: out of
+structured authority, and out of decision and withdrawal collection. The
+reviewer's own voice is prose *outside* every fence, and it withdraws exactly as
+before.
+
+**This supersedes the Round-3 rule that a rejection inside a fence still
+withdraws.** That rule was correct when it was written: a payload
+`review_verdict: PASS` was a live claim, so narrowing withdrawal to unfenced
+prose would have been a bypass. Round 5 removed that claim and Round 6 narrowed
+authority to one fence, so there is no longer anything for a fenced rejection to
+withdraw — what remained was only its cost. The test that pinned it
+(`test_nextplan_round3_findings.test_a_rejection_inside_a_fence_still_withdraws`)
+has been **inverted on purpose**, renamed, and carries the full reasoning; the
+same test file now also asserts that a fence still cannot authorize anything.
+
+The authoritative channel is untouched and still fails closed: a malformed,
+truncated, conflicting, unknown-verdict, unknown-field, wrong-run or
+blocking-finding `adm-review-result` block still blocks.
+
+### 7.4 One authority invocation (R6-IR-4)
+
+`classify.review_proof` passed the reviewer's decision statements to
+`contracts.review_authority`; `classify.signals_for` called the same contract
+with the same decisions and *without* them. So the proof could refuse a
+contradicted `PASS` while the signals still read it as authorized, and nothing
+reconciled the two — they agreed only where some other rule already routed the
+task away from completion. That is a contract fork, whatever its current
+blast radius.
+
+Both paths now go through **`classify.review_authority_for`**, the only place in
+that module where authority is asked about. A test asserts that neither function
+calls `contracts.review_authority` directly, because "we fixed the call site" is
+exactly the kind of fix that comes undone.
+
+### 7.5 Residual after Round 7
+
+**7.5.1 One pre-existing over-refusal, still recorded rather than chased.**
+`The decision was straightforward.` is read by the copula form as a decision
+whose value ADM cannot map, so beside a bound `PASS` it conflicts. Verified
+identical at `899d383e` before any Round-7 edit — it is neither a regression nor
+one of Grok's findings. It fails closed: it costs a round, never a completion.
+Closing it means distinguishing an announced decision from a mentioned one,
+which no shape rule available here can do.
+
+**7.5.2 The grammar is finite and stated, not learned.** Five decision nouns,
+eight modifiers, five owners. Extending any of the three sets is a reviewed
+change to this section, not a wording someone adds while closing a finding.
+
+**7.5.3 Residual 5.3 and 6.5.4 stand unchanged.** Nothing in production emits
+either contract, `run_validation` is still not wired into
+`repo_write_enforcement.py`, and the `adm-result` milestone was again
+deliberately not started.

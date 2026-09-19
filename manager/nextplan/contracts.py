@@ -228,6 +228,34 @@ def _binding_problems(block, expectation):
     return problems, True
 
 
+def _summary_statements(block):
+    """Decision-shaped things the reviewer wrote in this object's own ``summary``.
+
+    Round 6 documented ``summary`` as an optional human-prose field and never
+    read it, so a reviewer could return a bound ``PASS`` whose summary said
+    ``Current decision: reject`` and the task completed. A summary authorizes
+    nothing -- that is unchanged -- but it is the same reviewer's own voice, so
+    it must be able to withdraw the PASS it is attached to.
+
+    It is read by ``extract.decision_statements``: the SAME parser as the prose
+    rule, deliberately not a second rejection scanner. A summary that merely
+    mentions a rejection ("this review rejects the old approach, but the patch
+    now satisfies the contract") announces no decision and is read as none.
+
+    The import is deferred because ``extract`` imports this module. One parser
+    in one place was worth an import inside a function; two parsers would drift,
+    and drift between two readings of one contract is what R6-IR-1 and R6-IR-4
+    both were.
+    """
+    from manager.nextplan import extract
+
+    summary = block.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return []
+    return [s for s in extract.decision_statements(summary)
+            if s.get("polarity") in (STATEMENT_REJECT, STATEMENT_UNREADABLE)]
+
+
 def review_authority(decisions, expectation, statements=()):
     """Does this reviewer output authorize completing ``expectation``'s target?
 
@@ -248,7 +276,10 @@ def review_authority(decisions, expectation, statements=()):
     * no decision at all never authorizes.
 
     ``statements`` (Round 6) are the *decision-shaped* things the same reviewer
-    wrote in prose, as ``extract.decision_statements`` read them. They obey the
+    wrote in prose, as ``extract.decision_statements`` read them. Round 7 adds
+    the ``summary`` of each bound block, read by the same parser: a summary is
+    still human prose that authorizes nothing, but it is the reviewer's own
+    voice, so it may withdraw the PASS it is written inside. They obey the
     same asymmetry as every other prose rule here, and it is enforced rather
     than merely documented: a contradicting or unreadable statement turns an
     otherwise-authorizing PASS into a CONFLICT, and nothing in the list can
@@ -257,6 +288,10 @@ def review_authority(decisions, expectation, statements=()):
     told ADM two different things, and two different things are not consent.
     """
     problems, verdicts, considered, invalid = [], set(), 0, False
+    # Summary contradictions are collected per BOUND block. An unbound or
+    # off-target decision cannot block (a forged REJECT would stall any task),
+    # and its summary must not be able to do what the object it sits in cannot.
+    withdrawn = []
     for index, block in enumerate(decisions or ()):
         label = f"decision[{index}]"
         shape = review_problems(block)
@@ -273,6 +308,7 @@ def review_authority(decisions, expectation, statements=()):
             continue
         considered += 1
         verdicts.add(block["verdict"])
+        withdrawn.extend(_summary_statements(block))
         blocking = [f for f in block["findings"] if finding_is_blocking(f)]
         if blocking and block["verdict"] == "PASS":
             problems.append(f"{label}: verdict PASS with {len(blocking)} blocking finding(s)")
@@ -287,14 +323,17 @@ def review_authority(decisions, expectation, statements=()):
         # exists, do statements get consulted at all. A statement beside no
         # object is still nothing: it cannot grant, and it is not allowed to
         # block either, or a forged "Decision: reject" would stall any task.
-        contradictions = [s for s in (statements or ())
+        contradictions = [("in prose", s) for s in (statements or ())
                           if s.get("polarity") in (STATEMENT_REJECT, STATEMENT_UNREADABLE)]
+        # Round 7: and in the object's own summary, which Round 6 documented as
+        # optional prose and then never read.
+        contradictions += [("in its own summary", s) for s in withdrawn]
         if contradictions:
             return {"authorized": False, "blocked": True, "verdict": None, "reason": CONFLICT,
                     "problems": problems + [
-                        f"decision PASS, but the same reviewer also stated {s['raw']!r}"
+                        f"decision PASS, but the same reviewer also stated {s['raw']!r} {where}"
                         f"{'' if s['polarity'] == STATEMENT_REJECT else ' (a decision field ADM cannot read)'}"
-                        for s in contradictions],
+                        for where, s in contradictions],
                     "considered": considered}
         return {"authorized": True, "blocked": False, "verdict": "PASS", "reason": AUTHORIZED,
                 "problems": problems, "considered": considered}

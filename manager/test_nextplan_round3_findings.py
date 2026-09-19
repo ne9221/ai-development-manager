@@ -393,10 +393,48 @@ class GroupCHeldOutRejections(unittest.TestCase):
                 got = review_text(prose)
                 self.assertEqual(v.UNKNOWN, r.level(got, "review_verdict"))
 
-    def test_a_rejection_inside_a_fence_still_withdraws(self):
-        """Withdrawal widens: narrowing it to prose would be a new bypass."""
-        got = review_text("Notes:\n\n```\nTwo blockers remain.\n```\n")
-        self.assertEqual(v.UNKNOWN, r.level(got, "review_verdict"))
+    def test_a_rejection_inside_a_fence_is_quotation_in_both_directions(self):
+        """SUPERSEDED BY ROUND 7 (R6-IR-3). This assertion was inverted, on purpose.
+
+        Round 3 asserted that a rejection inside a fence STILL WITHDRAWS, and it
+        was right at the time: a payload ``review_verdict: PASS`` was a live
+        claim, so narrowing the withdrawal region to unfenced prose would have
+        been a bypass -- write the rejection in a fence and the payload's PASS
+        stands.
+
+        That claim no longer exists. Round 5 made a payload PASS unable to
+        authorize anything, and Round 6 narrowed authority to a single
+        ``adm-review-result`` fence. There is nothing left for a fenced
+        rejection to withdraw, and the reviewer's real decision has a channel of
+        its own that a quotation cannot reach.
+
+        What remained was only this rule's cost, which Grok 4.6 measured: a
+        bound PASS beside an ordinary ```json fence quoting ``"verdict":
+        "REJECT"`` -- a schema example, a transcript, another tool's output --
+        read as a contradiction and stalled the task, 5 of 5 fence languages.
+        TRUST-MODEL 6.4 states in writing that a decision in the wrong fence
+        neither authorizes NOR blocks; Round 6 implemented only the first half.
+
+        So a fence is quotation in both directions now. The rule that replaced
+        this one is the channel, and it is tested where the rest of the channel
+        is: ``test_nextplan_round7_findings.GroupThreeWrongChannelIsInert``.
+        What must NOT change is the reviewer's own voice, which is asserted
+        below and in every other case in this group.
+        """
+        quoted = review_text("Notes:\n\n```\nTwo blockers remain.\n```\n")
+        self.assertEqual([], quoted["decision_statements"])
+        self.assertEqual(v.REPORTED, r.level(quoted, "review_verdict"))
+
+        spoken = review_text("Notes:\n\nTwo blockers remain.\n")
+        self.assertEqual(v.UNKNOWN, r.level(spoken, "review_verdict"))
+
+    def test_a_fence_still_cannot_authorize_anything(self):
+        """The other half of the channel rule, checked from this group's side."""
+        got = review_text("Notes:\n\n```\nTwo blockers remain.\n```\n", decision=False)
+        self.assertEqual([], got["decisions"])
+        decision = plan(reviewing(),
+                        h.event(got, role=v.REVIEWER, session_id=h.REVIEWER_SESSION, generation=1))
+        self.assertNotEqual(v.MARK_COMPLETE, decision["action"])
 
     def test_a_worker_rejecting_its_own_work_is_caught(self):
         payload = {"schema_version": r.REPORT_SCHEMA_VERSION, "task_id": "t-1", "status": "PASS"}

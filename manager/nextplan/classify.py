@@ -113,6 +113,25 @@ def review_expectation(review_context):
             "job_id": dispatch.get("job_id")}
 
 
+def review_authority_for(result, review_context):
+    """The one place this module asks whether a reviewer output authorizes.
+
+    Round 6 added the reviewer's own decision statements as a second argument to
+    ``contracts.review_authority`` and passed them from ``review_proof`` only.
+    ``signals_for`` went on calling the same contract with the same decisions and
+    a *different* question, so the proof could refuse a contradicted PASS while
+    the signals still read it as authorized. Nothing downstream reconciled the
+    two: they happened to agree only where some other rule already routed the
+    task away from completion.
+
+    A contract that is consulted twice must be consulted the same way both
+    times, so it is consulted here and nowhere else in this module.
+    """
+    context = review_context or {}
+    return contracts.review_authority(result.get("decisions") or (), review_expectation(context),
+                                      result.get("decision_statements") or ())
+
+
 def review_proof(result, review_context):
     """Items a reviewer result must satisfy before it may approve the candidate.
 
@@ -130,8 +149,7 @@ def review_proof(result, review_context):
     """
     context = review_context or {}
     session = context.get("reviewer_session")
-    authority = contracts.review_authority(result.get("decisions") or (), review_expectation(context),
-                                           result.get("decision_statements") or ())
+    authority = review_authority_for(result, context)
     return [
         {"requirement": "a bound reviewer decision authorizes this candidate",
          "ok": authority["authorized"], "reason": authority["reason"], "problems": authority["problems"]},
@@ -203,12 +221,14 @@ def signals_for(result, verification_report, requirements, execution=None, revie
         if session and session in set(context.get("prior_reviewer_sessions") or ()):
             signals.add("review.session_reused")
         # Authority is read from the structured decision, never from the prose.
-        # The prose verdict survives only as annotation: extract still records
-        # it, and a written rejection beside a structured PASS still raises
-        # extract.conflicting_statements, which is merged in above. Withdrawal
-        # widens, authorization narrows -- unchanged from Round 3, but now the
-        # narrow side is a contract rather than a vocabulary.
-        authority = contracts.review_authority(result.get("decisions") or (), review_expectation(context))
+        # The prose verdict survives only as annotation. Withdrawal widens,
+        # authorization narrows -- unchanged from Round 3, but now the narrow
+        # side is a contract rather than a vocabulary.
+        #
+        # Round 7: through review_authority_for, so this path and review_proof
+        # put the reviewer's own decision statements to the contract identically.
+        # Asking the same question two ways was R6-IR-4.
+        authority = review_authority_for(result, context)
         reason = authority["reason"]
         if reason == contracts.REJECTED:
             signals.add("result.review_verdict_fail")

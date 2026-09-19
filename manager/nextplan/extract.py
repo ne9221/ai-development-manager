@@ -389,6 +389,33 @@ _DECISIVE_LABELS = (
     "recommendation", "overall decision", "overall verdict", "my decision", "my verdict",
     "review result", "决定", "決定", "裁決", "裁决", "審查結論", "审查结论",
 )
+# ...and, since Round 7, the finite GRAMMAR those strings were samples of.
+#
+# Round 6 built the copula form as a grammar -- an owner, an optional modifier,
+# a decision noun -- and left the label form as the tuple above. So the same
+# decision, written with a colon instead of a verb, fell outside the contract:
+# "My decision is to reject" was read and "My current decision: reject" was not.
+# Grok 4.6 named six such fields, and a bound PASS beside them completed.
+#
+# The answer is not six more strings. A tuple closes exactly what somebody
+# thought to list, and the next reviewer writes the seventh -- that is how
+# Rounds 2, 3 and 4 were lost, one wording at a time. What a decision field
+# actually is, is a small closed composition:
+#
+#     (owner)? (modifier)* (decision-noun)
+#
+# Every part is a closed set, so the set of accepted fields is finite and
+# stated rather than discovered. NOTHING here touches _REJECT_VALUES: this
+# widens what counts as the *field*, never what counts as a rejection.
+_LABEL_OWNERS = frozenset({"my", "our", "the", "its", "their"})
+_LABEL_MODIFIERS = frozenset({"current", "final", "overall", "review", "reviewer",
+                              "official", "formal", "considered"})
+# Only nouns whose sense IS an announced decision. "result", "status" and
+# "conclusion" are reporting words that may or may not carry one, so they stay
+# in the reporting tier below and are deliberately not promoted by a modifier:
+# "Final result: 3 passed" is a count, and reading it as an unreadable decision
+# would stall an honest review.
+_DECISION_NOUNS = frozenset({"decision", "verdict", "recommendation", "disposition", "outcome"})
 _REPORTING_LABELS = (
     "result", "status", "conclusion", "review conclusion", "assessment", "review status",
     "final status", "judgement", "judgment", "call", "overall", "summary verdict", "結論", "结论",
@@ -407,14 +434,48 @@ _LABEL_LINE = re.compile(
 # PASS" -- a genuine approval from the Round-5 corpus -- is the same shape, which
 # is what makes it a shape rather than a rejection pattern.
 _COPULA_DECISION = re.compile(
-    r"\b(?:my|our|the|its|their)\s+(?P<label>(?:review|final|overall|current)\s+)?"
+    # Built from the same closed sets as the label form above. Round 6 wrote
+    # these alternations out by hand and the two forms drifted apart: neither
+    # knew "reviewer" or "official" as a modifier, and the label form had no
+    # grammar at all. Drifting apart is precisely what R6-IR-1 was.
+    r"\b(?:%s)\s+(?:(?:%s)\s+){0,2}"
     r"(?P<noun>decision|verdict|recommendation|disposition|outcome|call|assessment|conclusion|judgement|judgment)\s+"
-    r"(?:is|was|are|were|remains?|stands?\s+as|will\s+be)\s+(?:to\s+)?(?P<value>[^.;!?\n]{1,40})",
+    r"(?:is|was|are|were|remains?|stands?\s+as|will\s+be)\s+(?:to\s+)?(?P<value>[^.;!?\n]{1,40})"
+    % ("|".join(sorted(_LABEL_OWNERS)), "|".join(sorted(_LABEL_MODIFIERS))),
     re.I
 )
 # Nouns whose sentence form is unambiguously announcing a decision; the rest get
 # the reporting tier's treatment, exactly as their label form does.
-_DECISIVE_NOUNS = frozenset({"decision", "verdict", "recommendation", "disposition", "outcome"})
+_DECISIVE_NOUNS = _DECISION_NOUNS
+
+_DECISIVE, _REPORTING = "decisive", "reporting"
+
+
+def _label_tier(label):
+    """``decisive`` / ``reporting`` / ``None`` for the text before a decision colon.
+
+    The explicit tables are consulted first, so every Round-5 and Round-6 label
+    keeps exactly the tier it had -- both the decisive ones the grammar would
+    not generate ("final call", "approval", "sign off", the Chinese labels) and
+    the reporting ones it must not ("final status", "summary verdict").
+
+    Only then is the composition tried, and only for the decisive tier. A
+    grammar that could invent *reporting* labels would be inventing tolerance,
+    and tolerance is the direction that has to be earned rather than guessed.
+    """
+    if label in _DECISIVE_LABELS:
+        return _DECISIVE
+    if label in _REPORTING_LABELS:
+        return _REPORTING
+    words = label.split()
+    if words and words[0] in _LABEL_OWNERS:
+        words = words[1:]
+    if words and words[-1] in _DECISION_NOUNS and all(w in _LABEL_MODIFIERS for w in words[:-1]):
+        # "my current decision", "the overall disposition", "final outcome".
+        # "the recommendation engine" is not one of them: its head noun is
+        # "engine", which is how an ordinary noun phrase stays ordinary.
+        return _DECISIVE
+    return None
 
 # First person, because "I reject this" carries no colon and is exactly as
 # explicit as "Decision: reject". The object has to be the work under review;
@@ -486,9 +547,10 @@ def decision_statements(text):
             continue
         label = re.sub(r"\s+", " ", match.group("label")).strip().lower().replace("-", " ")
         polarity = _decision_value(match.group("value"))
-        if label in _DECISIVE_LABELS:
+        tier = _label_tier(label)
+        if tier == _DECISIVE:
             statements.append({"raw": line.strip()[:120], "polarity": polarity})
-        elif label in _REPORTING_LABELS and polarity == contracts.STATEMENT_REJECT:
+        elif tier == _REPORTING and polarity == contracts.STATEMENT_REJECT:
             # A reporting label counts only on an unambiguous rejection; its
             # unreadable values are ordinary prose, not a withheld decision.
             statements.append({"raw": line.strip()[:120], "polarity": polarity})
@@ -1147,11 +1209,45 @@ def extract(output):
     prose = "\n".join(line for index, line in enumerate(lines) if index not in consumed)
     # Withdrawal widens: everything outside the agent's own payload counts,
     # including the regions evidence may not be read from. A rule that can only
-    # remove a claim is safe everywhere, and narrowing it to authoritative prose
-    # would hand anyone a bypass -- write the rejection inside a fence.
+    # remove a claim is safe almost everywhere -- ``unfenced`` below is the one
+    # place Round 7 had to draw a line, and only for the reviewer's decision.
+    # ``written`` still feeds the quota / rate-limit heuristics, which read what
+    # happened to the run rather than what anyone decided about it.
     claimed_lines = consumed - fenced_lines - non_evidence
     written = "\n".join(line for index, line in enumerate(lines)
                         if index not in fenced_lines and index not in claimed_lines)
+
+    # The reviewer's own VOICE: ``written``, minus every fenced region.
+    #
+    # Round 3 kept fenced text inside the withdrawal net, because back then a
+    # payload ``review_verdict: PASS`` was a live claim and narrowing the net to
+    # unfenced prose would have handed anyone a bypass -- write the rejection in
+    # a fence and the payload's PASS stands. Round 5 removed that claim (a
+    # payload can no longer authorize anything) and Round 6 narrowed authority to
+    # one fence, so the bypass the net was defending has no way in any more.
+    #
+    # What was left was only its cost, and Grok 4.6 measured it: a bound PASS
+    # beside an ordinary ```json fence quoting ``"verdict": "REJECT"`` -- a
+    # schema example, a transcript, another tool's output -- read as a
+    # contradiction and stalled the task, 5 of 5 fence languages. TRUST-MODEL
+    # 6.4 says in writing that a decision in the wrong fence neither authorizes
+    # NOR blocks; Round 6 implemented only the first half.
+    #
+    # So a fence is quotation or data in BOTH directions. This is the channel
+    # rule, not a weakening of withdrawal: the reviewer's real decision has a
+    # channel of its own, and unfenced prose still withdraws exactly as before.
+    # CLOSED fences only. An unclosed fence is not a quotation -- it is a
+    # malformed one, and its "body" runs to the end of the message. Excluding
+    # that would let a reviewer swallow its own rejection by opening a fence and
+    # never closing it, which is a bypass this rule would otherwise have
+    # created. Reading it costs a round at worst; not reading it costs a
+    # completion.
+    quoted = set()
+    for _lang, _body, closed, indexes in _fence_regions(lines):
+        if closed:
+            quoted.update(indexes)
+    unfenced = "\n".join(line for index, line in enumerate(lines)
+                          if index not in quoted and index not in claimed_lines)
 
     # A positive claim is withdrawn when the same message states the opposite in
     # its own words: a payload saying review_verdict PASS beside a written
@@ -1160,13 +1256,15 @@ def extract(output):
     # Decisions the reviewer announced in prose. Carried on the result rather
     # than folded into a fact, because they are not a claim ADM reasons over:
     # contracts.review_authority consults them, and only to withdraw. They are
-    # read from the same widened region as the withdrawal rules below -- a
-    # reviewer does not get to hide its own decision inside a fence.
+    # read from the reviewer's own voice: prose outside every fence. Round 7
+    # moved both this and the withdrawal check off ``written`` and onto
+    # ``unfenced``; see the note above that region for why a fence is now
+    # quotation in both directions.
     if role == v.REVIEWER:
-        result["decision_statements"] = decision_statements(written)
+        result["decision_statements"] = decision_statements(unfenced)
 
-    token = _CONTRARY_TOKEN.search(written)
-    contrary = rejection_signal(written) or (token.group(0) if token else None)
+    token = _CONTRARY_TOKEN.search(unfenced)
+    contrary = rejection_signal(unfenced) or (token.group(0) if token else None)
     if contrary:
         for field in ("status", "review_verdict"):
             if r.value(result, field) == "PASS" and r.level(result, field) in (v.REPORTED, v.DERIVED):
