@@ -218,11 +218,45 @@ else moved in either direction.
 
 ### Whole repository, base vs head
 
-See §6. Nothing outside `manager/nextplan/` imports the package
-(`grep -rl nextplan` over `manager/**.py`, excluding the package and its tests,
-returns **nothing**), which is Residual 5.3 restated as a measurement: NextPlan
-is not activated anywhere, so the whole-repo run is a lineage and parity check
-rather than a blast-radius check.
+Nothing outside `manager/nextplan/` imports the package (`grep -rl nextplan`
+over `manager/**.py`, excluding the package and its tests, returns **nothing**),
+which is Residual 5.3 restated as a measurement: NextPlan is not activated
+anywhere. So this is a lineage and parity check, not a blast-radius check.
+
+| | base `899d383e` | head `57f8ed7` | delta |
+|---|---|---|---|
+| **collected** | **2938** | **2976** | **+38** |
+| failed (summary line) | 73 | 73 | 0 |
+| `FAILED` tests | 65 | 65 | **identical set** |
+| tests with `SUBFAILED` | 3 | 3 | **identical set** |
+| passed (summary line) | 2872 | 2908 | +36 |
+| skipped | 1 | 1 | 0 |
+| subtests passed | 2033 | 2182 | +149 |
+| wall clock | 1716s | 1594s | |
+
+**The failure sets were diffed both ways and are identical** — no test fails at
+head that passed at base, and none the other way.
+
+**+38 collected is the honest count**, and it is exactly the 37 new Round-7
+tests plus the 1 net new Round-3 test. The summary line's +36 is not a
+discrepancy in the tests: `pytest-subtests` folds subtest outcomes into that
+line, so it over-counts by a different amount at each end (8 at base, 6 at
+head).
+
+**This environment is mildly non-deterministic, and that is stated rather than
+hidden.** The *same* base commit run twice gave `74 failed, 2871 passed` and
+`73 failed, 2872 passed`. A ±1 in the summary line is therefore not
+interpretable here, which is exactly why the identical failure **set** is the
+result being reported and the collected count is the number being trusted.
+
+**This environment is also not the one Round 6 measured in.** Round 6 recorded 5
+whole-repo failures at base; there are 73 here, because this machine has no
+Google credentials, no configured ADM manager HOME and no provider account
+config, so whole families of tests (`manager_home`, `ag_execution`,
+`command_watcher`, `refresh_status`, `phase1_cursor_*`) fail for environmental
+reasons at **both** ends. None of them is NextPlan, none of them changed, and
+the NextPlan-only comparison in the previous section is the one that carries
+information.
 
 ## 5. The one pre-existing assertion this round inverts
 

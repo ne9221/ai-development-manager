@@ -150,6 +150,14 @@ NextPlan suite, both clones pinned at equal path lengths: base **371 passed /
 1626 subtests**, head **409 passed / 1775 subtests**, with the same single
 environmental failure at both ends.
 
+Whole repository: **2938 collected at base, 2976 at head (+38, exactly the new
+tests)**, and the failure sets diffed both ways are **identical** — 65 `FAILED`
+and 3 `SUBFAILED` tests at each end, none of them NextPlan. This environment
+lacks the credentials and manager HOME those families need, so it carries 73
+environmental failures at *both* ends rather than Round 6's 5, and the same base
+commit run twice differs by one. See ROUND-7-EVIDENCE §4 for why the identical
+set and the collected count are the numbers being trusted.
+
 Every security-sensitive case ends at a **planner action**, not a return value.
 
 ## 5. The one behaviour change to an existing test
