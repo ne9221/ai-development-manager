@@ -1,6 +1,6 @@
 # Slice B Evidence — Live ADM_RESULT Wiring
 
-**Status: SLICE_B_IMPLEMENTED — PENDING FRESH INDEPENDENT REVIEW**
+**Status: SLICE_B_IMPLEMENTED — PENDING FRESH INDEPENDENT REVIEW\n\n**Branch tip (pushed):** 16ee5d3a70334c0bb8bd7517769fa427b3335911\n**Local==remote:** YES**
 
 Do not merge / activate / release until a fresh independent review passes.
 Do not self-declare PASS.
