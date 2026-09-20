@@ -14,7 +14,7 @@ Do not merge / activate / release until a fresh independent review passes.
 | PFP identity | tag `pfp-v2.0.9-reviewed` · commit `b9a7afbba6242dabe7c729b8d2e96c9da51d20a4` — **not modified** |
 | Base SHA | `b86773d8aedb1877127114637d2354ec2dc161f9` (NextPlan Round 8: one decision-field grammar, one source) |
 | Branch | `feat/adm-result-producer-contract-20260920` |
-| HEAD (pre-commit) | `b86773d8…` + **untracked** Slice A files only |
+| HEAD (committed) | `677f1a21329c6d218e43fa1927eb93d9f3924482` |
 | Measurement worktree | Linux mirror `/workspace/adm-slice-a-wt` matching Windows `C:\Users\neen9.BOBO\dev\adm-slice-a-20260920` (same branch/HEAD/untracked set). Windows `machineId` Shell was not available to this executor; BASE proof used detached worktree `/workspace/adm-slice-a-base-b86773d8`. |
 
 ## 2. Five allowed paths (only)
@@ -85,14 +85,24 @@ Conceptual BASE comparison: at BASE, `test_adm_result` cannot collect (module ab
 
 Artifacts: `_evidence/regression/test_adm_result.txt`, `test_nextplan.txt`.
 
-## 7. Residuals
+## 7. Commit / push / remote readback
 
-1. **Not committed / not pushed** — parent must commit the five allowed paths.
-2. **Windows machineId Shell unavailable** to this executor; measurements taken on the matching Linux worktree mirror (same git identity and untracked set). Re-run M1–M8 on Windows if the parent requires same-machine attestation.
-3. **Slice B unwired** — no `terminalize_execution` call, no Drive `ADM-RESULTS`, no NextPlan consumer.
-4. **PFP untouched** — identity pinned only; no skill/manifest/protocol edits.
-5. `_evidence/` scratch must stay untracked.
+| item | value |
+|------|-------|
+| Commit | `677f1a21329c6d218e43fa1927eb93d9f3924482` |
+| Branch | `feat/adm-result-producer-contract-20260920` |
+| Push | `origin/feat/adm-result-producer-contract-20260920` |
+| Local == remote | **YES** (`git ls-remote` + `gh api repos/.../git/ref/heads/...`) |
+| Blob `manager/adm_result.py` | git blob sha `89790ebf1e158863326b2070a3a1acb7bf6282e4`, size 48979 |
+| Blob `schema/adm_result.schema.json` | git blob sha `3bacc9e0fa24c8030e86f8a82519ac7b6e60698d`, size 29075 |
 
-## 8. Final status
+## 8. Residuals
+
+1. **Windows M1–M8 re-attest optional** — primary measurements on Linux mirror of the same untracked set; Windows used for commit/push and targeted green (88/842).
+2. **Slice B unwired** — no `terminalize_execution` call, no Drive `ADM-RESULTS`, no NextPlan consumer.
+3. **PFP untouched** — identity pinned only; no skill/manifest/protocol edits.
+4. `_evidence/` scratch must stay untracked.
+
+## 9. Final status
 
 **SLICE_A_IMPLEMENTED — PENDING FRESH INDEPENDENT REVIEW**
