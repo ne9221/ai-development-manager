@@ -436,7 +436,7 @@ def persist_terminal(store, service, project_id, execution_id, status="completed
     elapsed = max(0, (parse_time(completed_at) - parse_time(execution["started_at"])).total_seconds() / 60)
     after = quota_snapshot(read_drive_status(service=service), execution["provider"])
     execution.update(
-        completed_at=completed_at, elapsed_minutes=round(elapsed, 6), status=status,
+        completed_at=completed_at, elapsed_minutes=int(round(float(elapsed))), status=status,
         finished_at=completed_at,
         quota_after=after, quota_delta=quota_delta(execution["quota_before"], after, execution["started_at"], completed_at),
         heartbeat_at=completed_at, progress_updated_at=completed_at,

@@ -91,6 +91,7 @@ def to_nextplan_event(result, *, generation: int, session_id=None, agent=None, p
     if normalized is None:
         normalized = r.blank_result(event_id, task_id, role, tier="none",
                                     raw_sha256=(validated.get("agent_output") or {}).get("sha256") or ("0" * 64))
+        # Do NOT set status=PASS from execution.completed — that would be prose/status laundering.
     event = {
         "event_id": event_id,
         "task_id": task_id,
@@ -129,6 +130,7 @@ def plan_from_adm_result(state, result, *, generation, atlas=None, pointer=None,
         event = to_nextplan_event(result, generation=generation, session_id=session_id, agent=agent, pointer=pointer)
     except AdapterError as exc:
         if not allow_missing:
+            # Synthesize a failure-shaped decision via planner findings injection
             failure_event = {
                 "event_id": f"adapter-error-{(pointer or {}).get('result_id') or 'missing'}",
                 "task_id": state["task_id"],
@@ -139,6 +141,9 @@ def plan_from_adm_result(state, result, *, generation, atlas=None, pointer=None,
                 "orchestration_signals": [{"code": exc.code, "signals": exc.signals}],
                 "failure_code_hint": exc.code,
             }
+            # Prefer atlas-driven failure if code known
+            findings = [{"code": exc.code, "signals": exc.signals}]
+            decide = planner._Decision(state, failure_event, atlas).decide if False else None
             decision = planner.plan(state, {
                 "event_id": failure_event["event_id"],
                 "task_id": state["task_id"],
@@ -146,8 +151,9 @@ def plan_from_adm_result(state, result, *, generation, atlas=None, pointer=None,
                 "role": v.WORKER,
                 "generation": generation,
                 "result": failure_event["result"],
-                "orchestration_signals": [{"code": exc.code, "signals": exc.signals}],
+                "orchestration_signals": findings,
             }, atlas=atlas)
+            # If planner did not map the code, force HUMAN_GATE
             if decision["action"] in (v.MARK_COMPLETE,):
                 decision = {
                     **decision,
@@ -159,12 +165,14 @@ def plan_from_adm_result(state, result, *, generation, atlas=None, pointer=None,
             return decision, failure_event
         raise
     decision = planner.plan(state, event, atlas=atlas)
+    # Hard refuse MARK_COMPLETE when review required but not authorized / missing candidate
     adm = event["adm_result"]
     if decision["action"] == v.MARK_COMPLETE:
         if adm.get("pfp_required") and not adm.get("pfp_evidence"):
             decision = {**decision, "action": v.HUMAN_GATE, "next_state": v.HUMAN_GATE,
                         "failure_code": "pfp_deferred", "reason": "PFP required"}
         if adm["role"] == v.WORKER and state.get("requirements", {}).get("requires_review"):
+            # Worker alone must not complete when review required
             decision = {**decision, "action": v.SEND_TO_REVIEW, "next_state": v.AWAITING_REVIEW,
                         "reason": "worker adm-result alone cannot MARK_COMPLETE when review required"}
     return decision, event

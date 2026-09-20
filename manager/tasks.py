@@ -19,7 +19,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 
 ROOT_FOLDER_ID = "1pXvl8BglU05ZrXMHIVIDyK-lOWNShXSO"
-ROOT_FOLDERS = {"tasks": "TASKS", "handoffs": "HANDOFFS", "history": "TASK-HISTORY", "projects": "PROJECTS", "executions": "EXECUTIONS", "sessions": "SESSIONS", "session_reviews": "SESSION-REVIEWS", "overviews": "OVERVIEWS", "worktree_locks": "WORKTREE-LOCKS", "commands": "COMMANDS"}
+ROOT_FOLDERS = {"tasks": "TASKS", "handoffs": "HANDOFFS", "history": "TASK-HISTORY", "projects": "PROJECTS", "executions": "EXECUTIONS", "sessions": "SESSIONS", "session_reviews": "SESSION-REVIEWS", "overviews": "OVERVIEWS", "worktree_locks": "WORKTREE-LOCKS", "commands": "COMMANDS", "adm_results": "ADM-RESULTS"}
 SCHEMAS = {name: Path(__file__).parents[1] / "schema" / f"{name}.schema.json" for name in ("project", "project_preview", "task", "handoff", "execution", "session", "session_review", "overview", "worktree_lock", "worktree_lock_registry", "command", "dispatch_request")}
 MIME_JSON = "application/json"
 MIME_FOLDER = "application/vnd.google-apps.folder"
@@ -207,6 +207,40 @@ class DriveRecords:
         if remote != raw:
             raise TaskError(f"Drive fixed-ID verification failed: {filename}")
         return document
+
+
+    def put_raw_with_fixed_file_id(self, area, project_id, name, raw_bytes, drive_file_id):
+        """Create-only raw-bytes write for ADM-RESULTS canonical payloads.
+
+        Unlike put_with_fixed_file_id (JSON pretty-print documents), this stores
+        the exact bytes supplied so adm-result readback digests match.
+        """
+        from googleapiclient.http import MediaIoBaseUpload
+        drive_file_id = safe_id(drive_file_id)
+        parent = self.project_folder(area, project_id)
+        filename = self.record_filename(name)
+        raw = bytes(raw_bytes)
+        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=MIME_JSON, resumable=False)
+        try:
+            self.files.create(
+                body={"id": drive_file_id, "name": filename, "parents": [parent], "mimeType": MIME_JSON},
+                media_body=media,
+                fields="id"
+            ).execute()
+        except Exception as exc:
+            try:
+                remote = self.files.get_media(fileId=drive_file_id).execute()
+            except Exception:
+                raise TaskError(f"Drive fixed-ID raw create failed: {filename} ({exc})") from exc
+            if remote == raw:
+                return raw
+            raise TaskError(
+                f"Drive fixed-ID raw conflict: record {filename} with id {drive_file_id} already exists with conflicting payload"
+            )
+        remote = self.files.get_media(fileId=drive_file_id).execute()
+        if remote != raw:
+            raise TaskError(f"Drive fixed-ID raw verification failed: {filename}")
+        return raw
 
     def get_by_file_id(self, drive_file_id):
         try:

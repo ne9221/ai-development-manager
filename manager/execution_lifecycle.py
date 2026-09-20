@@ -12,7 +12,7 @@ from manager.worktree_locks import active, acquire, canonical_baseline, canonica
 
 
 _PERSISTENCE_RANK = {"incomplete": 0, "partial": 1, "complete": 2}
-_PERSISTED_ORDER = ["execution", "handoff", "task"]
+_PERSISTED_ORDER = ["execution", "adm_result", "handoff", "task"]
 _WRITER_RELEASE_STICKY = ("released", "not_required")
 
 
@@ -788,7 +788,7 @@ def retry_incomplete_terminal_persistence(store, project_id, task_id, execution_
         return False
 
 
-def terminalize_execution(store, service, writer_registry, claim_registry, project_id, task_id, execution_id, provider, status, claim_generation, provider_stopped, lease_token=None, completed_at=None, summary=None, writer_authority_released=False):
+def terminalize_execution(store, service, writer_registry, claim_registry, project_id, task_id, execution_id, provider, status, claim_generation, provider_stopped, lease_token=None, completed_at=None, summary=None, writer_authority_released=False, result_store=None, validation_registry=None, command=None):
     if status not in ("completed", "failed", "interrupted"):
         raise TaskError(f"invalid terminal execution status: {status}")
     if provider_stopped is not True:
@@ -827,6 +827,15 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
         persisted.append("execution")
         task = store.get("tasks", project_id, task_id)
 
+        # Slice B: produce + persist adm-result and attach adm_result_ref BEFORE
+        # the terminal bind / Handoff / Task materialization so the same epoch
+        # carries the immutable result pointer (Fable ADM_RESULT_AUTHORITY).
+        from manager import adm_result_live
+        terminal, adm_ref, _adm_result = adm_result_live.attach_terminal_adm_result(
+            store, terminal, result_store=result_store, validation_registry=validation_registry, command=command)
+        if adm_ref is not None:
+            persisted.append("adm_result")
+
         # P0-1 fix: commit the terminal proposal as this epoch's GCS-bound
         # winner BEFORE any Handoff/Task write -- Drive is only ever a
         # projection of this bind, identically on this normal path and on
@@ -847,7 +856,8 @@ def terminalize_execution(store, service, writer_registry, claim_registry, proje
             handoff_drive_id_factory = _resolve_handoff_drive_id_factory(store, project_id, handoff_id_preview)
             try:
                 bound_document, _generation = task_root.commit_terminal_bind(
-                    claim_registry, project_id, task_id, terminal, handoff_drive_id_factory=handoff_drive_id_factory)
+                    claim_registry, project_id, task_id, terminal, handoff_drive_id_factory=handoff_drive_id_factory,
+                    adm_result_ref=terminal.get("adm_result_ref"))
             except task_root.TerminalProposalLost as exc:
                 raise TaskError(f"terminal commit lost to execution {exc.winner.get('execution_id')}: fail closed") from exc
             except task_root.TerminalProposalConflict as exc:

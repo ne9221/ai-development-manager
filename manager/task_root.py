@@ -87,6 +87,8 @@ _BIND_IMMUTABLE_FIELDS = (
     "schema_version", "canonicalization_version", "canonical_proposal", "proposal_hash",
     "terminal_fence_epoch", "task_projection_drive_id", "handoff_drive_file_id",
     "expected_task_projection_digest", "expected_handoff_projection_digest",
+    # Slice B: adm-result pointer bound in the same terminal authority epoch
+    "result_id", "result_digest", "adm_result_drive_file_id",
 )
 
 
@@ -471,7 +473,8 @@ def validate_task_root_running_authority(claim, project_id, task_id, execution_i
 
 def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id_factory=None,
                          handoff_drive_id_factory=None, expected_task_projection=None,
-                         expected_handoff_projection=None, attempts=DEFAULT_ATTEMPTS):
+                         expected_handoff_projection=None, adm_result_ref=None,
+                         attempts=DEFAULT_ATTEMPTS):
     """CAS-bind this execution's terminal proposal as its epoch's winner.
 
     Same epoch + identical canonical proposal -> idempotent (returns the
@@ -556,6 +559,7 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
                 fresh_task_drive_id = task_drive_id_factory()
             if fresh_handoff_drive_id is None and handoff_drive_id_factory is not None:
                 fresh_handoff_drive_id = handoff_drive_id_factory()
+            ref = adm_result_ref or (execution.get("adm_result_ref") if isinstance(execution, dict) else None) or {}
             bind = {
                 "project_id": project_id, "task_id": task_id, "epoch": epoch,
                 "execution_id": execution_id, "retry_count": proposal["retry_count"],
@@ -569,6 +573,9 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
                 "task_projection_drive_id": fresh_task_drive_id, "handoff_drive_file_id": fresh_handoff_drive_id,
                 "expected_task_projection_digest": projection_digest(expected_task_projection) if expected_task_projection is not None else None,
                 "expected_handoff_projection_digest": projection_digest(expected_handoff_projection) if expected_handoff_projection is not None else None,
+                "result_id": ref.get("result_id"),
+                "result_digest": ref.get("result_digest"),
+                "adm_result_drive_file_id": ref.get("drive_file_id"),
             }
             new_document = {**document, "terminal": bind}
             try:
@@ -587,6 +594,16 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
                 raise TerminalProposalConflict(
                     "terminal proposal conflicts with the already-bound proposal for this epoch",
                     {"bound_proposal_hash": existing_bind.get("proposal_hash"), "candidate_proposal_hash": proposal_h})
+            ref = adm_result_ref or (execution.get("adm_result_ref") if isinstance(execution, dict) else None) or {}
+            if ref:
+                for key, field in (("result_id", "result_id"), ("result_digest", "result_digest"),
+                                   ("drive_file_id", "adm_result_drive_file_id")):
+                    bound = existing_bind.get(field)
+                    incoming = ref.get(key)
+                    if bound is not None and incoming is not None and bound != incoming:
+                        raise TerminalProposalConflict(
+                            "adm-result pointer conflicts with the already-bound terminal epoch",
+                            {"bound_" + field: bound, "candidate_" + field: incoming})
 
         updates = {}
         if fresh_task_drive_id is None and task_drive_id_factory is not None and existing_bind.get("task_projection_drive_id") is None:
@@ -601,6 +618,11 @@ def commit_terminal_bind(registry, project_id, task_id, execution, task_drive_id
             updates["expected_task_projection_digest"] = projection_digest(expected_task_projection)
         if expected_handoff_projection is not None and existing_bind.get("expected_handoff_projection_digest") is None:
             updates["expected_handoff_projection_digest"] = projection_digest(expected_handoff_projection)
+        ref = adm_result_ref or (execution.get("adm_result_ref") if isinstance(execution, dict) else None) or {}
+        if ref.get("result_id") is not None and existing_bind.get("result_id") is None:
+            updates["result_id"] = ref["result_id"]
+            updates["result_digest"] = ref.get("result_digest")
+            updates["adm_result_drive_file_id"] = ref.get("drive_file_id")
         if not updates:
             return document, generation
 
