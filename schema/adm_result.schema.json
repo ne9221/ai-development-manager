@@ -1,0 +1,517 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "adm://schema/adm_result.schema.json",
+  "title": "ADM result (adm-result/v1)",
+  "description": "One immutable record of execution/review TRUTH for one terminal execution attempt, produced by manager/adm_result.py under the authority of manager.execution_lifecycle.terminalize_execution (Slice B wires that; Slice A defines and proves the producer contract only). The object is CLOSED at every level: an unknown key anywhere is a validation failure, never silently kept, because a key ADM has no rule for cannot be shown to be harmless. It carries NO acceptance state and NO next action -- execution status and acceptance are orthogonal (a completed worker may still need repair), and planning is derived later, deterministically, by the NextPlan consumer from these facts. Every SHA that could authorize anything (candidate, review target, validation counts) comes from ADM-owned evidence; provider prose is carried only as a digest-bound reference. Referenced schemas (ai_result.schema.json, adm_review_result.schema.json) are the existing closed contracts, reused rather than duplicated.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "result_id",
+    "result_digest",
+    "produced_at",
+    "producer",
+    "identity",
+    "lineage",
+    "repository",
+    "candidate",
+    "actor",
+    "execution",
+    "agent_output",
+    "normalized_result",
+    "verification",
+    "tests",
+    "review",
+    "quota",
+    "pfp",
+    "human_gate",
+    "warnings"
+  ],
+  "properties": {
+    "schema": {"const": "adm-result/v1"},
+    "result_id": {
+      "type": "string",
+      "pattern": "^ar-[0-9a-f]{64}$",
+      "description": "\"ar-\" + sha256 over the length-prefixed tuple (project_id, task_id, execution_id, retry_count, role); see manager.adm_result.result_id_for. Deterministic: the same immutable identity tuple always yields the same result_id, and retry_count participates because the Command Watcher reuses an execution_id across retries."
+    },
+    "result_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "sha256 of the canonical serialization of this object with result_digest itself removed (the only excluded field). Same result_id with a different result_digest is a CONFLICT and is never overwritten."
+    },
+    "produced_at": {"$ref": "#/$defs/date_time"},
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module", "version", "authority"],
+      "properties": {
+        "module": {"const": "manager.adm_result"},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "authority": {"const": "manager.execution_lifecycle.terminalize_execution"}
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_id", "task_id", "execution_id", "retry_count", "role", "command_id"],
+      "properties": {
+        "project_id": {"type": "string", "minLength": 1},
+        "task_id": {"type": "string", "minLength": 1},
+        "execution_id": {"type": "string", "minLength": 1},
+        "retry_count": {"type": "integer", "minimum": 0},
+        "role": {"enum": ["worker", "reviewer"]},
+        "command_id": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9._-]{1,160}$",
+          "description": "The Command record that launched this execution (schema/command.schema.json command_id). null only when the execution was not launched from a Command record; never invented."
+        }
+      }
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trigger", "retry_of_execution_id", "repair_of_execution_id", "continues_execution_id", "reviews_execution_id", "reviewer_run_id"],
+      "properties": {
+        "trigger": {"enum": ["initial", "retry", "repair", "continuation", "review"]},
+        "retry_of_execution_id": {"$ref": "#/$defs/nullable_identifier"},
+        "repair_of_execution_id": {"$ref": "#/$defs/nullable_identifier"},
+        "continues_execution_id": {"$ref": "#/$defs/nullable_identifier"},
+        "reviews_execution_id": {"$ref": "#/$defs/nullable_identifier"},
+        "reviewer_run_id": {"$ref": "#/$defs/nullable_identifier"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"trigger": {"const": "initial"}}},
+          "then": {"properties": {
+            "retry_of_execution_id": {"type": "null"}, "repair_of_execution_id": {"type": "null"},
+            "continues_execution_id": {"type": "null"}, "reviews_execution_id": {"type": "null"}, "reviewer_run_id": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"trigger": {"const": "retry"}}},
+          "then": {"properties": {
+            "retry_of_execution_id": {"type": "string"}, "repair_of_execution_id": {"type": "null"},
+            "continues_execution_id": {"type": "null"}, "reviews_execution_id": {"type": "null"}, "reviewer_run_id": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"trigger": {"const": "repair"}}},
+          "then": {"properties": {
+            "retry_of_execution_id": {"type": "null"}, "repair_of_execution_id": {"type": "string"},
+            "continues_execution_id": {"type": "null"}, "reviews_execution_id": {"type": "null"}, "reviewer_run_id": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"trigger": {"const": "continuation"}}},
+          "then": {"properties": {
+            "retry_of_execution_id": {"type": "null"}, "repair_of_execution_id": {"type": "null"},
+            "continues_execution_id": {"type": "string"}, "reviews_execution_id": {"type": "null"}, "reviewer_run_id": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"trigger": {"const": "review"}}},
+          "then": {"properties": {
+            "retry_of_execution_id": {"type": "null"}, "repair_of_execution_id": {"type": "null"},
+            "continues_execution_id": {"type": "null"}, "reviews_execution_id": {"type": "string"}, "reviewer_run_id": {"type": "string"}}}
+        }
+      ],
+      "description": "Exactly the link implied by the trigger is present; every other link is null. RETRY is a rerun of the same intended work (transient/provider/environment cause), retry_count > 0, never a source-changing repair. REPAIR is a new execution answering failed verification and names the execution it repairs without overwriting it. CONTINUATION continues an execution. REVIEW binds a reviewer execution to the worker execution it reviewed AND to the ADM-issued reviewer_run_id. There is no vague 'rerun' trigger."
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "branch", "base_sha", "worktree_path", "worktree_identity"],
+      "properties": {
+        "repository": {"type": "string", "pattern": "^github:[a-z0-9_.-]+/[a-z0-9_.-]+$"},
+        "branch": {"type": "string", "pattern": "^refs/heads/.+$"},
+        "base_sha": {"$ref": "#/$defs/sha40"},
+        "worktree_path": {"type": "string", "minLength": 1},
+        "worktree_identity": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["worktree_id", "branch", "branch_short"],
+              "properties": {
+                "worktree_id": {"type": "string", "minLength": 1},
+                "branch": {"type": "string", "pattern": "^refs/heads/.+$"},
+                "branch_short": {"type": "string", "minLength": 1}
+              }
+            }
+          ]
+        }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_sha", "source", "push_status", "remote_sha"],
+      "properties": {
+        "candidate_sha": {"$ref": "#/$defs/nullable_sha40"},
+        "source": {"enum": ["repo_write_evidence", "dispatch_record", "none"]},
+        "push_status": {"enum": ["verified", "not_applicable", "not_observed"]},
+        "remote_sha": {"$ref": "#/$defs/nullable_sha40"}
+      },
+      "allOf": [
+        {"if": {"properties": {"push_status": {"const": "verified"}}},
+         "then": {"properties": {"candidate_sha": {"type": "string"}, "remote_sha": {"type": "string"}}}},
+        {"if": {"properties": {"push_status": {"const": "not_applicable"}}},
+         "then": {"properties": {"candidate_sha": {"type": "null"}, "remote_sha": {"type": "null"}}}},
+        {"if": {"properties": {"push_status": {"const": "not_observed"}}},
+         "then": {"properties": {"candidate_sha": {"type": "string"}, "remote_sha": {"type": "null"}, "source": {"const": "dispatch_record"}}}},
+        {"if": {"properties": {"source": {"const": "none"}}},
+         "then": {"properties": {"push_status": {"const": "not_applicable"}}}}
+      ],
+      "description": "The commit this result is about. Authority comes only from ADM-owned evidence: the execution record's repo_write_evidence (final_commit_sha with verified push and remote readback) or the authoritative dispatch record ADM holds for a reviewer. A provider saying 'I pushed abc123' is not a source. 'verified' means candidate_sha == remote_sha was read back from the remote by ADM."
+    },
+    "actor": {"$ref": "#/$defs/actor"},
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "started_at", "completed_at", "terminal_reason", "failure_classification", "cleanup", "record_sha256"],
+      "properties": {
+        "status": {"enum": ["completed", "failed", "interrupted"], "description": "Only terminal states. reserved/running/cancelled executions never produce an adm-result. Execution success is NOT acceptance."},
+        "started_at": {"$ref": "#/$defs/date_time"},
+        "completed_at": {"$ref": "#/$defs/date_time"},
+        "terminal_reason": {"type": ["string", "null"], "maxLength": 300},
+        "failure_classification": {"type": ["string", "null"], "minLength": 1, "maxLength": 100, "description": "Structured failure class (Command.result.error_kind vocabulary). A reviewer that could not work is a FAILED execution with a classification such as blocked_environment -- never a review verdict."},
+        "cleanup": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["persistence", "persisted", "task_claim_release", "writer_release", "provider_outcome", "errors", "terminal_at", "session_id", "error_kind", "cleanup_sha256"],
+              "properties": {
+                "persistence": {"type": ["string", "null"]},
+                "persisted": {"oneOf": [{"type": "null"}, {"type": "array", "items": {"type": "string"}}]},
+                "task_claim_release": {"type": ["string", "null"]},
+                "writer_release": {"type": ["string", "null"]},
+                "provider_outcome": {"type": ["string", "null"]},
+                "errors": {"type": "array", "items": {"type": "string"}},
+                "terminal_at": {"type": ["string", "null"]},
+                "session_id": {"type": ["string", "null"]},
+                "error_kind": {"type": ["string", "null"]},
+                "cleanup_sha256": {"$ref": "#/$defs/sha256", "description": "sha256 of the canonical serialization of the whole cleanup_evidence object, so keys this projection does not carry are still bound."}
+              }
+            }
+          ]
+        },
+        "record_sha256": {"$ref": "#/$defs/sha256", "description": "sha256 of manager.adm_result.canonical_bytes(execution_record): the authoritative execution record under the one canonicalization rule this contract defines."}
+      },
+      "allOf": [
+        {"if": {"properties": {"status": {"const": "completed"}}}, "then": {"properties": {"failure_classification": {"type": "null"}}}}
+      ]
+    },
+    "agent_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "sha256"],
+      "properties": {
+        "ref": {"type": ["string", "null"], "minLength": 1},
+        "sha256": {"$ref": "#/$defs/nullable_sha256"}
+      },
+      "allOf": [
+        {"if": {"properties": {"ref": {"type": "string"}}}, "then": {"properties": {"sha256": {"type": "string"}}}},
+        {"if": {"properties": {"ref": {"type": "null"}}}, "then": {"properties": {"sha256": {"type": "null"}}}}
+      ],
+      "description": "Reference + digest of the raw provider output. Evidence, never authority: nothing in this contract is parsed out of it."
+    },
+    "normalized_result": {
+      "oneOf": [{"type": "null"}, {"$ref": "adm://schema/ai_result.schema.json"}],
+      "description": "The existing adm-normalized-result/1 object (manager/nextplan/result.py), reused as-is. Evidence with per-fact levels; not acceptance."
+    },
+    "verification": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["probes_run", "probes_unavailable", "observations", "signals", "verified_result"],
+          "properties": {
+            "probes_run": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "probes_unavailable": {"type": "array", "items": {
+              "type": "object", "additionalProperties": false, "required": ["probe", "reason"],
+              "properties": {"probe": {"type": "string", "minLength": 1}, "reason": {"type": "string"}}}},
+            "observations": {"type": "array", "items": {"$ref": "#/$defs/observation"}},
+            "signals": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "verified_result": {"oneOf": [{"type": "null"}, {"$ref": "adm://schema/ai_result.schema.json"}]}
+          }
+        }
+      ],
+      "description": "manager.nextplan.verify output, carried verbatim in shape: probes run, probe observations, signals and the folded verified result. No second verification engine."
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["validation_runs", "legacy_steps", "tests_status"],
+      "properties": {
+        "validation_runs": {"type": "array", "items": {"$ref": "#/$defs/validation_run"}},
+        "legacy_steps": {"type": "array", "items": {"$ref": "#/$defs/legacy_step"}},
+        "tests_status": {"enum": ["passed", "failed", "unproven", "not_required", "not_observed"], "description": "Derived only from observed exit codes: 'failed' if any observed run failed or timed out; 'unproven' if a validation run's exit status was not observed by ADM; 'passed' if every run was observed and exited 0; 'not_required' only when the execution record itself says so; 'not_observed' when there is no test evidence at all."}
+      },
+      "description": "Authoritative runs (validation_runs, counts only from ADM's ExecutionRegistry entry) are kept apart from legacy shell-string steps (legacy_steps, exit state only, structurally unable to carry counts). No mutation evidence: PFP owns that separately. No universal base/head regression requirement."
+    },
+    "review": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["expectation", "reviewer_actor", "worker_actor", "reviewer_separation", "decisions", "decision_statements", "authority", "blocking_findings", "residual_findings", "evidence_artifact", "reviewed_at"],
+          "properties": {
+            "expectation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["target_sha", "reviewer_run_id", "provider", "job_id"],
+              "properties": {
+                "target_sha": {"$ref": "#/$defs/nullable_sha40"},
+                "reviewer_run_id": {"$ref": "#/$defs/nullable_identifier"},
+                "provider": {"$ref": "#/$defs/nullable_identifier"},
+                "job_id": {"$ref": "#/$defs/nullable_identifier"}
+              },
+              "description": "manager.nextplan.classify.review_expectation shape: what ADM itself knows a valid decision must match."
+            },
+            "reviewer_actor": {"$ref": "#/$defs/actor"},
+            "worker_actor": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/actor"}]},
+            "reviewer_separation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["session_differs", "account_differs", "provider_differs", "freshness"],
+              "properties": {
+                "session_differs": {"type": ["boolean", "null"]},
+                "account_differs": {"type": ["boolean", "null"]},
+                "provider_differs": {"type": ["boolean", "null"]},
+                "freshness": {"enum": ["fresh", "same_session", "unknown"]}
+              },
+              "description": "Mechanical comparison of reviewer_actor against worker_actor; null where a side is unknown. Whether provider/account separation is REQUIRED is task/PFP-tier dependent and decided by the consumer, except that PFP-required review fails closed at production without it."
+            },
+            "decisions": {"type": "array", "items": {"$ref": "adm://schema/adm_review_result.schema.json"}},
+            "decision_statements": {"type": "array", "items": {
+              "type": "object", "additionalProperties": false, "required": ["raw", "polarity"],
+              "properties": {"raw": {"type": "string"}, "polarity": {"enum": ["reject", "approve", "unreadable"]}}}},
+            "authority": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["authorized", "blocked", "verdict", "reason", "problems", "considered"],
+              "properties": {
+                "authorized": {"type": "boolean"},
+                "blocked": {"type": "boolean"},
+                "verdict": {"enum": ["PASS", "REJECT", null]},
+                "reason": {"enum": ["authorized", "rejected", "conflict", "invalid", "absent"]},
+                "problems": {"type": "array", "items": {"type": "string"}},
+                "considered": {"type": "integer", "minimum": 0}
+              },
+              "description": "Exactly manager.nextplan.contracts.review_authority(decisions, expectation, decision_statements); recomputed on validation and must match."
+            },
+            "blocking_findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+            "residual_findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+            "evidence_artifact": {"$ref": "#/$defs/evidence_ref"},
+            "reviewed_at": {"$ref": "#/$defs/date_time"}
+          }
+        }
+      ],
+      "description": "Present exactly when the result belongs to a completed reviewer execution. Verdicts are PASS or REJECT only (adm-review-result/v1). BLOCKED_ENVIRONMENT is not a verdict: it is a failed reviewer execution with a failure_classification."
+    },
+    "quota": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "source_confidence", "snapshots"],
+      "properties": {
+        "status": {"enum": ["observed", "not_observed"]},
+        "source_confidence": {"type": ["string", "null"]},
+        "snapshots": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["before", "after", "delta"],
+          "properties": {
+            "before": {"$ref": "#/$defs/nullable_sha256"},
+            "after": {"$ref": "#/$defs/nullable_sha256"},
+            "delta": {"$ref": "#/$defs/nullable_sha256"}
+          }
+        }
+      },
+      "description": "Evidence only: digests of the execution record's own quota_before/quota_after/quota_delta objects and its source_confidence. Nothing here is a provider availability claim, and no routing is decided from it."
+    },
+    "pfp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "basis", "evidence"],
+      "properties": {
+        "required": {"type": "boolean"},
+        "basis": {"type": "string", "minLength": 1},
+        "evidence": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["record_id", "record_sha256", "identity"],
+              "properties": {
+                "record_id": {"type": "string", "minLength": 1},
+                "record_sha256": {"$ref": "#/$defs/sha256"},
+                "identity": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["protocol", "version", "commit", "skill_sha256", "manifest_sha256"],
+                  "properties": {
+                    "protocol": {"const": "production-fix-protocol"},
+                    "version": {"type": "string", "minLength": 1},
+                    "commit": {"$ref": "#/$defs/sha40"},
+                    "skill_sha256": {"$ref": "#/$defs/sha256"},
+                    "manifest_sha256": {"$ref": "#/$defs/sha256"}
+                  },
+                  "description": "The AI-DEVELOPMENT-RULES 47.6 canonical identity tuple. Must equal the tuple pinned in manager.adm_result.PFP_CANONICAL_IDENTITY."
+                }
+              }
+            }
+          ]
+        }
+      },
+      "description": "Protocol evidence, not a competing result authority. required + evidence null is representable here and is fail-closed for the future consumer; no acceptance is inferred from it by the producer."
+    },
+    "human_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "reason", "evidence_ref"],
+      "properties": {
+        "required": {"type": "boolean"},
+        "reason": {"type": ["string", "null"], "minLength": 1},
+        "evidence_ref": {"type": ["string", "null"], "minLength": 1}
+      },
+      "description": "Evidence and reason only. Not a planner command: there is no next_action and no fabricated human decision."
+    },
+    "warnings": {"type": "array", "items": {"type": "string", "minLength": 1}}
+  },
+  "$defs": {
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "nullable_sha40": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nullable_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "identifier": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"},
+    "nullable_identifier": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"},
+    "date_time": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"},
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "account_id", "session_id", "provider_session_id", "model", "mode", "effort"],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "account_id": {"type": ["string", "null"], "minLength": 1},
+        "session_id": {"type": ["string", "null"], "minLength": 1},
+        "provider_session_id": {"type": ["string", "null"], "minLength": 1},
+        "model": {"type": ["string", "null"], "minLength": 1},
+        "mode": {"type": ["string", "null"], "minLength": 1},
+        "effort": {"type": ["string", "null"], "minLength": 1}
+      },
+      "description": "Execution record field semantics (schema/execution.schema.json); model from the Command record. null is the honest value where the record has none; nothing is fabricated."
+    },
+    "evidence_ref": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "object", "additionalProperties": false, "required": ["ref", "sha256"],
+         "properties": {"ref": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}}
+      ]
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "severity", "file", "line"],
+      "properties": {
+        "summary": {"type": "string", "minLength": 1},
+        "severity": {"enum": ["blocking", "high", "medium", "low", "info", null]},
+        "file": {"type": ["string", "null"]},
+        "line": {"type": ["integer", "null"]}
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "outcome", "observed", "probe", "detail"],
+      "properties": {
+        "field": {"type": "string", "minLength": 1},
+        "outcome": {"enum": ["VERIFIED", "CONTRADICTED", "UNKNOWN"]},
+        "observed": {},
+        "probe": {"type": "string", "minLength": 1},
+        "detail": {"type": ["string", "null"]}
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "failed", "skipped"],
+      "properties": {
+        "passed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "skipped": {"type": "integer", "minimum": 0}
+      }
+    },
+    "registry_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["execution_id", "task_id", "run_id", "argv_sha256", "artifact_sha256", "counts", "exit_code", "started", "timed_out", "issued_by_adm"],
+      "properties": {
+        "execution_id": {"$ref": "#/$defs/identifier"},
+        "task_id": {"type": ["string", "null"]},
+        "run_id": {"type": ["string", "null"]},
+        "argv_sha256": {"$ref": "#/$defs/sha256"},
+        "artifact_sha256": {"$ref": "#/$defs/nullable_sha256"},
+        "counts": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/counts"}]},
+        "exit_code": {"type": ["integer", "null"]},
+        "started": {"type": "boolean"},
+        "timed_out": {"type": "boolean"},
+        "issued_by_adm": {"type": "boolean"}
+      },
+      "description": "Projection of ADM's own manager.nextplan.runner.ExecutionRegistry entry. The ONLY source of counts."
+    },
+    "validation_block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "execution_id", "argv", "runner", "started", "exit_code", "timed_out", "tests", "artifact_sha256", "block_sha256"],
+      "properties": {
+        "schema": {"const": "adm-validation-result/v1"},
+        "execution_id": {"$ref": "#/$defs/identifier"},
+        "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "runner": {"type": "string", "minLength": 1},
+        "started": {"const": true},
+        "exit_code": {"type": "integer"},
+        "timed_out": {"type": "boolean"},
+        "tests": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/counts"}]},
+        "artifact_sha256": {"$ref": "#/$defs/nullable_sha256"},
+        "block_sha256": {"$ref": "#/$defs/sha256", "description": "sha256 of the canonical serialization of the full issued block, so nothing outside this closed projection is hidden."}
+      },
+      "description": "Closed projection of the issued/bound adm-validation-result/v1 block. Its tests field is the adapter's audit copy and is never the source of counts."
+    },
+    "validation_run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["execution_id", "argv", "argv_sha256", "runner", "bound", "exit_observed", "exit_code", "timed_out", "registry", "problems", "block"],
+      "properties": {
+        "execution_id": {"$ref": "#/$defs/identifier"},
+        "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "argv_sha256": {"$ref": "#/$defs/sha256"},
+        "runner": {"type": "string", "minLength": 1},
+        "bound": {"type": "boolean"},
+        "exit_observed": {"type": "boolean"},
+        "exit_code": {"type": ["integer", "null"]},
+        "timed_out": {"type": "boolean"},
+        "registry": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/registry_entry"}]},
+        "problems": {"type": "array", "items": {"type": "string"}},
+        "block": {"$ref": "#/$defs/validation_block"}
+      }
+    },
+    "legacy_step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "executable", "exit_code", "output_summary_sha256", "started_at", "completed_at", "timed_out", "test_step"],
+      "properties": {
+        "command": {"type": "string", "minLength": 1},
+        "executable": {"type": ["string", "null"], "minLength": 1},
+        "exit_code": {"type": ["integer", "null"]},
+        "output_summary_sha256": {"$ref": "#/$defs/sha256"},
+        "started_at": {"$ref": "#/$defs/date_time"},
+        "completed_at": {"$ref": "#/$defs/date_time"},
+        "timed_out": {"type": "boolean"},
+        "test_step": {"type": "boolean", "description": "manager.nextplan.verify.is_test_step: diagnostic annotation only."}
+      },
+      "description": "Legacy shell-string record: exit state only. There is deliberately no counts field -- numbers in its output cannot be bound to a test process."
+    }
+  }
+}
