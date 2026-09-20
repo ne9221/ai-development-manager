@@ -1,6 +1,6 @@
 # NextPlan trust model
 
-Status: Remediation Round 7 (2026-09-20), pending independent review.
+Status: Remediation Round 8 (2026-09-20), pending independent review.
 Applies to `manager/nextplan/contracts.py`, `runner.py`, `extract.py`,
 `verify.py`, `classify.py` and `planner.py`.
 
@@ -10,6 +10,13 @@ Applies to `manager/nextplan/contracts.py`, `runner.py`, `extract.py`,
 > disagreed. In one line: **a list is not a grammar, and a quotation is not a
 > voice.** Section 7 states the amended contract, and it supersedes one Round-3
 > rule explicitly (7.3).
+>
+> **Round 8 corrects section 7.1** (section 8), after a fresh Grok review
+> rejected `57f8ed79`: the grammar 7.1 publishes was not the grammar the code
+> implemented. The grammar itself is unchanged and still the contract; what
+> changes is that there is now exactly one source for it in the code. In one
+> line: **a character cap is not a grammar rule, and one grammar has one
+> source.**
 >
 > **Round 6 amends this document.** Round 5's design below is unchanged and
 > still correct; Round 6 fixes the places where it was written down but not
@@ -379,7 +386,8 @@ The fix is the grammar the other form already had, not six more strings:
 >   `outcome`
 
 Both forms are now built from the same two sets, so they cannot drift apart
-again. The explicit tables are still consulted first, so every Round-5 and
+again. *(Round 8: this sentence was false as implemented — the sets were shared,
+the composition was not. See section 8.)* The explicit tables are still consulted first, so every Round-5 and
 Round-6 label keeps the tier it had — including the decisive ones the grammar
 would not generate (`final call`, `approval`, `sign off`, the Chinese labels)
 and the reporting ones it must not (`final status`, `summary verdict`).
@@ -478,3 +486,86 @@ change to this section, not a wording someone adds while closing a finding.
 either contract, `run_validation` is still not wired into
 `repo_write_enforcement.py`, and the `adm-result` milestone was again
 deliberately not started.
+
+## 8. Round 8 correction — one grammar has one source
+
+A fresh independent Grok review rejected `57f8ed79` (docs-only tip
+`ec5da6f7`) with two HIGH surfaces of one parser defect. Read
+[`REMEDIATION-ROUND-8-20260920.md`](REMEDIATION-ROUND-8-20260920.md) with this
+section.
+
+### 8.1 What 7.1 published and what the code did (R7-IR-1, HIGH)
+
+Section 7.1 publishes `(owner)? (modifier)* (decision-noun)` over three closed
+sets, and says the two forms are built from the same sets and cannot drift.
+The sets were shared. The *composition* was not, and there were three of it:
+
+| | 7.1 says | `57f8ed79` did |
+|---|---|---|
+| label form, field length | any | `_LABEL_LINE` captured at most **25 characters** before the colon, so `My current official decision: reject` never reached the grammar |
+| copula form, owner | optional | required |
+| copula form, modifiers | `*` | `{0,2}` |
+
+So `Current decision: reject` was read and `Current decision is to reject`
+was not; `My current decision: reject` was read and `My current official
+decision: reject` was not. Measured at `ec5da6f7`: **7 of 7** attacks beside a
+bound `PASS` reached `MARK_COMPLETE`, including one written into the object's
+own `summary` (R7-IR-2), because the summary correctly reads through the same
+collector and so inherited the same hole.
+
+### 8.2 The corrected contract
+
+The grammar is **unchanged**: same five owners, same eight modifiers, same
+five decision nouns, same composition. What is corrected is how it is
+implemented, and the correction is the contract:
+
+> The decisive-field grammar has **one source**, `extract._field_grammar`,
+> compiled once as `_DECISION_FIELD`. The label form is decisive when the whole
+> text before the colon full-matches it (after the explicit tables). The copula
+> form's decisive branch **is** that compiled pattern, embedded by reference.
+> No length cap, character class or cardinality anywhere else may decide what
+> a decision field is.
+
+Consequences, all of them the published grammar rather than new behaviour:
+
+* a label of any length is read — the tables and the grammar decide, nothing
+  before them;
+* the copula form accepts an ownerless field (`Current decision is to reject`)
+  and any number of modifiers, exactly as the label form does;
+* the copula's reporting nouns (`call`, `assessment`, `conclusion`,
+  `judgement`, `judgment`) use the same composition over their own separate
+  set, remain reject-only, and are still never promoted by a modifier.
+
+### 8.3 What did not move
+
+`_REJECT_VALUES` is byte-for-byte unchanged (sha256 `1284e63e…`, 53 entries,
+pinned by a test). `_APPROVE_VALUES`, the three closed sets, the explicit
+tables and the reporting-noun policy are unchanged. 7.3 (a closed
+wrong-channel fence is quotation in both directions; an unclosed fence cannot
+hide the reviewer's voice) and 7.4 (one authority invocation through
+`classify.review_authority_for`) are untouched and re-tested with long
+compositions. `contracts.py` is unchanged: the summary rule was already
+correct in architecture, and closed when the collector did.
+
+### 8.4 The one syntax difference, stated
+
+The label form is anchored: the field is everything before the colon, so `My
+tentative decision: reject` is not a field and is not read. The copula form is
+a sentence, and reads the grammatical run ending at the noun, so `My tentative
+decision is to reject` reads `decision is to reject` — a rejection. Round 7
+already behaved this way for owned fields; an optional owner extends it to
+ownerless ones. It fails closed, and it is pinned as such.
+
+### 8.5 Residual after Round 8
+
+**8.5.1 The measured over-refusal of the ownerless copula.** A sweep of all
+1421 string literals in the existing NextPlan tests and fixtures found four
+whose reading changed, all test docstrings of the form `A decision is
+collected…`, all `unreadable`, none an approval. A reviewer who writes
+`… decision is …` about something other than the review can now cost a round.
+This is the published grammar working as published; it never completes.
+
+**8.5.2 7.5.1, 7.5.2 and 7.5.3 stand.** The grammar is still finite and
+stated; extending any set is a reviewed change to 7.1 and this section.
+Nothing in production emits either contract, and the `adm-result` milestone
+was again deliberately not started.

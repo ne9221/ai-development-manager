@@ -425,28 +425,60 @@ _LABEL_LINE = re.compile(
     # widened rather than narrowed: a decision line stays a decision line when
     # it is quoted, and excluding quotes would make "> Verdict: reject" a
     # one-character bypass. Reading it can only cost a round.
+    #
+    # Round 8: the label is everything before the colon, with NO length cap.
+    # Round 7 captured it as "[A-Za-z][A-Za-z \-]{0,24}" -- twenty-five
+    # characters -- so "My current official decision: reject" (28) never
+    # reached _label_tier at all, and the grammar below, which would have read
+    # it, was never asked. A character cap is not a grammar rule; which labels
+    # count is decided ONLY by the tables and _DECISION_FIELD in _label_tier.
     r"^\s{0,3}(?:>\s?)*\s{0,3}(?:[-*•]\s*)?(?:#{1,6}\s*)?(?:\*\*|__|\*|`)?\s*"
-    r"(?P<label>[A-Za-z][A-Za-z \-]{0,24}|[一-鿿]{2,6})"
+    r"(?P<label>[A-Za-z][A-Za-z \-]*|[一-鿿]{2,6})"
     r"\s*(?:\*\*|__|\*|`)?\s*[:：]\s*(?P<value>.*?)\s*$"
 )
+
+
+def _field_grammar(nouns, group="noun"):
+    """``(owner)? (modifier)* (noun)`` as one regex source. THE decision-field grammar.
+
+    This is the single authority for what a decision field looks like. The
+    label form (``My current decision: reject``) full-matches it; the copula
+    form (``My current decision is to reject``) embeds it verbatim ahead of the
+    verb. Round 7 stated this grammar and then built the two forms separately:
+    the copula kept a required owner and ``{0,2}`` modifiers from Round 6,
+    the label form had a character cap, and neither matched the published
+    contract (R7-IR-1). Two spellings of one grammar drift; one source cannot.
+
+    Owner and modifiers are the closed sets above; only ``nouns`` varies, so
+    the decisive and reporting tiers can share the composition without either
+    being able to borrow the other's nouns.
+    """
+    return (r"(?:(?:%s)\s+)?(?:(?:%s)\s+)*(?P<%s>%s)"
+            % ("|".join(sorted(_LABEL_OWNERS)), "|".join(sorted(_LABEL_MODIFIERS)),
+               group, "|".join(sorted(nouns))))
+
+
+# The decisive field: the grammar over the decision nouns, and nothing else.
+_DECISION_FIELD = re.compile(_field_grammar(_DECISION_NOUNS), re.I)
+# Nouns whose sentence form is NOT unambiguously announcing a decision. They get
+# the reporting tier's treatment (an unambiguous rejection counts, anything
+# else is prose), exactly as their label form does; a modifier never promotes
+# them. Kept apart from _DECISION_NOUNS so the decisive grammar cannot grow by
+# accident.
+_COPULA_REPORTING_NOUNS = frozenset({"call", "assessment", "conclusion", "judgement", "judgment"})
 # The same decision field written as a sentence. "My decision is to reject" is
 # the label form with a copula instead of a colon, and "My review verdict is
 # PASS" -- a genuine approval from the Round-5 corpus -- is the same shape, which
 # is what makes it a shape rather than a rejection pattern.
 _COPULA_DECISION = re.compile(
-    # Built from the same closed sets as the label form above. Round 6 wrote
-    # these alternations out by hand and the two forms drifted apart: neither
-    # knew "reviewer" or "official" as a modifier, and the label form had no
-    # grammar at all. Drifting apart is precisely what R6-IR-1 was.
-    r"\b(?:%s)\s+(?:(?:%s)\s+){0,2}"
-    r"(?P<noun>decision|verdict|recommendation|disposition|outcome|call|assessment|conclusion|judgement|judgment)\s+"
-    r"(?:is|was|are|were|remains?|stands?\s+as|will\s+be)\s+(?:to\s+)?(?P<value>[^.;!?\n]{1,40})"
-    % ("|".join(sorted(_LABEL_OWNERS)), "|".join(sorted(_LABEL_MODIFIERS))),
+    # The decisive branch IS _DECISION_FIELD, pasted in by reference so the two
+    # forms cannot be edited apart. The reporting branch is the same
+    # composition over the reporting nouns; it is reject-only in
+    # decision_statements, so it can cost a round and never a completion.
+    r"\b(?:" + _DECISION_FIELD.pattern + r"|" + _field_grammar(_COPULA_REPORTING_NOUNS, "rnoun") + r")\s+"
+    r"(?:is|was|are|were|remains?|stands?\s+as|will\s+be)\s+(?:to\s+)?(?P<value>[^.;!?\n]{1,40})",
     re.I
 )
-# Nouns whose sentence form is unambiguously announcing a decision; the rest get
-# the reporting tier's treatment, exactly as their label form does.
-_DECISIVE_NOUNS = _DECISION_NOUNS
 
 _DECISIVE, _REPORTING = "decisive", "reporting"
 
@@ -467,13 +499,13 @@ def _label_tier(label):
         return _DECISIVE
     if label in _REPORTING_LABELS:
         return _REPORTING
-    words = label.split()
-    if words and words[0] in _LABEL_OWNERS:
-        words = words[1:]
-    if words and words[-1] in _DECISION_NOUNS and all(w in _LABEL_MODIFIERS for w in words[:-1]):
-        # "my current decision", "the overall disposition", "final outcome".
-        # "the recommendation engine" is not one of them: its head noun is
-        # "engine", which is how an ordinary noun phrase stays ordinary.
+    if _DECISION_FIELD.fullmatch(label):
+        # "my current decision", "the overall disposition", "final outcome",
+        # and every other (owner)? (modifier)* (decision-noun) composition,
+        # however many modifiers. "the recommendation engine" is not one of
+        # them: its head noun is "engine", which is how an ordinary noun phrase
+        # stays ordinary. The SAME compiled grammar is the copula form's
+        # decisive branch, so a field decisive here is decisive there.
         return _DECISIVE
     return None
 
@@ -556,7 +588,7 @@ def decision_statements(text):
             statements.append({"raw": line.strip()[:120], "polarity": polarity})
     for match in _COPULA_DECISION.finditer(text or ""):
         polarity = _decision_value(match.group("value"))
-        decisive = match.group("noun").lower() in _DECISIVE_NOUNS
+        decisive = match.group("noun") is not None    # matched the _DECISION_FIELD branch
         if decisive or polarity == contracts.STATEMENT_REJECT:
             statements.append({"raw": match.group(0).strip()[:120], "polarity": polarity})
     for match in _REVIEW_OUTCOME.finditer(text or ""):
